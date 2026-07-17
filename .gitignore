@@ -1,0 +1,40 @@
+# Local agent and Codex state
+.agents/
+.codex/
+
+# Secrets and credentials
+.env
+.env.*
+*.key
+*.pem
+*.p12
+credentials/
+secrets/
+
+# Local databases, service state, and personal exports
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.bak
+*.backup
+exports/
+state/
+runtime/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Build/cache output
+dist/
+build/
+coverage/
+.cache/
+__pycache__/
+*.py[cod]
+node_modules/

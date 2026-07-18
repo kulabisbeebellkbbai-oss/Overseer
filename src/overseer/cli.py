@@ -484,6 +484,19 @@ def execute_admin_change_status(store_path: str | Path, plan_id: str) -> dict[st
         store.close()
 
 
+def admin_executions_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        executions = store.list_admin_executions()
+        return {
+            "store": str(store.path),
+            "executions": [admin_execution_status(result) for result in executions],
+            "execution_count": len(executions),
+        }
+    finally:
+        store.close()
+
+
 def approve_admin_change_status(
     store_path: str | Path,
     plan_id: str,
@@ -928,6 +941,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_admin_parser = subparsers.add_parser("execute-admin-change", help="execute an approved user-service admin change plan")
     execute_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     execute_admin_parser.add_argument("--plan-id", required=True)
+    admin_executions_parser = subparsers.add_parser("admin-executions", help="list persisted admin change execution results")
+    admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -1074,6 +1089,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "execute-admin-change":
         print(json.dumps(execute_admin_change_status(args.store, args.plan_id), sort_keys=True))
+        return 0
+
+    if args.command == "admin-executions":
+        print(json.dumps(admin_executions_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

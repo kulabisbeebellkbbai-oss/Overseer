@@ -95,6 +95,7 @@ from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
+from overseer.cli import admin_executions_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
 from overseer.cli import alerts_summary_status
@@ -664,6 +665,21 @@ class HealthSummaryTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
 
+    def test_admin_executions_status_reports_persisted_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            plan = plan_user_service_restart("admin.restart.test", "overseer-api.service", "reload code", "active")
+            result = execute_admin_change_plan(plan)
+            store.save_admin_execution(result)
+            store.close()
+
+            status = admin_executions_status(store_path)
+
+        self.assertEqual(status["execution_count"], 1)
+        self.assertEqual(status["executions"][0]["plan_id"], "admin.restart.test")
+        self.assertEqual(status["executions"][0]["status"], AdminExecutionStatus.BLOCKED.value)
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1009,6 +1025,28 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertFalse(canceled["can_execute"])
             self.assertEqual(pending["pending_count"], 0)
             self.assertTrue(state["admin_change_plans"][0]["canceled"])
+
+    def test_client_executes_and_lists_blocked_admin_change_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client.plan_admin_change(
+                    {
+                        "plan_id": "admin.restart.blocked",
+                        "kind": AdminChangeKind.USER_SERVICE_RESTART.value,
+                        "target": "overseer-api.service",
+                        "reason": "reload approved code",
+                        "current_state": "active",
+                    }
+                )
+                executed = client.execute_admin_change({"plan_id": "admin.restart.blocked"})
+                executions = client.admin_executions()
+
+            self.assertEqual(executed["status"], AdminExecutionStatus.BLOCKED.value)
+            self.assertEqual(executions["execution_count"], 1)
+            self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
 
 
 class HostInspectionTests(unittest.TestCase):

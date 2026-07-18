@@ -64,11 +64,17 @@ class OverseerApiClient:
     def authorizations_required(self) -> dict[str, Any]:
         return self._get("/admin/authorizations-required")
 
+    def admin_executions(self) -> dict[str, Any]:
+        return self._get("/admin/executions")
+
     def approve_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/approve", payload)
 
     def cancel_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/cancel", payload)
+
+    def execute_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/execute", payload)
 
     def _get(self, path: str, authenticated: bool = True) -> dict[str, Any]:
         request = Request(f"{self.base_url}{path}", headers=self._headers(authenticated))

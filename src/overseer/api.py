@@ -11,12 +11,14 @@ from typing import Any
 
 from .cli import (
     activate_claim_status,
+    admin_executions_status,
     assess_host_security_status,
     approve_admin_change_status,
     approve_claim_status,
     alerts_summary_status,
     authorizations_required_status,
     cancel_admin_change_status,
+    execute_admin_change_status,
     health_summary_status,
     inspect_host_status,
     list_state_status,
@@ -59,6 +61,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/admin/authorizations-required":
                 self._handle(lambda: authorizations_required_status(store_path))
                 return
+            if self.path == "/admin/executions":
+                self._handle(lambda: admin_executions_status(store_path))
+                return
             if self.path == "/state":
                 self._handle(lambda: list_state_status(store_path))
                 return
@@ -91,6 +96,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/cancel":
                 self._handle_json(lambda payload: cancel_admin_change_status(store_path, **_cancel_admin_plan_args(payload)))
+                return
+            if self.path == "/admin/execute":
+                self._handle_json(lambda payload: execute_admin_change_status(store_path, str(payload["plan_id"])))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

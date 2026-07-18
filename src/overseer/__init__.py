@@ -45,6 +45,7 @@ from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_con
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
+from .runtime import OverseerRuntime, RuntimeTick
 from .security import (
     ProtectiveAction,
     SecurityIncident,
@@ -127,6 +128,8 @@ __all__ = [
     "PlannedOperation",
     "ClaimRecord",
     "ResourceRegistry",
+    "OverseerRuntime",
+    "RuntimeTick",
     "ProtectiveAction",
     "SecurityIncident",
     "SecurityResponse",

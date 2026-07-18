@@ -13,6 +13,7 @@ from .health import HealthTarget, ProbeType
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
+from .runtime import OverseerRuntime
 from .service import OverseerCoordinator
 from .store import SQLiteStore
 
@@ -158,6 +159,20 @@ def discover_physical_status(roots: Sequence[str]) -> dict[str, object]:
     }
 
 
+def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.0) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        tick = OverseerRuntime(store).run(interval_seconds=interval_seconds, once=once)
+        return {
+            "store": str(store.path),
+            "resources": tick.resources,
+            "usage_limits": tick.usage_limits,
+            "audit_events": tick.audit_events,
+        }
+    finally:
+        store.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="overseer")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -176,6 +191,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
+    run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
+    run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
+    run_parser.add_argument("--interval-seconds", type=float, default=30.0)
     args = parser.parse_args(argv)
 
     if args.command == "demo":
@@ -206,6 +225,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "discover-physical":
         print(json.dumps(discover_physical_status(args.root), sort_keys=True))
+        return 0
+
+    if args.command == "run":
+        print(json.dumps(run_status(args.store, args.once, args.interval_seconds), sort_keys=True))
         return 0
 
     parser.error(f"unknown command: {args.command}")

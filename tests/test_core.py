@@ -24,6 +24,7 @@ from overseer import (
     ResourceState,
     ResourceType,
     RiskLevel,
+    OverseerRuntime,
     decide_claim,
     classify_probe,
     recovery_evidence,
@@ -72,6 +73,7 @@ from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import probe_health_status
+from overseer.cli import run_status
 from overseer.cli import seed_config_status
 
 
@@ -1201,6 +1203,65 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.load_resource("svc.seeded").owner_domain, OwnerDomain.JULIAN)
             self.assertEqual(store.load_usage_limit("limit.seeded").remaining, 10)
             store.close()
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_runtime_tick_reports_seeded_store_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            seed_store_from_config(
+                config_from_mapping(
+                    {
+                        "resources": [
+                            {
+                                "id": "svc.runtime",
+                                "name": "Runtime Service",
+                                "type": "service",
+                                "owner_domain": "julian",
+                                "risk_level": "low",
+                            }
+                        ],
+                        "usage_limits": [
+                            {
+                                "id": "limit.runtime",
+                                "resource_id": "svc.runtime",
+                                "kind": "requests",
+                                "capacity": 10,
+                                "remaining": 5,
+                                "resets_at": "2026-07-18T16:00:00-04:00",
+                                "window": "hourly",
+                            }
+                        ],
+                    }
+                ),
+                store,
+            )
+
+            tick = OverseerRuntime(store).run(once=True)
+
+            self.assertEqual(tick.resources, 1)
+            self.assertEqual(tick.usage_limits, 1)
+            store.close()
+
+    def test_run_status_reports_explicit_store_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.run",
+                    name="Run Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            status = run_status(store_path, once=True)
+
+            self.assertEqual(status["store"], str(store_path))
+            self.assertEqual(status["resources"], 1)
 
 
 class OverseerCoordinatorTests(unittest.TestCase):

@@ -34,7 +34,7 @@ from .admin import (
 from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
-from .audit import ApprovalStatus, AuditEvent, AuditEventType
+from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import HostFindingSeverity, HostInspectionAdapter, HostInspectionSnapshot, host_security_status, host_snapshot_status
 from .ids_review import (
@@ -2075,6 +2075,63 @@ def admin_history_restore_readiness_status(store_path: str | Path, plan_id: str 
         store.close()
 
 
+def request_admin_history_restore_status(
+    store_path: str | Path,
+    plan_id: str,
+    requested_by: str,
+    requested_at: str | None = None,
+) -> dict[str, object]:
+    if not requested_by.strip():
+        raise ValueError("requested_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            plan = store.load_admin_change_plan(plan_id)
+        except KeyError:
+            raise ValueError(f"admin plan does not exist: {plan_id}") from None
+        if not plan.archived:
+            raise ValueError("admin change plan is not archived")
+        archive_record_id = plan.archive_record_id
+        archive_record = store.load_admin_history_archive(archive_record_id) if archive_record_id else None
+        if archive_record is None:
+            raise ValueError("matching admin history archive record is required before restore approval")
+        approval = ApprovalRequest(
+            id=f"approval.admin.restore.{plan.id}",
+            subject_id=plan.id,
+            approval_level=_admin_history_restore_approval_level(plan),
+            requester_thread=requested_by,
+            owner_domain=OwnerDomain.SISKO,
+            reason=f"Restore archived admin plan {plan.id} to active admin history",
+            evidence_required=(archive_record.id,),
+        )
+        event = AuditEvent(
+            id=f"audit.{approval.id}.requested",
+            event_type=AuditEventType.REQUESTED,
+            owner_domain=OwnerDomain.SISKO,
+            subject_id=plan.id,
+            summary=approval.reason,
+            risk_level=_admin_history_restore_risk_level(plan),
+            evidence_ids=(approval.id, archive_record.id),
+            occurred_at=requested_at,
+        )
+        store.save_approval(approval)
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "approval_id": approval.id,
+            "subject_id": approval.subject_id,
+            "approval_status": ApprovalStatus(approval.status).value,
+            "approval_level": ApprovalLevel(approval.approval_level).value,
+            "requested_by": requested_by,
+            "requested_at": requested_at,
+            "archive_record_id": archive_record.id,
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
 def archive_admin_history_status(
     store_path: str | Path,
     archived_by: str,
@@ -2154,10 +2211,13 @@ def unarchive_admin_history_status(
     store_path: str | Path,
     plan_id: str,
     restored_by: str,
+    approval_id: str,
     restored_at: str | None = None,
 ) -> dict[str, object]:
     if not restored_by.strip():
         raise ValueError("restored_by is required")
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
     store = SQLiteStore(store_path)
     try:
         now = restored_at or datetime.now(UTC).isoformat()
@@ -2165,10 +2225,23 @@ def unarchive_admin_history_status(
             plan = store.load_admin_change_plan(plan_id)
         except KeyError:
             raise ValueError(f"admin plan does not exist: {plan_id}") from None
+        if not plan.archived:
+            raise ValueError("admin change plan is not archived")
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"restore approval does not exist: {approval_id}") from None
+        expected_approval_level = _admin_history_restore_approval_level(plan)
+        if approval.subject_id != plan.id:
+            raise ValueError("restore approval subject does not match admin plan")
+        if approval.approval_level != expected_approval_level:
+            raise ValueError("restore approval level does not match admin plan restore gate")
+        if approval.status != ApprovalStatus.APPROVED:
+            raise ValueError("restore approval must be approved before unarchiving")
         archive_record_id = plan.archive_record_id
         restored = unarchive_admin_change_plan(plan, restored_by)
         store.save_admin_change_plan(restored)
-        evidence_ids = (archive_record_id,) if archive_record_id else ()
+        evidence_ids = (approval.id,) + ((archive_record_id,) if archive_record_id else ())
         event = AuditEvent(
             id=f"audit.admin.unarchive.{plan.id}",
             event_type=AuditEventType.RELEASED,
@@ -2186,6 +2259,7 @@ def unarchive_admin_history_status(
             "restored": 1,
             "restored_by": restored_by,
             "restored_at": now,
+            "approval_id": approval.id,
             "archive_record_id": archive_record_id,
             "plan": admin_change_plan_status(restored),
             "audit_event": audit_event_status(event),
@@ -3143,6 +3217,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_restore_readiness_parser = subparsers.add_parser("admin-history-restore-readiness", help="plan approval and evidence gates before restoring archived admin plans")
     admin_restore_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_restore_readiness_parser.add_argument("--plan-id", help="filter restore readiness by admin plan id")
+    admin_restore_request_parser = subparsers.add_parser("request-admin-history-restore", help="request approval before restoring an archived admin plan")
+    admin_restore_request_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_restore_request_parser.add_argument("--plan-id", required=True)
+    admin_restore_request_parser.add_argument("--requested-by", required=True)
+    admin_restore_request_parser.add_argument("--requested-at")
     archive_admin_history_parser = subparsers.add_parser("archive-admin-history", help="archive inactive admin plans after explicit approval")
     archive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     archive_admin_history_parser.add_argument("--archived-by", required=True)
@@ -3152,6 +3231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     unarchive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     unarchive_admin_history_parser.add_argument("--plan-id", required=True)
     unarchive_admin_history_parser.add_argument("--restored-by", required=True)
+    unarchive_admin_history_parser.add_argument("--approval-id", required=True)
     unarchive_admin_history_parser.add_argument("--restored-at")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -3499,12 +3579,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(admin_history_restore_readiness_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
+    if args.command == "request-admin-history-restore":
+        print(json.dumps(request_admin_history_restore_status(args.store, args.plan_id, args.requested_by, args.requested_at), sort_keys=True))
+        return 0
+
     if args.command == "archive-admin-history":
         print(json.dumps(archive_admin_history_status(args.store, args.archived_by, args.archived_at, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "unarchive-admin-history":
-        print(json.dumps(unarchive_admin_history_status(args.store, args.plan_id, args.restored_by, args.restored_at), sort_keys=True))
+        print(json.dumps(unarchive_admin_history_status(args.store, args.plan_id, args.restored_by, args.approval_id, args.restored_at), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

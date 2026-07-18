@@ -68,6 +68,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /admin/approve`
 - `POST /admin/cancel`
 - `POST /admin/execute`
+- `POST /admin/history-restore-requests`
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
@@ -82,8 +83,9 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/history-archive-plan` prepares a read-only archive manifest for inactive admin plans. It groups each archive candidate with related execution, IDS review, and audit records, and does not mutate state.
 `GET /admin/history-archives` lists persisted archive records and supports `?plan_id=...` filtering. It is read-only and does not restore or modify plans.
 `GET /admin/history-restore-readiness` lists archived plans with restore risk, required approval level, archive record presence, and related evidence. It supports `?plan_id=...` filtering and is read-only.
+`POST /admin/history-restore-requests` creates the approval request required before an archived plan can be restored.
 `POST /admin/history-archive` marks archive-ready admin plans archived after explicit approval. It preserves the original plan, execution, IDS review, and audit records, persists an archive record, and emits an audit event.
-`POST /admin/history-unarchive` restores one archived admin plan to active admin history while keeping the archive record and emitting an audit event.
+`POST /admin/history-unarchive` restores one archived admin plan to active admin history after the restore approval is approved. It keeps the archive record and emits an audit event.
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, and recent admin audit events.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.

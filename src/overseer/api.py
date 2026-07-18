@@ -49,6 +49,7 @@ from .cli import (
     plan_admin_change_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
+    request_admin_history_restore_status,
     prepare_host_security_ids_review_package_status,
     request_claim_status,
     service_status,
@@ -221,6 +222,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/admin/history-archive":
                 self._handle_json(lambda payload: archive_admin_history_status(store_path, **_archive_admin_history_args(payload)))
                 return
+            if self.path == "/admin/history-restore-requests":
+                self._handle_json(lambda payload: request_admin_history_restore_status(store_path, **_admin_history_restore_request_args(payload)))
+                return
             if self.path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
                 return
@@ -360,7 +364,16 @@ def _unarchive_admin_history_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "plan_id": str(payload["plan_id"]),
         "restored_by": str(payload["restored_by"]),
+        "approval_id": str(payload["approval_id"]),
         "restored_at": str(payload["restored_at"]) if payload.get("restored_at") is not None else None,
+    }
+
+
+def _admin_history_restore_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "requested_by": str(payload["requested_by"]),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
     }
 
 

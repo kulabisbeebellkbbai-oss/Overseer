@@ -144,6 +144,7 @@ from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
+from overseer.cli import request_admin_history_restore_status
 from overseer.cli import request_claim_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
@@ -848,12 +849,25 @@ class HealthSummaryTests(unittest.TestCase):
             filtered_archive_records = admin_history_archives_status(store_path, "admin.restart.completed")
             restore_readiness = admin_history_restore_readiness_status(store_path)
             filtered_restore_readiness = admin_history_restore_readiness_status(store_path, "admin.restart.completed")
+            restore_request = request_admin_history_restore_status(
+                store_path,
+                "admin.restart.completed",
+                "sisko",
+                "2026-07-18T22:18:00+00:00",
+            )
+            restore_approval = approve_claim_status(
+                store_path,
+                restore_request["approval_id"],
+                "sisko",
+                "2026-07-18T22:19:00+00:00",
+            )
             post_archive_summary = admin_summary_status(store_path)
             post_archive_state = list_state_status(store_path)
             restored = unarchive_admin_history_status(
                 store_path,
                 "admin.restart.completed",
                 "sisko",
+                restore_request["approval_id"],
                 "2026-07-18T22:20:00+00:00",
             )
             post_restore_review = admin_history_review_status(store_path)
@@ -898,12 +912,16 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(restore_readiness["items"][0]["restore_risk_level"], RiskLevel.MEDIUM.value)
         self.assertEqual(restore_readiness["items"][0]["evidence"]["archive_record"]["id"], "admin.archive.admin.restart.completed")
         self.assertEqual(filtered_restore_readiness["filters"]["plan_id"], "admin.restart.completed")
+        self.assertTrue(restore_request["mutation_performed"])
+        self.assertEqual(restore_request["approval_status"], ApprovalStatus.PENDING.value)
+        self.assertEqual(restore_approval["approval_status"], ApprovalStatus.APPROVED.value)
         self.assertEqual(post_archive_summary["archived_plans"], 1)
         archived_state_plan = next(item for item in post_archive_state["admin_change_plans"] if item["id"] == "admin.restart.completed")
         self.assertTrue(archived_state_plan["archived"])
         self.assertEqual(post_archive_state["admin_history_archives"][0]["id"], "admin.archive.admin.restart.completed")
         self.assertTrue(restored["mutation_performed"])
         self.assertFalse(restored["plan"]["archived"])
+        self.assertEqual(restored["approval_id"], restore_request["approval_id"])
         self.assertEqual(restored["archive_record_id"], "admin.archive.admin.restart.completed")
         self.assertEqual(post_restore_review["archive_candidates"], 2)
         self.assertEqual(post_restore_review["archived_plans"], 0)
@@ -2361,6 +2379,17 @@ class OverseerApiClientTests(unittest.TestCase):
                 filtered_archives = client.admin_history_archives("admin.restart.blocked")
                 restore_readiness = client.admin_history_restore_readiness()
                 filtered_restore_readiness = client.admin_history_restore_readiness("admin.restart.blocked")
+                restore_request_error = None
+                try:
+                    client.request_admin_history_restore(
+                        {
+                            "plan_id": "admin.restart.blocked",
+                            "requested_by": "sisko",
+                            "requested_at": "2026-07-18T22:15:30+00:00",
+                        }
+                    )
+                except HTTPError as error:
+                    restore_request_error = error
                 archive_result = client.archive_admin_history(
                     {
                         "archived_by": "sisko",
@@ -2373,6 +2402,7 @@ class OverseerApiClientTests(unittest.TestCase):
                         {
                             "plan_id": "admin.restart.blocked",
                             "restored_by": "sisko",
+                            "approval_id": "approval.admin.restore.admin.restart.blocked",
                             "restored_at": "2026-07-18T22:16:00+00:00",
                         }
                     )
@@ -2390,6 +2420,8 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(filtered_archives["filters"]["plan_id"], "admin.restart.blocked")
             self.assertEqual(restore_readiness["archived_plans"], 0)
             self.assertEqual(filtered_restore_readiness["filters"]["plan_id"], "admin.restart.blocked")
+            self.assertIsNotNone(restore_request_error)
+            self.assertEqual(restore_request_error.code, 400)
             self.assertFalse(archive_result["mutation_performed"])
             self.assertIsNotNone(unarchive_error)
             self.assertEqual(unarchive_error.code, 400)

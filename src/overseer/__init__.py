@@ -40,6 +40,7 @@ from .health import (
     recovery_evidence,
     summarize_health_targets,
 )
+from .host import HostCommandObservation, HostInspectionAdapter, HostInspectionSnapshot, host_snapshot_status, parse_os_release
 from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
     InterruptionPolicy,
@@ -124,6 +125,11 @@ __all__ = [
     "classify_probe",
     "recovery_evidence",
     "summarize_health_targets",
+    "HostCommandObservation",
+    "HostInspectionAdapter",
+    "HostInspectionSnapshot",
+    "host_snapshot_status",
+    "parse_os_release",
     "HttpHealthProbeAdapter",
     "InterruptionPolicy",
     "MaintenanceKind",

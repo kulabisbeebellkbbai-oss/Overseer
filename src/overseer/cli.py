@@ -12,6 +12,7 @@ from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, Resour
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
+from .host import HostInspectionAdapter, host_snapshot_status
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
@@ -264,6 +265,19 @@ def service_status(store_path: str | Path, service_name: str = "overseer") -> di
         store.close()
 
 
+def inspect_host_status(store_path: str | Path | None = None) -> dict[str, object]:
+    snapshot = HostInspectionAdapter().inspect()
+    status = host_snapshot_status(snapshot)
+    if store_path is None:
+        return status
+    store = SQLiteStore(store_path)
+    try:
+        store.save_host_snapshot(snapshot)
+        return {"store": str(store.path), **status}
+    finally:
+        store.close()
+
+
 def health_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -308,6 +322,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         approvals = store.list_approvals()
         audit_events = store.list_audit_events()
         heartbeats = store.list_runtime_heartbeats()
+        host_snapshots = store.list_host_snapshots()
         return {
             "store": str(store.path),
             "resources": [
@@ -389,6 +404,15 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "tick_count": heartbeat.tick_count,
                 }
                 for heartbeat in heartbeats
+            ],
+            "host_snapshots": [
+                {
+                    "id": snapshot.id,
+                    "captured_at": snapshot.captured_at,
+                    "hostname": snapshot.hostname,
+                    "observation_count": len(snapshot.observations),
+                }
+                for snapshot in host_snapshots
             ],
         }
     finally:
@@ -542,6 +566,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
     service_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser.add_argument("--service-name", default="overseer")
+    inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
+    inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -632,6 +658,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "service-status":
         print(json.dumps(service_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "inspect-host":
+        print(json.dumps(inspect_host_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

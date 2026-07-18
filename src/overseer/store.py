@@ -11,6 +11,7 @@ from typing import Any
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence, HealthTarget
+from .host import HostInspectionSnapshot
 from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
@@ -75,6 +76,10 @@ class SQLiteStore:
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS runtime_heartbeats (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS host_snapshots (
                 id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
@@ -214,6 +219,15 @@ class SQLiteStore:
 
     def list_runtime_heartbeats(self) -> tuple[RuntimeHeartbeat, ...]:
         return tuple(_load_dataclass(RuntimeHeartbeat, payload) for payload in self._list_payloads("runtime_heartbeats"))
+
+    def save_host_snapshot(self, snapshot: HostInspectionSnapshot) -> None:
+        self._upsert("host_snapshots", snapshot.id, _dump(snapshot))
+
+    def load_host_snapshot(self, snapshot_id: str) -> HostInspectionSnapshot:
+        return _load_dataclass(HostInspectionSnapshot, self._get_payload("host_snapshots", snapshot_id))
+
+    def list_host_snapshots(self) -> tuple[HostInspectionSnapshot, ...]:
+        return tuple(_load_dataclass(HostInspectionSnapshot, payload) for payload in self._list_payloads("host_snapshots"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

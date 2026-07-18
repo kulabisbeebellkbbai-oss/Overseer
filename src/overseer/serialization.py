@@ -52,4 +52,7 @@ def _coerce_value(target_type: Any, value: Any) -> Any:
     if isinstance(target_type, type) and issubclass(target_type, Enum):
         return target_type(value)
 
+    if isinstance(target_type, type) and is_dataclass(target_type):
+        return dataclass_from_jsonable(target_type, value)
+
     return value

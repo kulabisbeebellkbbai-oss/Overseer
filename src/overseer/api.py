@@ -13,6 +13,7 @@ from .cli import (
     activate_claim_status,
     approve_claim_status,
     health_summary_status,
+    inspect_host_status,
     list_state_status,
     release_claim_status,
     request_claim_status,
@@ -59,6 +60,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/claims/release":
                 self._handle_json(lambda payload: release_claim_status(store_path, str(payload["claim_id"])))
+                return
+            if self.path == "/host/inspect":
+                self._handle(lambda: inspect_host_status(store_path))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

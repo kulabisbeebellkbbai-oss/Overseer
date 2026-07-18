@@ -46,6 +46,9 @@ class OverseerApiClient:
     def release_claim(self, claim_id: str) -> dict[str, Any]:
         return self._post("/claims/release", {"claim_id": claim_id})
 
+    def inspect_host(self) -> dict[str, Any]:
+        return self._post("/host/inspect", {})
+
     def _get(self, path: str, authenticated: bool = True) -> dict[str, Any]:
         request = Request(f"{self.base_url}{path}", headers=self._headers(authenticated))
         return self._read(request)

@@ -30,8 +30,11 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/approve`
 - `POST /claims/activate`
 - `POST /claims/release`
+- `POST /host/inspect`
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
+
+`POST /host/inspect` captures read-only host evidence and persists it to the API store.
 
 ## Python Client
 
@@ -42,6 +45,7 @@ from overseer.client import OverseerApiClient
 
 client = OverseerApiClient(auth_token_file="state/api-token")
 summary = client.health_summary()
+snapshot = client.inspect_host()
 ```
 
 ## Installed User Service

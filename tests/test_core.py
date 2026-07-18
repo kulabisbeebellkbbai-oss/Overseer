@@ -35,6 +35,8 @@ from overseer import (
     HealthStatus,
     HealthEvidence,
     HealthTarget,
+    HostCommandObservation,
+    HostInspectionAdapter,
     HttpHealthProbeAdapter,
     InterruptionPolicy,
     LimitDecision,
@@ -82,6 +84,7 @@ from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import approve_claim_status
 from overseer.cli import health_summary_status
+from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
 from overseer.cli import probe_config_status
@@ -816,6 +819,62 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
+
+
+class HostInspectionTests(unittest.TestCase):
+    def test_host_inspection_uses_read_only_observations(self):
+        commands = []
+
+        def runner(command, timeout_seconds):
+            commands.append(tuple(command))
+            stdout = {
+                ("hostname",): "workstation\n",
+                ("uname", "-a"): "Linux workstation test-kernel\n",
+                ("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"): "overseer.service loaded active running\n",
+                ("ss", "-ltnp"): "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*\n",
+                ("df", "-h", "--output=source,size,used,avail,pcent,target"): "Filesystem Size Used Avail Use% Mounted on\n/dev/root 20G 10G 10G 50% /\n",
+            }[tuple(command)]
+            return HostCommandObservation(
+                name=command[0],
+                command=tuple(command),
+                exit_code=0,
+                stdout=stdout.strip(),
+            )
+
+        adapter = HostInspectionAdapter(
+            command_runner=runner,
+            file_reader=lambda path: 'ID=debian\nPRETTY_NAME="Debian GNU/Linux"\nVERSION_ID="13"\n',
+        )
+
+        snapshot = adapter.inspect("2026-07-18T16:00:00+00:00")
+
+        self.assertEqual(snapshot.hostname, "workstation")
+        self.assertEqual(snapshot.os_release["ID"], "debian")
+        self.assertEqual(snapshot.observation("ss").stdout, "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*")
+        self.assertIn(("df", "-h", "--output=source,size,used,avail,pcent,target"), commands)
+
+    def test_host_snapshot_persists_and_appears_in_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout="host-a" if tuple(command) == ("hostname",) else "ok",
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:00:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            loaded = store.load_host_snapshot(snapshot.id)
+            store.close()
+
+            state = list_state_status(store_path)
+
+        self.assertEqual(loaded.hostname, "host-a")
+        self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
+        self.assertEqual(state["host_snapshots"][0]["observation_count"], 4)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

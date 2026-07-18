@@ -52,6 +52,17 @@ class AdminExecutionResult:
     verification_results: tuple[AdminCommandResult, ...] = ()
 
 
+@dataclass(frozen=True)
+class AdminHistoryArchiveRecord:
+    id: str
+    plan_id: str
+    disposition: str
+    archived_by: str
+    archived_at: str
+    summary: str
+    evidence_ids: tuple[str, ...] = ()
+
+
 AdminCommandRunner = Callable[[AdminCommandStep], AdminCommandResult]
 
 
@@ -77,12 +88,35 @@ class AdminChangePlan:
     canceled_by: str | None = None
     canceled_at: str | None = None
     cancellation_reason: str | None = None
+    archived: bool = False
+    archived_by: str | None = None
+    archived_at: str | None = None
+    archive_record_id: str | None = None
 
     def requires_explicit_approval(self) -> bool:
         return not self.canceled and (self.approval_level != ApprovalLevel.NONE or self.risk_level != RiskLevel.LOW)
 
     def can_execute(self) -> bool:
-        return not self.canceled and self.approved and not missing_admin_change_fields(self)
+        return not self.archived and not self.canceled and self.approved and not missing_admin_change_fields(self)
+
+
+def archive_admin_change_plan(
+    plan: AdminChangePlan,
+    archive_record_id: str,
+    archived_by: str,
+    archived_at: str,
+) -> AdminChangePlan:
+    if not archived_by.strip():
+        raise ValueError("archived_by is required")
+    if plan.archived:
+        raise ValueError("admin change plan is already archived")
+    return replace(
+        plan,
+        archived=True,
+        archived_by=archived_by,
+        archived_at=archived_at,
+        archive_record_id=archive_record_id,
+    )
 
 
 def plan_user_service_restart(plan_id: str, service_name: str, reason: str, current_state: str = "unknown") -> AdminChangePlan:

@@ -17,6 +17,7 @@ from .cli import (
     admin_history_archive_plan_status,
     admin_history_review_status,
     admin_summary_status,
+    archive_admin_history_status,
     assess_host_security_status,
     approve_admin_change_status,
     approve_claim_status,
@@ -208,6 +209,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/admin/execute":
                 self._handle_admin_execute()
                 return
+            if self.path == "/admin/history-archive":
+                self._handle_json(lambda payload: archive_admin_history_status(store_path, **_archive_admin_history_args(payload)))
+                return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def log_message(self, format: str, *args: object) -> None:
@@ -329,6 +333,14 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "current_state": str(payload.get("current_state", "unknown")),
         "packages": tuple(str(package) for package in payload.get("packages", ())),
         "port": int(payload["port"]) if payload.get("port") is not None else None,
+    }
+
+
+def _archive_admin_history_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "archived_by": str(payload["archived_by"]),
+        "archived_at": str(payload["archived_at"]) if payload.get("archived_at") is not None else None,
+        "plan_id": str(payload["plan_id"]) if payload.get("plan_id") is not None else None,
     }
 
 

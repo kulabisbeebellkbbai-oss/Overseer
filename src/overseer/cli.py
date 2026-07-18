@@ -7,6 +7,7 @@ import ipaddress
 import json
 import re
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .admin import (
@@ -15,6 +16,8 @@ from .admin import (
     AdminCommandResult,
     AdminExecutionResult,
     AdminExecutionStatus,
+    AdminHistoryArchiveRecord,
+    archive_admin_change_plan,
     approve_admin_change_plan,
     audit_event_from_admin_execution,
     authorization_required_status,
@@ -411,7 +414,7 @@ def command_summary_status(
         usage_limits = store.list_usage_limits()
         physical_identities = store.list_physical_identities()
         health_summaries = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
-        admin_plans = store.list_admin_change_plans()
+        admin_plans = active_admin_change_plans(store.list_admin_change_plans())
         heartbeats = store.list_runtime_heartbeats()
         heartbeat = next((item for item in heartbeats if item.service_name == service_name), None)
         runtime_freshness = assess_freshness(
@@ -514,7 +517,8 @@ def maintenance_summary_status(store_path: str | Path) -> dict[str, object]:
         plans = [
             plan
             for plan in store.list_admin_change_plans()
-            if plan.owner_domain == OwnerDomain.OBRIEN or plan.kind in {AdminChangeKind.USER_SERVICE_RESTART, AdminChangeKind.APT_INSTALL}
+            if not plan.archived
+            and (plan.owner_domain == OwnerDomain.OBRIEN or plan.kind in {AdminChangeKind.USER_SERVICE_RESTART, AdminChangeKind.APT_INSTALL})
         ]
         executions = store.list_admin_executions()
         executions_by_plan = {result.plan_id: result for result in executions}
@@ -593,8 +597,10 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
         plans = [
             plan
             for plan in store.list_admin_change_plans()
-            if plan.owner_domain == OwnerDomain.ODO
+            if not plan.archived
+            and (plan.owner_domain == OwnerDomain.ODO
             or plan.kind in {AdminChangeKind.BLOCK_IP, AdminChangeKind.FIREWALL_ALLOW_TCP}
+            )
         ]
         pending = [
             plan
@@ -1762,6 +1768,10 @@ def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
         "canceled_by": plan.canceled_by,
         "canceled_at": plan.canceled_at,
         "cancellation_reason": plan.cancellation_reason,
+        "archived": plan.archived,
+        "archived_by": plan.archived_by,
+        "archived_at": plan.archived_at,
+        "archive_record_id": plan.archive_record_id,
         "can_execute": plan.can_execute(),
         "missing_fields": list(missing_admin_change_fields(plan)),
         "steps": [_admin_command_status(step) for step in plan.steps],
@@ -1779,6 +1789,18 @@ def admin_execution_status(result: AdminExecutionResult) -> dict[str, object]:
         "summary": result.summary,
         "command_results": [_admin_command_result_status(item) for item in result.command_results],
         "verification_results": [_admin_command_result_status(item) for item in result.verification_results],
+    }
+
+
+def admin_history_archive_record_status(record: AdminHistoryArchiveRecord) -> dict[str, object]:
+    return {
+        "id": record.id,
+        "plan_id": record.plan_id,
+        "disposition": record.disposition,
+        "archived_by": record.archived_by,
+        "archived_at": record.archived_at,
+        "summary": record.summary,
+        "evidence_ids": list(record.evidence_ids),
     }
 
 
@@ -1849,6 +1871,8 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         plans = store.list_admin_change_plans()
+        active_plans = active_admin_change_plans(plans)
+        archives = store.list_admin_history_archives()
         executions = store.list_admin_executions()
         audit_events = [
             event
@@ -1857,21 +1881,23 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
         ]
         pending = [
             plan
-            for plan in plans
+            for plan in active_plans
             if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
         ]
         history_review = _admin_history_review_payload(
             store.path,
-            plans,
+            active_plans,
             {result.plan_id: result for result in executions},
+            archived_plans=len(plans) - len(active_plans),
         )
         return {
             "store": str(store.path),
-            "plans": len(plans),
+            "plans": len(active_plans),
+            "archived_plans": len(archives),
             "pending_authorizations": len(pending),
-            "approved_plans": sum(1 for plan in plans if plan.approved),
-            "canceled_plans": sum(1 for plan in plans if plan.canceled),
-            "executable_plans": sum(1 for plan in plans if plan.can_execute()),
+            "approved_plans": sum(1 for plan in active_plans if plan.approved),
+            "canceled_plans": sum(1 for plan in active_plans if plan.canceled),
+            "executable_plans": sum(1 for plan in active_plans if plan.can_execute()),
             "executions": len(executions),
             "executions_by_status": {
                 status.value: sum(1 for result in executions if result.status == status)
@@ -1936,10 +1962,13 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
 def admin_history_review_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
+        plans = store.list_admin_change_plans()
+        active_plans = active_admin_change_plans(plans)
         return _admin_history_review_payload(
             store.path,
-            store.list_admin_change_plans(),
+            active_plans,
             {result.plan_id: result for result in store.list_admin_executions()},
+            archived_plans=len(plans) - len(active_plans),
         )
     finally:
         store.close()
@@ -1949,15 +1978,17 @@ def admin_history_archive_plan_status(store_path: str | Path) -> dict[str, objec
     store = SQLiteStore(store_path)
     try:
         plans = store.list_admin_change_plans()
+        active_plans = active_admin_change_plans(plans)
         executions = store.list_admin_executions()
         audit_events = store.list_audit_events()
         ids_packages = store.list_host_security_ids_review_packages()
         history = _admin_history_review_payload(
             store.path,
-            plans,
+            active_plans,
             {result.plan_id: result for result in executions},
+            archived_plans=len(plans) - len(active_plans),
         )
-        plans_by_id = {plan.id: plan for plan in plans}
+        plans_by_id = {plan.id: plan for plan in active_plans}
         candidate_items = [item for item in history["items"] if item["archive_candidate"]]
         return {
             "store": str(store.path),
@@ -1980,6 +2011,81 @@ def admin_history_archive_plan_status(store_path: str | Path) -> dict[str, objec
                 )
                 for item in candidate_items
             ],
+        }
+    finally:
+        store.close()
+
+
+def archive_admin_history_status(
+    store_path: str | Path,
+    archived_by: str,
+    archived_at: str | None = None,
+    plan_id: str | None = None,
+) -> dict[str, object]:
+    if not archived_by.strip():
+        raise ValueError("archived_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        now = archived_at or datetime.now(UTC).isoformat()
+        plans = store.list_admin_change_plans()
+        executions = store.list_admin_executions()
+        audit_events = store.list_audit_events()
+        ids_packages = store.list_host_security_ids_review_packages()
+        history = _admin_history_review_payload(
+            store.path,
+            active_admin_change_plans(plans),
+            {result.plan_id: result for result in executions},
+            archived_plans=sum(1 for plan in plans if plan.archived),
+        )
+        candidate_items = [item for item in history["items"] if item["archive_candidate"]]
+        if plan_id is not None:
+            candidate_items = [item for item in candidate_items if item["id"] == plan_id]
+            if not candidate_items:
+                raise ValueError(f"admin plan is not archive-ready: {plan_id}")
+        plans_by_id = {plan.id: plan for plan in plans}
+        records = []
+        for item in candidate_items:
+            plan = plans_by_id[str(item["id"])]
+            related_execution_ids = tuple(result.id for result in executions if result.plan_id == plan.id)
+            related_package_ids = tuple(package.id for package in ids_packages if package.plan_id == plan.id)
+            related_audit_ids = tuple(
+                event.id
+                for event in audit_events
+                if event.subject_id == plan.id or plan.id in event.evidence_ids
+            )
+            evidence_ids = related_execution_ids + related_package_ids + related_audit_ids
+            record = AdminHistoryArchiveRecord(
+                id=f"admin.archive.{plan.id}",
+                plan_id=plan.id,
+                disposition=str(item["disposition"]),
+                archived_by=archived_by,
+                archived_at=now,
+                summary=f"Archived inactive admin plan {plan.id}: {item['reason']}",
+                evidence_ids=evidence_ids,
+            )
+            archived_plan = archive_admin_change_plan(plan, record.id, archived_by, now)
+            store.save_admin_history_archive(record)
+            store.save_admin_change_plan(archived_plan)
+            store.save_audit_event(
+                AuditEvent(
+                    id=f"audit.{record.id}",
+                    event_type=AuditEventType.RELEASED,
+                    owner_domain=OwnerDomain.SISKO,
+                    subject_id=plan.id,
+                    summary=record.summary,
+                    risk_level=RiskLevel.LOW,
+                    evidence_ids=(record.id,) + evidence_ids,
+                    occurred_at=now,
+                )
+            )
+            records.append(record)
+        return {
+            "store": str(store.path),
+            "mutation_performed": bool(records),
+            "archived": len(records),
+            "archived_by": archived_by,
+            "archived_at": now,
+            "records": [admin_history_archive_record_status(record) for record in records],
         }
     finally:
         store.close()
@@ -2017,6 +2123,7 @@ def _admin_history_review_payload(
     store_path: Path,
     plans: Sequence[AdminChangePlan],
     executions_by_plan: dict[str, AdminExecutionResult],
+    archived_plans: int = 0,
 ) -> dict[str, object]:
     items = [
         admin_history_review_item_status(plan, executions_by_plan.get(plan.id))
@@ -2025,6 +2132,7 @@ def _admin_history_review_payload(
     return {
         "store": str(store_path),
         "plans": len(plans),
+        "archived_plans": archived_plans,
         "archive_candidates": sum(1 for item in items if item["archive_candidate"]),
         "active_or_pending": sum(1 for item in items if item["disposition"] == "retain_active"),
         "by_disposition": {
@@ -2038,6 +2146,10 @@ def _admin_history_review_payload(
         },
         "items": items,
     }
+
+
+def active_admin_change_plans(plans: Sequence[AdminChangePlan]) -> tuple[AdminChangePlan, ...]:
+    return tuple(plan for plan in plans if not plan.archived)
 
 
 def admin_history_review_item_status(
@@ -2434,6 +2546,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         ids_review_packages = store.list_host_security_ids_review_packages()
         admin_change_plans = store.list_admin_change_plans()
         admin_executions = store.list_admin_executions()
+        admin_history_archives = store.list_admin_history_archives()
         return {
             "store": str(store.path),
             "resources": [
@@ -2527,6 +2640,8 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "approval_level": ApprovalLevel(plan.approval_level).value,
                     "approved": plan.approved,
                     "canceled": plan.canceled,
+                    "archived": plan.archived,
+                    "archive_record_id": plan.archive_record_id,
                     "can_execute": plan.can_execute(),
                 }
                 for plan in admin_change_plans
@@ -2539,6 +2654,10 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "summary": result.summary,
                 }
                 for result in admin_executions
+            ],
+            "admin_history_archives": [
+                admin_history_archive_record_status(record)
+                for record in admin_history_archives
             ],
             "host_security_source_reviews": [host_security_source_review_status(review) for review in source_reviews],
             "host_security_ids_review_packages": [
@@ -2857,6 +2976,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archive_plan_parser = subparsers.add_parser("admin-history-archive-plan", help="prepare a read-only archive manifest for inactive admin plans")
     admin_archive_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    archive_admin_history_parser = subparsers.add_parser("archive-admin-history", help="archive inactive admin plans after explicit approval")
+    archive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    archive_admin_history_parser.add_argument("--archived-by", required=True)
+    archive_admin_history_parser.add_argument("--archived-at")
+    archive_admin_history_parser.add_argument("--plan-id", help="archive only one eligible admin plan")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -3193,6 +3317,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-history-archive-plan":
         print(json.dumps(admin_history_archive_plan_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "archive-admin-history":
+        print(json.dumps(archive_admin_history_status(args.store, args.archived_by, args.archived_at, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

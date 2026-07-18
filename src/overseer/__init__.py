@@ -13,6 +13,8 @@ from .admin import (
     AdminCommandStep,
     AdminExecutionResult,
     AdminExecutionStatus,
+    AdminHistoryArchiveRecord,
+    archive_admin_change_plan,
     approve_admin_change_plan,
     audit_event_from_admin_execution,
     authorization_required_status,

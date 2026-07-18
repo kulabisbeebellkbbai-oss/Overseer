@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .admin import AdminChangePlan, AdminExecutionResult
+from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence, HealthTarget
@@ -91,6 +91,11 @@ class SQLiteStore:
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS admin_executions (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_history_archives (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
@@ -272,6 +277,19 @@ class SQLiteStore:
 
     def list_admin_executions(self) -> tuple[AdminExecutionResult, ...]:
         return tuple(_load_dataclass(AdminExecutionResult, payload) for payload in self._list_payloads("admin_executions"))
+
+    def save_admin_history_archive(self, archive: AdminHistoryArchiveRecord) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO admin_history_archives (id, plan_id, payload) VALUES (?, ?, ?)",
+            (archive.id, archive.plan_id, _dump(archive)),
+        )
+        self._connection.commit()
+
+    def load_admin_history_archive(self, archive_id: str) -> AdminHistoryArchiveRecord:
+        return _load_dataclass(AdminHistoryArchiveRecord, self._get_payload("admin_history_archives", archive_id))
+
+    def list_admin_history_archives(self) -> tuple[AdminHistoryArchiveRecord, ...]:
+        return tuple(_load_dataclass(AdminHistoryArchiveRecord, payload) for payload in self._list_payloads("admin_history_archives"))
 
     def save_host_security_source_review(self, review: HostSecuritySourceReview) -> None:
         self._connection.execute(

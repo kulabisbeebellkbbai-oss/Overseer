@@ -25,5 +25,6 @@ The first release should include a working initial slice for every major domain:
 - Approved project summary: `docs/project-summary.md`
 - DS9-inspired agent role map: `docs/agents.md`
 - Initial quality gates: `docs/quality-gates.md`
+- Command and safety model: `docs/command-safety-model.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

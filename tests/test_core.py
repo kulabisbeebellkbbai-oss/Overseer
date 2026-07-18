@@ -105,6 +105,7 @@ from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_executions_status
 from overseer.cli import admin_execution_readiness_status
+from overseer.cli import admin_history_archive_plan_status
 from overseer.cli import admin_history_review_status
 from overseer.cli import admin_summary_status
 from overseer.cli import approve_admin_change_status
@@ -830,6 +831,7 @@ class HealthSummaryTests(unittest.TestCase):
             )
 
             status = admin_history_review_status(store_path)
+            archive_plan = admin_history_archive_plan_status(store_path)
 
         completed_item = next(item for item in status["items"] if item["id"] == "admin.restart.completed")
         canceled_item = next(item for item in status["items"] if item["id"] == "admin.restart.canceled")
@@ -841,6 +843,14 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(completed_item["disposition"], "archive_completed")
         self.assertTrue(canceled_item["archive_candidate"])
         self.assertEqual(active_item["disposition"], "retain_active")
+        completed_bundle = next(item for item in archive_plan["items"] if item["id"] == "admin.restart.completed")
+        self.assertEqual(archive_plan["mode"], "read_only_plan")
+        self.assertFalse(archive_plan["mutation_performed"])
+        self.assertTrue(archive_plan["approval_required_before_archive"])
+        self.assertEqual(archive_plan["planned_bundles"], 2)
+        self.assertEqual(completed_bundle["records"]["admin_change_plan"], 1)
+        self.assertEqual(completed_bundle["records"]["admin_executions"], 1)
+        self.assertEqual(completed_bundle["action"], "export_then_mark_archived")
 
     def test_usage_summary_reports_capacity_and_reset_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2286,6 +2296,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 executions = client.admin_executions()
                 readiness = client.admin_execution_readiness()
                 history = client.admin_history_review()
+                archive_plan = client.admin_history_archive_plan()
                 summary = client.admin_summary()
                 state = client.state()
 
@@ -2293,6 +2304,7 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(executions["execution_count"], 1)
             self.assertEqual(readiness["items"][0]["readiness_state"], "approval_required")
             self.assertEqual(history["items"][0]["disposition"], "retain_active")
+            self.assertEqual(archive_plan["planned_bundles"], 0)
             self.assertEqual(summary["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
             self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)

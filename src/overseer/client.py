@@ -155,6 +155,9 @@ class OverseerApiClient:
     def admin_history_review(self) -> dict[str, Any]:
         return self._get("/admin/history-review")
 
+    def admin_history_archive_plan(self) -> dict[str, Any]:
+        return self._get("/admin/history-archive-plan")
+
     def admin_summary(self) -> dict[str, Any]:
         return self._get("/admin/summary")
 

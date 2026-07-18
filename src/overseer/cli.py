@@ -1945,6 +1945,74 @@ def admin_history_review_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def admin_history_archive_plan_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plans = store.list_admin_change_plans()
+        executions = store.list_admin_executions()
+        audit_events = store.list_audit_events()
+        ids_packages = store.list_host_security_ids_review_packages()
+        history = _admin_history_review_payload(
+            store.path,
+            plans,
+            {result.plan_id: result for result in executions},
+        )
+        plans_by_id = {plan.id: plan for plan in plans}
+        candidate_items = [item for item in history["items"] if item["archive_candidate"]]
+        return {
+            "store": str(store.path),
+            "mode": "read_only_plan",
+            "mutation_performed": False,
+            "approval_required_before_archive": True,
+            "archive_candidates": history["archive_candidates"],
+            "planned_bundles": len(candidate_items),
+            "items": [
+                admin_history_archive_plan_item_status(
+                    plans_by_id[str(item["id"])],
+                    item,
+                    [result for result in executions if result.plan_id == item["id"]],
+                    [package for package in ids_packages if package.plan_id == item["id"]],
+                    [
+                        event
+                        for event in audit_events
+                        if event.subject_id == item["id"] or item["id"] in event.evidence_ids
+                    ],
+                )
+                for item in candidate_items
+            ],
+        }
+    finally:
+        store.close()
+
+
+def admin_history_archive_plan_item_status(
+    plan: AdminChangePlan,
+    review_item: dict[str, object],
+    executions: Sequence[AdminExecutionResult],
+    ids_packages: Sequence[HostSecurityIDSReviewPackage],
+    audit_events: Sequence[AuditEvent],
+) -> dict[str, object]:
+    return {
+        "id": plan.id,
+        "archive_bundle_id": f"admin.archive.{plan.id}",
+        "disposition": review_item["disposition"],
+        "reason": review_item["reason"],
+        "action": "export_then_mark_archived",
+        "mutation_required_for_archive": True,
+        "safety_gate": "explicit approval required before any archive mutation",
+        "records": {
+            "admin_change_plan": 1,
+            "admin_executions": len(executions),
+            "ids_review_packages": len(ids_packages),
+            "audit_events": len(audit_events),
+        },
+        "plan": admin_change_plan_status(plan),
+        "executions": [admin_execution_status(result) for result in executions],
+        "ids_review_packages": [host_security_ids_review_package_status(package) for package in ids_packages],
+        "audit_events": [audit_event_status(event) for event in audit_events],
+    }
+
+
 def _admin_history_review_payload(
     store_path: Path,
     plans: Sequence[AdminChangePlan],
@@ -2787,6 +2855,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_history_parser = subparsers.add_parser("admin-history-review", help="review inactive admin plans for future archiving")
     admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_archive_plan_parser = subparsers.add_parser("admin-history-archive-plan", help="prepare a read-only archive manifest for inactive admin plans")
+    admin_archive_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -3119,6 +3189,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-history-review":
         print(json.dumps(admin_history_review_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-history-archive-plan":
+        print(json.dumps(admin_history_archive_plan_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

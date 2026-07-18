@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "overseer-local"
+version = "0.1.0"
+description = "Local resource manager for service health, asset checkout, maintenance, security, and usage-limit coordination."
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.scripts]
+overseer = "overseer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

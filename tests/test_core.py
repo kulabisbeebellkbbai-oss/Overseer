@@ -41,6 +41,7 @@ from overseer import (
     recommend_security_response,
     schedule_limited_work,
 )
+from overseer.cli import demo_status
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -625,6 +626,15 @@ class ResourceRegistryTests(unittest.TestCase):
         self.assertEqual(record.decision.outcome, ConflictOutcome.ESCALATE)
         self.assertEqual(record.claim.status, ClaimStatus.REQUESTED)
         self.assertEqual(record.decision.approval_level, ApprovalLevel.SISKO)
+
+
+class CliDemoTests(unittest.TestCase):
+    def test_demo_status_reports_approval_gated_gateway_claim(self):
+        status = demo_status()
+
+        self.assertEqual(status["resources"], ["gateway.protected"])
+        self.assertEqual(status["decision"], ConflictOutcome.ESCALATE.value)
+        self.assertEqual(status["approval"], ApprovalLevel.SISKO.value)
 
 
 if __name__ == "__main__":

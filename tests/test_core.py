@@ -46,6 +46,7 @@ from overseer import (
     SecuritySignalType,
     SecurityStatus,
     SQLiteStore,
+    ScheduledWorkStatus,
     UsageLimit,
     approval_from_decision,
     assess_maintenance_readiness,
@@ -54,7 +55,9 @@ from overseer import (
     needs_operator_approval,
     physical_identity_conflicts,
     recommend_security_response,
+    schedule_maintenance_window,
     schedule_limited_work,
+    schedule_usage_limited_work,
 )
 from overseer.cli import demo_status
 from overseer.cli import persisted_demo_status
@@ -620,6 +623,67 @@ class UsageLimitScheduleTests(unittest.TestCase):
 
         self.assertEqual(schedule.decision, LimitDecision.ESCALATE)
         self.assertEqual(schedule.approval_level, ApprovalLevel.SISKO)
+
+
+class LocalSchedulerTests(unittest.TestCase):
+    def test_schedules_usage_limited_work_until_reset(self):
+        work = schedule_usage_limited_work(
+            UsageLimit(
+                id="limit.ai",
+                resource_id="svc.ai",
+                kind=LimitKind.TOKENS,
+                capacity=100,
+                remaining=0,
+                resets_at="2026-07-18T14:00:00-04:00",
+                window="hourly",
+            ),
+            LimitedWorkRequest(
+                id="work.ai",
+                resource_id="svc.ai",
+                owner_thread="thread-ai",
+                requested_units=10,
+                intent="continue generation",
+            ),
+        )
+
+        self.assertEqual(work.status, ScheduledWorkStatus.WAITING)
+        self.assertEqual(work.scheduled_for, "2026-07-18T14:00:00-04:00")
+
+    def test_blocks_overlapping_exclusive_maintenance_window(self):
+        active = MaintenancePlan(
+            id="maint.active",
+            resource_id="gateway.protected",
+            kind=MaintenanceKind.PATCH,
+            requested_state="1.0.1",
+            risk_level=RiskLevel.MEDIUM,
+            window=MaintenanceWindow(
+                id="window.active",
+                starts_at="2026-07-18T13:00:00-04:00",
+                ends_at="2026-07-18T13:30:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.EXCLUSIVE_WINDOW_REQUIRED,
+            precheck_ids=("health.before",),
+            rollback_plan="restore snapshot",
+        )
+        requested = MaintenancePlan(
+            id="maint.requested",
+            resource_id="gateway.protected",
+            kind=MaintenanceKind.RESTART,
+            requested_state="restarted",
+            risk_level=RiskLevel.LOW,
+            window=MaintenanceWindow(
+                id="window.requested",
+                starts_at="2026-07-18T13:15:00-04:00",
+                ends_at="2026-07-18T13:45:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.EXCLUSIVE_WINDOW_REQUIRED,
+            precheck_ids=("health.before",),
+        )
+
+        work = schedule_maintenance_window(requested, (active,))
+
+        self.assertEqual(work.status, ScheduledWorkStatus.WAITING)
+        self.assertEqual(work.blocking_ids, ("maint.active",))
 
 
 class ResourceRegistryTests(unittest.TestCase):

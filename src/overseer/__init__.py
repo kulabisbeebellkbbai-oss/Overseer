@@ -52,6 +52,14 @@ from .security import (
     recommend_security_response,
 )
 from .service import CoordinationResult, OverseerCoordinator, needs_operator_approval
+from .scheduler import (
+    ScheduledWork,
+    ScheduledWorkStatus,
+    maintenance_window_conflicts,
+    next_ready_work,
+    schedule_maintenance_window,
+    schedule_usage_limited_work,
+)
 from .store import SQLiteStore
 from .usage_limits import (
     LimitDecision,
@@ -118,6 +126,12 @@ __all__ = [
     "CoordinationResult",
     "OverseerCoordinator",
     "needs_operator_approval",
+    "ScheduledWork",
+    "ScheduledWorkStatus",
+    "maintenance_window_conflicts",
+    "next_ready_work",
+    "schedule_maintenance_window",
+    "schedule_usage_limited_work",
     "SQLiteStore",
     "LimitDecision",
     "LimitKind",

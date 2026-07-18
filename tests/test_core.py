@@ -1377,6 +1377,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tick.health_targets, 1)
             self.assertEqual(tick.health_evidence, 0)
             self.assertEqual(tick.runtime_heartbeats, 1)
+            self.assertEqual(tick.health_probes, 0)
             store.close()
 
     def test_run_status_reports_explicit_store_counts(self):
@@ -1402,6 +1403,44 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["health_evidence"], 0)
             self.assertEqual(status["physical_identities"], 0)
             self.assertEqual(status["runtime_heartbeats"], 1)
+            self.assertEqual(status["health_probes"], 0)
+
+    def test_runtime_can_probe_configured_health_targets_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            seed_store_from_config(
+                config_from_mapping(
+                    {
+                        "resources": [
+                            {
+                                "id": "svc.runtime.probe",
+                                "name": "Runtime Probe Service",
+                                "type": "service",
+                                "owner_domain": "julian",
+                                "risk_level": "low",
+                            }
+                        ],
+                        "health_targets": [
+                            {
+                                "id": "health.runtime.probe",
+                                "resource_id": "svc.runtime.probe",
+                                "name": "Runtime Probe Health",
+                                "probe_type": "json",
+                                "target": server.url,
+                                "expected_content_type": "application/json",
+                            }
+                        ],
+                    }
+                ),
+                store,
+            )
+
+            tick = OverseerRuntime(store, probe_health_targets=True).run(once=True)
+
+            self.assertEqual(tick.health_probes, 1)
+            self.assertEqual(tick.health_evidence, 1)
+            self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
+            store.close()
 
     def test_runtime_tick_persists_service_heartbeat(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from .adapters import HealthProbeAdapter
+from .live_health import HttpHealthProbeAdapter
 from .runtime_state import RuntimeHeartbeat
 from .store import SQLiteStore
 
@@ -19,17 +21,27 @@ class RuntimeTick:
     health_evidence: int
     physical_identities: int
     runtime_heartbeats: int
+    health_probes: int
 
 
 class OverseerRuntime:
-    def __init__(self, store: SQLiteStore, service_name: str = "overseer") -> None:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        service_name: str = "overseer",
+        probe_health_targets: bool = False,
+        health_probe_adapter: HealthProbeAdapter | None = None,
+    ) -> None:
         self.store = store
         self.service_name = service_name
+        self.probe_health_targets = probe_health_targets
+        self.health_probe_adapter = health_probe_adapter or HttpHealthProbeAdapter()
         self.started_at = _utc_now()
         self.tick_count = 0
 
     def tick(self) -> RuntimeTick:
         self.tick_count += 1
+        health_probes = self._probe_health_targets()
         self.store.save_runtime_heartbeat(
             RuntimeHeartbeat(
                 id=self.service_name,
@@ -47,6 +59,7 @@ class OverseerRuntime:
             health_evidence=len(self.store.list_health_evidence()),
             physical_identities=len(self.store.list_physical_identities()),
             runtime_heartbeats=len(self.store.list_runtime_heartbeats()),
+            health_probes=health_probes,
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:
@@ -56,6 +69,14 @@ class OverseerRuntime:
         while True:
             time.sleep(interval_seconds)
             last_tick = self.tick()
+
+    def _probe_health_targets(self) -> int:
+        if not self.probe_health_targets:
+            return 0
+        targets = self.store.list_health_targets()
+        for target in targets:
+            self.store.save_health_evidence(self.health_probe_adapter.probe(target))
+        return len(targets)
 
 
 def _utc_now() -> str:

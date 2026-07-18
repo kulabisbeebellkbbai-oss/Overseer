@@ -218,10 +218,20 @@ def discover_physical_status(roots: Sequence[str], store_path: str | Path | None
     return status
 
 
-def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.0) -> dict[str, object]:
+def run_status(
+    store_path: str | Path,
+    once: bool,
+    interval_seconds: float = 30.0,
+    probe_health_targets: bool = False,
+    health_probe_timeout_seconds: float = 5.0,
+) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        tick = OverseerRuntime(store).run(interval_seconds=interval_seconds, once=once)
+        tick = OverseerRuntime(
+            store,
+            probe_health_targets=probe_health_targets,
+            health_probe_adapter=HttpHealthProbeAdapter(timeout_seconds=health_probe_timeout_seconds),
+        ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),
             "resources": tick.resources,
@@ -231,6 +241,7 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
             "health_evidence": tick.health_evidence,
             "physical_identities": tick.physical_identities,
             "runtime_heartbeats": tick.runtime_heartbeats,
+            "health_probes": tick.health_probes,
         }
     finally:
         store.close()
@@ -460,6 +471,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
     run_parser.add_argument("--interval-seconds", type=float, default=30.0)
+    run_parser.add_argument("--probe-health-targets", action="store_true", help="probe configured health targets on each tick")
+    run_parser.add_argument("--health-probe-timeout-seconds", type=float, default=5.0)
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
@@ -526,7 +539,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
-        print(json.dumps(run_status(args.store, args.once, args.interval_seconds), sort_keys=True))
+        print(
+            json.dumps(
+                run_status(
+                    args.store,
+                    args.once,
+                    args.interval_seconds,
+                    args.probe_health_targets,
+                    args.health_probe_timeout_seconds,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "list-state":

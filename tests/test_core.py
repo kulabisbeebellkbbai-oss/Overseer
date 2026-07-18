@@ -2470,6 +2470,11 @@ class HostInspectionTests(unittest.TestCase):
             approved = approve_admin_change_status(store_path, block_plan["id"], "sisko")
             auth_after_approval = authorizations_required_status(store_path)
             gated_state = list_state_status(store_path)
+            ids_review_audit_events = [
+                event
+                for event in gated_state["audit_events"]
+                if event["subject_id"] == ids_package["id"]
+            ]
 
         self.assertEqual(pending["disposition"], SourceReviewDisposition.NEEDS_REVIEW.value)
         self.assertFalse(pending["can_stage_block_plan"])
@@ -2510,6 +2515,11 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(reviews["by_disposition"][SourceReviewDisposition.HOSTILE.value], 1)
         self.assertEqual(len(state["host_security_source_reviews"]), 2)
         self.assertEqual(len(gated_state["host_security_ids_review_packages"]), 1)
+        self.assertEqual(
+            {event["event_type"] for event in ids_review_audit_events},
+            {AuditEventType.REQUESTED.value, AuditEventType.VERIFIED.value, AuditEventType.APPROVED.value},
+        )
+        self.assertEqual(len(ids_review_audit_events), 4)
 
     def test_host_security_remediation_stages_deny_plan_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

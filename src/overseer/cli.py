@@ -1513,6 +1513,7 @@ def prepare_host_security_ids_review_package_status(
         source_review = store.load_host_security_source_review(source_review_id) if source_review_id else None
         package = build_ids_review_package(plan, source_review, package_id, requested_by, created_at)
         store.save_host_security_ids_review_package(package)
+        store.save_audit_event(_ids_review_audit_event(package, "prepared", AuditEventType.REQUESTED, created_at))
         return {"store": str(store.path), **host_security_ids_review_package_status(package)}
     finally:
         store.close()
@@ -1547,6 +1548,7 @@ def submit_host_security_ids_review_package_status(
         package = store.load_host_security_ids_review_package(package_id)
         submitted = mark_ids_review_package_submitted(package, submitted_by, submitted_at, prompt_path)
         store.save_host_security_ids_review_package(submitted)
+        store.save_audit_event(_ids_review_audit_event(submitted, "submitted", AuditEventType.REQUESTED, submitted_at))
         return {"store": str(store.path), **host_security_ids_review_package_status(submitted)}
     finally:
         store.close()
@@ -1564,6 +1566,7 @@ def export_host_security_ids_review_prompt_status(
         resolved_output_dir = _resolve_store_local_output_dir(store.path, output_dir)
         exported, prompt_path = write_ids_review_prompt_file(package, resolved_output_dir, filename)
         store.save_host_security_ids_review_package(exported)
+        store.save_audit_event(_ids_review_audit_event(exported, "prompt-exported", AuditEventType.VERIFIED))
         return {
             "store": str(store.path),
             "exported_prompt_path": str(prompt_path),
@@ -1592,9 +1595,33 @@ def record_host_security_ids_review_result_status(
             reviewed_at,
         )
         store.save_host_security_ids_review_package(reviewed)
+        event_type = (
+            AuditEventType.APPROVED
+            if IDSReviewPackageStatus(reviewed.status) == IDSReviewPackageStatus.ACCEPTED
+            else AuditEventType.REJECTED
+        )
+        store.save_audit_event(_ids_review_audit_event(reviewed, IDSReviewPackageStatus(reviewed.status).value, event_type, reviewed_at))
         return {"store": str(store.path), **host_security_ids_review_package_status(reviewed)}
     finally:
         store.close()
+
+
+def _ids_review_audit_event(
+    package: HostSecurityIDSReviewPackage,
+    action: str,
+    event_type: AuditEventType,
+    occurred_at: str | None = None,
+) -> AuditEvent:
+    return AuditEvent(
+        id=f"audit.ids-review.{package.id}.{action}",
+        event_type=event_type,
+        owner_domain=OwnerDomain.ODO,
+        subject_id=package.id,
+        summary=f"IDS/firewall review package {action} for admin plan {package.plan_id}",
+        risk_level=RiskLevel.CRITICAL,
+        evidence_ids=(package.plan_id,),
+        occurred_at=occurred_at,
+    )
 
 
 def _resolve_store_local_output_dir(store_path: Path, output_dir: str | Path) -> Path:

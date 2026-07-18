@@ -51,3 +51,5 @@ Every execution attempt also writes an audit event keyed to the admin plan. Comp
 `admin-summary` is the compact operator view for O'Brien and Sisko. It reports plan counts, pending authorizations, executable plans, execution counts by status, pending plan details, and recent admin audit events.
 
 For firewall-affecting plans, `authorizations-required` and `admin-summary` also report the IDS/firewall review gate. The queue distinguishes missing packages, prepared packages that need prompt export, exported prompts that need submission, submitted packages waiting for advisory results, revision-required packages, and accepted advisory results that are ready for human approval.
+
+IDS/firewall review package lifecycle changes also write audit events keyed to the package id. Preparing and submitting a package use `requested`, prompt export uses `verified`, accepted results use `approved`, and revision-required results use `rejected`.

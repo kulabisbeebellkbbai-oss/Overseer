@@ -41,6 +41,7 @@ from overseer import (
     OperationPlanner,
     OverseerConfig,
     OverseerCoordinator,
+    PathPhysicalDiscoveryAdapter,
     ProbeResult,
     ProbeType,
     PhysicalAssetKind,
@@ -68,6 +69,7 @@ from overseer import (
     validate_config,
 )
 from overseer.cli import demo_status
+from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import probe_health_status
 from overseer.cli import seed_config_status
@@ -473,6 +475,29 @@ class PhysicalIdentityTests(unittest.TestCase):
         )
 
         self.assertTrue(identity.has_storage_risk())
+
+
+class PhysicalDiscoveryTests(unittest.TestCase):
+    def test_path_physical_discovery_reads_temp_serial_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "usb-FTDI_RS485_A-if00-port0").touch()
+
+            identities = PathPhysicalDiscoveryAdapter((root,)).discover()
+
+            self.assertEqual(len(identities), 1)
+            self.assertEqual(identities[0].kind, PhysicalAssetKind.SERIAL_PORT)
+            self.assertTrue(identities[0].is_complete_for_exclusive_checkout())
+
+    def test_discover_physical_status_reports_temp_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "usb-Serial_Device-if00-port0").touch()
+
+            status = discover_physical_status((str(root),))
+
+            self.assertEqual(status["count"], 1)
+            self.assertEqual(status["assets"][0]["kind"], PhysicalAssetKind.SERIAL_PORT.value)
 
 
 class MaintenancePlanTests(unittest.TestCase):

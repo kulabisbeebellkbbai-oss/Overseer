@@ -11,6 +11,7 @@ from .config import load_config, seed_store_from_config
 from .core import Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .health import HealthTarget, ProbeType
 from .live_health import HttpHealthProbeAdapter
+from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
 from .service import OverseerCoordinator
 from .store import SQLiteStore
@@ -141,6 +142,22 @@ def probe_health_status(
     }
 
 
+def discover_physical_status(roots: Sequence[str]) -> dict[str, object]:
+    identities = PathPhysicalDiscoveryAdapter(tuple(roots)).discover()
+    return {
+        "count": len(identities),
+        "assets": [
+            {
+                "stable_id": identity.stable_id,
+                "kind": identity.kind.value,
+                "observed_paths": sorted(identity.observed_paths),
+                "complete_for_checkout": identity.is_complete_for_exclusive_checkout(),
+            }
+            for identity in identities
+        ],
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="overseer")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -157,6 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_parser.add_argument("--expected-status", type=int)
     probe_parser.add_argument("--expected-content-type")
     probe_parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
+    discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     args = parser.parse_args(argv)
 
     if args.command == "demo":
@@ -183,6 +202,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "discover-physical":
+        print(json.dumps(discover_physical_status(args.root), sort_keys=True))
         return 0
 
     parser.error(f"unknown command: {args.command}")

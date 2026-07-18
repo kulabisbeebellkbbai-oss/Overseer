@@ -42,6 +42,7 @@ from .maintenance import (
     can_close_maintenance,
 )
 from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_conflicts
+from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
 from .security import (
@@ -121,6 +122,7 @@ __all__ = [
     "PhysicalAssetKind",
     "PhysicalIdentity",
     "physical_identity_conflicts",
+    "PathPhysicalDiscoveryAdapter",
     "OperationPlanner",
     "PlannedOperation",
     "ClaimRecord",

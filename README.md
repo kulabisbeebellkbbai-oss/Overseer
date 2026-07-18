@@ -27,6 +27,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli demo --store state/overseer.sqlite3` - persist the demo decision to an explicit ignored local database path.
 - `PYTHONPATH=src python3 -m overseer.cli seed-config --config config/overseer.json --store state/overseer.sqlite3` - seed explicit JSON config into an ignored local database path.
 - `PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.local --name Local --url http://127.0.0.1:8791/health` - run a read-only health probe against an explicit URL.
+- `PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-id` - read directory entries for physical device paths.
 
 ## Continuous Integration
 
@@ -55,5 +56,6 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Config seeding: `docs/config-seeding.md`
 - Config validation: `docs/config-validation.md`
 - Live health probes: `docs/live-health-probes.md`
+- Physical discovery: `docs/physical-discovery.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

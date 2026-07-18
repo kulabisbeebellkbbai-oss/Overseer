@@ -37,6 +37,7 @@ from .cli import (
     plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
+    record_host_security_ids_review_result_status,
     release_claim_status,
     prepare_host_security_ids_review_package_status,
     request_claim_status,
@@ -44,6 +45,7 @@ from .cli import (
     runtime_status,
     security_summary_status,
     usage_summary_status,
+    submit_host_security_ids_review_package_status,
     virtual_summary_status,
 )
 
@@ -159,6 +161,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/ids-review-packages":
                 self._handle_json(lambda payload: prepare_host_security_ids_review_package_status(store_path, **_host_security_ids_review_package_args(payload)))
+                return
+            if self.path == "/host/security/ids-review-packages/submit":
+                self._handle_json(lambda payload: submit_host_security_ids_review_package_status(store_path, **_submit_host_security_ids_review_package_args(payload)))
+                return
+            if self.path == "/host/security/ids-review-packages/results":
+                self._handle_json(lambda payload: record_host_security_ids_review_result_status(store_path, **_host_security_ids_review_result_args(payload)))
                 return
             if self.path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
@@ -336,6 +344,25 @@ def _host_security_ids_review_package_args(payload: dict[str, Any]) -> dict[str,
         "source_review_id": str(payload["source_review_id"]) if payload.get("source_review_id") else None,
         "requested_by": str(payload.get("requested_by", "odo")),
         "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
+    }
+
+
+def _submit_host_security_ids_review_package_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "package_id": str(payload["package_id"]),
+        "submitted_by": str(payload["submitted_by"]),
+        "submitted_at": str(payload["submitted_at"]) if payload.get("submitted_at") else None,
+        "prompt_path": str(payload["prompt_path"]) if payload.get("prompt_path") else None,
+    }
+
+
+def _host_security_ids_review_result_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "package_id": str(payload["package_id"]),
+        "status": str(payload["status"]),
+        "advisory_result": str(payload["advisory_result"]),
+        "reviewed_by": str(payload["reviewed_by"]),
+        "reviewed_at": str(payload["reviewed_at"]) if payload.get("reviewed_at") else None,
     }
 
 

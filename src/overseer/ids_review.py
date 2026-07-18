@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from enum import StrEnum
 
 from .admin import AdminChangeKind, AdminChangePlan
@@ -46,14 +47,15 @@ class HostSecurityIDSReviewPackage:
     prompt: str
     source_review_id: str | None = None
     created_at: str | None = None
+    submitted_by: str | None = None
+    submitted_at: str | None = None
+    prompt_path: str | None = None
+    reviewed_by: str | None = None
+    reviewed_at: str | None = None
     advisory_result: str | None = None
 
     def satisfies_pre_execution_review_gate(self) -> bool:
-        return self.status in {
-            IDSReviewPackageStatus.PREPARED,
-            IDSReviewPackageStatus.SUBMITTED,
-            IDSReviewPackageStatus.ACCEPTED,
-        }
+        return self.status == IDSReviewPackageStatus.ACCEPTED and bool((self.advisory_result or "").strip())
 
 
 def admin_plan_requires_ids_review(plan: AdminChangePlan) -> bool:
@@ -124,6 +126,50 @@ def build_ids_review_package(
         prompt=prompt,
         source_review_id=source_review.id if source_review is not None else None,
         created_at=created_at,
+    )
+
+
+def mark_ids_review_package_submitted(
+    package: HostSecurityIDSReviewPackage,
+    submitted_by: str,
+    submitted_at: str | None = None,
+    prompt_path: str | None = None,
+) -> HostSecurityIDSReviewPackage:
+    if not submitted_by.strip():
+        raise ValueError("submitted_by is required")
+    if package.status == IDSReviewPackageStatus.ACCEPTED:
+        raise ValueError("accepted IDS review packages cannot be resubmitted")
+    return replace(
+        package,
+        status=IDSReviewPackageStatus.SUBMITTED,
+        submitted_by=submitted_by,
+        submitted_at=submitted_at,
+        prompt_path=prompt_path,
+    )
+
+
+def record_ids_review_package_result(
+    package: HostSecurityIDSReviewPackage,
+    status: IDSReviewPackageStatus,
+    advisory_result: str,
+    reviewed_by: str,
+    reviewed_at: str | None = None,
+) -> HostSecurityIDSReviewPackage:
+    selected_status = IDSReviewPackageStatus(status)
+    if selected_status not in {IDSReviewPackageStatus.ACCEPTED, IDSReviewPackageStatus.REVISION_REQUIRED}:
+        raise ValueError("IDS review result status must be accepted or revision_required")
+    if not advisory_result.strip():
+        raise ValueError("advisory_result is required")
+    if not reviewed_by.strip():
+        raise ValueError("reviewed_by is required")
+    if package.status == IDSReviewPackageStatus.PREPARED:
+        raise ValueError("IDS review package must be submitted before recording a result")
+    return replace(
+        package,
+        status=selected_status,
+        advisory_result=advisory_result,
+        reviewed_by=reviewed_by,
+        reviewed_at=reviewed_at,
     )
 
 

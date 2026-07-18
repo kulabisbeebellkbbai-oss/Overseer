@@ -75,6 +75,8 @@ from .ids_review import (
     IDSReviewPackageStatus,
     admin_plan_requires_ids_review,
     build_ids_review_package,
+    mark_ids_review_package_submitted,
+    record_ids_review_package_result,
 )
 from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
@@ -199,6 +201,8 @@ __all__ = [
     "IDSReviewPackageStatus",
     "admin_plan_requires_ids_review",
     "build_ids_review_package",
+    "mark_ids_review_package_submitted",
+    "record_ids_review_package_result",
     "HttpHealthProbeAdapter",
     "InterruptionPolicy",
     "MaintenanceKind",

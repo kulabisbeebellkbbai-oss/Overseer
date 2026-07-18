@@ -103,6 +103,12 @@ class OverseerApiClient:
     def prepare_host_security_ids_review_package(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/ids-review-packages", payload)
 
+    def submit_host_security_ids_review_package(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/host/security/ids-review-packages/submit", payload)
+
+    def record_host_security_ids_review_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/host/security/ids-review-packages/results", payload)
+
     def plan_host_security_source_block(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/source-reviews/block-plans", payload)
 

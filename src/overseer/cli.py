@@ -38,6 +38,8 @@ from .ids_review import (
     IDSReviewPackageStatus,
     admin_plan_requires_ids_review,
     build_ids_review_package,
+    mark_ids_review_package_submitted,
+    record_ids_review_package_result,
 )
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity
@@ -1471,6 +1473,11 @@ def host_security_ids_review_package_status(package: HostSecurityIDSReviewPackag
         "status": IDSReviewPackageStatus(package.status).value,
         "source_review_id": package.source_review_id,
         "created_at": package.created_at,
+        "submitted_by": package.submitted_by,
+        "submitted_at": package.submitted_at,
+        "prompt_path": package.prompt_path,
+        "reviewed_by": package.reviewed_by,
+        "reviewed_at": package.reviewed_at,
         "advisory_project_path": package.advisory_project_path,
         "advisory_command": list(package.advisory_command),
         "interactive_thread": package.interactive_thread,
@@ -1523,6 +1530,47 @@ def host_security_ids_review_packages_status(store_path: str | Path) -> dict[str
             },
             "packages": [host_security_ids_review_package_status(package) for package in packages],
         }
+    finally:
+        store.close()
+
+
+def submit_host_security_ids_review_package_status(
+    store_path: str | Path,
+    package_id: str,
+    submitted_by: str,
+    submitted_at: str | None = None,
+    prompt_path: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        package = store.load_host_security_ids_review_package(package_id)
+        submitted = mark_ids_review_package_submitted(package, submitted_by, submitted_at, prompt_path)
+        store.save_host_security_ids_review_package(submitted)
+        return {"store": str(store.path), **host_security_ids_review_package_status(submitted)}
+    finally:
+        store.close()
+
+
+def record_host_security_ids_review_result_status(
+    store_path: str | Path,
+    package_id: str,
+    status: str,
+    advisory_result: str,
+    reviewed_by: str,
+    reviewed_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        package = store.load_host_security_ids_review_package(package_id)
+        reviewed = record_ids_review_package_result(
+            package,
+            IDSReviewPackageStatus(status),
+            advisory_result,
+            reviewed_by,
+            reviewed_at,
+        )
+        store.save_host_security_ids_review_package(reviewed)
+        return {"store": str(store.path), **host_security_ids_review_package_status(reviewed)}
     finally:
         store.close()
 
@@ -2191,6 +2239,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare_ids_review_parser.add_argument("--source-review-id")
     prepare_ids_review_parser.add_argument("--requested-by", default="odo")
     prepare_ids_review_parser.add_argument("--created-at")
+    submit_ids_review_parser = subparsers.add_parser(
+        "submit-host-security-ids-review-package",
+        help="record that an IDS/firewall review package was handed off for advisory review",
+    )
+    submit_ids_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    submit_ids_review_parser.add_argument("--package-id", required=True)
+    submit_ids_review_parser.add_argument("--submitted-by", required=True)
+    submit_ids_review_parser.add_argument("--submitted-at")
+    submit_ids_review_parser.add_argument("--prompt-path")
+    record_ids_review_parser = subparsers.add_parser(
+        "record-host-security-ids-review-result",
+        help="record the manual Intrusion Detection advisory result for a package",
+    )
+    record_ids_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_ids_review_parser.add_argument("--package-id", required=True)
+    record_ids_review_parser.add_argument(
+        "--status",
+        required=True,
+        choices=[IDSReviewPackageStatus.ACCEPTED.value, IDSReviewPackageStatus.REVISION_REQUIRED.value],
+    )
+    record_ids_review_parser.add_argument("--advisory-result", required=True)
+    record_ids_review_parser.add_argument("--reviewed-by", required=True)
+    record_ids_review_parser.add_argument("--reviewed-at")
     host_remediation_parser = subparsers.add_parser(
         "plan-host-security-remediation",
         help="stage an approval-gated host security remediation plan",
@@ -2434,6 +2505,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.source_review_id,
                     args.requested_by,
                     args.created_at,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "submit-host-security-ids-review-package":
+        print(
+            json.dumps(
+                submit_host_security_ids_review_package_status(
+                    args.store,
+                    args.package_id,
+                    args.submitted_by,
+                    args.submitted_at,
+                    args.prompt_path,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "record-host-security-ids-review-result":
+        print(
+            json.dumps(
+                record_host_security_ids_review_result_status(
+                    args.store,
+                    args.package_id,
+                    args.status,
+                    args.advisory_result,
+                    args.reviewed_by,
+                    args.reviewed_at,
                 ),
                 sort_keys=True,
             )

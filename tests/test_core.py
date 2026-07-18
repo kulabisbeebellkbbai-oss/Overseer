@@ -126,6 +126,7 @@ from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
 from overseer.cli import prepare_host_security_ids_review_package_status
 from overseer.cli import host_security_ids_review_packages_status
+from overseer.cli import record_host_security_ids_review_result_status
 from overseer.cli import plan_host_security_source_block_status
 from overseer.cli import plan_host_security_remediation_status
 from overseer.cli import plan_admin_change_status
@@ -136,6 +137,7 @@ from overseer.cli import request_claim_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
 from overseer.cli import security_summary_status
+from overseer.cli import submit_host_security_ids_review_package_status
 from overseer.cli import service_status
 from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
@@ -1820,6 +1822,25 @@ class OverseerApiClientTests(unittest.TestCase):
                 ids_package = client.prepare_host_security_ids_review_package(
                     {"plan_id": block_plan["id"], "source_review_id": hostile["id"]}
                 )
+                with self.assertRaises(HTTPError):
+                    client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                submitted = client.submit_host_security_ids_review_package(
+                    {
+                        "package_id": ids_package["id"],
+                        "submitted_by": "odo",
+                        "prompt_path": "state/advisories/ids-review.prompt.md",
+                    }
+                )
+                with self.assertRaises(HTTPError):
+                    client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                advisory_result = client.record_host_security_ids_review_result(
+                    {
+                        "package_id": ids_package["id"],
+                        "status": "accepted",
+                        "advisory_result": "approved staged source block package",
+                        "reviewed_by": "odo",
+                    }
+                )
                 approved = client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
                 packages = client.host_security_ids_review_packages()
                 reviews = client.host_security_source_reviews()
@@ -1832,6 +1853,10 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertFalse(block_plan["can_execute"])
             self.assertEqual(ids_package["plan_id"], block_plan["id"])
             self.assertIn("Intrusion Detection", ids_package["prompt"])
+            self.assertEqual(submitted["status"], "submitted")
+            self.assertEqual(submitted["prompt_path"], "state/advisories/ids-review.prompt.md")
+            self.assertEqual(advisory_result["status"], "accepted")
+            self.assertTrue(advisory_result["satisfies_pre_execution_review_gate"])
             self.assertTrue(approved["approved"])
             self.assertEqual(packages["package_count"], 1)
             self.assertEqual(reviews["review_count"], 2)
@@ -2403,6 +2428,25 @@ class HostInspectionTests(unittest.TestCase):
                 requested_by="odo",
                 created_at="2026-07-18T16:09:00+00:00",
             )
+            with self.assertRaises(ValueError):
+                approve_admin_change_status(store_path, block_plan["id"], "sisko")
+            submitted = submit_host_security_ids_review_package_status(
+                store_path,
+                ids_package["id"],
+                "odo",
+                submitted_at="2026-07-18T16:10:00+00:00",
+                prompt_path="state/advisories/ids-review.prompt.md",
+            )
+            with self.assertRaises(ValueError):
+                approve_admin_change_status(store_path, block_plan["id"], "sisko")
+            advisory_result = record_host_security_ids_review_result_status(
+                store_path,
+                ids_package["id"],
+                "accepted",
+                "approved staged source block package",
+                "odo",
+                reviewed_at="2026-07-18T16:11:00+00:00",
+            )
             ids_packages = host_security_ids_review_packages_status(store_path)
             approved = approve_admin_change_status(store_path, block_plan["id"], "sisko")
             gated_state = list_state_status(store_path)
@@ -2422,6 +2466,12 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(ids_package["status"], "prepared")
         self.assertIn("codex-advisor.sh", ids_package["advisory_command"][0])
         self.assertIn("custom firewall or IDS rules", ids_package["prompt"])
+        self.assertFalse(ids_package["satisfies_pre_execution_review_gate"])
+        self.assertEqual(submitted["status"], "submitted")
+        self.assertFalse(submitted["satisfies_pre_execution_review_gate"])
+        self.assertEqual(advisory_result["status"], "accepted")
+        self.assertEqual(advisory_result["reviewed_by"], "odo")
+        self.assertTrue(advisory_result["satisfies_pre_execution_review_gate"])
         self.assertEqual(ids_packages["package_count"], 1)
         self.assertTrue(approved["approved"])
         self.assertEqual(reviews["review_count"], 2)

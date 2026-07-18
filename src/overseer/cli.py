@@ -11,7 +11,7 @@ from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEventType
-from .health import HealthStatus, HealthTarget, ProbeType
+from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
@@ -264,6 +264,40 @@ def service_status(store_path: str | Path, service_name: str = "overseer") -> di
         store.close()
 
 
+def health_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        summaries = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
+        unhealthy = [
+            summary
+            for summary in summaries
+            if summary.latest_status in {HealthStatus.DEGRADED, HealthStatus.FAILED, HealthStatus.UNKNOWN}
+        ]
+        return {
+            "store": str(store.path),
+            "targets": len(summaries),
+            "healthy": sum(1 for summary in summaries if summary.latest_status == HealthStatus.HEALTHY),
+            "unhealthy": len(unhealthy),
+            "summaries": [
+                {
+                    "target_id": summary.target_id,
+                    "resource_id": summary.resource_id,
+                    "name": summary.name,
+                    "target": summary.target,
+                    "status": summary.latest_status.value,
+                    "owner_domain": summary.owner_domain.value,
+                    "latest_evidence_id": summary.latest_evidence_id,
+                    "latest_captured_at": summary.latest_captured_at,
+                    "recovery_required": summary.recovery_required,
+                    "error": summary.error,
+                }
+                for summary in summaries
+            ],
+        }
+    finally:
+        store.close()
+
+
 def list_state_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -508,6 +542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
     service_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser.add_argument("--service-name", default="overseer")
+    health_summary_parser = subparsers.add_parser("health-summary", help="summarize latest health evidence per target")
+    health_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
     claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser.add_argument("--claim-id", required=True)
@@ -590,6 +626,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "service-status":
         print(json.dumps(service_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "health-summary":
+        print(json.dumps(health_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "request-claim":

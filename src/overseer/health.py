@@ -66,6 +66,61 @@ class HealthEvidence:
     captured_at: str | None = None
 
 
+@dataclass(frozen=True)
+class HealthTargetSummary:
+    target_id: str
+    resource_id: str
+    name: str
+    target: str
+    latest_status: HealthStatus
+    owner_domain: OwnerDomain
+    latest_evidence_id: str | None = None
+    latest_captured_at: str | None = None
+    recovery_required: bool = False
+    error: str = ""
+
+
+def summarize_health_targets(
+    targets: tuple[HealthTarget, ...],
+    evidence_items: tuple[HealthEvidence, ...],
+) -> tuple[HealthTargetSummary, ...]:
+    evidence_by_key: dict[tuple[str, str], list[HealthEvidence]] = {}
+    for evidence in evidence_items:
+        evidence_by_key.setdefault((evidence.resource_id, evidence.target), []).append(evidence)
+    summaries: list[HealthTargetSummary] = []
+    for target in targets:
+        latest = _latest_evidence(evidence_by_key.get((target.resource_id, target.target), []))
+        if latest is None:
+            summaries.append(
+                HealthTargetSummary(
+                    target_id=target.id,
+                    resource_id=target.resource_id,
+                    name=target.name,
+                    target=target.target,
+                    latest_status=HealthStatus.UNKNOWN,
+                    owner_domain=target.owner_domain,
+                    recovery_required=True,
+                    error="missing health evidence",
+                )
+            )
+            continue
+        summaries.append(
+            HealthTargetSummary(
+                target_id=target.id,
+                resource_id=target.resource_id,
+                name=target.name,
+                target=target.target,
+                latest_status=HealthStatus(latest.observed_status),
+                owner_domain=OwnerDomain(latest.owner_domain),
+                latest_evidence_id=latest.id,
+                latest_captured_at=latest.captured_at,
+                recovery_required=latest.recovery_required,
+                error=latest.observed_error,
+            )
+        )
+    return tuple(summaries)
+
+
 def classify_probe(target: HealthTarget, result: ProbeResult | None) -> HealthEvidence:
     if result is None:
         return _evidence(target, HealthStatus.UNKNOWN, "missing probe result", True)
@@ -155,3 +210,9 @@ def _owner_for_status(target: HealthTarget, status: HealthStatus, error: str) ->
     if status in {HealthStatus.FAILED, HealthStatus.DEGRADED, HealthStatus.UNKNOWN}:
         return target.owner_domain
     return target.owner_domain
+
+
+def _latest_evidence(evidence_items: list[HealthEvidence]) -> HealthEvidence | None:
+    if not evidence_items:
+        return None
+    return max(evidence_items, key=lambda item: item.captured_at or item.id)

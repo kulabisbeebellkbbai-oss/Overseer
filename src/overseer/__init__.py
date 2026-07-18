@@ -29,7 +29,17 @@ from .core import (
     RiskLevel,
     decide_claim,
 )
-from .health import HealthEvidence, HealthStatus, HealthTarget, ProbeResult, ProbeType, classify_probe, recovery_evidence
+from .health import (
+    HealthEvidence,
+    HealthStatus,
+    HealthTarget,
+    HealthTargetSummary,
+    ProbeResult,
+    ProbeType,
+    classify_probe,
+    recovery_evidence,
+    summarize_health_targets,
+)
 from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
     InterruptionPolicy,
@@ -108,10 +118,12 @@ __all__ = [
     "HealthEvidence",
     "HealthStatus",
     "HealthTarget",
+    "HealthTargetSummary",
     "ProbeResult",
     "ProbeType",
     "classify_probe",
     "recovery_evidence",
+    "summarize_health_targets",
     "HttpHealthProbeAdapter",
     "InterruptionPolicy",
     "MaintenanceKind",

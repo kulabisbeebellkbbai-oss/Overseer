@@ -29,6 +29,7 @@ from overseer import (
     decide_claim,
     classify_probe,
     recovery_evidence,
+    summarize_health_targets,
     HealthStatus,
     HealthEvidence,
     HealthTarget,
@@ -76,6 +77,7 @@ from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import approve_claim_status
+from overseer.cli import health_summary_status
 from overseer.cli import list_state_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
@@ -513,6 +515,67 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
+
+
+class HealthSummaryTests(unittest.TestCase):
+    def test_summarizes_missing_evidence_as_unknown(self):
+        target = HealthTarget(
+            id="health.missing",
+            resource_id="svc.missing",
+            name="Missing",
+            probe_type=ProbeType.JSON,
+            target="http://127.0.0.1:1/health",
+        )
+
+        summary = summarize_health_targets((target,), ())[0]
+
+        self.assertEqual(summary.latest_status, HealthStatus.UNKNOWN)
+        self.assertTrue(summary.recovery_required)
+
+    def test_health_summary_status_reports_latest_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.summary",
+                    resource_id="svc.summary",
+                    name="Summary Health",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8787/health",
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.old",
+                    resource_id="svc.summary",
+                    target="http://127.0.0.1:8787/health",
+                    probe_type=ProbeType.JSON,
+                    observed_status=HealthStatus.FAILED,
+                    owner_domain=OwnerDomain.JULIAN,
+                    recovery_required=True,
+                    captured_at="2026-07-18T13:00:00+00:00",
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.new",
+                    resource_id="svc.summary",
+                    target="http://127.0.0.1:8787/health",
+                    probe_type=ProbeType.JSON,
+                    observed_status=HealthStatus.HEALTHY,
+                    owner_domain=OwnerDomain.JULIAN,
+                    captured_at="2026-07-18T13:01:00+00:00",
+                )
+            )
+            store.close()
+
+            status = health_summary_status(store_path)
+
+            self.assertEqual(status["targets"], 1)
+            self.assertEqual(status["healthy"], 1)
+            self.assertEqual(status["unhealthy"], 0)
+            self.assertEqual(status["summaries"][0]["latest_evidence_id"], "evidence.new")
 
 
 class PhysicalIdentityTests(unittest.TestCase):

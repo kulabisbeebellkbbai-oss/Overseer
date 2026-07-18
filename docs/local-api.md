@@ -39,6 +39,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security/sources`
 - `GET /host/security/source-reviews`
 - `GET /host/security/ids-review-packages`
+- `GET /host/security/ids-review-summary`
 - `GET /admin/authorizations-required`
 - `GET /admin/executions`
 - `GET /admin/summary`
@@ -87,6 +88,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /host/security/source-reviews` records Odo's review of a correlated source. It does not stage a block plan or change firewall policy.
 `POST /host/security/source-reviews/block-plans` stages an Odo-owned, human-approval source block plan from a reviewed hostile source. It records the plan only; firewall and IDS enforcement remain blocked until separate approval and Intrusion Detection advisory review.
 `GET /host/security/ids-review-packages` lists prepared Intrusion Detection advisory packages and prompts tied to security admin plans.
+`GET /host/security/ids-review-summary` returns compact IDS/firewall review gate counters, package next steps, and latest Odo audit events without full prompts or advisory text.
 `POST /host/security/ids-review-packages` prepares the review package required before firewall or source-block plans can be approved. It does not run the advisor or apply policy.
 `POST /host/security/ids-review-packages/submit` records manual handoff metadata for an IDS/firewall review package. It does not execute the advisor.
 `POST /host/security/ids-review-packages/prompts` writes the advisory prompt under the store directory and records the prompt path. It does not execute the advisor.

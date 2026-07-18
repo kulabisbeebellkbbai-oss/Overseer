@@ -29,6 +29,7 @@ from .cli import (
     health_summary_status,
     host_security_findings_status,
     host_security_ids_review_packages_status,
+    host_security_ids_review_summary_status,
     host_security_sources_status,
     host_security_source_reviews_status,
     host_security_triage_status,
@@ -125,6 +126,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/host/security/ids-review-packages":
                 self._handle(lambda: host_security_ids_review_packages_status(store_path))
+                return
+            if path == "/host/security/ids-review-summary":
+                self._handle(lambda: host_security_ids_review_summary_status(store_path))
                 return
             if path == "/admin/authorizations-required":
                 self._handle(lambda: authorizations_required_status(store_path))

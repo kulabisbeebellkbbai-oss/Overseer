@@ -1536,6 +1536,84 @@ def host_security_ids_review_packages_status(store_path: str | Path) -> dict[str
         store.close()
 
 
+def host_security_ids_review_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        packages = store.list_host_security_ids_review_packages()
+        audit_events = [
+            event
+            for event in store.list_audit_events()
+            if event.id.startswith("audit.ids-review.") or event.subject_id.startswith("ids-review.")
+        ]
+        return {
+            "store": str(store.path),
+            "package_count": len(packages),
+            "by_status": {
+                status.value: sum(1 for package in packages if package.status == status)
+                for status in IDSReviewPackageStatus
+            },
+            "gate_satisfied": sum(1 for package in packages if package.satisfies_pre_execution_review_gate()),
+            "gate_blocked": sum(1 for package in packages if not package.satisfies_pre_execution_review_gate()),
+            "prepared_without_prompt": sum(
+                1
+                for package in packages
+                if package.status == IDSReviewPackageStatus.PREPARED and not package.prompt_path
+            ),
+            "prepared_with_prompt": sum(
+                1
+                for package in packages
+                if package.status == IDSReviewPackageStatus.PREPARED and package.prompt_path
+            ),
+            "submitted_without_result": sum(
+                1
+                for package in packages
+                if package.status == IDSReviewPackageStatus.SUBMITTED and not package.advisory_result
+            ),
+            "revision_required": sum(
+                1
+                for package in packages
+                if package.status == IDSReviewPackageStatus.REVISION_REQUIRED
+            ),
+            "latest_audit_events": [audit_event_status(event) for event in audit_events[:5]],
+            "packages": [_host_security_ids_review_package_summary_status(package) for package in packages],
+        }
+    finally:
+        store.close()
+
+
+def _host_security_ids_review_package_summary_status(package: HostSecurityIDSReviewPackage) -> dict[str, object]:
+    return {
+        "id": package.id,
+        "plan_id": package.plan_id,
+        "plan_kind": AdminChangeKind(package.plan_kind).value,
+        "target": package.target,
+        "status": IDSReviewPackageStatus(package.status).value,
+        "source_review_id": package.source_review_id,
+        "created_at": package.created_at,
+        "submitted_by": package.submitted_by,
+        "submitted_at": package.submitted_at,
+        "prompt_path": package.prompt_path,
+        "reviewed_by": package.reviewed_by,
+        "reviewed_at": package.reviewed_at,
+        "advisory_result_present": bool(package.advisory_result),
+        "satisfies_pre_execution_review_gate": package.satisfies_pre_execution_review_gate(),
+        "next_step": _ids_review_package_next_step(package),
+    }
+
+
+def _ids_review_package_next_step(package: HostSecurityIDSReviewPackage) -> str:
+    status = IDSReviewPackageStatus(package.status)
+    if package.satisfies_pre_execution_review_gate():
+        return "IDS/firewall advisory accepted; human approval may proceed"
+    if status == IDSReviewPackageStatus.REVISION_REQUIRED:
+        return "revision required by Intrusion Detection; update the package or plan before approval"
+    if status == IDSReviewPackageStatus.SUBMITTED:
+        return "await Intrusion Detection advisory result before approval"
+    if status == IDSReviewPackageStatus.PREPARED and package.prompt_path:
+        return "submit IDS/firewall review package with exported prompt before approval"
+    return "export IDS/firewall review prompt and submit package before approval"
+
+
 def submit_host_security_ids_review_package_status(
     store_path: str | Path,
     package_id: str,
@@ -2392,6 +2470,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     source_block_parser.add_argument("--reason")
     ids_reviews_parser = subparsers.add_parser("host-security-ids-review-packages", help="list prepared IDS/firewall review packages")
     ids_reviews_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    ids_review_summary_parser = subparsers.add_parser(
+        "host-security-ids-review-summary",
+        help="summarize IDS/firewall review package gate state without full prompts",
+    )
+    ids_review_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     prepare_ids_review_parser = subparsers.add_parser(
         "prepare-host-security-ids-review-package",
         help="prepare an Intrusion Detection advisory package for a staged security admin plan",
@@ -2672,6 +2755,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-ids-review-packages":
         print(json.dumps(host_security_ids_review_packages_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-ids-review-summary":
+        print(json.dumps(host_security_ids_review_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "prepare-host-security-ids-review-package":

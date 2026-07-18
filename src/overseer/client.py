@@ -119,6 +119,9 @@ class OverseerApiClient:
     def host_security_ids_review_packages(self) -> dict[str, Any]:
         return self._get("/host/security/ids-review-packages")
 
+    def host_security_ids_review_summary(self) -> dict[str, Any]:
+        return self._get("/host/security/ids-review-summary")
+
     def prepare_host_security_ids_review_package(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/ids-review-packages", payload)
 

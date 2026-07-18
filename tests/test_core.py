@@ -47,6 +47,7 @@ from overseer import (
     HostInspectionAdapter,
     HttpHealthProbeAdapter,
     InterruptionPolicy,
+    IDSReviewPackageStatus,
     LimitDecision,
     LimitKind,
     LimitedWorkRequest,
@@ -128,6 +129,7 @@ from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
 from overseer.cli import prepare_host_security_ids_review_package_status
 from overseer.cli import host_security_ids_review_packages_status
+from overseer.cli import host_security_ids_review_summary_status
 from overseer.cli import record_host_security_ids_review_result_status
 from overseer.cli import plan_host_security_source_block_status
 from overseer.cli import plan_host_security_remediation_status
@@ -1912,6 +1914,7 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
                 approved = client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
                 packages = client.host_security_ids_review_packages()
+                ids_summary = client.host_security_ids_review_summary()
                 reviews = client.host_security_source_reviews()
 
             self.assertEqual(created["remote_address"], "8.8.8.8")
@@ -1930,6 +1933,10 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertTrue(advisory_result["satisfies_pre_execution_review_gate"])
             self.assertTrue(approved["approved"])
             self.assertEqual(packages["package_count"], 1)
+            self.assertEqual(ids_summary["package_count"], 1)
+            self.assertEqual(ids_summary["gate_satisfied"], 1)
+            self.assertTrue(ids_summary["packages"][0]["advisory_result_present"])
+            self.assertNotIn("prompt", ids_summary["packages"][0])
             self.assertEqual(reviews["review_count"], 2)
 
     def test_client_plans_host_security_remediation(self):
@@ -2584,6 +2591,7 @@ class HostInspectionTests(unittest.TestCase):
             )
             auth_advisory_accepted = authorizations_required_status(store_path)
             ids_packages = host_security_ids_review_packages_status(store_path)
+            ids_review_summary = host_security_ids_review_summary_status(store_path)
             approved = approve_admin_change_status(store_path, block_plan["id"], "sisko")
             auth_after_approval = authorizations_required_status(store_path)
             gated_state = list_state_status(store_path)
@@ -2626,6 +2634,15 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(advisory_result["reviewed_by"], "odo")
         self.assertTrue(advisory_result["satisfies_pre_execution_review_gate"])
         self.assertEqual(ids_packages["package_count"], 1)
+        self.assertEqual(ids_review_summary["package_count"], 1)
+        self.assertEqual(ids_review_summary["by_status"][IDSReviewPackageStatus.ACCEPTED.value], 1)
+        self.assertEqual(ids_review_summary["gate_satisfied"], 1)
+        self.assertEqual(ids_review_summary["gate_blocked"], 0)
+        self.assertEqual(ids_review_summary["submitted_without_result"], 0)
+        self.assertEqual(ids_review_summary["packages"][0]["next_step"], "IDS/firewall advisory accepted; human approval may proceed")
+        self.assertTrue(ids_review_summary["packages"][0]["advisory_result_present"])
+        self.assertNotIn("prompt", ids_review_summary["packages"][0])
+        self.assertEqual(ids_review_summary["latest_audit_events"][0]["owner_domain"], OwnerDomain.ODO.value)
         self.assertTrue(approved["approved"])
         self.assertEqual(reviews["review_count"], 2)
         self.assertEqual(reviews["ready_for_block_plan"], 1)

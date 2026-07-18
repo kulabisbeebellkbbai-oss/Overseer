@@ -86,7 +86,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/history-restore-requests` creates the approval request required before an archived plan can be restored.
 `POST /admin/history-archive` marks archive-ready admin plans archived after explicit approval. It preserves the original plan, execution, IDS review, and audit records, persists an archive record, and emits an audit event.
 `POST /admin/history-unarchive` restores one archived admin plan to active admin history after the restore approval is approved. It keeps the archive record and emits an audit event.
-`GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, and recent admin audit events.
+`GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, restore approvals, and recent admin audit events.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
 `GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, admin archive candidates, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.

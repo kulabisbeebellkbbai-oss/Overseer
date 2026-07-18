@@ -741,6 +741,7 @@ def health_failure_status(summary) -> dict[str, object]:
 
 def operator_dashboard_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
     command = command_summary_status(store_path, service_name)
+    admin = admin_summary_status(store_path)
     admin_history = admin_history_review_status(store_path)
     physical = physical_summary_status(store_path)
     virtual = virtual_summary_status(store_path)
@@ -749,7 +750,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
     usage = usage_summary_status(store_path)
     health = health_summary_status(store_path)
     health_efficiency = health_efficiency_summary_status(store_path)
-    attention = operator_dashboard_attention(command, admin_history, physical, virtual, maintenance, security, usage, health_efficiency)
+    attention = operator_dashboard_attention(command, admin, admin_history, physical, virtual, maintenance, security, usage, health_efficiency)
     return {
         "store": command["store"],
         "service_name": service_name,
@@ -762,6 +763,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
                 "blocked_claims": attention["blocked_claims"],
                 "service_freshness": attention["service_freshness"],
                 "admin_archive_candidates": attention["admin_archive_candidates"],
+                "pending_restore_approvals": attention["pending_restore_approvals"],
             },
             "kira": {
                 "assets": physical["assets"],
@@ -799,6 +801,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
         },
         "summaries": {
             "command": command,
+            "admin": admin,
             "admin_history": admin_history,
             "physical": physical,
             "virtual": virtual,
@@ -813,6 +816,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
 
 def operator_dashboard_attention(
     command: dict[str, object],
+    admin_summary: dict[str, object],
     admin_history: dict[str, object],
     physical: dict[str, object],
     virtual: dict[str, object],
@@ -824,6 +828,7 @@ def operator_dashboard_attention(
     service = command["service"]
     claims = command["claims"]
     admin = command["admin"]
+    restore_approvals = admin_summary["restore_approvals"]
     freshness = service["freshness"]
     protective_plans = security["protective_plans"]
     host_security = security["host_security"]
@@ -831,6 +836,7 @@ def operator_dashboard_attention(
     return {
         "service_freshness": freshness["status"],
         "pending_authorizations": admin["pending_authorizations"],
+        "pending_restore_approvals": restore_approvals["pending"],
         "pending_claim_approvals": claims["pending_approvals"],
         "queued_claims": claims["queued"],
         "blocked_claims": claims["blocked"],
@@ -858,6 +864,7 @@ def operator_dashboard_attention(
 def operator_dashboard_overall_status(attention: dict[str, object]) -> str:
     high_keys = (
         "pending_authorizations",
+        "pending_restore_approvals",
         "blocked_claims",
         "unhealthy_health_targets",
         "recovery_required",
@@ -1874,6 +1881,7 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
         plans = store.list_admin_change_plans()
         active_plans = active_admin_change_plans(plans)
         executions = store.list_admin_executions()
+        approvals = store.list_approvals()
         audit_events = [
             event
             for event in store.list_audit_events()
@@ -1890,6 +1898,11 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             {result.plan_id: result for result in executions},
             archived_plans=len(plans) - len(active_plans),
         )
+        restore_approvals = [
+            approval
+            for approval in approvals
+            if approval.id.startswith("approval.admin.restore.")
+        ]
         return {
             "store": str(store.path),
             "plans": len(active_plans),
@@ -1909,6 +1922,16 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                 "active_or_pending": history_review["active_or_pending"],
                 "by_disposition": history_review["by_disposition"],
             },
+            "restore_approvals": {
+                "total": len(restore_approvals),
+                "pending": sum(1 for approval in restore_approvals if approval.status == ApprovalStatus.PENDING),
+                "approved": sum(1 for approval in restore_approvals if approval.status == ApprovalStatus.APPROVED),
+                "by_status": {
+                    status.value: sum(1 for approval in restore_approvals if approval.status == status)
+                    for status in ApprovalStatus
+                },
+                "items": [admin_history_restore_approval_status(approval) for approval in restore_approvals],
+            },
             "pending": [
                 authorization_required_status_with_ids_review(
                     plan,
@@ -1919,6 +1942,21 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
         }
     finally:
         store.close()
+
+
+def admin_history_restore_approval_status(approval: ApprovalRequest) -> dict[str, object]:
+    return {
+        "id": approval.id,
+        "plan_id": approval.subject_id,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+        "requester_thread": approval.requester_thread,
+        "owner_domain": OwnerDomain(approval.owner_domain).value,
+        "reason": approval.reason,
+        "status": ApprovalStatus(approval.status).value,
+        "evidence_required": list(approval.evidence_required),
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+    }
 
 
 def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object]:

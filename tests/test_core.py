@@ -28,6 +28,7 @@ from overseer import (
     AdminCommandResult,
     AdminExecutionResult,
     AdminExecutionStatus,
+    AdminHistoryArchiveRecord,
     OwnerDomain,
     Resource,
     ResourceRegistry,
@@ -855,6 +856,7 @@ class HealthSummaryTests(unittest.TestCase):
                 "sisko",
                 "2026-07-18T22:18:00+00:00",
             )
+            pending_restore_summary = admin_summary_status(store_path)
             restore_approval = approve_claim_status(
                 store_path,
                 restore_request["approval_id"],
@@ -914,8 +916,13 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(filtered_restore_readiness["filters"]["plan_id"], "admin.restart.completed")
         self.assertTrue(restore_request["mutation_performed"])
         self.assertEqual(restore_request["approval_status"], ApprovalStatus.PENDING.value)
+        self.assertEqual(pending_restore_summary["restore_approvals"]["total"], 1)
+        self.assertEqual(pending_restore_summary["restore_approvals"]["pending"], 1)
+        self.assertEqual(pending_restore_summary["restore_approvals"]["items"][0]["plan_id"], "admin.restart.completed")
         self.assertEqual(restore_approval["approval_status"], ApprovalStatus.APPROVED.value)
         self.assertEqual(post_archive_summary["archived_plans"], 1)
+        self.assertEqual(post_archive_summary["restore_approvals"]["pending"], 0)
+        self.assertEqual(post_archive_summary["restore_approvals"]["approved"], 1)
         archived_state_plan = next(item for item in post_archive_state["admin_change_plans"] if item["id"] == "admin.restart.completed")
         self.assertTrue(archived_state_plan["archived"])
         self.assertEqual(post_archive_state["admin_history_archives"][0]["id"], "admin.archive.admin.restart.completed")
@@ -1498,6 +1505,44 @@ class HealthSummaryTests(unittest.TestCase):
                     command_results=(),
                 )
             )
+            archived = replace(
+                plan_user_service_restart(
+                    "admin.restart.dashboard.archived",
+                    "overseer-api.service",
+                    "restore old dashboard code",
+                    "active",
+                ),
+                approved=True,
+                approved_by="sisko",
+                approved_at="2026-07-18T00:30:00Z",
+                archived=True,
+                archived_by="sisko",
+                archived_at="2026-07-18T01:00:00Z",
+                archive_record_id="admin.archive.admin.restart.dashboard.archived",
+            )
+            store.save_admin_change_plan(archived)
+            store.save_admin_history_archive(
+                AdminHistoryArchiveRecord(
+                    id="admin.archive.admin.restart.dashboard.archived",
+                    plan_id=archived.id,
+                    disposition="archive_completed",
+                    archived_by="sisko",
+                    archived_at="2026-07-18T01:00:00Z",
+                    summary="Archived completed dashboard restart",
+                    evidence_ids=("admin.exec.admin.restart.dashboard.completed.completed",),
+                )
+            )
+            store.save_approval(
+                ApprovalRequest(
+                    id=f"approval.admin.restore.{archived.id}",
+                    subject_id=archived.id,
+                    approval_level=ApprovalLevel.SISKO,
+                    requester_thread="sisko",
+                    owner_domain=OwnerDomain.SISKO,
+                    reason=f"Restore archived admin plan {archived.id} to active admin history",
+                    evidence_required=(archived.archive_record_id,),
+                )
+            )
             store.close()
             prepare_host_security_ids_review_package_status(
                 store_path,
@@ -1515,13 +1560,16 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["attention"]["security_pending_authorizations"], 1)
         self.assertEqual(status["attention"]["security_ids_review_gate_blocked"], 1)
         self.assertEqual(status["attention"]["admin_archive_candidates"], 1)
+        self.assertEqual(status["attention"]["pending_restore_approvals"], 1)
         self.assertEqual(status["role_focus"]["sisko"]["pending_authorizations"], 1)
         self.assertEqual(status["role_focus"]["sisko"]["admin_archive_candidates"], 1)
+        self.assertEqual(status["role_focus"]["sisko"]["pending_restore_approvals"], 1)
         self.assertEqual(status["role_focus"]["odo"]["alerts"], 1)
         self.assertEqual(status["role_focus"]["odo"]["ids_review_gate_blocked"], 1)
         self.assertEqual(status["role_focus"]["quark"]["exhausted"], 1)
         self.assertEqual(status["role_focus"]["julian"]["latest_failures"], 1)
         self.assertIn("command", status["summaries"])
+        self.assertEqual(status["summaries"]["admin"]["restore_approvals"]["pending"], 1)
         self.assertIn("admin_history", status["summaries"])
         self.assertIn("health_efficiency", status["summaries"])
 

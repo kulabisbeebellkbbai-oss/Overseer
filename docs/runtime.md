@@ -30,7 +30,7 @@ Installed local unit:
 Runtime command:
 
 ```bash
-/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3
+/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets
 ```
 
 Operator commands:

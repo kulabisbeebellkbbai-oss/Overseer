@@ -56,6 +56,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/approve`
 - `POST /claims/activate`
 - `POST /claims/release`
+- `GET /claims/review`
 - `POST /host/inspect`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
@@ -92,6 +93,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
 `GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, admin archive candidates, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
+`GET /claims/review` reports active-like, queued, expired, and release-blocked claims for operator review without releasing, revoking, or renewing them. It supports `?now=...` for deterministic review timestamps.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.

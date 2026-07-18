@@ -83,6 +83,12 @@ class OverseerApiClient:
     def state(self) -> dict[str, Any]:
         return self._get("/state")
 
+    def claim_review(self, now: str | None = None) -> dict[str, Any]:
+        path = "/claims/review"
+        if now is not None:
+            path = f"{path}?{urlencode({'now': now})}"
+        return self._get(path)
+
     def request_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/request", payload)
 

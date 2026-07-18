@@ -423,6 +423,7 @@ def command_summary_status(
             now=now,
             policy=DEFAULT_RUNTIME_FRESHNESS_POLICY,
         )
+        checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
         alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
         pending_approvals = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
         pending_admin_plans = [
@@ -460,6 +461,12 @@ def command_summary_status(
                 "active_like": sum(1 for claim in claims if claim.is_active_like()),
                 "queued": sum(1 for claim in claims if claim.status == ClaimStatus.QUEUED),
                 "blocked": sum(1 for claim in claims if claim.status == ClaimStatus.BLOCKED),
+                "expired_active_like": sum(1 for claim in claims if _claim_is_expired(claim, checked_at)),
+                "missing_release_condition": sum(
+                    1
+                    for claim in claims
+                    if claim.is_exclusive() and claim.is_active_like() and not claim.release_condition
+                ),
                 "pending_approvals": len(pending_approvals),
             },
             "health": {
@@ -2864,6 +2871,77 @@ def audit_event_status(event: AuditEvent) -> dict[str, object]:
     }
 
 
+def claim_review_status(store_path: str | Path, now: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
+        resources = {resource.id: resource for resource in store.list_resources()}
+        items = [claim_review_item_status(claim, resources.get(claim.resource_id), checked_at) for claim in store.list_claims()]
+        return {
+            "store": str(store.path),
+            "checked_at": checked_at.isoformat(),
+            "claims": len(items),
+            "active_like": sum(1 for item in items if item["active_like"]),
+            "queued": sum(1 for item in items if item["status"] == ClaimStatus.QUEUED.value),
+            "expired_active_like": sum(1 for item in items if item["expired"] and item["active_like"]),
+            "missing_release_condition": sum(1 for item in items if item["missing_release_condition"]),
+            "operator_review_required": sum(1 for item in items if item["operator_review_required"]),
+            "items": items,
+        }
+    finally:
+        store.close()
+
+
+def claim_review_item_status(claim: Claim, resource: Resource | None, checked_at: datetime) -> dict[str, object]:
+    expired = _claim_is_expired(claim, checked_at)
+    missing_release_condition = claim.is_exclusive() and claim.is_active_like() and not claim.release_condition
+    return {
+        "id": claim.id,
+        "resource_id": claim.resource_id,
+        "resource_name": resource.name if resource else None,
+        "resource_owner": OwnerDomain(resource.owner_domain).value if resource else None,
+        "claim_type": ClaimType(claim.claim_type).value,
+        "owner_thread": claim.owner_thread,
+        "owner_role": OwnerDomain(claim.owner_role).value,
+        "status": ClaimStatus(claim.status).value,
+        "active_like": claim.is_active_like(),
+        "exclusive": claim.is_exclusive(),
+        "starts_at": claim.starts_at,
+        "expires_at": claim.expires_at,
+        "release_condition": claim.release_condition,
+        "expired": expired,
+        "missing_release_condition": missing_release_condition,
+        "operator_review_required": (expired and claim.is_active_like()) or missing_release_condition,
+        "next_step": _claim_review_next_step(claim, expired, missing_release_condition),
+    }
+
+
+def _claim_review_next_step(claim: Claim, expired: bool, missing_release_condition: bool) -> str:
+    if expired and claim.is_active_like():
+        return "operator review required before release, revocation, renewal, or takeover"
+    if missing_release_condition:
+        return "add release evidence or release condition before considering the resource available"
+    if claim.status == ClaimStatus.QUEUED:
+        return "wait for blocking claim release or re-evaluate after operator review"
+    if claim.status == ClaimStatus.ACTIVE:
+        return "monitor release condition"
+    return "no operator action required"
+
+
+def _claim_is_expired(claim: Claim, checked_at: datetime) -> bool:
+    expires_at = _parse_optional_datetime(claim.expires_at)
+    return expires_at is not None and expires_at <= checked_at
+
+
+def _parse_optional_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def list_state_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -2927,6 +3005,9 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "owner_role": OwnerDomain(claim.owner_role).value,
                     "risk_level": RiskLevel(claim.risk_level).value,
                     "status": ClaimStatus(claim.status).value,
+                    "starts_at": claim.starts_at,
+                    "expires_at": claim.expires_at,
+                    "release_condition": claim.release_condition,
                     "approval_id": claim.approval_id,
                 }
                 for claim in claims
@@ -3012,6 +3093,9 @@ def request_claim_status(
     requested_action: str,
     risk_level: str,
     ports: Sequence[int] = (),
+    starts_at: str | None = None,
+    expires_at: str | None = None,
+    release_condition: str | None = None,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -3026,6 +3110,9 @@ def request_claim_status(
                 intent=intent,
                 requested_action=requested_action,
                 risk_level=RiskLevel(risk_level),
+                starts_at=starts_at,
+                expires_at=expires_at,
+                release_condition=release_condition,
                 port_reservations=frozenset(ports),
             )
         )
@@ -3357,6 +3444,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_parser.add_argument("--requested-action", required=True)
     claim_parser.add_argument("--risk-level", required=True, choices=[item.value for item in RiskLevel])
     claim_parser.add_argument("--port", action="append", type=int, default=(), help="port reservation for conflict checks")
+    claim_parser.add_argument("--starts-at")
+    claim_parser.add_argument("--expires-at")
+    claim_parser.add_argument("--release-condition")
+    claim_review_parser = subparsers.add_parser("claim-review", help="review active, queued, expired, and release-blocked claims")
+    claim_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    claim_review_parser.add_argument("--now", help="override review timestamp for deterministic checks")
     activate_parser = subparsers.add_parser("activate-claim", help="mark a stored claim active after approval")
     activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     activate_parser.add_argument("--claim-id", required=True)
@@ -3713,6 +3806,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
         return 0
 
+    if args.command == "claim-review":
+        print(json.dumps(claim_review_status(args.store, args.now), sort_keys=True))
+        return 0
+
     if args.command == "request-claim":
         print(
             json.dumps(
@@ -3727,6 +3824,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.requested_action,
                     args.risk_level,
                     args.port,
+                    args.starts_at,
+                    args.expires_at,
+                    args.release_condition,
                 ),
                 sort_keys=True,
             )

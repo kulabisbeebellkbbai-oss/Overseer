@@ -28,6 +28,7 @@ from .cli import (
     audit_summary_status,
     authorizations_required_status,
     cancel_admin_change_status,
+    claim_review_status,
     command_summary_status,
     create_host_security_source_review_status,
     execute_admin_change_status,
@@ -165,6 +166,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/state":
                 self._handle(lambda: list_state_status(store_path))
+                return
+            if path == "/claims/review":
+                self._handle(lambda: claim_review_status(store_path, _query_first(query, "now")))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -326,6 +330,9 @@ def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "requested_action": str(payload["requested_action"]),
         "risk_level": str(payload["risk_level"]),
         "ports": tuple(int(port) for port in payload.get("ports", ())),
+        "starts_at": str(payload["starts_at"]) if payload.get("starts_at") else None,
+        "expires_at": str(payload["expires_at"]) if payload.get("expires_at") else None,
+        "release_condition": str(payload["release_condition"]) if payload.get("release_condition") else None,
     }
 
 

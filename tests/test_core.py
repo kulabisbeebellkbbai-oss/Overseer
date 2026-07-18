@@ -120,6 +120,7 @@ from overseer.cli import audit_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
+from overseer.cli import claim_review_status
 from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
 from overseer.cli import export_host_security_ids_review_prompt_status
@@ -2333,6 +2334,50 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
 
+    def test_client_reviews_expired_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.review",
+                    name="Review Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_claim(
+                    {
+                        "claim_id": "claim.gateway.review",
+                        "resource_id": "gateway.review",
+                        "claim_type": ClaimType.LEASE.value,
+                        "owner_thread": "thread-a",
+                        "owner_role": OwnerDomain.DAX.value,
+                        "intent": "use gateway",
+                        "requested_action": "bind gateway",
+                        "risk_level": RiskLevel.LOW.value,
+                        "expires_at": "2026-07-18T20:00:00+00:00",
+                    }
+                )
+                approved = client.approve_claim(
+                    {
+                        "approval_id": requested["approval_id"],
+                        "decided_by": "sisko",
+                    }
+                )
+                client.activate_claim({"claim_id": requested["claim"], "approval_id": approved["approval_id"]})
+                review = client.claim_review("2026-07-18T20:30:00+00:00")
+
+            self.assertEqual(review["expired_active_like"], 1)
+            self.assertEqual(review["missing_release_condition"], 1)
+            self.assertEqual(review["operator_review_required"], 1)
+            self.assertEqual(review["items"][0]["next_step"], "operator review required before release, revocation, renewal, or takeover")
+
     def test_client_creates_admin_change_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4468,6 +4513,45 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(second["claim_status"], ClaimStatus.QUEUED.value)
             self.assertEqual(second["blocking_claim_ids"], ["claim.cli.first"])
+
+    def test_claim_review_status_flags_expired_active_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.review.cli",
+                    name="Review CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.review.expired",
+                    resource_id="proxy.review.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use proxy",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                    expires_at="2026-07-18T20:00:00+00:00",
+                )
+            )
+            store.close()
+
+            review = claim_review_status(store_path, "2026-07-18T20:10:00+00:00")
+            command = command_summary_status(store_path, now="2026-07-18T20:10:00+00:00")
+
+            self.assertEqual(review["expired_active_like"], 1)
+            self.assertEqual(review["missing_release_condition"], 1)
+            self.assertEqual(review["operator_review_required"], 1)
+            self.assertTrue(review["items"][0]["expired"])
+            self.assertEqual(command["claims"]["expired_active_like"], 1)
+            self.assertEqual(command["claims"]["missing_release_condition"], 1)
 
     def test_activate_claim_status_requires_approved_request(self):
         with tempfile.TemporaryDirectory() as directory:

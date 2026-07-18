@@ -798,7 +798,17 @@ class HealthSummaryTests(unittest.TestCase):
                 "active",
             )
             approve_admin_change_status(store_path, completed["id"], "sisko")
-            execute_admin_change_status(store_path, completed["id"])
+            store = SQLiteStore(store_path)
+            store.save_admin_execution(
+                AdminExecutionResult(
+                    id="admin.exec.admin.restart.completed.completed",
+                    plan_id=completed["id"],
+                    status=AdminExecutionStatus.COMPLETED,
+                    summary="admin change completed and verified",
+                    command_results=(),
+                )
+            )
+            store.close()
             canceled = plan_admin_change_status(
                 store_path,
                 "admin.restart.canceled",

@@ -61,6 +61,9 @@ class OverseerApiClient:
     def approve_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/approve", payload)
 
+    def cancel_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/cancel", payload)
+
     def _get(self, path: str, authenticated: bool = True) -> dict[str, Any]:
         request = Request(f"{self.base_url}{path}", headers=self._headers(authenticated))
         return self._read(request)

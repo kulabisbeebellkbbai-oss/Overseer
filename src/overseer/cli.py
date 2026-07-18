@@ -12,6 +12,7 @@ from .admin import (
     AdminChangePlan,
     approve_admin_change_plan,
     authorization_required_status,
+    cancel_admin_change_plan,
     missing_admin_change_fields,
     plan_apt_install,
     plan_block_ip,
@@ -319,6 +320,10 @@ def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
         "approved": plan.approved,
         "approved_by": plan.approved_by,
         "approved_at": plan.approved_at,
+        "canceled": plan.canceled,
+        "canceled_by": plan.canceled_by,
+        "canceled_at": plan.canceled_at,
+        "cancellation_reason": plan.cancellation_reason,
         "can_execute": plan.can_execute(),
         "missing_fields": list(missing_admin_change_fields(plan)),
         "steps": [_admin_command_status(step) for step in plan.steps],
@@ -378,6 +383,23 @@ def approve_admin_change_status(
         store.close()
 
 
+def cancel_admin_change_status(
+    store_path: str | Path,
+    plan_id: str,
+    canceled_by: str,
+    cancellation_reason: str,
+    canceled_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        canceled = cancel_admin_change_plan(plan, canceled_by, cancellation_reason, canceled_at)
+        store.save_admin_change_plan(canceled)
+        return {"store": str(store.path), **admin_change_plan_status(canceled)}
+    finally:
+        store.close()
+
+
 def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -385,7 +407,7 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
         pending = [
             authorization_required_status(plan)
             for plan in plans
-            if plan.requires_explicit_approval() and not plan.approved
+            if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
         ]
         return {
             "store": str(store.path),
@@ -549,6 +571,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "risk_level": RiskLevel(plan.risk_level).value,
                     "approval_level": ApprovalLevel(plan.approval_level).value,
                     "approved": plan.approved,
+                    "canceled": plan.canceled,
                     "can_execute": plan.can_execute(),
                 }
                 for plan in admin_change_plans
@@ -726,6 +749,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     approve_admin_parser.add_argument("--plan-id", required=True)
     approve_admin_parser.add_argument("--approved-by", required=True)
     approve_admin_parser.add_argument("--approved-at")
+    cancel_admin_parser = subparsers.add_parser("cancel-admin-change", help="mark an admin change plan canceled without executing it")
+    cancel_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    cancel_admin_parser.add_argument("--plan-id", required=True)
+    cancel_admin_parser.add_argument("--canceled-by", required=True)
+    cancel_admin_parser.add_argument("--reason", required=True)
+    cancel_admin_parser.add_argument("--canceled-at")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -850,6 +879,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "approve-admin-change":
         print(json.dumps(approve_admin_change_status(args.store, args.plan_id, args.approved_by, args.approved_at), sort_keys=True))
+        return 0
+
+    if args.command == "cancel-admin-change":
+        print(
+            json.dumps(
+                cancel_admin_change_status(args.store, args.plan_id, args.canceled_by, args.reason, args.canceled_at),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "serve-api":

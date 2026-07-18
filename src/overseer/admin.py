@@ -41,12 +41,16 @@ class AdminChangePlan:
     approved: bool = False
     approved_by: str | None = None
     approved_at: str | None = None
+    canceled: bool = False
+    canceled_by: str | None = None
+    canceled_at: str | None = None
+    cancellation_reason: str | None = None
 
     def requires_explicit_approval(self) -> bool:
-        return self.approval_level != ApprovalLevel.NONE or self.risk_level != RiskLevel.LOW
+        return not self.canceled and (self.approval_level != ApprovalLevel.NONE or self.risk_level != RiskLevel.LOW)
 
     def can_execute(self) -> bool:
-        return self.approved and not missing_admin_change_fields(self)
+        return not self.canceled and self.approved and not missing_admin_change_fields(self)
 
 
 def plan_user_service_restart(plan_id: str, service_name: str, reason: str, current_state: str = "unknown") -> AdminChangePlan:
@@ -224,11 +228,35 @@ def missing_admin_change_fields(plan: AdminChangePlan) -> tuple[str, ...]:
 
 
 def approve_admin_change_plan(plan: AdminChangePlan, approved_by: str, approved_at: str | None = None) -> AdminChangePlan:
+    if plan.canceled:
+        raise ValueError("cannot approve canceled admin change plan")
     if missing_admin_change_fields(plan):
         raise ValueError("cannot approve incomplete admin change plan")
     if not approved_by.strip():
         raise ValueError("approved_by is required")
     return replace(plan, approved=True, approved_by=approved_by, approved_at=approved_at)
+
+
+def cancel_admin_change_plan(
+    plan: AdminChangePlan,
+    canceled_by: str,
+    cancellation_reason: str,
+    canceled_at: str | None = None,
+) -> AdminChangePlan:
+    if not canceled_by.strip():
+        raise ValueError("canceled_by is required")
+    if not cancellation_reason.strip():
+        raise ValueError("cancellation_reason is required")
+    return replace(
+        plan,
+        canceled=True,
+        canceled_by=canceled_by,
+        canceled_at=canceled_at,
+        cancellation_reason=cancellation_reason,
+        approved=False,
+        approved_by=None,
+        approved_at=None,
+    )
 
 
 def authorization_required_status(plan: AdminChangePlan) -> dict[str, object]:
@@ -240,6 +268,7 @@ def authorization_required_status(plan: AdminChangePlan) -> dict[str, object]:
         "risk_level": RiskLevel(plan.risk_level).value,
         "approval_level": ApprovalLevel(plan.approval_level).value,
         "approved": plan.approved,
+        "canceled": plan.canceled,
         "can_execute": plan.can_execute(),
         "reason": plan.reason,
         "authorization_required": plan.requires_explicit_approval() and not plan.approved,
@@ -248,6 +277,8 @@ def authorization_required_status(plan: AdminChangePlan) -> dict[str, object]:
 
 
 def _authorization_next_step(plan: AdminChangePlan) -> str:
+    if plan.canceled:
+        return "canceled; no authorization or execution is required"
     if plan.approved:
         return "approved; execution still requires a live adapter and verification boundary"
     if plan.approval_level == ApprovalLevel.HUMAN:

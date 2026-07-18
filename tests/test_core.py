@@ -91,6 +91,7 @@ from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
+from overseer.cli import cancel_admin_change_status
 from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -880,6 +881,36 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertTrue(approved["can_execute"])
             self.assertEqual(after["pending_count"], 0)
 
+    def test_client_cancels_placeholder_admin_change_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client.plan_admin_change(
+                    {
+                        "plan_id": "admin.block.placeholder",
+                        "kind": AdminChangeKind.BLOCK_IP.value,
+                        "target": "192.0.2.10",
+                        "reason": "placeholder example",
+                        "current_state": "no observed traffic",
+                    }
+                )
+                canceled = client.cancel_admin_change(
+                    {
+                        "plan_id": "admin.block.placeholder",
+                        "canceled_by": "odo",
+                        "cancellation_reason": "reserved documentation address; no observed hostile traffic",
+                    }
+                )
+                pending = client.authorizations_required()
+                state = client.state()
+
+            self.assertTrue(canceled["canceled"])
+            self.assertFalse(canceled["can_execute"])
+            self.assertEqual(pending["pending_count"], 0)
+            self.assertTrue(state["admin_change_plans"][0]["canceled"])
+
 
 class HostInspectionTests(unittest.TestCase):
     def test_host_inspection_uses_read_only_observations(self):
@@ -1072,6 +1103,34 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertTrue(approved["approved"])
         self.assertEqual(approved["approved_by"], "sisko")
         self.assertEqual(after["pending_count"], 0)
+
+    def test_cancel_admin_change_removes_plan_from_authorization_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.block.placeholder",
+                AdminChangeKind.BLOCK_IP.value,
+                "192.0.2.10",
+                "placeholder example",
+                "no observed traffic",
+            )
+
+            pending = authorizations_required_status(store_path)
+            canceled = cancel_admin_change_status(
+                store_path,
+                "admin.block.placeholder",
+                "odo",
+                "reserved documentation address; no observed hostile traffic",
+            )
+            after = authorizations_required_status(store_path)
+            state = list_state_status(store_path)
+
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertTrue(canceled["canceled"])
+        self.assertEqual(canceled["cancellation_reason"], "reserved documentation address; no observed hostile traffic")
+        self.assertEqual(after["pending_count"], 0)
+        self.assertTrue(state["admin_change_plans"][0]["canceled"])
 
 
 class PhysicalIdentityTests(unittest.TestCase):

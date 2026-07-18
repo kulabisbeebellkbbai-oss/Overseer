@@ -15,6 +15,7 @@ from .cli import (
     approve_admin_change_status,
     approve_claim_status,
     authorizations_required_status,
+    cancel_admin_change_status,
     health_summary_status,
     inspect_host_status,
     list_state_status,
@@ -79,6 +80,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/approve":
                 self._handle_json(lambda payload: approve_admin_change_status(store_path, **_approve_admin_plan_args(payload)))
+                return
+            if self.path == "/admin/cancel":
+                self._handle_json(lambda payload: cancel_admin_change_status(store_path, **_cancel_admin_plan_args(payload)))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -197,4 +201,13 @@ def _approve_admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_id": str(payload["plan_id"]),
         "approved_by": str(payload["approved_by"]),
         "approved_at": str(payload["approved_at"]) if payload.get("approved_at") else None,
+    }
+
+
+def _cancel_admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "canceled_by": str(payload["canceled_by"]),
+        "cancellation_reason": str(payload["cancellation_reason"]),
+        "canceled_at": str(payload["canceled_at"]) if payload.get("canceled_at") else None,
     }

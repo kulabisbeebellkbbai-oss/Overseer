@@ -35,12 +35,14 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/inspect`
 - `POST /admin/plans`
 - `POST /admin/approve`
+- `POST /admin/cancel`
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
 `POST /host/inspect` captures read-only host evidence and persists it to the API store.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
+`POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 
 ## Python Client
 
@@ -62,6 +64,13 @@ plan = client.plan_admin_change(
 )
 pending = client.authorizations_required()
 approved = client.approve_admin_change({"plan_id": "admin.restart.overseer-api", "approved_by": "sisko"})
+canceled = client.cancel_admin_change(
+    {
+        "plan_id": "admin.block.example",
+        "canceled_by": "odo",
+        "cancellation_reason": "reserved documentation address; no observed hostile traffic",
+    }
+)
 ```
 
 ## Installed User Service

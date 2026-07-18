@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
+from .health import HealthTarget, ProbeType
 from .store import SQLiteStore
 from .usage_limits import LimitKind, UsageLimit
 
@@ -18,12 +19,14 @@ SECRET_KEY_PARTS = ("token", "secret", "password", "credential", "api_key", "pri
 class OverseerConfig:
     resources: tuple[Resource, ...] = ()
     usage_limits: tuple[UsageLimit, ...] = ()
+    health_targets: tuple[HealthTarget, ...] = ()
 
 
 @dataclass(frozen=True)
 class ConfigSeedResult:
     resource_count: int
     usage_limit_count: int
+    health_target_count: int
     store_path: str
 
 
@@ -38,7 +41,8 @@ def config_from_mapping(data: dict[str, Any]) -> OverseerConfig:
     _reject_secret_like_keys(data)
     resources = tuple(_resource_from_mapping(item) for item in data.get("resources", ()))
     usage_limits = tuple(_usage_limit_from_mapping(item) for item in data.get("usage_limits", ()))
-    config = OverseerConfig(resources, usage_limits)
+    health_targets = tuple(_health_target_from_mapping(item) for item in data.get("health_targets", ()))
+    config = OverseerConfig(resources, usage_limits, health_targets)
     validate_config(config)
     return config
 
@@ -49,14 +53,18 @@ def seed_store_from_config(config: OverseerConfig, store: SQLiteStore) -> Config
         store.save_resource(resource)
     for usage_limit in config.usage_limits:
         store.save_usage_limit(usage_limit)
-    return ConfigSeedResult(len(config.resources), len(config.usage_limits), str(store.path))
+    for health_target in config.health_targets:
+        store.save_health_target(health_target)
+    return ConfigSeedResult(len(config.resources), len(config.usage_limits), len(config.health_targets), str(store.path))
 
 
 def validate_config(config: OverseerConfig) -> None:
     resource_ids = [resource.id for resource in config.resources]
     usage_limit_ids = [usage_limit.id for usage_limit in config.usage_limits]
+    health_target_ids = [target.id for target in config.health_targets]
     _reject_duplicates(resource_ids, "resource")
     _reject_duplicates(usage_limit_ids, "usage limit")
+    _reject_duplicates(health_target_ids, "health target")
     resource_id_set = set(resource_ids)
     for usage_limit in config.usage_limits:
         if usage_limit.resource_id not in resource_id_set:
@@ -65,6 +73,9 @@ def validate_config(config: OverseerConfig) -> None:
             raise ValueError("usage limit capacity and remaining must be non-negative")
         if usage_limit.remaining > usage_limit.capacity:
             raise ValueError("usage limit remaining cannot exceed capacity")
+    for target in config.health_targets:
+        if target.resource_id not in resource_id_set:
+            raise ValueError(f"health target references unknown resource: {target.resource_id}")
 
 
 def _resource_from_mapping(data: dict[str, Any]) -> Resource:
@@ -95,6 +106,20 @@ def _usage_limit_from_mapping(data: dict[str, Any]) -> UsageLimit:
         window=str(data["window"]),
         observed_at=data.get("observed_at"),
         confidence=float(data.get("confidence", 1.0)),
+    )
+
+
+def _health_target_from_mapping(data: dict[str, Any]) -> HealthTarget:
+    return HealthTarget(
+        id=str(data["id"]),
+        resource_id=str(data["resource_id"]),
+        name=str(data["name"]),
+        probe_type=ProbeType(data["probe_type"]),
+        target=str(data["target"]),
+        owner_domain=OwnerDomain(data.get("owner_domain", OwnerDomain.JULIAN.value)),
+        expected_status=int(data["expected_status"]) if "expected_status" in data else None,
+        expected_content_type=data.get("expected_content_type"),
+        latency_warn_ms=int(data["latency_warn_ms"]) if "latency_warn_ms" in data else None,
     )
 
 

@@ -72,6 +72,7 @@ from overseer import (
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
+from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import run_status
 from overseer.cli import seed_config_status
@@ -462,6 +463,47 @@ class LiveHealthProbeTests(unittest.TestCase):
 
             self.assertEqual(status["store"], str(store_path))
             self.assertEqual(store.load_health_evidence(status["id"]).observed_status, HealthStatus.HEALTHY)
+            store.close()
+
+    def test_probe_config_status_probes_declared_targets_and_persists_evidence(self):
+        with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
+            root = Path(directory)
+            config_path = root / "overseer.json"
+            store_path = root / "overseer.sqlite3"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "resources": [
+                            {
+                                "id": "svc.local.json",
+                                "name": "Local JSON",
+                                "type": "service",
+                                "owner_domain": "julian",
+                                "risk_level": "low",
+                            }
+                        ],
+                        "health_targets": [
+                            {
+                                "id": "health.local.json",
+                                "resource_id": "svc.local.json",
+                                "name": "Local JSON",
+                                "probe_type": "json",
+                                "target": server.url,
+                                "expected_content_type": "application/json",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = probe_config_status(config_path, store_path, timeout_seconds=2)
+            store = SQLiteStore(store_path)
+
+            self.assertEqual(status["targets"], 1)
+            self.assertEqual(status["healthy"], 1)
+            self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
+            self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
 
 
@@ -857,6 +899,16 @@ class ConfigLoadingTests(unittest.TestCase):
                         "window": "hourly",
                     }
                 ],
+                "health_targets": [
+                    {
+                        "id": "health.config",
+                        "resource_id": "svc.config",
+                        "name": "Configured Service Health",
+                        "probe_type": "json",
+                        "target": "http://127.0.0.1:8794/health",
+                        "expected_content_type": "application/json",
+                    }
+                ],
             }
         )
 
@@ -864,6 +916,7 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(config.resources[0].owner_domain, OwnerDomain.DAX)
         self.assertEqual(config.resources[0].ports(), frozenset({8795}))
         self.assertEqual(config.usage_limits[0].remaining, 50)
+        self.assertEqual(config.health_targets[0].probe_type, ProbeType.JSON)
 
     def test_rejects_secret_like_config_keys(self):
         with self.assertRaises(ValueError):
@@ -894,6 +947,22 @@ class ConfigLoadingTests(unittest.TestCase):
                             "capacity": 10,
                             "remaining": 1,
                             "window": "hourly",
+                        }
+                    ]
+                }
+            )
+
+    def test_rejects_health_target_for_unknown_resource(self):
+        with self.assertRaises(ValueError):
+            config_from_mapping(
+                {
+                    "health_targets": [
+                        {
+                            "id": "health.unknown",
+                            "resource_id": "svc.missing",
+                            "name": "Missing Service Health",
+                            "probe_type": "json",
+                            "target": "http://127.0.0.1:8794/health",
                         }
                     ]
                 }
@@ -1230,6 +1299,15 @@ class SQLiteStoreTests(unittest.TestCase):
                             "window": "hourly",
                         }
                     ],
+                    "health_targets": [
+                        {
+                            "id": "health.seeded",
+                            "resource_id": "svc.seeded",
+                            "name": "Seeded Health",
+                            "probe_type": "json",
+                            "target": "http://127.0.0.1:8794/health",
+                        }
+                    ],
                 }
             )
 
@@ -1237,8 +1315,10 @@ class SQLiteStoreTests(unittest.TestCase):
 
             self.assertEqual(result.resource_count, 1)
             self.assertEqual(result.usage_limit_count, 1)
+            self.assertEqual(result.health_target_count, 1)
             self.assertEqual(store.load_resource("svc.seeded").owner_domain, OwnerDomain.JULIAN)
             self.assertEqual(store.load_usage_limit("limit.seeded").remaining, 10)
+            self.assertEqual(store.load_health_target("health.seeded").resource_id, "svc.seeded")
             store.close()
 
 
@@ -1269,6 +1349,15 @@ class RuntimeTests(unittest.TestCase):
                                 "window": "hourly",
                             }
                         ],
+                        "health_targets": [
+                            {
+                                "id": "health.runtime",
+                                "resource_id": "svc.runtime",
+                                "name": "Runtime Health",
+                                "probe_type": "json",
+                                "target": "http://127.0.0.1:8794/health",
+                            }
+                        ],
                     }
                 ),
                 store,
@@ -1278,6 +1367,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(tick.resources, 1)
             self.assertEqual(tick.usage_limits, 1)
+            self.assertEqual(tick.health_targets, 1)
             self.assertEqual(tick.health_evidence, 0)
             store.close()
 
@@ -1300,6 +1390,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(status["store"], str(store_path))
             self.assertEqual(status["resources"], 1)
+            self.assertEqual(status["health_targets"], 0)
             self.assertEqual(status["health_evidence"], 0)
             self.assertEqual(status["physical_identities"], 0)
 

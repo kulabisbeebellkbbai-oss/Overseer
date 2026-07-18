@@ -12,6 +12,7 @@ from .store import SQLiteStore
 class RuntimeTick:
     resources: int
     usage_limits: int
+    health_targets: int
     audit_events: int
     health_evidence: int
     physical_identities: int
@@ -25,6 +26,7 @@ class OverseerRuntime:
         return RuntimeTick(
             resources=len(self.store.list_resources()),
             usage_limits=len(self.store.list_usage_limits()),
+            health_targets=len(self.store.list_health_targets()),
             audit_events=len(self.store.list_audit_events()),
             health_evidence=len(self.store.list_health_evidence()),
             physical_identities=len(self.store.list_physical_identities()),

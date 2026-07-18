@@ -6,6 +6,7 @@ Overseer configuration lets an operator seed known resources and usage limits wi
 
 - `resources`
 - `usage_limits`
+- `health_targets`
 
 ## Boundaries
 

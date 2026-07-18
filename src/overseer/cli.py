@@ -107,6 +107,7 @@ def seed_config_status(config_path: str | Path, store_path: str | Path) -> dict[
             "store": result.store_path,
             "resources": result.resource_count,
             "usage_limits": result.usage_limit_count,
+            "health_targets": result.health_target_count,
         }
     finally:
         store.close()
@@ -153,6 +154,42 @@ def probe_health_status(
     return status
 
 
+def probe_config_status(
+    config_path: str | Path,
+    store_path: str | Path | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, object]:
+    config = load_config(config_path)
+    adapter = HttpHealthProbeAdapter(timeout_seconds=timeout_seconds)
+    evidence_items = [adapter.probe(target) for target in config.health_targets]
+    if store_path is not None:
+        store = SQLiteStore(store_path)
+        try:
+            for evidence in evidence_items:
+                store.save_health_evidence(evidence)
+        finally:
+            store.close()
+    status = {
+        "config": str(Path(config_path)),
+        "targets": len(config.health_targets),
+        "healthy": sum(1 for evidence in evidence_items if evidence.observed_status.value == "healthy"),
+        "evidence": [
+            {
+                "id": evidence.id,
+                "resource_id": evidence.resource_id,
+                "target": evidence.target,
+                "status": evidence.observed_status.value,
+                "recovery_required": evidence.recovery_required,
+                "error": evidence.observed_error,
+            }
+            for evidence in evidence_items
+        ],
+    }
+    if store_path is not None:
+        status["store"] = str(Path(store_path))
+    return status
+
+
 def discover_physical_status(roots: Sequence[str], store_path: str | Path | None = None) -> dict[str, object]:
     identities = PathPhysicalDiscoveryAdapter(tuple(roots)).discover()
     if store_path is not None:
@@ -187,6 +224,7 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
             "store": str(store.path),
             "resources": tick.resources,
             "usage_limits": tick.usage_limits,
+            "health_targets": tick.health_targets,
             "audit_events": tick.audit_events,
             "health_evidence": tick.health_evidence,
             "physical_identities": tick.physical_identities,
@@ -212,6 +250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_parser.add_argument("--expected-content-type")
     probe_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     probe_parser.add_argument("--store", help="explicit SQLite store path for persisting health evidence")
+    probe_config_parser = subparsers.add_parser("probe-config", help="probe health targets declared in explicit JSON config")
+    probe_config_parser.add_argument("--config", required=True, help="explicit JSON config path")
+    probe_config_parser.add_argument("--store", help="explicit SQLite store path for persisting health evidence")
+    probe_config_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
@@ -246,6 +288,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "probe-config":
+        print(json.dumps(probe_config_status(args.config, args.store, args.timeout_seconds), sort_keys=True))
         return 0
 
     if args.command == "discover-physical":

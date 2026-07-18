@@ -10,7 +10,7 @@ from typing import Any
 
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
-from .health import HealthEvidence
+from .health import HealthEvidence, HealthTarget
 from .physical import PhysicalIdentity
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .usage_limits import UsageLimit
@@ -68,6 +68,11 @@ class SQLiteStore:
                 stable_id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS health_targets (
+                id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             """
         )
         self._connection.commit()
@@ -106,6 +111,19 @@ class SQLiteStore:
 
     def list_health_evidence(self) -> tuple[HealthEvidence, ...]:
         return tuple(_load_dataclass(HealthEvidence, payload) for payload in self._list_payloads("health_evidence"))
+
+    def save_health_target(self, target: HealthTarget) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO health_targets (id, resource_id, payload) VALUES (?, ?, ?)",
+            (target.id, target.resource_id, _dump(target)),
+        )
+        self._connection.commit()
+
+    def load_health_target(self, target_id: str) -> HealthTarget:
+        return _load_dataclass(HealthTarget, self._get_payload("health_targets", target_id))
+
+    def list_health_targets(self) -> tuple[HealthTarget, ...]:
+        return tuple(_load_dataclass(HealthTarget, payload) for payload in self._list_payloads("health_targets"))
 
     def save_physical_identity(self, identity: PhysicalIdentity) -> None:
         self._connection.execute(

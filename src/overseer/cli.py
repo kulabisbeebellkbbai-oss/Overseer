@@ -14,7 +14,7 @@ from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
-from .service import OverseerCoordinator
+from .service import OverseerCoordinator, coordinator_from_store
 from .store import SQLiteStore
 
 
@@ -233,6 +233,85 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
         store.close()
 
 
+def request_claim_status(
+    store_path: str | Path,
+    claim_id: str,
+    resource_id: str,
+    claim_type: str,
+    owner_thread: str,
+    owner_role: str,
+    intent: str,
+    requested_action: str,
+    risk_level: str,
+    ports: Sequence[int] = (),
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        coordinator = coordinator_from_store(store)
+        result = coordinator.request_claim(
+            Claim(
+                id=claim_id,
+                resource_id=resource_id,
+                claim_type=ClaimType(claim_type),
+                owner_thread=owner_thread,
+                owner_role=OwnerDomain(owner_role),
+                intent=intent,
+                requested_action=requested_action,
+                risk_level=RiskLevel(risk_level),
+                port_reservations=frozenset(ports),
+            )
+        )
+        return {
+            "store": str(store.path),
+            "claim": result.record.claim.id,
+            "claim_status": result.record.claim.status.value,
+            "decision": result.record.decision.outcome.value,
+            "approval": result.record.decision.approval_level.value,
+            "approval_id": result.approval.id if result.approval else None,
+            "audit_event": result.audit_event.id,
+            "blocking_claim_ids": list(result.record.decision.blocking_claim_ids),
+            "reason": result.record.decision.reason,
+        }
+    finally:
+        store.close()
+
+
+def activate_claim_status(
+    store_path: str | Path,
+    claim_id: str,
+    approval_id: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        coordinator = coordinator_from_store(store)
+        record = coordinator.activate_claim(claim_id, approval_id)
+        return {
+            "store": str(store.path),
+            "claim": record.claim.id,
+            "claim_status": record.claim.status.value,
+            "decision": record.decision.outcome.value,
+            "approval": record.decision.approval_level.value,
+            "blocking_claim_ids": list(record.decision.blocking_claim_ids),
+            "reason": record.decision.reason,
+        }
+    finally:
+        store.close()
+
+
+def release_claim_status(store_path: str | Path, claim_id: str) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        coordinator = coordinator_from_store(store)
+        claim = coordinator.release_claim(claim_id)
+        return {
+            "store": str(store.path),
+            "claim": claim.id,
+            "claim_status": claim.status.value,
+        }
+    finally:
+        store.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="overseer")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -261,6 +340,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
     run_parser.add_argument("--interval-seconds", type=float, default=30.0)
+    claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
+    claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    claim_parser.add_argument("--claim-id", required=True)
+    claim_parser.add_argument("--resource-id", required=True)
+    claim_parser.add_argument("--claim-type", required=True, choices=[item.value for item in ClaimType])
+    claim_parser.add_argument("--owner-thread", required=True)
+    claim_parser.add_argument("--owner-role", required=True, choices=[item.value for item in OwnerDomain])
+    claim_parser.add_argument("--intent", required=True)
+    claim_parser.add_argument("--requested-action", required=True)
+    claim_parser.add_argument("--risk-level", required=True, choices=[item.value for item in RiskLevel])
+    claim_parser.add_argument("--port", action="append", type=int, default=(), help="port reservation for conflict checks")
+    activate_parser = subparsers.add_parser("activate-claim", help="mark a stored claim active after approval")
+    activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    activate_parser.add_argument("--claim-id", required=True)
+    activate_parser.add_argument("--approval-id")
+    release_parser = subparsers.add_parser("release-claim", help="release a stored claim")
+    release_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    release_parser.add_argument("--claim-id", required=True)
     args = parser.parse_args(argv)
 
     if args.command == "demo":
@@ -300,6 +397,34 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         print(json.dumps(run_status(args.store, args.once, args.interval_seconds), sort_keys=True))
+        return 0
+
+    if args.command == "request-claim":
+        print(
+            json.dumps(
+                request_claim_status(
+                    args.store,
+                    args.claim_id,
+                    args.resource_id,
+                    args.claim_type,
+                    args.owner_thread,
+                    args.owner_role,
+                    args.intent,
+                    args.requested_action,
+                    args.risk_level,
+                    args.port,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "activate-claim":
+        print(json.dumps(activate_claim_status(args.store, args.claim_id, args.approval_id), sort_keys=True))
+        return 0
+
+    if args.command == "release-claim":
+        print(json.dumps(release_claim_status(args.store, args.claim_id), sort_keys=True))
         return 0
 
     parser.error(f"unknown command: {args.command}")

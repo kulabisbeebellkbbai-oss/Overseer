@@ -72,8 +72,11 @@ from overseer import (
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
+from overseer.cli import activate_claim_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
+from overseer.cli import release_claim_status
+from overseer.cli import request_claim_status
 from overseer.cli import run_status
 from overseer.cli import seed_config_status
 
@@ -1394,6 +1397,84 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["health_evidence"], 0)
             self.assertEqual(status["physical_identities"], 0)
 
+    def test_request_claim_status_queues_against_active_stored_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.cli",
+                    name="CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            first = request_claim_status(
+                store_path,
+                "claim.cli.first",
+                "proxy.cli",
+                ClaimType.LEASE.value,
+                "thread-a",
+                OwnerDomain.DAX.value,
+                "use proxy",
+                "bind proxy",
+                RiskLevel.LOW.value,
+            )
+            activated = activate_claim_status(store_path, first["claim"], "approval.role")
+            second = request_claim_status(
+                store_path,
+                "claim.cli.second",
+                "proxy.cli",
+                ClaimType.LEASE.value,
+                "thread-b",
+                OwnerDomain.DAX.value,
+                "use proxy too",
+                "bind proxy",
+                RiskLevel.LOW.value,
+            )
+
+            self.assertEqual(first["claim_status"], ClaimStatus.REQUESTED.value)
+            self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
+            self.assertEqual(second["claim_status"], ClaimStatus.QUEUED.value)
+            self.assertEqual(second["blocking_claim_ids"], ["claim.cli.first"])
+
+    def test_release_claim_status_clears_stored_resource_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.cli",
+                    name="CLI Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.gateway",
+                "gateway.cli",
+                ClaimType.LEASE.value,
+                "thread-a",
+                OwnerDomain.DAX.value,
+                "use gateway",
+                "bind gateway",
+                RiskLevel.LOW.value,
+            )
+            activate_claim_status(store_path, requested["claim"], "approval.role")
+            released = release_claim_status(store_path, requested["claim"])
+            store = SQLiteStore(store_path)
+
+            self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
+            self.assertIsNone(store.load_resource("gateway.cli").current_claim_id)
+            store.close()
+
 
 class OverseerCoordinatorTests(unittest.TestCase):
     def test_request_claim_persists_decision_approval_and_audit_event(self):
@@ -1461,6 +1542,7 @@ class OverseerCoordinatorTests(unittest.TestCase):
             self.assertEqual(activated.claim.status, ClaimStatus.ACTIVE)
             self.assertEqual(released.status, ClaimStatus.RELEASED)
             self.assertEqual(store.load_claim(activated.claim.id).status, ClaimStatus.RELEASED)
+            self.assertIsNone(store.load_resource(resource.id).current_claim_id)
             store.close()
 
 

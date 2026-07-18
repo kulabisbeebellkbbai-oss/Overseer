@@ -37,6 +37,13 @@ class ResourceRegistry:
     def list_resources(self) -> tuple[Resource, ...]:
         return tuple(self._resources.values())
 
+    def restore_claim(self, claim: Claim, decision: ConflictDecision) -> ClaimRecord:
+        if claim.resource_id not in self._resources:
+            raise KeyError(claim.resource_id)
+        self._claims[claim.id] = claim
+        self._decisions[claim.id] = decision
+        return ClaimRecord(claim, decision)
+
     def request_claim(self, claim: Claim) -> ClaimRecord:
         resource = self.get_resource(claim.resource_id)
         decision = decide_claim(resource, claim, self.active_claims(), self._resources)

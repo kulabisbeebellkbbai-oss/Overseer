@@ -52,12 +52,14 @@ class OverseerCoordinator:
         record = self.registry.activate_claim(claim_id, approval_id)
         if self.store is not None:
             self.store.save_claim(record.claim, record.decision)
+            self.store.save_resource(self.registry.get_resource(record.claim.resource_id))
         return record
 
     def release_claim(self, claim_id: str) -> Claim:
         released = self.registry.release_claim(claim_id)
         if self.store is not None:
             self.store.save_claim(released)
+            self.store.save_resource(self.registry.get_resource(released.resource_id))
         return released
 
     def _persist_result(
@@ -69,9 +71,23 @@ class OverseerCoordinator:
         if self.store is None:
             return
         self.store.save_claim(record.claim, record.decision)
+        self.store.save_resource(self.registry.get_resource(record.claim.resource_id))
         if approval is not None:
             self.store.save_approval(approval)
         self.store.save_audit_event(event)
+
+
+def coordinator_from_store(store: SQLiteStore) -> OverseerCoordinator:
+    registry = ResourceRegistry()
+    for resource in store.list_resources():
+        registry.register_resource(resource)
+    for claim in store.list_claims():
+        try:
+            decision = store.load_decision(claim.id)
+        except KeyError:
+            continue
+        registry.restore_claim(claim, decision)
+    return OverseerCoordinator(registry=registry, store=store)
 
 
 def needs_operator_approval(result: CoordinationResult) -> bool:

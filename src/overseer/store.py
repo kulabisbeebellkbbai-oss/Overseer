@@ -160,6 +160,9 @@ class SQLiteStore:
     def load_claim(self, claim_id: str) -> Claim:
         return _load_dataclass(Claim, self._get_payload("claims", claim_id))
 
+    def list_claims(self) -> tuple[Claim, ...]:
+        return tuple(_load_dataclass(Claim, payload) for payload in self._list_payloads("claims"))
+
     def load_decision(self, claim_id: str) -> ConflictDecision:
         row = self._connection.execute("SELECT payload FROM decisions WHERE claim_id = ?", (claim_id,)).fetchone()
         if row is None:

@@ -23,6 +23,7 @@ from .cli import (
     release_claim_status,
     request_claim_status,
     service_status,
+    runtime_status,
 )
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
@@ -41,6 +42,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/service-status":
                 self._handle(lambda: service_status(store_path))
+                return
+            if self.path == "/runtime-status":
+                self._handle(lambda: runtime_status(store_path))
                 return
             if self.path == "/health-summary":
                 self._handle(lambda: health_summary_status(store_path))

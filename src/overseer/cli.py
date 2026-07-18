@@ -286,6 +286,34 @@ def service_status(store_path: str | Path, service_name: str = "overseer") -> di
         store.close()
 
 
+def runtime_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        heartbeat = store.load_runtime_heartbeat(service_name)
+        snapshots = store.list_host_snapshots()
+        latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        host_security = host_security_status(latest_snapshot) if latest_snapshot else None
+        return {
+            "store": str(store.path),
+            "service": {
+                "service_name": heartbeat.service_name,
+                "started_at": heartbeat.started_at,
+                "last_tick_at": heartbeat.last_tick_at,
+                "tick_count": heartbeat.tick_count,
+            },
+            "host_inspection": {
+                "enabled": latest_snapshot is not None,
+                "latest_snapshot_id": latest_snapshot.id if latest_snapshot else None,
+                "latest_captured_at": latest_snapshot.captured_at if latest_snapshot else None,
+                "hostname": latest_snapshot.hostname if latest_snapshot else None,
+                "high_findings": host_security["high_findings"] if host_security else 0,
+                "warning_findings": host_security["warning_findings"] if host_security else 0,
+            },
+        }
+    finally:
+        store.close()
+
+
 def inspect_host_status(store_path: str | Path | None = None) -> dict[str, object]:
     snapshot = HostInspectionAdapter().inspect()
     status = host_snapshot_status(snapshot)
@@ -780,6 +808,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
     service_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser.add_argument("--service-name", default="overseer")
+    runtime_status_parser = subparsers.add_parser("runtime-status", help="read runtime heartbeat and latest host inspection status")
+    runtime_status_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    runtime_status_parser.add_argument("--service-name", default="overseer")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
     assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
@@ -901,6 +932,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "service-status":
         print(json.dumps(service_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "runtime-status":
+        print(json.dumps(runtime_status(args.store, args.service_name), sort_keys=True))
         return 0
 
     if args.command == "inspect-host":

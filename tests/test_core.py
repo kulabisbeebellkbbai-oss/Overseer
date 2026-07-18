@@ -107,6 +107,7 @@ from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_claim_status
 from overseer.cli import run_status
+from overseer.cli import runtime_status
 from overseer.cli import service_status
 from overseer.cli import seed_config_status
 
@@ -683,6 +684,27 @@ class OverseerApiTests(unittest.TestCase):
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.api")
 
+    def test_loopback_api_reports_runtime_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:01:00+00:00",
+                    tick_count=3,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path) as server:
+                status = server.get("/runtime-status")
+
+            self.assertEqual(status["service"]["tick_count"], 3)
+            self.assertFalse(status["host_inspection"]["enabled"])
+
     def test_loopback_api_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -786,6 +808,27 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.client")
+
+    def test_client_reads_runtime_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:01:00+00:00",
+                    tick_count=4,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.runtime_status()
+
+            self.assertEqual(status["service"]["tick_count"], 4)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1027,6 +1070,67 @@ class HostInspectionTests(unittest.TestCase):
 
         self.assertEqual(status["snapshot_id"], second.id)
         self.assertEqual(status["high_findings"], 1)
+
+    def test_runtime_status_reports_latest_host_security_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:01:00+00:00",
+                    tick_count=2,
+                )
+            )
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-b"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:01:30+00:00")
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = runtime_status(store_path)
+
+        self.assertEqual(status["service"]["tick_count"], 2)
+        self.assertTrue(status["host_inspection"]["enabled"])
+        self.assertEqual(status["host_inspection"]["latest_snapshot_id"], snapshot.id)
+        self.assertEqual(status["host_inspection"]["latest_captured_at"], "2026-07-18T16:01:30+00:00")
+        self.assertEqual(status["host_inspection"]["high_findings"], 1)
+        self.assertEqual(status["host_inspection"]["warning_findings"], 0)
+
+    def test_runtime_status_handles_missing_host_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:01:00+00:00",
+                    tick_count=1,
+                )
+            )
+            store.close()
+
+            status = runtime_status(store_path)
+
+        self.assertFalse(status["host_inspection"]["enabled"])
+        self.assertIsNone(status["host_inspection"]["latest_snapshot_id"])
+        self.assertEqual(status["host_inspection"]["high_findings"], 0)
 
 
 class AdminChangePlanTests(unittest.TestCase):

@@ -21,6 +21,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 
 - `GET /health`
 - `GET /service-status`
+- `GET /runtime-status`
 - `GET /health-summary`
 - `GET /host/security`
 - `GET /admin/authorizations-required`
@@ -52,6 +53,7 @@ Local Python tools can use `overseer.client.OverseerApiClient` to read the token
 from overseer.client import OverseerApiClient
 
 client = OverseerApiClient(auth_token_file="state/api-token")
+runtime = client.runtime_status()
 summary = client.health_summary()
 snapshot = client.inspect_host()
 plan = client.plan_admin_change(

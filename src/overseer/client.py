@@ -28,6 +28,9 @@ class OverseerApiClient:
     def service_status(self) -> dict[str, Any]:
         return self._get("/service-status")
 
+    def runtime_status(self) -> dict[str, Any]:
+        return self._get("/runtime-status")
+
     def health_summary(self) -> dict[str, Any]:
         return self._get("/health-summary")
 

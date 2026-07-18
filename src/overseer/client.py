@@ -173,6 +173,9 @@ class OverseerApiClient:
     def request_admin_history_restore(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/history-restore-requests", payload)
 
+    def approve_admin_history_restore(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/history-restore-requests/approve", payload)
+
     def archive_admin_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/history-archive", payload)
 

@@ -85,6 +85,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/history-archives` lists persisted archive records and supports `?plan_id=...` filtering. It is read-only and does not restore or modify plans.
 `GET /admin/history-restore-readiness` lists archived plans with restore risk, required approval level, archive record presence, and related evidence. It supports `?plan_id=...` filtering and is read-only.
 `POST /admin/history-restore-requests` creates the approval request required before an archived plan can be restored.
+`POST /admin/history-restore-requests/approve` approves a pending admin history restore request after validating that it targets an archived admin plan with a matching archive record.
 `POST /admin/history-archive` marks archive-ready admin plans archived after explicit approval. It preserves the original plan, execution, IDS review, and audit records, persists an archive record, and emits an audit event.
 `POST /admin/history-unarchive` restores one archived admin plan to active admin history after the restore approval is approved. It keeps the archive record and emits an audit event.
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, restore approvals, and recent admin audit events.

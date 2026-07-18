@@ -113,6 +113,7 @@ from overseer.cli import admin_history_restore_readiness_status
 from overseer.cli import admin_summary_status
 from overseer.cli import archive_admin_history_status
 from overseer.cli import approve_admin_change_status
+from overseer.cli import approve_admin_history_restore_status
 from overseer.cli import approve_claim_status
 from overseer.cli import alerts_summary_status
 from overseer.cli import audit_summary_status
@@ -858,7 +859,7 @@ class HealthSummaryTests(unittest.TestCase):
             )
             pending_restore_summary = admin_summary_status(store_path)
             pending_restore_authorizations = authorizations_required_status(store_path)
-            restore_approval = approve_claim_status(
+            restore_approval = approve_admin_history_restore_status(
                 store_path,
                 restore_request["approval_id"],
                 "sisko",
@@ -922,7 +923,14 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(pending_restore_summary["restore_approvals"]["items"][0]["plan_id"], "admin.restart.completed")
         self.assertEqual(pending_restore_authorizations["pending_restore_approval_count"], 1)
         self.assertEqual(pending_restore_authorizations["restore_approvals"][0]["plan_id"], "admin.restart.completed")
+        self.assertEqual(
+            pending_restore_authorizations["restore_approvals"][0]["next_step"],
+            "approve-admin-history-restore before unarchive-admin-history",
+        )
         self.assertEqual(restore_approval["approval_status"], ApprovalStatus.APPROVED.value)
+        self.assertTrue(restore_approval["restore_approval"])
+        self.assertEqual(restore_approval["plan_id"], "admin.restart.completed")
+        self.assertEqual(restore_approval["archive_record_id"], "admin.archive.admin.restart.completed")
         self.assertEqual(post_archive_summary["archived_plans"], 1)
         self.assertEqual(post_archive_summary["restore_approvals"]["pending"], 0)
         self.assertEqual(post_archive_summary["restore_approvals"]["approved"], 1)
@@ -2375,6 +2383,61 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(approved["approved_by"], "sisko")
             self.assertTrue(approved["can_execute"])
             self.assertEqual(after["pending_count"], 0)
+
+    def test_client_approves_admin_history_restore_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            completed = plan_admin_change_status(
+                store_path,
+                "admin.restart.client.completed",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+            approve_admin_change_status(store_path, completed["id"], "sisko")
+            store = SQLiteStore(store_path)
+            store.save_admin_execution(
+                AdminExecutionResult(
+                    id="admin.exec.admin.restart.client.completed.completed",
+                    plan_id=completed["id"],
+                    status=AdminExecutionStatus.COMPLETED,
+                    summary="admin change completed and verified",
+                    command_results=(),
+                )
+            )
+            store.close()
+            archive_admin_history_status(
+                store_path,
+                "sisko",
+                "2026-07-18T22:40:00+00:00",
+                plan_id=completed["id"],
+            )
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_admin_history_restore(
+                    {
+                        "plan_id": completed["id"],
+                        "requested_by": "sisko",
+                        "requested_at": "2026-07-18T22:41:00+00:00",
+                    }
+                )
+                pending = client.authorizations_required()
+                approved = client.approve_admin_history_restore(
+                    {
+                        "approval_id": requested["approval_id"],
+                        "approved_by": "sisko",
+                        "approved_at": "2026-07-18T22:42:00+00:00",
+                    }
+                )
+                after = client.authorizations_required()
+
+            self.assertEqual(pending["pending_restore_approval_count"], 1)
+            self.assertTrue(approved["restore_approval"])
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertEqual(approved["plan_id"], completed["id"])
+            self.assertEqual(after["pending_restore_approval_count"], 0)
 
     def test_client_cancels_placeholder_admin_change_plan(self):
         with tempfile.TemporaryDirectory() as directory:

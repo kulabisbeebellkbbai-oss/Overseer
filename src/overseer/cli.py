@@ -1945,6 +1945,7 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
 
 
 def admin_history_restore_approval_status(approval: ApprovalRequest) -> dict[str, object]:
+    approval_status = ApprovalStatus(approval.status)
     return {
         "id": approval.id,
         "plan_id": approval.subject_id,
@@ -1952,11 +1953,20 @@ def admin_history_restore_approval_status(approval: ApprovalRequest) -> dict[str
         "requester_thread": approval.requester_thread,
         "owner_domain": OwnerDomain(approval.owner_domain).value,
         "reason": approval.reason,
-        "status": ApprovalStatus(approval.status).value,
+        "status": approval_status.value,
         "evidence_required": list(approval.evidence_required),
         "decided_by": approval.decided_by,
         "decided_at": approval.decided_at,
+        "next_step": _admin_history_restore_approval_next_step(approval_status),
     }
+
+
+def _admin_history_restore_approval_next_step(status: ApprovalStatus) -> str:
+    if status == ApprovalStatus.PENDING:
+        return "approve-admin-history-restore before unarchive-admin-history"
+    if status == ApprovalStatus.APPROVED:
+        return "unarchive-admin-history with the approved restore approval"
+    return "restore approval is not actionable"
 
 
 def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object]:
@@ -2168,6 +2178,47 @@ def request_admin_history_restore_status(
         }
     finally:
         store.close()
+
+
+def approve_admin_history_restore_status(
+    store_path: str | Path,
+    approval_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"restore approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.admin.restore."):
+            raise ValueError("admin history restore approval is required")
+        try:
+            plan = store.load_admin_change_plan(approval.subject_id)
+        except KeyError:
+            raise ValueError(f"restore approval subject admin plan does not exist: {approval.subject_id}") from None
+        if not plan.archived:
+            raise ValueError("restore approval subject admin plan is not archived")
+        archive_record_id = plan.archive_record_id
+        archive_record = store.load_admin_history_archive(archive_record_id) if archive_record_id else None
+        if archive_record is None:
+            raise ValueError("matching admin history archive record is required before restore approval")
+    finally:
+        store.close()
+
+    approved = approve_claim_status(store_path, approval_id, approved_by, approved_at)
+    return {
+        **approved,
+        "plan_id": approval.subject_id,
+        "archive_record_id": archive_record.id,
+        "restore_approval": True,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+    }
 
 
 def archive_admin_history_status(
@@ -3269,6 +3320,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_restore_request_parser.add_argument("--plan-id", required=True)
     admin_restore_request_parser.add_argument("--requested-by", required=True)
     admin_restore_request_parser.add_argument("--requested-at")
+    admin_restore_approve_parser = subparsers.add_parser("approve-admin-history-restore", help="approve a requested admin history restore")
+    admin_restore_approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_restore_approve_parser.add_argument("--approval-id", required=True)
+    admin_restore_approve_parser.add_argument("--approved-by", required=True)
+    admin_restore_approve_parser.add_argument("--approved-at")
     archive_admin_history_parser = subparsers.add_parser("archive-admin-history", help="archive inactive admin plans after explicit approval")
     archive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     archive_admin_history_parser.add_argument("--archived-by", required=True)
@@ -3628,6 +3684,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "request-admin-history-restore":
         print(json.dumps(request_admin_history_restore_status(args.store, args.plan_id, args.requested_by, args.requested_at), sort_keys=True))
+        return 0
+
+    if args.command == "approve-admin-history-restore":
+        print(json.dumps(approve_admin_history_restore_status(args.store, args.approval_id, args.approved_by, args.approved_at), sort_keys=True))
         return 0
 
     if args.command == "archive-admin-history":

@@ -15,6 +15,16 @@ from .core import (
     decide_claim,
 )
 from .health import HealthEvidence, HealthStatus, HealthTarget, ProbeResult, ProbeType, classify_probe, recovery_evidence
+from .maintenance import (
+    InterruptionPolicy,
+    MaintenanceKind,
+    MaintenancePlan,
+    MaintenanceReadiness,
+    MaintenanceStatus,
+    MaintenanceWindow,
+    assess_maintenance_readiness,
+    can_close_maintenance,
+)
 from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_conflicts
 
 __all__ = [
@@ -37,6 +47,14 @@ __all__ = [
     "ProbeType",
     "classify_probe",
     "recovery_evidence",
+    "InterruptionPolicy",
+    "MaintenanceKind",
+    "MaintenancePlan",
+    "MaintenanceReadiness",
+    "MaintenanceStatus",
+    "MaintenanceWindow",
+    "assess_maintenance_readiness",
+    "can_close_maintenance",
     "PhysicalAssetKind",
     "PhysicalIdentity",
     "physical_identity_conflicts",

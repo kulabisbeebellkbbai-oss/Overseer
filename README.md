@@ -26,5 +26,9 @@ The first release should include a working initial slice for every major domain:
 - DS9-inspired agent role map: `docs/agents.md`
 - Initial quality gates: `docs/quality-gates.md`
 - Command and safety model: `docs/command-safety-model.md`
+- Virtual asset checkout: `docs/virtual-asset-checkout.md`
+- Service health monitoring: `docs/service-health-monitoring.md`
+- Physical asset checkout: `docs/physical-asset-checkout.md`
+- Maintenance and patch operations: `docs/maintenance-and-patch-operations.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

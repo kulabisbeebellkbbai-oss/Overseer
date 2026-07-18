@@ -16,10 +16,17 @@ from overseer import (
     recovery_evidence,
     HealthStatus,
     HealthTarget,
+    InterruptionPolicy,
+    MaintenanceKind,
+    MaintenancePlan,
+    MaintenanceStatus,
+    MaintenanceWindow,
     ProbeResult,
     ProbeType,
     PhysicalAssetKind,
     PhysicalIdentity,
+    assess_maintenance_readiness,
+    can_close_maintenance,
     physical_identity_conflicts,
 )
 
@@ -167,11 +174,6 @@ class ConflictDecisionTests(unittest.TestCase):
         self.assertEqual(decision.outcome, ConflictOutcome.QUARANTINE)
         self.assertEqual(decision.approval_level, ApprovalLevel.HUMAN)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class HealthClassificationTests(unittest.TestCase):
     def test_classifies_healthy_json_probe(self):
         target = HealthTarget(
@@ -284,3 +286,76 @@ class PhysicalIdentityTests(unittest.TestCase):
         )
 
         self.assertTrue(identity.has_storage_risk())
+
+
+class MaintenancePlanTests(unittest.TestCase):
+    def test_blocks_medium_risk_patch_without_rollback_plan(self):
+        plan = MaintenancePlan(
+            id="maint.patch.gateway",
+            resource_id="gateway.protected",
+            kind=MaintenanceKind.PATCH,
+            requested_state="1.2.3",
+            risk_level=RiskLevel.MEDIUM,
+            window=MaintenanceWindow(
+                id="window.maint",
+                starts_at="2026-07-18T08:00:00-04:00",
+                ends_at="2026-07-18T08:30:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.RESTART_ALLOWED,
+            precheck_ids=("health.gateway.before",),
+        )
+
+        readiness = assess_maintenance_readiness(plan)
+
+        self.assertFalse(readiness.ready)
+        self.assertEqual(readiness.status, MaintenanceStatus.BLOCKED)
+        self.assertEqual(readiness.missing_evidence, ("rollback_plan",))
+
+    def test_high_risk_update_is_ready_but_requires_sisko_approval(self):
+        plan = MaintenancePlan(
+            id="maint.update.proxy",
+            resource_id="proxy.protected",
+            kind=MaintenanceKind.UPDATE,
+            requested_state="2.0.0",
+            risk_level=RiskLevel.HIGH,
+            window=MaintenanceWindow(
+                id="window.update",
+                starts_at="2026-07-18T09:00:00-04:00",
+                ends_at="2026-07-18T09:45:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.EXCLUSIVE_WINDOW_REQUIRED,
+            precheck_ids=("health.proxy.before",),
+            rollback_plan="restore previous proxy package and config snapshot",
+        )
+
+        readiness = assess_maintenance_readiness(plan)
+
+        self.assertTrue(readiness.ready)
+        self.assertEqual(readiness.approval_level, ApprovalLevel.SISKO)
+
+    def test_requires_post_change_verification_before_closure(self):
+        plan = MaintenancePlan(
+            id="maint.restart.mcp",
+            resource_id="svc.mcp.github",
+            kind=MaintenanceKind.RESTART,
+            requested_state="restarted",
+            risk_level=RiskLevel.LOW,
+            window=MaintenanceWindow(
+                id="window.restart",
+                starts_at="2026-07-18T10:00:00-04:00",
+                ends_at="2026-07-18T10:05:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.RESTART_ALLOWED,
+            precheck_ids=("health.mcp.before",),
+            status=MaintenanceStatus.VERIFYING,
+        )
+
+        readiness = can_close_maintenance(plan)
+
+        self.assertFalse(readiness.ready)
+        self.assertEqual(readiness.status, MaintenanceStatus.VERIFYING)
+        self.assertEqual(readiness.missing_evidence, ("verification_ids",))
+
+
+if __name__ == "__main__":
+    unittest.main()

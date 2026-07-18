@@ -285,7 +285,7 @@ def health_summary_status(store_path: str | Path) -> dict[str, object]:
                     "name": summary.name,
                     "target": summary.target,
                     "status": summary.latest_status.value,
-                    "owner_domain": summary.owner_domain.value,
+                    "owner_domain": OwnerDomain(summary.owner_domain).value,
                     "latest_evidence_id": summary.latest_evidence_id,
                     "latest_captured_at": summary.latest_captured_at,
                     "recovery_required": summary.recovery_required,
@@ -544,6 +544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser.add_argument("--service-name", default="overseer")
     health_summary_parser = subparsers.add_parser("health-summary", help="summarize latest health evidence per target")
     health_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
     claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser.add_argument("--claim-id", required=True)
@@ -629,8 +630,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "health-summary":
-        print(json.dumps(health_summary_status(args.store), sort_keys=True))
-        return 0
+        status = health_summary_status(args.store)
+        print(json.dumps(status, sort_keys=True))
+        return 1 if args.fail_on_unhealthy and status["unhealthy"] else 0
 
     if args.command == "request-claim":
         print(

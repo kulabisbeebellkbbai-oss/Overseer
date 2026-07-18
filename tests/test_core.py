@@ -79,6 +79,7 @@ from overseer.cli import activate_claim_status
 from overseer.cli import approve_claim_status
 from overseer.cli import health_summary_status
 from overseer.cli import list_state_status
+from overseer.cli import main as cli_main
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
@@ -576,6 +577,25 @@ class HealthSummaryTests(unittest.TestCase):
             self.assertEqual(status["healthy"], 1)
             self.assertEqual(status["unhealthy"], 0)
             self.assertEqual(status["summaries"][0]["latest_evidence_id"], "evidence.new")
+
+    def test_health_summary_cli_can_fail_on_unhealthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.unhealthy",
+                    resource_id="svc.unhealthy",
+                    name="Unhealthy",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:1/health",
+                )
+            )
+            store.close()
+
+            exit_code = cli_main(["health-summary", "--store", str(store_path), "--fail-on-unhealthy"])
+
+            self.assertEqual(exit_code, 1)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

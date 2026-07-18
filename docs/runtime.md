@@ -19,6 +19,7 @@ PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3 --fail-on-unhealthy
 ```
 
 ## Local User Service

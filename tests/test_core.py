@@ -106,6 +106,7 @@ from overseer.cli import activate_claim_status
 from overseer.cli import admin_executions_status
 from overseer.cli import admin_execution_readiness_status
 from overseer.cli import admin_history_archive_plan_status
+from overseer.cli import admin_history_archives_status
 from overseer.cli import admin_history_review_status
 from overseer.cli import admin_summary_status
 from overseer.cli import archive_admin_history_status
@@ -842,6 +843,8 @@ class HealthSummaryTests(unittest.TestCase):
             )
             post_archive_review = admin_history_review_status(store_path)
             post_archive_plan = admin_history_archive_plan_status(store_path)
+            post_archive_records = admin_history_archives_status(store_path)
+            filtered_archive_records = admin_history_archives_status(store_path, "admin.restart.completed")
             post_archive_summary = admin_summary_status(store_path)
             post_archive_state = list_state_status(store_path)
             restored = unarchive_admin_history_status(
@@ -878,6 +881,11 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(post_archive_review["archive_candidates"], 1)
         self.assertEqual(post_archive_review["archived_plans"], 1)
         self.assertEqual(post_archive_plan["planned_bundles"], 1)
+        self.assertEqual(post_archive_records["archive_records"], 1)
+        self.assertFalse(post_archive_records["mutation_performed"])
+        self.assertEqual(post_archive_records["records"][0]["plan_id"], "admin.restart.completed")
+        self.assertEqual(filtered_archive_records["archive_records"], 1)
+        self.assertEqual(filtered_archive_records["filters"]["plan_id"], "admin.restart.completed")
         self.assertEqual(post_archive_summary["archived_plans"], 1)
         archived_state_plan = next(item for item in post_archive_state["admin_change_plans"] if item["id"] == "admin.restart.completed")
         self.assertTrue(archived_state_plan["archived"])
@@ -2337,6 +2345,8 @@ class OverseerApiClientTests(unittest.TestCase):
                 readiness = client.admin_execution_readiness()
                 history = client.admin_history_review()
                 archive_plan = client.admin_history_archive_plan()
+                archives = client.admin_history_archives()
+                filtered_archives = client.admin_history_archives("admin.restart.blocked")
                 archive_result = client.archive_admin_history(
                     {
                         "archived_by": "sisko",
@@ -2362,6 +2372,8 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(readiness["items"][0]["readiness_state"], "approval_required")
             self.assertEqual(history["items"][0]["disposition"], "retain_active")
             self.assertEqual(archive_plan["planned_bundles"], 0)
+            self.assertEqual(archives["archive_records"], 0)
+            self.assertEqual(filtered_archives["filters"]["plan_id"], "admin.restart.blocked")
             self.assertFalse(archive_result["mutation_performed"])
             self.assertIsNotNone(unarchive_error)
             self.assertEqual(unarchive_error.code, 400)

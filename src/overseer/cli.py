@@ -2016,6 +2016,24 @@ def admin_history_archive_plan_status(store_path: str | Path) -> dict[str, objec
         store.close()
 
 
+def admin_history_archives_status(store_path: str | Path, plan_id: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        records = list(store.list_admin_history_archives())
+        if plan_id is not None:
+            records = [record for record in records if record.plan_id == plan_id]
+        return {
+            "store": str(store.path),
+            "mode": "read_only",
+            "mutation_performed": False,
+            "archive_records": len(records),
+            "filters": {"plan_id": plan_id},
+            "records": [admin_history_archive_record_status(record) for record in records],
+        }
+    finally:
+        store.close()
+
+
 def archive_admin_history_status(
     store_path: str | Path,
     archived_by: str,
@@ -3020,6 +3038,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archive_plan_parser = subparsers.add_parser("admin-history-archive-plan", help="prepare a read-only archive manifest for inactive admin plans")
     admin_archive_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_archives_parser = subparsers.add_parser("admin-history-archives", help="list persisted admin history archive records")
+    admin_archives_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_archives_parser.add_argument("--plan-id", help="filter archive records by admin plan id")
     archive_admin_history_parser = subparsers.add_parser("archive-admin-history", help="archive inactive admin plans after explicit approval")
     archive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     archive_admin_history_parser.add_argument("--archived-by", required=True)
@@ -3366,6 +3387,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-history-archive-plan":
         print(json.dumps(admin_history_archive_plan_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-history-archives":
+        print(json.dumps(admin_history_archives_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "archive-admin-history":

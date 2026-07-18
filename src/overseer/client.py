@@ -158,6 +158,12 @@ class OverseerApiClient:
     def admin_history_archive_plan(self) -> dict[str, Any]:
         return self._get("/admin/history-archive-plan")
 
+    def admin_history_archives(self, plan_id: str | None = None) -> dict[str, Any]:
+        path = "/admin/history-archives"
+        if plan_id is not None:
+            path = f"{path}?{urlencode({'plan_id': plan_id})}"
+        return self._get(path)
+
     def archive_admin_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/history-archive", payload)
 

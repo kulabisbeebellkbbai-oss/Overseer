@@ -19,6 +19,7 @@ from .cli import (
     alerts_summary_status,
     authorizations_required_status,
     cancel_admin_change_status,
+    command_summary_status,
     execute_admin_change_status,
     health_summary_status,
     inspect_host_status,
@@ -52,6 +53,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/runtime-status":
                 self._handle(lambda: runtime_status(store_path))
+                return
+            if self.path == "/command-summary":
+                self._handle(lambda: command_summary_status(store_path))
                 return
             if self.path == "/health-summary":
                 self._handle(lambda: health_summary_status(store_path))

@@ -384,6 +384,116 @@ def _sorted_identifier_values(resource: Resource, key: str) -> list[object]:
     return []
 
 
+def command_summary_status(
+    store_path: str | Path,
+    service_name: str = "overseer",
+    now: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        resources = store.list_resources()
+        claims = store.list_claims()
+        approvals = store.list_approvals()
+        audit_events = store.list_audit_events()
+        usage_limits = store.list_usage_limits()
+        physical_identities = store.list_physical_identities()
+        health_summaries = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
+        admin_plans = store.list_admin_change_plans()
+        heartbeats = store.list_runtime_heartbeats()
+        heartbeat = next((item for item in heartbeats if item.service_name == service_name), None)
+        runtime_freshness = assess_freshness(
+            heartbeat.last_tick_at if heartbeat else None,
+            now=now,
+            policy=DEFAULT_RUNTIME_FRESHNESS_POLICY,
+        )
+        alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
+        pending_approvals = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
+        pending_admin_plans = [
+            plan
+            for plan in admin_plans
+            if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
+        ]
+        return {
+            "store": str(store.path),
+            "service": {
+                "service_name": service_name,
+                "heartbeat_present": heartbeat is not None,
+                "freshness": freshness_status(runtime_freshness),
+            },
+            "resources": {
+                "total": len(resources),
+                "by_type": {
+                    resource_type.value: sum(1 for resource in resources if resource.type == resource_type)
+                    for resource_type in ResourceType
+                },
+                "by_owner": {
+                    owner.value: sum(1 for resource in resources if resource.owner_domain == owner)
+                    for owner in OwnerDomain
+                },
+                "by_state": {
+                    state.value: sum(1 for resource in resources if resource.state == state)
+                    for state in ResourceState
+                },
+                "high_or_critical_risk": sum(
+                    1 for resource in resources if resource.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}
+                ),
+            },
+            "claims": {
+                "total": len(claims),
+                "active_like": sum(1 for claim in claims if claim.is_active_like()),
+                "queued": sum(1 for claim in claims if claim.status == ClaimStatus.QUEUED),
+                "blocked": sum(1 for claim in claims if claim.status == ClaimStatus.BLOCKED),
+                "pending_approvals": len(pending_approvals),
+            },
+            "health": {
+                "targets": len(health_summaries),
+                "healthy": sum(1 for summary in health_summaries if summary.latest_status == HealthStatus.HEALTHY),
+                "unhealthy": sum(
+                    1
+                    for summary in health_summaries
+                    if summary.latest_status in {HealthStatus.DEGRADED, HealthStatus.FAILED, HealthStatus.UNKNOWN}
+                ),
+            },
+            "usage_limits": {
+                "total": len(usage_limits),
+                "available": sum(1 for limit in usage_limits if limit.remaining > 0),
+                "exhausted": sum(1 for limit in usage_limits if limit.is_exhausted()),
+            },
+            "physical_assets": {
+                "total": len(physical_identities),
+                "ready_for_checkout": sum(
+                    1 for identity in physical_identities if identity.is_complete_for_exclusive_checkout()
+                ),
+                "power_risk": sum(1 for identity in physical_identities if identity.has_power_risk()),
+                "storage_risk": sum(1 for identity in physical_identities if identity.has_storage_risk()),
+            },
+            "virtual_assets": {
+                "total": sum(1 for resource in resources if resource.type == ResourceType.VIRTUAL_ASSET),
+                "active_claims": sum(
+                    1
+                    for claim in claims
+                    if claim.is_active_like()
+                    and any(
+                        resource.id == claim.resource_id and resource.type == ResourceType.VIRTUAL_ASSET
+                        for resource in resources
+                    )
+                ),
+            },
+            "admin": {
+                "plans": len(admin_plans),
+                "pending_authorizations": len(pending_admin_plans),
+            },
+            "alerts": {
+                "total": len(alerts),
+                "high_or_critical": sum(
+                    1 for event in alerts if event.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}
+                ),
+            },
+        }
+    finally:
+        store.close()
+
+
 def run_status(
     store_path: str | Path,
     once: bool,
@@ -1112,6 +1222,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     physical_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     virtual_summary_parser = subparsers.add_parser("virtual-summary", help="summarize persisted virtual assets")
     virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    command_summary_parser = subparsers.add_parser("command-summary", help="summarize command-level Overseer state")
+    command_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    command_summary_parser.add_argument("--service-name", default="overseer")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -1240,6 +1353,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "virtual-summary":
         print(json.dumps(virtual_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "command-summary":
+        print(json.dumps(command_summary_status(args.store, args.service_name), sort_keys=True))
         return 0
 
     if args.command == "run":

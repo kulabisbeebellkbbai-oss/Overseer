@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 
 from overseer import (
     ApprovalLevel,
+    ApprovalRequest,
     ApprovalStatus,
     AuditEvent,
     AuditEventType,
@@ -104,6 +105,7 @@ from overseer.cli import alerts_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
+from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
 from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
@@ -862,6 +864,112 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(gateway["queued_claim_ids"], ["claim.gateway.queued"])
         self.assertFalse(gateway["ready_for_checkout"])
 
+    def test_command_summary_reports_cross_domain_state_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.command",
+                    name="Command Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.HIGH,
+                    identifiers={"kind": "gateway", "ports": [8795]},
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.command",
+                    resource_id="gateway.command",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use command gateway",
+                    requested_action="bind gateway",
+                    risk_level=RiskLevel.HIGH,
+                    status=ClaimStatus.APPROVED,
+                    port_reservations=frozenset({8795}),
+                )
+            )
+            store.save_approval(
+                ApprovalRequest(
+                    id="approval.command",
+                    subject_id="claim.command",
+                    approval_level=ApprovalLevel.SISKO,
+                    requester_thread="thread-a",
+                    owner_domain=OwnerDomain.SISKO,
+                    reason="high-risk gateway use",
+                )
+            )
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.command",
+                    resource_id="svc.command",
+                    kind=LimitKind.REQUESTS,
+                    capacity=10,
+                    remaining=0,
+                    resets_at=None,
+                    window="hourly",
+                )
+            )
+            store.save_health_target(
+                HealthTarget(
+                    id="health.command",
+                    resource_id="gateway.command",
+                    name="Command Gateway",
+                    probe_type=ProbeType.HTTP,
+                    target="http://127.0.0.1:8795/health",
+                )
+            )
+            store.save_physical_identity(
+                PhysicalIdentity(
+                    kind=PhysicalAssetKind.USB_DEVICE,
+                    stable_id="usb.command",
+                    vendor_id="1234",
+                    product_id="5678",
+                    serial_number="abc",
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.command",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="gateway.command",
+                    summary="gateway alert",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T17:00:00+00:00",
+                    last_tick_at="2026-07-18T17:00:00+00:00",
+                    tick_count=1,
+                )
+            )
+            before_audit_count = len(store.list_audit_events())
+            store.close()
+
+            status = command_summary_status(store_path, now="2026-07-18T17:00:10+00:00")
+            store = SQLiteStore(store_path)
+            after_audit_count = len(store.list_audit_events())
+            store.close()
+
+        self.assertEqual(status["service"]["freshness"]["status"], FreshnessStatus.OK.value)
+        self.assertEqual(status["resources"]["total"], 1)
+        self.assertEqual(status["resources"]["by_type"][ResourceType.VIRTUAL_ASSET.value], 1)
+        self.assertEqual(status["claims"]["active_like"], 1)
+        self.assertEqual(status["claims"]["pending_approvals"], 1)
+        self.assertEqual(status["health"]["unhealthy"], 1)
+        self.assertEqual(status["usage_limits"]["exhausted"], 1)
+        self.assertEqual(status["physical_assets"]["ready_for_checkout"], 1)
+        self.assertEqual(status["virtual_assets"]["active_claims"], 1)
+        self.assertEqual(status["alerts"]["high_or_critical"], 1)
+        self.assertEqual(after_audit_count, before_audit_count)
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1165,6 +1273,28 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["assets"], 1)
             self.assertEqual(status["items"][0]["kind"], "vm")
+
+    def test_client_reads_command_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.command.client",
+                    name="Command Client Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.command_summary()
+
+            self.assertEqual(status["resources"]["total"], 1)
+            self.assertEqual(status["resources"]["by_owner"][OwnerDomain.JULIAN.value], 1)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

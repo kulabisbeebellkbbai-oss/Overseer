@@ -260,3 +260,13 @@ The first implementation should prove this loop:
 7. Release the claim only when the release condition is satisfied.
 
 This slice should support at least one resource from each core domain: physical asset, virtual asset, service health target, maintenance target, usage-limited service, and security surface.
+
+## Command Summary
+
+Sisko's compact operator read model is available with:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli command-summary --store state/overseer.sqlite3
+```
+
+It summarizes service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without creating new audit or freshness records.

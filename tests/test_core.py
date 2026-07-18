@@ -4,6 +4,7 @@ import unittest
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from overseer import (
     ApprovalLevel,
@@ -72,6 +73,7 @@ from overseer import (
     seed_store_from_config,
     validate_config,
 )
+from overseer.api import make_api_handler, run_api_server
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
@@ -119,6 +121,38 @@ class LocalHttpServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+
+
+class LocalOverseerApiServer:
+    def __init__(self, store_path):
+        self.store_path = str(store_path)
+
+    def __enter__(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(self.store_path))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.url = f"http://{host}:{port}"
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def get(self, path):
+        with urlopen(f"{self.url}{path}", timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def post(self, path, payload):
+        request = Request(
+            f"{self.url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -596,6 +630,84 @@ class HealthSummaryTests(unittest.TestCase):
             exit_code = cli_main(["health-summary", "--store", str(store_path), "--fail-on-unhealthy"])
 
             self.assertEqual(exit_code, 1)
+
+
+class OverseerApiTests(unittest.TestCase):
+    def test_loopback_api_reports_health_and_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.api",
+                    name="API Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path) as server:
+                health = server.get("/health")
+                state = server.get("/state")
+
+            self.assertTrue(health["ok"])
+            self.assertEqual(state["resources"][0]["id"], "svc.api")
+
+    def test_loopback_api_runs_claim_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.api",
+                    name="API Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path) as server:
+                requested = server.post(
+                    "/claims/request",
+                    {
+                        "claim_id": "claim.api.proxy",
+                        "resource_id": "proxy.api",
+                        "claim_type": ClaimType.LEASE.value,
+                        "owner_thread": "thread-api",
+                        "owner_role": OwnerDomain.DAX.value,
+                        "intent": "use proxy",
+                        "requested_action": "bind proxy",
+                        "risk_level": RiskLevel.LOW.value,
+                    },
+                )
+                approved = server.post(
+                    "/claims/approve",
+                    {
+                        "approval_id": requested["approval_id"],
+                        "decided_by": "sisko",
+                    },
+                )
+                activated = server.post(
+                    "/claims/activate",
+                    {
+                        "claim_id": requested["claim"],
+                        "approval_id": approved["approval_id"],
+                    },
+                )
+                released = server.post("/claims/release", {"claim_id": requested["claim"]})
+
+            self.assertEqual(requested["claim_status"], ClaimStatus.REQUESTED.value)
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
+            self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
+
+    def test_api_rejects_non_loopback_bind(self):
+        with self.assertRaises(ValueError):
+            run_api_server("state/unused.sqlite3", host="0.0.0.0", port=8766)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

@@ -1,0 +1,134 @@
+"""Loopback HTTP API for local Overseer coordination."""
+
+from __future__ import annotations
+
+import json
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+from .cli import (
+    activate_claim_status,
+    approve_claim_status,
+    health_summary_status,
+    list_state_status,
+    release_claim_status,
+    request_claim_status,
+    service_status,
+)
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+
+
+def make_api_handler(store_path: str):
+    class OverseerApiHandler(BaseHTTPRequestHandler):
+        server_version = "OverseerApi/0.1"
+
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                self._write_json({"ok": True, "service": "overseer-api"})
+                return
+            if self.path == "/service-status":
+                self._handle(lambda: service_status(store_path))
+                return
+            if self.path == "/health-summary":
+                self._handle(lambda: health_summary_status(store_path))
+                return
+            if self.path == "/state":
+                self._handle(lambda: list_state_status(store_path))
+                return
+            self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+        def do_POST(self) -> None:
+            if self.path == "/claims/request":
+                self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
+                return
+            if self.path == "/claims/approve":
+                self._handle_json(lambda payload: approve_claim_status(store_path, **_approve_claim_args(payload)))
+                return
+            if self.path == "/claims/activate":
+                self._handle_json(lambda payload: activate_claim_status(store_path, **_activate_claim_args(payload)))
+                return
+            if self.path == "/claims/release":
+                self._handle_json(lambda payload: release_claim_status(store_path, str(payload["claim_id"])))
+                return
+            self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def _handle(self, handler) -> None:
+            try:
+                self._write_json(handler())
+            except KeyError as error:
+                self._write_json({"error": f"missing record: {error.args[0]}"}, HTTPStatus.NOT_FOUND)
+            except ValueError as error:
+                self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+        def _handle_json(self, handler) -> None:
+            try:
+                payload = self._read_json()
+                self._write_json(handler(payload))
+            except KeyError as error:
+                self._write_json({"error": f"missing field: {error.args[0]}"}, HTTPStatus.BAD_REQUEST)
+            except ValueError as error:
+                self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+        def _read_json(self) -> dict[str, Any]:
+            length = int(self.headers.get("content-length", "0"))
+            if length == 0:
+                return {}
+            data = self.rfile.read(length)
+            parsed = json.loads(data.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("request body must be a JSON object")
+            return parsed
+
+        def _write_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+            body = json.dumps(payload, sort_keys=True).encode("utf-8")
+            self.send_response(int(status))
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return OverseerApiHandler
+
+
+def run_api_server(store_path: str, host: str = "127.0.0.1", port: int = 8766) -> None:
+    if host not in LOOPBACK_HOSTS:
+        raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
+    server = ThreadingHTTPServer((host, port), make_api_handler(store_path))
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_id": str(payload["claim_id"]),
+        "resource_id": str(payload["resource_id"]),
+        "claim_type": str(payload["claim_type"]),
+        "owner_thread": str(payload["owner_thread"]),
+        "owner_role": str(payload["owner_role"]),
+        "intent": str(payload["intent"]),
+        "requested_action": str(payload["requested_action"]),
+        "risk_level": str(payload["risk_level"]),
+        "ports": tuple(int(port) for port in payload.get("ports", ())),
+    }
+
+
+def _approve_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "decided_by": str(payload["decided_by"]),
+        "decided_at": str(payload["decided_at"]) if payload.get("decided_at") else None,
+    }
+
+
+def _activate_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_id": str(payload["claim_id"]),
+        "approval_id": str(payload["approval_id"]) if payload.get("approval_id") else None,
+    }

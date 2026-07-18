@@ -542,6 +542,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
     service_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser.add_argument("--service-name", default="overseer")
+    api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
+    api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
+    api_parser.add_argument("--port", type=int, default=8766)
     health_summary_parser = subparsers.add_parser("health-summary", help="summarize latest health evidence per target")
     health_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
@@ -627,6 +631,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "service-status":
         print(json.dumps(service_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "serve-api":
+        from .api import run_api_server
+
+        run_api_server(args.store, args.host, args.port)
         return 0
 
     if args.command == "health-summary":

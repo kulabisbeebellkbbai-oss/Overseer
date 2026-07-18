@@ -16,6 +16,7 @@ class AdminChangeKind(StrEnum):
     USER_SERVICE_RESTART = "user_service_restart"
     APT_INSTALL = "apt_install"
     FIREWALL_ALLOW_TCP = "firewall_allow_tcp"
+    FIREWALL_DENY_TCP = "firewall_deny_tcp"
     BLOCK_IP = "block_ip"
 
 
@@ -196,6 +197,48 @@ def plan_firewall_allow_tcp(plan_id: str, port: int, reason: str, current_state:
                 "Verify firewall status",
                 ("sudo", "ufw", "status", "verbose"),
                 "confirm the firewall rule exists only as approved",
+            ),
+        ),
+    )
+
+
+def plan_firewall_deny_tcp(plan_id: str, port: int, reason: str, current_state: str = "unknown") -> AdminChangePlan:
+    if port < 1 or port > 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.FIREWALL_DENY_TCP,
+        owner_domain=OwnerDomain.ODO,
+        risk_level=RiskLevel.CRITICAL,
+        approval_level=ApprovalLevel.HUMAN,
+        target=f"tcp/{port}",
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"deny inbound TCP traffic on port {port}",
+        steps=(
+            AdminCommandStep(
+                "Deny TCP port",
+                ("sudo", "ufw", "deny", f"{port}/tcp"),
+                "close the approved inbound service port",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Remove TCP deny rule",
+                ("sudo", "ufw", "delete", "deny", f"{port}/tcp"),
+                "remove the deny rule if it disrupts legitimate work",
+            ),
+        ),
+        risks=(
+            "legitimate clients may lose access",
+            "firewall policy changes require audit review",
+            "service may still listen until its bind configuration is changed",
+        ),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify firewall status",
+                ("sudo", "ufw", "status", "verbose"),
+                "confirm the deny rule exists only as approved",
             ),
         ),
     )

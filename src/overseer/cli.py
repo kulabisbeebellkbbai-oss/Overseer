@@ -23,6 +23,7 @@ from .admin import (
     plan_apt_install,
     plan_block_ip,
     plan_firewall_allow_tcp,
+    plan_firewall_deny_tcp,
     plan_user_service_restart,
 )
 from .config import load_config, seed_store_from_config
@@ -1149,6 +1150,40 @@ def host_security_recommended_path(bind_scope: str, severity: str) -> str:
     return "capture fresh evidence and assign Odo review before any mitigation"
 
 
+def plan_host_security_remediation_status(
+    store_path: str | Path,
+    listener: str,
+    plan_id: str | None = None,
+    action: str = "deny_tcp",
+    reason: str | None = None,
+    snapshot_id: str | None = None,
+) -> dict[str, object]:
+    triage = host_security_triage_status(store_path, snapshot_id)
+    group = next((item for item in triage["listener_groups"] if item["local"] == listener), None)
+    if group is None:
+        raise ValueError(f"host security listener is not present in triage: {listener}")
+    if action != "deny_tcp":
+        raise ValueError("unsupported host security remediation action")
+    port_value = str(group["port"])
+    if not port_value.isdigit():
+        raise ValueError(f"listener does not expose a numeric TCP port: {listener}")
+    default_plan_id = f"admin.host-security.deny-tcp.{port_value}"
+    default_reason = f"stage approval-gated firewall deny for host security listener {listener}"
+    current_state = f"{group['severity']} listener {listener}; bind_scope={group['bind_scope']}; evidence={'; '.join(group['evidence'])}"
+    plan = plan_firewall_deny_tcp(plan_id or default_plan_id, int(port_value), reason or default_reason, current_state)
+    store = SQLiteStore(store_path)
+    try:
+        store.save_admin_change_plan(plan)
+        return {
+            "store": str(store.path),
+            "remediation_action": action,
+            "listener": group,
+            **admin_change_plan_status(plan),
+        }
+    finally:
+        store.close()
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -1207,6 +1242,10 @@ def plan_admin_change_status(
         if port is None:
             raise ValueError("port is required for firewall_allow_tcp")
         plan = plan_firewall_allow_tcp(plan_id, port, reason, current_state)
+    elif plan_kind == AdminChangeKind.FIREWALL_DENY_TCP:
+        if port is None:
+            raise ValueError("port is required for firewall_deny_tcp")
+        plan = plan_firewall_deny_tcp(plan_id, port, reason, current_state)
     elif plan_kind == AdminChangeKind.BLOCK_IP:
         plan = plan_block_ip(plan_id, target, reason, current_state)
     else:
@@ -1761,6 +1800,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     host_triage_parser = subparsers.add_parser("host-security-triage", help="group host security findings by listener")
     host_triage_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_triage_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    host_remediation_parser = subparsers.add_parser(
+        "plan-host-security-remediation",
+        help="stage an approval-gated host security remediation plan",
+    )
+    host_remediation_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    host_remediation_parser.add_argument("--listener", required=True, help="triaged listener local socket, such as 0.0.0.0:22")
+    host_remediation_parser.add_argument("--plan-id", help="admin plan id; defaults from the listener port")
+    host_remediation_parser.add_argument("--action", default="deny_tcp", choices=("deny_tcp",))
+    host_remediation_parser.add_argument("--reason")
+    host_remediation_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     admin_plan_parser = subparsers.add_parser("plan-admin-change", help="prepare an approval-gated admin change plan")
     admin_plan_parser.add_argument("--store", help="explicit SQLite store path for persisting the admin change plan")
     admin_plan_parser.add_argument("--plan-id", required=True)
@@ -1935,6 +1984,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-triage":
         print(json.dumps(host_security_triage_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "plan-host-security-remediation":
+        print(
+            json.dumps(
+                plan_host_security_remediation_status(
+                    args.store,
+                    args.listener,
+                    args.plan_id,
+                    args.action,
+                    args.reason,
+                    args.snapshot_id,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "plan-admin-change":

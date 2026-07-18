@@ -22,6 +22,7 @@ from .admin import (
     plan_apt_install,
     plan_block_ip,
     plan_firewall_allow_tcp,
+    plan_firewall_deny_tcp,
     plan_user_service_restart,
 )
 from .audit import (
@@ -143,6 +144,7 @@ __all__ = [
     "plan_apt_install",
     "plan_block_ip",
     "plan_firewall_allow_tcp",
+    "plan_firewall_deny_tcp",
     "plan_user_service_restart",
     "ApprovalRequest",
     "ApprovalStatus",

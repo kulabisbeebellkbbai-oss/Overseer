@@ -29,6 +29,7 @@ from .cli import (
     list_state_status,
     maintenance_summary_status,
     operator_dashboard_status,
+    plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
     release_claim_status,
@@ -131,6 +132,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
+                return
+            if self.path == "/host/security/remediations/plans":
+                self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
                 return
             if self.path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
@@ -265,6 +269,16 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "current_state": str(payload.get("current_state", "unknown")),
         "packages": tuple(str(package) for package in payload.get("packages", ())),
         "port": int(payload["port"]) if payload.get("port") is not None else None,
+    }
+
+
+def _host_security_remediation_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "listener": str(payload["listener"]),
+        "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
+        "action": str(payload.get("action", "deny_tcp")),
+        "reason": str(payload["reason"]) if payload.get("reason") else None,
+        "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
     }
 
 

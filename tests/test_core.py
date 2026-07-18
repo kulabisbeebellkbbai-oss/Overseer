@@ -91,6 +91,7 @@ from overseer import (
     plan_apt_install,
     plan_block_ip,
     plan_firewall_allow_tcp,
+    plan_firewall_deny_tcp,
     plan_user_service_restart,
 )
 from overseer.api import make_api_handler, run_api_server
@@ -119,6 +120,7 @@ from overseer.cli import main as cli_main
 from overseer.cli import maintenance_summary_status
 from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
+from overseer.cli import plan_host_security_remediation_status
 from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
@@ -1729,6 +1731,38 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["group_count"], 1)
             self.assertEqual(status["listener_groups"][0]["port"], "22")
 
+    def test_client_plans_host_security_remediation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.plan_host_security_remediation({"listener": "0.0.0.0:22"})
+                pending = client.authorizations_required()
+
+            self.assertEqual(status["kind"], AdminChangeKind.FIREWALL_DENY_TCP.value)
+            self.assertEqual(status["target"], "tcp/22")
+            self.assertEqual(status["steps"][0]["command"], ["sudo", "ufw", "deny", "22/tcp"])
+            self.assertEqual(pending["pending_count"], 1)
+
     def test_client_reads_health_efficiency(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2164,6 +2198,40 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(warning_group["bind_scope"], "non_loopback_specific")
         self.assertIn("confirm expected clients", warning_group["recommended_mitigation_path"])
 
+    def test_host_security_remediation_stages_deny_plan_without_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-e"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:05:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = plan_host_security_remediation_status(store_path, "0.0.0.0:22")
+            loaded = SQLiteStore(store_path)
+            plan = loaded.load_admin_change_plan("admin.host-security.deny-tcp.22")
+            loaded.close()
+
+        self.assertEqual(status["remediation_action"], "deny_tcp")
+        self.assertEqual(status["listener"]["bind_scope"], "all_interfaces")
+        self.assertEqual(status["kind"], AdminChangeKind.FIREWALL_DENY_TCP.value)
+        self.assertEqual(status["approval_level"], ApprovalLevel.HUMAN.value)
+        self.assertFalse(status["can_execute"])
+        self.assertEqual(plan.target, "tcp/22")
+
     def test_runtime_status_reports_latest_host_security_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2306,6 +2374,20 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
         self.assertEqual(plan.steps[0].command, ("sudo", "ufw", "allow", "8443/tcp"))
         self.assertEqual(plan.rollback_steps[0].command, ("sudo", "ufw", "delete", "allow", "8443/tcp"))
+
+    def test_firewall_deny_plan_has_critical_risk_and_delete_rollback(self):
+        plan = plan_firewall_deny_tcp(
+            "admin.firewall.deny.22",
+            22,
+            "close exposed ssh listener",
+            "open",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.FIREWALL_DENY_TCP)
+        self.assertEqual(plan.risk_level, RiskLevel.CRITICAL)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.steps[0].command, ("sudo", "ufw", "deny", "22/tcp"))
+        self.assertEqual(plan.rollback_steps[0].command, ("sudo", "ufw", "delete", "deny", "22/tcp"))
 
     def test_admin_change_plan_persists_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

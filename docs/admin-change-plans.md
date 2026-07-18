@@ -29,6 +29,7 @@ PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.
 PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko
 PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"
+PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api
 ```
 
 ## Boundary
@@ -38,3 +39,5 @@ The planner never runs live commands. It produces the exact change list required
 Recording approval does not execute the plan. It only updates the stored approval metadata so a future execution adapter can see that a specific command list was approved.
 
 Canceling a plan keeps the record visible but removes it from the pending authorization queue and prevents execution. Use cancellation for placeholders, superseded plans, or plans created from disproven evidence.
+
+Live execution is currently limited to approved `user_service_restart` plans and is CLI-only. Package installs, firewall rules, IP blocks, network exposure, and privilege changes remain blocked even if a plan is approved.

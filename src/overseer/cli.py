@@ -10,9 +10,13 @@ from pathlib import Path
 from .admin import (
     AdminChangeKind,
     AdminChangePlan,
+    AdminCommandResult,
+    AdminExecutionResult,
+    AdminExecutionStatus,
     approve_admin_change_plan,
     authorization_required_status,
     cancel_admin_change_plan,
+    execute_admin_change_plan,
     missing_admin_change_fields,
     plan_apt_install,
     plan_block_ip,
@@ -333,6 +337,17 @@ def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     }
 
 
+def admin_execution_status(result: AdminExecutionResult) -> dict[str, object]:
+    return {
+        "id": result.id,
+        "plan_id": result.plan_id,
+        "status": AdminExecutionStatus(result.status).value,
+        "summary": result.summary,
+        "command_results": [_admin_command_result_status(item) for item in result.command_results],
+        "verification_results": [_admin_command_result_status(item) for item in result.verification_results],
+    }
+
+
 def plan_admin_change_status(
     store_path: str | Path | None,
     plan_id: str,
@@ -363,6 +378,17 @@ def plan_admin_change_status(
     try:
         store.save_admin_change_plan(plan)
         return {"store": str(store.path), **status}
+    finally:
+        store.close()
+
+
+def execute_admin_change_status(store_path: str | Path, plan_id: str) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        result = execute_admin_change_plan(plan)
+        store.save_admin_execution(result)
+        return {"store": str(store.path), **admin_execution_status(result)}
     finally:
         store.close()
 
@@ -426,6 +452,16 @@ def _admin_command_status(step) -> dict[str, object]:
     }
 
 
+def _admin_command_result_status(result: AdminCommandResult) -> dict[str, object]:
+    return {
+        "title": result.title,
+        "command": list(result.command),
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
 def health_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -472,6 +508,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         heartbeats = store.list_runtime_heartbeats()
         host_snapshots = store.list_host_snapshots()
         admin_change_plans = store.list_admin_change_plans()
+        admin_executions = store.list_admin_executions()
         return {
             "store": str(store.path),
             "resources": [
@@ -575,6 +612,15 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "can_execute": plan.can_execute(),
                 }
                 for plan in admin_change_plans
+            ],
+            "admin_executions": [
+                {
+                    "id": result.id,
+                    "plan_id": result.plan_id,
+                    "status": AdminExecutionStatus(result.status).value,
+                    "summary": result.summary,
+                }
+                for result in admin_executions
             ],
         }
     finally:
@@ -755,6 +801,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     cancel_admin_parser.add_argument("--canceled-by", required=True)
     cancel_admin_parser.add_argument("--reason", required=True)
     cancel_admin_parser.add_argument("--canceled-at")
+    execute_admin_parser = subparsers.add_parser("execute-admin-change", help="execute an approved user-service admin change plan")
+    execute_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    execute_admin_parser.add_argument("--plan-id", required=True)
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -888,6 +937,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "execute-admin-change":
+        print(json.dumps(execute_admin_change_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

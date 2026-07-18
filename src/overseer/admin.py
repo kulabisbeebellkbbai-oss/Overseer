@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import replace
 from enum import StrEnum
@@ -16,11 +18,39 @@ class AdminChangeKind(StrEnum):
     BLOCK_IP = "block_ip"
 
 
+class AdminExecutionStatus(StrEnum):
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class AdminCommandStep:
     title: str
     command: tuple[str, ...]
     reason: str
+
+
+@dataclass(frozen=True)
+class AdminCommandResult:
+    title: str
+    command: tuple[str, ...]
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclass(frozen=True)
+class AdminExecutionResult:
+    id: str
+    plan_id: str
+    status: AdminExecutionStatus
+    summary: str
+    command_results: tuple[AdminCommandResult, ...]
+    verification_results: tuple[AdminCommandResult, ...] = ()
+
+
+AdminCommandRunner = Callable[[AdminCommandStep], AdminCommandResult]
 
 
 @dataclass(frozen=True)
@@ -256,6 +286,77 @@ def cancel_admin_change_plan(
         approved=False,
         approved_by=None,
         approved_at=None,
+    )
+
+
+def execute_admin_change_plan(
+    plan: AdminChangePlan,
+    runner: AdminCommandRunner | None = None,
+) -> AdminExecutionResult:
+    if plan.kind != AdminChangeKind.USER_SERVICE_RESTART:
+        return AdminExecutionResult(
+            id=f"admin.exec.{plan.id}.blocked",
+            plan_id=plan.id,
+            status=AdminExecutionStatus.BLOCKED,
+            summary="live execution is only implemented for approved user service restart plans",
+            command_results=(),
+        )
+    if not plan.can_execute():
+        return AdminExecutionResult(
+            id=f"admin.exec.{plan.id}.blocked",
+            plan_id=plan.id,
+            status=AdminExecutionStatus.BLOCKED,
+            summary="admin change plan is not approved or is incomplete",
+            command_results=(),
+        )
+
+    command_runner = runner or run_admin_command_step
+    command_results = tuple(command_runner(step) for step in plan.steps)
+    failed = next((result for result in command_results if result.exit_code != 0), None)
+    if failed is not None:
+        return AdminExecutionResult(
+            id=f"admin.exec.{plan.id}.failed",
+            plan_id=plan.id,
+            status=AdminExecutionStatus.FAILED,
+            summary=f"admin change failed during step: {failed.title}",
+            command_results=command_results,
+        )
+
+    verification_results = tuple(command_runner(step) for step in plan.verification_steps)
+    verification_failed = next((result for result in verification_results if result.exit_code != 0), None)
+    if verification_failed is not None:
+        return AdminExecutionResult(
+            id=f"admin.exec.{plan.id}.failed",
+            plan_id=plan.id,
+            status=AdminExecutionStatus.FAILED,
+            summary=f"admin change verification failed during step: {verification_failed.title}",
+            command_results=command_results,
+            verification_results=verification_results,
+        )
+
+    return AdminExecutionResult(
+        id=f"admin.exec.{plan.id}.completed",
+        plan_id=plan.id,
+        status=AdminExecutionStatus.COMPLETED,
+        summary="admin change completed and verified",
+        command_results=command_results,
+        verification_results=verification_results,
+    )
+
+
+def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
+    completed = subprocess.run(
+        step.command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return AdminCommandResult(
+        title=step.title,
+        command=step.command,
+        exit_code=completed.returncode,
+        stdout=completed.stdout.strip(),
+        stderr=completed.stderr.strip(),
     )
 
 

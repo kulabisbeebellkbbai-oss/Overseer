@@ -21,6 +21,8 @@ from overseer import (
     ExecutionRequest,
     ExecutionStatus,
     AdminChangeKind,
+    AdminCommandResult,
+    AdminExecutionStatus,
     OwnerDomain,
     Resource,
     ResourceRegistry,
@@ -77,9 +79,12 @@ from overseer import (
     schedule_usage_limited_work,
     seed_store_from_config,
     validate_config,
+    approve_admin_change_plan,
     assess_host_security,
+    execute_admin_change_plan,
     plan_apt_install,
     plan_firewall_allow_tcp,
+    plan_user_service_restart,
 )
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
@@ -1131,6 +1136,67 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(canceled["cancellation_reason"], "reserved documentation address; no observed hostile traffic")
         self.assertEqual(after["pending_count"], 0)
         self.assertTrue(state["admin_change_plans"][0]["canceled"])
+
+    def test_approved_user_service_restart_executes_and_persists_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.restart.exec",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+            approve_admin_change_status(
+                store_path,
+                "admin.restart.exec",
+                "sisko",
+                "2026-07-18T16:45:00+00:00",
+            )
+            store = SQLiteStore(store_path)
+            plan = store.load_admin_change_plan("admin.restart.exec")
+            result = execute_admin_change_plan(
+                plan,
+                runner=lambda step: AdminCommandResult(
+                    title=step.title,
+                    command=step.command,
+                    exit_code=0,
+                    stdout="ok",
+                ),
+            )
+            store.save_admin_execution(result)
+            loaded = store.load_admin_execution(result.id)
+            store.close()
+            state = list_state_status(store_path)
+
+        self.assertEqual(result.status, AdminExecutionStatus.COMPLETED)
+        self.assertEqual(loaded.plan_id, "admin.restart.exec")
+        self.assertEqual(state["admin_executions"][0]["status"], AdminExecutionStatus.COMPLETED.value)
+
+    def test_unapproved_admin_change_execution_is_blocked(self):
+        plan = plan_user_service_restart(
+            "admin.restart.blocked",
+            "overseer-api.service",
+            "reload approved code",
+            "active",
+        )
+
+        result = execute_admin_change_plan(plan)
+
+        self.assertEqual(result.status, AdminExecutionStatus.BLOCKED)
+        self.assertEqual(result.command_results, ())
+
+    def test_non_restart_admin_change_execution_is_blocked(self):
+        plan = approve_admin_change_plan(
+            plan_apt_install("admin.install.blocked", ("nmap",), "enable approved audit"),
+            "operator",
+        )
+
+        result = execute_admin_change_plan(plan)
+
+        self.assertEqual(result.status, AdminExecutionStatus.BLOCKED)
+        self.assertIn("only implemented for approved user service restart", result.summary)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

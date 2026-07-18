@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .admin import AdminChangePlan
+from .admin import AdminChangePlan, AdminExecutionResult
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence, HealthTarget
@@ -86,6 +86,11 @@ class SQLiteStore:
             );
             CREATE TABLE IF NOT EXISTS admin_change_plans (
                 id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_executions (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             """
@@ -242,6 +247,19 @@ class SQLiteStore:
 
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))
+
+    def save_admin_execution(self, result: AdminExecutionResult) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO admin_executions (id, plan_id, payload) VALUES (?, ?, ?)",
+            (result.id, result.plan_id, _dump(result)),
+        )
+        self._connection.commit()
+
+    def load_admin_execution(self, result_id: str) -> AdminExecutionResult:
+        return _load_dataclass(AdminExecutionResult, self._get_payload("admin_executions", result_id))
+
+    def list_admin_executions(self) -> tuple[AdminExecutionResult, ...]:
+        return tuple(_load_dataclass(AdminExecutionResult, payload) for payload in self._list_payloads("admin_executions"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

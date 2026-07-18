@@ -17,6 +17,9 @@ from overseer import (
     HealthStatus,
     HealthTarget,
     InterruptionPolicy,
+    LimitDecision,
+    LimitKind,
+    LimitedWorkRequest,
     MaintenanceKind,
     MaintenancePlan,
     MaintenanceStatus,
@@ -30,10 +33,12 @@ from overseer import (
     SecuritySignal,
     SecuritySignalType,
     SecurityStatus,
+    UsageLimit,
     assess_maintenance_readiness,
     can_close_maintenance,
     physical_identity_conflicts,
     recommend_security_response,
+    schedule_limited_work,
 )
 
 
@@ -443,6 +448,79 @@ class SecurityResponseTests(unittest.TestCase):
         )
 
         self.assertTrue(incident.can_close())
+
+
+class UsageLimitScheduleTests(unittest.TestCase):
+    def test_runs_now_when_capacity_is_available(self):
+        limit = UsageLimit(
+            id="limit.github.requests",
+            resource_id="svc.github",
+            kind=LimitKind.REQUESTS,
+            capacity=5000,
+            remaining=100,
+            resets_at="2026-07-18T11:00:00-04:00",
+            window="hourly",
+        )
+        request = LimitedWorkRequest(
+            id="work.issue-sync",
+            resource_id="svc.github",
+            owner_thread="thread-a",
+            requested_units=10,
+            intent="sync issues",
+        )
+
+        schedule = schedule_limited_work(limit, request)
+
+        self.assertEqual(schedule.decision, LimitDecision.RUN_NOW)
+        self.assertEqual(schedule.approval_level, ApprovalLevel.NONE)
+
+    def test_queues_work_until_reset_when_capacity_is_insufficient(self):
+        limit = UsageLimit(
+            id="limit.ai.tokens",
+            resource_id="svc.ai",
+            kind=LimitKind.TOKENS,
+            capacity=100000,
+            remaining=1000,
+            resets_at="2026-07-18T12:00:00-04:00",
+            window="daily",
+        )
+        request = LimitedWorkRequest(
+            id="work.large-eval",
+            resource_id="svc.ai",
+            owner_thread="thread-b",
+            requested_units=5000,
+            intent="run eval",
+        )
+
+        schedule = schedule_limited_work(limit, request)
+
+        self.assertEqual(schedule.decision, LimitDecision.QUEUE_UNTIL_RESET)
+        self.assertEqual(schedule.scheduled_for, "2026-07-18T12:00:00-04:00")
+
+    def test_escalates_uncertain_high_risk_limit_to_sisko(self):
+        limit = UsageLimit(
+            id="limit.gateway.manual",
+            resource_id="gateway.protected",
+            kind=LimitKind.MANUAL,
+            capacity=1,
+            remaining=1,
+            resets_at=None,
+            window="manual",
+            confidence=0.2,
+        )
+        request = LimitedWorkRequest(
+            id="work.gateway-change",
+            resource_id="gateway.protected",
+            owner_thread="thread-c",
+            requested_units=1,
+            intent="change protected gateway",
+            risk_level=RiskLevel.HIGH,
+        )
+
+        schedule = schedule_limited_work(limit, request)
+
+        self.assertEqual(schedule.decision, LimitDecision.ESCALATE)
+        self.assertEqual(schedule.approval_level, ApprovalLevel.SISKO)
 
 
 if __name__ == "__main__":

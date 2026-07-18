@@ -35,6 +35,14 @@ from .security import (
     SecurityStatus,
     recommend_security_response,
 )
+from .usage_limits import (
+    LimitDecision,
+    LimitKind,
+    LimitedWorkRequest,
+    UsageLimit,
+    UsageSchedule,
+    schedule_limited_work,
+)
 
 __all__ = [
     "ApprovalLevel",
@@ -74,4 +82,10 @@ __all__ = [
     "SecuritySignalType",
     "SecurityStatus",
     "recommend_security_response",
+    "LimitDecision",
+    "LimitKind",
+    "LimitedWorkRequest",
+    "UsageLimit",
+    "UsageSchedule",
+    "schedule_limited_work",
 ]

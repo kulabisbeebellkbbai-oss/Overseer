@@ -111,6 +111,7 @@ from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
+from overseer.cli import host_security_findings_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
@@ -1667,6 +1668,36 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["security_surfaces"], 1)
             self.assertEqual(status["surfaces"][0]["owner_domain"], OwnerDomain.ODO.value)
 
+    def test_client_reads_host_security_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.host_security_findings()
+
+            self.assertEqual(status["snapshot_id"], snapshot.id)
+            self.assertEqual(status["finding_count"], 1)
+            self.assertEqual(status["findings"][0]["severity"], HostFindingSeverity.HIGH.value)
+
     def test_client_reads_health_efficiency(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2023,6 +2054,42 @@ class HostInspectionTests(unittest.TestCase):
 
         self.assertEqual(status["snapshot_id"], second.id)
         self.assertEqual(status["high_findings"], 1)
+
+    def test_host_security_findings_lists_details_and_filters_severity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-c"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 5 192.168.1.20:8080 0.0.0.0:*\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:02:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = host_security_findings_status(store_path)
+            high = host_security_findings_status(store_path, severity=HostFindingSeverity.HIGH.value)
+
+        self.assertEqual(status["snapshot_id"], snapshot.id)
+        self.assertEqual(status["finding_count"], 2)
+        self.assertEqual(status["by_severity"][HostFindingSeverity.HIGH.value], 1)
+        self.assertEqual(status["by_severity"][HostFindingSeverity.WARNING.value], 1)
+        self.assertEqual(high["severity_filter"], HostFindingSeverity.HIGH.value)
+        self.assertEqual(high["finding_count"], 1)
+        self.assertIn("0.0.0.0:22", high["findings"][0]["summary"])
+        self.assertIn("recommended_action", high["findings"][0])
 
     def test_runtime_status_reports_latest_host_security_counts(self):
         with tempfile.TemporaryDirectory() as directory:

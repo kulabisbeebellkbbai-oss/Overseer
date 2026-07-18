@@ -29,7 +29,7 @@ from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, Resour
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
-from .host import HostInspectionAdapter, host_security_status, host_snapshot_status
+from .host import HostFindingSeverity, HostInspectionAdapter, host_security_status, host_snapshot_status
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity
 from .physical_discovery import PathPhysicalDiscoveryAdapter
@@ -1008,6 +1008,35 @@ def assess_host_security_status(store_path: str | Path, snapshot_id: str | None 
         store.close()
 
 
+def host_security_findings_status(
+    store_path: str | Path,
+    snapshot_id: str | None = None,
+    severity: str | None = None,
+) -> dict[str, object]:
+    status = assess_host_security_status(store_path, snapshot_id)
+    severity_filter = HostFindingSeverity(severity) if severity else None
+    findings = [
+        finding
+        for finding in status["findings"]
+        if severity_filter is None or finding["severity"] == severity_filter.value
+    ]
+    return {
+        "store": status["store"],
+        "snapshot_id": status["snapshot_id"],
+        "captured_at": status["captured_at"],
+        "hostname": status["hostname"],
+        "severity_filter": severity_filter.value if severity_filter else None,
+        "findings": findings,
+        "finding_count": len(findings),
+        "by_severity": {
+            item.value: sum(1 for finding in status["findings"] if finding["severity"] == item.value)
+            for item in HostFindingSeverity
+        },
+        "high_findings": status["high_findings"],
+        "warning_findings": status["warning_findings"],
+    }
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -1613,6 +1642,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
     assess_host_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     assess_host_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    host_findings_parser = subparsers.add_parser("host-security-findings", help="list host security findings")
+    host_findings_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    host_findings_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    host_findings_parser.add_argument("--severity", choices=[item.value for item in HostFindingSeverity])
     admin_plan_parser = subparsers.add_parser("plan-admin-change", help="prepare an approval-gated admin change plan")
     admin_plan_parser.add_argument("--store", help="explicit SQLite store path for persisting the admin change plan")
     admin_plan_parser.add_argument("--plan-id", required=True)
@@ -1779,6 +1812,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "assess-host-security":
         print(json.dumps(assess_host_security_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-findings":
+        print(json.dumps(host_security_findings_status(args.store, args.snapshot_id, args.severity), sort_keys=True))
         return 0
 
     if args.command == "plan-admin-change":

@@ -47,6 +47,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3` - summarize persisted usage limits, capacity state, reset timing, and confidence.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.
 - `PYTHONPATH=src python3 -m overseer.cli assess-host-security --store state/overseer.sqlite3` - assess the latest persisted host snapshot for non-loopback TCP listeners.
+- `PYTHONPATH=src python3 -m overseer.cli host-security-findings --store state/overseer.sqlite3` - list detailed host security findings and recommendations from the latest persisted host snapshot.
 - `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --kind user_service_restart --target overseer-api.service --reason "reload approved code"` - prepare an approval-gated admin change plan without executing it.
 - `PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3` - list stored admin change plans waiting for explicit approval.
 - `PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko` - record approval metadata for an exact admin plan without executing it.

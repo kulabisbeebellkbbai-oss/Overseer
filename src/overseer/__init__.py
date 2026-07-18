@@ -26,6 +26,15 @@ from .maintenance import (
     can_close_maintenance,
 )
 from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_conflicts
+from .security import (
+    ProtectiveAction,
+    SecurityIncident,
+    SecurityResponse,
+    SecuritySignal,
+    SecuritySignalType,
+    SecurityStatus,
+    recommend_security_response,
+)
 
 __all__ = [
     "ApprovalLevel",
@@ -58,4 +67,11 @@ __all__ = [
     "PhysicalAssetKind",
     "PhysicalIdentity",
     "physical_identity_conflicts",
+    "ProtectiveAction",
+    "SecurityIncident",
+    "SecurityResponse",
+    "SecuritySignal",
+    "SecuritySignalType",
+    "SecurityStatus",
+    "recommend_security_response",
 ]

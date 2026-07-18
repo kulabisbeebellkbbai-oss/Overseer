@@ -25,9 +25,15 @@ from overseer import (
     ProbeType,
     PhysicalAssetKind,
     PhysicalIdentity,
+    ProtectiveAction,
+    SecurityIncident,
+    SecuritySignal,
+    SecuritySignalType,
+    SecurityStatus,
     assess_maintenance_readiness,
     can_close_maintenance,
     physical_identity_conflicts,
+    recommend_security_response,
 )
 
 
@@ -355,6 +361,88 @@ class MaintenancePlanTests(unittest.TestCase):
         self.assertFalse(readiness.ready)
         self.assertEqual(readiness.status, MaintenanceStatus.VERIFYING)
         self.assertEqual(readiness.missing_evidence, ("verification_ids",))
+
+
+class SecurityResponseTests(unittest.TestCase):
+    def test_low_risk_info_signal_is_read_only_monitoring(self):
+        signal = SecuritySignal(
+            id="sec.info",
+            resource_id="svc.mcp.github",
+            resource_type=ResourceType.SERVICE,
+            signal_type=SecuritySignalType.INFO,
+            severity=RiskLevel.LOW,
+            confidence=0.7,
+            source="log",
+            indicator="normal startup",
+        )
+
+        response = recommend_security_response(signal)
+
+        self.assertEqual(response.action, ProtectiveAction.MONITOR)
+        self.assertEqual(response.approval_level, ApprovalLevel.NONE)
+        self.assertFalse(response.active_defense)
+
+    def test_confirmed_high_risk_virtual_incident_requires_sisko_quarantine(self):
+        signal = SecuritySignal(
+            id="sec.vm",
+            resource_id="vm.suspect",
+            resource_type=ResourceType.VIRTUAL_ASSET,
+            signal_type=SecuritySignalType.CONFIRMED_INCIDENT,
+            severity=RiskLevel.HIGH,
+            confidence=0.95,
+            source="audit",
+            indicator="unexpected outbound connection",
+        )
+
+        response = recommend_security_response(signal)
+
+        self.assertEqual(response.action, ProtectiveAction.QUARANTINE)
+        self.assertEqual(response.owner_domain, OwnerDomain.DAX)
+        self.assertEqual(response.approval_level, ApprovalLevel.SISKO)
+        self.assertTrue(response.active_defense)
+
+    def test_security_surface_escalates_to_human_before_mutation(self):
+        signal = SecuritySignal(
+            id="sec.firewall",
+            resource_id="security.firewall",
+            resource_type=ResourceType.SECURITY_SURFACE,
+            signal_type=SecuritySignalType.INTRUSION_LIKELY,
+            severity=RiskLevel.HIGH,
+            confidence=0.9,
+            source="ids",
+            indicator="port scan and exploit attempt",
+        )
+
+        response = recommend_security_response(signal)
+
+        self.assertEqual(response.action, ProtectiveAction.ESCALATE)
+        self.assertEqual(response.approval_level, ApprovalLevel.HUMAN)
+        self.assertFalse(response.active_defense)
+
+    def test_incident_requires_containment_evidence_and_closure_note(self):
+        response = recommend_security_response(
+            SecuritySignal(
+                id="sec.service",
+                resource_id="svc.page",
+                resource_type=ResourceType.SERVICE,
+                signal_type=SecuritySignalType.CONFIRMED_INCIDENT,
+                severity=RiskLevel.MEDIUM,
+                confidence=0.8,
+                source="health",
+                indicator="unauthorized admin path access",
+            )
+        )
+        incident = SecurityIncident(
+            id="incident.service",
+            signal_id="sec.service",
+            resource_id="svc.page",
+            status=SecurityStatus.CONTAINED,
+            response=response,
+            evidence_ids=("health.after",),
+            closure_note="service isolated and access path verified closed",
+        )
+
+        self.assertTrue(incident.can_close())
 
 
 if __name__ == "__main__":

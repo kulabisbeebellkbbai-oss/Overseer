@@ -44,6 +44,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3` - read the stored runtime heartbeat for the local service.
 - `PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3` - read runtime heartbeat plus latest host-inspection freshness, stale-state assessment, security finding counts, and persisted freshness alert IDs.
 - `PYTHONPATH=src python3 -m overseer.cli alerts-summary --store state/overseer.sqlite3` - summarize persisted alert audit events without reading full state.
+- `PYTHONPATH=src python3 -m overseer.cli audit-summary --store state/overseer.sqlite3 --owner odo --subject-prefix ids-review.` - summarize persisted audit events, optionally filtered by event type, owner, or subject prefix.
 - `PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3` - summarize persisted usage limits, capacity state, reset timing, and confidence.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.
 - `PYTHONPATH=src python3 -m overseer.cli assess-host-security --store state/overseer.sqlite3` - assess the latest persisted host snapshot for non-loopback TCP listeners.

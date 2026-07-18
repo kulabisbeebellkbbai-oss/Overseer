@@ -8,6 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from .cli import (
     activate_claim_status,
@@ -17,6 +18,7 @@ from .cli import (
     approve_admin_change_status,
     approve_claim_status,
     alerts_summary_status,
+    audit_summary_status,
     authorizations_required_status,
     cancel_admin_change_status,
     command_summary_status,
@@ -58,76 +60,82 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
         server_version = "OverseerApi/0.1"
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            route = urlsplit(self.path)
+            path = route.path
+            query = parse_qs(route.query)
+            if path == "/health":
                 self._write_json({"ok": True, "service": "overseer-api"})
                 return
             if not self._is_authorized():
                 self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
                 return
-            if self.path == "/service-status":
+            if path == "/service-status":
                 self._handle(lambda: service_status(store_path))
                 return
-            if self.path == "/runtime-status":
+            if path == "/runtime-status":
                 self._handle(lambda: runtime_status(store_path))
                 return
-            if self.path == "/command-summary":
+            if path == "/command-summary":
                 self._handle(lambda: command_summary_status(store_path))
                 return
-            if self.path == "/operator-dashboard":
+            if path == "/operator-dashboard":
                 self._handle(lambda: operator_dashboard_status(store_path))
                 return
-            if self.path == "/maintenance-summary":
+            if path == "/maintenance-summary":
                 self._handle(lambda: maintenance_summary_status(store_path))
                 return
-            if self.path == "/health-summary":
+            if path == "/health-summary":
                 self._handle(lambda: health_summary_status(store_path))
                 return
-            if self.path == "/health-efficiency":
+            if path == "/health-efficiency":
                 self._handle(lambda: health_efficiency_summary_status(store_path))
                 return
-            if self.path == "/usage-summary":
+            if path == "/usage-summary":
                 self._handle(lambda: usage_summary_status(store_path))
                 return
-            if self.path == "/physical-summary":
+            if path == "/physical-summary":
                 self._handle(lambda: physical_summary_status(store_path))
                 return
-            if self.path == "/virtual-summary":
+            if path == "/virtual-summary":
                 self._handle(lambda: virtual_summary_status(store_path))
                 return
-            if self.path == "/alerts-summary":
+            if path == "/alerts-summary":
                 self._handle(lambda: alerts_summary_status(store_path))
                 return
-            if self.path == "/security-summary":
+            if path == "/audit-summary":
+                self._handle(lambda: audit_summary_status(store_path, _query_first(query, "event_type"), _query_first(query, "owner"), _query_first(query, "subject_prefix")))
+                return
+            if path == "/security-summary":
                 self._handle(lambda: security_summary_status(store_path))
                 return
-            if self.path == "/host/security":
+            if path == "/host/security":
                 self._handle(lambda: assess_host_security_status(store_path))
                 return
-            if self.path == "/host/security/findings":
+            if path == "/host/security/findings":
                 self._handle(lambda: host_security_findings_status(store_path))
                 return
-            if self.path == "/host/security/triage":
+            if path == "/host/security/triage":
                 self._handle(lambda: host_security_triage_status(store_path))
                 return
-            if self.path == "/host/security/sources":
+            if path == "/host/security/sources":
                 self._handle(lambda: host_security_sources_status(store_path))
                 return
-            if self.path == "/host/security/source-reviews":
+            if path == "/host/security/source-reviews":
                 self._handle(lambda: host_security_source_reviews_status(store_path))
                 return
-            if self.path == "/host/security/ids-review-packages":
+            if path == "/host/security/ids-review-packages":
                 self._handle(lambda: host_security_ids_review_packages_status(store_path))
                 return
-            if self.path == "/admin/authorizations-required":
+            if path == "/admin/authorizations-required":
                 self._handle(lambda: authorizations_required_status(store_path))
                 return
-            if self.path == "/admin/executions":
+            if path == "/admin/executions":
                 self._handle(lambda: admin_executions_status(store_path))
                 return
-            if self.path == "/admin/summary":
+            if path == "/admin/summary":
                 self._handle(lambda: admin_summary_status(store_path))
                 return
-            if self.path == "/state":
+            if path == "/state":
                 self._handle(lambda: list_state_status(store_path))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -358,6 +366,11 @@ def _submit_host_security_ids_review_package_args(payload: dict[str, Any]) -> di
         "submitted_at": str(payload["submitted_at"]) if payload.get("submitted_at") else None,
         "prompt_path": str(payload["prompt_path"]) if payload.get("prompt_path") else None,
     }
+
+
+def _query_first(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    return values[0] if values else None
 
 
 def _export_host_security_ids_review_prompt_args(payload: dict[str, Any]) -> dict[str, Any]:

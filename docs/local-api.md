@@ -26,6 +26,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /operator-dashboard`
 - `GET /maintenance-summary`
 - `GET /alerts-summary`
+- `GET /audit-summary`
 - `GET /security-summary`
 - `GET /usage-summary`
 - `GET /physical-summary`
@@ -77,6 +78,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
+`GET /audit-summary` returns persisted audit events with optional `event_type`, `owner`, and `subject_prefix` query filters.
 `GET /security-summary` returns Odo's compact view of security surfaces, alert audit events, latest host security findings, and protective firewall/block plans.
 `GET /host/security/findings` returns Odo's detailed host-security finding list, severity counts, evidence lines, and recommended actions from the latest persisted host snapshot.
 `GET /host/security/triage` groups Odo's host-security findings by listener, bind scope, severity, evidence, and read-only mitigation path. It does not change firewall, route, IDS, or service-bind state.
@@ -108,6 +110,7 @@ command = client.command_summary()
 dashboard = client.operator_dashboard()
 maintenance = client.maintenance_summary()
 alerts = client.alerts_summary()
+audit = client.audit_summary(owner="odo", subject_prefix="ids-review.")
 security = client.security_summary()
 usage = client.usage_summary()
 physical = client.physical_summary()

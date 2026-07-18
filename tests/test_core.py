@@ -106,6 +106,7 @@ from overseer.cli import admin_summary_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
 from overseer.cli import alerts_summary_status
+from overseer.cli import audit_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
@@ -1358,6 +1359,39 @@ class OverseerApiTests(unittest.TestCase):
             self.assertEqual(status["alerts"], 1)
             self.assertEqual(status["events"][0]["id"], "alert.api.runtime")
 
+    def test_loopback_api_reports_filtered_audit_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.api.ids-review.prepared",
+                    event_type=AuditEventType.REQUESTED,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="ids-review.admin.block.source",
+                    summary="IDS review prepared",
+                    risk_level=RiskLevel.CRITICAL,
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.api.claim.allowed",
+                    event_type=AuditEventType.ALLOWED,
+                    owner_domain=OwnerDomain.DAX,
+                    subject_id="claim.gateway",
+                    summary="claim allowed",
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path) as server:
+                status = server.get("/audit-summary?owner=odo&subject_prefix=ids-review.")
+
+            self.assertEqual(status["event_count"], 1)
+            self.assertEqual(status["filters"]["owner"], OwnerDomain.ODO.value)
+            self.assertEqual(status["events"][0]["id"], "audit.api.ids-review.prepared")
+
     def test_loopback_api_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -1523,6 +1557,39 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["alerts"], 1)
             self.assertEqual(status["events"][0]["owner_domain"], OwnerDomain.ODO.value)
+
+    def test_client_reads_filtered_audit_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.client.ids-review.approved",
+                    event_type=AuditEventType.APPROVED,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="ids-review.admin.block.source",
+                    summary="IDS review approved",
+                    risk_level=RiskLevel.CRITICAL,
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.client.claim.allowed",
+                    event_type=AuditEventType.ALLOWED,
+                    owner_domain=OwnerDomain.DAX,
+                    subject_id="claim.gateway",
+                    summary="claim allowed",
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.audit_summary(owner=OwnerDomain.ODO.value, subject_prefix="ids-review.")
+
+            self.assertEqual(status["event_count"], 1)
+            self.assertEqual(status["events"][0]["id"], "audit.client.ids-review.approved")
 
     def test_client_reads_usage_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2123,6 +2190,56 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(status["by_owner"][OwnerDomain.JULIAN.value], 1)
         self.assertEqual(status["by_owner"][OwnerDomain.ODO.value], 1)
         self.assertEqual([event["id"] for event in status["events"]], ["alert.host.high", "alert.runtime.warning"])
+
+    def test_audit_summary_filters_persisted_audit_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.ids-review.package.prepared",
+                    event_type=AuditEventType.REQUESTED,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="ids-review.admin.block.source",
+                    summary="IDS review prepared",
+                    risk_level=RiskLevel.CRITICAL,
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.ids-review.package.approved",
+                    event_type=AuditEventType.APPROVED,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="ids-review.admin.block.source",
+                    summary="IDS review accepted",
+                    risk_level=RiskLevel.CRITICAL,
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.claim.allowed",
+                    event_type=AuditEventType.ALLOWED,
+                    owner_domain=OwnerDomain.DAX,
+                    subject_id="claim.gateway",
+                    summary="claim allowed",
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            all_events = audit_summary_status(store_path)
+            filtered = audit_summary_status(
+                store_path,
+                owner=OwnerDomain.ODO.value,
+                subject_prefix="ids-review.",
+            )
+
+        self.assertEqual(all_events["event_count"], 3)
+        self.assertEqual(all_events["by_owner"][OwnerDomain.ODO.value], 2)
+        self.assertEqual(filtered["event_count"], 2)
+        self.assertEqual(filtered["by_event_type"][AuditEventType.REQUESTED.value], 1)
+        self.assertEqual(filtered["by_event_type"][AuditEventType.APPROVED.value], 1)
+        self.assertEqual([event["id"] for event in filtered["events"]], ["audit.ids-review.package.approved", "audit.ids-review.package.prepared"])
 
     def test_freshness_assessment_marks_stale_thresholds(self):
         fresh = assess_freshness(

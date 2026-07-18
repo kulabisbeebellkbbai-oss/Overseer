@@ -1993,6 +1993,49 @@ def alerts_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def audit_summary_status(
+    store_path: str | Path,
+    event_type: str | None = None,
+    owner: str | None = None,
+    subject_prefix: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        events = list(store.list_audit_events())
+        if event_type:
+            selected_event_type = AuditEventType(event_type)
+            events = [event for event in events if event.event_type == selected_event_type]
+        if owner:
+            selected_owner = OwnerDomain(owner)
+            events = [event for event in events if event.owner_domain == selected_owner]
+        if subject_prefix:
+            events = [event for event in events if event.subject_id.startswith(subject_prefix)]
+        return {
+            "store": str(store.path),
+            "events": [audit_event_status(event) for event in events],
+            "event_count": len(events),
+            "by_event_type": {
+                item.value: sum(1 for event in events if event.event_type == item)
+                for item in AuditEventType
+            },
+            "by_owner": {
+                item.value: sum(1 for event in events if event.owner_domain == item)
+                for item in OwnerDomain
+            },
+            "by_risk": {
+                item.value: sum(1 for event in events if event.risk_level == item)
+                for item in RiskLevel
+            },
+            "filters": {
+                "event_type": event_type,
+                "owner": owner,
+                "subject_prefix": subject_prefix,
+            },
+        }
+    finally:
+        store.close()
+
+
 def audit_event_status(event: AuditEvent) -> dict[str, object]:
     return {
         "id": event.id,
@@ -2305,6 +2348,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_status_parser.add_argument("--service-name", default="overseer")
     alerts_summary_parser = subparsers.add_parser("alerts-summary", help="summarize persisted alert audit events")
     alerts_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    audit_summary_parser = subparsers.add_parser("audit-summary", help="summarize persisted audit events")
+    audit_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    audit_summary_parser.add_argument("--event-type", choices=[item.value for item in AuditEventType])
+    audit_summary_parser.add_argument("--owner", choices=[item.value for item in OwnerDomain])
+    audit_summary_parser.add_argument("--subject-prefix")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
     assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
@@ -2557,6 +2605,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "alerts-summary":
         print(json.dumps(alerts_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "audit-summary":
+        print(json.dumps(audit_summary_status(args.store, args.event_type, args.owner, args.subject_prefix), sort_keys=True))
         return 0
 
     if args.command == "inspect-host":

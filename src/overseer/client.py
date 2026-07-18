@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -57,6 +58,24 @@ class OverseerApiClient:
 
     def alerts_summary(self) -> dict[str, Any]:
         return self._get("/alerts-summary")
+
+    def audit_summary(
+        self,
+        event_type: str | None = None,
+        owner: str | None = None,
+        subject_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        query = {
+            key: value
+            for key, value in {
+                "event_type": event_type,
+                "owner": owner,
+                "subject_prefix": subject_prefix,
+            }.items()
+            if value
+        }
+        suffix = f"?{urlencode(query)}" if query else ""
+        return self._get(f"/audit-summary{suffix}")
 
     def security_summary(self) -> dict[str, Any]:
         return self._get("/security-summary")

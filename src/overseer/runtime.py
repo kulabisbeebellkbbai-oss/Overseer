@@ -14,6 +14,7 @@ class RuntimeTick:
     usage_limits: int
     audit_events: int
     health_evidence: int
+    physical_identities: int
 
 
 class OverseerRuntime:
@@ -26,6 +27,7 @@ class OverseerRuntime:
             usage_limits=len(self.store.list_usage_limits()),
             audit_events=len(self.store.list_audit_events()),
             health_evidence=len(self.store.list_health_evidence()),
+            physical_identities=len(self.store.list_physical_identities()),
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:

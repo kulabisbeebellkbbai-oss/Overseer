@@ -520,6 +520,24 @@ class PhysicalDiscoveryTests(unittest.TestCase):
             self.assertEqual(status["count"], 1)
             self.assertEqual(status["assets"][0]["kind"], PhysicalAssetKind.SERIAL_PORT.value)
 
+    def test_discover_physical_status_persists_to_explicit_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "devices"
+            root.mkdir()
+            store_path = Path(directory) / "overseer.sqlite3"
+            (root / "usb-Serial_Device-if00-port0").touch()
+
+            status = discover_physical_status((str(root),), store_path=store_path)
+            store = SQLiteStore(store_path)
+
+            self.assertEqual(status["store"], str(store_path))
+            self.assertEqual(len(store.list_physical_identities()), 1)
+            self.assertEqual(
+                store.load_physical_identity("serial.usb-serial-device-if00-port0").kind,
+                PhysicalAssetKind.SERIAL_PORT,
+            )
+            store.close()
+
 
 class MaintenancePlanTests(unittest.TestCase):
     def test_blocks_medium_risk_patch_without_rollback_plan(self):
@@ -1283,6 +1301,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["store"], str(store_path))
             self.assertEqual(status["resources"], 1)
             self.assertEqual(status["health_evidence"], 0)
+            self.assertEqual(status["physical_identities"], 0)
 
 
 class OverseerCoordinatorTests(unittest.TestCase):

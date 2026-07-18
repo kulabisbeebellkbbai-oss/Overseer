@@ -11,6 +11,7 @@ from typing import Any
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence
+from .physical import PhysicalIdentity
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .usage_limits import UsageLimit
 
@@ -63,6 +64,10 @@ class SQLiteStore:
                 resource_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS physical_identities (
+                stable_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
             """
         )
         self._connection.commit()
@@ -101,6 +106,26 @@ class SQLiteStore:
 
     def list_health_evidence(self) -> tuple[HealthEvidence, ...]:
         return tuple(_load_dataclass(HealthEvidence, payload) for payload in self._list_payloads("health_evidence"))
+
+    def save_physical_identity(self, identity: PhysicalIdentity) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO physical_identities (stable_id, payload) VALUES (?, ?)",
+            (identity.stable_id, _dump(identity)),
+        )
+        self._connection.commit()
+
+    def load_physical_identity(self, stable_id: str) -> PhysicalIdentity:
+        row = self._connection.execute(
+            "SELECT payload FROM physical_identities WHERE stable_id = ?",
+            (stable_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(stable_id)
+        return _load_dataclass(PhysicalIdentity, str(row["payload"]))
+
+    def list_physical_identities(self) -> tuple[PhysicalIdentity, ...]:
+        rows = self._connection.execute("SELECT payload FROM physical_identities ORDER BY stable_id").fetchall()
+        return tuple(_load_dataclass(PhysicalIdentity, str(row["payload"])) for row in rows)
 
     def save_claim(self, claim: Claim, decision: ConflictDecision | None = None) -> None:
         self._connection.execute(

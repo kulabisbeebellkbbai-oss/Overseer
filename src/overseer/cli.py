@@ -153,9 +153,16 @@ def probe_health_status(
     return status
 
 
-def discover_physical_status(roots: Sequence[str]) -> dict[str, object]:
+def discover_physical_status(roots: Sequence[str], store_path: str | Path | None = None) -> dict[str, object]:
     identities = PathPhysicalDiscoveryAdapter(tuple(roots)).discover()
-    return {
+    if store_path is not None:
+        store = SQLiteStore(store_path)
+        try:
+            for identity in identities:
+                store.save_physical_identity(identity)
+        finally:
+            store.close()
+    status = {
         "count": len(identities),
         "assets": [
             {
@@ -167,6 +174,9 @@ def discover_physical_status(roots: Sequence[str]) -> dict[str, object]:
             for identity in identities
         ],
     }
+    if store_path is not None:
+        status["store"] = str(Path(store_path))
+    return status
 
 
 def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.0) -> dict[str, object]:
@@ -179,6 +189,7 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
             "usage_limits": tick.usage_limits,
             "audit_events": tick.audit_events,
             "health_evidence": tick.health_evidence,
+            "physical_identities": tick.physical_identities,
         }
     finally:
         store.close()
@@ -203,6 +214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_parser.add_argument("--store", help="explicit SQLite store path for persisting health evidence")
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
+    discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -237,7 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "discover-physical":
-        print(json.dumps(discover_physical_status(args.root), sort_keys=True))
+        print(json.dumps(discover_physical_status(args.root, args.store), sort_keys=True))
         return 0
 
     if args.command == "run":

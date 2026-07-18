@@ -1,4 +1,11 @@
 """Overseer local resource coordination core."""
+from .adapters import (
+    DryRunExecutor,
+    ExecutionMode,
+    ExecutionRequest,
+    ExecutionResult,
+    ExecutionStatus,
+)
 from .audit import (
     ApprovalRequest,
     ApprovalStatus,
@@ -55,6 +62,11 @@ from .usage_limits import (
 )
 
 __all__ = [
+    "DryRunExecutor",
+    "ExecutionMode",
+    "ExecutionRequest",
+    "ExecutionResult",
+    "ExecutionStatus",
     "ApprovalRequest",
     "ApprovalStatus",
     "AuditEvent",

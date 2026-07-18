@@ -11,6 +11,10 @@ from overseer import (
     ClaimType,
     ConflictDecision,
     ConflictOutcome,
+    DryRunExecutor,
+    ExecutionMode,
+    ExecutionRequest,
+    ExecutionStatus,
     OwnerDomain,
     Resource,
     ResourceRegistry,
@@ -197,6 +201,40 @@ class ConflictDecisionTests(unittest.TestCase):
 
         self.assertEqual(decision.outcome, ConflictOutcome.QUARANTINE)
         self.assertEqual(decision.approval_level, ApprovalLevel.HUMAN)
+
+
+class AdapterDryRunTests(unittest.TestCase):
+    def test_dry_run_executor_plans_without_host_state_change(self):
+        executor = DryRunExecutor()
+        result = executor.execute(
+            ExecutionRequest(
+                id="restart.mcp",
+                action="restart service",
+                target_resource_id="svc.mcp.github",
+                owner_domain=OwnerDomain.OBRIEN,
+            )
+        )
+
+        self.assertEqual(result.status, ExecutionStatus.PLANNED)
+        self.assertEqual(result.mode, ExecutionMode.DRY_RUN)
+        self.assertFalse(result.changed_host_state())
+        self.assertEqual(result.evidence_ids, ("dryrun.restart.mcp",))
+
+    def test_dry_run_executor_blocks_live_execution_without_adapter(self):
+        executor = DryRunExecutor()
+        result = executor.execute(
+            ExecutionRequest(
+                id="firewall.block",
+                action="block traffic",
+                target_resource_id="security.firewall",
+                owner_domain=OwnerDomain.ODO,
+                mode=ExecutionMode.LIVE,
+            )
+        )
+
+        self.assertEqual(result.status, ExecutionStatus.BLOCKED)
+        self.assertFalse(result.changed_host_state())
+
 
 class HealthClassificationTests(unittest.TestCase):
     def test_classifies_healthy_json_probe(self):

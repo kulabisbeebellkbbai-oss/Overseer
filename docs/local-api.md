@@ -77,6 +77,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 `POST /admin/execute` executes only a stored plan that passes the existing approval and completeness gates, then persists the result. Current live execution support is limited to approved user-service restart plans; unsupported or unapproved plans return persisted `blocked` results.
+`GET /admin/authorizations-required` lists admin change plans and restore requests waiting for explicit approval.
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
 `GET /admin/execution-readiness` explains each admin plan's execution gate state, including approval, missing fields, IDS review, manual execution, and Overseer-supported execution readiness.
 `GET /admin/history-review` identifies completed and canceled admin plans that are candidates for future archive support. It is read-only and does not delete plans or audit evidence.

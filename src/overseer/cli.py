@@ -2572,6 +2572,12 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         plans = store.list_admin_change_plans()
+        pending_restore_approvals = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id.startswith("approval.admin.restore.")
+            and approval.status == ApprovalStatus.PENDING
+        ]
         pending = [
             authorization_required_status_with_ids_review(
                 plan,
@@ -2583,7 +2589,10 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "pending": pending,
-            "pending_count": len(pending),
+            "pending_count": len(pending) + len(pending_restore_approvals),
+            "pending_plan_count": len(pending),
+            "pending_restore_approval_count": len(pending_restore_approvals),
+            "restore_approvals": [admin_history_restore_approval_status(approval) for approval in pending_restore_approvals],
         }
     finally:
         store.close()

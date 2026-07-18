@@ -857,6 +857,7 @@ class HealthSummaryTests(unittest.TestCase):
                 "2026-07-18T22:18:00+00:00",
             )
             pending_restore_summary = admin_summary_status(store_path)
+            pending_restore_authorizations = authorizations_required_status(store_path)
             restore_approval = approve_claim_status(
                 store_path,
                 restore_request["approval_id"],
@@ -919,6 +920,8 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(pending_restore_summary["restore_approvals"]["total"], 1)
         self.assertEqual(pending_restore_summary["restore_approvals"]["pending"], 1)
         self.assertEqual(pending_restore_summary["restore_approvals"]["items"][0]["plan_id"], "admin.restart.completed")
+        self.assertEqual(pending_restore_authorizations["pending_restore_approval_count"], 1)
+        self.assertEqual(pending_restore_authorizations["restore_approvals"][0]["plan_id"], "admin.restart.completed")
         self.assertEqual(restore_approval["approval_status"], ApprovalStatus.APPROVED.value)
         self.assertEqual(post_archive_summary["archived_plans"], 1)
         self.assertEqual(post_archive_summary["restore_approvals"]["pending"], 0)

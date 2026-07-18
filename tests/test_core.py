@@ -8,6 +8,7 @@ from overseer import (
     ConflictOutcome,
     OwnerDomain,
     Resource,
+    ResourceRegistry,
     ResourceState,
     ResourceType,
     RiskLevel,
@@ -521,6 +522,109 @@ class UsageLimitScheduleTests(unittest.TestCase):
 
         self.assertEqual(schedule.decision, LimitDecision.ESCALATE)
         self.assertEqual(schedule.approval_level, ApprovalLevel.SISKO)
+
+
+class ResourceRegistryTests(unittest.TestCase):
+    def test_activates_allowed_claim_and_releases_it(self):
+        registry = ResourceRegistry()
+        registry.register_resource(
+            Resource(
+                id="svc.local",
+                name="Local Service",
+                type=ResourceType.SERVICE,
+                owner_domain=OwnerDomain.JULIAN,
+                risk_level=RiskLevel.LOW,
+            )
+        )
+        claim = Claim(
+            id="claim.observe.local",
+            resource_id="svc.local",
+            claim_type=ClaimType.OBSERVATION,
+            owner_thread="thread-a",
+            owner_role=OwnerDomain.JULIAN,
+            intent="inspect service",
+            requested_action="read health",
+            risk_level=RiskLevel.LOW,
+        )
+
+        record = registry.request_claim(claim)
+        released = registry.release_claim(record.claim.id)
+
+        self.assertEqual(record.decision.outcome, ConflictOutcome.ALLOW)
+        self.assertEqual(record.claim.status, ClaimStatus.ACTIVE)
+        self.assertEqual(released.status, ClaimStatus.RELEASED)
+
+    def test_queues_conflicting_exclusive_claim(self):
+        registry = ResourceRegistry()
+        registry.register_resource(
+            Resource(
+                id="proxy.gateway",
+                name="Gateway Proxy",
+                type=ResourceType.VIRTUAL_ASSET,
+                owner_domain=OwnerDomain.DAX,
+                risk_level=RiskLevel.LOW,
+            )
+        )
+
+        first = registry.request_claim(
+            Claim(
+                id="claim.gateway.first",
+                resource_id="proxy.gateway",
+                claim_type=ClaimType.LEASE,
+                owner_thread="thread-a",
+                owner_role=OwnerDomain.DAX,
+                intent="use gateway",
+                requested_action="bind proxy",
+                risk_level=RiskLevel.LOW,
+            )
+        )
+        activated = registry.activate_claim(first.claim.id, approval_id="approval.dax.role")
+        second = registry.request_claim(
+            Claim(
+                id="claim.gateway.second",
+                resource_id="proxy.gateway",
+                claim_type=ClaimType.LEASE,
+                owner_thread="thread-b",
+                owner_role=OwnerDomain.DAX,
+                intent="use same gateway",
+                requested_action="bind proxy",
+                risk_level=RiskLevel.LOW,
+            )
+        )
+
+        self.assertEqual(first.claim.status, ClaimStatus.REQUESTED)
+        self.assertEqual(activated.claim.status, ClaimStatus.ACTIVE)
+        self.assertEqual(second.claim.status, ClaimStatus.QUEUED)
+        self.assertEqual(registry.queued_claims()[0].id, "claim.gateway.second")
+
+    def test_preserves_escalated_claim_as_requested(self):
+        registry = ResourceRegistry()
+        registry.register_resource(
+            Resource(
+                id="gateway.protected",
+                name="Protected Gateway",
+                type=ResourceType.VIRTUAL_ASSET,
+                owner_domain=OwnerDomain.DAX,
+                risk_level=RiskLevel.HIGH,
+            )
+        )
+
+        record = registry.request_claim(
+            Claim(
+                id="claim.gateway.high",
+                resource_id="gateway.protected",
+                claim_type=ClaimType.LEASE,
+                owner_thread="thread-c",
+                owner_role=OwnerDomain.DAX,
+                intent="change route",
+                requested_action="modify gateway route",
+                risk_level=RiskLevel.HIGH,
+            )
+        )
+
+        self.assertEqual(record.decision.outcome, ConflictOutcome.ESCALATE)
+        self.assertEqual(record.claim.status, ClaimStatus.REQUESTED)
+        self.assertEqual(record.decision.approval_level, ApprovalLevel.SISKO)
 
 
 if __name__ == "__main__":

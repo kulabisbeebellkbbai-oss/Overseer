@@ -25,6 +25,10 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m unittest discover -s tests -v` - run the current unit test suite.
 - `PYTHONPATH=src python3 -m overseer.cli demo` - print a read-only demo checkout decision.
 
+## Continuous Integration
+
+GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pull requests.
+
 ## Current Status
 
 - Approved project summary: `docs/project-summary.md`

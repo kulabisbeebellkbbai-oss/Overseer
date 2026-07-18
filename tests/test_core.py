@@ -97,12 +97,14 @@ from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_executions_status
+from overseer.cli import admin_summary_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
 from overseer.cli import alerts_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
+from overseer.cli import execute_admin_change_status
 from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -681,6 +683,27 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["executions"][0]["plan_id"], "admin.restart.test")
         self.assertEqual(status["executions"][0]["status"], AdminExecutionStatus.BLOCKED.value)
 
+    def test_admin_summary_reports_plans_executions_and_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.restart.summary",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+            execute_admin_change_status(store_path, "admin.restart.summary")
+
+            status = admin_summary_status(store_path)
+
+        self.assertEqual(status["plans"], 1)
+        self.assertEqual(status["pending_authorizations"], 1)
+        self.assertEqual(status["executions"], 1)
+        self.assertEqual(status["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
+        self.assertEqual(status["latest_audit_events"][0]["subject_id"], "admin.restart.summary")
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1062,10 +1085,12 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
                 executed = client.execute_admin_change({"plan_id": "admin.restart.blocked"})
                 executions = client.admin_executions()
+                summary = client.admin_summary()
                 state = client.state()
 
             self.assertEqual(executed["status"], AdminExecutionStatus.BLOCKED.value)
             self.assertEqual(executions["execution_count"], 1)
+            self.assertEqual(summary["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
             self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)
             self.assertEqual(state["audit_events"][0]["subject_id"], "admin.restart.blocked")

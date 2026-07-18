@@ -499,6 +499,40 @@ def admin_executions_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def admin_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plans = store.list_admin_change_plans()
+        executions = store.list_admin_executions()
+        audit_events = [
+            event
+            for event in store.list_audit_events()
+            if event.subject_id.startswith("admin.") or event.id.startswith("audit.admin.exec.")
+        ]
+        pending = [
+            plan
+            for plan in plans
+            if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
+        ]
+        return {
+            "store": str(store.path),
+            "plans": len(plans),
+            "pending_authorizations": len(pending),
+            "approved_plans": sum(1 for plan in plans if plan.approved),
+            "canceled_plans": sum(1 for plan in plans if plan.canceled),
+            "executable_plans": sum(1 for plan in plans if plan.can_execute()),
+            "executions": len(executions),
+            "executions_by_status": {
+                status.value: sum(1 for result in executions if result.status == status)
+                for status in AdminExecutionStatus
+            },
+            "latest_audit_events": [audit_event_status(event) for event in audit_events[-5:]],
+            "pending": [admin_change_plan_status(plan) for plan in pending],
+        }
+    finally:
+        store.close()
+
+
 def approve_admin_change_status(
     store_path: str | Path,
     plan_id: str,
@@ -945,6 +979,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_admin_parser.add_argument("--plan-id", required=True)
     admin_executions_parser = subparsers.add_parser("admin-executions", help="list persisted admin change execution results")
     admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_summary_parser = subparsers.add_parser("admin-summary", help="summarize admin plans, execution results, and audit events")
+    admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -1095,6 +1131,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-executions":
         print(json.dumps(admin_executions_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-summary":
+        print(json.dumps(admin_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

@@ -45,6 +45,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"` - cancel a placeholder or superseded admin plan without deleting history.
 - `PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api` - execute an approved user-service restart plan and persist the execution result.
 - `PYTHONPATH=src python3 -m overseer.cli admin-executions --store state/overseer.sqlite3` - list persisted admin execution results.
+- `PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqlite3` - summarize admin plans, pending approvals, execution outcomes, and admin audit events.
 - `PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3` - summarize latest health evidence per configured target.
 - `PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3 --fail-on-unhealthy` - return a non-zero exit when any configured target is unhealthy or missing evidence.
 - `PYTHONPATH=src python3 -m overseer.cli list-state --store state/overseer.sqlite3` - inspect stored resources, health targets, health evidence, claims, approvals, and audit events.

@@ -31,6 +31,7 @@ PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overse
 PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"
 PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api
 PYTHONPATH=src python3 -m overseer.cli admin-executions --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqlite3
 ```
 
 ## Boundary
@@ -46,3 +47,5 @@ Live execution is currently limited to approved `user_service_restart` plans. Pa
 Execution results are persisted and can be reviewed with `admin-executions` or the loopback API. Blocked execution attempts are also persisted so O'Brien and Sisko can see why a plan did not run.
 
 Every execution attempt also writes an audit event keyed to the admin plan. Completed executions use `executed`; blocked or failed attempts use `blocked` and cite the execution result id as evidence.
+
+`admin-summary` is the compact operator view for O'Brien and Sisko. It reports plan counts, pending authorizations, executable plans, execution counts by status, pending plan details, and recent admin audit events.

@@ -67,6 +67,9 @@ class OverseerApiClient:
     def admin_executions(self) -> dict[str, Any]:
         return self._get("/admin/executions")
 
+    def admin_summary(self) -> dict[str, Any]:
+        return self._get("/admin/summary")
+
     def approve_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/approve", payload)
 

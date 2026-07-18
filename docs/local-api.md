@@ -27,6 +27,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security`
 - `GET /admin/authorizations-required`
 - `GET /admin/executions`
+- `GET /admin/summary`
 - `GET /state`
 
 ## Claim Endpoints
@@ -49,6 +50,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 `POST /admin/execute` executes only a stored plan that passes the existing approval and completeness gates, then persists the result. Current live execution support is limited to approved user-service restart plans; unsupported or unapproved plans return persisted `blocked` results.
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
+`GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, and recent admin audit events.
 
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
@@ -77,6 +79,7 @@ pending = client.authorizations_required()
 approved = client.approve_admin_change({"plan_id": "admin.restart.overseer-api", "approved_by": "sisko"})
 execution = client.execute_admin_change({"plan_id": "admin.restart.overseer-api"})
 executions = client.admin_executions()
+admin = client.admin_summary()
 canceled = client.cancel_admin_change(
     {
         "plan_id": "admin.block.example",

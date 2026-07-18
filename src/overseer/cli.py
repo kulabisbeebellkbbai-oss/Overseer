@@ -224,6 +224,7 @@ def run_status(
     interval_seconds: float = 30.0,
     probe_health_targets: bool = False,
     health_probe_timeout_seconds: float = 5.0,
+    health_evidence_retention_per_target: int = 5,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -231,6 +232,7 @@ def run_status(
             store,
             probe_health_targets=probe_health_targets,
             health_probe_adapter=HttpHealthProbeAdapter(timeout_seconds=health_probe_timeout_seconds),
+            health_evidence_retention_per_target=health_evidence_retention_per_target,
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),
@@ -500,6 +502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--interval-seconds", type=float, default=30.0)
     run_parser.add_argument("--probe-health-targets", action="store_true", help="probe configured health targets on each tick")
     run_parser.add_argument("--health-probe-timeout-seconds", type=float, default=5.0)
+    run_parser.add_argument("--health-evidence-retention-per-target", type=int, default=5)
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
@@ -574,6 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.interval_seconds,
                     args.probe_health_targets,
                     args.health_probe_timeout_seconds,
+                    args.health_evidence_retention_per_target,
                 ),
                 sort_keys=True,
             )

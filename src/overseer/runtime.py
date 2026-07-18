@@ -31,11 +31,13 @@ class OverseerRuntime:
         service_name: str = "overseer",
         probe_health_targets: bool = False,
         health_probe_adapter: HealthProbeAdapter | None = None,
+        health_evidence_retention_per_target: int = 5,
     ) -> None:
         self.store = store
         self.service_name = service_name
         self.probe_health_targets = probe_health_targets
         self.health_probe_adapter = health_probe_adapter or HttpHealthProbeAdapter()
+        self.health_evidence_retention_per_target = health_evidence_retention_per_target
         self.started_at = _utc_now()
         self.tick_count = 0
 
@@ -76,6 +78,7 @@ class OverseerRuntime:
         targets = self.store.list_health_targets()
         for target in targets:
             self.store.save_health_evidence(self.health_probe_adapter.probe(target))
+        self.store.prune_health_evidence(self.health_evidence_retention_per_target)
         return len(targets)
 
 

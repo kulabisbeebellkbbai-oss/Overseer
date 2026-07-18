@@ -117,6 +117,25 @@ class SQLiteStore:
     def list_health_evidence(self) -> tuple[HealthEvidence, ...]:
         return tuple(_load_dataclass(HealthEvidence, payload) for payload in self._list_payloads("health_evidence"))
 
+    def delete_health_evidence(self, evidence_id: str) -> None:
+        self._connection.execute("DELETE FROM health_evidence WHERE id = ?", (evidence_id,))
+        self._connection.commit()
+
+    def prune_health_evidence(self, retain_per_target: int) -> int:
+        if retain_per_target < 1:
+            raise ValueError("retain_per_target must be positive")
+        grouped: dict[tuple[str, str], list[HealthEvidence]] = {}
+        for evidence in self.list_health_evidence():
+            grouped.setdefault((evidence.resource_id, evidence.target), []).append(evidence)
+        deleted = 0
+        for evidence_items in grouped.values():
+            ordered = sorted(evidence_items, key=lambda item: item.captured_at or item.id, reverse=True)
+            for stale in ordered[retain_per_target:]:
+                self._connection.execute("DELETE FROM health_evidence WHERE id = ?", (stale.id,))
+                deleted += 1
+        self._connection.commit()
+        return deleted
+
     def save_health_target(self, target: HealthTarget) -> None:
         self._connection.execute(
             "INSERT OR REPLACE INTO health_targets (id, resource_id, payload) VALUES (?, ?, ?)",

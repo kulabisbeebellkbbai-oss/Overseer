@@ -10,12 +10,13 @@ The runtime entrypoint is the shape of the future Overseer daemon. The first ver
 - Runtime state is read from an explicit SQLite store path.
 - The runtime writes a heartbeat on each tick and reports stored resource, usage-limit, health-target, health-evidence, physical-identity, runtime-heartbeat, and audit counts.
 - Configured health probes are read-only HTTP requests and run only when `--probe-health-targets` is supplied.
+- Runtime health evidence is pruned per target with `--health-evidence-retention-per-target`.
 
 ## CLI
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
-PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets
+PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 ```
 
@@ -30,7 +31,7 @@ Installed local unit:
 Runtime command:
 
 ```bash
-/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets
+/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets --health-evidence-retention-per-target 5
 ```
 
 Operator commands:

@@ -1443,6 +1443,48 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
 
+    def test_runtime_prunes_health_evidence_per_target(self):
+        with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            seed_store_from_config(
+                config_from_mapping(
+                    {
+                        "resources": [
+                            {
+                                "id": "svc.runtime.prune",
+                                "name": "Runtime Prune Service",
+                                "type": "service",
+                                "owner_domain": "julian",
+                                "risk_level": "low",
+                            }
+                        ],
+                        "health_targets": [
+                            {
+                                "id": "health.runtime.prune",
+                                "resource_id": "svc.runtime.prune",
+                                "name": "Runtime Prune Health",
+                                "probe_type": "json",
+                                "target": server.url,
+                                "expected_content_type": "application/json",
+                            }
+                        ],
+                    }
+                ),
+                store,
+            )
+            runtime = OverseerRuntime(
+                store,
+                probe_health_targets=True,
+                health_evidence_retention_per_target=2,
+            )
+
+            runtime.tick()
+            runtime.tick()
+            runtime.tick()
+
+            self.assertEqual(len(store.list_health_evidence()), 2)
+            store.close()
+
     def test_runtime_tick_persists_service_heartbeat(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

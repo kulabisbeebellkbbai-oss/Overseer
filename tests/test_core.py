@@ -34,6 +34,7 @@ from overseer import (
     MaintenancePlan,
     MaintenanceStatus,
     MaintenanceWindow,
+    OperationPlanner,
     OverseerCoordinator,
     ProbeResult,
     ProbeType,
@@ -234,6 +235,53 @@ class AdapterDryRunTests(unittest.TestCase):
 
         self.assertEqual(result.status, ExecutionStatus.BLOCKED)
         self.assertFalse(result.changed_host_state())
+
+
+class OperationPlannerTests(unittest.TestCase):
+    def test_plans_ready_high_risk_maintenance_as_dry_run_with_approval(self):
+        planner = OperationPlanner()
+        plan = MaintenancePlan(
+            id="maint.gateway.patch",
+            resource_id="gateway.protected",
+            kind=MaintenanceKind.PATCH,
+            requested_state="1.2.3",
+            risk_level=RiskLevel.HIGH,
+            window=MaintenanceWindow(
+                id="window.patch",
+                starts_at="2026-07-18T12:00:00-04:00",
+                ends_at="2026-07-18T12:30:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.EXCLUSIVE_WINDOW_REQUIRED,
+            precheck_ids=("health.before",),
+            rollback_plan="restore previous gateway config",
+        )
+
+        operation = planner.plan_maintenance(plan)
+
+        self.assertTrue(operation.requires_approval())
+        self.assertEqual(operation.approval_level, ApprovalLevel.SISKO)
+        self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
+        self.assertFalse(operation.result.changed_host_state())
+
+    def test_plans_security_response_as_dry_run_even_for_active_defense(self):
+        planner = OperationPlanner()
+        signal = SecuritySignal(
+            id="vm.intrusion",
+            resource_id="vm.suspect",
+            resource_type=ResourceType.VIRTUAL_ASSET,
+            signal_type=SecuritySignalType.CONFIRMED_INCIDENT,
+            severity=RiskLevel.HIGH,
+            confidence=0.9,
+            source="audit",
+            indicator="unexpected outbound connection",
+        )
+
+        operation = planner.plan_security_response(signal)
+
+        self.assertTrue(operation.requires_approval())
+        self.assertEqual(operation.approval_level, ApprovalLevel.SISKO)
+        self.assertEqual(operation.request.action, "security:quarantine")
+        self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
 
 
 class HealthClassificationTests(unittest.TestCase):

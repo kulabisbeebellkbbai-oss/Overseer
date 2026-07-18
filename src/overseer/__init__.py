@@ -46,6 +46,7 @@ from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
 from .runtime import OverseerRuntime, RuntimeTick
+from .runtime_state import RuntimeHeartbeat
 from .security import (
     ProtectiveAction,
     SecurityIncident,
@@ -130,6 +131,7 @@ __all__ = [
     "ResourceRegistry",
     "OverseerRuntime",
     "RuntimeTick",
+    "RuntimeHeartbeat",
     "ProtectiveAction",
     "SecurityIncident",
     "SecurityResponse",

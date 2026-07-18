@@ -12,6 +12,7 @@ from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence, HealthTarget
 from .physical import PhysicalIdentity
+from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .usage_limits import UsageLimit
 
@@ -71,6 +72,10 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS health_targets (
                 id TEXT PRIMARY KEY,
                 resource_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_heartbeats (
+                id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
             """
@@ -181,6 +186,15 @@ class SQLiteStore:
 
     def list_approvals(self) -> tuple[ApprovalRequest, ...]:
         return tuple(_load_dataclass(ApprovalRequest, payload) for payload in self._list_payloads("approvals"))
+
+    def save_runtime_heartbeat(self, heartbeat: RuntimeHeartbeat) -> None:
+        self._upsert("runtime_heartbeats", heartbeat.id, _dump(heartbeat))
+
+    def load_runtime_heartbeat(self, heartbeat_id: str) -> RuntimeHeartbeat:
+        return _load_dataclass(RuntimeHeartbeat, self._get_payload("runtime_heartbeats", heartbeat_id))
+
+    def list_runtime_heartbeats(self) -> tuple[RuntimeHeartbeat, ...]:
+        return tuple(_load_dataclass(RuntimeHeartbeat, payload) for payload in self._list_payloads("runtime_heartbeats"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

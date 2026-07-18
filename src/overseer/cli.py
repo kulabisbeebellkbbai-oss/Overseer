@@ -230,6 +230,22 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
             "audit_events": tick.audit_events,
             "health_evidence": tick.health_evidence,
             "physical_identities": tick.physical_identities,
+            "runtime_heartbeats": tick.runtime_heartbeats,
+        }
+    finally:
+        store.close()
+
+
+def service_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        heartbeat = store.load_runtime_heartbeat(service_name)
+        return {
+            "store": str(store.path),
+            "service_name": heartbeat.service_name,
+            "started_at": heartbeat.started_at,
+            "last_tick_at": heartbeat.last_tick_at,
+            "tick_count": heartbeat.tick_count,
         }
     finally:
         store.close()
@@ -242,6 +258,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         claims = store.list_claims()
         approvals = store.list_approvals()
         audit_events = store.list_audit_events()
+        heartbeats = store.list_runtime_heartbeats()
         return {
             "store": str(store.path),
             "resources": [
@@ -288,6 +305,16 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "summary": event.summary,
                 }
                 for event in audit_events
+            ],
+            "runtime_heartbeats": [
+                {
+                    "id": heartbeat.id,
+                    "service_name": heartbeat.service_name,
+                    "started_at": heartbeat.started_at,
+                    "last_tick_at": heartbeat.last_tick_at,
+                    "tick_count": heartbeat.tick_count,
+                }
+                for heartbeat in heartbeats
             ],
         }
     finally:
@@ -435,6 +462,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--interval-seconds", type=float, default=30.0)
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
+    service_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    service_parser.add_argument("--service-name", default="overseer")
     claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
     claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser.add_argument("--claim-id", required=True)
@@ -501,6 +531,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "list-state":
         print(json.dumps(list_state_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "service-status":
+        print(json.dumps(service_status(args.store, args.service_name), sort_keys=True))
         return 0
 
     if args.command == "request-claim":

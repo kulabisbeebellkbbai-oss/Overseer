@@ -25,6 +25,7 @@ from overseer import (
     ResourceType,
     RiskLevel,
     OverseerRuntime,
+    RuntimeHeartbeat,
     decide_claim,
     classify_probe,
     recovery_evidence,
@@ -80,6 +81,7 @@ from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_claim_status
 from overseer.cli import run_status
+from overseer.cli import service_status
 from overseer.cli import seed_config_status
 
 
@@ -1374,6 +1376,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tick.usage_limits, 1)
             self.assertEqual(tick.health_targets, 1)
             self.assertEqual(tick.health_evidence, 0)
+            self.assertEqual(tick.runtime_heartbeats, 1)
             store.close()
 
     def test_run_status_reports_explicit_store_counts(self):
@@ -1398,6 +1401,40 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["health_targets"], 0)
             self.assertEqual(status["health_evidence"], 0)
             self.assertEqual(status["physical_identities"], 0)
+            self.assertEqual(status["runtime_heartbeats"], 1)
+
+    def test_runtime_tick_persists_service_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+
+            tick = OverseerRuntime(store, service_name="test-overseer").run(once=True)
+            heartbeat = store.load_runtime_heartbeat("test-overseer")
+
+            self.assertEqual(tick.runtime_heartbeats, 1)
+            self.assertEqual(heartbeat.service_name, "test-overseer")
+            self.assertEqual(heartbeat.tick_count, 1)
+            store.close()
+
+    def test_service_status_reads_stored_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T13:00:00+00:00",
+                    last_tick_at="2026-07-18T13:00:30+00:00",
+                    tick_count=2,
+                )
+            )
+            store.close()
+
+            status = service_status(store_path)
+
+            self.assertEqual(status["service_name"], "overseer")
+            self.assertEqual(status["tick_count"], 2)
 
     def test_request_claim_status_queues_against_active_stored_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1508,6 +1545,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["claims"][0]["status"], ClaimStatus.REQUESTED.value)
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")
+            self.assertEqual(status["runtime_heartbeats"], [])
 
     def test_release_claim_status_clears_stored_resource_claim(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1917,6 +1917,70 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
         store.close()
 
 
+def admin_history_review_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plans = store.list_admin_change_plans()
+        executions_by_plan = {result.plan_id: result for result in store.list_admin_executions()}
+        items = [
+            admin_history_review_item_status(plan, executions_by_plan.get(plan.id))
+            for plan in plans
+        ]
+        return {
+            "store": str(store.path),
+            "plans": len(plans),
+            "archive_candidates": sum(1 for item in items if item["archive_candidate"]),
+            "active_or_pending": sum(1 for item in items if item["disposition"] == "retain_active"),
+            "by_disposition": {
+                disposition: sum(1 for item in items if item["disposition"] == disposition)
+                for disposition in (
+                    "archive_completed",
+                    "archive_canceled",
+                    "review_failed_execution",
+                    "retain_active",
+                )
+            },
+            "items": items,
+        }
+    finally:
+        store.close()
+
+
+def admin_history_review_item_status(
+    plan: AdminChangePlan,
+    latest_execution: AdminExecutionResult | None = None,
+) -> dict[str, object]:
+    disposition, archive_candidate, next_step = _admin_history_disposition(plan, latest_execution)
+    return {
+        "id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "owner_domain": OwnerDomain(plan.owner_domain).value,
+        "approved": plan.approved,
+        "canceled": plan.canceled,
+        "can_execute_model": plan.can_execute(),
+        "latest_execution_id": latest_execution.id if latest_execution else None,
+        "latest_execution_status": AdminExecutionStatus(latest_execution.status).value if latest_execution else None,
+        "disposition": disposition,
+        "archive_candidate": archive_candidate,
+        "next_step": next_step,
+        "reason": plan.reason,
+    }
+
+
+def _admin_history_disposition(
+    plan: AdminChangePlan,
+    latest_execution: AdminExecutionResult | None,
+) -> tuple[str, bool, str]:
+    if latest_execution is not None and latest_execution.status == AdminExecutionStatus.COMPLETED:
+        return "archive_completed", True, "keep audit evidence and move completed plan out of active operator views when archive support exists"
+    if latest_execution is not None and latest_execution.status == AdminExecutionStatus.FAILED:
+        return "review_failed_execution", False, "inspect failed execution evidence before archiving, retrying, or replacing the plan"
+    if plan.canceled:
+        return "archive_canceled", True, "keep cancellation evidence and move canceled plan out of active operator views when archive support exists"
+    return "retain_active", False, "keep plan visible in active readiness and authorization views"
+
+
 def admin_change_execution_readiness_status(
     plan: AdminChangePlan,
     ids_review_packages: Sequence[HostSecurityIDSReviewPackage] = (),
@@ -2695,6 +2759,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
     admin_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_history_parser = subparsers.add_parser("admin-history-review", help="review inactive admin plans for future archiving")
+    admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -3023,6 +3089,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-execution-readiness":
         print(json.dumps(admin_execution_readiness_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-history-review":
+        print(json.dumps(admin_history_review_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

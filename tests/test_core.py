@@ -104,6 +104,7 @@ from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_executions_status
 from overseer.cli import admin_execution_readiness_status
+from overseer.cli import admin_history_review_status
 from overseer.cli import admin_summary_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
@@ -784,6 +785,50 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(block_item["readiness_state"], "manual_execution_required")
         self.assertFalse(block_item["live_execution_supported"])
         self.assertTrue(block_item["ids_review_gate_satisfied"])
+
+    def test_admin_history_review_identifies_archive_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            completed = plan_admin_change_status(
+                store_path,
+                "admin.restart.completed",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+            approve_admin_change_status(store_path, completed["id"], "sisko")
+            execute_admin_change_status(store_path, completed["id"])
+            canceled = plan_admin_change_status(
+                store_path,
+                "admin.restart.canceled",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload superseded code",
+                "active",
+            )
+            cancel_admin_change_status(store_path, canceled["id"], "sisko", "superseded")
+            plan_admin_change_status(
+                store_path,
+                "admin.restart.active",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload active code",
+                "active",
+            )
+
+            status = admin_history_review_status(store_path)
+
+        completed_item = next(item for item in status["items"] if item["id"] == "admin.restart.completed")
+        canceled_item = next(item for item in status["items"] if item["id"] == "admin.restart.canceled")
+        active_item = next(item for item in status["items"] if item["id"] == "admin.restart.active")
+        self.assertEqual(status["archive_candidates"], 2)
+        self.assertEqual(status["active_or_pending"], 1)
+        self.assertEqual(status["by_disposition"]["archive_completed"], 1)
+        self.assertEqual(status["by_disposition"]["archive_canceled"], 1)
+        self.assertEqual(completed_item["disposition"], "archive_completed")
+        self.assertTrue(canceled_item["archive_candidate"])
+        self.assertEqual(active_item["disposition"], "retain_active")
 
     def test_usage_summary_reports_capacity_and_reset_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2208,12 +2253,14 @@ class OverseerApiClientTests(unittest.TestCase):
                 executed = client.execute_admin_change({"plan_id": "admin.restart.blocked"})
                 executions = client.admin_executions()
                 readiness = client.admin_execution_readiness()
+                history = client.admin_history_review()
                 summary = client.admin_summary()
                 state = client.state()
 
             self.assertEqual(executed["status"], AdminExecutionStatus.BLOCKED.value)
             self.assertEqual(executions["execution_count"], 1)
             self.assertEqual(readiness["items"][0]["readiness_state"], "approval_required")
+            self.assertEqual(history["items"][0]["disposition"], "retain_active")
             self.assertEqual(summary["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
             self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)

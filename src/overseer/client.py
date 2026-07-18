@@ -98,8 +98,24 @@ class OverseerApiClient:
     def activate_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/activate", payload)
 
-    def release_claim(self, claim_id: str) -> dict[str, Any]:
-        return self._post("/claims/release", {"claim_id": claim_id})
+    def release_claim(
+        self,
+        claim_id: str,
+        released_by: str | None = None,
+        reason: str | None = None,
+        evidence_ids: tuple[str, ...] = (),
+        released_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"claim_id": claim_id}
+        if released_by:
+            payload["released_by"] = released_by
+        if reason:
+            payload["reason"] = reason
+        if evidence_ids:
+            payload["evidence_ids"] = list(evidence_ids)
+        if released_at:
+            payload["released_at"] = released_at
+        return self._post("/claims/release", payload)
 
     def inspect_host(self) -> dict[str, Any]:
         return self._post("/host/inspect", {})

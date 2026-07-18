@@ -3185,15 +3185,39 @@ def approve_claim_status(
         store.close()
 
 
-def release_claim_status(store_path: str | Path, claim_id: str) -> dict[str, object]:
+def release_claim_status(
+    store_path: str | Path,
+    claim_id: str,
+    released_by: str | None = None,
+    reason: str | None = None,
+    evidence_ids: Sequence[str] = (),
+    released_at: str | None = None,
+) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         coordinator = coordinator_from_store(store)
+        existing = store.load_claim(claim_id)
         claim = coordinator.release_claim(claim_id)
+        release_reason = reason or "claim released by operator"
+        event = AuditEvent(
+            id=f"audit.{claim.id}.released",
+            event_type=AuditEventType.RELEASED,
+            owner_domain=claim.owner_role,
+            subject_id=claim.id,
+            summary=release_reason,
+            risk_level=existing.risk_level,
+            evidence_ids=tuple(evidence_ids),
+            occurred_at=released_at,
+        )
+        store.save_audit_event(event)
         return {
             "store": str(store.path),
             "claim": claim.id,
             "claim_status": claim.status.value,
+            "released_by": released_by,
+            "reason": release_reason,
+            "release_evidence_complete": bool(evidence_ids),
+            "audit_event": audit_event_status(event),
         }
     finally:
         store.close()
@@ -3462,6 +3486,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_parser = subparsers.add_parser("release-claim", help="release a stored claim")
     release_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     release_parser.add_argument("--claim-id", required=True)
+    release_parser.add_argument("--released-by")
+    release_parser.add_argument("--reason")
+    release_parser.add_argument("--evidence-id", action="append", default=())
+    release_parser.add_argument("--released-at")
     args = parser.parse_args(argv)
 
     if args.command == "demo":
@@ -3842,7 +3870,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "release-claim":
-        print(json.dumps(release_claim_status(args.store, args.claim_id), sort_keys=True))
+        print(
+            json.dumps(
+                release_claim_status(
+                    args.store,
+                    args.claim_id,
+                    args.released_by,
+                    args.reason,
+                    args.evidence_id,
+                    args.released_at,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     parser.error(f"unknown command: {args.command}")

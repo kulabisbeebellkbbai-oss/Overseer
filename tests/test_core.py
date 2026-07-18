@@ -1730,12 +1730,22 @@ class OverseerApiTests(unittest.TestCase):
                         "approval_id": approved["approval_id"],
                     },
                 )
-                released = server.post("/claims/release", {"claim_id": requested["claim"]})
+                released = server.post(
+                    "/claims/release",
+                    {
+                        "claim_id": requested["claim"],
+                        "released_by": "dax",
+                        "reason": "work complete and proxy health verified",
+                        "evidence_ids": ["health.proxy.ok"],
+                    },
+                )
 
             self.assertEqual(requested["claim_status"], ClaimStatus.REQUESTED.value)
             self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
+            self.assertTrue(released["release_evidence_complete"])
+            self.assertEqual(released["audit_event"]["evidence_ids"], ["health.proxy.ok"])
 
     def test_api_rejects_non_loopback_bind(self):
         with self.assertRaises(ValueError):
@@ -2327,12 +2337,19 @@ class OverseerApiClientTests(unittest.TestCase):
                         "approval_id": approved["approval_id"],
                     }
                 )
-                released = client.release_claim(requested["claim"])
+                released = client.release_claim(
+                    requested["claim"],
+                    released_by="dax",
+                    reason="work complete",
+                    evidence_ids=("health.proxy.client.ok",),
+                )
 
             self.assertEqual(requested["claim_status"], ClaimStatus.REQUESTED.value)
             self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
+            self.assertTrue(released["release_evidence_complete"])
+            self.assertEqual(released["audit_event"]["evidence_ids"], ["health.proxy.client.ok"])
 
     def test_client_reviews_expired_claims(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4676,10 +4693,22 @@ class RuntimeTests(unittest.TestCase):
             )
             approval = approve_claim_status(store_path, requested["approval_id"], "sisko")
             activate_claim_status(store_path, requested["claim"], approval["approval_id"])
-            released = release_claim_status(store_path, requested["claim"])
+            released = release_claim_status(
+                store_path,
+                requested["claim"],
+                released_by="dax",
+                reason="gateway health verified after work",
+                evidence_ids=("health.gateway.ok",),
+                released_at="2026-07-18T21:00:00+00:00",
+            )
             store = SQLiteStore(store_path)
 
             self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
+            self.assertTrue(released["release_evidence_complete"])
+            self.assertEqual(released["audit_event"]["summary"], "gateway health verified after work")
+            self.assertEqual(released["audit_event"]["occurred_at"], "2026-07-18T21:00:00+00:00")
+            release_event = next(event for event in store.list_audit_events() if event.id == "audit.claim.cli.gateway.released")
+            self.assertEqual(release_event.evidence_ids, ("health.gateway.ok",))
             self.assertIsNone(store.load_resource("gateway.cli").current_claim_id)
             store.close()
 

@@ -186,7 +186,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 self._handle_json(lambda payload: activate_claim_status(store_path, **_activate_claim_args(payload)))
                 return
             if self.path == "/claims/release":
-                self._handle_json(lambda payload: release_claim_status(store_path, str(payload["claim_id"])))
+                self._handle_json(lambda payload: release_claim_status(store_path, **_release_claim_args(payload)))
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
@@ -348,6 +348,16 @@ def _activate_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "claim_id": str(payload["claim_id"]),
         "approval_id": str(payload["approval_id"]) if payload.get("approval_id") else None,
+    }
+
+
+def _release_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_id": str(payload["claim_id"]),
+        "released_by": str(payload["released_by"]) if payload.get("released_by") else None,
+        "reason": str(payload["reason"]) if payload.get("reason") else None,
+        "evidence_ids": tuple(str(evidence_id) for evidence_id in payload.get("evidence_ids", ())),
+        "released_at": str(payload["released_at"]) if payload.get("released_at") else None,
     }
 
 

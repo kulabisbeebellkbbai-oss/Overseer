@@ -1,17 +1,39 @@
 # Runtime
 
-The runtime entrypoint is the shape of the future Overseer daemon. The first version is operator-started and foreground-only; it can run a single tick against an explicit SQLite store.
+The runtime entrypoint is the shape of the future Overseer daemon. The first version can run a single foreground tick against an explicit SQLite store, and this workstation has an approved user systemd service installed for continuous local operation.
 
 ## Boundaries
 
-- No systemd unit is installed.
-- No background service is started automatically.
+- The user systemd unit is local machine state and is not committed to the repository.
+- The service uses a no-space symlink at `/home/god/.local/share/overseer/project` because systemd rejected the workspace path with spaces as a working directory.
 - No host scheduler is modified.
 - Runtime state is read from an explicit SQLite store path.
-- The first tick reports stored resource, usage-limit, and audit counts only.
+- The runtime currently reports stored resource, usage-limit, health-target, health-evidence, physical-identity, and audit counts.
 
 ## CLI
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
+```
+
+## Local User Service
+
+Installed local unit:
+
+```text
+/home/god/.config/systemd/user/overseer.service
+```
+
+Runtime command:
+
+```bash
+/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3
+```
+
+Operator commands:
+
+```bash
+systemctl --user status overseer.service --no-pager
+journalctl --user -u overseer.service --no-pager -n 80
+systemctl --user disable --now overseer.service
 ```

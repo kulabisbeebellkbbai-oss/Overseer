@@ -34,6 +34,9 @@ class OverseerApiClient:
     def command_summary(self) -> dict[str, Any]:
         return self._get("/command-summary")
 
+    def maintenance_summary(self) -> dict[str, Any]:
+        return self._get("/maintenance-summary")
+
     def health_summary(self) -> dict[str, Any]:
         return self._get("/health-summary")
 

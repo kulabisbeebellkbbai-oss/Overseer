@@ -25,6 +25,7 @@ from overseer import (
     FreshnessStatus,
     AdminChangeKind,
     AdminCommandResult,
+    AdminExecutionResult,
     AdminExecutionStatus,
     OwnerDomain,
     Resource,
@@ -111,6 +112,7 @@ from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
+from overseer.cli import maintenance_summary_status
 from overseer.cli import physical_summary_status
 from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
@@ -970,6 +972,60 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["alerts"]["high_or_critical"], 1)
         self.assertEqual(after_audit_count, before_audit_count)
 
+    def test_maintenance_summary_reports_plans_targets_and_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="maint.overseer-api",
+                    name="Overseer API Maintenance",
+                    type=ResourceType.MAINTENANCE_TARGET,
+                    owner_domain=OwnerDomain.OBRIEN,
+                    risk_level=RiskLevel.MEDIUM,
+                    state=ResourceState.MAINTENANCE,
+                )
+            )
+            restart_plan = plan_user_service_restart(
+                "admin.restart.maintenance",
+                "overseer-api.service",
+                "reload tested code",
+                "active",
+            )
+            store.save_admin_change_plan(restart_plan)
+            install_plan = approve_admin_change_plan(
+                plan_apt_install("admin.install.maintenance", ("sqlite3",), "install sqlite tooling", "not installed"),
+                "sisko",
+                "2026-07-18T18:00:00+00:00",
+            )
+            store.save_admin_change_plan(install_plan)
+            store.save_admin_execution(
+                AdminExecutionResult(
+                    id="admin.exec.install.maintenance",
+                    plan_id=install_plan.id,
+                    status=AdminExecutionStatus.COMPLETED,
+                    summary="installed sqlite tooling",
+                    command_results=(),
+                )
+            )
+            store.close()
+
+            status = maintenance_summary_status(store_path)
+
+        self.assertEqual(status["targets"], 1)
+        self.assertEqual(status["plans"], 2)
+        self.assertEqual(status["pending_authorizations"], 1)
+        self.assertEqual(status["approved_plans"], 1)
+        self.assertEqual(status["executable_plans"], 1)
+        self.assertEqual(status["executions"], 1)
+        self.assertEqual(status["plans_by_kind"][AdminChangeKind.USER_SERVICE_RESTART.value], 1)
+        self.assertEqual(status["plans_by_kind"][AdminChangeKind.APT_INSTALL.value], 1)
+        self.assertEqual(status["execution_by_status"][AdminExecutionStatus.COMPLETED.value], 1)
+        self.assertEqual(status["targets_by_state"][ResourceState.MAINTENANCE.value], 1)
+        restart = next(item for item in status["items"] if item["id"] == "admin.restart.maintenance")
+        self.assertTrue(restart["requires_explicit_approval"])
+        self.assertIsNone(restart["latest_execution_status"])
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1295,6 +1351,27 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["resources"]["total"], 1)
             self.assertEqual(status["resources"]["by_owner"][OwnerDomain.JULIAN.value], 1)
+
+    def test_client_reads_maintenance_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_admin_change_plan(
+                plan_user_service_restart(
+                    "admin.restart.client",
+                    "overseer-api.service",
+                    "reload client test",
+                    "active",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.maintenance_summary()
+
+            self.assertEqual(status["plans"], 1)
+            self.assertEqual(status["items"][0]["kind"], AdminChangeKind.USER_SERVICE_RESTART.value)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

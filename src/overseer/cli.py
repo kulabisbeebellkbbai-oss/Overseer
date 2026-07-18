@@ -494,6 +494,80 @@ def command_summary_status(
         store.close()
 
 
+def maintenance_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        resources = [resource for resource in store.list_resources() if resource.type == ResourceType.MAINTENANCE_TARGET]
+        plans = [
+            plan
+            for plan in store.list_admin_change_plans()
+            if plan.owner_domain == OwnerDomain.OBRIEN or plan.kind in {AdminChangeKind.USER_SERVICE_RESTART, AdminChangeKind.APT_INSTALL}
+        ]
+        executions = store.list_admin_executions()
+        executions_by_plan = {result.plan_id: result for result in executions}
+        pending = [
+            plan
+            for plan in plans
+            if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
+        ]
+        return {
+            "store": str(store.path),
+            "targets": len(resources),
+            "plans": len(plans),
+            "pending_authorizations": len(pending),
+            "approved_plans": sum(1 for plan in plans if plan.approved),
+            "canceled_plans": sum(1 for plan in plans if plan.canceled),
+            "executable_plans": sum(1 for plan in plans if plan.can_execute()),
+            "executions": sum(1 for plan in plans if plan.id in executions_by_plan),
+            "plans_by_kind": {
+                kind.value: sum(1 for plan in plans if plan.kind == kind)
+                for kind in AdminChangeKind
+            },
+            "plans_by_risk": {
+                risk.value: sum(1 for plan in plans if plan.risk_level == risk)
+                for risk in RiskLevel
+            },
+            "execution_by_status": {
+                status.value: sum(
+                    1
+                    for plan in plans
+                    for result in (executions_by_plan.get(plan.id),)
+                    if result is not None and result.status == status
+                )
+                for status in AdminExecutionStatus
+            },
+            "targets_by_state": {
+                state.value: sum(1 for resource in resources if resource.state == state)
+                for state in ResourceState
+            },
+            "items": [maintenance_plan_status(plan, executions_by_plan.get(plan.id)) for plan in plans],
+        }
+    finally:
+        store.close()
+
+
+def maintenance_plan_status(plan: AdminChangePlan, execution: AdminExecutionResult | None = None) -> dict[str, object]:
+    return {
+        "id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "owner_domain": OwnerDomain(plan.owner_domain).value,
+        "risk_level": RiskLevel(plan.risk_level).value,
+        "approval_level": ApprovalLevel(plan.approval_level).value,
+        "requires_explicit_approval": plan.requires_explicit_approval(),
+        "approved": plan.approved,
+        "canceled": plan.canceled,
+        "can_execute": plan.can_execute(),
+        "missing_fields": list(missing_admin_change_fields(plan)),
+        "step_count": len(plan.steps),
+        "rollback_step_count": len(plan.rollback_steps),
+        "verification_step_count": len(plan.verification_steps),
+        "latest_execution_id": execution.id if execution else None,
+        "latest_execution_status": AdminExecutionStatus(execution.status).value if execution else None,
+        "reason": plan.reason,
+    }
+
+
 def run_status(
     store_path: str | Path,
     once: bool,
@@ -1225,6 +1299,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     command_summary_parser = subparsers.add_parser("command-summary", help="summarize command-level Overseer state")
     command_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     command_summary_parser.add_argument("--service-name", default="overseer")
+    maintenance_summary_parser = subparsers.add_parser("maintenance-summary", help="summarize maintenance and update plans")
+    maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -1357,6 +1433,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "command-summary":
         print(json.dumps(command_summary_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "maintenance-summary":
+        print(json.dumps(maintenance_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "run":

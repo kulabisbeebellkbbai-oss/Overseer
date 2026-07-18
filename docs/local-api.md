@@ -23,6 +23,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /service-status`
 - `GET /runtime-status`
 - `GET /command-summary`
+- `GET /maintenance-summary`
 - `GET /alerts-summary`
 - `GET /usage-summary`
 - `GET /physical-summary`
@@ -57,6 +58,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, and recent admin audit events.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
+`GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
@@ -73,6 +75,7 @@ from overseer.client import OverseerApiClient
 client = OverseerApiClient(auth_token_file="state/api-token")
 runtime = client.runtime_status()
 command = client.command_summary()
+maintenance = client.maintenance_summary()
 alerts = client.alerts_summary()
 usage = client.usage_summary()
 physical = client.physical_summary()

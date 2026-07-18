@@ -36,3 +36,13 @@ Maintenance work must not surprise active project threads or consume a shared se
 - Work that affects physical devices, power, or storage requires Kira identity and risk confirmation.
 - Work that affects a quota-limited service must ask Quark for a window that will not waste limited capacity.
 - Work cannot close until Julian's health evidence confirms recovery or the failure is explicitly recorded.
+
+## Maintenance Summary
+
+O'Brien's compact operator read model is available with:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli maintenance-summary --store state/overseer.sqlite3
+```
+
+It summarizes persisted maintenance targets plus install and restart admin plans, approval state, rollback and verification step coverage, execution status, and risk distribution.

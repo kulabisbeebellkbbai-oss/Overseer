@@ -33,6 +33,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-id --store state/overseer.sqlite3` - persist discovered path identities to an explicit ignored local database path.
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once` - run one foreground runtime tick against an explicit store.
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5` - run one tick, probe configured health targets, and retain bounded evidence per target.
+- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host` - run one tick and capture read-only host admin evidence.
 - `PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3` - read the stored runtime heartbeat for the local service.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.
 - `PYTHONPATH=src python3 -m overseer.cli assess-host-security --store state/overseer.sqlite3` - assess the latest persisted host snapshot for non-loopback TCP listeners.

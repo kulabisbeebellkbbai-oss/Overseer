@@ -242,6 +242,7 @@ def run_status(
     probe_health_targets: bool = False,
     health_probe_timeout_seconds: float = 5.0,
     health_evidence_retention_per_target: int = 5,
+    inspect_host: bool = False,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -250,6 +251,7 @@ def run_status(
             probe_health_targets=probe_health_targets,
             health_probe_adapter=HttpHealthProbeAdapter(timeout_seconds=health_probe_timeout_seconds),
             health_evidence_retention_per_target=health_evidence_retention_per_target,
+            inspect_host=inspect_host,
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),
@@ -261,6 +263,9 @@ def run_status(
             "physical_identities": tick.physical_identities,
             "runtime_heartbeats": tick.runtime_heartbeats,
             "health_probes": tick.health_probes,
+            "host_inspections": tick.host_inspections,
+            "host_security_high_findings": tick.host_security_high_findings,
+            "host_security_warning_findings": tick.host_security_warning_findings,
         }
     finally:
         store.close()
@@ -769,6 +774,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--probe-health-targets", action="store_true", help="probe configured health targets on each tick")
     run_parser.add_argument("--health-probe-timeout-seconds", type=float, default=5.0)
     run_parser.add_argument("--health-evidence-retention-per-target", type=int, default=5)
+    run_parser.add_argument("--inspect-host", action="store_true", help="capture a read-only host inspection snapshot on each tick")
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
@@ -882,6 +888,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.probe_health_targets,
                     args.health_probe_timeout_seconds,
                     args.health_evidence_retention_per_target,
+                    args.inspect_host,
                 ),
                 sort_keys=True,
             )

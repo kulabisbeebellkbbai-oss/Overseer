@@ -2089,6 +2089,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["physical_identities"], 0)
             self.assertEqual(status["runtime_heartbeats"], 1)
             self.assertEqual(status["health_probes"], 0)
+            self.assertEqual(status["host_inspections"], 0)
 
     def test_runtime_can_probe_configured_health_targets_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
@@ -2125,6 +2126,40 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tick.health_probes, 1)
             self.assertEqual(tick.health_evidence, 1)
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
+            store.close()
+
+    def test_runtime_can_capture_host_inspection_when_enabled(self):
+        class FakeHostInspectionAdapter:
+            def inspect(self):
+                return HostInspectionAdapter(
+                    command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                        name=command[0],
+                        command=tuple(command),
+                        exit_code=0,
+                        stdout=(
+                            "host-runtime"
+                            if tuple(command) == ("hostname",)
+                            else "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                            if tuple(command) == ("ss", "-ltnp")
+                            else "ok"
+                        ),
+                    ),
+                    file_reader=lambda path: "ID=debian\n",
+                ).inspect("2026-07-18T17:00:00+00:00")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+
+            tick = OverseerRuntime(
+                store,
+                inspect_host=True,
+                host_inspection_adapter=FakeHostInspectionAdapter(),
+            ).run(once=True)
+
+            self.assertEqual(tick.host_inspections, 1)
+            self.assertEqual(tick.host_security_high_findings, 1)
+            self.assertEqual(tick.host_security_warning_findings, 0)
+            self.assertEqual(store.list_host_snapshots()[0].hostname, "host-runtime")
             store.close()
 
     def test_runtime_prunes_health_evidence_per_target(self):

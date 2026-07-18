@@ -120,6 +120,7 @@ from overseer.cli import runtime_status
 from overseer.cli import service_status
 from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
+from overseer.cli import virtual_summary_status
 
 
 class _JsonHealthHandler(BaseHTTPRequestHandler):
@@ -785,6 +786,82 @@ class HealthSummaryTests(unittest.TestCase):
         serial = next(item for item in status["items"] if item["stable_id"] == "serial.rs485-a")
         self.assertEqual(serial["observed_paths"], ["/dev/serial/by-id/rs485-a"])
 
+    def test_virtual_summary_reports_checkout_readiness_and_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.protected",
+                    name="Protected Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.HIGH,
+                    identifiers={
+                        "kind": "gateway",
+                        "host": "127.0.0.1",
+                        "ports": [8795],
+                        "networks": ["loopback"],
+                        "state_path": "state/gateway",
+                    },
+                    exclusive_groups=frozenset({"gateway.protected"}),
+                    current_claim_id="claim.gateway.active",
+                )
+            )
+            store.save_resource(
+                Resource(
+                    id="proxy.local",
+                    name="Local Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.MEDIUM,
+                    identifiers={"kind": "proxy", "ports": [8766], "config_paths": ["config/proxy.json"]},
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.gateway.active",
+                    resource_id="gateway.protected",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use gateway",
+                    requested_action="bind protected gateway",
+                    risk_level=RiskLevel.HIGH,
+                    status=ClaimStatus.ACTIVE,
+                    port_reservations=frozenset({8795}),
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.gateway.queued",
+                    resource_id="gateway.protected",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-b",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use gateway later",
+                    requested_action="bind protected gateway",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.QUEUED,
+                    port_reservations=frozenset({8795}),
+                )
+            )
+            store.close()
+
+            status = virtual_summary_status(store_path)
+
+        self.assertEqual(status["assets"], 2)
+        self.assertEqual(status["ready_for_checkout"], 1)
+        self.assertEqual(status["checked_out_or_reserved"], 1)
+        self.assertEqual(status["active_claims"], 1)
+        self.assertEqual(status["queued_claims"], 1)
+        self.assertEqual(status["reserved_ports"], [8795])
+        self.assertEqual(status["assets_by_kind"]["gateway"], 1)
+        gateway = next(item for item in status["items"] if item["id"] == "gateway.protected")
+        self.assertEqual(gateway["active_claim_ids"], ["claim.gateway.active"])
+        self.assertEqual(gateway["queued_claim_ids"], ["claim.gateway.queued"])
+        self.assertFalse(gateway["ready_for_checkout"])
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1065,6 +1142,29 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["assets"], 1)
             self.assertEqual(status["items"][0]["stable_id"], "usb.device-a")
+
+    def test_client_reads_virtual_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="vm.client",
+                    name="Client VM",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.MEDIUM,
+                    identifiers={"kind": "vm", "host": "localhost"},
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.virtual_summary()
+
+            self.assertEqual(status["assets"], 1)
+            self.assertEqual(status["items"][0]["kind"], "vm")
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

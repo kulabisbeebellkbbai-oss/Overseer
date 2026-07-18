@@ -40,6 +40,9 @@ class OverseerApiClient:
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 
+    def virtual_summary(self) -> dict[str, Any]:
+        return self._get("/virtual-summary")
+
     def alerts_summary(self) -> dict[str, Any]:
         return self._get("/alerts-summary")
 

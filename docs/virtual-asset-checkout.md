@@ -97,4 +97,7 @@ PYTHONPATH=src python3 -m overseer.cli request-claim --store state/overseer.sqli
 PYTHONPATH=src python3 -m overseer.cli approve-claim --store state/overseer.sqlite3 --approval-id approval.claim.gateway --decided-by sisko
 PYTHONPATH=src python3 -m overseer.cli activate-claim --store state/overseer.sqlite3 --claim-id claim.gateway --approval-id approval.claim.gateway
 PYTHONPATH=src python3 -m overseer.cli release-claim --store state/overseer.sqlite3 --claim-id claim.gateway
+PYTHONPATH=src python3 -m overseer.cli virtual-summary --store state/overseer.sqlite3
 ```
+
+`virtual-summary` is Dax's compact read model for persisted virtual resources. It reports asset counts, checkout readiness, active and queued claims, reserved ports, counts by virtual kind, state, and risk, plus per-asset topology identity details.

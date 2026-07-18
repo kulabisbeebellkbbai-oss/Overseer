@@ -285,6 +285,105 @@ def physical_identity_status(identity: PhysicalIdentity) -> dict[str, object]:
     }
 
 
+VIRTUAL_ASSET_KINDS = (
+    "emulator",
+    "vm",
+    "gateway",
+    "proxy",
+    "network_segment",
+    "composite_topology",
+    "unknown",
+)
+
+
+def virtual_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        resources = [resource for resource in store.list_resources() if resource.type == ResourceType.VIRTUAL_ASSET]
+        claims = store.list_claims()
+        virtual_resource_ids = {resource.id for resource in resources}
+        active_claims = [
+            claim
+            for claim in claims
+            if claim.resource_id in virtual_resource_ids and claim.is_active_like()
+        ]
+        queued_claims = [
+            claim
+            for claim in claims
+            if claim.resource_id in virtual_resource_ids and claim.status == ClaimStatus.QUEUED
+        ]
+        return {
+            "store": str(store.path),
+            "assets": len(resources),
+            "ready_for_checkout": sum(1 for resource in resources if virtual_resource_ready_for_checkout(resource, active_claims)),
+            "checked_out_or_reserved": sum(1 for resource in resources if not virtual_resource_ready_for_checkout(resource, active_claims)),
+            "active_claims": len(active_claims),
+            "queued_claims": len(queued_claims),
+            "reserved_ports": sorted({port for claim in active_claims for port in claim.port_reservations}),
+            "assets_by_kind": {
+                kind: sum(1 for resource in resources if virtual_resource_kind(resource) == kind)
+                for kind in VIRTUAL_ASSET_KINDS
+            },
+            "assets_by_state": {
+                state.value: sum(1 for resource in resources if resource.state == state)
+                for state in ResourceState
+            },
+            "assets_by_risk": {
+                risk.value: sum(1 for resource in resources if resource.risk_level == risk)
+                for risk in RiskLevel
+            },
+            "items": [virtual_resource_status(resource, claims) for resource in resources],
+        }
+    finally:
+        store.close()
+
+
+def virtual_resource_kind(resource: Resource) -> str:
+    kind = resource.identifiers.get("kind", "unknown")
+    return str(kind) if str(kind) in VIRTUAL_ASSET_KINDS else "unknown"
+
+
+def virtual_resource_ready_for_checkout(resource: Resource, active_claims: Sequence[Claim]) -> bool:
+    if resource.state != ResourceState.AVAILABLE:
+        return False
+    return not any(claim.resource_id == resource.id for claim in active_claims)
+
+
+def virtual_resource_status(resource: Resource, claims: Sequence[Claim]) -> dict[str, object]:
+    resource_claims = [claim for claim in claims if claim.resource_id == resource.id]
+    active_claims = [claim for claim in resource_claims if claim.is_active_like()]
+    queued_claims = [claim for claim in resource_claims if claim.status == ClaimStatus.QUEUED]
+    return {
+        "id": resource.id,
+        "name": resource.name,
+        "kind": virtual_resource_kind(resource),
+        "owner_domain": OwnerDomain(resource.owner_domain).value,
+        "risk_level": RiskLevel(resource.risk_level).value,
+        "state": ResourceState(resource.state).value,
+        "host": resource.identifiers.get("host"),
+        "ports": sorted(resource.ports()),
+        "networks": _sorted_identifier_values(resource, "networks"),
+        "state_path": resource.identifiers.get("state_path"),
+        "process_hint": resource.identifiers.get("process_hint"),
+        "config_paths": _sorted_identifier_values(resource, "config_paths"),
+        "dependencies": sorted(resource.dependencies),
+        "exclusive_groups": sorted(resource.exclusive_groups),
+        "current_claim_id": resource.current_claim_id,
+        "active_claim_ids": [claim.id for claim in active_claims],
+        "queued_claim_ids": [claim.id for claim in queued_claims],
+        "ready_for_checkout": virtual_resource_ready_for_checkout(resource, active_claims),
+    }
+
+
+def _sorted_identifier_values(resource: Resource, key: str) -> list[object]:
+    values = resource.identifiers.get(key, ())
+    if isinstance(values, (list, tuple, set, frozenset)):
+        return sorted(values)
+    if values:
+        return [values]
+    return []
+
+
 def run_status(
     store_path: str | Path,
     once: bool,
@@ -1011,6 +1110,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
     physical_summary_parser = subparsers.add_parser("physical-summary", help="summarize persisted physical identities")
     physical_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    virtual_summary_parser = subparsers.add_parser("virtual-summary", help="summarize persisted virtual assets")
+    virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -1135,6 +1236,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "physical-summary":
         print(json.dumps(physical_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "virtual-summary":
+        print(json.dumps(virtual_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "run":

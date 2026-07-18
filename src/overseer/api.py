@@ -30,6 +30,7 @@ from .cli import (
     service_status,
     runtime_status,
     usage_summary_status,
+    virtual_summary_status,
 )
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
@@ -60,6 +61,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/physical-summary":
                 self._handle(lambda: physical_summary_status(store_path))
+                return
+            if self.path == "/virtual-summary":
+                self._handle(lambda: virtual_summary_status(store_path))
                 return
             if self.path == "/alerts-summary":
                 self._handle(lambda: alerts_summary_status(store_path))

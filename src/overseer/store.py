@@ -13,6 +13,7 @@ from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence, HealthTarget
 from .host import HostInspectionSnapshot
+from .ids_review import HostSecurityIDSReviewPackage
 from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
@@ -97,6 +98,11 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS host_security_source_reviews (
                 id TEXT PRIMARY KEY,
                 remote_address TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS host_security_ids_review_packages (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             """
@@ -279,6 +285,26 @@ class SQLiteStore:
 
     def list_host_security_source_reviews(self) -> tuple[HostSecuritySourceReview, ...]:
         return tuple(_load_dataclass(HostSecuritySourceReview, payload) for payload in self._list_payloads("host_security_source_reviews"))
+
+    def save_host_security_ids_review_package(self, package: HostSecurityIDSReviewPackage) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO host_security_ids_review_packages (id, plan_id, payload) VALUES (?, ?, ?)",
+            (package.id, package.plan_id, _dump(package)),
+        )
+        self._connection.commit()
+
+    def load_host_security_ids_review_package(self, package_id: str) -> HostSecurityIDSReviewPackage:
+        return _load_dataclass(HostSecurityIDSReviewPackage, self._get_payload("host_security_ids_review_packages", package_id))
+
+    def list_host_security_ids_review_packages(self) -> tuple[HostSecurityIDSReviewPackage, ...]:
+        return tuple(_load_dataclass(HostSecurityIDSReviewPackage, payload) for payload in self._list_payloads("host_security_ids_review_packages"))
+
+    def list_host_security_ids_review_packages_for_plan(self, plan_id: str) -> tuple[HostSecurityIDSReviewPackage, ...]:
+        rows = self._connection.execute(
+            "SELECT payload FROM host_security_ids_review_packages WHERE plan_id = ? ORDER BY id",
+            (plan_id,),
+        ).fetchall()
+        return tuple(_load_dataclass(HostSecurityIDSReviewPackage, str(row["payload"])) for row in rows)
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

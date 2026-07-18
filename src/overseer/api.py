@@ -25,6 +25,7 @@ from .cli import (
     health_efficiency_summary_status,
     health_summary_status,
     host_security_findings_status,
+    host_security_ids_review_packages_status,
     host_security_sources_status,
     host_security_source_reviews_status,
     host_security_triage_status,
@@ -37,6 +38,7 @@ from .cli import (
     physical_summary_status,
     plan_admin_change_status,
     release_claim_status,
+    prepare_host_security_ids_review_package_status,
     request_claim_status,
     service_status,
     runtime_status,
@@ -110,6 +112,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/host/security/source-reviews":
                 self._handle(lambda: host_security_source_reviews_status(store_path))
                 return
+            if self.path == "/host/security/ids-review-packages":
+                self._handle(lambda: host_security_ids_review_packages_status(store_path))
+                return
             if self.path == "/admin/authorizations-required":
                 self._handle(lambda: authorizations_required_status(store_path))
                 return
@@ -151,6 +156,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/source-reviews":
                 self._handle_json(lambda payload: create_host_security_source_review_status(store_path, **_host_security_source_review_args(payload)))
+                return
+            if self.path == "/host/security/ids-review-packages":
+                self._handle_json(lambda payload: prepare_host_security_ids_review_package_status(store_path, **_host_security_ids_review_package_args(payload)))
                 return
             if self.path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
@@ -318,6 +326,16 @@ def _host_security_source_block_args(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
         "action": str(payload.get("action", "block_ip")),
         "reason": str(payload["reason"]) if payload.get("reason") else None,
+    }
+
+
+def _host_security_ids_review_package_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "package_id": str(payload["package_id"]) if payload.get("package_id") else None,
+        "source_review_id": str(payload["source_review_id"]) if payload.get("source_review_id") else None,
+        "requested_by": str(payload.get("requested_by", "odo")),
+        "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
     }
 
 

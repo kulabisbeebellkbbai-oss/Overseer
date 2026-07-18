@@ -124,6 +124,8 @@ from overseer.cli import main as cli_main
 from overseer.cli import maintenance_summary_status
 from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
+from overseer.cli import prepare_host_security_ids_review_package_status
+from overseer.cli import host_security_ids_review_packages_status
 from overseer.cli import plan_host_security_source_block_status
 from overseer.cli import plan_host_security_remediation_status
 from overseer.cli import plan_admin_change_status
@@ -1813,6 +1815,13 @@ class OverseerApiClientTests(unittest.TestCase):
                     }
                 )
                 block_plan = client.plan_host_security_source_block({"review_id": hostile["id"]})
+                with self.assertRaises(HTTPError):
+                    client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                ids_package = client.prepare_host_security_ids_review_package(
+                    {"plan_id": block_plan["id"], "source_review_id": hostile["id"]}
+                )
+                approved = client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                packages = client.host_security_ids_review_packages()
                 reviews = client.host_security_source_reviews()
 
             self.assertEqual(created["remote_address"], "8.8.8.8")
@@ -1821,6 +1830,10 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(block_plan["kind"], AdminChangeKind.BLOCK_IP.value)
             self.assertEqual(block_plan["target"], "8.8.8.8")
             self.assertFalse(block_plan["can_execute"])
+            self.assertEqual(ids_package["plan_id"], block_plan["id"])
+            self.assertIn("Intrusion Detection", ids_package["prompt"])
+            self.assertTrue(approved["approved"])
+            self.assertEqual(packages["package_count"], 1)
             self.assertEqual(reviews["review_count"], 2)
 
     def test_client_plans_host_security_remediation(self):
@@ -2381,6 +2394,18 @@ class HostInspectionTests(unittest.TestCase):
             loaded.close()
             with self.assertRaises(ValueError):
                 plan_host_security_source_block_status(store_path, pending["id"], plan_id="admin.block.pending")
+            with self.assertRaises(ValueError):
+                approve_admin_change_status(store_path, block_plan["id"], "sisko")
+            ids_package = prepare_host_security_ids_review_package_status(
+                store_path,
+                block_plan["id"],
+                source_review_id=hostile["id"],
+                requested_by="odo",
+                created_at="2026-07-18T16:09:00+00:00",
+            )
+            ids_packages = host_security_ids_review_packages_status(store_path)
+            approved = approve_admin_change_status(store_path, block_plan["id"], "sisko")
+            gated_state = list_state_status(store_path)
 
         self.assertEqual(pending["disposition"], SourceReviewDisposition.NEEDS_REVIEW.value)
         self.assertFalse(pending["can_stage_block_plan"])
@@ -2392,10 +2417,18 @@ class HostInspectionTests(unittest.TestCase):
         self.assertFalse(block_plan["can_execute"])
         self.assertTrue(block_plan["ids_review_required_before_execution"])
         self.assertEqual(plan.target, "8.8.8.8")
+        self.assertEqual(ids_package["plan_id"], block_plan["id"])
+        self.assertEqual(ids_package["source_review_id"], hostile["id"])
+        self.assertEqual(ids_package["status"], "prepared")
+        self.assertIn("codex-advisor.sh", ids_package["advisory_command"][0])
+        self.assertIn("custom firewall or IDS rules", ids_package["prompt"])
+        self.assertEqual(ids_packages["package_count"], 1)
+        self.assertTrue(approved["approved"])
         self.assertEqual(reviews["review_count"], 2)
         self.assertEqual(reviews["ready_for_block_plan"], 1)
         self.assertEqual(reviews["by_disposition"][SourceReviewDisposition.HOSTILE.value], 1)
         self.assertEqual(len(state["host_security_source_reviews"]), 2)
+        self.assertEqual(len(gated_state["host_security_ids_review_packages"]), 1)
 
     def test_host_security_remediation_stages_deny_plan_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

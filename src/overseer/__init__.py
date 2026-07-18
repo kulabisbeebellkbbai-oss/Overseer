@@ -70,6 +70,12 @@ from .host import (
     host_snapshot_status,
     parse_os_release,
 )
+from .ids_review import (
+    HostSecurityIDSReviewPackage,
+    IDSReviewPackageStatus,
+    admin_plan_requires_ids_review,
+    build_ids_review_package,
+)
 from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
     InterruptionPolicy,
@@ -189,6 +195,10 @@ __all__ = [
     "host_security_status",
     "host_snapshot_status",
     "parse_os_release",
+    "HostSecurityIDSReviewPackage",
+    "IDSReviewPackageStatus",
+    "admin_plan_requires_ids_review",
+    "build_ids_review_package",
     "HttpHealthProbeAdapter",
     "InterruptionPolicy",
     "MaintenanceKind",

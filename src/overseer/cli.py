@@ -33,6 +33,12 @@ from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import HostFindingSeverity, HostInspectionAdapter, HostInspectionSnapshot, host_security_status, host_snapshot_status
+from .ids_review import (
+    HostSecurityIDSReviewPackage,
+    IDSReviewPackageStatus,
+    admin_plan_requires_ids_review,
+    build_ids_review_package,
+)
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity
 from .physical_discovery import PathPhysicalDiscoveryAdapter
@@ -1455,6 +1461,72 @@ def plan_host_security_source_block_status(
         store.close()
 
 
+def host_security_ids_review_package_status(package: HostSecurityIDSReviewPackage) -> dict[str, object]:
+    return {
+        "id": package.id,
+        "plan_id": package.plan_id,
+        "plan_kind": AdminChangeKind(package.plan_kind).value,
+        "target": package.target,
+        "requested_by": package.requested_by,
+        "status": IDSReviewPackageStatus(package.status).value,
+        "source_review_id": package.source_review_id,
+        "created_at": package.created_at,
+        "advisory_project_path": package.advisory_project_path,
+        "advisory_command": list(package.advisory_command),
+        "interactive_thread": package.interactive_thread,
+        "current_state": package.current_state,
+        "intended_traffic": package.intended_traffic,
+        "operational_reason": package.operational_reason,
+        "sensitivity": package.sensitivity,
+        "policy_gaps": package.policy_gaps,
+        "firewall_rule_drafts": list(package.firewall_rule_drafts),
+        "ids_rule_drafts": list(package.ids_rule_drafts),
+        "logging_plan": package.logging_plan,
+        "test_plan": package.test_plan,
+        "rollback_plan": package.rollback_plan,
+        "approval_boundary": package.approval_boundary,
+        "prompt": package.prompt,
+        "advisory_result": package.advisory_result,
+        "satisfies_pre_execution_review_gate": package.satisfies_pre_execution_review_gate(),
+    }
+
+
+def prepare_host_security_ids_review_package_status(
+    store_path: str | Path,
+    plan_id: str,
+    package_id: str | None = None,
+    source_review_id: str | None = None,
+    requested_by: str = "odo",
+    created_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        source_review = store.load_host_security_source_review(source_review_id) if source_review_id else None
+        package = build_ids_review_package(plan, source_review, package_id, requested_by, created_at)
+        store.save_host_security_ids_review_package(package)
+        return {"store": str(store.path), **host_security_ids_review_package_status(package)}
+    finally:
+        store.close()
+
+
+def host_security_ids_review_packages_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        packages = store.list_host_security_ids_review_packages()
+        return {
+            "store": str(store.path),
+            "package_count": len(packages),
+            "by_status": {
+                status.value: sum(1 for package in packages if package.status == status)
+                for status in IDSReviewPackageStatus
+            },
+            "packages": [host_security_ids_review_package_status(package) for package in packages],
+        }
+    finally:
+        store.close()
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -1600,6 +1672,11 @@ def approve_admin_change_status(
     store = SQLiteStore(store_path)
     try:
         plan = store.load_admin_change_plan(plan_id)
+        if admin_plan_requires_ids_review(plan) and not any(
+            package.satisfies_pre_execution_review_gate()
+            for package in store.list_host_security_ids_review_packages_for_plan(plan.id)
+        ):
+            raise ValueError("IDS/firewall review package is required before approving this admin change plan")
         approved = approve_admin_change_plan(plan, approved_by, approved_at)
         store.save_admin_change_plan(approved)
         return {"store": str(store.path), **admin_change_plan_status(approved)}
@@ -1778,6 +1855,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         heartbeats = store.list_runtime_heartbeats()
         host_snapshots = store.list_host_snapshots()
         source_reviews = store.list_host_security_source_reviews()
+        ids_review_packages = store.list_host_security_ids_review_packages()
         admin_change_plans = store.list_admin_change_plans()
         admin_executions = store.list_admin_executions()
         return {
@@ -1887,6 +1965,9 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                 for result in admin_executions
             ],
             "host_security_source_reviews": [host_security_source_review_status(review) for review in source_reviews],
+            "host_security_ids_review_packages": [
+                host_security_ids_review_package_status(package) for package in ids_review_packages
+            ],
         }
     finally:
         store.close()
@@ -2098,6 +2179,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     source_block_parser.add_argument("--plan-id")
     source_block_parser.add_argument("--action", default="block_ip")
     source_block_parser.add_argument("--reason")
+    ids_reviews_parser = subparsers.add_parser("host-security-ids-review-packages", help="list prepared IDS/firewall review packages")
+    ids_reviews_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    prepare_ids_review_parser = subparsers.add_parser(
+        "prepare-host-security-ids-review-package",
+        help="prepare an Intrusion Detection advisory package for a staged security admin plan",
+    )
+    prepare_ids_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    prepare_ids_review_parser.add_argument("--plan-id", required=True)
+    prepare_ids_review_parser.add_argument("--package-id")
+    prepare_ids_review_parser.add_argument("--source-review-id")
+    prepare_ids_review_parser.add_argument("--requested-by", default="odo")
+    prepare_ids_review_parser.add_argument("--created-at")
     host_remediation_parser = subparsers.add_parser(
         "plan-host-security-remediation",
         help="stage an approval-gated host security remediation plan",
@@ -2321,6 +2414,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.plan_id,
                     args.action,
                     args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "host-security-ids-review-packages":
+        print(json.dumps(host_security_ids_review_packages_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "prepare-host-security-ids-review-package":
+        print(
+            json.dumps(
+                prepare_host_security_ids_review_package_status(
+                    args.store,
+                    args.plan_id,
+                    args.package_id,
+                    args.source_review_id,
+                    args.requested_by,
+                    args.created_at,
                 ),
                 sort_keys=True,
             )

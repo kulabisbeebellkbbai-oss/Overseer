@@ -826,6 +826,24 @@ class OverseerApiTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 401)
             self.assertEqual(state["resources"][0]["id"], "svc.secured")
 
+    def test_admin_execute_reports_missing_field_and_missing_record_distinctly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path) as server:
+                with self.assertRaises(HTTPError) as missing_field_error:
+                    server.post("/admin/execute", {})
+                missing_field_body = json.loads(missing_field_error.exception.read().decode("utf-8"))
+
+                with self.assertRaises(HTTPError) as missing_record_error:
+                    server.post("/admin/execute", {"plan_id": "admin.missing"})
+                missing_record_body = json.loads(missing_record_error.exception.read().decode("utf-8"))
+
+            self.assertEqual(missing_field_error.exception.code, 400)
+            self.assertEqual(missing_field_body["error"], "missing field: plan_id")
+            self.assertEqual(missing_record_error.exception.code, 404)
+            self.assertEqual(missing_record_body["error"], "missing record: admin.missing")
+
 
 class OverseerApiClientTests(unittest.TestCase):
     def test_client_reads_state_with_token_file(self):

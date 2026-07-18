@@ -98,7 +98,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 self._handle_json(lambda payload: cancel_admin_change_status(store_path, **_cancel_admin_plan_args(payload)))
                 return
             if self.path == "/admin/execute":
-                self._handle_json(lambda payload: execute_admin_change_status(store_path, str(payload["plan_id"])))
+                self._handle_admin_execute()
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -130,6 +130,18 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 self._write_json({"error": f"missing field: {error.args[0]}"}, HTTPStatus.BAD_REQUEST)
             except ValueError as error:
                 self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+        def _handle_admin_execute(self) -> None:
+            try:
+                payload = self._read_json()
+                plan_id = str(payload["plan_id"])
+            except KeyError as error:
+                self._write_json({"error": f"missing field: {error.args[0]}"}, HTTPStatus.BAD_REQUEST)
+                return
+            except ValueError as error:
+                self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._handle(lambda: execute_admin_change_status(store_path, plan_id))
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("content-length", "0"))

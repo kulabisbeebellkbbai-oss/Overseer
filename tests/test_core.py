@@ -75,6 +75,7 @@ from overseer import (
     validate_config,
 )
 from overseer.api import make_api_handler, run_api_server
+from overseer.client import OverseerApiClient
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
@@ -740,6 +741,81 @@ class OverseerApiTests(unittest.TestCase):
 
             self.assertEqual(error.exception.code, 401)
             self.assertEqual(state["resources"][0]["id"], "svc.secured")
+
+
+class OverseerApiClientTests(unittest.TestCase):
+    def test_client_reads_state_with_token_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            token_path = Path(directory) / "api-token"
+            token_path.write_text("client-secret\n", encoding="utf-8")
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.client",
+                    name="Client Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token_file=str(token_path))
+                health = client.health()
+                state = client.state()
+
+            self.assertTrue(health["ok"])
+            self.assertEqual(state["resources"][0]["id"], "svc.client")
+
+    def test_client_runs_claim_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.client",
+                    name="Client Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_claim(
+                    {
+                        "claim_id": "claim.client.proxy",
+                        "resource_id": "proxy.client",
+                        "claim_type": ClaimType.LEASE.value,
+                        "owner_thread": "thread-client",
+                        "owner_role": OwnerDomain.DAX.value,
+                        "intent": "use proxy",
+                        "requested_action": "bind proxy",
+                        "risk_level": RiskLevel.LOW.value,
+                    }
+                )
+                approved = client.approve_claim(
+                    {
+                        "approval_id": requested["approval_id"],
+                        "decided_by": "sisko",
+                    }
+                )
+                activated = client.activate_claim(
+                    {
+                        "claim_id": requested["claim"],
+                        "approval_id": approved["approval_id"],
+                    }
+                )
+                released = client.release_claim(requested["claim"])
+
+            self.assertEqual(requested["claim_status"], ClaimStatus.REQUESTED.value)
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
+            self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

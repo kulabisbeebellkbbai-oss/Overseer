@@ -33,6 +33,17 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
+## Python Client
+
+Local Python tools can use `overseer.client.OverseerApiClient` to read the token file and call the API:
+
+```python
+from overseer.client import OverseerApiClient
+
+client = OverseerApiClient(auth_token_file="state/api-token")
+summary = client.health_summary()
+```
+
 ## Installed User Service
 
 The approved local service is installed as:

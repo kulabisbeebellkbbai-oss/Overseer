@@ -52,6 +52,7 @@ from overseer import (
     schedule_limited_work,
 )
 from overseer.cli import demo_status
+from overseer.cli import persisted_demo_status
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -645,6 +646,16 @@ class CliDemoTests(unittest.TestCase):
         self.assertEqual(status["resources"], ["gateway.protected"])
         self.assertEqual(status["decision"], ConflictOutcome.ESCALATE.value)
         self.assertEqual(status["approval"], ApprovalLevel.SISKO.value)
+
+    def test_persisted_demo_status_uses_explicit_store_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "demo.sqlite3"
+
+            status = persisted_demo_status(store_path)
+
+            self.assertEqual(status["store"], str(store_path))
+            self.assertEqual(status["decision"], ConflictOutcome.ESCALATE.value)
+            self.assertTrue(store_path.exists())
 
 
 class ApprovalAuditTests(unittest.TestCase):

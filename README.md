@@ -24,6 +24,7 @@ The first release should include a working initial slice for every major domain:
 
 - `PYTHONPATH=src python3 -m unittest discover -s tests -v` - run the current unit test suite.
 - `PYTHONPATH=src python3 -m overseer.cli demo` - print a read-only demo checkout decision.
+- `PYTHONPATH=src python3 -m overseer.cli demo --store state/overseer.sqlite3` - persist the demo decision to an explicit ignored local database path.
 
 ## Continuous Integration
 

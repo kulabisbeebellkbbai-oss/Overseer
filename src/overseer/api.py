@@ -23,6 +23,7 @@ from .cli import (
     health_summary_status,
     inspect_host_status,
     list_state_status,
+    physical_summary_status,
     plan_admin_change_status,
     release_claim_status,
     request_claim_status,
@@ -56,6 +57,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/usage-summary":
                 self._handle(lambda: usage_summary_status(store_path))
+                return
+            if self.path == "/physical-summary":
+                self._handle(lambda: physical_summary_status(store_path))
                 return
             if self.path == "/alerts-summary":
                 self._handle(lambda: alerts_summary_status(store_path))

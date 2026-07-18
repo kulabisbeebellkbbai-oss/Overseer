@@ -109,6 +109,7 @@ from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
+from overseer.cli import physical_summary_status
 from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
@@ -745,6 +746,45 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["next_reset_at"], "2026-07-18T18:00:00+00:00")
         self.assertEqual(status["limits_by_kind"][LimitKind.REQUESTS.value], 1)
 
+    def test_physical_summary_reports_identity_readiness_and_risk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_physical_identity(
+                PhysicalIdentity(
+                    kind=PhysicalAssetKind.SERIAL_PORT,
+                    stable_id="serial.rs485-a",
+                    observed_paths=frozenset({"/dev/serial/by-id/rs485-a"}),
+                    capabilities=frozenset({"rs485"}),
+                    exclusive_groups=frozenset({"bus.rs485.a"}),
+                )
+            )
+            store.save_physical_identity(
+                PhysicalIdentity(
+                    kind=PhysicalAssetKind.STORAGE_ARRAY,
+                    stable_id="storage.array-a",
+                    storage_profile="write_shared",
+                )
+            )
+            store.save_physical_identity(
+                PhysicalIdentity(
+                    kind=PhysicalAssetKind.POWER_RESOURCE,
+                    stable_id="power.usb-hub-a",
+                    power_profile="high",
+                )
+            )
+            store.close()
+
+            status = physical_summary_status(store_path)
+
+        self.assertEqual(status["assets"], 3)
+        self.assertEqual(status["complete_for_checkout"], 3)
+        self.assertEqual(status["power_risk"], 1)
+        self.assertEqual(status["storage_risk"], 1)
+        self.assertEqual(status["assets_by_kind"][PhysicalAssetKind.SERIAL_PORT.value], 1)
+        serial = next(item for item in status["items"] if item["stable_id"] == "serial.rs485-a")
+        self.assertEqual(serial["observed_paths"], ["/dev/serial/by-id/rs485-a"])
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1003,6 +1043,28 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["limits"], 1)
             self.assertEqual(status["items"][0]["kind"], LimitKind.TOKENS.value)
+
+    def test_client_reads_physical_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_physical_identity(
+                PhysicalIdentity(
+                    kind=PhysicalAssetKind.USB_DEVICE,
+                    stable_id="usb.device-a",
+                    vendor_id="1234",
+                    product_id="5678",
+                    serial_number="abc",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.physical_summary()
+
+            self.assertEqual(status["assets"], 1)
+            self.assertEqual(status["items"][0]["stable_id"], "usb.device-a")
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

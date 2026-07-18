@@ -31,6 +31,7 @@ from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import HostInspectionAdapter, host_security_status, host_snapshot_status
 from .live_health import HttpHealthProbeAdapter
+from .physical import PhysicalAssetKind, PhysicalIdentity
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
@@ -242,6 +243,46 @@ def discover_physical_status(roots: Sequence[str], store_path: str | Path | None
     if store_path is not None:
         status["store"] = str(Path(store_path))
     return status
+
+
+def physical_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        identities = store.list_physical_identities()
+        return {
+            "store": str(store.path),
+            "assets": len(identities),
+            "complete_for_checkout": sum(1 for identity in identities if identity.is_complete_for_exclusive_checkout()),
+            "incomplete_for_checkout": sum(1 for identity in identities if not identity.is_complete_for_exclusive_checkout()),
+            "power_risk": sum(1 for identity in identities if identity.has_power_risk()),
+            "storage_risk": sum(1 for identity in identities if identity.has_storage_risk()),
+            "assets_by_kind": {
+                kind.value: sum(1 for identity in identities if identity.kind == kind)
+                for kind in PhysicalAssetKind
+            },
+            "items": [physical_identity_status(identity) for identity in identities],
+        }
+    finally:
+        store.close()
+
+
+def physical_identity_status(identity: PhysicalIdentity) -> dict[str, object]:
+    return {
+        "stable_id": identity.stable_id,
+        "kind": PhysicalAssetKind(identity.kind).value,
+        "observed_paths": sorted(identity.observed_paths),
+        "vendor_id": identity.vendor_id,
+        "product_id": identity.product_id,
+        "serial_number": identity.serial_number,
+        "capabilities": sorted(identity.capabilities),
+        "power_profile": identity.power_profile,
+        "storage_profile": identity.storage_profile,
+        "exclusive_groups": sorted(identity.exclusive_groups),
+        "depends_on": sorted(identity.depends_on),
+        "complete_for_checkout": identity.is_complete_for_exclusive_checkout(),
+        "power_risk": identity.has_power_risk(),
+        "storage_risk": identity.has_storage_risk(),
+    }
 
 
 def run_status(
@@ -968,6 +1009,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
+    physical_summary_parser = subparsers.add_parser("physical-summary", help="summarize persisted physical identities")
+    physical_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -1088,6 +1131,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "discover-physical":
         print(json.dumps(discover_physical_status(args.root, args.store), sort_keys=True))
+        return 0
+
+    if args.command == "physical-summary":
+        print(json.dumps(physical_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "run":

@@ -15,4 +15,7 @@ Physical discovery is a read-only adapter for finding device path entries such a
 ```bash
 PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-id
 PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-id --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli physical-summary --store state/overseer.sqlite3
 ```
+
+`physical-summary` is Kira's compact read model for persisted physical identities. It reports asset counts, checkout readiness, power risk, storage risk, counts by physical kind, and per-asset identity detail.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, fields, is_dataclass
 from enum import Enum
-from typing import Any, TypeVar, get_args, get_origin
+from typing import Any, TypeVar, get_args, get_origin, get_type_hints
 
 T = TypeVar("T")
 
@@ -27,10 +27,11 @@ def to_jsonable(value: Any) -> Any:
 
 def dataclass_from_jsonable(cls: type[T], data: dict[str, Any]) -> T:
     values: dict[str, Any] = {}
+    type_hints = get_type_hints(cls)
     for field in fields(cls):
         if field.name not in data:
             continue
-        values[field.name] = _coerce_value(field.type, data[field.name])
+        values[field.name] = _coerce_value(type_hints.get(field.name, field.type), data[field.name])
     return cls(**values)
 
 

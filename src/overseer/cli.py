@@ -21,7 +21,7 @@ from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, Resour
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
-from .host import HostInspectionAdapter, host_snapshot_status
+from .host import HostInspectionAdapter, host_security_status, host_snapshot_status
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
@@ -283,6 +283,21 @@ def inspect_host_status(store_path: str | Path | None = None) -> dict[str, objec
     try:
         store.save_host_snapshot(snapshot)
         return {"store": str(store.path), **status}
+    finally:
+        store.close()
+
+
+def assess_host_security_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        if snapshot_id is not None:
+            snapshot = store.load_host_snapshot(snapshot_id)
+        else:
+            snapshots = store.list_host_snapshots()
+            if not snapshots:
+                raise ValueError("no host snapshots are available")
+            snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1]
+        return {"store": str(store.path), **host_security_status(snapshot)}
     finally:
         store.close()
 
@@ -654,6 +669,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser.add_argument("--service-name", default="overseer")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
+    assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
+    assess_host_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    assess_host_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     admin_plan_parser = subparsers.add_parser("plan-admin-change", help="prepare an approval-gated admin change plan")
     admin_plan_parser.add_argument("--store", help="explicit SQLite store path for persisting the admin change plan")
     admin_plan_parser.add_argument("--plan-id", required=True)
@@ -757,6 +775,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "inspect-host":
         print(json.dumps(inspect_host_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "assess-host-security":
+        print(json.dumps(assess_host_security_status(args.store, args.snapshot_id), sort_keys=True))
         return 0
 
     if args.command == "plan-admin-change":

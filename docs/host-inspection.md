@@ -25,3 +25,13 @@ PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlit
 ```
 
 Persisted snapshots appear in `list-state` under `host_snapshots`.
+
+## Security Assessment
+
+Odo's first host assessment flags TCP listeners that are not bound to loopback. This is read-only and does not change firewall rules or service bind addresses.
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli assess-host-security --store state/overseer.sqlite3
+```
+
+High findings mean an externally bound listener exists and should be reviewed through an approval-gated admin change plan before any firewall or bind-address change is made.

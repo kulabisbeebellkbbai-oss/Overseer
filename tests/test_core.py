@@ -37,6 +37,7 @@ from overseer import (
     HealthEvidence,
     HealthTarget,
     HostCommandObservation,
+    HostFindingSeverity,
     HostInspectionAdapter,
     HttpHealthProbeAdapter,
     InterruptionPolicy,
@@ -76,6 +77,7 @@ from overseer import (
     schedule_usage_limited_work,
     seed_store_from_config,
     validate_config,
+    assess_host_security,
     plan_apt_install,
     plan_firewall_allow_tcp,
 )
@@ -86,6 +88,7 @@ from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import approve_claim_status
+from overseer.cli import assess_host_security_status
 from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -900,6 +903,62 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(loaded.hostname, "host-a")
         self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
         self.assertEqual(state["host_snapshots"][0]["observation_count"], 4)
+
+    def test_host_security_assessment_flags_non_loopback_listeners(self):
+        snapshot = HostInspectionAdapter(
+            command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                name=command[0],
+                command=tuple(command),
+                exit_code=0,
+                stdout=(
+                    "host-a"
+                    if tuple(command) == ("hostname",)
+                    else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                    "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*\n"
+                    "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                    if tuple(command) == ("ss", "-ltnp")
+                    else "ok"
+                ),
+            ),
+            file_reader=lambda path: "ID=debian\n",
+        ).inspect("2026-07-18T16:00:00+00:00")
+
+        findings = assess_host_security(snapshot)
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, HostFindingSeverity.HIGH)
+        self.assertIn("0.0.0.0:22", findings[0].summary)
+
+    def test_host_security_status_uses_latest_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            first = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout="host-a" if tuple(command) == ("hostname",) else "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*",
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:00:00+00:00")
+            second = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout="host-b" if tuple(command) == ("hostname",) else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*",
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:01:00+00:00")
+            store.save_host_snapshot(first)
+            store.save_host_snapshot(second)
+            store.close()
+
+            status = assess_host_security_status(store_path)
+
+        self.assertEqual(status["snapshot_id"], second.id)
+        self.assertEqual(status["high_findings"], 1)
 
 
 class AdminChangePlanTests(unittest.TestCase):

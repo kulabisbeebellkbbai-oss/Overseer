@@ -50,7 +50,17 @@ from .health import (
     recovery_evidence,
     summarize_health_targets,
 )
-from .host import HostCommandObservation, HostInspectionAdapter, HostInspectionSnapshot, host_snapshot_status, parse_os_release
+from .host import (
+    HostCommandObservation,
+    HostFindingSeverity,
+    HostInspectionAdapter,
+    HostInspectionSnapshot,
+    HostSecurityFinding,
+    assess_host_security,
+    host_security_status,
+    host_snapshot_status,
+    parse_os_release,
+)
 from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
     InterruptionPolicy,
@@ -144,8 +154,12 @@ __all__ = [
     "recovery_evidence",
     "summarize_health_targets",
     "HostCommandObservation",
+    "HostFindingSeverity",
     "HostInspectionAdapter",
     "HostInspectionSnapshot",
+    "HostSecurityFinding",
+    "assess_host_security",
+    "host_security_status",
     "host_snapshot_status",
     "parse_os_release",
     "HttpHealthProbeAdapter",

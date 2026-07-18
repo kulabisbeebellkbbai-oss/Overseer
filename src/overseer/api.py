@@ -11,6 +11,7 @@ from typing import Any
 
 from .cli import (
     activate_claim_status,
+    assess_host_security_status,
     approve_claim_status,
     health_summary_status,
     inspect_host_status,
@@ -40,6 +41,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/health-summary":
                 self._handle(lambda: health_summary_status(store_path))
+                return
+            if self.path == "/host/security":
+                self._handle(lambda: assess_host_security_status(store_path))
                 return
             if self.path == "/state":
                 self._handle(lambda: list_state_status(store_path))

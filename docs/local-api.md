@@ -22,6 +22,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /health`
 - `GET /service-status`
 - `GET /health-summary`
+- `GET /host/security`
 - `GET /state`
 
 ## Claim Endpoints

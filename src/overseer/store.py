@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .admin import AdminChangePlan
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .health import HealthEvidence, HealthTarget
@@ -80,6 +81,10 @@ class SQLiteStore:
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS host_snapshots (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_change_plans (
                 id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
@@ -228,6 +233,15 @@ class SQLiteStore:
 
     def list_host_snapshots(self) -> tuple[HostInspectionSnapshot, ...]:
         return tuple(_load_dataclass(HostInspectionSnapshot, payload) for payload in self._list_payloads("host_snapshots"))
+
+    def save_admin_change_plan(self, plan: AdminChangePlan) -> None:
+        self._upsert("admin_change_plans", plan.id, _dump(plan))
+
+    def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
+        return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
+
+    def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
+        return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

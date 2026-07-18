@@ -15,6 +15,7 @@ from .cli import (
     health_summary_status,
     inspect_host_status,
     list_state_status,
+    plan_admin_change_status,
     release_claim_status,
     request_claim_status,
     service_status,
@@ -63,6 +64,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
+                return
+            if self.path == "/admin/plans":
+                self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -161,4 +165,16 @@ def _activate_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "claim_id": str(payload["claim_id"]),
         "approval_id": str(payload["approval_id"]) if payload.get("approval_id") else None,
+    }
+
+
+def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "kind": str(payload["kind"]),
+        "target": str(payload["target"]),
+        "reason": str(payload["reason"]),
+        "current_state": str(payload.get("current_state", "unknown")),
+        "packages": tuple(str(package) for package in payload.get("packages", ())),
+        "port": int(payload["port"]) if payload.get("port") is not None else None,
     }

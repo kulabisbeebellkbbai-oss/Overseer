@@ -35,6 +35,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5` - run one tick, probe configured health targets, and retain bounded evidence per target.
 - `PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3` - read the stored runtime heartbeat for the local service.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.
+- `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --kind user_service_restart --target overseer-api.service --reason "reload approved code"` - prepare an approval-gated admin change plan without executing it.
 - `PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3` - summarize latest health evidence per configured target.
 - `PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3 --fail-on-unhealthy` - return a non-zero exit when any configured target is unhealthy or missing evidence.
 - `PYTHONPATH=src python3 -m overseer.cli list-state --store state/overseer.sqlite3` - inspect stored resources, health targets, health evidence, claims, approvals, and audit events.

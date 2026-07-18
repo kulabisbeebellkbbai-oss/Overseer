@@ -7,6 +7,15 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from .admin import (
+    AdminChangeKind,
+    AdminChangePlan,
+    missing_admin_change_fields,
+    plan_apt_install,
+    plan_block_ip,
+    plan_firewall_allow_tcp,
+    plan_user_service_restart,
+)
 from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
@@ -278,6 +287,70 @@ def inspect_host_status(store_path: str | Path | None = None) -> dict[str, objec
         store.close()
 
 
+def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
+    return {
+        "id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "owner_domain": OwnerDomain(plan.owner_domain).value,
+        "risk_level": RiskLevel(plan.risk_level).value,
+        "approval_level": ApprovalLevel(plan.approval_level).value,
+        "target": plan.target,
+        "reason": plan.reason,
+        "current_state": plan.current_state,
+        "proposed_state": plan.proposed_state,
+        "requires_explicit_approval": plan.requires_explicit_approval(),
+        "approved": plan.approved,
+        "can_execute": plan.can_execute(),
+        "missing_fields": list(missing_admin_change_fields(plan)),
+        "steps": [_admin_command_status(step) for step in plan.steps],
+        "rollback_steps": [_admin_command_status(step) for step in plan.rollback_steps],
+        "verification_steps": [_admin_command_status(step) for step in plan.verification_steps],
+        "risks": list(plan.risks),
+    }
+
+
+def plan_admin_change_status(
+    store_path: str | Path | None,
+    plan_id: str,
+    kind: str,
+    target: str,
+    reason: str,
+    current_state: str,
+    packages: Sequence[str] = (),
+    port: int | None = None,
+) -> dict[str, object]:
+    plan_kind = AdminChangeKind(kind)
+    if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
+        plan = plan_user_service_restart(plan_id, target, reason, current_state)
+    elif plan_kind == AdminChangeKind.APT_INSTALL:
+        plan = plan_apt_install(plan_id, tuple(packages or (target,)), reason, current_state)
+    elif plan_kind == AdminChangeKind.FIREWALL_ALLOW_TCP:
+        if port is None:
+            raise ValueError("port is required for firewall_allow_tcp")
+        plan = plan_firewall_allow_tcp(plan_id, port, reason, current_state)
+    elif plan_kind == AdminChangeKind.BLOCK_IP:
+        plan = plan_block_ip(plan_id, target, reason, current_state)
+    else:
+        raise ValueError(f"unsupported admin change kind: {kind}")
+    status = admin_change_plan_status(plan)
+    if store_path is None:
+        return status
+    store = SQLiteStore(store_path)
+    try:
+        store.save_admin_change_plan(plan)
+        return {"store": str(store.path), **status}
+    finally:
+        store.close()
+
+
+def _admin_command_status(step) -> dict[str, object]:
+    return {
+        "title": step.title,
+        "command": list(step.command),
+        "reason": step.reason,
+    }
+
+
 def health_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -323,6 +396,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         audit_events = store.list_audit_events()
         heartbeats = store.list_runtime_heartbeats()
         host_snapshots = store.list_host_snapshots()
+        admin_change_plans = store.list_admin_change_plans()
         return {
             "store": str(store.path),
             "resources": [
@@ -413,6 +487,18 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "observation_count": len(snapshot.observations),
                 }
                 for snapshot in host_snapshots
+            ],
+            "admin_change_plans": [
+                {
+                    "id": plan.id,
+                    "kind": AdminChangeKind(plan.kind).value,
+                    "target": plan.target,
+                    "risk_level": RiskLevel(plan.risk_level).value,
+                    "approval_level": ApprovalLevel(plan.approval_level).value,
+                    "approved": plan.approved,
+                    "can_execute": plan.can_execute(),
+                }
+                for plan in admin_change_plans
             ],
         }
     finally:
@@ -568,6 +654,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     service_parser.add_argument("--service-name", default="overseer")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
+    admin_plan_parser = subparsers.add_parser("plan-admin-change", help="prepare an approval-gated admin change plan")
+    admin_plan_parser.add_argument("--store", help="explicit SQLite store path for persisting the admin change plan")
+    admin_plan_parser.add_argument("--plan-id", required=True)
+    admin_plan_parser.add_argument("--kind", required=True, choices=[item.value for item in AdminChangeKind])
+    admin_plan_parser.add_argument("--target", required=True)
+    admin_plan_parser.add_argument("--reason", required=True)
+    admin_plan_parser.add_argument("--current-state", default="unknown")
+    admin_plan_parser.add_argument("--package", action="append", default=())
+    admin_plan_parser.add_argument("--port", type=int)
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -662,6 +757,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "inspect-host":
         print(json.dumps(inspect_host_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "plan-admin-change":
+        print(
+            json.dumps(
+                plan_admin_change_status(
+                    args.store,
+                    args.plan_id,
+                    args.kind,
+                    args.target,
+                    args.reason,
+                    args.current_state,
+                    args.package,
+                    args.port,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "serve-api":

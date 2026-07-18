@@ -49,6 +49,9 @@ class OverseerApiClient:
     def inspect_host(self) -> dict[str, Any]:
         return self._post("/host/inspect", {})
 
+    def plan_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/plans", payload)
+
     def _get(self, path: str, authenticated: bool = True) -> dict[str, Any]:
         request = Request(f"{self.base_url}{path}", headers=self._headers(authenticated))
         return self._read(request)

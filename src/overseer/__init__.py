@@ -6,6 +6,16 @@ from .adapters import (
     ExecutionResult,
     ExecutionStatus,
 )
+from .admin import (
+    AdminChangeKind,
+    AdminChangePlan,
+    AdminCommandStep,
+    missing_admin_change_fields,
+    plan_apt_install,
+    plan_block_ip,
+    plan_firewall_allow_tcp,
+    plan_user_service_restart,
+)
 from .audit import (
     ApprovalRequest,
     ApprovalStatus,
@@ -92,6 +102,14 @@ __all__ = [
     "ExecutionRequest",
     "ExecutionResult",
     "ExecutionStatus",
+    "AdminChangeKind",
+    "AdminChangePlan",
+    "AdminCommandStep",
+    "missing_admin_change_fields",
+    "plan_apt_install",
+    "plan_block_ip",
+    "plan_firewall_allow_tcp",
+    "plan_user_service_restart",
     "ApprovalRequest",
     "ApprovalStatus",
     "AuditEvent",

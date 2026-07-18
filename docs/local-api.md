@@ -31,10 +31,12 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/activate`
 - `POST /claims/release`
 - `POST /host/inspect`
+- `POST /admin/plans`
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
 `POST /host/inspect` captures read-only host evidence and persists it to the API store.
+`POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
 
 ## Python Client
 
@@ -46,6 +48,14 @@ from overseer.client import OverseerApiClient
 client = OverseerApiClient(auth_token_file="state/api-token")
 summary = client.health_summary()
 snapshot = client.inspect_host()
+plan = client.plan_admin_change(
+    {
+        "plan_id": "admin.restart.overseer-api",
+        "kind": "user_service_restart",
+        "target": "overseer-api.service",
+        "reason": "reload approved code",
+    }
+)
 ```
 
 ## Installed User Service

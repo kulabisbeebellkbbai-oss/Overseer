@@ -20,6 +20,7 @@ from overseer import (
     ExecutionMode,
     ExecutionRequest,
     ExecutionStatus,
+    AdminChangeKind,
     OwnerDomain,
     Resource,
     ResourceRegistry,
@@ -75,6 +76,8 @@ from overseer import (
     schedule_usage_limited_work,
     seed_store_from_config,
     validate_config,
+    plan_apt_install,
+    plan_firewall_allow_tcp,
 )
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
@@ -87,6 +90,7 @@ from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
+from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
@@ -820,6 +824,27 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(released["claim_status"], ClaimStatus.RELEASED.value)
 
+    def test_client_creates_admin_change_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                plan = client.plan_admin_change(
+                    {
+                        "plan_id": "admin.block.source",
+                        "kind": AdminChangeKind.BLOCK_IP.value,
+                        "target": "192.0.2.10",
+                        "reason": "block documented hostile source",
+                        "current_state": "allowed",
+                    }
+                )
+                state = client.state()
+
+            self.assertEqual(plan["approval_level"], ApprovalLevel.HUMAN.value)
+            self.assertEqual(plan["steps"][0]["command"], ["sudo", "ufw", "deny", "from", "192.0.2.10"])
+            self.assertEqual(state["admin_change_plans"][0]["id"], "admin.block.source")
+
 
 class HostInspectionTests(unittest.TestCase):
     def test_host_inspection_uses_read_only_observations(self):
@@ -875,6 +900,60 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(loaded.hostname, "host-a")
         self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
         self.assertEqual(state["host_snapshots"][0]["observation_count"], 4)
+
+
+class AdminChangePlanTests(unittest.TestCase):
+    def test_package_install_plan_requires_human_approval_and_rollback(self):
+        plan = plan_apt_install(
+            "admin.install.nmap",
+            ("nmap",),
+            "enable approved local security auditing",
+            "package absent",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.APT_INSTALL)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertTrue(plan.requires_explicit_approval())
+        self.assertFalse(plan.can_execute())
+        self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "install", "--dry-run", "nmap"))
+        self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "install", "-y", "nmap"))
+        self.assertEqual(plan.rollback_steps[0].command, ("sudo", "apt-get", "remove", "-y", "nmap"))
+
+    def test_firewall_plan_has_critical_risk_and_delete_rollback(self):
+        plan = plan_firewall_allow_tcp(
+            "admin.firewall.8443",
+            8443,
+            "publish approved local service",
+            "closed",
+        )
+
+        self.assertEqual(plan.risk_level, RiskLevel.CRITICAL)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.steps[0].command, ("sudo", "ufw", "allow", "8443/tcp"))
+        self.assertEqual(plan.rollback_steps[0].command, ("sudo", "ufw", "delete", "allow", "8443/tcp"))
+
+    def test_admin_change_plan_persists_without_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = plan_admin_change_status(
+                store_path,
+                "admin.restart.overseer-api",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload updated code",
+                "active",
+            )
+            store = SQLiteStore(store_path)
+            loaded = store.load_admin_change_plan("admin.restart.overseer-api")
+            store.close()
+            state = list_state_status(store_path)
+
+        self.assertEqual(status["approval_level"], ApprovalLevel.SISKO.value)
+        self.assertEqual(status["steps"][0]["command"], ["systemctl", "--user", "restart", "overseer-api.service"])
+        self.assertFalse(status["can_execute"])
+        self.assertEqual(loaded.target, "overseer-api.service")
+        self.assertEqual(state["admin_change_plans"][0]["id"], "admin.restart.overseer-api")
 
 
 class PhysicalIdentityTests(unittest.TestCase):

@@ -161,6 +161,9 @@ class OverseerApiClient:
     def archive_admin_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/history-archive", payload)
 
+    def unarchive_admin_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/history-unarchive", payload)
+
     def admin_summary(self) -> dict[str, Any]:
         return self._get("/admin/summary")
 

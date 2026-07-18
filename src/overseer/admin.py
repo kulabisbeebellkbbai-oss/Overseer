@@ -119,6 +119,20 @@ def archive_admin_change_plan(
     )
 
 
+def unarchive_admin_change_plan(plan: AdminChangePlan, restored_by: str) -> AdminChangePlan:
+    if not restored_by.strip():
+        raise ValueError("restored_by is required")
+    if not plan.archived:
+        raise ValueError("admin change plan is not archived")
+    return replace(
+        plan,
+        archived=False,
+        archived_by=None,
+        archived_at=None,
+        archive_record_id=None,
+    )
+
+
 def plan_user_service_restart(plan_id: str, service_name: str, reason: str, current_state: str = "unknown") -> AdminChangePlan:
     return AdminChangePlan(
         id=plan_id,

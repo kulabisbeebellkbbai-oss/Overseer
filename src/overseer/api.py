@@ -54,6 +54,7 @@ from .cli import (
     security_summary_status,
     usage_summary_status,
     submit_host_security_ids_review_package_status,
+    unarchive_admin_history_status,
     virtual_summary_status,
 )
 
@@ -212,6 +213,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/admin/history-archive":
                 self._handle_json(lambda payload: archive_admin_history_status(store_path, **_archive_admin_history_args(payload)))
                 return
+            if self.path == "/admin/history-unarchive":
+                self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
+                return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def log_message(self, format: str, *args: object) -> None:
@@ -341,6 +345,14 @@ def _archive_admin_history_args(payload: dict[str, Any]) -> dict[str, Any]:
         "archived_by": str(payload["archived_by"]),
         "archived_at": str(payload["archived_at"]) if payload.get("archived_at") is not None else None,
         "plan_id": str(payload["plan_id"]) if payload.get("plan_id") is not None else None,
+    }
+
+
+def _unarchive_admin_history_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "restored_by": str(payload["restored_by"]),
+        "restored_at": str(payload["restored_at"]) if payload.get("restored_at") is not None else None,
     }
 
 

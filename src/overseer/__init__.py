@@ -26,6 +26,7 @@ from .admin import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_user_service_restart,
+    unarchive_admin_change_plan,
 )
 from .audit import (
     ApprovalRequest,

@@ -29,6 +29,7 @@ from .admin import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_user_service_restart,
+    unarchive_admin_change_plan,
 )
 from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
@@ -1872,7 +1873,6 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
     try:
         plans = store.list_admin_change_plans()
         active_plans = active_admin_change_plans(plans)
-        archives = store.list_admin_history_archives()
         executions = store.list_admin_executions()
         audit_events = [
             event
@@ -1893,7 +1893,7 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "plans": len(active_plans),
-            "archived_plans": len(archives),
+            "archived_plans": len(plans) - len(active_plans),
             "pending_authorizations": len(pending),
             "approved_plans": sum(1 for plan in active_plans if plan.approved),
             "canceled_plans": sum(1 for plan in active_plans if plan.canceled),
@@ -2086,6 +2086,47 @@ def archive_admin_history_status(
             "archived_by": archived_by,
             "archived_at": now,
             "records": [admin_history_archive_record_status(record) for record in records],
+        }
+    finally:
+        store.close()
+
+
+def unarchive_admin_history_status(
+    store_path: str | Path,
+    plan_id: str,
+    restored_by: str,
+    restored_at: str | None = None,
+) -> dict[str, object]:
+    if not restored_by.strip():
+        raise ValueError("restored_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        now = restored_at or datetime.now(UTC).isoformat()
+        plan = store.load_admin_change_plan(plan_id)
+        archive_record_id = plan.archive_record_id
+        restored = unarchive_admin_change_plan(plan, restored_by)
+        store.save_admin_change_plan(restored)
+        evidence_ids = (archive_record_id,) if archive_record_id else ()
+        event = AuditEvent(
+            id=f"audit.admin.unarchive.{plan.id}",
+            event_type=AuditEventType.RELEASED,
+            owner_domain=OwnerDomain.SISKO,
+            subject_id=plan.id,
+            summary=f"Restored archived admin plan {plan.id} to active admin history",
+            risk_level=RiskLevel.LOW,
+            evidence_ids=evidence_ids,
+            occurred_at=now,
+        )
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "restored": 1,
+            "restored_by": restored_by,
+            "restored_at": now,
+            "archive_record_id": archive_record_id,
+            "plan": admin_change_plan_status(restored),
+            "audit_event": audit_event_status(event),
         }
     finally:
         store.close()
@@ -2981,6 +3022,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     archive_admin_history_parser.add_argument("--archived-by", required=True)
     archive_admin_history_parser.add_argument("--archived-at")
     archive_admin_history_parser.add_argument("--plan-id", help="archive only one eligible admin plan")
+    unarchive_admin_history_parser = subparsers.add_parser("unarchive-admin-history", help="restore one archived admin plan to active admin history")
+    unarchive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    unarchive_admin_history_parser.add_argument("--plan-id", required=True)
+    unarchive_admin_history_parser.add_argument("--restored-by", required=True)
+    unarchive_admin_history_parser.add_argument("--restored-at")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -3321,6 +3367,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "archive-admin-history":
         print(json.dumps(archive_admin_history_status(args.store, args.archived_by, args.archived_at, args.plan_id), sort_keys=True))
+        return 0
+
+    if args.command == "unarchive-admin-history":
+        print(json.dumps(unarchive_admin_history_status(args.store, args.plan_id, args.restored_by, args.restored_at), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

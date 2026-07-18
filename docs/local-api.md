@@ -78,6 +78,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/history-review` identifies completed and canceled admin plans that are candidates for future archive support. It is read-only and does not delete plans or audit evidence.
 `GET /admin/history-archive-plan` prepares a read-only archive manifest for inactive admin plans. It groups each archive candidate with related execution, IDS review, and audit records, and does not mutate state.
 `POST /admin/history-archive` marks archive-ready admin plans archived after explicit approval. It preserves the original plan, execution, IDS review, and audit records, persists an archive record, and emits an audit event.
+`POST /admin/history-unarchive` restores one archived admin plan to active admin history while keeping the archive record and emitting an audit event.
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, and recent admin audit events.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.

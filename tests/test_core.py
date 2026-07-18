@@ -148,6 +148,7 @@ from overseer.cli import runtime_status
 from overseer.cli import security_summary_status
 from overseer.cli import submit_host_security_ids_review_package_status
 from overseer.cli import service_status
+from overseer.cli import unarchive_admin_history_status
 from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
 from overseer.cli import virtual_summary_status
@@ -843,6 +844,15 @@ class HealthSummaryTests(unittest.TestCase):
             post_archive_plan = admin_history_archive_plan_status(store_path)
             post_archive_summary = admin_summary_status(store_path)
             post_archive_state = list_state_status(store_path)
+            restored = unarchive_admin_history_status(
+                store_path,
+                "admin.restart.completed",
+                "sisko",
+                "2026-07-18T22:20:00+00:00",
+            )
+            post_restore_review = admin_history_review_status(store_path)
+            post_restore_summary = admin_summary_status(store_path)
+            post_restore_state = list_state_status(store_path)
 
         completed_item = next(item for item in status["items"] if item["id"] == "admin.restart.completed")
         canceled_item = next(item for item in status["items"] if item["id"] == "admin.restart.canceled")
@@ -872,6 +882,15 @@ class HealthSummaryTests(unittest.TestCase):
         archived_state_plan = next(item for item in post_archive_state["admin_change_plans"] if item["id"] == "admin.restart.completed")
         self.assertTrue(archived_state_plan["archived"])
         self.assertEqual(post_archive_state["admin_history_archives"][0]["id"], "admin.archive.admin.restart.completed")
+        self.assertTrue(restored["mutation_performed"])
+        self.assertFalse(restored["plan"]["archived"])
+        self.assertEqual(restored["archive_record_id"], "admin.archive.admin.restart.completed")
+        self.assertEqual(post_restore_review["archive_candidates"], 2)
+        self.assertEqual(post_restore_review["archived_plans"], 0)
+        self.assertEqual(post_restore_summary["archived_plans"], 0)
+        restored_state_plan = next(item for item in post_restore_state["admin_change_plans"] if item["id"] == "admin.restart.completed")
+        self.assertFalse(restored_state_plan["archived"])
+        self.assertEqual(post_restore_state["admin_history_archives"][0]["id"], "admin.archive.admin.restart.completed")
 
     def test_usage_summary_reports_capacity_and_reset_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2324,6 +2343,17 @@ class OverseerApiClientTests(unittest.TestCase):
                         "archived_at": "2026-07-18T22:15:00+00:00",
                     }
                 )
+                unarchive_error = None
+                try:
+                    client.unarchive_admin_history(
+                        {
+                            "plan_id": "admin.restart.blocked",
+                            "restored_by": "sisko",
+                            "restored_at": "2026-07-18T22:16:00+00:00",
+                        }
+                    )
+                except HTTPError as error:
+                    unarchive_error = error
                 summary = client.admin_summary()
                 state = client.state()
 
@@ -2333,6 +2363,8 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(history["items"][0]["disposition"], "retain_active")
             self.assertEqual(archive_plan["planned_bundles"], 0)
             self.assertFalse(archive_result["mutation_performed"])
+            self.assertIsNotNone(unarchive_error)
+            self.assertEqual(unarchive_error.code, 400)
             self.assertEqual(summary["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
             self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)

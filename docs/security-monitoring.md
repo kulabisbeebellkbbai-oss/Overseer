@@ -32,3 +32,13 @@ Overseer should treat security as an evidence-backed workflow, not as an automat
 - approval requirement
 - response owner
 - closure evidence ids
+
+## Security Summary
+
+Odo's compact operator read model is available with:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli security-summary --store state/overseer.sqlite3
+```
+
+It summarizes persisted security surfaces, alert audit events, latest host security findings, and protective firewall or block plans without executing active defense.

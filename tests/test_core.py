@@ -89,6 +89,7 @@ from overseer import (
     assess_host_security,
     execute_admin_change_plan,
     plan_apt_install,
+    plan_block_ip,
     plan_firewall_allow_tcp,
     plan_user_service_restart,
 )
@@ -121,6 +122,7 @@ from overseer.cli import release_claim_status
 from overseer.cli import request_claim_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
+from overseer.cli import security_summary_status
 from overseer.cli import service_status
 from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
@@ -1026,6 +1028,69 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertTrue(restart["requires_explicit_approval"])
         self.assertIsNone(restart["latest_execution_status"])
 
+    def test_security_summary_reports_surfaces_alerts_host_findings_and_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="security.firewall",
+                    name="Host Firewall",
+                    type=ResourceType.SECURITY_SURFACE,
+                    owner_domain=OwnerDomain.ODO,
+                    risk_level=RiskLevel.CRITICAL,
+                    state=ResourceState.AVAILABLE,
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.security",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.firewall",
+                    summary="non-loopback listener needs review",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-a"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T18:00:00+00:00")
+            store.save_host_snapshot(snapshot)
+            store.save_admin_change_plan(
+                plan_block_ip(
+                    "admin.block.security",
+                    "203.0.113.10",
+                    "block suspicious source",
+                    "not blocked",
+                )
+            )
+            store.close()
+
+            status = security_summary_status(store_path)
+
+        self.assertEqual(status["security_surfaces"], 1)
+        self.assertEqual(status["alerts"], 1)
+        self.assertEqual(status["alerts_by_risk"][RiskLevel.HIGH.value], 1)
+        self.assertEqual(status["host_security"]["high_findings"], 1)
+        self.assertEqual(status["protective_plans"]["total"], 1)
+        self.assertEqual(status["protective_plans"]["pending_authorizations"], 1)
+        self.assertEqual(status["protective_plans"]["by_kind"][AdminChangeKind.BLOCK_IP.value], 1)
+        self.assertEqual(status["surfaces"][0]["id"], "security.firewall")
+        self.assertEqual(status["events"][0]["id"], "alert.security")
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1372,6 +1437,28 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["plans"], 1)
             self.assertEqual(status["items"][0]["kind"], AdminChangeKind.USER_SERVICE_RESTART.value)
+
+    def test_client_reads_security_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="security.client",
+                    name="Client Security Surface",
+                    type=ResourceType.SECURITY_SURFACE,
+                    owner_domain=OwnerDomain.ODO,
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.security_summary()
+
+            self.assertEqual(status["security_surfaces"], 1)
+            self.assertEqual(status["surfaces"][0]["owner_domain"], OwnerDomain.ODO.value)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -31,6 +31,7 @@ from .cli import (
     request_claim_status,
     service_status,
     runtime_status,
+    security_summary_status,
     usage_summary_status,
     virtual_summary_status,
 )
@@ -75,6 +76,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/alerts-summary":
                 self._handle(lambda: alerts_summary_status(store_path))
+                return
+            if self.path == "/security-summary":
+                self._handle(lambda: security_summary_status(store_path))
                 return
             if self.path == "/host/security":
                 self._handle(lambda: assess_host_security_status(store_path))

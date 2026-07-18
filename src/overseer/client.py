@@ -52,6 +52,9 @@ class OverseerApiClient:
     def alerts_summary(self) -> dict[str, Any]:
         return self._get("/alerts-summary")
 
+    def security_summary(self) -> dict[str, Any]:
+        return self._get("/security-summary")
+
     def state(self) -> dict[str, Any]:
         return self._get("/state")
 

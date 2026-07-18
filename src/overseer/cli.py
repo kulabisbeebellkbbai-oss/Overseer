@@ -568,6 +568,90 @@ def maintenance_plan_status(plan: AdminChangePlan, execution: AdminExecutionResu
     }
 
 
+def security_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        resources = [resource for resource in store.list_resources() if resource.type == ResourceType.SECURITY_SURFACE]
+        alerts = [event for event in store.list_audit_events() if event.event_type == AuditEventType.ALERT]
+        snapshots = store.list_host_snapshots()
+        latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        host_security = host_security_status(latest_snapshot) if latest_snapshot else None
+        plans = [
+            plan
+            for plan in store.list_admin_change_plans()
+            if plan.owner_domain == OwnerDomain.ODO
+            or plan.kind in {AdminChangeKind.BLOCK_IP, AdminChangeKind.FIREWALL_ALLOW_TCP}
+        ]
+        pending = [
+            plan
+            for plan in plans
+            if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
+        ]
+        return {
+            "store": str(store.path),
+            "security_surfaces": len(resources),
+            "alerts": len(alerts),
+            "alerts_by_risk": {
+                risk.value: sum(1 for event in alerts if event.risk_level == risk)
+                for risk in RiskLevel
+            },
+            "alerts_by_owner": {
+                owner.value: sum(1 for event in alerts if event.owner_domain == owner)
+                for owner in OwnerDomain
+            },
+            "host_security": {
+                "enabled": latest_snapshot is not None,
+                "latest_snapshot_id": latest_snapshot.id if latest_snapshot else None,
+                "latest_captured_at": latest_snapshot.captured_at if latest_snapshot else None,
+                "high_findings": host_security["high_findings"] if host_security else 0,
+                "warning_findings": host_security["warning_findings"] if host_security else 0,
+            },
+            "protective_plans": {
+                "total": len(plans),
+                "pending_authorizations": len(pending),
+                "approved": sum(1 for plan in plans if plan.approved),
+                "canceled": sum(1 for plan in plans if plan.canceled),
+                "by_kind": {
+                    kind.value: sum(1 for plan in plans if plan.kind == kind)
+                    for kind in AdminChangeKind
+                },
+                "items": [security_plan_status(plan) for plan in plans],
+            },
+            "surfaces": [security_surface_status(resource) for resource in resources],
+            "events": [audit_event_status(event) for event in alerts],
+        }
+    finally:
+        store.close()
+
+
+def security_plan_status(plan: AdminChangePlan) -> dict[str, object]:
+    return {
+        "id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "risk_level": RiskLevel(plan.risk_level).value,
+        "approval_level": ApprovalLevel(plan.approval_level).value,
+        "requires_explicit_approval": plan.requires_explicit_approval(),
+        "approved": plan.approved,
+        "canceled": plan.canceled,
+        "can_execute": plan.can_execute(),
+        "reason": plan.reason,
+    }
+
+
+def security_surface_status(resource: Resource) -> dict[str, object]:
+    return {
+        "id": resource.id,
+        "name": resource.name,
+        "owner_domain": OwnerDomain(resource.owner_domain).value,
+        "risk_level": RiskLevel(resource.risk_level).value,
+        "state": ResourceState(resource.state).value,
+        "dependencies": sorted(resource.dependencies),
+        "exclusive_groups": sorted(resource.exclusive_groups),
+        "current_claim_id": resource.current_claim_id,
+    }
+
+
 def run_status(
     store_path: str | Path,
     once: bool,
@@ -1301,6 +1385,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     command_summary_parser.add_argument("--service-name", default="overseer")
     maintenance_summary_parser = subparsers.add_parser("maintenance-summary", help="summarize maintenance and update plans")
     maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    security_summary_parser = subparsers.add_parser("security-summary", help="summarize security surfaces and alerts")
+    security_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -1437,6 +1523,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "maintenance-summary":
         print(json.dumps(maintenance_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "security-summary":
+        print(json.dumps(security_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "run":

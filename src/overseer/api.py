@@ -20,11 +20,13 @@ from .cli import (
     authorizations_required_status,
     cancel_admin_change_status,
     command_summary_status,
+    create_host_security_source_review_status,
     execute_admin_change_status,
     health_efficiency_summary_status,
     health_summary_status,
     host_security_findings_status,
     host_security_sources_status,
+    host_security_source_reviews_status,
     host_security_triage_status,
     inspect_host_status,
     list_state_status,
@@ -104,6 +106,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/host/security/sources":
                 self._handle(lambda: host_security_sources_status(store_path))
                 return
+            if self.path == "/host/security/source-reviews":
+                self._handle(lambda: host_security_source_reviews_status(store_path))
+                return
             if self.path == "/admin/authorizations-required":
                 self._handle(lambda: authorizations_required_status(store_path))
                 return
@@ -139,6 +144,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
+                return
+            if self.path == "/host/security/source-reviews":
+                self._handle_json(lambda payload: create_host_security_source_review_status(store_path, **_host_security_source_review_args(payload)))
                 return
             if self.path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
@@ -282,6 +290,20 @@ def _host_security_remediation_args(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
         "action": str(payload.get("action", "deny_tcp")),
         "reason": str(payload["reason"]) if payload.get("reason") else None,
+        "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
+    }
+
+
+def _host_security_source_review_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "remote_address": str(payload["remote_address"]),
+        "listener": str(payload["listener"]) if payload.get("listener") else None,
+        "review_id": str(payload["review_id"]) if payload.get("review_id") else None,
+        "disposition": str(payload.get("disposition", "needs_review")),
+        "rationale": str(payload.get("rationale", "pending Odo review")),
+        "reviewed_by": str(payload["reviewed_by"]) if payload.get("reviewed_by") else None,
+        "reviewed_at": str(payload["reviewed_at"]) if payload.get("reviewed_at") else None,
+        "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
         "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
     }
 

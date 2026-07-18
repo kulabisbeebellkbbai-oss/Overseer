@@ -91,6 +91,12 @@ class OverseerApiClient:
     def host_security_sources(self) -> dict[str, Any]:
         return self._get("/host/security/sources")
 
+    def host_security_source_reviews(self) -> dict[str, Any]:
+        return self._get("/host/security/source-reviews")
+
+    def create_host_security_source_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/host/security/source-reviews", payload)
+
     def plan_host_security_remediation(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/remediations/plans", payload)
 

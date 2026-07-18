@@ -16,6 +16,7 @@ from .host import HostInspectionSnapshot
 from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
+from .source_review import HostSecuritySourceReview
 from .usage_limits import UsageLimit
 
 
@@ -91,6 +92,11 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS admin_executions (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS host_security_source_reviews (
+                id TEXT PRIMARY KEY,
+                remote_address TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             """
@@ -260,6 +266,19 @@ class SQLiteStore:
 
     def list_admin_executions(self) -> tuple[AdminExecutionResult, ...]:
         return tuple(_load_dataclass(AdminExecutionResult, payload) for payload in self._list_payloads("admin_executions"))
+
+    def save_host_security_source_review(self, review: HostSecuritySourceReview) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO host_security_source_reviews (id, remote_address, payload) VALUES (?, ?, ?)",
+            (review.id, review.remote_address, _dump(review)),
+        )
+        self._connection.commit()
+
+    def load_host_security_source_review(self, review_id: str) -> HostSecuritySourceReview:
+        return _load_dataclass(HostSecuritySourceReview, self._get_payload("host_security_source_reviews", review_id))
+
+    def list_host_security_source_reviews(self) -> tuple[HostSecuritySourceReview, ...]:
+        return tuple(_load_dataclass(HostSecuritySourceReview, payload) for payload in self._list_payloads("host_security_source_reviews"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

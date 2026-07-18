@@ -46,6 +46,7 @@ from .runtime_state import (
     assess_freshness,
 )
 from .service import OverseerCoordinator, coordinator_from_store
+from .source_review import HostSecuritySourceReview, SourceReviewDisposition
 from .store import SQLiteStore
 from .usage_limits import LimitKind, UsageLimit
 
@@ -1323,6 +1324,99 @@ def source_recommended_action(source_scope: str) -> str:
     return "capture fresh source evidence before any remediation"
 
 
+def host_security_source_review_status(review: HostSecuritySourceReview) -> dict[str, object]:
+    return {
+        "id": review.id,
+        "source_connection_id": review.source_connection_id,
+        "snapshot_id": review.snapshot_id,
+        "listener": review.listener,
+        "remote_address": review.remote_address,
+        "remote_port": review.remote_port,
+        "source_scope": review.source_scope,
+        "evidence": review.evidence,
+        "disposition": SourceReviewDisposition(review.disposition).value,
+        "rationale": review.rationale,
+        "reviewed_by": review.reviewed_by,
+        "reviewed_at": review.reviewed_at,
+        "created_at": review.created_at,
+        "can_stage_block_plan": review.can_stage_block_plan(),
+        "approval_boundary": (
+            "source review only; block plans, firewall, IDS, route, or service-bind changes require "
+            "separate approval-gated remediation"
+        ),
+    }
+
+
+def create_host_security_source_review_status(
+    store_path: str | Path,
+    remote_address: str,
+    listener: str | None = None,
+    review_id: str | None = None,
+    disposition: str = SourceReviewDisposition.NEEDS_REVIEW.value,
+    rationale: str = "pending Odo review",
+    reviewed_by: str | None = None,
+    reviewed_at: str | None = None,
+    created_at: str | None = None,
+    snapshot_id: str | None = None,
+) -> dict[str, object]:
+    selected_disposition = SourceReviewDisposition(disposition)
+    if selected_disposition != SourceReviewDisposition.NEEDS_REVIEW and not reviewed_by:
+        raise ValueError("reviewed_by is required for reviewed source dispositions")
+    if not rationale.strip():
+        raise ValueError("rationale is required")
+    sources = host_security_sources_status(store_path, snapshot_id)
+    connection = next(
+        (
+            item
+            for item in sources["connections"]
+            if item["remote_address"] == remote_address and (listener is None or item["listener"] == listener)
+        ),
+        None,
+    )
+    if connection is None:
+        raise ValueError(f"remote source is not present in source correlation evidence: {remote_address}")
+    default_review_id = f"source-review.{sources['snapshot_id']}.{_status_id(str(connection['listener']))}.{_status_id(remote_address)}.{connection['remote_port']}"
+    review = HostSecuritySourceReview(
+        id=review_id or default_review_id,
+        source_connection_id=str(connection["id"]),
+        snapshot_id=str(sources["snapshot_id"]),
+        listener=str(connection["listener"]),
+        remote_address=str(connection["remote_address"]),
+        remote_port=str(connection["remote_port"]),
+        source_scope=str(connection["source_scope"]),
+        evidence=str(connection["evidence"]),
+        disposition=selected_disposition,
+        rationale=rationale,
+        reviewed_by=reviewed_by,
+        reviewed_at=reviewed_at,
+        created_at=created_at,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_host_security_source_review(review)
+        return {"store": str(store.path), **host_security_source_review_status(review)}
+    finally:
+        store.close()
+
+
+def host_security_source_reviews_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        reviews = store.list_host_security_source_reviews()
+        return {
+            "store": str(store.path),
+            "review_count": len(reviews),
+            "by_disposition": {
+                disposition.value: sum(1 for review in reviews if review.disposition == disposition)
+                for disposition in SourceReviewDisposition
+            },
+            "ready_for_block_plan": sum(1 for review in reviews if review.can_stage_block_plan()),
+            "reviews": [host_security_source_review_status(review) for review in reviews],
+        }
+    finally:
+        store.close()
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -1645,6 +1739,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         audit_events = store.list_audit_events()
         heartbeats = store.list_runtime_heartbeats()
         host_snapshots = store.list_host_snapshots()
+        source_reviews = store.list_host_security_source_reviews()
         admin_change_plans = store.list_admin_change_plans()
         admin_executions = store.list_admin_executions()
         return {
@@ -1753,6 +1848,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                 }
                 for result in admin_executions
             ],
+            "host_security_source_reviews": [host_security_source_review_status(review) for review in source_reviews],
         }
     finally:
         store.close()
@@ -1942,6 +2038,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     host_sources_parser = subparsers.add_parser("host-security-sources", help="correlate established TCP sources to host security listeners")
     host_sources_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_sources_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    source_reviews_parser = subparsers.add_parser("host-security-source-reviews", help="list host security source reviews")
+    source_reviews_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    create_source_review_parser = subparsers.add_parser("create-host-security-source-review", help="record Odo review of a correlated source")
+    create_source_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    create_source_review_parser.add_argument("--remote-address", required=True)
+    create_source_review_parser.add_argument("--listener")
+    create_source_review_parser.add_argument("--review-id")
+    create_source_review_parser.add_argument("--disposition", default=SourceReviewDisposition.NEEDS_REVIEW.value, choices=[item.value for item in SourceReviewDisposition])
+    create_source_review_parser.add_argument("--rationale", default="pending Odo review")
+    create_source_review_parser.add_argument("--reviewed-by")
+    create_source_review_parser.add_argument("--reviewed-at")
+    create_source_review_parser.add_argument("--created-at")
+    create_source_review_parser.add_argument("--snapshot-id")
     host_remediation_parser = subparsers.add_parser(
         "plan-host-security-remediation",
         help="stage an approval-gated host security remediation plan",
@@ -2130,6 +2239,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-sources":
         print(json.dumps(host_security_sources_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-source-reviews":
+        print(json.dumps(host_security_source_reviews_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "create-host-security-source-review":
+        print(
+            json.dumps(
+                create_host_security_source_review_status(
+                    args.store,
+                    args.remote_address,
+                    args.listener,
+                    args.review_id,
+                    args.disposition,
+                    args.rationale,
+                    args.reviewed_by,
+                    args.reviewed_at,
+                    args.created_at,
+                    args.snapshot_id,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "plan-host-security-remediation":

@@ -105,6 +105,7 @@ from .security import (
     recommend_security_response,
 )
 from .service import CoordinationResult, OverseerCoordinator, needs_operator_approval
+from .source_review import HostSecuritySourceReview, SourceReviewDisposition
 from .scheduler import (
     ScheduledWork,
     ScheduledWorkStatus,
@@ -221,6 +222,8 @@ __all__ = [
     "SecuritySignalType",
     "SecurityStatus",
     "recommend_security_response",
+    "HostSecuritySourceReview",
+    "SourceReviewDisposition",
     "CoordinationResult",
     "OverseerCoordinator",
     "needs_operator_approval",

@@ -93,6 +93,7 @@ from overseer import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_user_service_restart,
+    SourceReviewDisposition,
 )
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
@@ -114,6 +115,8 @@ from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import host_security_findings_status
 from overseer.cli import host_security_sources_status
+from overseer.cli import create_host_security_source_review_status
+from overseer.cli import host_security_source_reviews_status
 from overseer.cli import host_security_triage_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -1765,6 +1768,47 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["connections"][0]["remote_address"], "8.8.8.8")
             self.assertEqual(status["connections"][0]["source_scope"], "external")
 
+    def test_client_creates_host_security_source_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53122"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                created = client.create_host_security_source_review(
+                    {
+                        "remote_address": "8.8.8.8",
+                        "disposition": SourceReviewDisposition.SUSPICIOUS.value,
+                        "reviewed_by": "odo",
+                        "rationale": "unexpected remote source",
+                    }
+                )
+                reviews = client.host_security_source_reviews()
+
+            self.assertEqual(created["remote_address"], "8.8.8.8")
+            self.assertEqual(created["disposition"], SourceReviewDisposition.SUSPICIOUS.value)
+            self.assertFalse(created["can_stage_block_plan"])
+            self.assertEqual(reviews["review_count"], 1)
+
     def test_client_plans_host_security_remediation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2278,6 +2322,54 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(documentation_connection["source_scope"], "documentation")
         self.assertFalse(documentation_connection["can_stage_block_plan"])
         self.assertIn("read-only source correlation", status["correlation_boundary"])
+
+    def test_host_security_source_review_requires_review_before_block_plan_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-review"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53122\n"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:07:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            pending = create_host_security_source_review_status(store_path, "8.8.8.8")
+            hostile = create_host_security_source_review_status(
+                store_path,
+                "8.8.8.8",
+                review_id="source-review.hostile.8-8-8-8",
+                disposition=SourceReviewDisposition.HOSTILE.value,
+                rationale="confirmed malicious login attempts in external evidence",
+                reviewed_by="odo",
+                reviewed_at="2026-07-18T16:08:00+00:00",
+            )
+            reviews = host_security_source_reviews_status(store_path)
+            state = list_state_status(store_path)
+
+        self.assertEqual(pending["disposition"], SourceReviewDisposition.NEEDS_REVIEW.value)
+        self.assertFalse(pending["can_stage_block_plan"])
+        self.assertEqual(hostile["disposition"], SourceReviewDisposition.HOSTILE.value)
+        self.assertTrue(hostile["can_stage_block_plan"])
+        self.assertEqual(reviews["review_count"], 2)
+        self.assertEqual(reviews["ready_for_block_plan"], 1)
+        self.assertEqual(reviews["by_disposition"][SourceReviewDisposition.HOSTILE.value], 1)
+        self.assertEqual(len(state["host_security_source_reviews"]), 2)
 
     def test_host_security_remediation_stages_deny_plan_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

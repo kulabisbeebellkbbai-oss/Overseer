@@ -18,6 +18,9 @@ from overseer import (
     HealthTarget,
     ProbeResult,
     ProbeType,
+    PhysicalAssetKind,
+    PhysicalIdentity,
+    physical_identity_conflicts,
 )
 
 
@@ -248,3 +251,36 @@ class HealthClassificationTests(unittest.TestCase):
 
         self.assertEqual(recovered.observed_status, HealthStatus.RECOVERED)
         self.assertFalse(recovered.recovery_required)
+
+
+class PhysicalIdentityTests(unittest.TestCase):
+    def test_detects_same_serial_port_path_conflict(self):
+        left = PhysicalIdentity(
+            kind=PhysicalAssetKind.SERIAL_PORT,
+            stable_id="serial.rs485-a",
+            observed_paths=frozenset({"/dev/serial/by-id/usb-rs485-a"}),
+        )
+        right = PhysicalIdentity(
+            kind=PhysicalAssetKind.SERIAL_PORT,
+            stable_id="serial.rs485-b",
+            observed_paths=frozenset({"/dev/serial/by-id/usb-rs485-a"}),
+        )
+
+        self.assertTrue(physical_identity_conflicts(left, right))
+
+    def test_requires_observed_path_for_serial_checkout_identity(self):
+        identity = PhysicalIdentity(
+            kind=PhysicalAssetKind.SERIAL_PORT,
+            stable_id="serial.unknown",
+        )
+
+        self.assertFalse(identity.is_complete_for_exclusive_checkout())
+
+    def test_flags_storage_write_risk(self):
+        identity = PhysicalIdentity(
+            kind=PhysicalAssetKind.STORAGE_ARRAY,
+            stable_id="storage.backups",
+            storage_profile="read_write",
+        )
+
+        self.assertTrue(identity.has_storage_risk())

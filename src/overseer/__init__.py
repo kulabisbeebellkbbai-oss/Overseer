@@ -15,6 +15,7 @@ from .core import (
     decide_claim,
 )
 from .health import HealthEvidence, HealthStatus, HealthTarget, ProbeResult, ProbeType, classify_probe, recovery_evidence
+from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_conflicts
 
 __all__ = [
     "ApprovalLevel",
@@ -36,4 +37,7 @@ __all__ = [
     "ProbeType",
     "classify_probe",
     "recovery_evidence",
+    "PhysicalAssetKind",
+    "PhysicalIdentity",
+    "physical_identity_conflicts",
 ]

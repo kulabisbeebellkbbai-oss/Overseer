@@ -179,6 +179,9 @@ class SQLiteStore:
     def load_approval(self, approval_id: str) -> ApprovalRequest:
         return _load_dataclass(ApprovalRequest, self._get_payload("approvals", approval_id))
 
+    def list_approvals(self) -> tuple[ApprovalRequest, ...]:
+        return tuple(_load_dataclass(ApprovalRequest, payload) for payload in self._list_payloads("approvals"))
+
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(
             "INSERT OR REPLACE INTO audit_events (id, subject_id, payload) VALUES (?, ?, ?)",

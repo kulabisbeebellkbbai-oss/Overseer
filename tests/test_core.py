@@ -74,6 +74,7 @@ from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import approve_claim_status
+from overseer.cli import list_state_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
@@ -1473,6 +1474,40 @@ class RuntimeTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 activate_claim_status(store_path, requested["claim"], requested["approval_id"])
+
+    def test_list_state_status_reports_claim_approval_and_audit_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.state.cli",
+                    name="State CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.state",
+                "proxy.state.cli",
+                ClaimType.LEASE.value,
+                "thread-a",
+                OwnerDomain.DAX.value,
+                "use proxy",
+                "bind proxy",
+                RiskLevel.LOW.value,
+            )
+            approve_claim_status(store_path, requested["approval_id"], "sisko")
+
+            status = list_state_status(store_path)
+
+            self.assertEqual(status["resources"][0]["id"], "proxy.state.cli")
+            self.assertEqual(status["claims"][0]["status"], ClaimStatus.REQUESTED.value)
+            self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
+            self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")
 
     def test_release_claim_status_clears_stored_resource_claim(self):
         with tempfile.TemporaryDirectory() as directory:

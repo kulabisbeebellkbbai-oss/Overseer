@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
+from .core import ClaimStatus, ResourceState
+from .audit import ApprovalStatus, AuditEventType
 from .health import HealthTarget, ProbeType
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
@@ -233,6 +235,65 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
         store.close()
 
 
+def list_state_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        resources = store.list_resources()
+        claims = store.list_claims()
+        approvals = store.list_approvals()
+        audit_events = store.list_audit_events()
+        return {
+            "store": str(store.path),
+            "resources": [
+                {
+                    "id": resource.id,
+                    "type": ResourceType(resource.type).value,
+                    "owner_domain": OwnerDomain(resource.owner_domain).value,
+                    "risk_level": RiskLevel(resource.risk_level).value,
+                    "state": ResourceState(resource.state).value,
+                    "current_claim_id": resource.current_claim_id,
+                }
+                for resource in resources
+            ],
+            "claims": [
+                {
+                    "id": claim.id,
+                    "resource_id": claim.resource_id,
+                    "claim_type": ClaimType(claim.claim_type).value,
+                    "owner_thread": claim.owner_thread,
+                    "owner_role": OwnerDomain(claim.owner_role).value,
+                    "risk_level": RiskLevel(claim.risk_level).value,
+                    "status": ClaimStatus(claim.status).value,
+                    "approval_id": claim.approval_id,
+                }
+                for claim in claims
+            ],
+            "approvals": [
+                {
+                    "id": approval.id,
+                    "subject_id": approval.subject_id,
+                    "approval_level": ApprovalLevel(approval.approval_level).value,
+                    "status": ApprovalStatus(approval.status).value,
+                    "decided_by": approval.decided_by,
+                }
+                for approval in approvals
+            ],
+            "audit_events": [
+                {
+                    "id": event.id,
+                    "event_type": AuditEventType(event.event_type).value,
+                    "subject_id": event.subject_id,
+                    "owner_domain": OwnerDomain(event.owner_domain).value,
+                    "risk_level": RiskLevel(event.risk_level).value,
+                    "summary": event.summary,
+                }
+                for event in audit_events
+            ],
+        }
+    finally:
+        store.close()
+
+
 def request_claim_status(
     store_path: str | Path,
     claim_id: str,
@@ -372,6 +433,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
     run_parser.add_argument("--interval-seconds", type=float, default=30.0)
+    state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
+    state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
     claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser.add_argument("--claim-id", required=True)
@@ -434,6 +497,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         print(json.dumps(run_status(args.store, args.once, args.interval_seconds), sort_keys=True))
+        return 0
+
+    if args.command == "list-state":
+        print(json.dumps(list_state_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "request-claim":

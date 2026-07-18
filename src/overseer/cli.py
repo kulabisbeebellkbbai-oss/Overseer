@@ -1537,7 +1537,10 @@ def prepare_host_security_ids_review_package_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        plan = store.load_admin_change_plan(plan_id)
+        try:
+            plan = store.load_admin_change_plan(plan_id)
+        except KeyError:
+            raise ValueError(f"admin plan does not exist: {plan_id}") from None
         source_review = store.load_host_security_source_review(source_review_id) if source_review_id else None
         package = build_ids_review_package(plan, source_review, package_id, requested_by, created_at)
         store.save_host_security_ids_review_package(package)

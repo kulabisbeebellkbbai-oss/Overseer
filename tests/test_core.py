@@ -2365,6 +2365,7 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertFalse(archive_result["mutation_performed"])
             self.assertIsNotNone(unarchive_error)
             self.assertEqual(unarchive_error.code, 400)
+            self.assertIn("is not archived", unarchive_error.read().decode("utf-8"))
             self.assertEqual(summary["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
             self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)

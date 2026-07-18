@@ -120,6 +120,7 @@ def probe_health_status(
     expected_status: int | None = None,
     expected_content_type: str | None = None,
     timeout_seconds: float = 5.0,
+    store_path: str | Path | None = None,
 ) -> dict[str, object]:
     target = HealthTarget(
         id=resource_id.replace(".", "-"),
@@ -131,7 +132,13 @@ def probe_health_status(
         expected_content_type=expected_content_type,
     )
     evidence = HttpHealthProbeAdapter(timeout_seconds=timeout_seconds).probe(target)
-    return {
+    if store_path is not None:
+        store = SQLiteStore(store_path)
+        try:
+            store.save_health_evidence(evidence)
+        finally:
+            store.close()
+    status = {
         "id": evidence.id,
         "resource_id": evidence.resource_id,
         "target": evidence.target,
@@ -141,6 +148,9 @@ def probe_health_status(
         "recovery_required": evidence.recovery_required,
         "error": evidence.observed_error,
     }
+    if store_path is not None:
+        status["store"] = str(Path(store_path))
+    return status
 
 
 def discover_physical_status(roots: Sequence[str]) -> dict[str, object]:
@@ -168,6 +178,7 @@ def run_status(store_path: str | Path, once: bool, interval_seconds: float = 30.
             "resources": tick.resources,
             "usage_limits": tick.usage_limits,
             "audit_events": tick.audit_events,
+            "health_evidence": tick.health_evidence,
         }
     finally:
         store.close()
@@ -189,6 +200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_parser.add_argument("--expected-status", type=int)
     probe_parser.add_argument("--expected-content-type")
     probe_parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    probe_parser.add_argument("--store", help="explicit SQLite store path for persisting health evidence")
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
@@ -217,6 +229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.expected_status,
                     args.expected_content_type,
                     args.timeout_seconds,
+                    args.store,
                 ),
                 sort_keys=True,
             )

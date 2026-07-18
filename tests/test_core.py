@@ -445,6 +445,25 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
             self.assertEqual(status["resource_id"], "svc.local.json")
 
+    def test_probe_health_status_persists_evidence_to_explicit_store(self):
+        with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = probe_health_status(
+                "svc.local.json",
+                "Local JSON",
+                server.url,
+                ProbeType.JSON.value,
+                expected_content_type="application/json",
+                timeout_seconds=2,
+                store_path=store_path,
+            )
+            store = SQLiteStore(store_path)
+
+            self.assertEqual(status["store"], str(store_path))
+            self.assertEqual(store.load_health_evidence(status["id"]).observed_status, HealthStatus.HEALTHY)
+            store.close()
+
 
 class PhysicalIdentityTests(unittest.TestCase):
     def test_detects_same_serial_port_path_conflict(self):
@@ -1241,6 +1260,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(tick.resources, 1)
             self.assertEqual(tick.usage_limits, 1)
+            self.assertEqual(tick.health_evidence, 0)
             store.close()
 
     def test_run_status_reports_explicit_store_counts(self):
@@ -1262,6 +1282,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(status["store"], str(store_path))
             self.assertEqual(status["resources"], 1)
+            self.assertEqual(status["health_evidence"], 0)
 
 
 class OverseerCoordinatorTests(unittest.TestCase):

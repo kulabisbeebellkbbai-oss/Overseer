@@ -10,6 +10,7 @@ from typing import Any
 
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
+from .health import HealthEvidence
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .usage_limits import UsageLimit
 
@@ -57,6 +58,11 @@ class SQLiteStore:
                 resource_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS health_evidence (
+                id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             """
         )
         self._connection.commit()
@@ -82,6 +88,19 @@ class SQLiteStore:
 
     def list_usage_limits(self) -> tuple[UsageLimit, ...]:
         return tuple(_load_dataclass(UsageLimit, payload) for payload in self._list_payloads("usage_limits"))
+
+    def save_health_evidence(self, evidence: HealthEvidence) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO health_evidence (id, resource_id, payload) VALUES (?, ?, ?)",
+            (evidence.id, evidence.resource_id, _dump(evidence)),
+        )
+        self._connection.commit()
+
+    def load_health_evidence(self, evidence_id: str) -> HealthEvidence:
+        return _load_dataclass(HealthEvidence, self._get_payload("health_evidence", evidence_id))
+
+    def list_health_evidence(self) -> tuple[HealthEvidence, ...]:
+        return tuple(_load_dataclass(HealthEvidence, payload) for payload in self._list_payloads("health_evidence"))
 
     def save_claim(self, claim: Claim, decision: ConflictDecision | None = None) -> None:
         self._connection.execute(

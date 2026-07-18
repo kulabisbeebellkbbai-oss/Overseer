@@ -30,6 +30,7 @@ from .core import (
     decide_claim,
 )
 from .health import HealthEvidence, HealthStatus, HealthTarget, ProbeResult, ProbeType, classify_probe, recovery_evidence
+from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
     InterruptionPolicy,
     MaintenanceKind,
@@ -108,6 +109,7 @@ __all__ = [
     "ProbeType",
     "classify_probe",
     "recovery_evidence",
+    "HttpHealthProbeAdapter",
     "InterruptionPolicy",
     "MaintenanceKind",
     "MaintenancePlan",

@@ -1,6 +1,8 @@
 import tempfile
+import threading
 import unittest
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from overseer import (
@@ -27,6 +29,7 @@ from overseer import (
     recovery_evidence,
     HealthStatus,
     HealthTarget,
+    HttpHealthProbeAdapter,
     InterruptionPolicy,
     LimitDecision,
     LimitKind,
@@ -66,7 +69,40 @@ from overseer import (
 )
 from overseer.cli import demo_status
 from overseer.cli import persisted_demo_status
+from overseer.cli import probe_health_status
 from overseer.cli import seed_config_status
+
+
+class _JsonHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+class LocalHttpServer:
+    def __enter__(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _JsonHealthHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.url = f"http://{host}:{port}/health"
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -372,6 +408,38 @@ class HealthClassificationTests(unittest.TestCase):
 
         self.assertEqual(recovered.observed_status, HealthStatus.RECOVERED)
         self.assertFalse(recovered.recovery_required)
+
+
+class LiveHealthProbeTests(unittest.TestCase):
+    def test_http_health_probe_adapter_classifies_local_json_endpoint(self):
+        with LocalHttpServer() as server:
+            target = HealthTarget(
+                id="local-json",
+                resource_id="svc.local.json",
+                name="Local JSON",
+                probe_type=ProbeType.JSON,
+                target=server.url,
+                expected_content_type="application/json",
+            )
+
+            evidence = HttpHealthProbeAdapter(timeout_seconds=2).probe(target)
+
+            self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+            self.assertFalse(evidence.recovery_required)
+
+    def test_probe_health_status_reports_local_json_endpoint(self):
+        with LocalHttpServer() as server:
+            status = probe_health_status(
+                "svc.local.json",
+                "Local JSON",
+                server.url,
+                ProbeType.JSON.value,
+                expected_content_type="application/json",
+                timeout_seconds=2,
+            )
+
+            self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
+            self.assertEqual(status["resource_id"], "svc.local.json")
 
 
 class PhysicalIdentityTests(unittest.TestCase):

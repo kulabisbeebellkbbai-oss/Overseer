@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .config import load_config, seed_store_from_config
 from .core import Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
+from .health import HealthTarget, ProbeType
+from .live_health import HttpHealthProbeAdapter
 from .registry import ResourceRegistry
 from .service import OverseerCoordinator
 from .store import SQLiteStore
@@ -108,6 +110,37 @@ def seed_config_status(config_path: str | Path, store_path: str | Path) -> dict[
         store.close()
 
 
+def probe_health_status(
+    resource_id: str,
+    name: str,
+    url: str,
+    probe_type: str,
+    expected_status: int | None = None,
+    expected_content_type: str | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, object]:
+    target = HealthTarget(
+        id=resource_id.replace(".", "-"),
+        resource_id=resource_id,
+        name=name,
+        probe_type=ProbeType(probe_type),
+        target=url,
+        expected_status=expected_status,
+        expected_content_type=expected_content_type,
+    )
+    evidence = HttpHealthProbeAdapter(timeout_seconds=timeout_seconds).probe(target)
+    return {
+        "id": evidence.id,
+        "resource_id": evidence.resource_id,
+        "target": evidence.target,
+        "probe_type": evidence.probe_type.value,
+        "status": evidence.observed_status.value,
+        "owner_domain": evidence.owner_domain.value,
+        "recovery_required": evidence.recovery_required,
+        "error": evidence.observed_error,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="overseer")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -116,6 +149,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
     seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
     seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    probe_parser = subparsers.add_parser("probe-health", help="run a read-only HTTP health probe for an explicit URL")
+    probe_parser.add_argument("--resource-id", required=True)
+    probe_parser.add_argument("--name", required=True)
+    probe_parser.add_argument("--url", required=True)
+    probe_parser.add_argument("--probe-type", default=ProbeType.HTTP.value, choices=[item.value for item in ProbeType])
+    probe_parser.add_argument("--expected-status", type=int)
+    probe_parser.add_argument("--expected-content-type")
+    probe_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     args = parser.parse_args(argv)
 
     if args.command == "demo":
@@ -125,6 +166,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "seed-config":
         print(json.dumps(seed_config_status(args.config, args.store), sort_keys=True))
+        return 0
+
+    if args.command == "probe-health":
+        print(
+            json.dumps(
+                probe_health_status(
+                    args.resource_id,
+                    args.name,
+                    args.url,
+                    args.probe_type,
+                    args.expected_status,
+                    args.expected_content_type,
+                    args.timeout_seconds,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     parser.error(f"unknown command: {args.command}")

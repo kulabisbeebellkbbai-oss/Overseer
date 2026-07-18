@@ -25,6 +25,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m unittest discover -s tests -v` - run the current unit test suite.
 - `PYTHONPATH=src python3 -m overseer.cli demo` - print a read-only demo checkout decision.
 - `PYTHONPATH=src python3 -m overseer.cli demo --store state/overseer.sqlite3` - persist the demo decision to an explicit ignored local database path.
+- `PYTHONPATH=src python3 -m overseer.cli seed-config --config config/overseer.json --store state/overseer.sqlite3` - seed explicit JSON config into an ignored local database path.
 
 ## Continuous Integration
 
@@ -50,5 +51,6 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Operation planner: `docs/operation-planner.md`
 - Local scheduler: `docs/scheduler.md`
 - JSON configuration loading: `docs/configuration.md`
+- Config seeding: `docs/config-seeding.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

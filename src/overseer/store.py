@@ -11,6 +11,7 @@ from typing import Any
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
 from .serialization import dataclass_from_jsonable, to_jsonable
+from .usage_limits import UsageLimit
 
 
 class SQLiteStore:
@@ -51,6 +52,11 @@ class SQLiteStore:
                 subject_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS usage_limits (
+                id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             """
         )
         self._connection.commit()
@@ -63,6 +69,19 @@ class SQLiteStore:
 
     def list_resources(self) -> tuple[Resource, ...]:
         return tuple(_load_dataclass(Resource, payload) for payload in self._list_payloads("resources"))
+
+    def save_usage_limit(self, usage_limit: UsageLimit) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO usage_limits (id, resource_id, payload) VALUES (?, ?, ?)",
+            (usage_limit.id, usage_limit.resource_id, _dump(usage_limit)),
+        )
+        self._connection.commit()
+
+    def load_usage_limit(self, usage_limit_id: str) -> UsageLimit:
+        return _load_dataclass(UsageLimit, self._get_payload("usage_limits", usage_limit_id))
+
+    def list_usage_limits(self) -> tuple[UsageLimit, ...]:
+        return tuple(_load_dataclass(UsageLimit, payload) for payload in self._list_payloads("usage_limits"))
 
     def save_claim(self, claim: Claim, decision: ConflictDecision | None = None) -> None:
         self._connection.execute(

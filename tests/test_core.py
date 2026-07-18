@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from overseer import (
@@ -60,9 +61,11 @@ from overseer import (
     schedule_maintenance_window,
     schedule_limited_work,
     schedule_usage_limited_work,
+    seed_store_from_config,
 )
 from overseer.cli import demo_status
 from overseer.cli import persisted_demo_status
+from overseer.cli import seed_config_status
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -844,6 +847,44 @@ class CliDemoTests(unittest.TestCase):
             self.assertEqual(status["decision"], ConflictOutcome.ESCALATE.value)
             self.assertTrue(store_path.exists())
 
+    def test_seed_config_status_uses_explicit_config_and_store_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "overseer.json"
+            store_path = Path(directory) / "overseer.sqlite3"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "resources": [
+                            {
+                                "id": "svc.cli.config",
+                                "name": "CLI Config Service",
+                                "type": "service",
+                                "owner_domain": "julian",
+                                "risk_level": "low",
+                            }
+                        ],
+                        "usage_limits": [
+                            {
+                                "id": "limit.cli.config",
+                                "resource_id": "svc.cli.config",
+                                "kind": "requests",
+                                "capacity": 10,
+                                "remaining": 5,
+                                "resets_at": "2026-07-18T16:00:00-04:00",
+                                "window": "hourly",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = seed_config_status(config_path, store_path)
+
+            self.assertEqual(status["store"], str(store_path))
+            self.assertEqual(status["resources"], 1)
+            self.assertEqual(status["usage_limits"], 1)
+
 
 class ApprovalAuditTests(unittest.TestCase):
     def test_creates_approval_request_for_escalated_claim_decision(self):
@@ -961,6 +1002,42 @@ class SQLiteStoreTests(unittest.TestCase):
 
             self.assertEqual(store.load_approval("approval.persisted").approval_level, ApprovalLevel.SISKO)
             self.assertEqual(store.list_audit_events()[0].event_type, AuditEventType.ESCALATED)
+            store.close()
+
+    def test_seeds_resources_and_usage_limits_from_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            config = config_from_mapping(
+                {
+                    "resources": [
+                        {
+                            "id": "svc.seeded",
+                            "name": "Seeded Service",
+                            "type": "service",
+                            "owner_domain": "julian",
+                            "risk_level": "low",
+                        }
+                    ],
+                    "usage_limits": [
+                        {
+                            "id": "limit.seeded",
+                            "resource_id": "svc.seeded",
+                            "kind": "requests",
+                            "capacity": 20,
+                            "remaining": 10,
+                            "resets_at": "2026-07-18T16:00:00-04:00",
+                            "window": "hourly",
+                        }
+                    ],
+                }
+            )
+
+            result = seed_store_from_config(config, store)
+
+            self.assertEqual(result.resource_count, 1)
+            self.assertEqual(result.usage_limit_count, 1)
+            self.assertEqual(store.load_resource("svc.seeded").owner_domain, OwnerDomain.JULIAN)
+            self.assertEqual(store.load_usage_limit("limit.seeded").remaining, 10)
             store.close()
 
 

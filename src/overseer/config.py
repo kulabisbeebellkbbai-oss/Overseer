@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
+from .store import SQLiteStore
 from .usage_limits import LimitKind, UsageLimit
 
 
@@ -15,6 +16,13 @@ from .usage_limits import LimitKind, UsageLimit
 class OverseerConfig:
     resources: tuple[Resource, ...] = ()
     usage_limits: tuple[UsageLimit, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfigSeedResult:
+    resource_count: int
+    usage_limit_count: int
+    store_path: str
 
 
 def load_config(path: str | Path) -> OverseerConfig:
@@ -28,6 +36,14 @@ def config_from_mapping(data: dict[str, Any]) -> OverseerConfig:
     resources = tuple(_resource_from_mapping(item) for item in data.get("resources", ()))
     usage_limits = tuple(_usage_limit_from_mapping(item) for item in data.get("usage_limits", ()))
     return OverseerConfig(resources, usage_limits)
+
+
+def seed_store_from_config(config: OverseerConfig, store: SQLiteStore) -> ConfigSeedResult:
+    for resource in config.resources:
+        store.save_resource(resource)
+    for usage_limit in config.usage_limits:
+        store.save_usage_limit(usage_limit)
+    return ConfigSeedResult(len(config.resources), len(config.usage_limits), str(store.path))
 
 
 def _resource_from_mapping(data: dict[str, Any]) -> Resource:

@@ -14,7 +14,7 @@ from .audit import (
     approval_from_decision,
     audit_event_from_decision,
 )
-from .config import OverseerConfig, config_from_mapping, load_config
+from .config import ConfigSeedResult, OverseerConfig, config_from_mapping, load_config, seed_store_from_config
 from .core import (
     ApprovalLevel,
     Claim,
@@ -83,9 +83,11 @@ __all__ = [
     "AuditEventType",
     "approval_from_decision",
     "audit_event_from_decision",
+    "ConfigSeedResult",
     "OverseerConfig",
     "config_from_mapping",
     "load_config",
+    "seed_store_from_config",
     "ApprovalLevel",
     "Claim",
     "ClaimStatus",

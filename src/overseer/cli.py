@@ -7,6 +7,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from .config import load_config, seed_store_from_config
 from .core import Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .registry import ResourceRegistry
 from .service import OverseerCoordinator
@@ -94,16 +95,36 @@ def persisted_demo_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def seed_config_status(config_path: str | Path, store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        result = seed_store_from_config(load_config(config_path), store)
+        return {
+            "store": result.store_path,
+            "resources": result.resource_count,
+            "usage_limits": result.usage_limit_count,
+        }
+    finally:
+        store.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="overseer")
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo_parser = subparsers.add_parser("demo", help="print a demo checkout decision")
     demo_parser.add_argument("--store", help="explicit SQLite path for persisting the demo decision")
+    seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
+    seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
+    seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     args = parser.parse_args(argv)
 
     if args.command == "demo":
         status = persisted_demo_status(args.store) if args.store else demo_status()
         print(json.dumps(status, sort_keys=True))
+        return 0
+
+    if args.command == "seed-config":
+        print(json.dumps(seed_config_status(args.config, args.store), sort_keys=True))
         return 0
 
     parser.error(f"unknown command: {args.command}")

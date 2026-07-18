@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import replace
 from enum import StrEnum
+from pathlib import Path
+import re
 
 from .admin import AdminChangeKind, AdminChangePlan
 from .source_review import HostSecuritySourceReview, SourceReviewDisposition
@@ -56,6 +58,9 @@ class HostSecurityIDSReviewPackage:
 
     def satisfies_pre_execution_review_gate(self) -> bool:
         return self.status == IDSReviewPackageStatus.ACCEPTED and bool((self.advisory_result or "").strip())
+
+
+_PROMPT_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def admin_plan_requires_ids_review(plan: AdminChangePlan) -> bool:
@@ -171,6 +176,33 @@ def record_ids_review_package_result(
         reviewed_by=reviewed_by,
         reviewed_at=reviewed_at,
     )
+
+
+def write_ids_review_prompt_file(
+    package: HostSecurityIDSReviewPackage,
+    output_dir: str | Path,
+    filename: str | None = None,
+) -> tuple[HostSecurityIDSReviewPackage, Path]:
+    output_path = Path(output_dir)
+    if output_path.exists() and not output_path.is_dir():
+        raise ValueError("output_dir must be a directory")
+    selected_filename = filename or _default_prompt_filename(package)
+    if Path(selected_filename).name != selected_filename:
+        raise ValueError("filename must not include a directory")
+    if not selected_filename.endswith(".md"):
+        raise ValueError("filename must end with .md")
+    output_path.mkdir(parents=True, exist_ok=True)
+    prompt_path = output_path / selected_filename
+    prompt_path.write_text(package.prompt + "\n", encoding="utf-8")
+    prompt_path.chmod(0o600)
+    return replace(package, prompt_path=str(prompt_path)), prompt_path
+
+
+def _default_prompt_filename(package: HostSecurityIDSReviewPackage) -> str:
+    safe_id = _PROMPT_FILENAME_RE.sub("-", package.id).strip(".-")
+    if not safe_id:
+        safe_id = "ids-review-package"
+    return f"{safe_id}.prompt.md"
 
 
 def _source_context(source_review: HostSecuritySourceReview | None) -> str:

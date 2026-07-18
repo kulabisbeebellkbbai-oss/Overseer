@@ -77,6 +77,7 @@ from .ids_review import (
     build_ids_review_package,
     mark_ids_review_package_submitted,
     record_ids_review_package_result,
+    write_ids_review_prompt_file,
 )
 from .live_health import HttpHealthProbeAdapter
 from .maintenance import (
@@ -203,6 +204,7 @@ __all__ = [
     "build_ids_review_package",
     "mark_ids_review_package_submitted",
     "record_ids_review_package_result",
+    "write_ids_review_prompt_file",
     "HttpHealthProbeAdapter",
     "InterruptionPolicy",
     "MaintenanceKind",

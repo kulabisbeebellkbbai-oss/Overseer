@@ -111,6 +111,7 @@ from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
 from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
+from overseer.cli import export_host_security_ids_review_prompt_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import host_security_findings_status
@@ -1824,11 +1825,12 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
                 with self.assertRaises(HTTPError):
                     client.approve_admin_change({"plan_id": block_plan["id"], "approved_by": "sisko"})
+                exported = client.export_host_security_ids_review_prompt({"package_id": ids_package["id"]})
                 submitted = client.submit_host_security_ids_review_package(
                     {
                         "package_id": ids_package["id"],
                         "submitted_by": "odo",
-                        "prompt_path": "state/advisories/ids-review.prompt.md",
+                        "prompt_path": exported["prompt_path"],
                     }
                 )
                 with self.assertRaises(HTTPError):
@@ -1853,8 +1855,10 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertFalse(block_plan["can_execute"])
             self.assertEqual(ids_package["plan_id"], block_plan["id"])
             self.assertIn("Intrusion Detection", ids_package["prompt"])
+            self.assertTrue(Path(exported["prompt_path"]).exists())
+            self.assertTrue(exported["prompt_path"].endswith(".prompt.md"))
             self.assertEqual(submitted["status"], "submitted")
-            self.assertEqual(submitted["prompt_path"], "state/advisories/ids-review.prompt.md")
+            self.assertEqual(submitted["prompt_path"], exported["prompt_path"])
             self.assertEqual(advisory_result["status"], "accepted")
             self.assertTrue(advisory_result["satisfies_pre_execution_review_gate"])
             self.assertTrue(approved["approved"])
@@ -2430,12 +2434,22 @@ class HostInspectionTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 approve_admin_change_status(store_path, block_plan["id"], "sisko")
+            exported = export_host_security_ids_review_prompt_status(
+                store_path,
+                ids_package["id"],
+                "advisories",
+                "source-block.prompt.md",
+            )
+            exported_prompt_exists = Path(exported["prompt_path"]).exists()
+            exported_prompt_text = Path(exported["prompt_path"]).read_text(encoding="utf-8").strip()
+            with self.assertRaises(ValueError):
+                export_host_security_ids_review_prompt_status(store_path, ids_package["id"], "../outside")
             submitted = submit_host_security_ids_review_package_status(
                 store_path,
                 ids_package["id"],
                 "odo",
                 submitted_at="2026-07-18T16:10:00+00:00",
-                prompt_path="state/advisories/ids-review.prompt.md",
+                prompt_path=exported["prompt_path"],
             )
             with self.assertRaises(ValueError):
                 approve_admin_change_status(store_path, block_plan["id"], "sisko")
@@ -2467,7 +2481,10 @@ class HostInspectionTests(unittest.TestCase):
         self.assertIn("codex-advisor.sh", ids_package["advisory_command"][0])
         self.assertIn("custom firewall or IDS rules", ids_package["prompt"])
         self.assertFalse(ids_package["satisfies_pre_execution_review_gate"])
+        self.assertTrue(exported_prompt_exists)
+        self.assertEqual(exported_prompt_text, ids_package["prompt"])
         self.assertEqual(submitted["status"], "submitted")
+        self.assertEqual(submitted["prompt_path"], exported["prompt_path"])
         self.assertFalse(submitted["satisfies_pre_execution_review_gate"])
         self.assertEqual(advisory_result["status"], "accepted")
         self.assertEqual(advisory_result["reviewed_by"], "odo")

@@ -54,6 +54,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/source-reviews/block-plans`
 - `POST /host/security/ids-review-packages`
 - `POST /host/security/ids-review-packages/submit`
+- `POST /host/security/ids-review-packages/prompts`
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
 - `POST /admin/plans`
@@ -86,6 +87,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /host/security/ids-review-packages` lists prepared Intrusion Detection advisory packages and prompts tied to security admin plans.
 `POST /host/security/ids-review-packages` prepares the review package required before firewall or source-block plans can be approved. It does not run the advisor or apply policy.
 `POST /host/security/ids-review-packages/submit` records manual handoff metadata for an IDS/firewall review package. It does not execute the advisor.
+`POST /host/security/ids-review-packages/prompts` writes the advisory prompt under the store directory and records the prompt path. It does not execute the advisor.
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
@@ -120,7 +122,8 @@ reviews = client.host_security_source_reviews()
 review = client.create_host_security_source_review({"remote_address": "8.8.8.8", "disposition": "suspicious", "reviewed_by": "odo", "rationale": "unexpected remote source"})
 source_block = client.plan_host_security_source_block({"review_id": "source-review.example"})
 ids_package = client.prepare_host_security_ids_review_package({"plan_id": "admin.host-security.block-source.8-8-8-8", "source_review_id": "source-review.example"})
-submitted = client.submit_host_security_ids_review_package({"package_id": ids_package["id"], "submitted_by": "odo"})
+exported_prompt = client.export_host_security_ids_review_prompt({"package_id": ids_package["id"]})
+submitted = client.submit_host_security_ids_review_package({"package_id": ids_package["id"], "submitted_by": "odo", "prompt_path": exported_prompt["prompt_path"]})
 result = client.record_host_security_ids_review_result({"package_id": ids_package["id"], "status": "accepted", "advisory_result": "approved staged package", "reviewed_by": "odo"})
 remediation = client.plan_host_security_remediation({"listener": "0.0.0.0:22"})
 plan = client.plan_admin_change(

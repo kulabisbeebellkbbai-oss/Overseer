@@ -22,6 +22,7 @@ from .cli import (
     command_summary_status,
     create_host_security_source_review_status,
     execute_admin_change_status,
+    export_host_security_ids_review_prompt_status,
     health_efficiency_summary_status,
     health_summary_status,
     host_security_findings_status,
@@ -164,6 +165,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/ids-review-packages/submit":
                 self._handle_json(lambda payload: submit_host_security_ids_review_package_status(store_path, **_submit_host_security_ids_review_package_args(payload)))
+                return
+            if self.path == "/host/security/ids-review-packages/prompts":
+                self._handle_json(lambda payload: export_host_security_ids_review_prompt_status(store_path, **_export_host_security_ids_review_prompt_args(payload)))
                 return
             if self.path == "/host/security/ids-review-packages/results":
                 self._handle_json(lambda payload: record_host_security_ids_review_result_status(store_path, **_host_security_ids_review_result_args(payload)))
@@ -353,6 +357,14 @@ def _submit_host_security_ids_review_package_args(payload: dict[str, Any]) -> di
         "submitted_by": str(payload["submitted_by"]),
         "submitted_at": str(payload["submitted_at"]) if payload.get("submitted_at") else None,
         "prompt_path": str(payload["prompt_path"]) if payload.get("prompt_path") else None,
+    }
+
+
+def _export_host_security_ids_review_prompt_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "package_id": str(payload["package_id"]),
+        "output_dir": str(payload["output_dir"]) if payload.get("output_dir") else "advisories",
+        "filename": str(payload["filename"]) if payload.get("filename") else None,
     }
 
 

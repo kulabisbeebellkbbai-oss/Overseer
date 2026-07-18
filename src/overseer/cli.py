@@ -40,6 +40,7 @@ from .ids_review import (
     build_ids_review_package,
     mark_ids_review_package_submitted,
     record_ids_review_package_result,
+    write_ids_review_prompt_file,
 )
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity
@@ -1551,6 +1552,27 @@ def submit_host_security_ids_review_package_status(
         store.close()
 
 
+def export_host_security_ids_review_prompt_status(
+    store_path: str | Path,
+    package_id: str,
+    output_dir: str | Path = "advisories",
+    filename: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        package = store.load_host_security_ids_review_package(package_id)
+        resolved_output_dir = _resolve_store_local_output_dir(store.path, output_dir)
+        exported, prompt_path = write_ids_review_prompt_file(package, resolved_output_dir, filename)
+        store.save_host_security_ids_review_package(exported)
+        return {
+            "store": str(store.path),
+            "exported_prompt_path": str(prompt_path),
+            **host_security_ids_review_package_status(exported),
+        }
+    finally:
+        store.close()
+
+
 def record_host_security_ids_review_result_status(
     store_path: str | Path,
     package_id: str,
@@ -1573,6 +1595,15 @@ def record_host_security_ids_review_result_status(
         return {"store": str(store.path), **host_security_ids_review_package_status(reviewed)}
     finally:
         store.close()
+
+
+def _resolve_store_local_output_dir(store_path: Path, output_dir: str | Path) -> Path:
+    base_dir = store_path.parent.resolve()
+    selected = Path(output_dir)
+    resolved = (selected if selected.is_absolute() else base_dir / selected).resolve()
+    if resolved != base_dir and base_dir not in resolved.parents:
+        raise ValueError("output_dir must be within the store directory")
+    return resolved
 
 
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
@@ -2248,6 +2279,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     submit_ids_review_parser.add_argument("--submitted-by", required=True)
     submit_ids_review_parser.add_argument("--submitted-at")
     submit_ids_review_parser.add_argument("--prompt-path")
+    export_ids_review_parser = subparsers.add_parser(
+        "export-host-security-ids-review-prompt",
+        help="write an IDS/firewall review prompt artifact without running the advisor",
+    )
+    export_ids_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    export_ids_review_parser.add_argument("--package-id", required=True)
+    export_ids_review_parser.add_argument(
+        "--output-dir",
+        default="advisories",
+        help="directory under the store directory for prompt artifacts",
+    )
+    export_ids_review_parser.add_argument("--filename")
     record_ids_review_parser = subparsers.add_parser(
         "record-host-security-ids-review-result",
         help="record the manual Intrusion Detection advisory result for a package",
@@ -2520,6 +2563,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.submitted_by,
                     args.submitted_at,
                     args.prompt_path,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "export-host-security-ids-review-prompt":
+        print(
+            json.dumps(
+                export_host_security_ids_review_prompt_status(
+                    args.store,
+                    args.package_id,
+                    args.output_dir,
+                    args.filename,
                 ),
                 sort_keys=True,
             )

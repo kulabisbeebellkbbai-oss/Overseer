@@ -18,6 +18,7 @@ class ApprovalStatus(StrEnum):
 
 class AuditEventType(StrEnum):
     REQUESTED = "requested"
+    ALERT = "alert"
     ALLOWED = "allowed"
     QUEUED = "queued"
     BLOCKED = "blocked"

@@ -33,6 +33,7 @@ Default freshness thresholds:
 - Runtime heartbeat: `warning` at 90 seconds, `high` at 300 seconds.
 - Host inspection snapshot: `warning` at 120 seconds, `high` at 600 seconds.
 - Missing host inspection evidence is reported as `missing`.
+- Non-OK freshness states persist `alert` audit events with stable IDs so repeated status reads do not flood duplicate records.
 
 ## Local User Service
 

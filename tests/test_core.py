@@ -1136,6 +1136,7 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(status["host_inspection"]["freshness"]["age_seconds"], 15)
         self.assertEqual(status["host_inspection"]["high_findings"], 1)
         self.assertEqual(status["host_inspection"]["warning_findings"], 0)
+        self.assertEqual(status["freshness_alerts"], [])
 
     def test_runtime_status_handles_missing_host_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1153,12 +1154,56 @@ class HostInspectionTests(unittest.TestCase):
             store.close()
 
             status = runtime_status(store_path, now="2026-07-18T16:06:30+00:00")
+            store = SQLiteStore(store_path)
+            audit_events = store.list_audit_events()
+            store.close()
 
         self.assertEqual(status["service"]["freshness"]["status"], FreshnessStatus.HIGH.value)
         self.assertFalse(status["host_inspection"]["enabled"])
         self.assertEqual(status["host_inspection"]["freshness"]["status"], FreshnessStatus.MISSING.value)
         self.assertIsNone(status["host_inspection"]["latest_snapshot_id"])
         self.assertEqual(status["host_inspection"]["high_findings"], 0)
+        self.assertEqual(len(status["freshness_alerts"]), 2)
+        self.assertEqual({event.event_type for event in audit_events}, {AuditEventType.ALERT})
+        self.assertEqual({event.subject_id for event in audit_events}, {"runtime.heartbeat", "host.inspection"})
+        self.assertEqual({event.risk_level for event in audit_events}, {RiskLevel.HIGH})
+
+    def test_runtime_status_persists_warning_freshness_alert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:01:00+00:00",
+                    tick_count=2,
+                )
+            )
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout="host-b" if tuple(command) == ("hostname",) else "ok",
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:01:30+00:00")
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = runtime_status(store_path, now="2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            audit_events = store.list_audit_events()
+            store.close()
+
+        self.assertEqual(status["service"]["freshness"]["status"], FreshnessStatus.WARNING.value)
+        self.assertEqual(status["host_inspection"]["freshness"]["status"], FreshnessStatus.OK.value)
+        self.assertEqual(len(status["freshness_alerts"]), 1)
+        self.assertEqual(audit_events[0].event_type, AuditEventType.ALERT)
+        self.assertEqual(audit_events[0].subject_id, "runtime.heartbeat")
+        self.assertEqual(audit_events[0].risk_level, RiskLevel.MEDIUM)
 
 
 class AdminChangePlanTests(unittest.TestCase):

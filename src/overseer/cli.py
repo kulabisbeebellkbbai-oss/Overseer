@@ -26,7 +26,7 @@ from .admin import (
 from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
-from .audit import ApprovalStatus, AuditEventType
+from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import HostInspectionAdapter, host_security_status, host_snapshot_status
 from .live_health import HttpHealthProbeAdapter
@@ -37,6 +37,7 @@ from .runtime_state import (
     DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
     DEFAULT_RUNTIME_FRESHNESS_POLICY,
     FreshnessAssessment,
+    FreshnessStatus,
     assess_freshness,
 )
 from .service import OverseerCoordinator, coordinator_from_store
@@ -309,6 +310,16 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
             now=now,
             policy=DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
         )
+        freshness_alerts = (
+            freshness_alert_event("runtime.heartbeat", OwnerDomain.JULIAN, heartbeat_freshness),
+            freshness_alert_event("host.inspection", OwnerDomain.ODO, host_freshness),
+        )
+        persisted_alert_ids = []
+        for alert in freshness_alerts:
+            if alert is None:
+                continue
+            store.save_audit_event(alert)
+            persisted_alert_ids.append(alert.id)
         return {
             "store": str(store.path),
             "service": {
@@ -327,6 +338,7 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
                 "warning_findings": host_security["warning_findings"] if host_security else 0,
                 "freshness": freshness_status(host_freshness),
             },
+            "freshness_alerts": persisted_alert_ids,
         }
     finally:
         store.close()
@@ -341,6 +353,23 @@ def freshness_status(assessment: FreshnessAssessment) -> dict[str, object]:
         "high_after_seconds": assessment.high_after_seconds,
         "summary": assessment.summary,
     }
+
+
+def freshness_alert_event(subject_id: str, owner_domain: OwnerDomain, assessment: FreshnessAssessment) -> AuditEvent | None:
+    if assessment.status == FreshnessStatus.OK:
+        return None
+    risk_level = RiskLevel.MEDIUM if assessment.status == FreshnessStatus.WARNING else RiskLevel.HIGH
+    observed = assessment.observed_at or "missing"
+    return AuditEvent(
+        id=f"freshness.{subject_id}.{assessment.status.value}.{_status_id(observed)}",
+        event_type=AuditEventType.ALERT,
+        owner_domain=owner_domain,
+        subject_id=subject_id,
+        summary=f"{subject_id} freshness is {assessment.status.value}: {assessment.summary}",
+        risk_level=risk_level,
+        evidence_ids=(observed,),
+        occurred_at=observed if assessment.observed_at else None,
+    )
 
 
 def inspect_host_status(store_path: str | Path | None = None) -> dict[str, object]:
@@ -1059,6 +1088,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+def _status_id(value: str) -> str:
+    return "".join(character if character.isalnum() else "-" for character in value.lower()).strip("-")
 
 
 if __name__ == "__main__":

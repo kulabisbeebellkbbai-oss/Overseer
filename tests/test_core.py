@@ -108,6 +108,7 @@ from overseer.cli import admin_execution_readiness_status
 from overseer.cli import admin_history_archive_plan_status
 from overseer.cli import admin_history_archives_status
 from overseer.cli import admin_history_review_status
+from overseer.cli import admin_history_restore_readiness_status
 from overseer.cli import admin_summary_status
 from overseer.cli import archive_admin_history_status
 from overseer.cli import approve_admin_change_status
@@ -845,6 +846,8 @@ class HealthSummaryTests(unittest.TestCase):
             post_archive_plan = admin_history_archive_plan_status(store_path)
             post_archive_records = admin_history_archives_status(store_path)
             filtered_archive_records = admin_history_archives_status(store_path, "admin.restart.completed")
+            restore_readiness = admin_history_restore_readiness_status(store_path)
+            filtered_restore_readiness = admin_history_restore_readiness_status(store_path, "admin.restart.completed")
             post_archive_summary = admin_summary_status(store_path)
             post_archive_state = list_state_status(store_path)
             restored = unarchive_admin_history_status(
@@ -886,6 +889,15 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(post_archive_records["records"][0]["plan_id"], "admin.restart.completed")
         self.assertEqual(filtered_archive_records["archive_records"], 1)
         self.assertEqual(filtered_archive_records["filters"]["plan_id"], "admin.restart.completed")
+        self.assertEqual(restore_readiness["mode"], "read_only_restore_plan")
+        self.assertFalse(restore_readiness["mutation_performed"])
+        self.assertEqual(restore_readiness["archived_plans"], 1)
+        self.assertEqual(restore_readiness["ready_for_restore_request"], 1)
+        self.assertEqual(restore_readiness["approval_required_before_restore"], 1)
+        self.assertEqual(restore_readiness["items"][0]["approval_level_before_restore"], ApprovalLevel.SISKO.value)
+        self.assertEqual(restore_readiness["items"][0]["restore_risk_level"], RiskLevel.MEDIUM.value)
+        self.assertEqual(restore_readiness["items"][0]["evidence"]["archive_record"]["id"], "admin.archive.admin.restart.completed")
+        self.assertEqual(filtered_restore_readiness["filters"]["plan_id"], "admin.restart.completed")
         self.assertEqual(post_archive_summary["archived_plans"], 1)
         archived_state_plan = next(item for item in post_archive_state["admin_change_plans"] if item["id"] == "admin.restart.completed")
         self.assertTrue(archived_state_plan["archived"])
@@ -2347,6 +2359,8 @@ class OverseerApiClientTests(unittest.TestCase):
                 archive_plan = client.admin_history_archive_plan()
                 archives = client.admin_history_archives()
                 filtered_archives = client.admin_history_archives("admin.restart.blocked")
+                restore_readiness = client.admin_history_restore_readiness()
+                filtered_restore_readiness = client.admin_history_restore_readiness("admin.restart.blocked")
                 archive_result = client.archive_admin_history(
                     {
                         "archived_by": "sisko",
@@ -2374,6 +2388,8 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(archive_plan["planned_bundles"], 0)
             self.assertEqual(archives["archive_records"], 0)
             self.assertEqual(filtered_archives["filters"]["plan_id"], "admin.restart.blocked")
+            self.assertEqual(restore_readiness["archived_plans"], 0)
+            self.assertEqual(filtered_restore_readiness["filters"]["plan_id"], "admin.restart.blocked")
             self.assertFalse(archive_result["mutation_performed"])
             self.assertIsNotNone(unarchive_error)
             self.assertEqual(unarchive_error.code, 400)

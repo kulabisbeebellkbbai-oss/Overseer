@@ -17,6 +17,7 @@ from .cli import (
     admin_history_archive_plan_status,
     admin_history_archives_status,
     admin_history_review_status,
+    admin_history_restore_readiness_status,
     admin_summary_status,
     archive_admin_history_status,
     assess_host_security_status,
@@ -153,6 +154,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/admin/history-archives":
                 self._handle(lambda: admin_history_archives_status(store_path, _query_first(query, "plan_id")))
+                return
+            if path == "/admin/history-restore-readiness":
+                self._handle(lambda: admin_history_restore_readiness_status(store_path, _query_first(query, "plan_id")))
                 return
             if path == "/admin/summary":
                 self._handle(lambda: admin_summary_status(store_path))

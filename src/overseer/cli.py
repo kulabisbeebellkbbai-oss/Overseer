@@ -2034,6 +2034,47 @@ def admin_history_archives_status(store_path: str | Path, plan_id: str | None = 
         store.close()
 
 
+def admin_history_restore_readiness_status(store_path: str | Path, plan_id: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plans = [plan for plan in store.list_admin_change_plans() if plan.archived]
+        if plan_id is not None:
+            plans = [plan for plan in plans if plan.id == plan_id]
+        archive_records = {record.id: record for record in store.list_admin_history_archives()}
+        executions = store.list_admin_executions()
+        ids_packages = store.list_host_security_ids_review_packages()
+        audit_events = store.list_audit_events()
+        items = [
+            admin_history_restore_readiness_item_status(
+                plan,
+                archive_records.get(plan.archive_record_id or ""),
+                [result for result in executions if result.plan_id == plan.id],
+                [package for package in ids_packages if package.plan_id == plan.id],
+                [
+                    event
+                    for event in audit_events
+                    if event.subject_id == plan.id
+                    or plan.id in event.evidence_ids
+                    or (plan.archive_record_id is not None and plan.archive_record_id in event.evidence_ids)
+                ],
+            )
+            for plan in plans
+        ]
+        return {
+            "store": str(store.path),
+            "mode": "read_only_restore_plan",
+            "mutation_performed": False,
+            "archived_plans": len(items),
+            "ready_for_restore_request": sum(1 for item in items if item["readiness_state"] == "ready_for_restore_request"),
+            "blocked_missing_archive_record": sum(1 for item in items if item["readiness_state"] == "missing_archive_record"),
+            "approval_required_before_restore": sum(1 for item in items if item["approval_required_before_restore"]),
+            "filters": {"plan_id": plan_id},
+            "items": items,
+        }
+    finally:
+        store.close()
+
+
 def archive_admin_history_status(
     store_path: str | Path,
     archived_by: str,
@@ -2179,6 +2220,64 @@ def admin_history_archive_plan_item_status(
         "ids_review_packages": [host_security_ids_review_package_status(package) for package in ids_packages],
         "audit_events": [audit_event_status(event) for event in audit_events],
     }
+
+
+def admin_history_restore_readiness_item_status(
+    plan: AdminChangePlan,
+    archive_record: AdminHistoryArchiveRecord | None,
+    executions: Sequence[AdminExecutionResult],
+    ids_packages: Sequence[HostSecurityIDSReviewPackage],
+    audit_events: Sequence[AuditEvent],
+) -> dict[str, object]:
+    approval_level = _admin_history_restore_approval_level(plan)
+    readiness_state = "ready_for_restore_request" if archive_record is not None else "missing_archive_record"
+    next_step = (
+        f"request {approval_level.value} approval before restoring archived admin plan {plan.id}"
+        if archive_record is not None
+        else "restore is blocked until the matching archive record is present"
+    )
+    evidence_ids = (
+        tuple(result.id for result in executions)
+        + tuple(package.id for package in ids_packages)
+        + tuple(event.id for event in audit_events)
+    )
+    return {
+        "id": plan.id,
+        "archive_record_id": plan.archive_record_id,
+        "archive_record_present": archive_record is not None,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "owner_domain": OwnerDomain(plan.owner_domain).value,
+        "original_risk_level": RiskLevel(plan.risk_level).value,
+        "restore_risk_level": _admin_history_restore_risk_level(plan).value,
+        "approval_required_before_restore": True,
+        "approval_level_before_restore": approval_level.value,
+        "readiness_state": readiness_state,
+        "next_step": next_step,
+        "archived_by": plan.archived_by,
+        "archived_at": plan.archived_at,
+        "archive_summary": archive_record.summary if archive_record else None,
+        "evidence": {
+            "archive_record": admin_history_archive_record_status(archive_record) if archive_record else None,
+            "admin_execution_ids": [result.id for result in executions],
+            "ids_review_package_ids": [package.id for package in ids_packages],
+            "audit_event_ids": [event.id for event in audit_events],
+            "all_evidence_ids": list(evidence_ids),
+        },
+        "plan": admin_change_plan_status(plan),
+    }
+
+
+def _admin_history_restore_approval_level(plan: AdminChangePlan) -> ApprovalLevel:
+    if plan.approval_level == ApprovalLevel.HUMAN or plan.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
+        return ApprovalLevel.HUMAN
+    return ApprovalLevel.SISKO
+
+
+def _admin_history_restore_risk_level(plan: AdminChangePlan) -> RiskLevel:
+    if plan.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
+        return RiskLevel.HIGH
+    return RiskLevel.MEDIUM
 
 
 def _admin_history_review_payload(
@@ -3041,6 +3140,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_archives_parser = subparsers.add_parser("admin-history-archives", help="list persisted admin history archive records")
     admin_archives_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archives_parser.add_argument("--plan-id", help="filter archive records by admin plan id")
+    admin_restore_readiness_parser = subparsers.add_parser("admin-history-restore-readiness", help="plan approval and evidence gates before restoring archived admin plans")
+    admin_restore_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_restore_readiness_parser.add_argument("--plan-id", help="filter restore readiness by admin plan id")
     archive_admin_history_parser = subparsers.add_parser("archive-admin-history", help="archive inactive admin plans after explicit approval")
     archive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     archive_admin_history_parser.add_argument("--archived-by", required=True)
@@ -3391,6 +3493,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-history-archives":
         print(json.dumps(admin_history_archives_status(args.store, args.plan_id), sort_keys=True))
+        return 0
+
+    if args.command == "admin-history-restore-readiness":
+        print(json.dumps(admin_history_restore_readiness_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "archive-admin-history":

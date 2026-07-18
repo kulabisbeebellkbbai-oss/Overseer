@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from overseer import (
     ApprovalLevel,
@@ -37,6 +39,7 @@ from overseer import (
     SecuritySignal,
     SecuritySignalType,
     SecurityStatus,
+    SQLiteStore,
     UsageLimit,
     approval_from_decision,
     assess_maintenance_readiness,
@@ -699,6 +702,66 @@ class ApprovalAuditTests(unittest.TestCase):
 
         self.assertEqual(event.event_type, AuditEventType.QUEUED)
         self.assertEqual(event.evidence_ids, ("claim.active",))
+
+
+class SQLiteStoreTests(unittest.TestCase):
+    def test_persists_resource_claim_and_decision_in_explicit_temp_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            resource = Resource(
+                id="svc.persisted",
+                name="Persisted Service",
+                type=ResourceType.SERVICE,
+                owner_domain=OwnerDomain.JULIAN,
+                risk_level=RiskLevel.LOW,
+                identifiers={"ports": [8080]},
+            )
+            claim = Claim(
+                id="claim.persisted",
+                resource_id=resource.id,
+                claim_type=ClaimType.OBSERVATION,
+                owner_thread="thread-store",
+                owner_role=OwnerDomain.JULIAN,
+                intent="inspect persisted service",
+                requested_action="read health",
+                risk_level=RiskLevel.LOW,
+            )
+            decision = decide_claim(resource, claim, [])
+
+            store.save_resource(resource)
+            store.save_claim(claim, decision)
+
+            self.assertEqual(store.load_resource(resource.id).ports(), frozenset({8080}))
+            self.assertEqual(store.load_claim(claim.id).owner_thread, "thread-store")
+            self.assertEqual(store.load_decision(claim.id).outcome, ConflictOutcome.ALLOW)
+            store.close()
+
+    def test_persists_approval_and_audit_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            decision = ConflictDecision(ConflictOutcome.ESCALATE, "sisko approval required", ApprovalLevel.SISKO)
+            approval = approval_from_decision(
+                "approval.persisted",
+                "claim.persisted",
+                "thread-store",
+                OwnerDomain.DAX,
+                decision,
+            )
+            event = audit_event_from_decision(
+                "audit.persisted",
+                "claim.persisted",
+                OwnerDomain.DAX,
+                RiskLevel.HIGH,
+                decision,
+            )
+
+            self.assertIsNotNone(approval)
+            store.save_approval(approval)
+            store.save_audit_event(event)
+
+            self.assertEqual(store.load_approval("approval.persisted").approval_level, ApprovalLevel.SISKO)
+            self.assertEqual(store.list_audit_events()[0].event_type, AuditEventType.ESCALATED)
+            store.close()
 
 
 if __name__ == "__main__":

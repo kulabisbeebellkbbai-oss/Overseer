@@ -43,6 +43,7 @@ from .security import (
     SecurityStatus,
     recommend_security_response,
 )
+from .store import SQLiteStore
 from .usage_limits import (
     LimitDecision,
     LimitKind,
@@ -98,6 +99,7 @@ __all__ = [
     "SecuritySignalType",
     "SecurityStatus",
     "recommend_security_response",
+    "SQLiteStore",
     "LimitDecision",
     "LimitKind",
     "LimitedWorkRequest",

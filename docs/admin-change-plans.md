@@ -44,3 +44,5 @@ Canceling a plan keeps the record visible but removes it from the pending author
 Live execution is currently limited to approved `user_service_restart` plans. Package installs, firewall rules, IP blocks, network exposure, and privilege changes remain blocked even if a plan is approved.
 
 Execution results are persisted and can be reviewed with `admin-executions` or the loopback API. Blocked execution attempts are also persisted so O'Brien and Sisko can see why a plan did not run.
+
+Every execution attempt also writes an audit event keyed to the admin plan. Completed executions use `executed`; blocked or failed attempts use `blocked` and cite the execution result id as evidence.

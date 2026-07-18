@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 from enum import StrEnum
 
+from .audit import AuditEvent, AuditEventType
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
@@ -341,6 +342,19 @@ def execute_admin_change_plan(
         summary="admin change completed and verified",
         command_results=command_results,
         verification_results=verification_results,
+    )
+
+
+def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecutionResult) -> AuditEvent:
+    event_type = AuditEventType.EXECUTED if result.status == AdminExecutionStatus.COMPLETED else AuditEventType.BLOCKED
+    return AuditEvent(
+        id=f"audit.{result.id}",
+        event_type=event_type,
+        owner_domain=plan.owner_domain,
+        subject_id=plan.id,
+        summary=result.summary,
+        risk_level=plan.risk_level,
+        evidence_ids=(result.id,),
     )
 
 

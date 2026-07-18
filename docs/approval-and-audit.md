@@ -32,6 +32,8 @@ An audit event should include:
 - evidence ids
 - timestamp when known
 
+Admin execution attempts must create audit events. Completed user-service restart executions record `executed`; blocked or failed execution attempts record `blocked`. The execution result id is stored as audit evidence so operators can jump from the event to command and verification output.
+
 ## Closure Gate
 
 High-risk or live-change workflows should not close until the related audit records include both decision evidence and verification evidence.

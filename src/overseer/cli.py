@@ -14,6 +14,7 @@ from .admin import (
     AdminExecutionResult,
     AdminExecutionStatus,
     approve_admin_change_plan,
+    audit_event_from_admin_execution,
     authorization_required_status,
     cancel_admin_change_plan,
     execute_admin_change_plan,
@@ -479,6 +480,7 @@ def execute_admin_change_status(store_path: str | Path, plan_id: str) -> dict[st
         plan = store.load_admin_change_plan(plan_id)
         result = execute_admin_change_plan(plan)
         store.save_admin_execution(result)
+        store.save_audit_event(audit_event_from_admin_execution(plan, result))
         return {"store": str(store.path), **admin_execution_status(result)}
     finally:
         store.close()

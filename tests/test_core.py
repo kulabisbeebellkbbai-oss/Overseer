@@ -83,6 +83,7 @@ from overseer import (
     seed_store_from_config,
     validate_config,
     approve_admin_change_plan,
+    audit_event_from_admin_execution,
     assess_host_security,
     execute_admin_change_plan,
     plan_apt_install,
@@ -1061,10 +1062,13 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
                 executed = client.execute_admin_change({"plan_id": "admin.restart.blocked"})
                 executions = client.admin_executions()
+                state = client.state()
 
             self.assertEqual(executed["status"], AdminExecutionStatus.BLOCKED.value)
             self.assertEqual(executions["execution_count"], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
+            self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)
+            self.assertEqual(state["audit_events"][0]["subject_id"], "admin.restart.blocked")
 
 
 class HostInspectionTests(unittest.TestCase):
@@ -1495,12 +1499,15 @@ class AdminChangePlanTests(unittest.TestCase):
                 ),
             )
             store.save_admin_execution(result)
+            store.save_audit_event(audit_event_from_admin_execution(plan, result))
             loaded = store.load_admin_execution(result.id)
             store.close()
             state = list_state_status(store_path)
 
         self.assertEqual(result.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(loaded.plan_id, "admin.restart.exec")
+        self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.EXECUTED.value)
+        self.assertEqual(state["audit_events"][0]["evidence_ids"], [result.id])
         self.assertEqual(state["admin_executions"][0]["status"], AdminExecutionStatus.COMPLETED.value)
 
     def test_unapproved_admin_change_execution_is_blocked(self):

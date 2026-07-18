@@ -12,8 +12,10 @@ The Overseer API is a loopback-only HTTP surface for local Codex threads and too
 ## Run
 
 ```bash
-PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 --host 127.0.0.1 --port 8766
+PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 --host 127.0.0.1 --port 8766 --auth-token-file state/api-token
 ```
+
+`GET /health` is always available for local service monitoring. All other endpoints require `Authorization: Bearer <token>` when `--auth-token-file` is configured.
 
 ## Read Endpoints
 
@@ -37,6 +39,12 @@ The approved local service is installed as:
 
 ```text
 /home/god/.config/systemd/user/overseer-api.service
+```
+
+The installed service reads its bearer token from an ignored local file:
+
+```text
+/home/god/.local/share/overseer/project/state/api-token
 ```
 
 Rollback:

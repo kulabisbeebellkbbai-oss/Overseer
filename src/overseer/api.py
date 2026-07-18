@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from .cli import (
@@ -20,13 +22,16 @@ from .cli import (
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
 
 
-def make_api_handler(store_path: str):
+def make_api_handler(store_path: str, auth_token: str | None = None):
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
 
         def do_GET(self) -> None:
             if self.path == "/health":
                 self._write_json({"ok": True, "service": "overseer-api"})
+                return
+            if not self._is_authorized():
+                self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
                 return
             if self.path == "/service-status":
                 self._handle(lambda: service_status(store_path))
@@ -40,6 +45,9 @@ def make_api_handler(store_path: str):
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
+            if not self._is_authorized():
+                self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                return
             if self.path == "/claims/request":
                 self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
                 return
@@ -56,6 +64,15 @@ def make_api_handler(store_path: str):
 
         def log_message(self, format: str, *args: object) -> None:
             return
+
+        def _is_authorized(self) -> bool:
+            if auth_token is None:
+                return True
+            header = self.headers.get("authorization", "")
+            prefix = "Bearer "
+            if not header.startswith(prefix):
+                return False
+            return secrets.compare_digest(header[len(prefix) :], auth_token)
 
         def _handle(self, handler) -> None:
             try:
@@ -95,14 +112,23 @@ def make_api_handler(store_path: str):
     return OverseerApiHandler
 
 
-def run_api_server(store_path: str, host: str = "127.0.0.1", port: int = 8766) -> None:
+def run_api_server(store_path: str, host: str = "127.0.0.1", port: int = 8766, auth_token: str | None = None) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
-    server = ThreadingHTTPServer((host, port), make_api_handler(store_path))
+    server = ThreadingHTTPServer((host, port), make_api_handler(store_path, auth_token))
     try:
         server.serve_forever()
     finally:
         server.server_close()
+
+
+def load_auth_token(token_file: str | None) -> str | None:
+    if token_file is None:
+        return None
+    token = Path(token_file).read_text(encoding="utf-8").strip()
+    if not token:
+        raise ValueError("auth token file is empty")
+    return token
 
 
 def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:

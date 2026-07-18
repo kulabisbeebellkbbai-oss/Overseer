@@ -4,6 +4,7 @@ import unittest
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from overseer import (
@@ -124,11 +125,12 @@ class LocalHttpServer:
 
 
 class LocalOverseerApiServer:
-    def __init__(self, store_path):
+    def __init__(self, store_path, auth_token=None):
         self.store_path = str(store_path)
+        self.auth_token = auth_token
 
     def __enter__(self):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(self.store_path))
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(self.store_path, self.auth_token))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
@@ -141,18 +143,25 @@ class LocalOverseerApiServer:
         self.thread.join(timeout=5)
 
     def get(self, path):
-        with urlopen(f"{self.url}{path}", timeout=5) as response:
+        request = Request(f"{self.url}{path}", headers=self._headers())
+        with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def post(self, path, payload):
         request = Request(
             f"{self.url}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers=self._headers({"content-type": "application/json"}),
             method="POST",
         )
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def _headers(self, headers=None):
+        merged = dict(headers or {})
+        if self.auth_token:
+            merged["authorization"] = f"Bearer {self.auth_token}"
+        return merged
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -708,6 +717,29 @@ class OverseerApiTests(unittest.TestCase):
     def test_api_rejects_non_loopback_bind(self):
         with self.assertRaises(ValueError):
             run_api_server("state/unused.sqlite3", host="0.0.0.0", port=8766)
+
+    def test_api_requires_bearer_token_when_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.secured",
+                    name="Secured API",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(f"{server.url}/state", timeout=5)
+                state = server.get("/state")
+
+            self.assertEqual(error.exception.code, 401)
+            self.assertEqual(state["resources"][0]["id"], "svc.secured")
 
 
 class PhysicalIdentityTests(unittest.TestCase):

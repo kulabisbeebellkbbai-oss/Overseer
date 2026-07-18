@@ -62,6 +62,7 @@ from overseer import (
     schedule_limited_work,
     schedule_usage_limited_work,
     seed_store_from_config,
+    validate_config,
 )
 from overseer.cli import demo_status
 from overseer.cli import persisted_demo_status
@@ -704,6 +705,13 @@ class ConfigLoadingTests(unittest.TestCase):
                         "risk_level": "high",
                         "identifiers": {"ports": [8795]},
                         "exclusive_groups": ["gateway"],
+                    },
+                    {
+                        "id": "svc.config",
+                        "name": "Configured Service",
+                        "type": "service",
+                        "owner_domain": "julian",
+                        "risk_level": "low",
                     }
                 ],
                 "usage_limits": [
@@ -724,6 +732,67 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(config.resources[0].owner_domain, OwnerDomain.DAX)
         self.assertEqual(config.resources[0].ports(), frozenset({8795}))
         self.assertEqual(config.usage_limits[0].remaining, 50)
+
+    def test_rejects_secret_like_config_keys(self):
+        with self.assertRaises(ValueError):
+            config_from_mapping(
+                {
+                    "resources": [
+                        {
+                            "id": "svc.secret",
+                            "name": "Secret Service",
+                            "type": "service",
+                            "owner_domain": "julian",
+                            "risk_level": "low",
+                            "identifiers": {"api_key": "not-allowed"},
+                        }
+                    ]
+                }
+            )
+
+    def test_rejects_usage_limit_for_unknown_resource(self):
+        with self.assertRaises(ValueError):
+            config_from_mapping(
+                {
+                    "usage_limits": [
+                        {
+                            "id": "limit.unknown",
+                            "resource_id": "svc.missing",
+                            "kind": "requests",
+                            "capacity": 10,
+                            "remaining": 1,
+                            "window": "hourly",
+                        }
+                    ]
+                }
+            )
+
+    def test_validate_config_rejects_remaining_above_capacity(self):
+        config = OverseerConfig(
+            resources=(
+                Resource(
+                    id="svc.limit",
+                    name="Limit Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                ),
+            ),
+            usage_limits=(
+                UsageLimit(
+                    id="limit.bad",
+                    resource_id="svc.limit",
+                    kind=LimitKind.REQUESTS,
+                    capacity=1,
+                    remaining=2,
+                    resets_at=None,
+                    window="hourly",
+                ),
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            validate_config(config)
 
 
 class ResourceRegistryTests(unittest.TestCase):

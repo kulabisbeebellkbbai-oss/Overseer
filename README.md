@@ -52,5 +52,6 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Local scheduler: `docs/scheduler.md`
 - JSON configuration loading: `docs/configuration.md`
 - Config seeding: `docs/config-seeding.md`
+- Config validation: `docs/config-validation.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

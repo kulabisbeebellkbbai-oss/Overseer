@@ -103,6 +103,7 @@ from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_executions_status
+from overseer.cli import admin_execution_readiness_status
 from overseer.cli import admin_summary_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
@@ -731,6 +732,58 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["executions"], 1)
         self.assertEqual(status["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
         self.assertEqual(status["latest_audit_events"][0]["subject_id"], "admin.restart.summary")
+
+    def test_admin_execution_readiness_explains_plan_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            restart = plan_admin_change_status(
+                store_path,
+                "admin.restart.ready",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+            approve_admin_change_status(store_path, restart["id"], "sisko")
+            block_plan = plan_admin_change_status(
+                store_path,
+                "admin.block.readiness",
+                AdminChangeKind.BLOCK_IP.value,
+                "8.8.8.8",
+                "block hostile source",
+                "not blocked",
+            )
+            ids_package = prepare_host_security_ids_review_package_status(
+                store_path,
+                block_plan["id"],
+                package_id="ids-review.admin.block.readiness",
+            )
+            submitted = submit_host_security_ids_review_package_status(
+                store_path,
+                ids_package["id"],
+                "odo",
+            )
+            record_host_security_ids_review_result_status(
+                store_path,
+                submitted["id"],
+                "accepted",
+                "approved staged block package",
+                "odo",
+            )
+            approve_admin_change_status(store_path, block_plan["id"], "sisko")
+
+            status = admin_execution_readiness_status(store_path)
+
+        restart_item = next(item for item in status["items"] if item["id"] == "admin.restart.ready")
+        block_item = next(item for item in status["items"] if item["id"] == "admin.block.readiness")
+        self.assertEqual(status["plans"], 2)
+        self.assertEqual(status["ready_for_overseer_execution"], 1)
+        self.assertEqual(status["manual_execution_required"], 1)
+        self.assertEqual(restart_item["readiness_state"], "ready_for_overseer_execution")
+        self.assertTrue(restart_item["live_execution_supported"])
+        self.assertEqual(block_item["readiness_state"], "manual_execution_required")
+        self.assertFalse(block_item["live_execution_supported"])
+        self.assertTrue(block_item["ids_review_gate_satisfied"])
 
     def test_usage_summary_reports_capacity_and_reset_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2154,11 +2207,13 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
                 executed = client.execute_admin_change({"plan_id": "admin.restart.blocked"})
                 executions = client.admin_executions()
+                readiness = client.admin_execution_readiness()
                 summary = client.admin_summary()
                 state = client.state()
 
             self.assertEqual(executed["status"], AdminExecutionStatus.BLOCKED.value)
             self.assertEqual(executions["execution_count"], 1)
+            self.assertEqual(readiness["items"][0]["readiness_state"], "approval_required")
             self.assertEqual(summary["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
             self.assertEqual(executions["executions"][0]["plan_id"], "admin.restart.blocked")
             self.assertEqual(state["audit_events"][0]["event_type"], AuditEventType.BLOCKED.value)

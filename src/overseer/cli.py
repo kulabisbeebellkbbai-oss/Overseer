@@ -1879,6 +1879,114 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plans = store.list_admin_change_plans()
+        executions_by_plan = {result.plan_id: result for result in store.list_admin_executions()}
+        packages_by_plan = {
+            plan.id: store.list_host_security_ids_review_packages_for_plan(plan.id)
+            for plan in plans
+        }
+        items = [
+            admin_change_execution_readiness_status(
+                plan,
+                packages_by_plan[plan.id],
+                executions_by_plan.get(plan.id),
+            )
+            for plan in plans
+        ]
+        return {
+            "store": str(store.path),
+            "plans": len(plans),
+            "ready_for_overseer_execution": sum(1 for item in items if item["readiness_state"] == "ready_for_overseer_execution"),
+            "completed": sum(1 for item in items if item["readiness_state"] == "completed"),
+            "failed": sum(1 for item in items if item["readiness_state"] == "failed"),
+            "manual_execution_required": sum(1 for item in items if item["readiness_state"] == "manual_execution_required"),
+            "approval_required": sum(1 for item in items if item["readiness_state"] == "approval_required"),
+            "ids_review_blocked": sum(1 for item in items if item["readiness_state"] == "ids_review_blocked"),
+            "incomplete": sum(1 for item in items if item["readiness_state"] == "incomplete"),
+            "canceled": sum(1 for item in items if item["readiness_state"] == "canceled"),
+            "by_kind": {
+                kind.value: sum(1 for plan in plans if plan.kind == kind)
+                for kind in AdminChangeKind
+            },
+            "items": items,
+        }
+    finally:
+        store.close()
+
+
+def admin_change_execution_readiness_status(
+    plan: AdminChangePlan,
+    ids_review_packages: Sequence[HostSecurityIDSReviewPackage] = (),
+    latest_execution: AdminExecutionResult | None = None,
+) -> dict[str, object]:
+    missing_fields = missing_admin_change_fields(plan)
+    ids_review_required = admin_plan_requires_ids_review(plan)
+    ids_review_gate_satisfied = (
+        not ids_review_required
+        or any(package.satisfies_pre_execution_review_gate() for package in ids_review_packages)
+    )
+    live_execution_supported = plan.kind == AdminChangeKind.USER_SERVICE_RESTART
+    readiness_state, next_step = _admin_execution_readiness_state(
+        plan,
+        missing_fields,
+        ids_review_required,
+        ids_review_gate_satisfied,
+        live_execution_supported,
+        latest_execution,
+    )
+    return {
+        "id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "owner_domain": OwnerDomain(plan.owner_domain).value,
+        "risk_level": RiskLevel(plan.risk_level).value,
+        "approval_level": ApprovalLevel(plan.approval_level).value,
+        "approved": plan.approved,
+        "canceled": plan.canceled,
+        "requires_explicit_approval": plan.requires_explicit_approval(),
+        "can_execute_model": plan.can_execute(),
+        "live_execution_supported": live_execution_supported,
+        "ready_for_overseer_execution": readiness_state == "ready_for_overseer_execution",
+        "readiness_state": readiness_state,
+        "next_step": next_step,
+        "missing_fields": list(missing_fields),
+        "ids_review_required_before_approval": ids_review_required,
+        "ids_review_gate_satisfied": ids_review_gate_satisfied,
+        "ids_review_package_count": len(ids_review_packages),
+        "latest_execution_id": latest_execution.id if latest_execution else None,
+        "latest_execution_status": AdminExecutionStatus(latest_execution.status).value if latest_execution else None,
+        "reason": plan.reason,
+    }
+
+
+def _admin_execution_readiness_state(
+    plan: AdminChangePlan,
+    missing_fields: Sequence[str],
+    ids_review_required: bool,
+    ids_review_gate_satisfied: bool,
+    live_execution_supported: bool,
+    latest_execution: AdminExecutionResult | None,
+) -> tuple[str, str]:
+    if latest_execution is not None and latest_execution.status == AdminExecutionStatus.COMPLETED:
+        return "completed", "plan already completed and verified"
+    if latest_execution is not None and latest_execution.status == AdminExecutionStatus.FAILED:
+        return "failed", "inspect failed execution evidence before retrying or replacing the plan"
+    if plan.canceled:
+        return "canceled", "plan is canceled; create a new admin change plan if the work is still needed"
+    if missing_fields:
+        return "incomplete", "complete missing plan fields before approval or execution"
+    if ids_review_required and not ids_review_gate_satisfied:
+        return "ids_review_blocked", "complete accepted IDS/firewall advisory review before approval or execution"
+    if plan.requires_explicit_approval() and not plan.approved:
+        return "approval_required", "request explicit approval before execution"
+    if not live_execution_supported:
+        return "manual_execution_required", "manual execution is required; Overseer live execution currently supports user service restarts"
+    return "ready_for_overseer_execution", "execute approved plan through Overseer"
+
+
 def approve_admin_change_status(
     store_path: str | Path,
     plan_id: str,
@@ -2585,6 +2693,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_summary_parser = subparsers.add_parser("admin-summary", help="summarize admin plans, execution results, and audit events")
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
+    admin_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -2909,6 +3019,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-summary":
         print(json.dumps(admin_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-execution-readiness":
+        print(json.dumps(admin_execution_readiness_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

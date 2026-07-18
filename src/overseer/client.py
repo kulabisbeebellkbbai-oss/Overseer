@@ -149,6 +149,9 @@ class OverseerApiClient:
     def admin_executions(self) -> dict[str, Any]:
         return self._get("/admin/executions")
 
+    def admin_execution_readiness(self) -> dict[str, Any]:
+        return self._get("/admin/execution-readiness")
+
     def admin_summary(self) -> dict[str, Any]:
         return self._get("/admin/summary")
 

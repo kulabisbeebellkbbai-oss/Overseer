@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from .cli import (
     activate_claim_status,
     admin_executions_status,
+    admin_execution_readiness_status,
     admin_summary_status,
     assess_host_security_status,
     approve_admin_change_status,
@@ -135,6 +136,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/admin/executions":
                 self._handle(lambda: admin_executions_status(store_path))
+                return
+            if path == "/admin/execution-readiness":
+                self._handle(lambda: admin_execution_readiness_status(store_path))
                 return
             if path == "/admin/summary":
                 self._handle(lambda: admin_summary_status(store_path))

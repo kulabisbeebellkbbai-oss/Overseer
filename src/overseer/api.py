@@ -26,6 +26,7 @@ from .cli import (
     inspect_host_status,
     list_state_status,
     maintenance_summary_status,
+    operator_dashboard_status,
     physical_summary_status,
     plan_admin_change_status,
     release_claim_status,
@@ -59,6 +60,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/command-summary":
                 self._handle(lambda: command_summary_status(store_path))
+                return
+            if self.path == "/operator-dashboard":
+                self._handle(lambda: operator_dashboard_status(store_path))
                 return
             if self.path == "/maintenance-summary":
                 self._handle(lambda: maintenance_summary_status(store_path))

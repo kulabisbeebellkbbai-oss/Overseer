@@ -713,6 +713,143 @@ def health_failure_status(summary) -> dict[str, object]:
     }
 
 
+def operator_dashboard_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+    command = command_summary_status(store_path, service_name)
+    physical = physical_summary_status(store_path)
+    virtual = virtual_summary_status(store_path)
+    maintenance = maintenance_summary_status(store_path)
+    security = security_summary_status(store_path)
+    usage = usage_summary_status(store_path)
+    health = health_summary_status(store_path)
+    health_efficiency = health_efficiency_summary_status(store_path)
+    attention = operator_dashboard_attention(command, physical, virtual, maintenance, security, usage, health_efficiency)
+    return {
+        "store": command["store"],
+        "service_name": service_name,
+        "overall_status": operator_dashboard_overall_status(attention),
+        "attention": attention,
+        "role_focus": {
+            "sisko": {
+                "pending_authorizations": attention["pending_authorizations"],
+                "queued_claims": attention["queued_claims"],
+                "blocked_claims": attention["blocked_claims"],
+                "service_freshness": attention["service_freshness"],
+            },
+            "kira": {
+                "assets": physical["assets"],
+                "power_risk": attention["physical_power_risk"],
+                "storage_risk": attention["physical_storage_risk"],
+            },
+            "obrien": {
+                "plans": maintenance["plans"],
+                "pending_authorizations": attention["maintenance_pending_authorizations"],
+                "executable_plans": maintenance["executable_plans"],
+            },
+            "odo": {
+                "alerts": attention["security_alerts"],
+                "high_findings": attention["high_security_findings"],
+                "pending_protective_authorizations": attention["security_pending_authorizations"],
+            },
+            "quark": {
+                "limits": usage["limits"],
+                "exhausted": attention["exhausted_usage_limits"],
+                "next_reset_at": usage["next_reset_at"],
+            },
+            "dax": {
+                "assets": virtual["assets"],
+                "active_claims": attention["virtual_active_claims"],
+                "queued_claims": attention["virtual_queued_claims"],
+            },
+            "julian": {
+                "targets": health_efficiency["targets"],
+                "unhealthy": attention["unhealthy_health_targets"],
+                "recovery_required": attention["recovery_required"],
+                "latest_failures": attention["latest_failures"],
+            },
+        },
+        "summaries": {
+            "command": command,
+            "physical": physical,
+            "virtual": virtual,
+            "maintenance": maintenance,
+            "security": security,
+            "usage": usage,
+            "health": health,
+            "health_efficiency": health_efficiency,
+        },
+    }
+
+
+def operator_dashboard_attention(
+    command: dict[str, object],
+    physical: dict[str, object],
+    virtual: dict[str, object],
+    maintenance: dict[str, object],
+    security: dict[str, object],
+    usage: dict[str, object],
+    health_efficiency: dict[str, object],
+) -> dict[str, object]:
+    service = command["service"]
+    claims = command["claims"]
+    admin = command["admin"]
+    freshness = service["freshness"]
+    protective_plans = security["protective_plans"]
+    host_security = security["host_security"]
+    return {
+        "service_freshness": freshness["status"],
+        "pending_authorizations": admin["pending_authorizations"],
+        "pending_claim_approvals": claims["pending_approvals"],
+        "queued_claims": claims["queued"],
+        "blocked_claims": claims["blocked"],
+        "unhealthy_health_targets": health_efficiency["unhealthy"],
+        "recovery_required": health_efficiency["recovery_required"],
+        "latest_failures": len(health_efficiency["latest_failures"]),
+        "exhausted_usage_limits": usage["exhausted"],
+        "low_confidence_usage_limits": usage["low_confidence"],
+        "physical_power_risk": physical["power_risk"],
+        "physical_storage_risk": physical["storage_risk"],
+        "virtual_active_claims": virtual["active_claims"],
+        "virtual_queued_claims": virtual["queued_claims"],
+        "maintenance_pending_authorizations": maintenance["pending_authorizations"],
+        "security_alerts": security["alerts"],
+        "security_pending_authorizations": protective_plans["pending_authorizations"],
+        "high_security_findings": host_security["high_findings"],
+        "warning_security_findings": host_security["warning_findings"],
+    }
+
+
+def operator_dashboard_overall_status(attention: dict[str, object]) -> str:
+    high_keys = (
+        "pending_authorizations",
+        "blocked_claims",
+        "unhealthy_health_targets",
+        "recovery_required",
+        "security_alerts",
+        "security_pending_authorizations",
+        "high_security_findings",
+    )
+    warning_keys = (
+        "pending_claim_approvals",
+        "queued_claims",
+        "exhausted_usage_limits",
+        "low_confidence_usage_limits",
+        "physical_power_risk",
+        "physical_storage_risk",
+        "virtual_queued_claims",
+        "maintenance_pending_authorizations",
+        "warning_security_findings",
+    )
+    if attention["service_freshness"] in {FreshnessStatus.HIGH.value, FreshnessStatus.MISSING.value}:
+        return "attention_required"
+    if any(attention[key] for key in high_keys):
+        return "attention_required"
+    if attention["service_freshness"] == FreshnessStatus.WARNING.value:
+        return "warning"
+    if any(attention[key] for key in warning_keys):
+        return "warning"
+    return "nominal"
+
+
 def run_status(
     store_path: str | Path,
     once: bool,
@@ -1444,6 +1581,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     command_summary_parser = subparsers.add_parser("command-summary", help="summarize command-level Overseer state")
     command_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     command_summary_parser.add_argument("--service-name", default="overseer")
+    operator_dashboard_parser = subparsers.add_parser("operator-dashboard", help="summarize all Overseer operator domains")
+    operator_dashboard_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    operator_dashboard_parser.add_argument("--service-name", default="overseer")
     maintenance_summary_parser = subparsers.add_parser("maintenance-summary", help="summarize maintenance and update plans")
     maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     security_summary_parser = subparsers.add_parser("security-summary", help="summarize security surfaces and alerts")
@@ -1582,6 +1722,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "command-summary":
         print(json.dumps(command_summary_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "operator-dashboard":
+        print(json.dumps(operator_dashboard_status(args.store, args.service_name), sort_keys=True))
         return 0
 
     if args.command == "maintenance-summary":

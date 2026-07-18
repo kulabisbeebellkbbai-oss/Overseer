@@ -115,6 +115,7 @@ from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
 from overseer.cli import maintenance_summary_status
+from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
 from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
@@ -1181,6 +1182,99 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(mcp_failure["error"], "connection refused")
         self.assertTrue(mcp_failure["recovery_required"])
 
+    def test_operator_dashboard_rolls_up_domain_attention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.dashboard",
+                    name="Dashboard Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.HIGH,
+                    identifiers={"kind": "gateway", "ports": [8766]},
+                )
+            )
+            store.save_resource(
+                Resource(
+                    id="security.dashboard",
+                    name="Dashboard Security Surface",
+                    type=ResourceType.SECURITY_SURFACE,
+                    owner_domain=OwnerDomain.ODO,
+                    risk_level=RiskLevel.CRITICAL,
+                )
+            )
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.dashboard",
+                    resource_id="svc.limited",
+                    kind=LimitKind.REQUESTS,
+                    capacity=10,
+                    remaining=0,
+                    resets_at="2026-07-18T19:00:00+00:00",
+                    window="hourly",
+                    observed_at="2026-07-18T18:00:00+00:00",
+                )
+            )
+            store.save_health_target(
+                HealthTarget(
+                    id="health.dashboard",
+                    resource_id="svc.dashboard",
+                    name="Dashboard Health",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8766/state",
+                    owner_domain=OwnerDomain.JULIAN,
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.dashboard.failed",
+                    resource_id="svc.dashboard",
+                    target="http://127.0.0.1:8766/state",
+                    probe_type=ProbeType.JSON,
+                    observed_status=HealthStatus.FAILED,
+                    owner_domain=OwnerDomain.JULIAN,
+                    observed_error="json parse failed",
+                    recovery_required=True,
+                    captured_at="2026-07-18T18:00:00+00:00",
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.dashboard",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="security.dashboard",
+                    summary="dashboard alert",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store.save_admin_change_plan(
+                plan_block_ip(
+                    "admin.block.dashboard",
+                    "203.0.113.20",
+                    "block dashboard test source",
+                    "not blocked",
+                )
+            )
+            store.close()
+
+            status = operator_dashboard_status(store_path)
+
+        self.assertEqual(status["overall_status"], "attention_required")
+        self.assertEqual(status["attention"]["unhealthy_health_targets"], 1)
+        self.assertEqual(status["attention"]["recovery_required"], 1)
+        self.assertEqual(status["attention"]["exhausted_usage_limits"], 1)
+        self.assertEqual(status["attention"]["security_alerts"], 1)
+        self.assertEqual(status["attention"]["security_pending_authorizations"], 1)
+        self.assertEqual(status["role_focus"]["sisko"]["pending_authorizations"], 1)
+        self.assertEqual(status["role_focus"]["odo"]["alerts"], 1)
+        self.assertEqual(status["role_focus"]["quark"]["exhausted"], 1)
+        self.assertEqual(status["role_focus"]["julian"]["latest_failures"], 1)
+        self.assertIn("command", status["summaries"])
+        self.assertIn("health_efficiency", status["summaries"])
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1506,6 +1600,29 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["resources"]["total"], 1)
             self.assertEqual(status["resources"]["by_owner"][OwnerDomain.JULIAN.value], 1)
+
+    def test_client_reads_operator_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.dashboard.client",
+                    name="Dashboard Client Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.operator_dashboard()
+
+            self.assertEqual(status["service_name"], "overseer")
+            self.assertIn(status["overall_status"], {"nominal", "warning", "attention_required"})
+            self.assertEqual(status["summaries"]["command"]["resources"]["total"], 1)
 
     def test_client_reads_maintenance_summary(self):
         with tempfile.TemporaryDirectory() as directory:

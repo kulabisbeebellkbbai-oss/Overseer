@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .config import load_config, seed_store_from_config
-from .core import Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
+from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .health import HealthTarget, ProbeType
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
@@ -283,6 +283,16 @@ def activate_claim_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
+        decision = store.load_decision(claim_id)
+        approval_level = ApprovalLevel(decision.approval_level)
+        if approval_level != ApprovalLevel.NONE:
+            if approval_id is None:
+                raise ValueError(f"claim requires {approval_level.value} approval before activation")
+            approval = store.load_approval(approval_id)
+            if approval.subject_id != claim_id:
+                raise ValueError("approval subject does not match claim")
+            if not approval.can_execute():
+                raise ValueError("approval is not approved")
         coordinator = coordinator_from_store(store)
         record = coordinator.activate_claim(claim_id, approval_id)
         return {
@@ -293,6 +303,28 @@ def activate_claim_status(
             "approval": record.decision.approval_level.value,
             "blocking_claim_ids": list(record.decision.blocking_claim_ids),
             "reason": record.decision.reason,
+        }
+    finally:
+        store.close()
+
+
+def approve_claim_status(
+    store_path: str | Path,
+    approval_id: str,
+    decided_by: str,
+    decided_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        coordinator = coordinator_from_store(store)
+        result = coordinator.approve_request(approval_id, decided_by, decided_at)
+        return {
+            "store": str(store.path),
+            "approval_id": result.approval.id,
+            "subject_id": result.approval.subject_id,
+            "approval_status": result.approval.status.value,
+            "decided_by": result.approval.decided_by,
+            "audit_event": result.audit_event.id,
         }
     finally:
         store.close()
@@ -355,6 +387,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     activate_parser.add_argument("--claim-id", required=True)
     activate_parser.add_argument("--approval-id")
+    approve_parser = subparsers.add_parser("approve-claim", help="approve a stored approval request")
+    approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    approve_parser.add_argument("--approval-id", required=True)
+    approve_parser.add_argument("--decided-by", required=True)
+    approve_parser.add_argument("--decided-at")
     release_parser = subparsers.add_parser("release-claim", help="release a stored claim")
     release_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     release_parser.add_argument("--claim-id", required=True)
@@ -421,6 +458,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "activate-claim":
         print(json.dumps(activate_claim_status(args.store, args.claim_id, args.approval_id), sort_keys=True))
+        return 0
+
+    if args.command == "approve-claim":
+        print(json.dumps(approve_claim_status(args.store, args.approval_id, args.decided_by, args.decided_at), sort_keys=True))
         return 0
 
     if args.command == "release-claim":

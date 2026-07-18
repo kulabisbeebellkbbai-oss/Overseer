@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .audit import ApprovalRequest, AuditEvent, approval_from_decision, audit_event_from_decision
-from .core import Claim, ClaimStatus, Resource
+from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType, approval_from_decision, audit_event_from_decision
+from .core import ApprovalLevel, Claim, ClaimStatus, Resource, RiskLevel
 from .registry import ClaimRecord, ResourceRegistry
 from .store import SQLiteStore
 
@@ -14,6 +14,12 @@ from .store import SQLiteStore
 class CoordinationResult:
     record: ClaimRecord
     approval: ApprovalRequest | None
+    audit_event: AuditEvent
+
+
+@dataclass(frozen=True)
+class ApprovalDecisionResult:
+    approval: ApprovalRequest
     audit_event: AuditEvent
 
 
@@ -61,6 +67,40 @@ class OverseerCoordinator:
             self.store.save_claim(released)
             self.store.save_resource(self.registry.get_resource(released.resource_id))
         return released
+
+    def approve_request(
+        self,
+        approval_id: str,
+        decided_by: str,
+        decided_at: str | None = None,
+    ) -> ApprovalDecisionResult:
+        if self.store is None:
+            raise ValueError("approval decisions require a store")
+        current = self.store.load_approval(approval_id)
+        approved = replace(
+            current,
+            status=ApprovalStatus.APPROVED,
+            decided_by=decided_by,
+            decided_at=decided_at,
+        )
+        risk_level = RiskLevel.LOW
+        try:
+            risk_level = self.store.load_claim(approved.subject_id).risk_level
+        except KeyError:
+            pass
+        approval_level = ApprovalLevel(approved.approval_level)
+        event = AuditEvent(
+            id=f"audit.{approval_id}.approved",
+            event_type=AuditEventType.APPROVED,
+            owner_domain=approved.owner_domain,
+            subject_id=approved.subject_id,
+            summary=f"{approval_level.value} approval granted",
+            risk_level=risk_level,
+            evidence_ids=(approval_id,),
+        )
+        self.store.save_approval(approved)
+        self.store.save_audit_event(event)
+        return ApprovalDecisionResult(approved, event)
 
     def _persist_result(
         self,

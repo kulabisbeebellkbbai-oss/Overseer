@@ -73,6 +73,7 @@ from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
+from overseer.cli import approve_claim_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
@@ -1423,7 +1424,8 @@ class RuntimeTests(unittest.TestCase):
                 "bind proxy",
                 RiskLevel.LOW.value,
             )
-            activated = activate_claim_status(store_path, first["claim"], "approval.role")
+            approval = approve_claim_status(store_path, first["approval_id"], "sisko")
+            activated = activate_claim_status(store_path, first["claim"], approval["approval_id"])
             second = request_claim_status(
                 store_path,
                 "claim.cli.second",
@@ -1437,9 +1439,40 @@ class RuntimeTests(unittest.TestCase):
             )
 
             self.assertEqual(first["claim_status"], ClaimStatus.REQUESTED.value)
+            self.assertEqual(approval["approval_status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(activated["claim_status"], ClaimStatus.ACTIVE.value)
             self.assertEqual(second["claim_status"], ClaimStatus.QUEUED.value)
             self.assertEqual(second["blocking_claim_ids"], ["claim.cli.first"])
+
+    def test_activate_claim_status_requires_approved_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.approval.cli",
+                    name="Approval CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            requested = request_claim_status(
+                store_path,
+                "claim.cli.approval",
+                "proxy.approval.cli",
+                ClaimType.LEASE.value,
+                "thread-a",
+                OwnerDomain.DAX.value,
+                "use proxy",
+                "bind proxy",
+                RiskLevel.LOW.value,
+            )
+
+            with self.assertRaises(ValueError):
+                activate_claim_status(store_path, requested["claim"], requested["approval_id"])
 
     def test_release_claim_status_clears_stored_resource_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1467,7 +1500,8 @@ class RuntimeTests(unittest.TestCase):
                 "bind gateway",
                 RiskLevel.LOW.value,
             )
-            activate_claim_status(store_path, requested["claim"], "approval.role")
+            approval = approve_claim_status(store_path, requested["approval_id"], "sisko")
+            activate_claim_status(store_path, requested["claim"], approval["approval_id"])
             released = release_claim_status(store_path, requested["claim"])
             store = SQLiteStore(store_path)
 

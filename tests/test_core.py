@@ -1097,6 +1097,11 @@ class HealthSummaryTests(unittest.TestCase):
                 )
             )
             store.close()
+            prepare_host_security_ids_review_package_status(
+                store_path,
+                "admin.block.security",
+                package_id="ids-review.admin.block.security",
+            )
 
             status = security_summary_status(store_path)
 
@@ -1107,6 +1112,9 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["protective_plans"]["total"], 1)
         self.assertEqual(status["protective_plans"]["pending_authorizations"], 1)
         self.assertEqual(status["protective_plans"]["by_kind"][AdminChangeKind.BLOCK_IP.value], 1)
+        self.assertEqual(status["ids_review"]["package_count"], 1)
+        self.assertEqual(status["ids_review"]["gate_blocked"], 1)
+        self.assertEqual(status["ids_review"]["packages"][0]["next_step"], "export IDS/firewall review prompt and submit package before approval")
         self.assertEqual(status["surfaces"][0]["id"], "security.firewall")
         self.assertEqual(status["events"][0]["id"], "alert.security")
 
@@ -1276,6 +1284,11 @@ class HealthSummaryTests(unittest.TestCase):
                 )
             )
             store.close()
+            prepare_host_security_ids_review_package_status(
+                store_path,
+                "admin.block.dashboard",
+                package_id="ids-review.admin.block.dashboard",
+            )
 
             status = operator_dashboard_status(store_path)
 
@@ -1285,8 +1298,10 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["attention"]["exhausted_usage_limits"], 1)
         self.assertEqual(status["attention"]["security_alerts"], 1)
         self.assertEqual(status["attention"]["security_pending_authorizations"], 1)
+        self.assertEqual(status["attention"]["security_ids_review_gate_blocked"], 1)
         self.assertEqual(status["role_focus"]["sisko"]["pending_authorizations"], 1)
         self.assertEqual(status["role_focus"]["odo"]["alerts"], 1)
+        self.assertEqual(status["role_focus"]["odo"]["ids_review_gate_blocked"], 1)
         self.assertEqual(status["role_focus"]["quark"]["exhausted"], 1)
         self.assertEqual(status["role_focus"]["julian"]["latest_failures"], 1)
         self.assertIn("command", status["summaries"])

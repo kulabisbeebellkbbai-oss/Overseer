@@ -75,12 +75,12 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, and recent admin audit events.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
-`GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
+`GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 `GET /audit-summary` returns persisted audit events with optional `event_type`, `owner`, and `subject_prefix` query filters.
-`GET /security-summary` returns Odo's compact view of security surfaces, alert audit events, latest host security findings, and protective firewall/block plans.
+`GET /security-summary` returns Odo's compact view of security surfaces, alert audit events, latest host security findings, protective firewall/block plans, and IDS review gates.
 `GET /host/security/findings` returns Odo's detailed host-security finding list, severity counts, evidence lines, and recommended actions from the latest persisted host snapshot.
 `GET /host/security/triage` groups Odo's host-security findings by listener, bind scope, severity, evidence, and read-only mitigation path. It does not change firewall, route, IDS, or service-bind state.
 `GET /host/security/sources` correlates established TCP remote sources to triaged listeners and reports source scope. It is evidence only; it does not declare a source hostile or change firewall, IDS, route, or service-bind state.

@@ -585,7 +585,8 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         resources = [resource for resource in store.list_resources() if resource.type == ResourceType.SECURITY_SURFACE]
-        alerts = [event for event in store.list_audit_events() if event.event_type == AuditEventType.ALERT]
+        audit_events = store.list_audit_events()
+        alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
         snapshots = store.list_host_snapshots()
         latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
         host_security = host_security_status(latest_snapshot) if latest_snapshot else None
@@ -630,6 +631,11 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
                 },
                 "items": [security_plan_status(plan) for plan in plans],
             },
+            "ids_review": _host_security_ids_review_summary_payload(
+                store.path,
+                store.list_host_security_ids_review_packages(),
+                audit_events,
+            ),
             "surfaces": [security_surface_status(resource) for resource in resources],
             "events": [audit_event_status(event) for event in alerts],
         }
@@ -762,6 +768,8 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
                 "alerts": attention["security_alerts"],
                 "high_findings": attention["high_security_findings"],
                 "pending_protective_authorizations": attention["security_pending_authorizations"],
+                "ids_review_gate_blocked": attention["security_ids_review_gate_blocked"],
+                "ids_review_revision_required": attention["security_ids_review_revision_required"],
             },
             "quark": {
                 "limits": usage["limits"],
@@ -808,6 +816,7 @@ def operator_dashboard_attention(
     freshness = service["freshness"]
     protective_plans = security["protective_plans"]
     host_security = security["host_security"]
+    ids_review = security["ids_review"]
     return {
         "service_freshness": freshness["status"],
         "pending_authorizations": admin["pending_authorizations"],
@@ -826,6 +835,9 @@ def operator_dashboard_attention(
         "maintenance_pending_authorizations": maintenance["pending_authorizations"],
         "security_alerts": security["alerts"],
         "security_pending_authorizations": protective_plans["pending_authorizations"],
+        "security_ids_review_gate_blocked": ids_review["gate_blocked"],
+        "security_ids_review_revision_required": ids_review["revision_required"],
+        "security_ids_review_submitted_without_result": ids_review["submitted_without_result"],
         "high_security_findings": host_security["high_findings"],
         "warning_security_findings": host_security["warning_findings"],
     }
@@ -839,6 +851,8 @@ def operator_dashboard_overall_status(attention: dict[str, object]) -> str:
         "recovery_required",
         "security_alerts",
         "security_pending_authorizations",
+        "security_ids_review_gate_blocked",
+        "security_ids_review_revision_required",
         "high_security_findings",
     )
     warning_keys = (
@@ -850,6 +864,7 @@ def operator_dashboard_overall_status(attention: dict[str, object]) -> str:
         "physical_storage_risk",
         "virtual_queued_claims",
         "maintenance_pending_authorizations",
+        "security_ids_review_submitted_without_result",
         "warning_security_findings",
     )
     if attention["service_freshness"] in {FreshnessStatus.HIGH.value, FreshnessStatus.MISSING.value}:
@@ -1539,46 +1554,57 @@ def host_security_ids_review_packages_status(store_path: str | Path) -> dict[str
 def host_security_ids_review_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        packages = store.list_host_security_ids_review_packages()
-        audit_events = [
-            event
-            for event in store.list_audit_events()
-            if event.id.startswith("audit.ids-review.") or event.subject_id.startswith("ids-review.")
-        ]
-        return {
-            "store": str(store.path),
-            "package_count": len(packages),
-            "by_status": {
-                status.value: sum(1 for package in packages if package.status == status)
-                for status in IDSReviewPackageStatus
-            },
-            "gate_satisfied": sum(1 for package in packages if package.satisfies_pre_execution_review_gate()),
-            "gate_blocked": sum(1 for package in packages if not package.satisfies_pre_execution_review_gate()),
-            "prepared_without_prompt": sum(
-                1
-                for package in packages
-                if package.status == IDSReviewPackageStatus.PREPARED and not package.prompt_path
-            ),
-            "prepared_with_prompt": sum(
-                1
-                for package in packages
-                if package.status == IDSReviewPackageStatus.PREPARED and package.prompt_path
-            ),
-            "submitted_without_result": sum(
-                1
-                for package in packages
-                if package.status == IDSReviewPackageStatus.SUBMITTED and not package.advisory_result
-            ),
-            "revision_required": sum(
-                1
-                for package in packages
-                if package.status == IDSReviewPackageStatus.REVISION_REQUIRED
-            ),
-            "latest_audit_events": [audit_event_status(event) for event in audit_events[:5]],
-            "packages": [_host_security_ids_review_package_summary_status(package) for package in packages],
-        }
+        return _host_security_ids_review_summary_payload(
+            store.path,
+            store.list_host_security_ids_review_packages(),
+            store.list_audit_events(),
+        )
     finally:
         store.close()
+
+
+def _host_security_ids_review_summary_payload(
+    store_path: Path,
+    packages: Sequence[HostSecurityIDSReviewPackage],
+    audit_events: Sequence[AuditEvent],
+) -> dict[str, object]:
+    ids_audit_events = [
+        event
+        for event in audit_events
+        if event.id.startswith("audit.ids-review.") or event.subject_id.startswith("ids-review.")
+    ]
+    return {
+        "store": str(store_path),
+        "package_count": len(packages),
+        "by_status": {
+            status.value: sum(1 for package in packages if package.status == status)
+            for status in IDSReviewPackageStatus
+        },
+        "gate_satisfied": sum(1 for package in packages if package.satisfies_pre_execution_review_gate()),
+        "gate_blocked": sum(1 for package in packages if not package.satisfies_pre_execution_review_gate()),
+        "prepared_without_prompt": sum(
+            1
+            for package in packages
+            if package.status == IDSReviewPackageStatus.PREPARED and not package.prompt_path
+        ),
+        "prepared_with_prompt": sum(
+            1
+            for package in packages
+            if package.status == IDSReviewPackageStatus.PREPARED and package.prompt_path
+        ),
+        "submitted_without_result": sum(
+            1
+            for package in packages
+            if package.status == IDSReviewPackageStatus.SUBMITTED and not package.advisory_result
+        ),
+        "revision_required": sum(
+            1
+            for package in packages
+            if package.status == IDSReviewPackageStatus.REVISION_REQUIRED
+        ),
+        "latest_audit_events": [audit_event_status(event) for event in ids_audit_events[:5]],
+        "packages": [_host_security_ids_review_package_summary_status(package) for package in packages],
+    }
 
 
 def _host_security_ids_review_package_summary_status(package: HostSecurityIDSReviewPackage) -> dict[str, object]:

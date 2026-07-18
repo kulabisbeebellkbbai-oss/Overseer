@@ -23,6 +23,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /service-status`
 - `GET /health-summary`
 - `GET /host/security`
+- `GET /admin/authorizations-required`
 - `GET /state`
 
 ## Claim Endpoints
@@ -33,11 +34,13 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/release`
 - `POST /host/inspect`
 - `POST /admin/plans`
+- `POST /admin/approve`
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
 `POST /host/inspect` captures read-only host evidence and persists it to the API store.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
+`POST /admin/approve` records approval metadata for a stored plan without executing it.
 
 ## Python Client
 
@@ -57,6 +60,8 @@ plan = client.plan_admin_change(
         "reason": "reload approved code",
     }
 )
+pending = client.authorizations_required()
+approved = client.approve_admin_change({"plan_id": "admin.restart.overseer-api", "approved_by": "sisko"})
 ```
 
 ## Installed User Service

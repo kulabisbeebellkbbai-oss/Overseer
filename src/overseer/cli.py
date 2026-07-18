@@ -10,6 +10,8 @@ from pathlib import Path
 from .admin import (
     AdminChangeKind,
     AdminChangePlan,
+    approve_admin_change_plan,
+    authorization_required_status,
     missing_admin_change_fields,
     plan_apt_install,
     plan_block_ip,
@@ -315,6 +317,8 @@ def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
         "proposed_state": plan.proposed_state,
         "requires_explicit_approval": plan.requires_explicit_approval(),
         "approved": plan.approved,
+        "approved_by": plan.approved_by,
+        "approved_at": plan.approved_at,
         "can_execute": plan.can_execute(),
         "missing_fields": list(missing_admin_change_fields(plan)),
         "steps": [_admin_command_status(step) for step in plan.steps],
@@ -354,6 +358,40 @@ def plan_admin_change_status(
     try:
         store.save_admin_change_plan(plan)
         return {"store": str(store.path), **status}
+    finally:
+        store.close()
+
+
+def approve_admin_change_status(
+    store_path: str | Path,
+    plan_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        approved = approve_admin_change_plan(plan, approved_by, approved_at)
+        store.save_admin_change_plan(approved)
+        return {"store": str(store.path), **admin_change_plan_status(approved)}
+    finally:
+        store.close()
+
+
+def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plans = store.list_admin_change_plans()
+        pending = [
+            authorization_required_status(plan)
+            for plan in plans
+            if plan.requires_explicit_approval() and not plan.approved
+        ]
+        return {
+            "store": str(store.path),
+            "pending": pending,
+            "pending_count": len(pending),
+        }
     finally:
         store.close()
 
@@ -681,6 +719,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--current-state", default="unknown")
     admin_plan_parser.add_argument("--package", action="append", default=())
     admin_plan_parser.add_argument("--port", type=int)
+    auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
+    auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    approve_admin_parser = subparsers.add_parser("approve-admin-change", help="record approval metadata for an admin change plan")
+    approve_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    approve_admin_parser.add_argument("--plan-id", required=True)
+    approve_admin_parser.add_argument("--approved-by", required=True)
+    approve_admin_parser.add_argument("--approved-at")
     api_parser = subparsers.add_parser("serve-api", help="serve the localhost Overseer HTTP API")
     api_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
@@ -797,6 +842,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "authorizations-required":
+        print(json.dumps(authorizations_required_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "approve-admin-change":
+        print(json.dumps(approve_admin_change_status(args.store, args.plan_id, args.approved_by, args.approved_at), sort_keys=True))
         return 0
 
     if args.command == "serve-api":

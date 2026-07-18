@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from enum import StrEnum
 
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
@@ -38,6 +39,8 @@ class AdminChangePlan:
     risks: tuple[str, ...]
     verification_steps: tuple[AdminCommandStep, ...]
     approved: bool = False
+    approved_by: str | None = None
+    approved_at: str | None = None
 
     def requires_explicit_approval(self) -> bool:
         return self.approval_level != ApprovalLevel.NONE or self.risk_level != RiskLevel.LOW
@@ -218,3 +221,39 @@ def missing_admin_change_fields(plan: AdminChangePlan) -> tuple[str, ...]:
     if not plan.verification_steps:
         missing.append("verification_steps")
     return tuple(missing)
+
+
+def approve_admin_change_plan(plan: AdminChangePlan, approved_by: str, approved_at: str | None = None) -> AdminChangePlan:
+    if missing_admin_change_fields(plan):
+        raise ValueError("cannot approve incomplete admin change plan")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    return replace(plan, approved=True, approved_by=approved_by, approved_at=approved_at)
+
+
+def authorization_required_status(plan: AdminChangePlan) -> dict[str, object]:
+    return {
+        "id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "owner_domain": OwnerDomain(plan.owner_domain).value,
+        "risk_level": RiskLevel(plan.risk_level).value,
+        "approval_level": ApprovalLevel(plan.approval_level).value,
+        "approved": plan.approved,
+        "can_execute": plan.can_execute(),
+        "reason": plan.reason,
+        "authorization_required": plan.requires_explicit_approval() and not plan.approved,
+        "next_step": _authorization_next_step(plan),
+    }
+
+
+def _authorization_next_step(plan: AdminChangePlan) -> str:
+    if plan.approved:
+        return "approved; execution still requires a live adapter and verification boundary"
+    if plan.approval_level == ApprovalLevel.HUMAN:
+        return "human approval required for exact command list, risks, rollback, and verification"
+    if plan.approval_level == ApprovalLevel.SISKO:
+        return "Sisko approval required for exact command list, risks, rollback, and verification"
+    if plan.approval_level == ApprovalLevel.ROLE:
+        return f"{OwnerDomain(plan.owner_domain).value} role approval required"
+    return "no explicit approval required"

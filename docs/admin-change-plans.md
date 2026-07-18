@@ -26,8 +26,12 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --kind user_service_restart --target overseer-api.service --reason "reload approved code" --current-state active
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.install.nmap --kind apt_install --target nmap --reason "enable approved local audit"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.firewall.8443 --kind firewall_allow_tcp --target tcp/8443 --port 8443 --reason "publish approved local service"
+PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko
 ```
 
 ## Boundary
 
 The planner never runs live commands. It produces the exact change list required by the approval gate. A future live adapter must verify `approved=true`, execute only the approved steps, record evidence, and preserve rollback status.
+
+Recording approval does not execute the plan. It only updates the stored approval metadata so a future execution adapter can see that a specific command list was approved.

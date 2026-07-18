@@ -12,7 +12,9 @@ from typing import Any
 from .cli import (
     activate_claim_status,
     assess_host_security_status,
+    approve_admin_change_status,
     approve_claim_status,
+    authorizations_required_status,
     health_summary_status,
     inspect_host_status,
     list_state_status,
@@ -45,6 +47,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/host/security":
                 self._handle(lambda: assess_host_security_status(store_path))
                 return
+            if self.path == "/admin/authorizations-required":
+                self._handle(lambda: authorizations_required_status(store_path))
+                return
             if self.path == "/state":
                 self._handle(lambda: list_state_status(store_path))
                 return
@@ -71,6 +76,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
+                return
+            if self.path == "/admin/approve":
+                self._handle_json(lambda payload: approve_admin_change_status(store_path, **_approve_admin_plan_args(payload)))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -181,4 +189,12 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "current_state": str(payload.get("current_state", "unknown")),
         "packages": tuple(str(package) for package in payload.get("packages", ())),
         "port": int(payload["port"]) if payload.get("port") is not None else None,
+    }
+
+
+def _approve_admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") else None,
     }

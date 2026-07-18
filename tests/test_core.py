@@ -87,8 +87,10 @@ from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
+from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
 from overseer.cli import assess_host_security_status
+from overseer.cli import authorizations_required_status
 from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -848,6 +850,36 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(plan["steps"][0]["command"], ["sudo", "ufw", "deny", "from", "192.0.2.10"])
             self.assertEqual(state["admin_change_plans"][0]["id"], "admin.block.source")
 
+    def test_client_lists_and_approves_admin_change_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client.plan_admin_change(
+                    {
+                        "plan_id": "admin.restart.client",
+                        "kind": AdminChangeKind.USER_SERVICE_RESTART.value,
+                        "target": "overseer-api.service",
+                        "reason": "reload approved code",
+                        "current_state": "active",
+                    }
+                )
+                pending = client.authorizations_required()
+                approved = client.approve_admin_change(
+                    {
+                        "plan_id": "admin.restart.client",
+                        "approved_by": "sisko",
+                        "approved_at": "2026-07-18T16:30:00+00:00",
+                    }
+                )
+                after = client.authorizations_required()
+
+            self.assertEqual(pending["pending_count"], 1)
+            self.assertEqual(approved["approved_by"], "sisko")
+            self.assertTrue(approved["can_execute"])
+            self.assertEqual(after["pending_count"], 0)
+
 
 class HostInspectionTests(unittest.TestCase):
     def test_host_inspection_uses_read_only_observations(self):
@@ -1013,6 +1045,33 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertFalse(status["can_execute"])
         self.assertEqual(loaded.target, "overseer-api.service")
         self.assertEqual(state["admin_change_plans"][0]["id"], "admin.restart.overseer-api")
+
+    def test_authorizations_required_lists_unapproved_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.restart.pending",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+
+            pending = authorizations_required_status(store_path)
+            approved = approve_admin_change_status(
+                store_path,
+                "admin.restart.pending",
+                "sisko",
+                "2026-07-18T16:30:00+00:00",
+            )
+            after = authorizations_required_status(store_path)
+
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertEqual(pending["pending"][0]["next_step"], "Sisko approval required for exact command list, risks, rollback, and verification")
+        self.assertTrue(approved["approved"])
+        self.assertEqual(approved["approved_by"], "sisko")
+        self.assertEqual(after["pending_count"], 0)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

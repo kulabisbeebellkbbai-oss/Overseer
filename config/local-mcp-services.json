@@ -1,0 +1,51 @@
+{
+  "resources": [
+    {
+      "id": "svc.mcp.calculator",
+      "name": "Calculator MCP",
+      "type": "service",
+      "owner_domain": "julian",
+      "risk_level": "low"
+    },
+    {
+      "id": "svc.mcp.github",
+      "name": "GitHub MCP Proxy",
+      "type": "service",
+      "owner_domain": "julian",
+      "risk_level": "low"
+    },
+    {
+      "id": "svc.mcp.skiller",
+      "name": "Skiller MCP",
+      "type": "service",
+      "owner_domain": "julian",
+      "risk_level": "low"
+    }
+  ],
+  "health_targets": [
+    {
+      "id": "health.mcp.calculator",
+      "resource_id": "svc.mcp.calculator",
+      "name": "Calculator MCP Health",
+      "probe_type": "json",
+      "target": "http://127.0.0.1:8787/health",
+      "expected_content_type": "application/json"
+    },
+    {
+      "id": "health.mcp.github",
+      "resource_id": "svc.mcp.github",
+      "name": "GitHub MCP Proxy Health",
+      "probe_type": "json",
+      "target": "http://127.0.0.1:8791/health",
+      "expected_content_type": "application/json"
+    },
+    {
+      "id": "health.mcp.skiller",
+      "resource_id": "svc.mcp.skiller",
+      "name": "Skiller MCP Health",
+      "probe_type": "json",
+      "target": "http://127.0.0.1:8794/health",
+      "expected_content_type": "application/json"
+    }
+  ]
+}

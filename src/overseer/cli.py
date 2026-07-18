@@ -11,7 +11,7 @@ from .config import load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEventType
-from .health import HealthTarget, ProbeType
+from .health import HealthStatus, HealthTarget, ProbeType
 from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
@@ -266,6 +266,8 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         resources = store.list_resources()
+        health_targets = store.list_health_targets()
+        health_evidence = store.list_health_evidence()
         claims = store.list_claims()
         approvals = store.list_approvals()
         audit_events = store.list_audit_events()
@@ -282,6 +284,31 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "current_claim_id": resource.current_claim_id,
                 }
                 for resource in resources
+            ],
+            "health_targets": [
+                {
+                    "id": target.id,
+                    "resource_id": target.resource_id,
+                    "name": target.name,
+                    "probe_type": ProbeType(target.probe_type).value,
+                    "target": target.target,
+                    "owner_domain": OwnerDomain(target.owner_domain).value,
+                }
+                for target in health_targets
+            ],
+            "health_evidence": [
+                {
+                    "id": evidence.id,
+                    "resource_id": evidence.resource_id,
+                    "target": evidence.target,
+                    "probe_type": ProbeType(evidence.probe_type).value,
+                    "status": HealthStatus(evidence.observed_status).value,
+                    "owner_domain": OwnerDomain(evidence.owner_domain).value,
+                    "recovery_required": evidence.recovery_required,
+                    "captured_at": evidence.captured_at,
+                    "error": evidence.observed_error,
+                }
+                for evidence in health_evidence
             ],
             "claims": [
                 {

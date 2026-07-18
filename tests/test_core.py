@@ -30,6 +30,7 @@ from overseer import (
     classify_probe,
     recovery_evidence,
     HealthStatus,
+    HealthEvidence,
     HealthTarget,
     HttpHealthProbeAdapter,
     InterruptionPolicy,
@@ -1585,6 +1586,36 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")
             self.assertEqual(status["runtime_heartbeats"], [])
+
+    def test_list_state_status_reports_health_targets_and_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.state",
+                    resource_id="svc.state",
+                    name="State Health",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8787/health",
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.state",
+                    resource_id="svc.state",
+                    target="http://127.0.0.1:8787/health",
+                    probe_type=ProbeType.JSON,
+                    observed_status=HealthStatus.HEALTHY,
+                    owner_domain=OwnerDomain.JULIAN,
+                )
+            )
+            store.close()
+
+            status = list_state_status(store_path)
+
+            self.assertEqual(status["health_targets"][0]["id"], "health.state")
+            self.assertEqual(status["health_evidence"][0]["status"], HealthStatus.HEALTHY.value)
 
     def test_release_claim_status_clears_stored_resource_claim(self):
         with tempfile.TemporaryDirectory() as directory:

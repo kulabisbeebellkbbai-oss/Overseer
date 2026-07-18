@@ -33,6 +33,12 @@ from .live_health import HttpHealthProbeAdapter
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
+from .runtime_state import (
+    DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
+    DEFAULT_RUNTIME_FRESHNESS_POLICY,
+    FreshnessAssessment,
+    assess_freshness,
+)
 from .service import OverseerCoordinator, coordinator_from_store
 from .store import SQLiteStore
 
@@ -286,13 +292,23 @@ def service_status(store_path: str | Path, service_name: str = "overseer") -> di
         store.close()
 
 
-def runtime_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+def runtime_status(store_path: str | Path, service_name: str = "overseer", now: str | None = None) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         heartbeat = store.load_runtime_heartbeat(service_name)
         snapshots = store.list_host_snapshots()
         latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
         host_security = host_security_status(latest_snapshot) if latest_snapshot else None
+        heartbeat_freshness = assess_freshness(
+            heartbeat.last_tick_at,
+            now=now,
+            policy=DEFAULT_RUNTIME_FRESHNESS_POLICY,
+        )
+        host_freshness = assess_freshness(
+            latest_snapshot.captured_at if latest_snapshot else None,
+            now=now,
+            policy=DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
+        )
         return {
             "store": str(store.path),
             "service": {
@@ -300,6 +316,7 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer") -> di
                 "started_at": heartbeat.started_at,
                 "last_tick_at": heartbeat.last_tick_at,
                 "tick_count": heartbeat.tick_count,
+                "freshness": freshness_status(heartbeat_freshness),
             },
             "host_inspection": {
                 "enabled": latest_snapshot is not None,
@@ -308,10 +325,22 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer") -> di
                 "hostname": latest_snapshot.hostname if latest_snapshot else None,
                 "high_findings": host_security["high_findings"] if host_security else 0,
                 "warning_findings": host_security["warning_findings"] if host_security else 0,
+                "freshness": freshness_status(host_freshness),
             },
         }
     finally:
         store.close()
+
+
+def freshness_status(assessment: FreshnessAssessment) -> dict[str, object]:
+    return {
+        "status": assessment.status.value,
+        "observed_at": assessment.observed_at,
+        "age_seconds": assessment.age_seconds,
+        "warning_after_seconds": assessment.warning_after_seconds,
+        "high_after_seconds": assessment.high_after_seconds,
+        "summary": assessment.summary,
+    }
 
 
 def inspect_host_status(store_path: str | Path | None = None) -> dict[str, object]:

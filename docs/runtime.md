@@ -26,7 +26,13 @@ PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sql
 PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3 --fail-on-unhealthy
 ```
 
-`runtime-status` is the monitor-friendly surface for Julian and Odo. It reports the service heartbeat, latest host inspection snapshot id and capture time, and current high/warning host security finding counts without requiring consumers to parse raw snapshots.
+`runtime-status` is the monitor-friendly surface for Julian and Odo. It reports the service heartbeat, latest host inspection snapshot id and capture time, freshness state, and current high/warning host security finding counts without requiring consumers to parse raw snapshots.
+
+Default freshness thresholds:
+
+- Runtime heartbeat: `warning` at 90 seconds, `high` at 300 seconds.
+- Host inspection snapshot: `warning` at 120 seconds, `high` at 600 seconds.
+- Missing host inspection evidence is reported as `missing`.
 
 ## Local User Service
 

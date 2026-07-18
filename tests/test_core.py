@@ -20,6 +20,7 @@ from overseer import (
     ExecutionMode,
     ExecutionRequest,
     ExecutionStatus,
+    FreshnessStatus,
     AdminChangeKind,
     AdminCommandResult,
     AdminExecutionStatus,
@@ -66,6 +67,7 @@ from overseer import (
     SQLiteStore,
     ScheduledWorkStatus,
     UsageLimit,
+    assess_freshness,
     approval_from_decision,
     assess_maintenance_readiness,
     audit_event_from_decision,
@@ -961,6 +963,26 @@ class OverseerApiClientTests(unittest.TestCase):
 
 
 class HostInspectionTests(unittest.TestCase):
+    def test_freshness_assessment_marks_stale_thresholds(self):
+        fresh = assess_freshness(
+            "2026-07-18T16:00:00+00:00",
+            now="2026-07-18T16:00:30+00:00",
+        )
+        warning = assess_freshness(
+            "2026-07-18T16:00:00+00:00",
+            now="2026-07-18T16:02:00+00:00",
+        )
+        high = assess_freshness(
+            "2026-07-18T16:00:00+00:00",
+            now="2026-07-18T16:05:00+00:00",
+        )
+        missing = assess_freshness(None, now="2026-07-18T16:05:00+00:00")
+
+        self.assertEqual(fresh.status, FreshnessStatus.OK)
+        self.assertEqual(warning.status, FreshnessStatus.WARNING)
+        self.assertEqual(high.status, FreshnessStatus.HIGH)
+        self.assertEqual(missing.status, FreshnessStatus.MISSING)
+
     def test_host_inspection_uses_read_only_observations(self):
         commands = []
 
@@ -1102,12 +1124,16 @@ class HostInspectionTests(unittest.TestCase):
             store.save_host_snapshot(snapshot)
             store.close()
 
-            status = runtime_status(store_path)
+            status = runtime_status(store_path, now="2026-07-18T16:01:45+00:00")
 
         self.assertEqual(status["service"]["tick_count"], 2)
+        self.assertEqual(status["service"]["freshness"]["status"], FreshnessStatus.OK.value)
+        self.assertEqual(status["service"]["freshness"]["age_seconds"], 45)
         self.assertTrue(status["host_inspection"]["enabled"])
         self.assertEqual(status["host_inspection"]["latest_snapshot_id"], snapshot.id)
         self.assertEqual(status["host_inspection"]["latest_captured_at"], "2026-07-18T16:01:30+00:00")
+        self.assertEqual(status["host_inspection"]["freshness"]["status"], FreshnessStatus.OK.value)
+        self.assertEqual(status["host_inspection"]["freshness"]["age_seconds"], 15)
         self.assertEqual(status["host_inspection"]["high_findings"], 1)
         self.assertEqual(status["host_inspection"]["warning_findings"], 0)
 
@@ -1126,9 +1152,11 @@ class HostInspectionTests(unittest.TestCase):
             )
             store.close()
 
-            status = runtime_status(store_path)
+            status = runtime_status(store_path, now="2026-07-18T16:06:30+00:00")
 
+        self.assertEqual(status["service"]["freshness"]["status"], FreshnessStatus.HIGH.value)
         self.assertFalse(status["host_inspection"]["enabled"])
+        self.assertEqual(status["host_inspection"]["freshness"]["status"], FreshnessStatus.MISSING.value)
         self.assertIsNone(status["host_inspection"]["latest_snapshot_id"])
         self.assertEqual(status["host_inspection"]["high_findings"], 0)
 

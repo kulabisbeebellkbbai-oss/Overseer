@@ -84,7 +84,15 @@ from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
 from .runtime import OverseerRuntime, RuntimeTick
-from .runtime_state import RuntimeHeartbeat
+from .runtime_state import (
+    DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY,
+    DEFAULT_RUNTIME_FRESHNESS_POLICY,
+    FreshnessAssessment,
+    FreshnessPolicy,
+    FreshnessStatus,
+    RuntimeHeartbeat,
+    assess_freshness,
+)
 from .security import (
     ProtectiveAction,
     SecurityIncident,
@@ -195,7 +203,13 @@ __all__ = [
     "ResourceRegistry",
     "OverseerRuntime",
     "RuntimeTick",
+    "DEFAULT_HOST_INSPECTION_FRESHNESS_POLICY",
+    "DEFAULT_RUNTIME_FRESHNESS_POLICY",
+    "FreshnessAssessment",
+    "FreshnessPolicy",
+    "FreshnessStatus",
     "RuntimeHeartbeat",
+    "assess_freshness",
     "ProtectiveAction",
     "SecurityIncident",
     "SecurityResponse",

@@ -45,6 +45,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 
+`GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`.
+
 ## Python Client
 
 Local Python tools can use `overseer.client.OverseerApiClient` to read the token file and call the API:

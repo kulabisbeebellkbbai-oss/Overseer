@@ -30,6 +30,7 @@ from overseer import (
     MaintenancePlan,
     MaintenanceStatus,
     MaintenanceWindow,
+    OverseerCoordinator,
     ProbeResult,
     ProbeType,
     PhysicalAssetKind,
@@ -45,6 +46,7 @@ from overseer import (
     assess_maintenance_readiness,
     audit_event_from_decision,
     can_close_maintenance,
+    needs_operator_approval,
     physical_identity_conflicts,
     recommend_security_response,
     schedule_limited_work,
@@ -761,6 +763,75 @@ class SQLiteStoreTests(unittest.TestCase):
 
             self.assertEqual(store.load_approval("approval.persisted").approval_level, ApprovalLevel.SISKO)
             self.assertEqual(store.list_audit_events()[0].event_type, AuditEventType.ESCALATED)
+            store.close()
+
+
+class OverseerCoordinatorTests(unittest.TestCase):
+    def test_request_claim_persists_decision_approval_and_audit_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            coordinator = OverseerCoordinator(store=store)
+            resource = coordinator.register_resource(
+                Resource(
+                    id="gateway.coordinator",
+                    name="Coordinator Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            claim = Claim(
+                id="claim.coordinator.gateway",
+                resource_id=resource.id,
+                claim_type=ClaimType.LEASE,
+                owner_thread="thread-coordinator",
+                owner_role=OwnerDomain.DAX,
+                intent="change protected gateway",
+                requested_action="modify route",
+                risk_level=RiskLevel.HIGH,
+            )
+
+            result = coordinator.request_claim(claim)
+
+            self.assertTrue(needs_operator_approval(result))
+            self.assertEqual(store.load_claim(claim.id).status, ClaimStatus.REQUESTED)
+            self.assertEqual(store.load_decision(claim.id).approval_level, ApprovalLevel.SISKO)
+            self.assertEqual(store.load_approval(f"approval.{claim.id}").approval_level, ApprovalLevel.SISKO)
+            self.assertEqual(store.list_audit_events()[0].event_type, AuditEventType.ESCALATED)
+            store.close()
+
+    def test_activate_and_release_claim_updates_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            coordinator = OverseerCoordinator(store=store)
+            resource = coordinator.register_resource(
+                Resource(
+                    id="proxy.coordinator",
+                    name="Coordinator Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            result = coordinator.request_claim(
+                Claim(
+                    id="claim.coordinator.proxy",
+                    resource_id=resource.id,
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-coordinator",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use proxy",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+
+            activated = coordinator.activate_claim(result.record.claim.id, "approval.role")
+            released = coordinator.release_claim(activated.claim.id)
+
+            self.assertEqual(activated.claim.status, ClaimStatus.ACTIVE)
+            self.assertEqual(released.status, ClaimStatus.RELEASED)
+            self.assertEqual(store.load_claim(activated.claim.id).status, ClaimStatus.RELEASED)
             store.close()
 
 

@@ -43,6 +43,7 @@ from .security import (
     SecurityStatus,
     recommend_security_response,
 )
+from .service import CoordinationResult, OverseerCoordinator, needs_operator_approval
 from .store import SQLiteStore
 from .usage_limits import (
     LimitDecision,
@@ -99,6 +100,9 @@ __all__ = [
     "SecuritySignalType",
     "SecurityStatus",
     "recommend_security_response",
+    "CoordinationResult",
+    "OverseerCoordinator",
+    "needs_operator_approval",
     "SQLiteStore",
     "LimitDecision",
     "LimitKind",

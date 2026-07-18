@@ -44,5 +44,6 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Local in-memory registry: `docs/local-registry.md`
 - Approval and audit records: `docs/approval-and-audit.md`
 - SQLite persistence contract: `docs/persistence.md`
+- Coordinator service: `docs/coordinator-service.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

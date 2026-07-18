@@ -35,6 +35,7 @@ from overseer import (
     MaintenanceStatus,
     MaintenanceWindow,
     OperationPlanner,
+    OverseerConfig,
     OverseerCoordinator,
     ProbeResult,
     ProbeType,
@@ -52,6 +53,7 @@ from overseer import (
     assess_maintenance_readiness,
     audit_event_from_decision,
     can_close_maintenance,
+    config_from_mapping,
     needs_operator_approval,
     physical_identity_conflicts,
     recommend_security_response,
@@ -684,6 +686,41 @@ class LocalSchedulerTests(unittest.TestCase):
 
         self.assertEqual(work.status, ScheduledWorkStatus.WAITING)
         self.assertEqual(work.blocking_ids, ("maint.active",))
+
+
+class ConfigLoadingTests(unittest.TestCase):
+    def test_loads_resources_and_usage_limits_from_mapping(self):
+        config = config_from_mapping(
+            {
+                "resources": [
+                    {
+                        "id": "gateway.config",
+                        "name": "Configured Gateway",
+                        "type": "virtual_asset",
+                        "owner_domain": "dax",
+                        "risk_level": "high",
+                        "identifiers": {"ports": [8795]},
+                        "exclusive_groups": ["gateway"],
+                    }
+                ],
+                "usage_limits": [
+                    {
+                        "id": "limit.config",
+                        "resource_id": "svc.config",
+                        "kind": "requests",
+                        "capacity": 100,
+                        "remaining": 50,
+                        "resets_at": "2026-07-18T15:00:00-04:00",
+                        "window": "hourly",
+                    }
+                ],
+            }
+        )
+
+        self.assertIsInstance(config, OverseerConfig)
+        self.assertEqual(config.resources[0].owner_domain, OwnerDomain.DAX)
+        self.assertEqual(config.resources[0].ports(), frozenset({8795}))
+        self.assertEqual(config.usage_limits[0].remaining, 50)
 
 
 class ResourceRegistryTests(unittest.TestCase):

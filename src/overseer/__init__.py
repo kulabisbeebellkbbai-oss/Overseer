@@ -14,6 +14,7 @@ from .audit import (
     approval_from_decision,
     audit_event_from_decision,
 )
+from .config import OverseerConfig, config_from_mapping, load_config
 from .core import (
     ApprovalLevel,
     Claim,
@@ -82,6 +83,9 @@ __all__ = [
     "AuditEventType",
     "approval_from_decision",
     "audit_event_from_decision",
+    "OverseerConfig",
+    "config_from_mapping",
+    "load_config",
     "ApprovalLevel",
     "Claim",
     "ClaimStatus",

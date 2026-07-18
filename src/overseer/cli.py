@@ -1537,10 +1537,7 @@ def prepare_host_security_ids_review_package_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        try:
-            plan = store.load_admin_change_plan(plan_id)
-        except KeyError:
-            raise ValueError(f"admin plan does not exist: {plan_id}") from None
+        plan = store.load_admin_change_plan(plan_id)
         source_review = store.load_host_security_source_review(source_review_id) if source_review_id else None
         package = build_ids_review_package(plan, source_review, package_id, requested_by, created_at)
         store.save_host_security_ids_review_package(package)
@@ -2105,7 +2102,10 @@ def unarchive_admin_history_status(
     store = SQLiteStore(store_path)
     try:
         now = restored_at or datetime.now(UTC).isoformat()
-        plan = store.load_admin_change_plan(plan_id)
+        try:
+            plan = store.load_admin_change_plan(plan_id)
+        except KeyError:
+            raise ValueError(f"admin plan does not exist: {plan_id}") from None
         archive_record_id = plan.archive_record_id
         restored = unarchive_admin_change_plan(plan, restored_by)
         store.save_admin_change_plan(restored)

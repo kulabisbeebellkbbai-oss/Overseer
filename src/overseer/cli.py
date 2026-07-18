@@ -1417,6 +1417,44 @@ def host_security_source_reviews_status(store_path: str | Path) -> dict[str, obj
         store.close()
 
 
+def plan_host_security_source_block_status(
+    store_path: str | Path,
+    review_id: str,
+    plan_id: str | None = None,
+    action: str = "block_ip",
+    reason: str | None = None,
+) -> dict[str, object]:
+    if action != "block_ip":
+        raise ValueError("unsupported host security source remediation action")
+    store = SQLiteStore(store_path)
+    try:
+        review = store.load_host_security_source_review(review_id)
+        if not review.can_stage_block_plan():
+            raise ValueError("source review is not eligible for block-plan staging")
+        default_plan_id = f"admin.host-security.block-source.{_status_id(review.remote_address)}"
+        default_reason = f"stage approval-gated source block from Odo review {review.id}"
+        current_state = (
+            f"review={review.id}; disposition={SourceReviewDisposition(review.disposition).value}; "
+            f"source_scope={review.source_scope}; listener={review.listener}; evidence={review.evidence}; "
+            f"rationale={review.rationale}"
+        )
+        plan = plan_block_ip(plan_id or default_plan_id, review.remote_address, reason or default_reason, current_state)
+        store.save_admin_change_plan(plan)
+        return {
+            "store": str(store.path),
+            "remediation_action": action,
+            "source_review": host_security_source_review_status(review),
+            "ids_review_required_before_execution": True,
+            "approval_boundary": (
+                "block plan staged only; firewall, IDS, route, service-bind, or enforcement changes require "
+                "separate approval and Intrusion Detection advisory review"
+            ),
+            **admin_change_plan_status(plan),
+        }
+    finally:
+        store.close()
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -2051,6 +2089,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     create_source_review_parser.add_argument("--reviewed-at")
     create_source_review_parser.add_argument("--created-at")
     create_source_review_parser.add_argument("--snapshot-id")
+    source_block_parser = subparsers.add_parser(
+        "plan-host-security-source-block",
+        help="stage an approval-gated source block from an Odo-reviewed hostile source",
+    )
+    source_block_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    source_block_parser.add_argument("--review-id", required=True)
+    source_block_parser.add_argument("--plan-id")
+    source_block_parser.add_argument("--action", default="block_ip")
+    source_block_parser.add_argument("--reason")
     host_remediation_parser = subparsers.add_parser(
         "plan-host-security-remediation",
         help="stage an approval-gated host security remediation plan",
@@ -2259,6 +2306,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.reviewed_at,
                     args.created_at,
                     args.snapshot_id,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "plan-host-security-source-block":
+        print(
+            json.dumps(
+                plan_host_security_source_block_status(
+                    args.store,
+                    args.review_id,
+                    args.plan_id,
+                    args.action,
+                    args.reason,
                 ),
                 sort_keys=True,
             )

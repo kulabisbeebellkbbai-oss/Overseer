@@ -124,6 +124,7 @@ from overseer.cli import main as cli_main
 from overseer.cli import maintenance_summary_status
 from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
+from overseer.cli import plan_host_security_source_block_status
 from overseer.cli import plan_host_security_remediation_status
 from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
@@ -1802,12 +1803,25 @@ class OverseerApiClientTests(unittest.TestCase):
                         "rationale": "unexpected remote source",
                     }
                 )
+                hostile = client.create_host_security_source_review(
+                    {
+                        "remote_address": "8.8.8.8",
+                        "review_id": "source-review.client.hostile",
+                        "disposition": SourceReviewDisposition.HOSTILE.value,
+                        "reviewed_by": "odo",
+                        "rationale": "confirmed malicious source activity",
+                    }
+                )
+                block_plan = client.plan_host_security_source_block({"review_id": hostile["id"]})
                 reviews = client.host_security_source_reviews()
 
             self.assertEqual(created["remote_address"], "8.8.8.8")
             self.assertEqual(created["disposition"], SourceReviewDisposition.SUSPICIOUS.value)
             self.assertFalse(created["can_stage_block_plan"])
-            self.assertEqual(reviews["review_count"], 1)
+            self.assertEqual(block_plan["kind"], AdminChangeKind.BLOCK_IP.value)
+            self.assertEqual(block_plan["target"], "8.8.8.8")
+            self.assertFalse(block_plan["can_execute"])
+            self.assertEqual(reviews["review_count"], 2)
 
     def test_client_plans_host_security_remediation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2360,12 +2374,24 @@ class HostInspectionTests(unittest.TestCase):
                 reviewed_at="2026-07-18T16:08:00+00:00",
             )
             reviews = host_security_source_reviews_status(store_path)
+            block_plan = plan_host_security_source_block_status(store_path, hostile["id"])
             state = list_state_status(store_path)
+            loaded = SQLiteStore(store_path)
+            plan = loaded.load_admin_change_plan("admin.host-security.block-source.8-8-8-8")
+            loaded.close()
+            with self.assertRaises(ValueError):
+                plan_host_security_source_block_status(store_path, pending["id"], plan_id="admin.block.pending")
 
         self.assertEqual(pending["disposition"], SourceReviewDisposition.NEEDS_REVIEW.value)
         self.assertFalse(pending["can_stage_block_plan"])
         self.assertEqual(hostile["disposition"], SourceReviewDisposition.HOSTILE.value)
         self.assertTrue(hostile["can_stage_block_plan"])
+        self.assertEqual(block_plan["kind"], AdminChangeKind.BLOCK_IP.value)
+        self.assertEqual(block_plan["source_review"]["id"], hostile["id"])
+        self.assertEqual(block_plan["approval_level"], ApprovalLevel.HUMAN.value)
+        self.assertFalse(block_plan["can_execute"])
+        self.assertTrue(block_plan["ids_review_required_before_execution"])
+        self.assertEqual(plan.target, "8.8.8.8")
         self.assertEqual(reviews["review_count"], 2)
         self.assertEqual(reviews["ready_for_block_plan"], 1)
         self.assertEqual(reviews["by_disposition"][SourceReviewDisposition.HOSTILE.value], 1)

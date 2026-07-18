@@ -32,6 +32,7 @@ from .cli import (
     list_state_status,
     maintenance_summary_status,
     operator_dashboard_status,
+    plan_host_security_source_block_status,
     plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
@@ -144,6 +145,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
+                return
+            if self.path == "/host/security/source-reviews/block-plans":
+                self._handle_json(lambda payload: plan_host_security_source_block_status(store_path, **_host_security_source_block_args(payload)))
                 return
             if self.path == "/host/security/source-reviews":
                 self._handle_json(lambda payload: create_host_security_source_review_status(store_path, **_host_security_source_review_args(payload)))
@@ -305,6 +309,15 @@ def _host_security_source_review_args(payload: dict[str, Any]) -> dict[str, Any]
         "reviewed_at": str(payload["reviewed_at"]) if payload.get("reviewed_at") else None,
         "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
         "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
+    }
+
+
+def _host_security_source_block_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "review_id": str(payload["review_id"]),
+        "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
+        "action": str(payload.get("action", "block_ip")),
+        "reason": str(payload["reason"]) if payload.get("reason") else None,
     }
 
 

@@ -2423,6 +2423,7 @@ class HostInspectionTests(unittest.TestCase):
             loaded.close()
             with self.assertRaises(ValueError):
                 plan_host_security_source_block_status(store_path, pending["id"], plan_id="admin.block.pending")
+            auth_missing_package = authorizations_required_status(store_path)
             with self.assertRaises(ValueError):
                 approve_admin_change_status(store_path, block_plan["id"], "sisko")
             ids_package = prepare_host_security_ids_review_package_status(
@@ -2432,6 +2433,7 @@ class HostInspectionTests(unittest.TestCase):
                 requested_by="odo",
                 created_at="2026-07-18T16:09:00+00:00",
             )
+            auth_prepared_package = authorizations_required_status(store_path)
             with self.assertRaises(ValueError):
                 approve_admin_change_status(store_path, block_plan["id"], "sisko")
             exported = export_host_security_ids_review_prompt_status(
@@ -2444,6 +2446,7 @@ class HostInspectionTests(unittest.TestCase):
             exported_prompt_text = Path(exported["prompt_path"]).read_text(encoding="utf-8").strip()
             with self.assertRaises(ValueError):
                 export_host_security_ids_review_prompt_status(store_path, ids_package["id"], "../outside")
+            auth_exported_prompt = authorizations_required_status(store_path)
             submitted = submit_host_security_ids_review_package_status(
                 store_path,
                 ids_package["id"],
@@ -2451,6 +2454,7 @@ class HostInspectionTests(unittest.TestCase):
                 submitted_at="2026-07-18T16:10:00+00:00",
                 prompt_path=exported["prompt_path"],
             )
+            auth_submitted_package = authorizations_required_status(store_path)
             with self.assertRaises(ValueError):
                 approve_admin_change_status(store_path, block_plan["id"], "sisko")
             advisory_result = record_host_security_ids_review_result_status(
@@ -2461,8 +2465,10 @@ class HostInspectionTests(unittest.TestCase):
                 "odo",
                 reviewed_at="2026-07-18T16:11:00+00:00",
             )
+            auth_advisory_accepted = authorizations_required_status(store_path)
             ids_packages = host_security_ids_review_packages_status(store_path)
             approved = approve_admin_change_status(store_path, block_plan["id"], "sisko")
+            auth_after_approval = authorizations_required_status(store_path)
             gated_state = list_state_status(store_path)
 
         self.assertEqual(pending["disposition"], SourceReviewDisposition.NEEDS_REVIEW.value)
@@ -2474,6 +2480,14 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(block_plan["approval_level"], ApprovalLevel.HUMAN.value)
         self.assertFalse(block_plan["can_execute"])
         self.assertTrue(block_plan["ids_review_required_before_execution"])
+        self.assertEqual(auth_missing_package["pending"][0]["ids_review_next_step"], "prepare IDS/firewall review package before requesting approval")
+        self.assertFalse(auth_missing_package["pending"][0]["authorization_required"])
+        self.assertEqual(auth_prepared_package["pending"][0]["ids_review_next_step"], "export IDS/firewall review prompt and submit package before approval")
+        self.assertEqual(auth_exported_prompt["pending"][0]["ids_review_next_step"], "submit IDS/firewall review package with exported prompt before approval")
+        self.assertEqual(auth_submitted_package["pending"][0]["ids_review_next_step"], "await Intrusion Detection advisory result before approval")
+        self.assertEqual(auth_advisory_accepted["pending"][0]["ids_review_next_step"], "IDS/firewall advisory accepted; human approval may proceed")
+        self.assertTrue(auth_advisory_accepted["pending"][0]["authorization_required"])
+        self.assertEqual(auth_after_approval["pending_count"], 0)
         self.assertEqual(plan.target, "8.8.8.8")
         self.assertEqual(ids_package["plan_id"], block_plan["id"])
         self.assertEqual(ids_package["source_review_id"], hostile["id"])

@@ -1736,7 +1736,13 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                 for status in AdminExecutionStatus
             },
             "latest_audit_events": [audit_event_status(event) for event in audit_events[-5:]],
-            "pending": [admin_change_plan_status(plan) for plan in pending],
+            "pending": [
+                authorization_required_status_with_ids_review(
+                    plan,
+                    store.list_host_security_ids_review_packages_for_plan(plan.id),
+                )
+                for plan in pending
+            ],
         }
     finally:
         store.close()
@@ -1785,7 +1791,10 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
     try:
         plans = store.list_admin_change_plans()
         pending = [
-            authorization_required_status(plan)
+            authorization_required_status_with_ids_review(
+                plan,
+                store.list_host_security_ids_review_packages_for_plan(plan.id),
+            )
             for plan in plans
             if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
         ]
@@ -1796,6 +1805,54 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
         }
     finally:
         store.close()
+
+
+def authorization_required_status_with_ids_review(
+    plan: AdminChangePlan,
+    ids_review_packages: Sequence[HostSecurityIDSReviewPackage] = (),
+) -> dict[str, object]:
+    status = authorization_required_status(plan)
+    if not admin_plan_requires_ids_review(plan):
+        status["ids_review_required_before_approval"] = False
+        status["ids_review_gate_satisfied"] = True
+        return status
+
+    packages = tuple(ids_review_packages)
+    gate_satisfied = any(package.satisfies_pre_execution_review_gate() for package in packages)
+    status["ids_review_required_before_approval"] = True
+    status["ids_review_gate_satisfied"] = gate_satisfied
+    status["ids_review_package_count"] = len(packages)
+    status["ids_review_packages"] = [
+        {
+            "id": package.id,
+            "status": IDSReviewPackageStatus(package.status).value,
+            "prompt_path": package.prompt_path,
+            "reviewed_by": package.reviewed_by,
+            "reviewed_at": package.reviewed_at,
+            "satisfies_pre_execution_review_gate": package.satisfies_pre_execution_review_gate(),
+        }
+        for package in packages
+    ]
+    status["ids_review_next_step"] = _ids_review_authorization_next_step(packages)
+    if not gate_satisfied:
+        status["authorization_required"] = False
+        status["next_step"] = status["ids_review_next_step"]
+    return status
+
+
+def _ids_review_authorization_next_step(ids_review_packages: Sequence[HostSecurityIDSReviewPackage]) -> str:
+    packages = tuple(ids_review_packages)
+    if not packages:
+        return "prepare IDS/firewall review package before requesting approval"
+    if any(package.satisfies_pre_execution_review_gate() for package in packages):
+        return "IDS/firewall advisory accepted; human approval may proceed"
+    if any(package.status == IDSReviewPackageStatus.REVISION_REQUIRED for package in packages):
+        return "revision required by Intrusion Detection; update the package or plan before approval"
+    if any(package.status == IDSReviewPackageStatus.SUBMITTED for package in packages):
+        return "await Intrusion Detection advisory result before approval"
+    if any(package.prompt_path for package in packages):
+        return "submit IDS/firewall review package with exported prompt before approval"
+    return "export IDS/firewall review prompt and submit package before approval"
 
 
 def _admin_command_status(step) -> dict[str, object]:

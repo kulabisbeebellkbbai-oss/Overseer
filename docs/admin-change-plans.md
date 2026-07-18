@@ -49,3 +49,5 @@ Execution results are persisted and can be reviewed with `admin-executions` or t
 Every execution attempt also writes an audit event keyed to the admin plan. Completed executions use `executed`; blocked or failed attempts use `blocked` and cite the execution result id as evidence.
 
 `admin-summary` is the compact operator view for O'Brien and Sisko. It reports plan counts, pending authorizations, executable plans, execution counts by status, pending plan details, and recent admin audit events.
+
+For firewall-affecting plans, `authorizations-required` and `admin-summary` also report the IDS/firewall review gate. The queue distinguishes missing packages, prepared packages that need prompt export, exported prompts that need submission, submitted packages waiting for advisory results, revision-required packages, and accepted advisory results that are ready for human approval.

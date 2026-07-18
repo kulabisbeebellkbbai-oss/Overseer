@@ -90,3 +90,13 @@ The first executable slice should:
 2. Preserve exact target and error fields.
 3. Map failures to an owner domain.
 4. Require recovery evidence before closure.
+
+## Health Efficiency Summary
+
+Julian's compact operator read model is available with:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli health-efficiency --store state/overseer.sqlite3
+```
+
+It summarizes target status counts, probe-type coverage, owner routing, recovery requirements, missing evidence, and latest failures for MCP, hosted page, HTTPS, HTML, JSON, process, command, log, and manual health checks.

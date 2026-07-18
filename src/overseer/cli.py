@@ -652,6 +652,67 @@ def security_surface_status(resource: Resource) -> dict[str, object]:
     }
 
 
+def health_efficiency_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        targets = store.list_health_targets()
+        evidence = store.list_health_evidence()
+        summaries = summarize_health_targets(targets, evidence)
+        unhealthy_statuses = {HealthStatus.DEGRADED, HealthStatus.FAILED, HealthStatus.UNKNOWN}
+        latest_failures = [summary for summary in summaries if summary.latest_status in unhealthy_statuses]
+        return {
+            "store": str(store.path),
+            "targets": len(summaries),
+            "evidence_records": len(evidence),
+            "healthy": sum(1 for summary in summaries if summary.latest_status == HealthStatus.HEALTHY),
+            "unhealthy": len(latest_failures),
+            "recovered": sum(1 for summary in summaries if summary.latest_status == HealthStatus.RECOVERED),
+            "missing_evidence": sum(1 for summary in summaries if summary.latest_evidence_id is None),
+            "recovery_required": sum(1 for summary in summaries if summary.recovery_required),
+            "by_status": {
+                status.value: sum(1 for summary in summaries if summary.latest_status == status)
+                for status in HealthStatus
+            },
+            "by_probe_type": {
+                probe_type.value: sum(1 for target in targets if target.probe_type == probe_type)
+                for probe_type in ProbeType
+            },
+            "by_owner": {
+                owner.value: sum(1 for summary in summaries if summary.owner_domain == owner)
+                for owner in OwnerDomain
+            },
+            "errors_by_probe_type": {
+                probe_type.value: sum(
+                    1
+                    for summary in latest_failures
+                    if any(
+                        target.id == summary.target_id and target.probe_type == probe_type
+                        for target in targets
+                    )
+                )
+                for probe_type in ProbeType
+            },
+            "latest_failures": [health_failure_status(summary) for summary in latest_failures],
+        }
+    finally:
+        store.close()
+
+
+def health_failure_status(summary) -> dict[str, object]:
+    return {
+        "target_id": summary.target_id,
+        "resource_id": summary.resource_id,
+        "name": summary.name,
+        "target": summary.target,
+        "status": HealthStatus(summary.latest_status).value,
+        "owner_domain": OwnerDomain(summary.owner_domain).value,
+        "latest_evidence_id": summary.latest_evidence_id,
+        "latest_captured_at": summary.latest_captured_at,
+        "recovery_required": summary.recovery_required,
+        "error": summary.error,
+    }
+
+
 def run_status(
     store_path: str | Path,
     once: bool,
@@ -1387,6 +1448,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     security_summary_parser = subparsers.add_parser("security-summary", help="summarize security surfaces and alerts")
     security_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    health_efficiency_parser = subparsers.add_parser("health-efficiency", help="summarize service health efficiency")
+    health_efficiency_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser = subparsers.add_parser("run", help="run Overseer foreground runtime against an explicit store")
     run_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_parser.add_argument("--once", action="store_true", help="run one tick and exit")
@@ -1527,6 +1590,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "security-summary":
         print(json.dumps(security_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "health-efficiency":
+        print(json.dumps(health_efficiency_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "run":

@@ -30,6 +30,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /physical-summary`
 - `GET /virtual-summary`
 - `GET /health-summary`
+- `GET /health-efficiency`
 - `GET /host/security`
 - `GET /admin/authorizations-required`
 - `GET /admin/executions`
@@ -66,6 +67,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
+`GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.
 
 ## Python Client
 
@@ -83,6 +85,7 @@ security = client.security_summary()
 usage = client.usage_summary()
 physical = client.physical_summary()
 virtual = client.virtual_summary()
+efficiency = client.health_efficiency()
 summary = client.health_summary()
 snapshot = client.inspect_host()
 plan = client.plan_admin_change(

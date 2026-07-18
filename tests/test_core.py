@@ -109,6 +109,7 @@ from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
 from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
+from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -1091,6 +1092,95 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["surfaces"][0]["id"], "security.firewall")
         self.assertEqual(status["events"][0]["id"], "alert.security")
 
+    def test_health_efficiency_summary_reports_probe_failures_and_owner_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            targets = (
+                HealthTarget(
+                    id="health.mcp",
+                    resource_id="svc.mcp",
+                    name="MCP Service",
+                    probe_type=ProbeType.MCP,
+                    target="http://127.0.0.1:8791/health",
+                    owner_domain=OwnerDomain.JULIAN,
+                ),
+                HealthTarget(
+                    id="health.json",
+                    resource_id="svc.json",
+                    name="JSON Service",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8766/state",
+                    owner_domain=OwnerDomain.JULIAN,
+                ),
+                HealthTarget(
+                    id="health.html",
+                    resource_id="svc.page",
+                    name="Hosted Page",
+                    probe_type=ProbeType.HTML,
+                    target="http://127.0.0.1:8000/",
+                    owner_domain=OwnerDomain.DAX,
+                ),
+            )
+            for target in targets:
+                store.save_health_target(target)
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.mcp.failed",
+                    resource_id="svc.mcp",
+                    target="http://127.0.0.1:8791/health",
+                    probe_type=ProbeType.MCP,
+                    observed_status=HealthStatus.FAILED,
+                    owner_domain=OwnerDomain.JULIAN,
+                    observed_error="connection refused",
+                    recovery_required=True,
+                    captured_at="2026-07-18T18:00:00+00:00",
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.json.healthy",
+                    resource_id="svc.json",
+                    target="http://127.0.0.1:8766/state",
+                    probe_type=ProbeType.JSON,
+                    observed_status=HealthStatus.HEALTHY,
+                    owner_domain=OwnerDomain.JULIAN,
+                    captured_at="2026-07-18T18:01:00+00:00",
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.html.degraded",
+                    resource_id="svc.page",
+                    target="http://127.0.0.1:8000/",
+                    probe_type=ProbeType.HTML,
+                    observed_status=HealthStatus.DEGRADED,
+                    owner_domain=OwnerDomain.DAX,
+                    observed_error="expected content type text/html, got application/json",
+                    recovery_required=True,
+                    captured_at="2026-07-18T18:02:00+00:00",
+                )
+            )
+            store.close()
+
+            status = health_efficiency_summary_status(store_path)
+
+        self.assertEqual(status["targets"], 3)
+        self.assertEqual(status["evidence_records"], 3)
+        self.assertEqual(status["healthy"], 1)
+        self.assertEqual(status["unhealthy"], 2)
+        self.assertEqual(status["recovery_required"], 2)
+        self.assertEqual(status["by_status"][HealthStatus.FAILED.value], 1)
+        self.assertEqual(status["by_status"][HealthStatus.DEGRADED.value], 1)
+        self.assertEqual(status["by_probe_type"][ProbeType.MCP.value], 1)
+        self.assertEqual(status["errors_by_probe_type"][ProbeType.HTML.value], 1)
+        self.assertEqual(status["by_owner"][OwnerDomain.DAX.value], 1)
+        mcp_failure = next(
+            failure for failure in status["latest_failures"] if failure["target_id"] == "health.mcp"
+        )
+        self.assertEqual(mcp_failure["error"], "connection refused")
+        self.assertTrue(mcp_failure["recovery_required"])
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -1459,6 +1549,28 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["security_surfaces"], 1)
             self.assertEqual(status["surfaces"][0]["owner_domain"], OwnerDomain.ODO.value)
+
+    def test_client_reads_health_efficiency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.client",
+                    resource_id="svc.client",
+                    name="Client Health",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8766/health",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.health_efficiency()
+
+            self.assertEqual(status["targets"], 1)
+            self.assertEqual(status["missing_evidence"], 1)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

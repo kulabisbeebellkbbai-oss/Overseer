@@ -40,6 +40,9 @@ class OverseerApiClient:
     def health_summary(self) -> dict[str, Any]:
         return self._get("/health-summary")
 
+    def health_efficiency(self) -> dict[str, Any]:
+        return self._get("/health-efficiency")
+
     def usage_summary(self) -> dict[str, Any]:
         return self._get("/usage-summary")
 

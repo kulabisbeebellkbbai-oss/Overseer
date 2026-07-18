@@ -587,6 +587,40 @@ def health_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def alerts_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        alerts = [event for event in store.list_audit_events() if event.event_type == AuditEventType.ALERT]
+        return {
+            "store": str(store.path),
+            "alerts": len(alerts),
+            "by_risk": {
+                risk.value: sum(1 for event in alerts if event.risk_level == risk)
+                for risk in RiskLevel
+            },
+            "by_owner": {
+                owner.value: sum(1 for event in alerts if event.owner_domain == owner)
+                for owner in OwnerDomain
+            },
+            "events": [audit_event_status(event) for event in alerts],
+        }
+    finally:
+        store.close()
+
+
+def audit_event_status(event: AuditEvent) -> dict[str, object]:
+    return {
+        "id": event.id,
+        "event_type": AuditEventType(event.event_type).value,
+        "subject_id": event.subject_id,
+        "owner_domain": OwnerDomain(event.owner_domain).value,
+        "risk_level": RiskLevel(event.risk_level).value,
+        "summary": event.summary,
+        "evidence_ids": list(event.evidence_ids),
+        "occurred_at": event.occurred_at,
+    }
+
+
 def list_state_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -662,14 +696,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                 for approval in approvals
             ],
             "audit_events": [
-                {
-                    "id": event.id,
-                    "event_type": AuditEventType(event.event_type).value,
-                    "subject_id": event.subject_id,
-                    "owner_domain": OwnerDomain(event.owner_domain).value,
-                    "risk_level": RiskLevel(event.risk_level).value,
-                    "summary": event.summary,
-                }
+                audit_event_status(event)
                 for event in audit_events
             ],
             "runtime_heartbeats": [
@@ -869,6 +896,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_status_parser = subparsers.add_parser("runtime-status", help="read runtime heartbeat and latest host inspection status")
     runtime_status_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     runtime_status_parser.add_argument("--service-name", default="overseer")
+    alerts_summary_parser = subparsers.add_parser("alerts-summary", help="summarize persisted alert audit events")
+    alerts_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
     assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
@@ -994,6 +1023,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "runtime-status":
         print(json.dumps(runtime_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "alerts-summary":
+        print(json.dumps(alerts_summary_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "inspect-host":

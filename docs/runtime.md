@@ -22,6 +22,7 @@ PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli alerts-summary --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3 --fail-on-unhealthy
 ```
@@ -34,6 +35,8 @@ Default freshness thresholds:
 - Host inspection snapshot: `warning` at 120 seconds, `high` at 600 seconds.
 - Missing host inspection evidence is reported as `missing`.
 - Non-OK freshness states persist `alert` audit events with stable IDs so repeated status reads do not flood duplicate records.
+
+`alerts-summary` reports persisted alert audit events only, grouped by risk and owner domain.
 
 ## Local User Service
 

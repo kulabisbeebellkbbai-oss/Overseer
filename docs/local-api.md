@@ -22,6 +22,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /health`
 - `GET /service-status`
 - `GET /runtime-status`
+- `GET /alerts-summary`
 - `GET /health-summary`
 - `GET /host/security`
 - `GET /admin/authorizations-required`
@@ -46,6 +47,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
+`GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 
 ## Python Client
 
@@ -56,6 +58,7 @@ from overseer.client import OverseerApiClient
 
 client = OverseerApiClient(auth_token_file="state/api-token")
 runtime = client.runtime_status()
+alerts = client.alerts_summary()
 summary = client.health_summary()
 snapshot = client.inspect_host()
 plan = client.plan_admin_change(

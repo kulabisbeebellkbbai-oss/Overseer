@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from overseer import (
     ApprovalLevel,
     ApprovalStatus,
+    AuditEvent,
     AuditEventType,
     Claim,
     ClaimStatus,
@@ -96,6 +97,7 @@ from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_claim_status
+from overseer.cli import alerts_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
@@ -707,6 +709,30 @@ class OverseerApiTests(unittest.TestCase):
             self.assertEqual(status["service"]["tick_count"], 3)
             self.assertFalse(status["host_inspection"]["enabled"])
 
+    def test_loopback_api_reports_alerts_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.api.runtime",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.JULIAN,
+                    subject_id="runtime.heartbeat",
+                    summary="runtime heartbeat is stale",
+                    risk_level=RiskLevel.MEDIUM,
+                    evidence_ids=("heartbeat.old",),
+                    occurred_at="2026-07-18T16:00:00+00:00",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path) as server:
+                status = server.get("/alerts-summary")
+
+            self.assertEqual(status["alerts"], 1)
+            self.assertEqual(status["events"][0]["id"], "alert.api.runtime")
+
     def test_loopback_api_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -831,6 +857,29 @@ class OverseerApiClientTests(unittest.TestCase):
                 status = client.runtime_status()
 
             self.assertEqual(status["service"]["tick_count"], 4)
+
+    def test_client_reads_alerts_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.client.host",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="host.inspection",
+                    summary="host inspection is missing",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.alerts_summary()
+
+            self.assertEqual(status["alerts"], 1)
+            self.assertEqual(status["events"][0]["owner_domain"], OwnerDomain.ODO.value)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -963,6 +1012,53 @@ class OverseerApiClientTests(unittest.TestCase):
 
 
 class HostInspectionTests(unittest.TestCase):
+    def test_alerts_summary_reports_only_alert_audit_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.runtime.warning",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.JULIAN,
+                    subject_id="runtime.heartbeat",
+                    summary="runtime heartbeat is stale",
+                    risk_level=RiskLevel.MEDIUM,
+                    evidence_ids=("2026-07-18T16:00:00+00:00",),
+                    occurred_at="2026-07-18T16:00:00+00:00",
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="alert.host.high",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="host.inspection",
+                    summary="host inspection is missing",
+                    risk_level=RiskLevel.HIGH,
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.claim.allowed",
+                    event_type=AuditEventType.ALLOWED,
+                    owner_domain=OwnerDomain.DAX,
+                    subject_id="claim.gateway",
+                    summary="claim allowed",
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            status = alerts_summary_status(store_path)
+
+        self.assertEqual(status["alerts"], 2)
+        self.assertEqual(status["by_risk"][RiskLevel.MEDIUM.value], 1)
+        self.assertEqual(status["by_risk"][RiskLevel.HIGH.value], 1)
+        self.assertEqual(status["by_owner"][OwnerDomain.JULIAN.value], 1)
+        self.assertEqual(status["by_owner"][OwnerDomain.ODO.value], 1)
+        self.assertEqual([event["id"] for event in status["events"]], ["alert.host.high", "alert.runtime.warning"])
+
     def test_freshness_assessment_marks_stale_thresholds(self):
         fresh = assess_freshness(
             "2026-07-18T16:00:00+00:00",

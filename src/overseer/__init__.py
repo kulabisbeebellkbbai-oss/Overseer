@@ -14,6 +14,7 @@ from .core import (
     RiskLevel,
     decide_claim,
 )
+from .health import HealthEvidence, HealthStatus, HealthTarget, ProbeResult, ProbeType, classify_probe, recovery_evidence
 
 __all__ = [
     "ApprovalLevel",
@@ -28,4 +29,11 @@ __all__ = [
     "ResourceType",
     "RiskLevel",
     "decide_claim",
+    "HealthEvidence",
+    "HealthStatus",
+    "HealthTarget",
+    "ProbeResult",
+    "ProbeType",
+    "classify_probe",
+    "recovery_evidence",
 ]

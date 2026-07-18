@@ -12,6 +12,12 @@ from overseer import (
     ResourceType,
     RiskLevel,
     decide_claim,
+    classify_probe,
+    recovery_evidence,
+    HealthStatus,
+    HealthTarget,
+    ProbeResult,
+    ProbeType,
 )
 
 
@@ -161,3 +167,84 @@ class ConflictDecisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HealthClassificationTests(unittest.TestCase):
+    def test_classifies_healthy_json_probe(self):
+        target = HealthTarget(
+            id="mcp.github",
+            resource_id="svc.mcp.github",
+            name="GitHub MCP",
+            probe_type=ProbeType.JSON,
+            target="http://127.0.0.1:8791/health",
+            expected_content_type="application/json",
+        )
+        result = ProbeResult(
+            target=target.target,
+            probe_type=ProbeType.JSON,
+            status_code=200,
+            content_type="application/json; charset=utf-8",
+            body_summary='{"status":"ok"}',
+        )
+
+        evidence = classify_probe(target, result)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+        self.assertFalse(evidence.recovery_required)
+
+    def test_classifies_invalid_json_as_failed(self):
+        target = HealthTarget(
+            id="mcp.bad",
+            resource_id="svc.mcp.bad",
+            name="Bad MCP",
+            probe_type=ProbeType.JSON,
+            target="http://127.0.0.1:9999/health",
+            expected_content_type="application/json",
+        )
+        result = ProbeResult(
+            target=target.target,
+            probe_type=ProbeType.JSON,
+            status_code=200,
+            content_type="application/json",
+            body_summary="invalid json: unexpected token",
+        )
+
+        evidence = classify_probe(target, result)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
+        self.assertTrue(evidence.recovery_required)
+
+    def test_marks_matching_healthy_probe_as_recovered(self):
+        target = HealthTarget(
+            id="page.local",
+            resource_id="svc.page.local",
+            name="Local Page",
+            probe_type=ProbeType.HTML,
+            target="https://local.test/",
+            expected_content_type="text/html",
+        )
+        failed = classify_probe(
+            target,
+            ProbeResult(
+                target=target.target,
+                probe_type=ProbeType.HTML,
+                status_code=503,
+                content_type="text/html",
+                body_summary="service unavailable",
+            ),
+        )
+        healthy = classify_probe(
+            target,
+            ProbeResult(
+                target=target.target,
+                probe_type=ProbeType.HTML,
+                status_code=200,
+                content_type="text/html",
+                body_summary="<html></html>",
+            ),
+        )
+
+        recovered = recovery_evidence(failed, healthy)
+
+        self.assertEqual(recovered.observed_status, HealthStatus.RECOVERED)
+        self.assertFalse(recovered.recovery_required)

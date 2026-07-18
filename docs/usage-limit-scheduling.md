@@ -33,3 +33,11 @@ Overseer should avoid wasting limited service capacity. When a project thread ne
 - requested units
 - thread to resume
 - decision: run now, queue until reset, blocked, or escalate
+
+## Operator Summary
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3
+```
+
+`usage-summary` is Quark's compact read model for persisted service limits. It reports total limits, available capacity, exhausted limits, unknown reset times, low-confidence observations, the next reset timestamp, counts by limit kind, and per-limit details.

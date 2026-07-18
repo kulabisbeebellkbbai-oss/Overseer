@@ -43,6 +43,7 @@ from .runtime_state import (
 )
 from .service import OverseerCoordinator, coordinator_from_store
 from .store import SQLiteStore
+from .usage_limits import LimitKind, UsageLimit
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -636,6 +637,44 @@ def health_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def usage_summary_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        limits = store.list_usage_limits()
+        reset_times = sorted(limit.resets_at for limit in limits if limit.resets_at)
+        return {
+            "store": str(store.path),
+            "limits": len(limits),
+            "available": sum(1 for limit in limits if limit.remaining > 0),
+            "exhausted": sum(1 for limit in limits if limit.is_exhausted()),
+            "unknown_reset": sum(1 for limit in limits if not limit.resets_at),
+            "low_confidence": sum(1 for limit in limits if limit.confidence < 0.5),
+            "next_reset_at": reset_times[0] if reset_times else None,
+            "limits_by_kind": {
+                kind.value: sum(1 for limit in limits if limit.kind == kind)
+                for kind in LimitKind
+            },
+            "items": [usage_limit_status(limit) for limit in limits],
+        }
+    finally:
+        store.close()
+
+
+def usage_limit_status(limit: UsageLimit) -> dict[str, object]:
+    return {
+        "id": limit.id,
+        "resource_id": limit.resource_id,
+        "kind": LimitKind(limit.kind).value,
+        "capacity": limit.capacity,
+        "remaining": limit.remaining,
+        "resets_at": limit.resets_at,
+        "window": limit.window,
+        "observed_at": limit.observed_at,
+        "confidence": limit.confidence,
+        "exhausted": limit.is_exhausted(),
+    }
+
+
 def alerts_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -989,6 +1028,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser = subparsers.add_parser("health-summary", help="summarize latest health evidence per target")
     health_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
+    usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
+    usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
     claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser.add_argument("--claim-id", required=True)
@@ -1147,6 +1188,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         status = health_summary_status(args.store)
         print(json.dumps(status, sort_keys=True))
         return 1 if args.fail_on_unhealthy and status["unhealthy"] else 0
+
+    if args.command == "usage-summary":
+        print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
 
     if args.command == "request-claim":
         print(

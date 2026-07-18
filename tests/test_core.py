@@ -118,6 +118,7 @@ from overseer.cli import run_status
 from overseer.cli import runtime_status
 from overseer.cli import service_status
 from overseer.cli import seed_config_status
+from overseer.cli import usage_summary_status
 
 
 class _JsonHealthHandler(BaseHTTPRequestHandler):
@@ -704,6 +705,46 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
         self.assertEqual(status["latest_audit_events"][0]["subject_id"], "admin.restart.summary")
 
+    def test_usage_summary_reports_capacity_and_reset_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.available",
+                    resource_id="svc.ai",
+                    kind=LimitKind.REQUESTS,
+                    capacity=100,
+                    remaining=40,
+                    resets_at="2026-07-18T18:00:00+00:00",
+                    window="daily",
+                    confidence=1.0,
+                )
+            )
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.exhausted",
+                    resource_id="svc.render",
+                    kind=LimitKind.CREDITS,
+                    capacity=10,
+                    remaining=0,
+                    resets_at=None,
+                    window="monthly",
+                    confidence=0.4,
+                )
+            )
+            store.close()
+
+            status = usage_summary_status(store_path)
+
+        self.assertEqual(status["limits"], 2)
+        self.assertEqual(status["available"], 1)
+        self.assertEqual(status["exhausted"], 1)
+        self.assertEqual(status["unknown_reset"], 1)
+        self.assertEqual(status["low_confidence"], 1)
+        self.assertEqual(status["next_reset_at"], "2026-07-18T18:00:00+00:00")
+        self.assertEqual(status["limits_by_kind"][LimitKind.REQUESTS.value], 1)
+
 
 class OverseerApiTests(unittest.TestCase):
     def test_loopback_api_reports_health_and_state(self):
@@ -938,6 +979,30 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["alerts"], 1)
             self.assertEqual(status["events"][0]["owner_domain"], OwnerDomain.ODO.value)
+
+    def test_client_reads_usage_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.client",
+                    resource_id="svc.client.limited",
+                    kind=LimitKind.TOKENS,
+                    capacity=1000,
+                    remaining=250,
+                    resets_at="2026-07-18T19:00:00+00:00",
+                    window="hourly",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.usage_summary()
+
+            self.assertEqual(status["limits"], 1)
+            self.assertEqual(status["items"][0]["kind"], LimitKind.TOKENS.value)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

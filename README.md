@@ -38,5 +38,6 @@ The first release should include a working initial slice for every major domain:
 - Security monitoring: `docs/security-monitoring.md`
 - Usage-limit scheduling: `docs/usage-limit-scheduling.md`
 - Local in-memory registry: `docs/local-registry.md`
+- Approval and audit records: `docs/approval-and-audit.md`
 
 No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.

@@ -2,9 +2,12 @@ import unittest
 
 from overseer import (
     ApprovalLevel,
+    ApprovalStatus,
+    AuditEventType,
     Claim,
     ClaimStatus,
     ClaimType,
+    ConflictDecision,
     ConflictOutcome,
     OwnerDomain,
     Resource,
@@ -35,7 +38,9 @@ from overseer import (
     SecuritySignalType,
     SecurityStatus,
     UsageLimit,
+    approval_from_decision,
     assess_maintenance_readiness,
+    audit_event_from_decision,
     can_close_maintenance,
     physical_identity_conflicts,
     recommend_security_response,
@@ -635,6 +640,65 @@ class CliDemoTests(unittest.TestCase):
         self.assertEqual(status["resources"], ["gateway.protected"])
         self.assertEqual(status["decision"], ConflictOutcome.ESCALATE.value)
         self.assertEqual(status["approval"], ApprovalLevel.SISKO.value)
+
+
+class ApprovalAuditTests(unittest.TestCase):
+    def test_creates_approval_request_for_escalated_claim_decision(self):
+        registry = ResourceRegistry()
+        registry.register_resource(
+            Resource(
+                id="gateway.protected",
+                name="Protected Gateway",
+                type=ResourceType.VIRTUAL_ASSET,
+                owner_domain=OwnerDomain.DAX,
+                risk_level=RiskLevel.HIGH,
+            )
+        )
+        record = registry.request_claim(
+            Claim(
+                id="claim.gateway.audit",
+                resource_id="gateway.protected",
+                claim_type=ClaimType.LEASE,
+                owner_thread="thread-a",
+                owner_role=OwnerDomain.DAX,
+                intent="change gateway",
+                requested_action="modify route",
+                risk_level=RiskLevel.HIGH,
+            )
+        )
+
+        approval = approval_from_decision(
+            "approval.gateway.audit",
+            record.claim.id,
+            record.claim.owner_thread,
+            record.claim.owner_role,
+            record.decision,
+            ("health.gateway.before",),
+        )
+
+        self.assertIsNotNone(approval)
+        self.assertEqual(approval.status, ApprovalStatus.PENDING)
+        self.assertEqual(approval.approval_level, ApprovalLevel.SISKO)
+        self.assertFalse(approval.can_execute())
+
+    def test_maps_queue_decision_to_audit_event(self):
+        decision = ConflictDecision(
+            outcome=ConflictOutcome.QUEUE,
+            reason="resource already claimed",
+            blocking_claim_ids=("claim.active",),
+        )
+
+        event = audit_event_from_decision(
+            "audit.queue",
+            "claim.waiting",
+            OwnerDomain.DAX,
+            RiskLevel.MEDIUM,
+            decision,
+            ("claim.active",),
+        )
+
+        self.assertEqual(event.event_type, AuditEventType.QUEUED)
+        self.assertEqual(event.evidence_ids, ("claim.active",))
 
 
 if __name__ == "__main__":

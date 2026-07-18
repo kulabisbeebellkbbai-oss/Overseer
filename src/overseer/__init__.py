@@ -1,4 +1,12 @@
 """Overseer local resource coordination core."""
+from .audit import (
+    ApprovalRequest,
+    ApprovalStatus,
+    AuditEvent,
+    AuditEventType,
+    approval_from_decision,
+    audit_event_from_decision,
+)
 from .core import (
     ApprovalLevel,
     Claim,
@@ -45,6 +53,12 @@ from .usage_limits import (
 )
 
 __all__ = [
+    "ApprovalRequest",
+    "ApprovalStatus",
+    "AuditEvent",
+    "AuditEventType",
+    "approval_from_decision",
+    "audit_event_from_decision",
     "ApprovalLevel",
     "Claim",
     "ClaimStatus",

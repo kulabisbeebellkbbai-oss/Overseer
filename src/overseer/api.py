@@ -24,6 +24,7 @@ from .cli import (
     health_efficiency_summary_status,
     health_summary_status,
     host_security_findings_status,
+    host_security_triage_status,
     inspect_host_status,
     list_state_status,
     maintenance_summary_status,
@@ -94,6 +95,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/findings":
                 self._handle(lambda: host_security_findings_status(store_path))
+                return
+            if self.path == "/host/security/triage":
+                self._handle(lambda: host_security_triage_status(store_path))
                 return
             if self.path == "/admin/authorizations-required":
                 self._handle(lambda: authorizations_required_status(store_path))

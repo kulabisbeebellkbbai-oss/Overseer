@@ -34,6 +34,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /health-efficiency`
 - `GET /host/security`
 - `GET /host/security/findings`
+- `GET /host/security/triage`
 - `GET /admin/authorizations-required`
 - `GET /admin/executions`
 - `GET /admin/summary`
@@ -68,6 +69,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 `GET /security-summary` returns Odo's compact view of security surfaces, alert audit events, latest host security findings, and protective firewall/block plans.
 `GET /host/security/findings` returns Odo's detailed host-security finding list, severity counts, evidence lines, and recommended actions from the latest persisted host snapshot.
+`GET /host/security/triage` groups Odo's host-security findings by listener, bind scope, severity, evidence, and read-only mitigation path. It does not change firewall, route, IDS, or service-bind state.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
@@ -94,6 +96,7 @@ efficiency = client.health_efficiency()
 summary = client.health_summary()
 snapshot = client.inspect_host()
 findings = client.host_security_findings()
+triage = client.host_security_triage()
 plan = client.plan_admin_change(
     {
         "plan_id": "admin.restart.overseer-api",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -1037,6 +1038,117 @@ def host_security_findings_status(
     }
 
 
+def host_security_triage_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    findings_status = host_security_findings_status(store_path, snapshot_id)
+    findings = findings_status["findings"]
+    groups = host_security_triage_groups(findings)
+    return {
+        "store": findings_status["store"],
+        "snapshot_id": findings_status["snapshot_id"],
+        "captured_at": findings_status["captured_at"],
+        "hostname": findings_status["hostname"],
+        "finding_count": findings_status["finding_count"],
+        "by_severity": findings_status["by_severity"],
+        "listener_groups": groups,
+        "group_count": len(groups),
+        "approval_boundary": (
+            "read-only triage only; firewall, IDS, route, service bind, or listener changes require "
+            "separate explicit approval and Intrusion Detection review"
+        ),
+    }
+
+
+def host_security_triage_groups(findings: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for finding in findings:
+        listener = listener_from_finding(finding)
+        key = listener["local"]
+        group = grouped.setdefault(
+            key,
+            {
+                "local": listener["local"],
+                "address": listener["address"],
+                "port": listener["port"],
+                "bind_scope": listener["bind_scope"],
+                "severity": finding["severity"],
+                "finding_ids": [],
+                "evidence": [],
+                "recommended_actions": set(),
+            },
+        )
+        group["finding_ids"].append(finding["id"])
+        group["evidence"].append(finding["evidence"])
+        group["recommended_actions"].add(finding["recommended_action"])
+        if finding["severity"] == HostFindingSeverity.HIGH.value:
+            group["severity"] = HostFindingSeverity.HIGH.value
+    triage_groups = []
+    for group in grouped.values():
+        recommended_path = host_security_recommended_path(str(group["bind_scope"]), str(group["severity"]))
+        triage_groups.append(
+            {
+                "local": group["local"],
+                "address": group["address"],
+                "port": group["port"],
+                "bind_scope": group["bind_scope"],
+                "severity": group["severity"],
+                "finding_ids": sorted(group["finding_ids"]),
+                "finding_count": len(group["finding_ids"]),
+                "evidence": sorted(group["evidence"]),
+                "recommended_actions": sorted(group["recommended_actions"]),
+                "recommended_mitigation_path": recommended_path,
+                "requires_approval": True,
+            }
+        )
+    return sorted(triage_groups, key=lambda item: (item["severity"] != HostFindingSeverity.HIGH.value, item["local"]))
+
+
+def listener_from_finding(finding: dict[str, object]) -> dict[str, object]:
+    summary = str(finding["summary"])
+    match = re.search(r" on (?P<local>\S+)$", summary)
+    local = match.group("local") if match else "unknown"
+    address, port = split_listener_address_port(local)
+    return {
+        "local": local,
+        "address": address,
+        "port": port,
+        "bind_scope": listener_bind_scope(address),
+    }
+
+
+def split_listener_address_port(local: str) -> tuple[str, str]:
+    if local.startswith("[") and "]:" in local:
+        address, port = local.rsplit("]:", 1)
+        return f"{address}]", port
+    if ":" not in local:
+        return local, ""
+    address, port = local.rsplit(":", 1)
+    return address, port
+
+
+def listener_bind_scope(address: str) -> str:
+    if address in {"0.0.0.0", "*", "[::]", "::"}:
+        return "all_interfaces"
+    if address in {"127.0.0.1", "::1", "[::1]", "localhost"}:
+        return "loopback"
+    if address == "unknown":
+        return "unknown"
+    return "non_loopback_specific"
+
+
+def host_security_recommended_path(bind_scope: str, severity: str) -> str:
+    if bind_scope == "all_interfaces":
+        return (
+            "prepare approval-gated exposure review; prefer rebinding to the intended local interface "
+            "or staging source-scoped firewall and IDS rules before enforcement"
+        )
+    if severity == HostFindingSeverity.WARNING.value:
+        return (
+            "confirm expected clients and interface; document service owner, then stage allowlist and "
+            "monitoring changes only if exposure is intentional"
+        )
+    return "capture fresh evidence and assign Odo review before any mitigation"
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -1646,6 +1758,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     host_findings_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_findings_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     host_findings_parser.add_argument("--severity", choices=[item.value for item in HostFindingSeverity])
+    host_triage_parser = subparsers.add_parser("host-security-triage", help="group host security findings by listener")
+    host_triage_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    host_triage_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     admin_plan_parser = subparsers.add_parser("plan-admin-change", help="prepare an approval-gated admin change plan")
     admin_plan_parser.add_argument("--store", help="explicit SQLite store path for persisting the admin change plan")
     admin_plan_parser.add_argument("--plan-id", required=True)
@@ -1816,6 +1931,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-findings":
         print(json.dumps(host_security_findings_status(args.store, args.snapshot_id, args.severity), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-triage":
+        print(json.dumps(host_security_triage_status(args.store, args.snapshot_id), sort_keys=True))
         return 0
 
     if args.command == "plan-admin-change":

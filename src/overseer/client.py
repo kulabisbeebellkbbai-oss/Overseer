@@ -85,6 +85,9 @@ class OverseerApiClient:
     def host_security_findings(self) -> dict[str, Any]:
         return self._get("/host/security/findings")
 
+    def host_security_triage(self) -> dict[str, Any]:
+        return self._get("/host/security/triage")
+
     def plan_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/plans", payload)
 

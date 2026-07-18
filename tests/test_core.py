@@ -112,6 +112,7 @@ from overseer.cli import execute_admin_change_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import host_security_findings_status
+from overseer.cli import host_security_triage_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
@@ -1698,6 +1699,36 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["finding_count"], 1)
             self.assertEqual(status["findings"][0]["severity"], HostFindingSeverity.HIGH.value)
 
+    def test_client_reads_host_security_triage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.host_security_triage()
+
+            self.assertEqual(status["snapshot_id"], snapshot.id)
+            self.assertEqual(status["group_count"], 1)
+            self.assertEqual(status["listener_groups"][0]["port"], "22")
+
     def test_client_reads_health_efficiency(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2090,6 +2121,48 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(high["finding_count"], 1)
         self.assertIn("0.0.0.0:22", high["findings"][0]["summary"])
         self.assertIn("recommended_action", high["findings"][0])
+
+    def test_host_security_triage_groups_findings_by_listener_and_approval_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-d"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*\n"
+                        "LISTEN 0 5 192.168.1.20:8080 0.0.0.0:*\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:04:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = host_security_triage_status(store_path)
+
+        self.assertEqual(status["snapshot_id"], snapshot.id)
+        self.assertEqual(status["finding_count"], 2)
+        self.assertEqual(status["group_count"], 2)
+        self.assertIn("Intrusion Detection review", status["approval_boundary"])
+        high_group = next(group for group in status["listener_groups"] if group["local"] == "0.0.0.0:22")
+        warning_group = next(group for group in status["listener_groups"] if group["local"] == "192.168.1.20:8080")
+        self.assertEqual(high_group["address"], "0.0.0.0")
+        self.assertEqual(high_group["port"], "22")
+        self.assertEqual(high_group["bind_scope"], "all_interfaces")
+        self.assertEqual(high_group["severity"], HostFindingSeverity.HIGH.value)
+        self.assertTrue(high_group["requires_approval"])
+        self.assertIn("approval-gated", high_group["recommended_mitigation_path"])
+        self.assertEqual(warning_group["bind_scope"], "non_loopback_specific")
+        self.assertIn("confirm expected clients", warning_group["recommended_mitigation_path"])
 
     def test_runtime_status_reports_latest_host_security_counts(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -76,10 +76,10 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
 `GET /admin/execution-readiness` explains each admin plan's execution gate state, including approval, missing fields, IDS review, manual execution, and Overseer-supported execution readiness.
 `GET /admin/history-review` identifies completed and canceled admin plans that are candidates for future archive support. It is read-only and does not delete plans or audit evidence.
-`GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, and recent admin audit events.
+`GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, and recent admin audit events.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
-`GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
+`GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, admin archive candidates, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.

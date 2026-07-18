@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 import json
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -733,6 +734,7 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["executions"], 1)
         self.assertEqual(status["executions_by_status"][AdminExecutionStatus.BLOCKED.value], 1)
         self.assertEqual(status["latest_audit_events"][0]["subject_id"], "admin.restart.summary")
+        self.assertEqual(status["history_review"]["active_or_pending"], 1)
 
     def test_admin_execution_readiness_explains_plan_gates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1391,6 +1393,23 @@ class HealthSummaryTests(unittest.TestCase):
                     "not blocked",
                 )
             )
+            completed = plan_user_service_restart(
+                "admin.restart.dashboard.completed",
+                "overseer-api.service",
+                "reload old dashboard code",
+                "active",
+            )
+            completed = replace(completed, approved=True, approved_by="sisko", approved_at="2026-07-18T00:00:00Z")
+            store.save_admin_change_plan(completed)
+            store.save_admin_execution(
+                AdminExecutionResult(
+                    id="admin.exec.admin.restart.dashboard.completed.completed",
+                    plan_id=completed.id,
+                    status=AdminExecutionStatus.COMPLETED,
+                    summary="admin change completed and verified",
+                    command_results=(),
+                )
+            )
             store.close()
             prepare_host_security_ids_review_package_status(
                 store_path,
@@ -1407,12 +1426,15 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["attention"]["security_alerts"], 1)
         self.assertEqual(status["attention"]["security_pending_authorizations"], 1)
         self.assertEqual(status["attention"]["security_ids_review_gate_blocked"], 1)
+        self.assertEqual(status["attention"]["admin_archive_candidates"], 1)
         self.assertEqual(status["role_focus"]["sisko"]["pending_authorizations"], 1)
+        self.assertEqual(status["role_focus"]["sisko"]["admin_archive_candidates"], 1)
         self.assertEqual(status["role_focus"]["odo"]["alerts"], 1)
         self.assertEqual(status["role_focus"]["odo"]["ids_review_gate_blocked"], 1)
         self.assertEqual(status["role_focus"]["quark"]["exhausted"], 1)
         self.assertEqual(status["role_focus"]["julian"]["latest_failures"], 1)
         self.assertIn("command", status["summaries"])
+        self.assertIn("admin_history", status["summaries"])
         self.assertIn("health_efficiency", status["summaries"])
 
 

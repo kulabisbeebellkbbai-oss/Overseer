@@ -734,6 +734,7 @@ def health_failure_status(summary) -> dict[str, object]:
 
 def operator_dashboard_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
     command = command_summary_status(store_path, service_name)
+    admin_history = admin_history_review_status(store_path)
     physical = physical_summary_status(store_path)
     virtual = virtual_summary_status(store_path)
     maintenance = maintenance_summary_status(store_path)
@@ -741,7 +742,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
     usage = usage_summary_status(store_path)
     health = health_summary_status(store_path)
     health_efficiency = health_efficiency_summary_status(store_path)
-    attention = operator_dashboard_attention(command, physical, virtual, maintenance, security, usage, health_efficiency)
+    attention = operator_dashboard_attention(command, admin_history, physical, virtual, maintenance, security, usage, health_efficiency)
     return {
         "store": command["store"],
         "service_name": service_name,
@@ -753,6 +754,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
                 "queued_claims": attention["queued_claims"],
                 "blocked_claims": attention["blocked_claims"],
                 "service_freshness": attention["service_freshness"],
+                "admin_archive_candidates": attention["admin_archive_candidates"],
             },
             "kira": {
                 "assets": physical["assets"],
@@ -790,6 +792,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
         },
         "summaries": {
             "command": command,
+            "admin_history": admin_history,
             "physical": physical,
             "virtual": virtual,
             "maintenance": maintenance,
@@ -803,6 +806,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
 
 def operator_dashboard_attention(
     command: dict[str, object],
+    admin_history: dict[str, object],
     physical: dict[str, object],
     virtual: dict[str, object],
     maintenance: dict[str, object],
@@ -823,6 +827,7 @@ def operator_dashboard_attention(
         "pending_claim_approvals": claims["pending_approvals"],
         "queued_claims": claims["queued"],
         "blocked_claims": claims["blocked"],
+        "admin_archive_candidates": admin_history["archive_candidates"],
         "unhealthy_health_targets": health_efficiency["unhealthy"],
         "recovery_required": health_efficiency["recovery_required"],
         "latest_failures": len(health_efficiency["latest_failures"]),
@@ -858,6 +863,7 @@ def operator_dashboard_overall_status(attention: dict[str, object]) -> str:
     warning_keys = (
         "pending_claim_approvals",
         "queued_claims",
+        "admin_archive_candidates",
         "exhausted_usage_limits",
         "low_confidence_usage_limits",
         "physical_power_risk",
@@ -1854,6 +1860,11 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             for plan in plans
             if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
         ]
+        history_review = _admin_history_review_payload(
+            store.path,
+            plans,
+            {result.plan_id: result for result in executions},
+        )
         return {
             "store": str(store.path),
             "plans": len(plans),
@@ -1867,6 +1878,11 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                 for status in AdminExecutionStatus
             },
             "latest_audit_events": [audit_event_status(event) for event in audit_events[-5:]],
+            "history_review": {
+                "archive_candidates": history_review["archive_candidates"],
+                "active_or_pending": history_review["active_or_pending"],
+                "by_disposition": history_review["by_disposition"],
+            },
             "pending": [
                 authorization_required_status_with_ids_review(
                     plan,
@@ -1920,30 +1936,40 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
 def admin_history_review_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        plans = store.list_admin_change_plans()
-        executions_by_plan = {result.plan_id: result for result in store.list_admin_executions()}
-        items = [
-            admin_history_review_item_status(plan, executions_by_plan.get(plan.id))
-            for plan in plans
-        ]
-        return {
-            "store": str(store.path),
-            "plans": len(plans),
-            "archive_candidates": sum(1 for item in items if item["archive_candidate"]),
-            "active_or_pending": sum(1 for item in items if item["disposition"] == "retain_active"),
-            "by_disposition": {
-                disposition: sum(1 for item in items if item["disposition"] == disposition)
-                for disposition in (
-                    "archive_completed",
-                    "archive_canceled",
-                    "review_failed_execution",
-                    "retain_active",
-                )
-            },
-            "items": items,
-        }
+        return _admin_history_review_payload(
+            store.path,
+            store.list_admin_change_plans(),
+            {result.plan_id: result for result in store.list_admin_executions()},
+        )
     finally:
         store.close()
+
+
+def _admin_history_review_payload(
+    store_path: Path,
+    plans: Sequence[AdminChangePlan],
+    executions_by_plan: dict[str, AdminExecutionResult],
+) -> dict[str, object]:
+    items = [
+        admin_history_review_item_status(plan, executions_by_plan.get(plan.id))
+        for plan in plans
+    ]
+    return {
+        "store": str(store_path),
+        "plans": len(plans),
+        "archive_candidates": sum(1 for item in items if item["archive_candidate"]),
+        "active_or_pending": sum(1 for item in items if item["disposition"] == "retain_active"),
+        "by_disposition": {
+            disposition: sum(1 for item in items if item["disposition"] == disposition)
+            for disposition in (
+                "archive_completed",
+                "archive_canceled",
+                "review_failed_execution",
+                "retain_active",
+            )
+        },
+        "items": items,
+    }
 
 
 def admin_history_review_item_status(

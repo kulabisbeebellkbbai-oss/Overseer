@@ -113,6 +113,7 @@ from overseer.cli import execute_admin_change_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import host_security_findings_status
+from overseer.cli import host_security_sources_status
 from overseer.cli import host_security_triage_status
 from overseer.cli import inspect_host_status
 from overseer.cli import list_state_status
@@ -1731,6 +1732,39 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["group_count"], 1)
             self.assertEqual(status["listener_groups"][0]["port"], "22")
 
+    def test_client_reads_host_security_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53122"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.host_security_sources()
+
+            self.assertEqual(status["snapshot_id"], snapshot.id)
+            self.assertEqual(status["connection_count"], 1)
+            self.assertEqual(status["connections"][0]["remote_address"], "8.8.8.8")
+            self.assertEqual(status["connections"][0]["source_scope"], "external")
+
     def test_client_plans_host_security_remediation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2020,6 +2054,7 @@ class HostInspectionTests(unittest.TestCase):
                 ("uname", "-a"): "Linux workstation test-kernel\n",
                 ("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"): "overseer.service loaded active running\n",
                 ("ss", "-ltnp"): "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*\n",
+                ("ss", "-tnp"): "ESTAB 0 0 127.0.0.1:8766 127.0.0.1:40000\n",
                 ("df", "-h", "--output=source,size,used,avail,pcent,target"): "Filesystem Size Used Avail Use% Mounted on\n/dev/root 20G 10G 10G 50% /\n",
             }[tuple(command)]
             return HostCommandObservation(
@@ -2039,6 +2074,7 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(snapshot.hostname, "workstation")
         self.assertEqual(snapshot.os_release["ID"], "debian")
         self.assertEqual(snapshot.observation("ss").stdout, "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*")
+        self.assertEqual(snapshot.observation("ss-established").stdout, "ESTAB 0 0 127.0.0.1:8766 127.0.0.1:40000")
         self.assertIn(("df", "-h", "--output=source,size,used,avail,pcent,target"), commands)
 
     def test_host_snapshot_persists_and_appears_in_state(self):
@@ -2062,7 +2098,7 @@ class HostInspectionTests(unittest.TestCase):
 
         self.assertEqual(loaded.hostname, "host-a")
         self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
-        self.assertEqual(state["host_snapshots"][0]["observation_count"], 4)
+        self.assertEqual(state["host_snapshots"][0]["observation_count"], 5)
 
     def test_host_security_assessment_flags_non_loopback_listeners(self):
         snapshot = HostInspectionAdapter(
@@ -2197,6 +2233,51 @@ class HostInspectionTests(unittest.TestCase):
         self.assertIn("approval-gated", high_group["recommended_mitigation_path"])
         self.assertEqual(warning_group["bind_scope"], "non_loopback_specific")
         self.assertIn("confirm expected clients", warning_group["recommended_mitigation_path"])
+
+    def test_host_security_sources_correlates_remote_addresses_to_listeners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-sources"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53122\n"
+                        "ESTAB 0 0 192.168.1.20:22 192.0.2.10:54000\n"
+                        "ESTAB 0 0 127.0.0.1:8766 127.0.0.1:42000\n"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:06:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = host_security_sources_status(store_path)
+
+        self.assertEqual(status["snapshot_id"], snapshot.id)
+        self.assertEqual(status["connection_count"], 2)
+        self.assertEqual(status["by_source_scope"]["external"], 1)
+        self.assertEqual(status["by_source_scope"]["documentation"], 1)
+        connection = next(item for item in status["connections"] if item["remote_address"] == "8.8.8.8")
+        documentation_connection = next(item for item in status["connections"] if item["remote_address"] == "192.0.2.10")
+        self.assertEqual(connection["listener"], "0.0.0.0:22")
+        self.assertEqual(connection["local_port"], "22")
+        self.assertEqual(connection["remote"], "8.8.8.8:53122")
+        self.assertEqual(connection["source_scope"], "external")
+        self.assertTrue(connection["can_stage_block_plan"])
+        self.assertEqual(documentation_connection["source_scope"], "documentation")
+        self.assertFalse(documentation_connection["can_stage_block_plan"])
+        self.assertIn("read-only source correlation", status["correlation_boundary"])
 
     def test_host_security_remediation_stages_deny_plan_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

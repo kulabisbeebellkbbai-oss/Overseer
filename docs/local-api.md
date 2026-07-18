@@ -35,6 +35,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security`
 - `GET /host/security/findings`
 - `GET /host/security/triage`
+- `GET /host/security/sources`
 - `GET /admin/authorizations-required`
 - `GET /admin/executions`
 - `GET /admin/summary`
@@ -71,6 +72,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /security-summary` returns Odo's compact view of security surfaces, alert audit events, latest host security findings, and protective firewall/block plans.
 `GET /host/security/findings` returns Odo's detailed host-security finding list, severity counts, evidence lines, and recommended actions from the latest persisted host snapshot.
 `GET /host/security/triage` groups Odo's host-security findings by listener, bind scope, severity, evidence, and read-only mitigation path. It does not change firewall, route, IDS, or service-bind state.
+`GET /host/security/sources` correlates established TCP remote sources to triaged listeners and reports source scope. It is evidence only; it does not declare a source hostile or change firewall, IDS, route, or service-bind state.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, and per-asset detail for Kira review.
@@ -99,6 +101,7 @@ summary = client.health_summary()
 snapshot = client.inspect_host()
 findings = client.host_security_findings()
 triage = client.host_security_triage()
+sources = client.host_security_sources()
 remediation = client.plan_host_security_remediation({"listener": "0.0.0.0:22"})
 plan = client.plan_admin_change(
     {

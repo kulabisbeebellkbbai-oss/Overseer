@@ -70,10 +70,18 @@ class HostInspectionAdapter:
     def inspect(self, captured_at: str | None = None) -> HostInspectionSnapshot:
         captured = captured_at or datetime.now(UTC).isoformat()
         hostname = self.command_runner(("hostname",), self.timeout_seconds).stdout.strip()
+        established_tcp = self.command_runner(("ss", "-tnp"), self.timeout_seconds)
         observations = (
             self.command_runner(("uname", "-a"), self.timeout_seconds),
             self.command_runner(("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"), self.timeout_seconds),
             self.command_runner(("ss", "-ltnp"), self.timeout_seconds),
+            HostCommandObservation(
+                name="ss-established",
+                command=established_tcp.command,
+                exit_code=established_tcp.exit_code,
+                stdout=established_tcp.stdout,
+                stderr=established_tcp.stderr,
+            ),
             self.command_runner(("df", "-h", "--output=source,size,used,avail,pcent,target"), self.timeout_seconds),
         )
         return HostInspectionSnapshot(

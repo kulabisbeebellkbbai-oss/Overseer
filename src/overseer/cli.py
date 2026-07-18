@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 from collections.abc import Sequence
@@ -31,7 +32,7 @@ from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, Resour
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
-from .host import HostFindingSeverity, HostInspectionAdapter, host_security_status, host_snapshot_status
+from .host import HostFindingSeverity, HostInspectionAdapter, HostInspectionSnapshot, host_security_status, host_snapshot_status
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity
 from .physical_discovery import PathPhysicalDiscoveryAdapter
@@ -1184,6 +1185,144 @@ def plan_host_security_remediation_status(
         store.close()
 
 
+def host_security_sources_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        if snapshot_id is not None:
+            snapshot = store.load_host_snapshot(snapshot_id)
+        else:
+            snapshots = store.list_host_snapshots()
+            if not snapshots:
+                raise ValueError("no host snapshots are available")
+            snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1]
+    finally:
+        store.close()
+    triage = host_security_triage_status(store_path, snapshot.id)
+    connections = host_security_source_connections(snapshot, triage["listener_groups"])
+    return {
+        "store": str(Path(store_path)),
+        "snapshot_id": snapshot.id,
+        "captured_at": snapshot.captured_at,
+        "hostname": snapshot.hostname,
+        "connection_count": len(connections),
+        "connections": connections,
+        "by_source_scope": {
+            scope: sum(1 for connection in connections if connection["source_scope"] == scope)
+            for scope in ("loopback", "private", "documentation", "link_local", "multicast", "external", "unknown")
+        },
+        "correlation_boundary": (
+            "read-only source correlation only; hostile classification, blocking, firewall, IDS, route, "
+            "or service-bind changes require separate evidence review and approval"
+        ),
+    }
+
+
+def host_security_source_connections(
+    snapshot: HostInspectionSnapshot,
+    listener_groups: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    try:
+        ss_output = snapshot.observation("ss-established").stdout
+    except KeyError:
+        return []
+    connections = []
+    for index, line in enumerate(ss_output.splitlines()):
+        if "ESTAB" not in line:
+            continue
+        local, peer = established_tcp_sockets(line)
+        if not local or not peer:
+            continue
+        local_address, local_port = split_listener_address_port(local)
+        peer_address, peer_port = split_listener_address_port(peer)
+        listener = matching_listener_group(local_address, local_port, listener_groups)
+        if listener is None:
+            continue
+        source_scope = source_address_scope(peer_address)
+        connections.append(
+            {
+                "id": f"source.{snapshot.id}.{index}",
+                "listener": listener["local"],
+                "listener_severity": listener["severity"],
+                "local": local,
+                "local_address": local_address,
+                "local_port": local_port,
+                "remote": peer,
+                "remote_address": peer_address,
+                "remote_port": peer_port,
+                "source_scope": source_scope,
+                "evidence": line.strip(),
+                "recommended_action": source_recommended_action(source_scope),
+                "can_stage_block_plan": source_scope == "external",
+                "requires_approval": True,
+            }
+        )
+    return sorted(connections, key=lambda item: (item["listener"], item["remote_address"], item["remote_port"]))
+
+
+def established_tcp_sockets(line: str) -> tuple[str, str]:
+    columns = line.split()
+    if len(columns) < 5:
+        return "", ""
+    return columns[3], columns[4]
+
+
+def matching_listener_group(
+    local_address: str,
+    local_port: str,
+    listener_groups: Sequence[dict[str, object]],
+) -> dict[str, object] | None:
+    for group in listener_groups:
+        if str(group["port"]) != local_port:
+            continue
+        listener_address = str(group["address"])
+        if listener_address in {"0.0.0.0", "*", "[::]", "::"} or listener_address == local_address:
+            return group
+    return None
+
+
+def source_address_scope(address: str) -> str:
+    normalized = address.strip("[]")
+    try:
+        parsed = ipaddress.ip_address(normalized)
+    except ValueError:
+        return "unknown"
+    if parsed.is_loopback:
+        return "loopback"
+    if parsed.is_link_local:
+        return "link_local"
+    if parsed.is_multicast:
+        return "multicast"
+    if is_documentation_address(parsed):
+        return "documentation"
+    if parsed.is_private:
+        return "private"
+    if parsed.is_global:
+        return "external"
+    return "unknown"
+
+
+def is_documentation_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    documentation_networks = (
+        ipaddress.ip_network("192.0.2.0/24"),
+        ipaddress.ip_network("198.51.100.0/24"),
+        ipaddress.ip_network("203.0.113.0/24"),
+        ipaddress.ip_network("2001:db8::/32"),
+    )
+    return any(address in network for network in documentation_networks)
+
+
+def source_recommended_action(source_scope: str) -> str:
+    if source_scope == "external":
+        return "review source evidence with Odo before staging any block plan"
+    if source_scope in {"private", "link_local"}:
+        return "confirm the source is an expected local client before changing policy"
+    if source_scope == "loopback":
+        return "treat as local process traffic and correlate with process ownership"
+    if source_scope == "documentation":
+        return "documentation-range address; use only as test evidence unless observed on a live interface"
+    return "capture fresh source evidence before any remediation"
+
+
 def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
     return {
         "id": plan.id,
@@ -1800,6 +1939,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     host_triage_parser = subparsers.add_parser("host-security-triage", help="group host security findings by listener")
     host_triage_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_triage_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    host_sources_parser = subparsers.add_parser("host-security-sources", help="correlate established TCP sources to host security listeners")
+    host_sources_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    host_sources_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     host_remediation_parser = subparsers.add_parser(
         "plan-host-security-remediation",
         help="stage an approval-gated host security remediation plan",
@@ -1984,6 +2126,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-triage":
         print(json.dumps(host_security_triage_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-sources":
+        print(json.dumps(host_security_sources_status(args.store, args.snapshot_id), sort_keys=True))
         return 0
 
     if args.command == "plan-host-security-remediation":

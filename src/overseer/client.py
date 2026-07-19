@@ -171,6 +171,12 @@ class OverseerApiClient:
     def admin_adapter_capabilities(self) -> dict[str, Any]:
         return self._get("/admin/adapter-capabilities")
 
+    def admin_adapter_enablement_plan(self, kind: str | None = None) -> dict[str, Any]:
+        path = "/admin/adapter-enablement-plan"
+        if kind is not None:
+            path = f"{path}?{urlencode({'kind': kind})}"
+        return self._get(path)
+
     def admin_executions(self) -> dict[str, Any]:
         return self._get("/admin/executions")
 

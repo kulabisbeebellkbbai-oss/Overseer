@@ -69,6 +69,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api` - execute an approved user-service restart plan and persist the execution result.
 - `PYTHONPATH=src python3 -m overseer.cli admin-executions --store state/overseer.sqlite3` - list persisted admin execution results.
 - `PYTHONPATH=src python3 -m overseer.cli admin-adapter-capabilities` - list which live admin adapter classes are enabled, disabled pending approval, or unsupported.
+- `PYTHONPATH=src python3 -m overseer.cli admin-adapter-enablement-plan --kind block_ip` - prepare a read-only high-risk approval plan before enabling a disabled live admin adapter.
 - `PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqlite3` - summarize admin plans, pending approvals, execution outcomes, archive candidates, restore approvals, and admin audit events.
 - `PYTHONPATH=src python3 -m overseer.cli admin-execution-readiness --store state/overseer.sqlite3` - summarize which admin plans are ready for Overseer execution, need approval, need IDS review, or require manual execution.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-review --store state/overseer.sqlite3` - identify completed or canceled admin plans that are candidates for future archive support without deleting them.

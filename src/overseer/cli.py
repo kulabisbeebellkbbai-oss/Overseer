@@ -1905,6 +1905,88 @@ def admin_adapter_capabilities_status() -> dict[str, object]:
     }
 
 
+def admin_adapter_enablement_plan_status(kind: str | None = None) -> dict[str, object]:
+    selected_kind = AdminChangeKind(kind) if kind else None
+    capabilities = [
+        admin_execution_capability_for(candidate)
+        for candidate in AdminChangeKind
+        if selected_kind is None or candidate == selected_kind
+    ]
+    plans = [_admin_adapter_enablement_plan_item_status(capability) for capability in capabilities]
+    return {
+        "mode": "read_only_enablement_plan",
+        "mutation_performed": False,
+        "filters": {"kind": kind},
+        "plans": len(plans),
+        "approval_required": sum(1 for plan in plans if plan["approval_required_before_enable"]),
+        "already_enabled": sum(1 for plan in plans if plan["current_status"] == "enabled"),
+        "items": plans,
+    }
+
+
+def _admin_adapter_enablement_plan_item_status(capability) -> dict[str, object]:
+    approval_required = capability.authorization_required_before_enable or capability.approval_plan_required
+    if capability.can_execute_live():
+        next_step = "adapter is already enabled; keep monitoring execution evidence and rollback readiness"
+    else:
+        next_step = "prepare exact high-risk approval request before enabling this live adapter"
+    return {
+        "kind": capability.kind.value,
+        "adapter_name": capability.adapter_name,
+        "current_status": capability.status.value,
+        "current_state": capability.summary,
+        "approval_required_before_enable": approval_required,
+        "proposed_state": f"enable live Overseer execution for {capability.kind.value} using adapter {capability.adapter_name}",
+        "proposed_changes": [
+            {
+                "target": "Overseer admin adapter capability table",
+                "change": f"change {capability.kind.value} adapter status from {capability.status.value} to enabled",
+                "reason": "allow Overseer to execute only approved plans of this kind through a typed adapter boundary",
+            },
+            {
+                "target": "execution gate",
+                "change": "verify approved=true, no missing fields, no cancellation/archive state, and required advisory gates before command execution",
+                "reason": "preserve the existing approval and audit safety model before any host mutation",
+            },
+            {
+                "target": "audit and verification records",
+                "change": "persist command results, verification results, and rollback evidence for every execution attempt",
+                "reason": "make live host changes reviewable and reversible",
+            },
+        ],
+        "commands_in_scope": [list(command) for command in capability.supported_commands],
+        "risks": _admin_adapter_enablement_risks(capability.kind),
+        "rollback_plan": [
+            f"disable {capability.kind.value} adapter capability",
+            "stop accepting new execution requests for this adapter kind",
+            "review latest admin executions and apply each plan's stored rollback steps if verification shows harm",
+        ],
+        "validation_required": [
+            "unit tests for approval, blocked, failed, completed, and rollback-readiness paths",
+            "dry-run or mock-run evidence before any live command is attempted",
+            "operator-approved live smoke test against a non-critical target",
+            "post-change admin execution and audit summaries showing persisted evidence",
+        ],
+        "next_step": next_step,
+    }
+
+
+def _admin_adapter_enablement_risks(kind: AdminChangeKind) -> list[str]:
+    if kind == AdminChangeKind.APT_INSTALL:
+        return [
+            "sudo package changes may alter shared host dependencies",
+            "dependency installation may restart or change local services",
+            "rollback may not fully restore transitive package state",
+        ]
+    if kind in {AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP, AdminChangeKind.BLOCK_IP}:
+        return [
+            "firewall changes can break legitimate connectivity",
+            "allow rules can increase attack surface",
+            "deny or source-block rules can interrupt active project work",
+        ]
+    return ["service interruption during execution", "dependent local threads may fail while the target changes state"]
+
+
 def admin_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -3449,6 +3531,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_executions_parser = subparsers.add_parser("admin-executions", help="list persisted admin change execution results")
     admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     subparsers.add_parser("admin-adapter-capabilities", help="list live admin adapter enablement status")
+    admin_adapter_plan_parser = subparsers.add_parser(
+        "admin-adapter-enablement-plan",
+        help="prepare a read-only high-risk approval plan for enabling live admin adapters",
+    )
+    admin_adapter_plan_parser.add_argument("--kind", choices=[item.value for item in AdminChangeKind])
     admin_summary_parser = subparsers.add_parser("admin-summary", help="summarize admin plans, execution results, and audit events")
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
@@ -3818,6 +3905,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-adapter-capabilities":
         print(json.dumps(admin_adapter_capabilities_status(), sort_keys=True))
+        return 0
+
+    if args.command == "admin-adapter-enablement-plan":
+        print(json.dumps(admin_adapter_enablement_plan_status(args.kind), sort_keys=True))
         return 0
 
     if args.command == "admin-summary":

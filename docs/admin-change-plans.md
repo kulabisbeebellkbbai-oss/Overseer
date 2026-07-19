@@ -40,7 +40,7 @@ The planner never runs live commands. It produces the exact change list required
 
 Recording approval does not execute the plan. It only updates the stored approval metadata so a future execution adapter can see that a specific command list was approved.
 
-Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled; package install, firewall allow/deny, and source-block adapters remain disabled until a specific high-risk approval plan enables them. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution.
+Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled; package install, firewall allow/deny, and source-block adapters remain disabled until a specific high-risk approval plan enables them. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
 
 Canceling a plan keeps the record visible but removes it from the pending authorization queue and prevents execution. Use cancellation for placeholders, superseded plans, or plans created from disproven evidence.
 

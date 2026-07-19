@@ -107,6 +107,7 @@ from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_adapter_capabilities_status
+from overseer.cli import admin_adapter_enablement_plan_status
 from overseer.cli import admin_executions_status
 from overseer.cli import admin_execution_readiness_status
 from overseer.cli import admin_history_archive_plan_status
@@ -737,6 +738,20 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertFalse(restart["authorization_required_before_enable"])
         self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
         self.assertTrue(package["approval_plan_required"])
+
+    def test_admin_adapter_enablement_plan_describes_high_risk_gate(self):
+        status = admin_adapter_enablement_plan_status(AdminChangeKind.BLOCK_IP.value)
+        item = status["items"][0]
+
+        self.assertEqual(status["mode"], "read_only_enablement_plan")
+        self.assertFalse(status["mutation_performed"])
+        self.assertEqual(status["plans"], 1)
+        self.assertEqual(status["approval_required"], 1)
+        self.assertEqual(item["kind"], AdminChangeKind.BLOCK_IP.value)
+        self.assertEqual(item["current_status"], AdminAdapterStatus.DISABLED.value)
+        self.assertTrue(item["approval_required_before_enable"])
+        self.assertIn("sudo", item["commands_in_scope"][0])
+        self.assertIn("disable block_ip adapter capability", item["rollback_plan"][0])
 
     def test_admin_summary_reports_plans_executions_and_audit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2479,6 +2494,20 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
             self.assertEqual(block["status"], AdminAdapterStatus.DISABLED.value)
             self.assertTrue(block["authorization_required_before_enable"])
+
+    def test_client_reads_admin_adapter_enablement_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                plan = client.admin_adapter_enablement_plan(AdminChangeKind.APT_INSTALL.value)
+
+            self.assertEqual(plan["filters"]["kind"], AdminChangeKind.APT_INSTALL.value)
+            self.assertEqual(plan["plans"], 1)
+            self.assertEqual(plan["approval_required"], 1)
+            self.assertEqual(plan["items"][0]["current_status"], AdminAdapterStatus.DISABLED.value)
+            self.assertTrue(plan["items"][0]["approval_required_before_enable"])
 
     def test_client_approves_admin_history_restore_request(self):
         with tempfile.TemporaryDirectory() as directory:

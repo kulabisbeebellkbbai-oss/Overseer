@@ -445,3 +445,41 @@ def policy_customization_helper_status(profile: PolicyProfile = BEST_PRACTICE_PO
         ],
         "next_step": "answer the questions, update the profile JSON fields, then pass the file with --policy-profile",
     }
+
+
+def policy_profile_from_answers(
+    answers: Mapping[str, object],
+    base_profile: PolicyProfile = BEST_PRACTICE_POLICY_PROFILE,
+) -> PolicyProfile:
+    profile = policy_profile_status(base_profile)
+    profile["name"] = str(answers.get("name", "custom"))
+    profile["description"] = str(answers.get("description", "Customized Overseer policy profile."))
+    question_by_id = {question.id: question for question in policy_customization_questions()}
+    for answer_id, value in answers.items():
+        if answer_id in {"name", "description"}:
+            continue
+        if answer_id not in question_by_id:
+            raise ValueError(f"unsupported policy answer id: {answer_id}")
+        question = question_by_id[answer_id]
+        if value not in question.options:
+            raise ValueError(f"unsupported value for {answer_id}: {value}")
+        _set_profile_value(profile, question.profile_key, value)
+    return policy_profile_from_mapping(profile)
+
+
+def policy_profile_from_answers_status(answers: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "profile": policy_profile_status(policy_profile_from_answers(answers)),
+        "source": "policy_customization_answers",
+    }
+
+
+def _set_profile_value(profile: dict[str, object], dotted_key: str, value: object) -> None:
+    if dotted_key.startswith("minimum_approval_by_risk."):
+        risk = dotted_key.removeprefix("minimum_approval_by_risk.")
+        approvals = profile["minimum_approval_by_risk"]
+        if not isinstance(approvals, dict):
+            raise ValueError("minimum_approval_by_risk must be an object")
+        approvals[risk] = value
+        return
+    profile[dotted_key] = value

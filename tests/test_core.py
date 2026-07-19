@@ -118,6 +118,7 @@ from overseer import (
     plan_firewall_deny_tcp,
     plan_user_service_restart,
     policy_customization_helper_status,
+    policy_profile_from_answers_status,
     policy_profile_from_mapping,
     SourceReviewDisposition,
 )
@@ -140,6 +141,7 @@ from overseer.cli import admin_history_review_status
 from overseer.cli import admin_history_restore_readiness_status
 from overseer.cli import admin_summary_status
 from overseer.cli import archive_admin_history_status
+from overseer.cli import build_policy_profile_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_admin_adapter_enablement_status
 from overseer.cli import approve_admin_history_archive_status
@@ -3079,6 +3081,22 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertIn("questions", status)
             self.assertIn("next_step", status)
 
+    def test_client_builds_policy_profile_from_answers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.build_policy_profile(
+                    {
+                        "name": "client-profile",
+                        "warnings-block": False,
+                    }
+                )
+
+            self.assertEqual(status["profile"]["name"], "client-profile")
+            self.assertFalse(status["profile"]["block_warnings_until_accepted"])
+
     def test_client_runs_stored_health_probes(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4920,6 +4938,44 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(profile.name, "lab-relaxed")
         self.assertFalse(profile.block_warnings_until_accepted)
         self.assertEqual(profile.minimum_approval_by_risk[RiskLevel.MEDIUM], ApprovalLevel.ROLE)
+
+    def test_policy_profile_from_answers_builds_custom_profile(self):
+        status = policy_profile_from_answers_status(
+            {
+                "name": "lab-profile",
+                "description": "Local lab profile",
+                "risk-medium-approval": ApprovalLevel.ROLE.value,
+                "warnings-block": False,
+            }
+        )
+
+        self.assertEqual(status["profile"]["name"], "lab-profile")
+        self.assertEqual(status["profile"]["description"], "Local lab profile")
+        self.assertEqual(status["profile"]["minimum_approval_by_risk"]["medium"], ApprovalLevel.ROLE.value)
+        self.assertFalse(status["profile"]["block_warnings_until_accepted"])
+
+    def test_build_policy_profile_status_writes_profile_from_answers_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            answers_path = root / "answers.json"
+            output_path = root / "policy-profile.json"
+            answers_path.write_text(
+                json.dumps(
+                    {
+                        "name": "file-profile",
+                        "risk-critical-approval": ApprovalLevel.HUMAN.value,
+                        "apt-upgrade-warning": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = build_policy_profile_status(answers_path, output_path)
+            written = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(status["output_path"], str(output_path))
+        self.assertEqual(written["name"], "file-profile")
+        self.assertFalse(written["warn_on_apt_upgrade_rollback"])
 
     def test_execute_admin_change_status_can_use_policy_profile_file(self):
         with tempfile.TemporaryDirectory() as directory:

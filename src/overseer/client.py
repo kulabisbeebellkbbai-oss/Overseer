@@ -422,6 +422,9 @@ class OverseerApiClient:
     def policy_customization_helper(self) -> dict[str, Any]:
         return self._get("/admin/policy-customization-helper")
 
+    def build_policy_profile(self, answers: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/policy-customization-helper/profile", {"answers": answers})
+
     def admin_history_review(self) -> dict[str, Any]:
         return self._get("/admin/history-review")
 

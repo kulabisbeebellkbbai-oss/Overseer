@@ -96,6 +96,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /admin/adapter-enablement-requests/approve`
 - `POST /admin/policy-warning-requests`
 - `POST /admin/policy-warning-requests/approve`
+- `POST /admin/policy-customization-helper/profile`
 - `POST /admin/history-restore-requests`
 - `POST /admin/history-archive-requests`
 - `POST /admin/history-archive-requests/approve`
@@ -120,6 +121,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /admin/adapter-enablement-requests/approve` approves a requested adapter enablement gate for that store and adapter kind without approving a specific host change or running commands.
 `POST /admin/policy-warning-requests` requests explicit acceptance of an active residual policy warning for one admin plan, such as the package-upgrade rollback warning. It does not execute the plan.
 `POST /admin/policy-warning-requests/approve` approves a pending residual policy warning acceptance request. Approved warning acceptance changes that warning to a pass for the targeted plan only.
+`POST /admin/policy-customization-helper/profile` builds a policy profile from the stable question-answer IDs returned by `GET /admin/policy-customization-helper`. It returns JSON only and does not persist or apply the profile.
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
 `GET /admin/execution-readiness` explains each admin plan's execution gate state, including approval, missing fields, IDS review, manual execution, and Overseer-supported execution readiness.
 `GET /admin/policies` evaluates stored admin plans against approval, adapter, IDS, rollback, verification, and risk policy checks. It supports `?plan_id=...` filtering.
@@ -237,6 +239,7 @@ execution = client.execute_admin_change({"plan_id": "admin.restart.overseer-api"
 executions = client.admin_executions()
 admin = client.admin_summary()
 policy_helper = client.policy_customization_helper()
+policy_profile = client.build_policy_profile({"name": "lab-profile", "warnings-block": True})
 canceled = client.cancel_admin_change(
     {
         "plan_id": "admin.block.example",

@@ -54,6 +54,7 @@ Generate the reusable customization questionnaire and JSON template with:
 ```bash
 PYTHONPATH=src python3 -m overseer.cli policy-customization-helper
 PYTHONPATH=src python3 -m overseer.cli policy-customization-helper --output state/policy-customization-helper.json
+PYTHONPATH=src python3 -m overseer.cli build-policy-profile --answers state/policy-answers.json --output state/policy-profile.json
 ```
 
 The helper output contains:
@@ -61,6 +62,17 @@ The helper output contains:
 - `profile`: the best-practice JSON profile that can be copied into a custom policy profile file
 - `questions`: stable question IDs, profile keys, defaults, options, and rationale
 - `next_step`: the handoff instruction for applying the customized profile
+
+The answer file is a JSON object keyed by stable question IDs. Example:
+
+```json
+{
+  "name": "lab-profile",
+  "description": "Local lab policy profile.",
+  "risk-medium-approval": "sisko",
+  "warnings-block": true
+}
+```
 
 Use the same helper on new installs before local policy customization sessions. Keep the generated policy profile out of public commits when it contains site-specific operational choices.
 

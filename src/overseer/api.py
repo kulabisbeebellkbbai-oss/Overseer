@@ -345,6 +345,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/admin/policy-warning-requests/approve":
                 self._handle_json(lambda payload: approve_admin_policy_warning_status(store_path, **_approve_admin_policy_warning_args(payload)))
                 return
+            if self.path == "/admin/policy-customization-helper/profile":
+                self._handle_json(lambda payload: _build_policy_profile_api_status(payload))
+                return
             if self.path == "/runtime/daemon-migration-requests":
                 self._handle_json(lambda payload: request_daemon_migration_status(store_path, **_daemon_migration_request_args(payload)))
                 return
@@ -669,6 +672,15 @@ def _admin_policy_warning_request_args(payload: dict[str, Any]) -> dict[str, Any
         "requested_by": str(payload["requested_by"]),
         "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
     }
+
+
+def _build_policy_profile_api_status(payload: dict[str, Any]) -> dict[str, object]:
+    from .policy import policy_profile_from_answers_status
+
+    answers = payload.get("answers", payload)
+    if not isinstance(answers, dict):
+        raise ValueError("policy answers must be a JSON object")
+    return policy_profile_from_answers_status(answers)
 
 
 def _approve_admin_policy_warning_args(payload: dict[str, Any]) -> dict[str, Any]:

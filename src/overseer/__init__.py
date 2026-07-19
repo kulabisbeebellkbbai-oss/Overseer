@@ -111,6 +111,8 @@ from .policy import (
     evaluate_admin_change_policy,
     policy_customization_helper_status,
     policy_customization_questions,
+    policy_profile_from_answers,
+    policy_profile_from_answers_status,
     policy_profile_from_mapping,
     policy_profile_status,
 )
@@ -265,6 +267,8 @@ __all__ = [
     "evaluate_admin_change_policy",
     "policy_customization_helper_status",
     "policy_customization_questions",
+    "policy_profile_from_answers",
+    "policy_profile_from_answers_status",
     "policy_profile_from_mapping",
     "policy_profile_status",
     "OperationPlanner",

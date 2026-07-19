@@ -13,6 +13,7 @@ from typing import Any
 from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
 from .audit import ApprovalRequest, AuditEvent
 from .core import Claim, ConflictDecision, Resource
+from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
 from .host import HostInspectionSnapshot
 from .ids_review import HostSecurityIDSReviewPackage
@@ -145,6 +146,11 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS host_security_ids_review_packages (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS crew_messages (
+                id TEXT PRIMARY KEY,
+                owner_domain TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             """
@@ -424,6 +430,19 @@ class SQLiteStore:
             (plan_id,),
         ).fetchall()
         return tuple(_load_dataclass(HostSecurityIDSReviewPackage, str(row["payload"])) for row in rows)
+
+    def save_crew_message(self, message: CrewMessage) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO crew_messages (id, owner_domain, payload) VALUES (?, ?, ?)",
+            (message.id, message.owner_domain.value, _dump(message)),
+        )
+        self._connection.commit()
+
+    def load_crew_message(self, message_id: str) -> CrewMessage:
+        return _load_dataclass(CrewMessage, self._get_payload("crew_messages", message_id))
+
+    def list_crew_messages(self) -> tuple[CrewMessage, ...]:
+        return tuple(_load_dataclass(CrewMessage, payload) for payload in self._list_payloads("crew_messages"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

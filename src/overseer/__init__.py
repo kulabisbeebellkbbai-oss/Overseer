@@ -65,6 +65,7 @@ from .core import (
     RiskLevel,
     decide_claim,
 )
+from .crew import CrewMessage, CrewMessageStatus, build_crew_message, crew_message_status
 from .health import (
     HealthEvidence,
     HealthStatus,
@@ -234,6 +235,10 @@ __all__ = [
     "ResourceType",
     "RiskLevel",
     "decide_claim",
+    "CrewMessage",
+    "CrewMessageStatus",
+    "build_crew_message",
+    "crew_message_status",
     "HealthEvidence",
     "HealthStatus",
     "HealthTarget",

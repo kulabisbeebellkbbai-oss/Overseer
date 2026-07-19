@@ -44,6 +44,7 @@ from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_reso
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
+from .crew import CrewMessageStatus, build_crew_message, crew_message_status
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import (
@@ -4628,6 +4629,85 @@ def usage_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def crew_messages_status(
+    store_path: str | Path,
+    owner_domain: str | None = None,
+    status: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        messages = list(store.list_crew_messages())
+        if owner_domain:
+            selected_owner = OwnerDomain(owner_domain)
+            messages = [message for message in messages if message.owner_domain == selected_owner]
+        if status:
+            selected_status = CrewMessageStatus(status)
+            messages = [message for message in messages if message.status == selected_status]
+        messages = sorted(messages, key=lambda message: message.created_at or message.id, reverse=True)
+        return {
+            "store": str(store.path),
+            "messages": len(messages),
+            "open": sum(1 for message in messages if message.status == CrewMessageStatus.OPEN),
+            "items": [crew_message_status(message) for message in messages],
+            "filters": {
+                "owner_domain": owner_domain,
+                "status": status,
+            },
+        }
+    finally:
+        store.close()
+
+
+def record_crew_message_status(
+    store_path: str | Path,
+    owner_domain: str,
+    subject: str,
+    message: str,
+    priority: str = RiskLevel.MEDIUM.value,
+    requested_by: str = "operator",
+    message_id: str | None = None,
+    created_at: str | None = None,
+    related_resource_id: str | None = None,
+    related_plan_id: str | None = None,
+    related_limit_id: str | None = None,
+) -> dict[str, object]:
+    crew_message = build_crew_message(
+        owner_domain=owner_domain,
+        subject=subject,
+        message=message,
+        priority=priority,
+        requested_by=requested_by,
+        message_id=message_id,
+        created_at=created_at,
+        related_resource_id=related_resource_id,
+        related_plan_id=related_plan_id,
+        related_limit_id=related_limit_id,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_crew_message(crew_message)
+        audit_event = AuditEvent(
+            id=f"audit.{crew_message.id}",
+            event_type=AuditEventType.REQUESTED,
+            owner_domain=crew_message.owner_domain,
+            subject_id=crew_message.id,
+            summary=f"{crew_message.subject} routed to {crew_message.owner_domain.value}",
+            risk_level=crew_message.priority,
+            occurred_at=crew_message.created_at,
+        )
+        store.save_audit_event(audit_event)
+        return {
+            "store": str(store.path),
+            "message": crew_message_status(crew_message),
+            "audit_event": audit_event_status(audit_event),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+            "next_step": f"{crew_message.owner_domain.value} reviews and converts this request into the appropriate protected action",
+        }
+    finally:
+        store.close()
+
+
 def discover_codex_project_threads_status(
     store_path: str | Path,
     registry_path: str | Path = "/home/god/.codex/codex-projects.csv",
@@ -5556,6 +5636,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         claims = store.list_claims()
         approvals = store.list_approvals()
         audit_events = store.list_audit_events()
+        crew_messages = store.list_crew_messages()
         heartbeats = store.list_runtime_heartbeats()
         host_snapshots = store.list_host_snapshots()
         source_reviews = store.list_host_security_source_reviews()
@@ -5587,6 +5668,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                 usage_continuation_dispatch_status(dispatch)
                 for dispatch in usage_continuation_dispatches
             ],
+            "crew_messages": [crew_message_status(message) for message in crew_messages],
             "health_evidence": [
                 {
                     "id": evidence.id,
@@ -6351,6 +6433,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_usage_limit_parser.add_argument("--resets-at")
     record_usage_limit_parser.add_argument("--observed-at")
     record_usage_limit_parser.add_argument("--confidence", type=float, default=1.0)
+    crew_messages_parser = subparsers.add_parser("crew-messages", help="list crew-scoped operator messages")
+    crew_messages_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    crew_messages_parser.add_argument("--owner-domain", choices=[item.value for item in OwnerDomain])
+    crew_messages_parser.add_argument("--status", choices=[item.value for item in CrewMessageStatus])
+    record_crew_message_parser = subparsers.add_parser("record-crew-message", help="route an operator request to a crew domain")
+    record_crew_message_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_crew_message_parser.add_argument("--owner-domain", required=True, choices=[item.value for item in OwnerDomain])
+    record_crew_message_parser.add_argument("--subject", required=True)
+    record_crew_message_parser.add_argument("--message", required=True)
+    record_crew_message_parser.add_argument("--priority", default=RiskLevel.MEDIUM.value, choices=[item.value for item in RiskLevel])
+    record_crew_message_parser.add_argument("--requested-by", default="operator")
+    record_crew_message_parser.add_argument("--message-id")
+    record_crew_message_parser.add_argument("--created-at")
+    record_crew_message_parser.add_argument("--related-resource-id")
+    record_crew_message_parser.add_argument("--related-plan-id")
+    record_crew_message_parser.add_argument("--related-limit-id")
     usage_continuation_plan_parser = subparsers.add_parser(
         "usage-continuation-plan",
         help="summarize persisted usage-limited continuation requests",
@@ -7008,6 +7106,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.resets_at,
                     args.observed_at,
                     args.confidence,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "crew-messages":
+        print(json.dumps(crew_messages_status(args.store, args.owner_domain, args.status), sort_keys=True))
+        return 0
+
+    if args.command == "record-crew-message":
+        print(
+            json.dumps(
+                record_crew_message_status(
+                    args.store,
+                    args.owner_domain,
+                    args.subject,
+                    args.message,
+                    args.priority,
+                    args.requested_by,
+                    args.message_id,
+                    args.created_at,
+                    args.related_resource_id,
+                    args.related_plan_id,
+                    args.related_limit_id,
                 ),
                 sort_keys=True,
             )

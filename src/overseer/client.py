@@ -258,6 +258,40 @@ class OverseerApiClient:
             payload["requested_at"] = requested_at
         return self._post("/usage/continuation-requests", payload)
 
+    def crew_messages(self, owner_domain: str | None = None, status: str | None = None) -> dict[str, Any]:
+        query = {key: value for key, value in {"owner_domain": owner_domain, "status": status}.items() if value}
+        suffix = f"?{urlencode(query)}" if query else ""
+        return self._get(f"/crew/messages{suffix}")
+
+    def record_crew_message(
+        self,
+        owner_domain: str,
+        subject: str,
+        message: str,
+        priority: str = "medium",
+        requested_by: str = "operator",
+        message_id: str | None = None,
+        related_resource_id: str | None = None,
+        related_plan_id: str | None = None,
+        related_limit_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "owner_domain": owner_domain,
+            "subject": subject,
+            "message": message,
+            "priority": priority,
+            "requested_by": requested_by,
+        }
+        if message_id:
+            payload["message_id"] = message_id
+        if related_resource_id:
+            payload["related_resource_id"] = related_resource_id
+        if related_plan_id:
+            payload["related_plan_id"] = related_plan_id
+        if related_limit_id:
+            payload["related_limit_id"] = related_limit_id
+        return self._post("/crew/messages", payload)
+
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 

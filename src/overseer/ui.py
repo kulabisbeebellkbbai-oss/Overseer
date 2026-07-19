@@ -39,7 +39,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    button, input, select {
+    button, input, select, textarea {
       font: inherit;
     }
     .shell {
@@ -56,14 +56,6 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       padding: 18px 14px;
       border-right: 1px solid #2d3540;
       box-shadow: inset -5px 0 0 rgba(199, 167, 108, 0.14);
-    }
-    aside::before {
-      content: "";
-      display: block;
-      height: 10px;
-      margin: -4px 0 18px;
-      background: linear-gradient(90deg, var(--command) 0 24%, var(--ops) 24% 52%, var(--alert) 52% 66%, var(--focus) 66% 100%);
-      border-radius: 2px;
     }
     main {
       min-width: 0;
@@ -287,6 +279,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 4px;
       min-width: 0;
     }
+    .field.span-1 { grid-column: span 1; }
     .field.span-2 { grid-column: span 2; }
     .field.span-3 { grid-column: span 3; }
     .field.span-6 { grid-column: span 6; }
@@ -295,7 +288,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       font-size: 12px;
       font-weight: 700;
     }
-    .field input, .field select {
+    .field input, .field select, .field textarea {
       width: 100%;
       min-height: 36px;
       border: 1px solid var(--line);
@@ -305,7 +298,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       color: var(--text);
       min-width: 0;
     }
-    .field input:focus, .field select:focus {
+    .field textarea {
+      min-height: 86px;
+      resize: vertical;
+    }
+    .field input:focus, .field select:focus, .field textarea:focus {
       outline: 2px solid rgba(122, 183, 216, 0.34);
       border-color: var(--focus);
     }
@@ -383,7 +380,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         flex: 1;
       }
       .span-3, .span-4, .span-6, .span-8 { grid-column: span 12; }
-      .field.span-2, .field.span-3 { grid-column: span 6; }
+      .field.span-1, .field.span-2, .field.span-3 { grid-column: span 6; }
     }
     @media (max-width: 520px) {
       main { padding: 12px; }
@@ -462,6 +459,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       health: "/health-efficiency",
       healthSummary: "/health-summary",
       usage: "/usage-summary",
+      crewMessages: "/crew/messages",
       audit: "/audit-summary",
       approvals: "/approvals-summary",
       claims: "/claims/review",
@@ -494,7 +492,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const button = event.target.closest("[data-action]");
       if (!button) return;
       event.preventDefault();
-      await runAction(button.dataset.action);
+      await runAction(button.dataset.action, button);
     });
     function selectView(view) {
       state.view = view;
@@ -536,12 +534,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (!response.ok) throw new Error(`${path}: ${response.status}`);
       return await response.json();
     }
-    async function runAction(action) {
+    async function runAction(action, source) {
       const status = document.getElementById("action-status");
       status.hidden = false;
       status.textContent = "Running action...";
       try {
-        const result = await actionRequest(action);
+        const result = await actionRequest(action, source);
         state.lastAction = {action, result, at: new Date().toLocaleString()};
         await refresh();
       } catch (err) {
@@ -549,7 +547,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         status.className = "panel action-status error";
       }
     }
-    async function actionRequest(action) {
+    async function actionRequest(action, source) {
       if (action === "discover-physical") return await postJson("/physical/discover", {});
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
@@ -564,6 +562,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "record-usage-limit") return await recordUsageLimit();
+      if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
@@ -759,6 +758,23 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (observedAt) payload.observed_at = observedAt;
       return await postJson("/usage-limits", payload);
     }
+    async function sendCrewMessage(role, source) {
+      const prefix = source.dataset.prefix || rolePrefix(role);
+      const payload = {
+        owner_domain: role,
+        subject: value(`${prefix}-subject`),
+        message: value(`${prefix}-message`),
+        priority: value(`${prefix}-priority`),
+        requested_by: value(`${prefix}-requested-by`) || "operator"
+      };
+      const resourceId = value(`${prefix}-resource-id`);
+      const planId = value(`${prefix}-plan-id`);
+      const limitId = value(`${prefix}-limit-id`);
+      if (resourceId) payload.related_resource_id = resourceId;
+      if (planId) payload.related_plan_id = planId;
+      if (limitId) payload.related_limit_id = limitId;
+      return await postJson("/crew/messages", payload);
+    }
     async function requestUsageContinuation() {
       const payload = {
         request_id: value("usage-request-id"),
@@ -893,6 +909,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${crew("Quark", focus.quark)}
           ${crew("Dax", focus.dax)}
           ${crew("Julian", focus.julian)}
+          ${officerPanel("sisko", "Command routing", "Coordinate this issue across the crew.")}
         </div>`;
     }
     function renderAdmin() {
@@ -987,6 +1004,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"])}</div>
           <div class="panel span-6">${table("Archive Candidates", archivePlan.items || [], ["plan_id", "disposition", "next_step"])}</div>
           <div class="panel span-6">${table("Archived Plans", archives.items || [], ["plan_id", "disposition", "archived_by", "archived_at"])}</div>
+          ${officerPanel("sisko", "Administrative decision", "Plan, approve, or coordinate a protected administrative change.")}
+          ${officerPanel("obrien", "Maintenance deployment", "Schedule updates, patches, or service maintenance.")}
         </div>`;
     }
     function renderAssets() {
@@ -1012,6 +1031,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-6">${table("Physical Assets", physical.items || [], ["id", "kind", "stable_id", "checkout_ready"])}</div>
           <div class="panel span-6">${table("Virtual Assets", virtual.items || [], ["id", "name", "state", "current_claim_id"])}</div>
+          ${officerPanel("kira", "Physical asset issue", "Handle a USB, serial, power, storage, or connected-device issue.")}
+          ${officerPanel("dax", "Virtual asset checkout", "Handle an emulator, VM, gateway, proxy, listener, or virtual checkout issue.")}
         </div>`;
     }
     function renderClaims() {
@@ -1074,6 +1095,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"])}</div>
           <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"])}</div>
+          ${officerPanel("dax", "Checkout conflict", "Deconflict a claim, lease, lock, or cleanup request.")}
         </div>`;
     }
     function renderSecurity() {
@@ -1141,6 +1163,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-4">${kv("IDS Review", security.ids_review || {})}</div>
           <div class="panel span-12">${table("Listener Review Queue", listenerQueue.items || [], ["listener", "bind_scope", "severity", "queue_status", "plan_id", "next_step"])}</div>
           <div class="panel span-12">${table("Source Review Queue", sourceQueue.items || [], ["remote_address", "listener", "source_scope", "disposition", "queue_status", "next_step"])}</div>
+          ${officerPanel("odo", "Security investigation", "Investigate traffic, exposed listeners, intrusion signals, or protective actions.")}
         </div>`;
     }
     function renderHealth() {
@@ -1166,6 +1189,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-12">${table("Health Targets", healthSummary.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"])}</div>
+          ${officerPanel("julian", "Service health issue", "Diagnose MCP, HTTP, HTML, JSON, process, or probe failures.")}
         </div>`;
     }
     function probeTypeOptions() {
@@ -1208,11 +1232,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">
             <div class="toolbar"><h3>Record Limit</h3><button class="action-btn" data-action="record-usage-limit">Record Limit</button></div>
             <div class="form-grid">
-              <div class="field span-6"><label for="usage-limit-id">Limit ID</label><input id="usage-limit-id" value="limit.service.requests"></div>
-              <div class="field span-6"><label for="usage-resource-id">Resource ID</label><input id="usage-resource-id" value="svc.service"></div>
-              <div class="field span-4"><label for="usage-kind">Kind</label><input id="usage-kind" value="requests"></div>
-              <div class="field span-4"><label for="usage-window">Window</label><input id="usage-window" value="hourly"></div>
-              <div class="field span-2"><label for="usage-capacity">Capacity</label><input id="usage-capacity" type="number" min="0" value="100"></div>
+              <div class="field span-6"><label for="usage-limit-id">Limit ID</label><input id="usage-limit-id" value="limit.mcp.api.calls.daily"></div>
+              <div class="field span-6"><label for="usage-resource-id">Resource ID</label><input id="usage-resource-id" value="svc.mcp.api-keyed"></div>
+              <div class="field span-4"><label for="usage-kind">Kind</label><input id="usage-kind" value="daily_quota"></div>
+              <div class="field span-4"><label for="usage-window">Window</label><input id="usage-window" value="daily"></div>
+              <div class="field span-2"><label for="usage-capacity">Capacity</label><input id="usage-capacity" type="number" min="0" value="1000"></div>
               <div class="field span-2"><label for="usage-remaining">Remaining</label><input id="usage-remaining" type="number" min="0" value="0"></div>
               <div class="field span-4"><label for="usage-confidence">Confidence</label><input id="usage-confidence" type="number" min="0" max="1" step="0.01" value="1"></div>
               <div class="field span-4"><label for="usage-resets-at">Resets At</label><input id="usage-resets-at" placeholder="2026-07-19T18:00:00+00:00"></div>
@@ -1222,14 +1246,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">
             <div class="toolbar"><h3>Request Continuation</h3><button class="action-btn" data-action="request-usage-continuation">Request</button></div>
             <div class="form-grid">
-              <div class="field span-6"><label for="usage-request-id">Request ID</label><input id="usage-request-id" value="work.service.continue"></div>
-              <div class="field span-6"><label for="usage-request-limit-id">Limit ID</label><input id="usage-request-limit-id" value="limit.service.requests"></div>
-              <div class="field span-6"><label for="usage-request-resource-id">Resource ID</label><input id="usage-request-resource-id" value="svc.service"></div>
-              <div class="field span-6"><label for="usage-owner-thread">Owner Thread</label><input id="usage-owner-thread" value="thread.service"></div>
+              <div class="field span-6"><label for="usage-request-id">Request ID</label><input id="usage-request-id" value="work.mcp.api.continue"></div>
+              <div class="field span-6"><label for="usage-request-limit-id">Limit ID</label><input id="usage-request-limit-id" value="limit.mcp.api.calls.daily"></div>
+              <div class="field span-6"><label for="usage-request-resource-id">Resource ID</label><input id="usage-request-resource-id" value="svc.mcp.api-keyed"></div>
+              <div class="field span-6"><label for="usage-owner-thread">Owner Thread</label><input id="usage-owner-thread" value="thread.mcp.api-work"></div>
               <div class="field span-3"><label for="usage-requested-units">Units</label><input id="usage-requested-units" type="number" min="0" value="1"></div>
               <div class="field span-3"><label for="usage-risk">Risk</label><select id="usage-risk">${riskOptions()}</select></div>
               <div class="field span-6"><label for="usage-requested-by">Requested By</label><input id="usage-requested-by" value="quark"></div>
-              <div class="field span-12"><label for="usage-intent">Intent</label><input id="usage-intent" value="continue queued service work"></div>
+              <div class="field span-12"><label for="usage-intent">Intent</label><input id="usage-intent" value="continue queued MCP API-keyed work after quota renewal"></div>
               <div class="field span-6"><label for="usage-earliest-start">Earliest Start</label><input id="usage-earliest-start" placeholder="optional"></div>
               <div class="field span-6"><label for="usage-deadline">Deadline</label><input id="usage-deadline" placeholder="optional"></div>
             </div>
@@ -1242,6 +1266,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"])}</div>
+          ${officerPanel("quark", "MCP API quota scheduling", "Track API-keyed MCP call limits and schedule continuation after the quota window resets.", "limit.mcp.api.calls.daily")}
         </div>`;
     }
     function renderAudit() {
@@ -1253,10 +1278,43 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Approvals", approvals.approval_count, "stored", "span-3")}
           <div class="panel span-6">${table("Recent Audit", audit.events || [], ["id", "event_type", "owner_domain", "summary"])}</div>
           <div class="panel span-6">${table("Approvals", approvals.items || [], ["id", "status", "owner_domain", "reason"])}</div>
+          ${officerPanel("sisko", "Audit review", "Review decision history, approvals, evidence, or policy concerns.")}
         </div>`;
     }
     function metric(label, value, hint, span = "span-3", tone = "") {
       return `<div class="panel metric ${span}"><h3>${safe(label)}</h3><div class="value ${toneClass(tone)}">${safe(value ?? 0)}</div><p class="muted">${safe(hint)}</p></div>`;
+    }
+    function officerPanel(role, subject, prompt, relatedLimitId = "") {
+      const prefix = rolePrefix(`${role}-${subject}`);
+      const recent = ((state.data.crewMessages || {}).items || []).filter((item) => item.owner_domain === role).slice(0, 5);
+      return `<div class="panel span-12 officer-channel">
+        <div class="toolbar"><h3>${safe(officerName(role))} Channel</h3><button class="action-btn" data-action="send-crew-message" data-role="${safe(role)}" data-prefix="${safe(prefix)}">Send Request</button></div>
+        <div class="form-grid">
+          <div class="field span-3"><label for="${prefix}-subject">Subject</label><input id="${prefix}-subject" value="${safe(subject)}"></div>
+          <div class="field span-2"><label for="${prefix}-priority">Priority</label><select id="${prefix}-priority">${riskOptions()}</select></div>
+          <div class="field span-1"><label for="${prefix}-requested-by">By</label><input id="${prefix}-requested-by" value="operator"></div>
+          <div class="field span-2"><label for="${prefix}-resource-id">Resource</label><input id="${prefix}-resource-id"></div>
+          <div class="field span-2"><label for="${prefix}-plan-id">Plan</label><input id="${prefix}-plan-id"></div>
+          <div class="field span-2"><label for="${prefix}-limit-id">Limit</label><input id="${prefix}-limit-id" value="${safe(relatedLimitId)}"></div>
+          <div class="field span-6"><label for="${prefix}-message">Issue</label><textarea id="${prefix}-message">${safe(prompt)}</textarea></div>
+          <div class="field span-6">${table("Recent Requests", recent, ["id", "priority", "status", "subject", "created_at"])}</div>
+        </div>
+      </div>`;
+    }
+    function rolePrefix(role) {
+      return `crew-${String(role).replace(/[^a-z0-9]+/g, "-")}`;
+    }
+    function officerName(role) {
+      const names = {
+        sisko: "Sisko",
+        kira: "Kira",
+        obrien: "O'Brien",
+        odo: "Odo",
+        quark: "Quark",
+        dax: "Dax",
+        julian: "Julian"
+      };
+      return names[role] || labelize(role);
     }
     function crew(name, data) {
       const rows = Object.entries(data || {}).slice(0, 5).map(([key, value]) => `<div class="row"><span>${safe(labelize(key))}</span><strong>${safe(value ?? 0)}</strong></div>`).join("");

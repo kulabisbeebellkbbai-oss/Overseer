@@ -99,6 +99,7 @@ from overseer import (
     UsageContinuationRequest,
     UsageContinuationDispatch,
     UsageLimit,
+    CrewMessage,
     assess_freshness,
     approval_from_decision,
     assess_maintenance_readiness,
@@ -222,6 +223,7 @@ from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
 from overseer.cli import record_usage_limit_status
+from overseer.cli import crew_messages_status, record_crew_message_status
 from overseer.cli import request_usage_continuation_status
 from overseer.cli import dispatch_host_security_ids_review_package_status
 from overseer.cli import dispatch_usage_continuations_status
@@ -2424,7 +2426,12 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("Overseer API token", html)
             self.assertIn("enter Overseer API token", html)
             self.assertIn("crewStation(name)", html)
+            self.assertNotIn("aside::before", html)
             self.assertIn("/operator-dashboard", html)
+            self.assertIn("crewMessages: \"/crew/messages\"", html)
+            self.assertIn("data-action=\"send-crew-message\"", html)
+            self.assertIn("MCP API quota scheduling", html)
+            self.assertIn("limit.mcp.api.calls.daily", html)
             self.assertIn('apiBase = protectedGatewayPath ? "/Overseer" : ""', html)
             self.assertIn("tokenStore = protectedGatewayPath ? sessionStorage : localStorage", html)
             self.assertIn("data-action=\"register-resource\"", html)
@@ -6776,6 +6783,25 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["threads"], 1)
             self.assertEqual(status["items"][0]["command"], "codex-overseer-019f7140")
 
+    def test_api_client_records_and_filters_crew_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            with LocalOverseerApiServer(store_path, auth_token="secret") as harness:
+                client = OverseerApiClient(harness.url, auth_token="secret")
+
+                recorded = client.record_crew_message(
+                    OwnerDomain.ODO.value,
+                    "Investigate source",
+                    "Review a suspicious source before planning a block.",
+                    priority=RiskLevel.CRITICAL.value,
+                    message_id="crew.odo.investigate-source",
+                )
+                summary = client.crew_messages(owner_domain=OwnerDomain.ODO.value)
+
+            self.assertEqual(recorded["message"]["owner_domain"], OwnerDomain.ODO.value)
+            self.assertEqual(summary["messages"], 1)
+            self.assertEqual(summary["items"][0]["id"], "crew.odo.investigate-source")
+
     def test_records_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -6799,6 +6825,31 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["limit"]["remaining"], 4000)
             self.assertEqual(summary["limits"], 1)
             self.assertEqual(summary["items"][0]["confidence"], 0.9)
+
+    def test_records_crew_message_and_audits_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = record_crew_message_status(
+                store_path,
+                OwnerDomain.QUARK.value,
+                "MCP API quota scheduling",
+                "Queue work until the API-keyed MCP service call limit resets.",
+                RiskLevel.HIGH.value,
+                requested_by="operator",
+                message_id="crew.quark.mcp-api-quota",
+                created_at="2026-07-19T12:00:00+00:00",
+                related_limit_id="limit.mcp.api.calls.daily",
+            )
+            summary = crew_messages_status(store_path, owner_domain=OwnerDomain.QUARK.value)
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["message"]["id"], "crew.quark.mcp-api-quota")
+            self.assertEqual(status["message"]["related_limit_id"], "limit.mcp.api.calls.daily")
+            self.assertEqual(status["audit_event"]["event_type"], AuditEventType.REQUESTED.value)
+            self.assertEqual(summary["messages"], 1)
+            self.assertEqual(summary["items"][0]["subject"], "MCP API quota scheduling")
 
     def test_rejects_invalid_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7607,6 +7658,31 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.load_approval("approval.persisted").approval_level, ApprovalLevel.SISKO)
             self.assertEqual(store.list_audit_events()[0].event_type, AuditEventType.ESCALATED)
             store.close()
+
+    def test_persists_crew_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            store.save_crew_message(
+                CrewMessage(
+                    id="crew.julian.mcp-health",
+                    owner_domain=OwnerDomain.JULIAN,
+                    subject="MCP health",
+                    message="Review MCP service errors.",
+                    priority=RiskLevel.MEDIUM,
+                    requested_by="operator",
+                    created_at="2026-07-19T12:00:00+00:00",
+                    updated_at="2026-07-19T12:00:00+00:00",
+                )
+            )
+            store.close()
+
+            reopened = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            messages = reopened.list_crew_messages()
+            reopened.close()
+
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0].owner_domain, OwnerDomain.JULIAN)
+            self.assertEqual(messages[0].subject, "MCP health")
 
     def test_seeds_resources_and_usage_limits_from_config(self):
         with tempfile.TemporaryDirectory() as directory:

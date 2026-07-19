@@ -42,6 +42,7 @@ from .cli import (
     claim_review_status,
     command_summary_status,
     create_host_security_source_review_status,
+    crew_messages_status,
     discover_codex_project_threads_status,
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
@@ -78,6 +79,7 @@ from .cli import (
     policy_customization_helper_cli_status,
     probe_stored_health_status,
     record_resource_status,
+    record_crew_message_status,
     record_health_target_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
@@ -158,6 +160,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/usage-summary":
                 self._handle(lambda: usage_summary_status(store_path))
+                return
+            if path == "/crew/messages":
+                self._handle(lambda: crew_messages_status(store_path, _query_first(query, "owner_domain"), _query_first(query, "status")))
                 return
             if path == "/usage/continuation-plan":
                 self._handle(lambda: usage_continuation_plan_status(store_path))
@@ -401,6 +406,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/usage-limits":
                 self._handle_json(lambda payload: record_usage_limit_status(store_path, **_usage_limit_args(payload)))
                 return
+            if self.path == "/crew/messages":
+                self._handle_json(lambda payload: record_crew_message_status(store_path, **_crew_message_args(payload)))
+                return
             if self.path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
@@ -571,6 +579,21 @@ def _usage_limit_args(payload: dict[str, Any]) -> dict[str, Any]:
         "resets_at": str(payload["resets_at"]) if payload.get("resets_at") else None,
         "observed_at": str(payload["observed_at"]) if payload.get("observed_at") else None,
         "confidence": float(payload.get("confidence", 1.0)),
+    }
+
+
+def _crew_message_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": str(payload["message_id"]) if payload.get("message_id") else None,
+        "owner_domain": str(payload["owner_domain"]),
+        "subject": str(payload["subject"]),
+        "message": str(payload["message"]),
+        "priority": str(payload.get("priority", "medium")),
+        "requested_by": str(payload.get("requested_by", "operator")),
+        "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
+        "related_resource_id": str(payload["related_resource_id"]) if payload.get("related_resource_id") else None,
+        "related_plan_id": str(payload["related_plan_id"]) if payload.get("related_plan_id") else None,
+        "related_limit_id": str(payload["related_limit_id"]) if payload.get("related_limit_id") else None,
     }
 
 

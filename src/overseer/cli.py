@@ -1788,8 +1788,14 @@ def _detected_firewall_backend(snapshot: HostInspectionSnapshot) -> str:
     try:
         firewalld_state = snapshot.observation("firewalld-state")
     except KeyError:
-        return "ufw"
-    if firewalld_state.exit_code == 0 and firewalld_state.stdout.strip() == "running":
+        firewalld_state = None
+    if firewalld_state is not None and firewalld_state.exit_code == 0 and firewalld_state.stdout.strip() == "running":
+        return "firewalld"
+    try:
+        active_zones = snapshot.observation("firewalld-active-zones")
+    except KeyError:
+        active_zones = None
+    if active_zones is not None and active_zones.exit_code == 0 and "interfaces:" in active_zones.stdout:
         return "firewalld"
     return "ufw"
 

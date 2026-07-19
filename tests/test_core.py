@@ -5377,17 +5377,24 @@ class HostInspectionTests(unittest.TestCase):
 
             def runner(command, timeout_seconds):
                 stdout = "ok"
+                stderr = ""
+                exit_code = 0
                 if tuple(command) == ("hostname",):
                     stdout = "host-firewalld"
                 elif tuple(command) == ("ss", "-ltnp"):
                     stdout = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
                 elif tuple(command) == ("firewall-cmd", "--state"):
-                    stdout = "running"
+                    stdout = ""
+                    stderr = "Authorization failed."
+                    exit_code = 253
+                elif tuple(command) == ("firewall-cmd", "--get-active-zones"):
+                    stdout = "public (default)\n  interfaces: enp3s0"
                 return HostCommandObservation(
                     name=command[0],
                     command=tuple(command),
-                    exit_code=0,
+                    exit_code=exit_code,
                     stdout=stdout,
+                    stderr=stderr,
                 )
 
             snapshot = HostInspectionAdapter(

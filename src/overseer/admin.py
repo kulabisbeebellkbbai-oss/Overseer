@@ -15,6 +15,8 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 class AdminChangeKind(StrEnum):
     USER_SERVICE_RESTART = "user_service_restart"
     APT_INSTALL = "apt_install"
+    APT_UPDATE = "apt_update"
+    APT_UPGRADE = "apt_upgrade"
     FIREWALL_ALLOW_TCP = "firewall_allow_tcp"
     FIREWALL_DENY_TCP = "firewall_deny_tcp"
     BLOCK_IP = "block_ip"
@@ -138,6 +140,24 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         authorization_required_before_enable=True,
         approval_plan_required=True,
         supported_commands=(("sudo", "apt-get", "install"), ("dpkg-query", "-W")),
+    ),
+    AdminChangeKind.APT_UPDATE: AdminExecutionCapability(
+        kind=AdminChangeKind.APT_UPDATE,
+        adapter_name="apt-package-index-refresh",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live apt package index refresh requires a specific package-maintenance adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("sudo", "apt-get", "update"), ("apt-get", "check")),
+    ),
+    AdminChangeKind.APT_UPGRADE: AdminExecutionCapability(
+        kind=AdminChangeKind.APT_UPGRADE,
+        adapter_name="apt-package-upgrade",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live apt upgrades require a specific high-risk package-maintenance adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("sudo", "apt-get", "upgrade"), ("apt-get", "check"), ("apt", "list", "--upgradable")),
     ),
     AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
@@ -302,6 +322,97 @@ def plan_apt_install(plan_id: str, packages: tuple[str, ...], reason: str, curre
                 "Verify package installation",
                 ("dpkg-query", "-W", *packages),
                 "confirm packages are installed and queryable",
+            ),
+        ),
+    )
+
+
+def plan_apt_update(plan_id: str, reason: str, current_state: str = "unknown") -> AdminChangePlan:
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.APT_UPDATE,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.MEDIUM,
+        approval_level=ApprovalLevel.SISKO,
+        target="apt package index",
+        reason=reason,
+        current_state=current_state,
+        proposed_state="refresh apt package index and verify package manager consistency",
+        steps=(
+            AdminCommandStep(
+                "Refresh package index",
+                ("sudo", "apt-get", "update"),
+                "refresh package metadata before planned installs or upgrades",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Verify package manager state after refresh",
+                ("apt-get", "check"),
+                "package-index refresh has no direct rollback; confirm package manager consistency",
+            ),
+        ),
+        risks=("sudo privilege use", "repository metadata changes may affect later package decisions"),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify package manager consistency",
+                ("apt-get", "check"),
+                "confirm dependency metadata remains consistent after refresh",
+            ),
+        ),
+    )
+
+
+def plan_apt_upgrade(
+    plan_id: str,
+    packages: tuple[str, ...] = (),
+    reason: str = "",
+    current_state: str = "unknown",
+) -> AdminChangePlan:
+    package_args = packages or ()
+    target = " ".join(package_args) if package_args else "all upgradeable packages"
+    preview_command = ("sudo", "apt-get", "upgrade", "--dry-run", *package_args)
+    upgrade_command = ("sudo", "apt-get", "upgrade", "-y", *package_args)
+    verification_command = ("dpkg-query", "-W", *package_args) if package_args else ("apt-get", "check")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.APT_UPGRADE,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.HUMAN,
+        target=target,
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"upgrade apt packages: {target}",
+        steps=(
+            AdminCommandStep(
+                "Simulate package upgrade",
+                preview_command,
+                "preview package changes before live upgrade",
+            ),
+            AdminCommandStep(
+                "Upgrade packages",
+                upgrade_command,
+                "apply the approved package upgrade",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Check package manager state before rollback decision",
+                ("apt-get", "check"),
+                "apt upgrades may not be safely reversible automatically; verify state before operator-selected rollback",
+            ),
+        ),
+        risks=(
+            "sudo privilege use",
+            "package upgrades may restart or change local services",
+            "downgrade rollback may be unavailable without cached package versions",
+        ),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify package upgrade",
+                verification_command,
+                "confirm upgraded packages or package manager state are queryable",
             ),
         ),
     )

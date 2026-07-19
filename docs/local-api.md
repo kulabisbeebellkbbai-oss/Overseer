@@ -102,7 +102,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 `POST /admin/execute` executes only a stored plan that passes the existing approval, completeness, adapter, and IDS gates, then persists the result. Unsupported, disabled, or unapproved plans return persisted `blocked` results.
 `GET /admin/authorizations-required` lists admin change plans, archive requests, restore requests, adapter enablement requests, claim cleanup requests, and daemon migration requests waiting for explicit approval.
-`GET /admin/adapter-capabilities` lists the effective live admin adapter table for the API store, including enabled user-service restart execution and any package/firewall/source-block adapters with approved adapter enablement records.
+`GET /admin/adapter-capabilities` lists the effective live admin adapter table for the API store, including enabled user-service restart execution and any package install, package index refresh, package upgrade, firewall, or source-block adapters with approved adapter enablement records.
 `GET /admin/adapter-enablement-plan` prepares a read-only high-risk approval plan for enabling disabled live admin adapters. It supports `?kind=...` filtering and does not enable adapters or execute commands.
 `POST /admin/adapter-enablement-requests` creates the approval request required before a disabled live admin adapter can become effective for that store.
 `POST /admin/adapter-enablement-requests/approve` approves a requested adapter enablement gate for that store and adapter kind without approving a specific host change or running commands.
@@ -131,7 +131,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /claims/cleanup-requests` creates the approval request required before cleanup execution may release, revoke, renew, take over, or re-evaluate a cleanup candidate.
 `POST /claims/cleanup-requests/approve` approves a pending cleanup request after validating that its claim is still a cleanup candidate. It does not mutate the claim.
 `POST /claims/cleanup-requests/execute` executes only an approved cleanup request after re-validating the cleanup candidate. It can mark an expired active-like claim expired, re-evaluate a stale queued claim, move a release-blocked claim to `releasing`, or revoke a blocked claim. Moving a claim to `releasing` does not free the resource.
-`GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
+`GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership, permissions, sidecar files, and schema migration metadata without creating a missing database or changing file modes.
 `GET /state` includes schema migrations, persisted resources, claims, approvals, audit events, usage limits, usage continuation requests, usage continuation dispatches, health records, runtime records, admin plans, and security review records.

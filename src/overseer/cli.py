@@ -30,6 +30,8 @@ from .admin import (
     execute_admin_change_plan,
     missing_admin_change_fields,
     plan_apt_install,
+    plan_apt_update,
+    plan_apt_upgrade,
     plan_block_ip,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
@@ -533,7 +535,16 @@ def maintenance_summary_status(store_path: str | Path) -> dict[str, object]:
             plan
             for plan in store.list_admin_change_plans()
             if not plan.archived
-            and (plan.owner_domain == OwnerDomain.OBRIEN or plan.kind in {AdminChangeKind.USER_SERVICE_RESTART, AdminChangeKind.APT_INSTALL})
+            and (
+                plan.owner_domain == OwnerDomain.OBRIEN
+                or plan.kind
+                in {
+                    AdminChangeKind.USER_SERVICE_RESTART,
+                    AdminChangeKind.APT_INSTALL,
+                    AdminChangeKind.APT_UPDATE,
+                    AdminChangeKind.APT_UPGRADE,
+                }
+            )
         ]
         executions = store.list_admin_executions()
         executions_by_plan = {result.plan_id: result for result in executions}
@@ -2047,6 +2058,10 @@ def plan_admin_change_status(
         plan = plan_user_service_restart(plan_id, target, reason, current_state)
     elif plan_kind == AdminChangeKind.APT_INSTALL:
         plan = plan_apt_install(plan_id, tuple(packages or (target,)), reason, current_state)
+    elif plan_kind == AdminChangeKind.APT_UPDATE:
+        plan = plan_apt_update(plan_id, reason, current_state)
+    elif plan_kind == AdminChangeKind.APT_UPGRADE:
+        plan = plan_apt_upgrade(plan_id, tuple(packages), reason, current_state)
     elif plan_kind == AdminChangeKind.FIREWALL_ALLOW_TCP:
         if port is None:
             raise ValueError("port is required for firewall_allow_tcp")
@@ -2336,10 +2351,10 @@ def _admin_adapter_enablement_plan_item_status(capability) -> dict[str, object]:
 
 
 def _admin_adapter_enablement_risks(kind: AdminChangeKind) -> list[str]:
-    if kind == AdminChangeKind.APT_INSTALL:
+    if kind in {AdminChangeKind.APT_INSTALL, AdminChangeKind.APT_UPDATE, AdminChangeKind.APT_UPGRADE}:
         return [
             "sudo package changes may alter shared host dependencies",
-            "dependency installation may restart or change local services",
+            "package installation or upgrade may restart or change local services",
             "rollback may not fully restore transitive package state",
         ]
     if kind in {AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP, AdminChangeKind.BLOCK_IP}:

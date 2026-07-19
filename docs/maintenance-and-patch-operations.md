@@ -45,4 +45,4 @@ O'Brien's compact operator read model is available with:
 PYTHONPATH=src python3 -m overseer.cli maintenance-summary --store state/overseer.sqlite3
 ```
 
-It summarizes persisted maintenance targets plus install and restart admin plans, approval state, rollback and verification step coverage, execution status, and risk distribution.
+It summarizes persisted maintenance targets plus install, package index refresh, package upgrade, and restart admin plans, approval state, rollback and verification step coverage, execution status, and risk distribution.

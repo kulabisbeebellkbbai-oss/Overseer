@@ -100,6 +100,8 @@ from overseer import (
     assess_host_security,
     execute_admin_change_plan,
     plan_apt_install,
+    plan_apt_update,
+    plan_apt_upgrade,
     plan_block_ip,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
@@ -840,14 +842,16 @@ class HealthSummaryTests(unittest.TestCase):
         status = admin_adapter_capabilities_status()
         restart = next(item for item in status["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
         package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
+        upgrade = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_UPGRADE.value)
 
         self.assertIsNone(status["store"])
         self.assertEqual(status["enabled"], 1)
-        self.assertEqual(status["disabled"], 4)
+        self.assertEqual(status["disabled"], 6)
         self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
         self.assertFalse(restart["authorization_required_before_enable"])
         self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
         self.assertTrue(package["approval_plan_required"])
+        self.assertEqual(upgrade["adapter_name"], "apt-package-upgrade")
 
     def test_admin_adapter_capabilities_use_approved_store_enablement(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -870,7 +874,7 @@ class HealthSummaryTests(unittest.TestCase):
         package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
         self.assertEqual(status["store"], str(store_path))
         self.assertEqual(status["enabled"], 2)
-        self.assertEqual(status["disabled"], 3)
+        self.assertEqual(status["disabled"], 5)
         self.assertEqual(package["status"], AdminAdapterStatus.ENABLED.value)
         self.assertIn("approved live", package["summary"])
 
@@ -4200,6 +4204,36 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "install", "-y", "nmap"))
         self.assertEqual(plan.rollback_steps[0].command, ("sudo", "apt-get", "remove", "-y", "nmap"))
 
+    def test_package_update_plan_uses_sisko_approval_and_consistency_check(self):
+        plan = plan_apt_update(
+            "admin.apt.update",
+            "refresh package metadata before maintenance",
+            "package index stale",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.APT_UPDATE)
+        self.assertEqual(plan.approval_level, ApprovalLevel.SISKO)
+        self.assertEqual(plan.risk_level, RiskLevel.MEDIUM)
+        self.assertTrue(plan.requires_explicit_approval())
+        self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "update"))
+        self.assertEqual(plan.verification_steps[0].command, ("apt-get", "check"))
+
+    def test_package_upgrade_plan_requires_human_approval_and_preview(self):
+        plan = plan_apt_upgrade(
+            "admin.apt.upgrade.sqlite",
+            ("sqlite3",),
+            "apply approved package patch",
+            "sqlite3 upgrade available",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.APT_UPGRADE)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.risk_level, RiskLevel.HIGH)
+        self.assertEqual(plan.target, "sqlite3")
+        self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "upgrade", "--dry-run", "sqlite3"))
+        self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "upgrade", "-y", "sqlite3"))
+        self.assertEqual(plan.verification_steps[0].command, ("dpkg-query", "-W", "sqlite3"))
+
     def test_firewall_plan_has_critical_risk_and_delete_rollback(self):
         plan = plan_firewall_allow_tcp(
             "admin.firewall.8443",
@@ -4370,6 +4404,30 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(result.status, AdminExecutionStatus.BLOCKED)
         self.assertEqual(capability.status, AdminAdapterStatus.DISABLED)
         self.assertIn("live adapter unavailable for apt_install", result.summary)
+
+    def test_approved_package_update_executes_only_with_enabled_adapter(self):
+        plan = approve_admin_change_plan(
+            plan_apt_update("admin.apt.update.exec", "refresh approved package metadata"),
+            "sisko",
+        )
+
+        blocked = execute_admin_change_plan(plan)
+        executed = execute_admin_change_plan(
+            plan,
+            enabled_adapter_kinds=(AdminChangeKind.APT_UPDATE,),
+            runner=lambda step: AdminCommandResult(
+                title=step.title,
+                command=step.command,
+                exit_code=0,
+                stdout="ok",
+            ),
+        )
+        capability = admin_execution_capability_for(plan.kind, (AdminChangeKind.APT_UPDATE,))
+
+        self.assertEqual(blocked.status, AdminExecutionStatus.BLOCKED)
+        self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
+        self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
+        self.assertEqual(executed.command_results[0].command, ("sudo", "apt-get", "update"))
 
 
 class PhysicalIdentityTests(unittest.TestCase):

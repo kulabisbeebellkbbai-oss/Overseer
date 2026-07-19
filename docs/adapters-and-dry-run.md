@@ -5,7 +5,7 @@ Adapters are the boundary between Overseer's coordination model and the local ma
 ## Adapter Categories
 
 - health probes
-- maintenance runners
+- maintenance runners, including package install, package index refresh, package upgrade, and user-service restart adapters
 - physical asset discovery
 - security action runners
 - usage-limit probes

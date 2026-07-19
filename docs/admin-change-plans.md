@@ -1,6 +1,6 @@
 # Admin Change Plans
 
-Admin change plans are Overseer's bridge from observed host evidence to real IT actions. A plan is not execution. It is the approval artifact that must exist before package installs, service restarts, firewall changes, network exposure, or active blocking actions.
+Admin change plans are Overseer's bridge from observed host evidence to real IT actions. A plan is not execution. It is the approval artifact that must exist before package installs, package index refreshes, package upgrades, service restarts, firewall changes, network exposure, or active blocking actions.
 
 ## Included Fields
 
@@ -17,7 +17,10 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 
 - `user_service_restart`
 - `apt_install`
+- `apt_update`
+- `apt_upgrade`
 - `firewall_allow_tcp`
+- `firewall_deny_tcp`
 - `block_ip`
 
 ## CLI
@@ -25,6 +28,8 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --kind user_service_restart --target overseer-api.service --reason "reload approved code" --current-state active
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.install.nmap --kind apt_install --target nmap --reason "enable approved local audit"
+PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.update --kind apt_update --target apt --reason "refresh package metadata"
+PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.upgrade.sqlite --kind apt_upgrade --target sqlite3 --package sqlite3 --reason "apply approved patch"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.firewall.8443 --kind firewall_allow_tcp --target tcp/8443 --port 8443 --reason "publish approved local service"
 PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko
@@ -40,13 +45,13 @@ The planner never runs live commands. It produces the exact change list required
 
 Recording approval does not execute the plan. It only updates the stored approval metadata so the execution adapter can see that a specific command list was approved.
 
-Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled by default. Package install, firewall allow/deny, and source-block adapters remain disabled unless the same store contains an approved adapter enablement request for that exact kind. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
+Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled by default. Package install, package index refresh, package upgrade, firewall allow/deny, and source-block adapters remain disabled unless the same store contains an approved adapter enablement request for that exact kind. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
 
 Adapter enablement requests persist the human approval record for that work. Approval changes only the effective adapter capability for that store and kind; it does not approve any specific host change, modify the host, or run commands. Each admin plan must still pass its own approval, IDS review when applicable, command-boundary validation, execution recording, and verification.
 
 Canceling a plan keeps the record visible but removes it from the pending authorization queue and prevents execution. Use cancellation for placeholders, superseded plans, or plans created from disproven evidence.
 
-Live execution support is controlled by the effective adapter table. User-service restart is enabled by default; package install, firewall allow/deny, and source-block execution require approved adapter enablement for the store plus the specific admin plan approval and any IDS review gate.
+Live execution support is controlled by the effective adapter table. User-service restart is enabled by default; package install, package index refresh, package upgrade, firewall allow/deny, and source-block execution require approved adapter enablement for the store plus the specific admin plan approval and any IDS review gate.
 
 Execution results are persisted and can be reviewed with `admin-executions` or the loopback API. Blocked execution attempts are also persisted so O'Brien and Sisko can see why a plan did not run.
 

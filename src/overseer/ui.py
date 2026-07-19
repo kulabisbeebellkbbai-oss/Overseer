@@ -485,6 +485,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
+      if (action === "plan-admin-change") return await planAdminChange();
+      if (action === "approve-admin-change") return await approveAdminChange();
+      if (action === "cancel-admin-change") return await cancelAdminChange();
+      if (action === "execute-admin-change") return await executeAdminChange();
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
       throw new Error(`unsupported action: ${action}`);
@@ -555,6 +559,38 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/claims/cleanup-requests/execute", {
         approval_id: value("cleanup-execute-approval-id"),
         executed_by: value("cleanup-executed-by")
+      });
+    }
+    async function planAdminChange() {
+      const payload = {
+        plan_id: value("admin-plan-id"),
+        kind: value("admin-kind"),
+        target: value("admin-target"),
+        reason: value("admin-reason"),
+        current_state: value("admin-current-state") || "unknown"
+      };
+      const packageName = value("admin-package");
+      if (packageName) payload.packages = [packageName];
+      const port = value("admin-port");
+      if (port) payload.port = Number(port);
+      return await postJson("/admin/plans", payload);
+    }
+    async function approveAdminChange() {
+      return await postJson("/admin/approve", {
+        plan_id: value("admin-approval-plan-id"),
+        approved_by: value("admin-approved-by")
+      });
+    }
+    async function cancelAdminChange() {
+      return await postJson("/admin/cancel", {
+        plan_id: value("admin-cancel-plan-id"),
+        canceled_by: value("admin-canceled-by"),
+        reason: value("admin-cancel-reason")
+      });
+    }
+    async function executeAdminChange() {
+      return await postJson("/admin/execute", {
+        plan_id: value("admin-execute-plan-id")
       });
     }
     async function registerHealthTarget() {
@@ -628,6 +664,39 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good")}
           ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3")}
           ${metric("Failed", readiness.failed, "plans", "span-3", readiness.failed ? "bad" : "good")}
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Plan Admin Change</h3><button class="action-btn" data-action="plan-admin-change">Plan Change</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="admin-plan-id">Plan ID</label><input id="admin-plan-id" value="admin.restart.local-service"></div>
+              <div class="field span-2"><label for="admin-kind">Kind</label><select id="admin-kind">${adminKindOptions()}</select></div>
+              <div class="field span-2"><label for="admin-target">Target</label><input id="admin-target" value="overseer-api.service"></div>
+              <div class="field span-2"><label for="admin-current-state">Current State</label><input id="admin-current-state" value="active"></div>
+              <div class="field span-2"><label for="admin-package">Package</label><input id="admin-package"></div>
+              <div class="field span-2"><label for="admin-port">Port</label><input id="admin-port" type="number" min="1" max="65535"></div>
+              <div class="field span-6"><label for="admin-reason">Reason</label><input id="admin-reason" value="operator requested maintenance"></div>
+            </div>
+          </div>
+          <div class="panel span-4">
+            <div class="toolbar"><h3>Approve Plan</h3><button class="action-btn" data-action="approve-admin-change">Approve</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="admin-approval-plan-id">Plan ID</label><input id="admin-approval-plan-id"></div>
+              <div class="field span-6"><label for="admin-approved-by">Approved By</label><input id="admin-approved-by" value="sisko"></div>
+            </div>
+          </div>
+          <div class="panel span-4">
+            <div class="toolbar"><h3>Execute Plan</h3><button class="action-btn" data-action="execute-admin-change">Execute</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="admin-execute-plan-id">Plan ID</label><input id="admin-execute-plan-id"></div>
+            </div>
+          </div>
+          <div class="panel span-4">
+            <div class="toolbar"><h3>Cancel Plan</h3><button class="action-btn" data-action="cancel-admin-change">Cancel</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="admin-cancel-plan-id">Plan ID</label><input id="admin-cancel-plan-id"></div>
+              <div class="field span-3"><label for="admin-canceled-by">By</label><input id="admin-canceled-by" value="sisko"></div>
+              <div class="field span-3"><label for="admin-cancel-reason">Reason</label><input id="admin-cancel-reason"></div>
+            </div>
+          </div>
           <div class="panel span-4">${kv("Package Status", {
             status: packageStatus.status,
             upgradable: packageStatus.upgradable,
@@ -787,6 +856,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function claimTypeOptions() {
       return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function adminKindOptions() {
+      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function value(id) {
       const element = document.getElementById(id);

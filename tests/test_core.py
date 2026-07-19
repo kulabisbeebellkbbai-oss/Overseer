@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 import json
+import subprocess
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -174,6 +175,7 @@ from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
 from overseer.cli import record_usage_limit_status
 from overseer.cli import request_usage_continuation_status
+from overseer.cli import dispatch_host_security_ids_review_package_status
 from overseer.cli import dispatch_usage_continuations_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
@@ -202,6 +204,17 @@ class _JsonHealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         return
+
+
+class _FakeCodexProjectRunner:
+    def __init__(self) -> None:
+        self.commands = []
+
+    def __call__(self, command, text=True, capture_output=True):
+        self.commands.append(tuple(command))
+        if tuple(command[:3]) == ("/usr/bin/tmux", "has-session", "-t"):
+            return subprocess.CompletedProcess(command, 1, "", "missing")
+        return subprocess.CompletedProcess(command, 0, "resumed", "")
 
 
 class LocalHttpServer:
@@ -2770,6 +2783,43 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertNotIn("prompt", ids_summary["packages"][0])
             self.assertEqual(reviews["review_count"], 2)
 
+    def test_client_dispatch_ids_review_records_missing_codex_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            missing_registry = Path(directory) / "missing-codex-projects.csv"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                block_plan = client.plan_admin_change(
+                    {
+                        "plan_id": "admin.host-security.block-source.api",
+                        "kind": AdminChangeKind.BLOCK_IP.value,
+                        "target": "192.0.2.10",
+                        "reason": "stage hostile source block",
+                        "current_state": "pending IDS review",
+                    }
+                )
+                ids_package = client.prepare_host_security_ids_review_package({"plan_id": block_plan["id"]})
+                dispatched = client.dispatch_host_security_ids_review_package(
+                    {
+                        "package_id": ids_package["id"],
+                        "dispatched_by": "odo",
+                        "codex_projects_registry": str(missing_registry),
+                    }
+                )
+                summary = client.host_security_ids_review_summary()
+                pending = client.authorizations_required()
+                prompt_exists = Path(dispatched["prompt_path"]).exists()
+
+            self.assertEqual(dispatched["status"], IDSReviewPackageStatus.PREPARED.value)
+            self.assertEqual(dispatched["dispatch_status"], "not_found")
+            self.assertTrue(prompt_exists)
+            self.assertEqual(summary["packages"][0]["next_step"], "repair Intrusion Detection codex-project dispatch before approval")
+            self.assertEqual(
+                pending["pending"][0]["ids_review_next_step"],
+                "repair Intrusion Detection codex-project dispatch before approval",
+            )
+
     def test_client_plans_host_security_remediation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3933,6 +3983,58 @@ class HostInspectionTests(unittest.TestCase):
             {AuditEventType.REQUESTED.value, AuditEventType.VERIFIED.value, AuditEventType.APPROVED.value},
         )
         self.assertEqual(len(ids_review_audit_events), 4)
+
+    def test_dispatch_ids_review_package_uses_codex_projects_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            registry_path = Path(directory) / "codex-projects.csv"
+            registry_path.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f09da-25c8-72b2-9730-9a0a17b9e177,Intrusion Detection,"
+                "/home/god/Documents/Codex Workspace/Intrusion Detection,"
+                "codex-intrusion-detection-019f09da,"
+                "/home/god/.local/bin/codex-intrusion-detection-019f09da,"
+                "2026-06-27T16:11:59+00:00,2026-06-28T17:17:28+00:00,registry+codex-state,\n",
+                encoding="utf-8",
+            )
+            fake_runner = _FakeCodexProjectRunner()
+            adapter = CodexProjectThreadAdapter(registry_path=registry_path, runner=fake_runner)
+            plan = plan_admin_change_status(
+                store_path,
+                "admin.host-security.block-source.192-0-2-10",
+                AdminChangeKind.BLOCK_IP.value,
+                "192.0.2.10",
+                "stage hostile source block",
+                "source review pending IDS review",
+            )
+            package = prepare_host_security_ids_review_package_status(store_path, plan["id"])
+
+            dispatched = dispatch_host_security_ids_review_package_status(
+                store_path,
+                package["id"],
+                "odo",
+                "2026-07-19T05:10:00+00:00",
+                adapter=adapter,
+            )
+            auth_status = authorizations_required_status(store_path)
+            summary = host_security_ids_review_summary_status(store_path)
+            prompt_exists = Path(dispatched["prompt_path"]).exists()
+
+        self.assertEqual(dispatched["status"], IDSReviewPackageStatus.SUBMITTED.value)
+        self.assertEqual(dispatched["dispatch_status"], "resumed")
+        self.assertEqual(dispatched["dispatch_thread"], "codex-intrusion-detection-019f09da")
+        self.assertEqual(dispatched["dispatch_conversation_id"], "019f09da-25c8-72b2-9730-9a0a17b9e177")
+        self.assertTrue(prompt_exists)
+        self.assertEqual(
+            auth_status["pending"][0]["ids_review_next_step"],
+            "await Intrusion Detection advisory result before approval",
+        )
+        self.assertEqual(summary["submitted_without_result"], 1)
+        self.assertEqual(
+            fake_runner.commands[0],
+            ("/usr/bin/tmux", "has-session", "-t", "codex-intrusion-detection-019f09da"),
+        )
+        self.assertEqual(fake_runner.commands[1][0:4], ("/usr/bin/tmux", "new-session", "-d", "-s"))
 
     def test_host_security_remediation_stages_deny_plan_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

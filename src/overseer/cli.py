@@ -1649,6 +1649,14 @@ def host_security_ids_review_package_status(package: HostSecurityIDSReviewPackag
         "prompt_path": package.prompt_path,
         "reviewed_by": package.reviewed_by,
         "reviewed_at": package.reviewed_at,
+        "dispatched_by": package.dispatched_by,
+        "dispatched_at": package.dispatched_at,
+        "dispatch_status": package.dispatch_status,
+        "dispatch_reason": package.dispatch_reason,
+        "dispatch_thread": package.dispatch_thread,
+        "dispatch_conversation_id": package.dispatch_conversation_id,
+        "dispatch_command": package.dispatch_command,
+        "dispatch_exit_code": package.dispatch_exit_code,
         "advisory_project_path": package.advisory_project_path,
         "advisory_command": list(package.advisory_command),
         "interactive_thread": package.interactive_thread,
@@ -1788,6 +1796,8 @@ def _ids_review_package_next_step(package: HostSecurityIDSReviewPackage) -> str:
         return "IDS/firewall advisory accepted; human approval may proceed"
     if status == IDSReviewPackageStatus.REVISION_REQUIRED:
         return "revision required by Intrusion Detection; update the package or plan before approval"
+    if package.dispatch_status in {"failed", "not_found"}:
+        return "repair Intrusion Detection codex-project dispatch before approval"
     if status == IDSReviewPackageStatus.SUBMITTED:
         return "await Intrusion Detection advisory result before approval"
     if status == IDSReviewPackageStatus.PREPARED and package.prompt_path:
@@ -1830,6 +1840,81 @@ def export_host_security_ids_review_prompt_status(
             "store": str(store.path),
             "exported_prompt_path": str(prompt_path),
             **host_security_ids_review_package_status(exported),
+        }
+    finally:
+        store.close()
+
+
+def dispatch_host_security_ids_review_package_status(
+    store_path: str | Path,
+    package_id: str,
+    dispatched_by: str,
+    dispatched_at: str | None = None,
+    owner_thread: str | None = None,
+    output_dir: str | Path = "advisories",
+    filename: str | None = None,
+    codex_projects_registry: str | Path | None = None,
+    adapter: CodexProjectThreadAdapter | None = None,
+) -> dict[str, object]:
+    if not dispatched_by.strip():
+        raise ValueError("dispatched_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        package = store.load_host_security_ids_review_package(package_id)
+        prompt_path = Path(package.prompt_path) if package.prompt_path else None
+        if prompt_path is None:
+            resolved_output_dir = _resolve_store_local_output_dir(store.path, output_dir)
+            package, prompt_path = write_ids_review_prompt_file(package, resolved_output_dir, filename)
+
+        target_thread = owner_thread or package.interactive_thread
+        selected_adapter = adapter
+        if selected_adapter is None:
+            selected_adapter = (
+                CodexProjectThreadAdapter(registry_path=codex_projects_registry)
+                if codex_projects_registry
+                else CodexProjectThreadAdapter()
+            )
+        resume_result = selected_adapter.resume(target_thread)
+        dispatched = replace(
+            package,
+            dispatched_by=dispatched_by,
+            dispatched_at=dispatched_at,
+            dispatch_status=resume_result.status,
+            dispatch_reason=resume_result.reason,
+            dispatch_thread=target_thread,
+            dispatch_conversation_id=resume_result.conversation_id,
+            dispatch_command=resume_result.command,
+            dispatch_exit_code=resume_result.exit_code,
+        )
+        if resume_result.status in {"resumed", "already_running"}:
+            dispatched = mark_ids_review_package_submitted(
+                dispatched,
+                submitted_by=dispatched_by,
+                submitted_at=dispatched_at,
+                prompt_path=str(prompt_path),
+            )
+            event_type = AuditEventType.REQUESTED
+            action = "dispatched"
+        else:
+            event_type = AuditEventType.BLOCKED
+            action = "dispatch-blocked"
+
+        store.save_host_security_ids_review_package(dispatched)
+        store.save_audit_event(_ids_review_audit_event(dispatched, action, event_type, dispatched_at))
+        return {
+            "store": str(store.path),
+            "exported_prompt_path": str(prompt_path),
+            "resume_result": {
+                "owner_thread": resume_result.owner_thread,
+                "status": resume_result.status,
+                "reason": resume_result.reason,
+                "conversation_id": resume_result.conversation_id,
+                "project": resume_result.project,
+                "command": resume_result.command,
+                "launcher": resume_result.launcher,
+                "exit_code": resume_result.exit_code,
+            },
+            **host_security_ids_review_package_status(dispatched),
         }
     finally:
         store.close()
@@ -3506,6 +3591,8 @@ def _ids_review_authorization_next_step(ids_review_packages: Sequence[HostSecuri
         return "IDS/firewall advisory accepted; human approval may proceed"
     if any(package.status == IDSReviewPackageStatus.REVISION_REQUIRED for package in packages):
         return "revision required by Intrusion Detection; update the package or plan before approval"
+    if any(package.dispatch_status in {"failed", "not_found"} for package in packages):
+        return "repair Intrusion Detection codex-project dispatch before approval"
     if any(package.status == IDSReviewPackageStatus.SUBMITTED for package in packages):
         return "await Intrusion Detection advisory result before approval"
     if any(package.prompt_path for package in packages):
@@ -5001,6 +5088,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="directory under the store directory for prompt artifacts",
     )
     export_ids_review_parser.add_argument("--filename")
+    dispatch_ids_review_parser = subparsers.add_parser(
+        "dispatch-host-security-ids-review-package",
+        help="export and dispatch an IDS/firewall review package to the registered Intrusion Detection Codex thread",
+    )
+    dispatch_ids_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    dispatch_ids_review_parser.add_argument("--package-id", required=True)
+    dispatch_ids_review_parser.add_argument("--dispatched-by", required=True)
+    dispatch_ids_review_parser.add_argument("--dispatched-at")
+    dispatch_ids_review_parser.add_argument("--owner-thread", help="override the package's registered Intrusion Detection thread")
+    dispatch_ids_review_parser.add_argument(
+        "--output-dir",
+        default="advisories",
+        help="directory under the store directory for prompt artifacts when no prompt has been exported",
+    )
+    dispatch_ids_review_parser.add_argument("--filename")
+    dispatch_ids_review_parser.add_argument("--codex-projects-registry", help="override codex-projects registry path")
     record_ids_review_parser = subparsers.add_parser(
         "record-host-security-ids-review-result",
         help="record the manual Intrusion Detection advisory result for a package",
@@ -5472,6 +5575,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.package_id,
                     args.output_dir,
                     args.filename,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "dispatch-host-security-ids-review-package":
+        print(
+            json.dumps(
+                dispatch_host_security_ids_review_package_status(
+                    args.store,
+                    args.package_id,
+                    args.dispatched_by,
+                    args.dispatched_at,
+                    args.owner_thread,
+                    args.output_dir,
+                    args.filename,
+                    args.codex_projects_registry,
                 ),
                 sort_keys=True,
             )

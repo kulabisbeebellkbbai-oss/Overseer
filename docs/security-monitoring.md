@@ -42,3 +42,13 @@ PYTHONPATH=src python3 -m overseer.cli security-summary --store state/overseer.s
 ```
 
 It summarizes persisted security surfaces, alert audit events, latest host security findings, and protective firewall or block plans without executing active defense.
+
+## IDS Advisory Dispatch
+
+Firewall and source-block plans require an Intrusion Detection advisory package before approval. Overseer can export the advisory prompt and dispatch it to the registered Intrusion Detection Codex thread through the local `codex-projects` registry:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli dispatch-host-security-ids-review-package --store state/overseer.sqlite3 --package-id ids-review.admin.host-security.block-source.8-8-8-8 --dispatched-by odo
+```
+
+Dispatch records prompt path, thread id, conversation id, and resume status. It does not accept the advisory, approve the admin plan, or execute firewall changes; `record-host-security-ids-review-result --status accepted` remains the separate review gate.

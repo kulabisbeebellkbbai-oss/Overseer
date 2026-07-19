@@ -74,6 +74,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/ids-review-packages`
 - `POST /host/security/ids-review-packages/submit`
 - `POST /host/security/ids-review-packages/prompts`
+- `POST /host/security/ids-review-packages/dispatch`
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
 - `POST /usage-limits`
@@ -148,8 +149,9 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /host/security/ids-review-packages` lists prepared Intrusion Detection advisory packages and prompts tied to security admin plans.
 `GET /host/security/ids-review-summary` returns compact IDS/firewall review gate counters, package next steps, and latest Odo audit events without full prompts or advisory text.
 `POST /host/security/ids-review-packages` prepares the review package required before firewall or source-block plans can be approved. It does not run the advisor or apply policy.
-`POST /host/security/ids-review-packages/submit` records manual handoff metadata for an IDS/firewall review package. It does not execute the advisor.
+`POST /host/security/ids-review-packages/submit` records manual handoff metadata for an IDS/firewall review package when codex-project dispatch is unavailable.
 `POST /host/security/ids-review-packages/prompts` writes the advisory prompt under the store directory and records the prompt path. It does not execute the advisor.
+`POST /host/security/ids-review-packages/dispatch` writes the advisory prompt when needed, resumes the registered Intrusion Detection Codex thread through `codex-projects`, records dispatch evidence, and leaves advisory acceptance as a separate result gate.
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.

@@ -349,6 +349,9 @@ class OverseerApiClient:
     def export_host_security_ids_review_prompt(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/ids-review-packages/prompts", payload)
 
+    def dispatch_host_security_ids_review_package(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/host/security/ids-review-packages/dispatch", payload)
+
     def record_host_security_ids_review_result(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/ids-review-packages/results", payload)
 

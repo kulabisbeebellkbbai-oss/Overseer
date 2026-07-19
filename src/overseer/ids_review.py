@@ -55,6 +55,14 @@ class HostSecurityIDSReviewPackage:
     reviewed_by: str | None = None
     reviewed_at: str | None = None
     advisory_result: str | None = None
+    dispatched_by: str | None = None
+    dispatched_at: str | None = None
+    dispatch_status: str | None = None
+    dispatch_reason: str | None = None
+    dispatch_thread: str | None = None
+    dispatch_conversation_id: str | None = None
+    dispatch_command: str | None = None
+    dispatch_exit_code: int | None = None
 
     def satisfies_pre_execution_review_gate(self) -> bool:
         return self.status == IDSReviewPackageStatus.ACCEPTED and bool((self.advisory_result or "").strip())

@@ -40,6 +40,7 @@ from .cli import (
     command_summary_status,
     create_host_security_source_review_status,
     dispatch_usage_continuations_status,
+    dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
     execute_admin_change_status,
     execute_claim_cleanup_status,
@@ -269,6 +270,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/ids-review-packages/prompts":
                 self._handle_json(lambda payload: export_host_security_ids_review_prompt_status(store_path, **_export_host_security_ids_review_prompt_args(payload)))
+                return
+            if self.path == "/host/security/ids-review-packages/dispatch":
+                self._handle_json(lambda payload: dispatch_host_security_ids_review_package_status(store_path, **_dispatch_host_security_ids_review_package_args(payload)))
                 return
             if self.path == "/host/security/ids-review-packages/results":
                 self._handle_json(lambda payload: record_host_security_ids_review_result_status(store_path, **_host_security_ids_review_result_args(payload)))
@@ -671,6 +675,20 @@ def _export_host_security_ids_review_prompt_args(payload: dict[str, Any]) -> dic
         "package_id": str(payload["package_id"]),
         "output_dir": str(payload["output_dir"]) if payload.get("output_dir") else "advisories",
         "filename": str(payload["filename"]) if payload.get("filename") else None,
+    }
+
+
+def _dispatch_host_security_ids_review_package_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "package_id": str(payload["package_id"]),
+        "dispatched_by": str(payload["dispatched_by"]),
+        "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
+        "owner_thread": str(payload["owner_thread"]) if payload.get("owner_thread") else None,
+        "output_dir": str(payload["output_dir"]) if payload.get("output_dir") else "advisories",
+        "filename": str(payload["filename"]) if payload.get("filename") else None,
+        "codex_projects_registry": str(payload["codex_projects_registry"])
+        if payload.get("codex_projects_registry")
+        else None,
     }
 
 

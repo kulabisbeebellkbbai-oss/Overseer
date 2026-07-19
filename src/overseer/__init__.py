@@ -96,7 +96,13 @@ from .ids_review import (
     record_ids_review_package_result,
     write_ids_review_prompt_file,
 )
-from .live_health import HttpHealthProbeAdapter, LocalProcessHealthProbeAdapter, RoutedHealthProbeAdapter, health_probe_adapter_for
+from .live_health import (
+    HttpHealthProbeAdapter,
+    LocalCommandHealthProbeAdapter,
+    LocalProcessHealthProbeAdapter,
+    RoutedHealthProbeAdapter,
+    health_probe_adapter_for,
+)
 from .maintenance import (
     InterruptionPolicy,
     MaintenanceKind,
@@ -252,6 +258,7 @@ __all__ = [
     "record_ids_review_package_result",
     "write_ids_review_prompt_file",
     "HttpHealthProbeAdapter",
+    "LocalCommandHealthProbeAdapter",
     "LocalProcessHealthProbeAdapter",
     "RoutedHealthProbeAdapter",
     "health_probe_adapter_for",

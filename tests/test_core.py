@@ -60,6 +60,7 @@ from overseer import (
     HostInspectionAdapter,
     HostInspectionSnapshot,
     HttpHealthProbeAdapter,
+    LocalCommandHealthProbeAdapter,
     LocalProcessHealthProbeAdapter,
     RoutedHealthProbeAdapter,
     InterruptionPolicy,
@@ -724,6 +725,17 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
             self.assertEqual(status["resource_id"], "svc.local.json")
 
+    def test_probe_health_status_reports_allowed_command_target(self):
+        status = probe_health_status(
+            "svc.command.file",
+            "Command File",
+            "command:test -e /tmp",
+            ProbeType.COMMAND.value,
+        )
+
+        self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
+        self.assertEqual(status["probe_type"], ProbeType.COMMAND.value)
+
     def test_probe_health_status_persists_evidence_to_explicit_store(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -787,6 +799,50 @@ class LiveHealthProbeTests(unittest.TestCase):
         self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
         self.assertTrue(evidence.recovery_required)
         self.assertEqual(evidence.observed_error, "inactive")
+
+    def test_local_command_probe_adapter_runs_allowed_read_only_command(self):
+        commands = []
+
+        def runner(command, timeout_seconds):
+            commands.append(tuple(command))
+            return HostCommandObservation(
+                name="stat",
+                command=tuple(command),
+                exit_code=0,
+                stdout="regular file\n",
+            )
+
+        target = HealthTarget(
+            id="health.command.file",
+            resource_id="svc.command.file",
+            name="Command File",
+            probe_type=ProbeType.COMMAND,
+            target="command:stat -c %F /tmp/example",
+        )
+
+        evidence = LocalCommandHealthProbeAdapter(command_runner=runner).probe(target)
+
+        self.assertEqual(commands, [("stat", "-c", "%F", "/tmp/example")])
+        self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+        self.assertFalse(evidence.recovery_required)
+
+    def test_local_command_probe_adapter_blocks_unsupported_command(self):
+        def runner(command, timeout_seconds):
+            raise AssertionError("unsupported command should not execute")
+
+        target = HealthTarget(
+            id="health.command.unsafe",
+            resource_id="svc.command.unsafe",
+            name="Unsafe Command",
+            probe_type=ProbeType.COMMAND,
+            target="command:rm -rf /tmp/example",
+        )
+
+        evidence = LocalCommandHealthProbeAdapter(command_runner=runner).probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
+        self.assertTrue(evidence.recovery_required)
+        self.assertIn("unsupported command probe target", evidence.observed_error)
 
     def test_probe_config_status_probes_declared_targets_and_persists_evidence(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:

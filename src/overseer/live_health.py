@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
@@ -84,6 +85,38 @@ class LocalProcessHealthProbeAdapter(HealthProbeAdapter):
         return classify_probe(target, result)
 
 
+class LocalCommandHealthProbeAdapter(HealthProbeAdapter):
+    """Read-only command health probes with constrained command shapes."""
+
+    def __init__(self, command_runner: CommandRunner | None = None, timeout_seconds: float = 5.0) -> None:
+        self.command_runner = command_runner or run_read_only_command
+        self.timeout_seconds = timeout_seconds
+
+    def probe(self, target: HealthTarget) -> HealthEvidence:
+        captured_at = datetime.now(UTC).isoformat()
+        try:
+            command = _command_probe_command(target.target)
+        except ValueError as error:
+            return classify_probe(
+                target,
+                ProbeResult(
+                    target=target.target,
+                    probe_type=target.probe_type,
+                    error=str(error),
+                    captured_at=captured_at,
+                ),
+            )
+        observation = self.command_runner(command, self.timeout_seconds)
+        result = ProbeResult(
+            target=target.target,
+            probe_type=target.probe_type,
+            body_summary=_process_body_summary(observation),
+            error="" if observation.exit_code == 0 else _process_error(observation),
+            captured_at=captured_at,
+        )
+        return classify_probe(target, result)
+
+
 class RoutedHealthProbeAdapter(HealthProbeAdapter):
     def __init__(self, timeout_seconds: float = 5.0) -> None:
         self.timeout_seconds = timeout_seconds
@@ -95,6 +128,8 @@ class RoutedHealthProbeAdapter(HealthProbeAdapter):
 def health_probe_adapter_for(target: HealthTarget, timeout_seconds: float = 5.0) -> HealthProbeAdapter:
     if target.probe_type == ProbeType.PROCESS:
         return LocalProcessHealthProbeAdapter(timeout_seconds=timeout_seconds)
+    if target.probe_type == ProbeType.COMMAND:
+        return LocalCommandHealthProbeAdapter(timeout_seconds=timeout_seconds)
     return HttpHealthProbeAdapter(timeout_seconds=timeout_seconds)
 
 
@@ -122,6 +157,33 @@ def _process_probe_command(target: str) -> tuple[str, ...]:
     if target.startswith("pid:"):
         return ("ps", "-p", target.removeprefix("pid:"), "-o", "pid=")
     return ("pgrep", "-af", target)
+
+
+def _command_probe_command(target: str) -> tuple[str, ...]:
+    command_text = target.removeprefix("command:").strip()
+    try:
+        command = tuple(shlex.split(command_text))
+    except ValueError as error:
+        raise ValueError(f"invalid command probe target: {error}") from error
+    if _is_read_only_health_command(command):
+        return command
+    raise ValueError("unsupported command probe target; only read-only health command shapes are allowed")
+
+
+def _is_read_only_health_command(command: tuple[str, ...]) -> bool:
+    if len(command) == 4 and command[:3] == ("systemctl", "--user", "is-active"):
+        return bool(command[3].strip())
+    if len(command) == 3 and command[:2] == ("systemctl", "is-active"):
+        return bool(command[2].strip())
+    if len(command) == 3 and command[:2] == ("pgrep", "-af"):
+        return bool(command[2].strip())
+    if len(command) == 5 and command[0] == "ps" and command[1] == "-p" and command[3:] == ("-o", "pid="):
+        return command[2].isdigit()
+    if len(command) == 3 and command[:2] == ("test", "-e"):
+        return bool(command[2].strip())
+    if len(command) == 4 and command[:3] == ("stat", "-c", "%F"):
+        return bool(command[3].strip())
+    return False
 
 
 def _process_body_summary(observation: HostCommandObservation) -> str:

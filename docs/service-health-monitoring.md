@@ -119,3 +119,22 @@ Supported process target forms:
 - any other value: checks for a matching process with `pgrep -af`.
 
 These probes only observe process state. They do not start, stop, restart, enable, disable, install, remove, or reconfigure services.
+
+## Live Command Probes
+
+Julian can also run constrained read-only command probes for checks that are not naturally HTTP or process targets:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.example --name "File Presence" --probe-type command --url "command:test -e /tmp" --store state/overseer.sqlite3
+```
+
+Supported command target shapes:
+
+- `command:systemctl --user is-active <unit>`
+- `command:systemctl is-active <unit>`
+- `command:pgrep -af <pattern>`
+- `command:ps -p <pid> -o pid=`
+- `command:test -e <path>`
+- `command:stat -c %F <path>`
+
+Unsupported command targets are recorded as failed health evidence and are not executed. Command probes do not invoke a shell and do not run service mutation, package, firewall, permission, mount, or file-write commands.

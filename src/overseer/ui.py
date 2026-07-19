@@ -12,29 +12,29 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #080b0d;
-      --deck: #111719;
-      --panel: #151d20;
-      --panel-2: #202b2e;
-      --line: #3b4647;
-      --line-hot: #c68a35;
-      --text: #f2ede4;
-      --muted: #a9b3ae;
-      --good: #58c6a9;
-      --warn: #e2a94a;
-      --bad: #e06d5f;
-      --focus: #7ab7d8;
-      --command: #d9a14a;
-      --ops: #2f766f;
-      --alert: #6f2f33;
+      --bg: #0e1117;
+      --deck: #151922;
+      --panel: #1b2028;
+      --panel-2: #252c36;
+      --line: #3a4350;
+      --line-hot: #9bb7d4;
+      --text: #eef2f6;
+      --muted: #a6b0bd;
+      --good: #7bd88f;
+      --warn: #f0c36a;
+      --bad: #ff7a78;
+      --focus: #8bbfe8;
+      --command: #c7a76c;
+      --ops: #667d94;
+      --alert: #8b4e5a;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-width: 320px;
       background:
-        linear-gradient(90deg, rgba(217, 161, 74, 0.12), transparent 18%, transparent 82%, rgba(47, 118, 111, 0.12)),
-        radial-gradient(circle at 50% -20%, rgba(122, 183, 216, 0.16), transparent 35%),
+        linear-gradient(120deg, rgba(199, 167, 108, 0.07), transparent 24%, transparent 76%, rgba(102, 125, 148, 0.09)),
+        radial-gradient(circle at 50% -20%, rgba(139, 191, 232, 0.10), transparent 38%),
         var(--bg);
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -50,19 +50,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     aside {
       position: relative;
       background:
-        linear-gradient(180deg, #1d2424, #0e1314 58%, #111719),
+        linear-gradient(180deg, #1a202a, #11161e 58%, #0d1117),
         var(--deck);
       color: var(--text);
       padding: 18px 14px;
-      border-right: 1px solid #2e3838;
-      box-shadow: inset -5px 0 0 rgba(217, 161, 74, 0.24);
+      border-right: 1px solid #2d3540;
+      box-shadow: inset -5px 0 0 rgba(199, 167, 108, 0.14);
     }
     aside::before {
       content: "";
       display: block;
       height: 10px;
       margin: -4px 0 18px;
-      background: linear-gradient(90deg, var(--command) 0 26%, var(--ops) 26% 50%, var(--alert) 50% 66%, var(--focus) 66% 100%);
+      background: linear-gradient(90deg, var(--command) 0 24%, var(--ops) 24% 52%, var(--alert) 52% 66%, var(--focus) 66% 100%);
       border-radius: 2px;
     }
     main {
@@ -79,8 +79,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       width: 42px;
       height: 42px;
       border-radius: 4px 13px 4px 13px;
-      background: linear-gradient(135deg, var(--command), #8e5d29);
-      color: #111719;
+      background: linear-gradient(135deg, var(--command), #6f7f90);
+      color: #101318;
       display: grid;
       place-items: center;
       font-weight: 800;
@@ -105,17 +105,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       border: 1px solid transparent;
       border-radius: 4px 12px 4px 12px;
       padding: 10px 12px;
-      background: rgba(255, 255, 255, 0.03);
-      color: #d9ddd8;
+      background: rgba(238, 242, 246, 0.035);
+      color: #d8dee7;
       text-align: left;
       cursor: pointer;
       min-height: 40px;
     }
     .nav button[aria-selected="true"] {
-      background: linear-gradient(90deg, rgba(217, 161, 74, 0.85), rgba(47, 118, 111, 0.42));
-      color: #fff7e8;
-      border-color: rgba(242, 237, 228, 0.24);
-      box-shadow: inset 4px 0 0 #f1c66d;
+      background: linear-gradient(90deg, rgba(102, 125, 148, 0.58), rgba(199, 167, 108, 0.18));
+      color: #ffffff;
+      border-color: rgba(155, 183, 212, 0.42);
+      box-shadow: inset 4px 0 0 var(--focus);
     }
     .topbar {
       display: grid;
@@ -126,7 +126,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       padding: 12px 14px;
       border: 1px solid var(--line);
       border-radius: 4px;
-      background: rgba(17, 23, 25, 0.82);
+      background: rgba(18, 23, 31, 0.88);
     }
     .status-line {
       display: flex;
@@ -146,7 +146,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       border: 1px solid var(--line);
       border-radius: 4px;
       padding: 8px 10px;
-      background: #090d0e;
+      background: #0b0f15;
       color: var(--text);
     }
     .token input:focus {
@@ -157,14 +157,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       border: 1px solid var(--line);
       border-radius: 4px 10px 4px 10px;
       min-height: 36px;
-      background: linear-gradient(180deg, #243032, #12191b);
+      background: linear-gradient(180deg, #26303b, #141922);
       color: var(--text);
       cursor: pointer;
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
     }
     .icon-btn:hover, .action-btn:hover {
       border-color: var(--line-hot);
-      color: #fff7e8;
+      color: #ffffff;
     }
     .icon-btn {
       width: 38px;
@@ -181,12 +181,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     .panel {
       position: relative;
-      background: linear-gradient(180deg, #172023, #111719);
+      background: linear-gradient(180deg, #1d242d, #151a22);
       border: 1px solid var(--line);
       border-radius: 4px;
       padding: 14px;
       min-width: 0;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 14px 32px rgba(0, 0, 0, 0.18);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 14px 32px rgba(0, 0, 0, 0.16);
     }
     .panel::before {
       content: "";
@@ -226,9 +226,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       font-size: 12px;
       white-space: nowrap;
     }
-    .pill.good { color: var(--good); border-color: rgba(88, 198, 169, 0.55); background: rgba(39, 93, 82, 0.34); }
-    .pill.warn { color: var(--warn); border-color: rgba(226, 169, 74, 0.55); background: rgba(103, 72, 24, 0.36); }
-    .pill.bad { color: var(--bad); border-color: rgba(224, 109, 95, 0.55); background: rgba(111, 47, 51, 0.42); }
+    .pill.good { color: var(--good); border-color: rgba(123, 216, 143, 0.48); background: rgba(43, 83, 58, 0.30); }
+    .pill.warn { color: var(--warn); border-color: rgba(240, 195, 106, 0.50); background: rgba(92, 68, 29, 0.30); }
+    .pill.bad { color: var(--bad); border-color: rgba(255, 122, 120, 0.50); background: rgba(101, 45, 50, 0.34); }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -301,7 +301,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       border: 1px solid var(--line);
       border-radius: 4px;
       padding: 7px 9px;
-      background: #090d0e;
+      background: #0b0f15;
       color: var(--text);
       min-width: 0;
     }
@@ -353,7 +353,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     .error {
       border-color: rgba(224, 109, 95, 0.74);
-      background: rgba(111, 47, 51, 0.42);
+      background: rgba(101, 45, 50, 0.34);
       color: var(--bad);
     }
     @media (max-width: 900px) {
@@ -363,8 +363,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         top: 0;
         z-index: 2;
         border-right: 0;
-        border-bottom: 1px solid #2e3838;
-        box-shadow: inset 0 -5px 0 rgba(217, 161, 74, 0.22);
+        border-bottom: 1px solid #2d3540;
+        box-shadow: inset 0 -5px 0 rgba(199, 167, 108, 0.12);
       }
       .nav {
         grid-template-columns: repeat(4, minmax(0, 1fr));

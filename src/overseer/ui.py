@@ -348,6 +348,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       readiness: "/admin/execution-readiness",
       adapters: "/admin/adapter-capabilities",
       activePolicy: "/admin/active-policy-profile",
+      packageStatus: "/maintenance/package-status",
       physical: "/physical-summary",
       virtual: "/virtual-summary",
       security: "/security-summary",
@@ -487,6 +488,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const auth = state.data.authorizations || {};
       const readiness = state.data.readiness || {};
       const activePolicy = state.data.activePolicy || {};
+      const packageStatus = state.data.packageStatus || {};
       const profile = activePolicy.profile || {};
       document.getElementById("admin").innerHTML = `
         <div class="grid">
@@ -494,6 +496,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good")}
           ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3")}
           ${metric("Failed", readiness.failed, "plans", "span-3", readiness.failed ? "bad" : "good")}
+          <div class="panel span-4">${kv("Package Status", {
+            status: packageStatus.status,
+            upgradable: packageStatus.upgradable,
+            captured_at: packageStatus.captured_at,
+            stderr: packageStatus.stderr
+          })}</div>
+          <div class="panel span-8">${table("Upgradable Packages", packageStatus.items || [], ["name", "installed_version", "candidate_version", "repository"])}</div>
           <div class="panel span-12">${kv("Active Policy Profile", {
             name: profile.name,
             source: activePolicy.source,

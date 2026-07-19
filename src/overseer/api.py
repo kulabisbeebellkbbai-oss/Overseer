@@ -60,6 +60,7 @@ from .cli import (
     host_security_source_reviews_status,
     host_security_triage_status,
     inspect_host_status,
+    inspect_packages_status,
     list_state_status,
     maintenance_summary_status,
     operator_dashboard_status,
@@ -136,6 +137,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/maintenance-summary":
                 self._handle(lambda: maintenance_summary_status(store_path))
+                return
+            if path == "/maintenance/package-status":
+                self._handle(lambda: inspect_packages_status())
                 return
             if path == "/health-summary":
                 self._handle(lambda: health_summary_status(store_path))

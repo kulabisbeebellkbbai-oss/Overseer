@@ -58,6 +58,7 @@ from .ids_review import (
 from .live_health import HttpHealthProbeAdapter, health_probe_adapter_for
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
+from .packages import AptPackageInspectionAdapter, PackageInspectionSnapshot, PackageUpdate
 from .policy import (
     PolicyCheck,
     PolicyDecision,
@@ -700,6 +701,37 @@ def maintenance_plan_status(plan: AdminChangePlan, execution: AdminExecutionResu
         "latest_execution_id": execution.id if execution else None,
         "latest_execution_status": AdminExecutionStatus(execution.status).value if execution else None,
         "reason": plan.reason,
+    }
+
+
+def inspect_packages_status(
+    captured_at: str | None = None,
+    adapter: AptPackageInspectionAdapter | None = None,
+) -> dict[str, object]:
+    snapshot = (adapter or AptPackageInspectionAdapter()).inspect(captured_at)
+    return package_inspection_snapshot_status(snapshot)
+
+
+def package_inspection_snapshot_status(snapshot: PackageInspectionSnapshot) -> dict[str, object]:
+    return {
+        "id": snapshot.id,
+        "captured_at": snapshot.captured_at,
+        "command": list(snapshot.command),
+        "exit_code": snapshot.exit_code,
+        "status": "ok" if snapshot.succeeded() else "failed",
+        "upgradable": len(snapshot.updates),
+        "stderr": snapshot.stderr,
+        "items": [package_update_status(update) for update in snapshot.updates],
+    }
+
+
+def package_update_status(update: PackageUpdate) -> dict[str, object]:
+    return {
+        "name": update.name,
+        "repository": update.repository,
+        "candidate_version": update.candidate_version,
+        "architecture": update.architecture,
+        "installed_version": update.installed_version,
     }
 
 
@@ -5357,6 +5389,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     operator_dashboard_parser.add_argument("--service-name", default="overseer")
     maintenance_summary_parser = subparsers.add_parser("maintenance-summary", help="summarize maintenance and update plans")
     maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    inspect_packages_parser = subparsers.add_parser("inspect-packages", help="read apt package update availability without changing packages")
+    inspect_packages_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
     security_summary_parser = subparsers.add_parser("security-summary", help="summarize security surfaces and alerts")
     security_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_efficiency_parser = subparsers.add_parser("health-efficiency", help="summarize service health efficiency")
@@ -5837,6 +5871,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "maintenance-summary":
         print(json.dumps(maintenance_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "inspect-packages":
+        print(json.dumps(inspect_packages_status(args.captured_at), sort_keys=True))
         return 0
 
     if args.command == "security-summary":

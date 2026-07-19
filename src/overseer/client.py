@@ -78,6 +78,9 @@ class OverseerApiClient:
     def maintenance_summary(self) -> dict[str, Any]:
         return self._get("/maintenance-summary")
 
+    def package_status(self) -> dict[str, Any]:
+        return self._get("/maintenance/package-status")
+
     def health_summary(self) -> dict[str, Any]:
         return self._get("/health-summary")
 

@@ -71,6 +71,7 @@ from overseer import (
     OverseerConfig,
     OverseerCoordinator,
     PathPhysicalDiscoveryAdapter,
+    AptPackageInspectionAdapter,
     StoragePhysicalDiscoveryAdapter,
     ListenerVirtualDiscoveryAdapter,
     PolicyProfile,
@@ -99,6 +100,7 @@ from overseer import (
     config_from_mapping,
     needs_operator_approval,
     physical_identity_conflicts,
+    parse_apt_upgradable,
     recommend_security_response,
     schedule_maintenance_window,
     schedule_limited_work,
@@ -174,6 +176,7 @@ from overseer.cli import create_host_security_source_review_status
 from overseer.cli import host_security_source_reviews_status
 from overseer.cli import host_security_triage_status
 from overseer.cli import inspect_host_status
+from overseer.cli import inspect_packages_status
 from overseer.cli import list_state_status
 from overseer.cli import main as cli_main
 from overseer.cli import maintenance_summary_status
@@ -858,6 +861,59 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
+
+
+class PackageInspectionTests(unittest.TestCase):
+    def test_parse_apt_upgradable_extracts_versions(self):
+        updates = parse_apt_upgradable(
+            "\n".join(
+                (
+                    "Listing...",
+                    "openssl/oldstable-security 3.0.15-1 amd64 [upgradable from: 3.0.14-1]",
+                    "python3/oldstable 3.11.2-1 amd64 [upgradable from: 3.11.1-1]",
+                )
+            )
+        )
+
+        self.assertEqual([update.name for update in updates], ["openssl", "python3"])
+        self.assertEqual(updates[0].repository, "oldstable-security")
+        self.assertEqual(updates[0].candidate_version, "3.0.15-1")
+        self.assertEqual(updates[0].installed_version, "3.0.14-1")
+
+    def test_inspect_packages_status_reports_read_only_apt_updates(self):
+        commands = []
+
+        def runner(command):
+            commands.append(tuple(command))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "Listing...\nopenssl/oldstable-security 3.0.15-1 amd64 [upgradable from: 3.0.14-1]\n",
+                "",
+            )
+
+        status = inspect_packages_status(
+            "2026-07-19T14:45:00+00:00",
+            AptPackageInspectionAdapter(command_runner=runner),
+        )
+
+        self.assertEqual(commands, [("apt", "list", "--upgradable")])
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["upgradable"], 1)
+        self.assertEqual(status["items"][0]["name"], "openssl")
+
+    def test_inspect_packages_status_preserves_failed_stderr(self):
+        def runner(command):
+            return subprocess.CompletedProcess(command, 100, "", "apt lock unavailable")
+
+        status = inspect_packages_status(
+            "2026-07-19T14:46:00+00:00",
+            AptPackageInspectionAdapter(command_runner=runner),
+        )
+
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["upgradable"], 0)
+        self.assertEqual(status["stderr"], "apt lock unavailable")
 
 
 class HealthSummaryTests(unittest.TestCase):
@@ -2769,6 +2825,27 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["plans"], 1)
             self.assertEqual(status["items"][0]["kind"], AdminChangeKind.USER_SERVICE_RESTART.value)
 
+    def test_client_reads_package_status(self):
+        original = overseer_api.inspect_packages_status
+        overseer_api.inspect_packages_status = lambda: {
+            "status": "ok",
+            "upgradable": 1,
+            "items": [{"name": "openssl"}],
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    client = OverseerApiClient(server.url, auth_token="client-secret")
+                    status = client.package_status()
+        finally:
+            overseer_api.inspect_packages_status = original
+
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["upgradable"], 1)
+        self.assertEqual(status["items"][0]["name"], "openssl")
+
     def test_client_reads_security_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3103,6 +3180,8 @@ class OverseerApiClientTests(unittest.TestCase):
     def test_operator_console_loads_active_policy_profile(self):
         self.assertIn('activePolicy: "/admin/active-policy-profile"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Active Policy Profile", OPERATOR_CONSOLE_HTML)
+        self.assertIn('packageStatus: "/maintenance/package-status"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Package Status", OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:

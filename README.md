@@ -36,6 +36,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli command-summary --store state/overseer.sqlite3` - summarize command-level service, resource, claim, health, usage, asset, admin, and alert state.
 - `PYTHONPATH=src python3 -m overseer.cli operator-dashboard --store state/overseer.sqlite3` - summarize all operator domains into one role-focused attention dashboard, including admin archive candidates, restore approvals, and security review gate blockers.
 - `PYTHONPATH=src python3 -m overseer.cli maintenance-summary --store state/overseer.sqlite3` - summarize maintenance targets, install/update/upgrade/restart plans, approvals, rollback readiness, and execution status.
+- `PYTHONPATH=src python3 -m overseer.cli inspect-packages` - inspect apt package update availability without installing, upgrading, or refreshing package indexes.
 - `PYTHONPATH=src python3 -m overseer.cli security-summary --store state/overseer.sqlite3` - summarize security surfaces, alert audit events, host findings, protective admin plans, and IDS review gates.
 - `PYTHONPATH=src python3 -m overseer.cli health-efficiency --store state/overseer.sqlite3` - summarize service health status, probe types, owner routing, recovery requirements, and latest failures.
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once` - run one foreground runtime tick against an explicit store.

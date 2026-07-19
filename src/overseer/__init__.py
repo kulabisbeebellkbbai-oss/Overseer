@@ -101,6 +101,7 @@ from .maintenance import (
 )
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource, physical_identity_conflicts
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
+from .packages import AptPackageInspectionAdapter, PackageInspectionSnapshot, PackageUpdate, parse_apt_upgradable
 from .policy import (
     BEST_PRACTICE_POLICY_PROFILE,
     PolicyCheck,
@@ -258,6 +259,10 @@ __all__ = [
     "physical_identity_conflicts",
     "PathPhysicalDiscoveryAdapter",
     "StoragePhysicalDiscoveryAdapter",
+    "AptPackageInspectionAdapter",
+    "PackageInspectionSnapshot",
+    "PackageUpdate",
+    "parse_apt_upgradable",
     "PolicyCheck",
     "PolicyCheckStatus",
     "PolicyDecision",

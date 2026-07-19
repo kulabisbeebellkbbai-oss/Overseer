@@ -4240,7 +4240,7 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.risk_level, RiskLevel.MEDIUM)
         self.assertTrue(plan.requires_explicit_approval())
         self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "update"))
-        self.assertEqual(plan.verification_steps[0].command, ("apt-get", "check"))
+        self.assertEqual(plan.verification_steps[0].command, ("sudo", "apt-get", "check"))
 
     def test_package_upgrade_plan_requires_human_approval_and_preview(self):
         plan = plan_apt_upgrade(

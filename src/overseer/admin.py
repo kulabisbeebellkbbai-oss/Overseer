@@ -148,7 +148,7 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         summary="live apt package index refresh requires a specific package-maintenance adapter approval plan before enablement",
         authorization_required_before_enable=True,
         approval_plan_required=True,
-        supported_commands=(("sudo", "apt-get", "update"), ("apt-get", "check")),
+        supported_commands=(("sudo", "apt-get", "update"), ("sudo", "apt-get", "check")),
     ),
     AdminChangeKind.APT_UPGRADE: AdminExecutionCapability(
         kind=AdminChangeKind.APT_UPGRADE,
@@ -157,7 +157,7 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         summary="live apt upgrades require a specific high-risk package-maintenance adapter approval plan before enablement",
         authorization_required_before_enable=True,
         approval_plan_required=True,
-        supported_commands=(("sudo", "apt-get", "upgrade"), ("apt-get", "check"), ("apt", "list", "--upgradable")),
+        supported_commands=(("sudo", "apt-get", "upgrade"), ("sudo", "apt-get", "check"), ("apt", "list", "--upgradable")),
     ),
     AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
@@ -348,7 +348,7 @@ def plan_apt_update(plan_id: str, reason: str, current_state: str = "unknown") -
         rollback_steps=(
             AdminCommandStep(
                 "Verify package manager state after refresh",
-                ("apt-get", "check"),
+                ("sudo", "apt-get", "check"),
                 "package-index refresh has no direct rollback; confirm package manager consistency",
             ),
         ),
@@ -356,7 +356,7 @@ def plan_apt_update(plan_id: str, reason: str, current_state: str = "unknown") -
         verification_steps=(
             AdminCommandStep(
                 "Verify package manager consistency",
-                ("apt-get", "check"),
+                ("sudo", "apt-get", "check"),
                 "confirm dependency metadata remains consistent after refresh",
             ),
         ),
@@ -373,7 +373,7 @@ def plan_apt_upgrade(
     target = " ".join(package_args) if package_args else "all upgradeable packages"
     preview_command = ("sudo", "apt-get", "upgrade", "--dry-run", *package_args)
     upgrade_command = ("sudo", "apt-get", "upgrade", "-y", *package_args)
-    verification_command = ("dpkg-query", "-W", *package_args) if package_args else ("apt-get", "check")
+    verification_command = ("dpkg-query", "-W", *package_args) if package_args else ("sudo", "apt-get", "check")
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.APT_UPGRADE,
@@ -399,7 +399,7 @@ def plan_apt_upgrade(
         rollback_steps=(
             AdminCommandStep(
                 "Check package manager state before rollback decision",
-                ("apt-get", "check"),
+                ("sudo", "apt-get", "check"),
                 "apt upgrades may not be safely reversible automatically; verify state before operator-selected rollback",
             ),
         ),

@@ -59,6 +59,7 @@ from .cli import (
     host_security_findings_status,
     host_security_ids_review_packages_status,
     host_security_ids_review_summary_status,
+    host_security_source_review_queue_status,
     host_security_sources_status,
     host_security_source_reviews_status,
     host_security_triage_status,
@@ -196,6 +197,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/host/security/sources":
                 self._handle(lambda: host_security_sources_status(store_path))
+                return
+            if path == "/host/security/source-review-queue":
+                self._handle(lambda: host_security_source_review_queue_status(store_path))
                 return
             if path == "/host/security/source-reviews":
                 self._handle(lambda: host_security_source_reviews_status(store_path))

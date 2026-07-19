@@ -393,7 +393,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       audit: "/audit-summary",
       approvals: "/approvals-summary",
       claims: "/claims/review",
-      claimCleanup: "/claims/cleanup-plan"
+      claimCleanup: "/claims/cleanup-plan",
+      sourceReviewQueue: "/host/security/source-review-queue"
     };
     const state = {
       data: {},
@@ -1002,6 +1003,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const security = state.data.security || {};
       const host = security.host_security || {};
       const plans = (security.protective_plans || {}).items || [];
+      const sourceQueue = state.data.sourceReviewQueue || {};
       document.getElementById("security").innerHTML = `
         <div class="grid">
           <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button></div></div>
@@ -1059,6 +1061,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-8">${table("Protective Plans", plans, ["id", "kind", "target", "approved", "canceled"])}</div>
           <div class="panel span-4">${kv("IDS Review", security.ids_review || {})}</div>
+          <div class="panel span-12">${table("Source Review Queue", sourceQueue.items || [], ["remote_address", "listener", "source_scope", "disposition", "queue_status", "next_step"])}</div>
         </div>`;
     }
     function renderHealth() {

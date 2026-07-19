@@ -438,6 +438,9 @@ class OverseerApiClient:
     def host_security_sources(self) -> dict[str, Any]:
         return self._get("/host/security/sources")
 
+    def host_security_source_review_queue(self) -> dict[str, Any]:
+        return self._get("/host/security/source-review-queue")
+
     def host_security_source_reviews(self) -> dict[str, Any]:
         return self._get("/host/security/source-reviews")
 

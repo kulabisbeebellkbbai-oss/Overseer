@@ -1959,6 +1959,94 @@ def host_security_source_reviews_status(store_path: str | Path) -> dict[str, obj
         store.close()
 
 
+def host_security_source_review_queue_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    sources = host_security_sources_status(store_path, snapshot_id)
+    reviews = host_security_source_reviews_status(store_path)
+    latest_reviews = _latest_source_reviews_by_source(reviews["reviews"])
+    items = []
+    for connection in sources["connections"]:
+        review = latest_reviews.get(_source_review_key(connection))
+        disposition = str(review["disposition"]) if review else SourceReviewDisposition.NEEDS_REVIEW.value
+        can_stage_block = bool(review["can_stage_block_plan"]) if review else False
+        items.append(
+            {
+                "source_connection_id": connection["id"],
+                "listener": connection["listener"],
+                "remote_address": connection["remote_address"],
+                "remote_port": connection["remote_port"],
+                "source_scope": connection["source_scope"],
+                "listener_severity": connection["listener_severity"],
+                "review_id": review["id"] if review else None,
+                "disposition": disposition,
+                "can_stage_block_plan": can_stage_block,
+                "queue_status": _source_review_queue_status(connection, review),
+                "next_step": _source_review_queue_next_step(connection, review),
+                "recommended_action": connection["recommended_action"],
+                "evidence": connection["evidence"],
+            }
+        )
+    return {
+        "store": str(Path(store_path)),
+        "snapshot_id": sources["snapshot_id"],
+        "captured_at": sources["captured_at"],
+        "connection_count": sources["connection_count"],
+        "review_count": reviews["review_count"],
+        "needs_review": sum(1 for item in items if item["queue_status"] == "needs_review"),
+        "ready_for_block_plan": sum(1 for item in items if item["queue_status"] == "ready_for_block_plan"),
+        "reviewed_no_action": sum(1 for item in items if item["queue_status"] == "reviewed_no_action"),
+        "not_blockable": sum(1 for item in items if item["queue_status"] == "not_blockable"),
+        "items": items,
+        "approval_boundary": (
+            "read-only queue only; hostile classification, block plans, firewall, IDS, route, or service-bind "
+            "changes require separate review and approval-gated remediation"
+        ),
+    }
+
+
+def _latest_source_reviews_by_source(reviews: Sequence[dict[str, object]]) -> dict[tuple[str, str], dict[str, object]]:
+    latest: dict[tuple[str, str], dict[str, object]] = {}
+    for review in reviews:
+        key = _source_review_key(review)
+        existing = latest.get(key)
+        if existing is None or str(review.get("reviewed_at") or review.get("created_at") or review["id"]) >= str(
+            existing.get("reviewed_at") or existing.get("created_at") or existing["id"]
+        ):
+            latest[key] = review
+    return latest
+
+
+def _source_review_key(item: dict[str, object]) -> tuple[str, str]:
+    return str(item["listener"]), str(item["remote_address"])
+
+
+def _source_review_queue_status(connection: dict[str, object], review: dict[str, object] | None) -> str:
+    if review is None:
+        return "needs_review"
+    if bool(review["can_stage_block_plan"]):
+        return "ready_for_block_plan"
+    disposition = SourceReviewDisposition(str(review["disposition"]))
+    if disposition in {SourceReviewDisposition.EXPECTED, SourceReviewDisposition.BENIGN, SourceReviewDisposition.SUSPICIOUS}:
+        return "reviewed_no_action"
+    if not bool(connection["can_stage_block_plan"]):
+        return "not_blockable"
+    return "needs_review"
+
+
+def _source_review_queue_next_step(connection: dict[str, object], review: dict[str, object] | None) -> str:
+    if review is None:
+        if connection["source_scope"] == "external":
+            return "record Odo source review before any block plan is staged"
+        return "record Odo source review only if this source is unexpected"
+    if bool(review["can_stage_block_plan"]):
+        return "stage approval-gated source block plan or downgrade the review disposition"
+    disposition = SourceReviewDisposition(str(review["disposition"]))
+    if disposition == SourceReviewDisposition.HOSTILE:
+        return "hostile review is not block-ready; confirm external scope, reviewer, and rationale"
+    if disposition == SourceReviewDisposition.SUSPICIOUS:
+        return "continue monitoring or escalate to hostile only with supporting evidence"
+    return "no protective action queued"
+
+
 def plan_host_security_source_block_status(
     store_path: str | Path,
     review_id: str,
@@ -5772,6 +5860,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     host_sources_parser = subparsers.add_parser("host-security-sources", help="correlate established TCP sources to host security listeners")
     host_sources_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_sources_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    source_queue_parser = subparsers.add_parser("host-security-source-review-queue", help="summarize current source review and block-readiness queue")
+    source_queue_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    source_queue_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     source_reviews_parser = subparsers.add_parser("host-security-source-reviews", help="list host security source reviews")
     source_reviews_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     create_source_review_parser = subparsers.add_parser("create-host-security-source-review", help="record Odo review of a correlated source")
@@ -6338,6 +6429,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-sources":
         print(json.dumps(host_security_sources_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-source-review-queue":
+        print(json.dumps(host_security_source_review_queue_status(args.store, args.snapshot_id), sort_keys=True))
         return 0
 
     if args.command == "host-security-source-reviews":

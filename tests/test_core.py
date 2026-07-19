@@ -182,6 +182,7 @@ from overseer.cli import export_host_security_ids_review_prompt_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import host_security_findings_status
+from overseer.cli import host_security_source_review_queue_status
 from overseer.cli import host_security_sources_status
 from overseer.cli import create_host_security_source_review_status
 from overseer.cli import host_security_source_reviews_status
@@ -3396,6 +3397,39 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["connections"][0]["remote_address"], "8.8.8.8")
             self.assertEqual(status["connections"][0]["source_scope"], "external")
 
+    def test_client_reads_host_security_source_review_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53122"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.host_security_source_review_queue()
+
+            self.assertEqual(status["connection_count"], 1)
+            self.assertEqual(status["needs_review"], 1)
+            self.assertEqual(status["items"][0]["remote_address"], "8.8.8.8")
+            self.assertEqual(status["items"][0]["queue_status"], "needs_review")
+
     def test_client_creates_host_security_source_review(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4980,6 +5014,90 @@ class HostInspectionTests(unittest.TestCase):
             {AuditEventType.REQUESTED.value, AuditEventType.VERIFIED.value, AuditEventType.APPROVED.value},
         )
         self.assertEqual(len(ids_review_audit_events), 4)
+
+    def test_host_security_source_review_queue_reconciles_current_sources_and_reviews(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-review-queue"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53122\n"
+                        "ESTAB 0 0 192.168.1.20:22 1.1.1.1:53123\n"
+                        "ESTAB 0 0 192.168.1.20:22 192.0.2.10:54000\n"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:12:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            create_host_security_source_review_status(
+                store_path,
+                "8.8.8.8",
+                disposition=SourceReviewDisposition.HOSTILE.value,
+                rationale="confirmed hostile connection pattern",
+                reviewed_by="odo",
+                reviewed_at="2026-07-18T16:13:00+00:00",
+            )
+            create_host_security_source_review_status(
+                store_path,
+                "192.0.2.10",
+                disposition=SourceReviewDisposition.BENIGN.value,
+                rationale="documentation-range test evidence",
+                reviewed_by="odo",
+                reviewed_at="2026-07-18T16:14:00+00:00",
+            )
+            refreshed_snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-review-queue"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "ESTAB 0 0 192.168.1.20:22 8.8.8.8:53124\n"
+                        "ESTAB 0 0 192.168.1.20:22 1.1.1.1:53125\n"
+                        "ESTAB 0 0 192.168.1.20:22 192.0.2.10:54001\n"
+                        if tuple(command) == ("ss", "-tnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:15:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(refreshed_snapshot)
+            store.close()
+
+            queue = host_security_source_review_queue_status(store_path)
+
+        by_remote = {item["remote_address"]: item for item in queue["items"]}
+        self.assertEqual(queue["connection_count"], 3)
+        self.assertEqual(queue["review_count"], 2)
+        self.assertEqual(queue["needs_review"], 1)
+        self.assertEqual(queue["ready_for_block_plan"], 1)
+        self.assertEqual(queue["reviewed_no_action"], 1)
+        self.assertEqual(queue["not_blockable"], 0)
+        self.assertEqual(by_remote["8.8.8.8"]["queue_status"], "ready_for_block_plan")
+        self.assertTrue(by_remote["8.8.8.8"]["can_stage_block_plan"])
+        self.assertEqual(by_remote["1.1.1.1"]["queue_status"], "needs_review")
+        self.assertEqual(by_remote["192.0.2.10"]["queue_status"], "reviewed_no_action")
+        self.assertIn("read-only queue", queue["approval_boundary"])
 
     def test_dispatch_ids_review_package_uses_codex_projects_adapter(self):
         with tempfile.TemporaryDirectory() as directory:

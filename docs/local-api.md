@@ -46,6 +46,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security/findings`
 - `GET /host/security/triage`
 - `GET /host/security/sources`
+- `GET /host/security/source-review-queue`
 - `GET /host/security/source-reviews`
 - `GET /host/security/ids-review-packages`
 - `GET /host/security/ids-review-summary`
@@ -177,6 +178,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `GET /host/security/findings` returns Odo's detailed host-security finding list, severity counts, evidence lines, and recommended actions from the latest persisted host snapshot.
 `GET /host/security/triage` groups Odo's host-security findings by listener, bind scope, severity, evidence, and read-only mitigation path. It does not change firewall, route, IDS, or service-bind state.
 `GET /host/security/sources` correlates established TCP remote sources to triaged listeners and reports source scope. It is evidence only; it does not declare a source hostile or change firewall, IDS, route, or service-bind state.
+`GET /host/security/source-review-queue` reconciles current source correlations with persisted Odo reviews and reports which sources need review, are ready for block-plan staging, are reviewed with no action queued, or are not blockable. It is read-only.
 `GET /host/security/source-reviews` lists persisted Odo source reviews, dispositions, and whether a reviewed source is eligible for a later block-plan staging step.
 `POST /host/security/source-reviews` records Odo's review of a correlated source. It does not stage a block plan or change firewall policy.
 `POST /host/security/source-reviews/block-plans` stages an Odo-owned, human-approval source block plan from a reviewed hostile source. It records the plan only; firewall and IDS enforcement remain blocked until separate approval and Intrusion Detection advisory review.

@@ -14,6 +14,6 @@ The coordinator service is the first application-level layer above the registry 
 
 ## Boundaries
 
-- The service does not execute package installs, firewall changes, service restarts, device access, or health probes.
+- The service does not execute package installs, firewall changes, service restarts, device access, or health probes; those run through dedicated runtime and admin adapter paths.
 - Persistence is optional and must be passed explicitly.
-- Approval records are created, but approving them remains an operator or future policy decision.
+- Approval records are created and approved through explicit operator or API actions before any mutation-specific executor can act.

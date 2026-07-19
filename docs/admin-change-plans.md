@@ -36,9 +36,9 @@ PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqli
 
 ## Boundary
 
-The planner never runs live commands. It produces the exact change list required by the approval gate. A future live adapter must verify `approved=true`, execute only the approved steps, record evidence, and preserve rollback status.
+The planner never runs live commands. It produces the exact change list required by the approval gate. The live admin adapter layer must verify `approved=true`, execute only the approved steps, record evidence, and preserve rollback status.
 
-Recording approval does not execute the plan. It only updates the stored approval metadata so a future execution adapter can see that a specific command list was approved.
+Recording approval does not execute the plan. It only updates the stored approval metadata so the execution adapter can see that a specific command list was approved.
 
 Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled by default. Package install, firewall allow/deny, and source-block adapters remain disabled unless the same store contains an approved adapter enablement request for that exact kind. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
 

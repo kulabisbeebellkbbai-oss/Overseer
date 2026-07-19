@@ -1,6 +1,6 @@
 # Operation Planner
 
-The operation planner converts approved domain objects into execution requests. It does not run live actions. The first planner slice emits dry-run requests only and marks approval requirements before execution.
+The operation planner converts approved domain objects into execution requests. It does not run live actions directly; live admin execution is handled by the admin adapter layer after the required approvals, advisory gates, and command boundaries are satisfied.
 
 ## Planned Inputs
 
@@ -17,6 +17,6 @@ The operation planner converts approved domain objects into execution requests. 
 - Maintenance plans carry scheduler metadata so overlapping exclusive windows are visible before execution.
 - Usage-limited work can be planned against current limit records to produce ready, waiting, blocked, or escalated scheduler output.
 
-## Future Work
+## Boundary
 
-- Add live adapter injection after operator approval.
+The planner never runs live commands. It produces dry-run requests and approval metadata. The live admin adapter layer is responsible for verifying approved plans, executing only approved command steps, recording evidence, and preserving rollback status.

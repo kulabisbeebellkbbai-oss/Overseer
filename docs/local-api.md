@@ -113,7 +113,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/history-unarchive` restores one archived admin plan to active admin history after the restore approval is approved. It keeps the archive record and emits an audit event.
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, restore approvals, and recent admin audit events.
 `GET /runtime/daemon-migration-plan` prepares a read-only foreground-to-daemon migration plan with approval level, command boundary, rollback, risks, and evidence requirements.
-`POST /runtime/daemon-migration-requests` creates the approval request required before a future daemon migration changes user service enablement or runtime commands.
+`POST /runtime/daemon-migration-requests` creates the approval request required before daemon migration changes user service enablement or runtime commands.
 `POST /runtime/daemon-migration-requests/approve` approves a pending daemon migration request without changing systemd state or running commands.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
@@ -121,7 +121,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /claims/release` accepts optional `released_by`, `reason`, `evidence_ids`, and `released_at` fields and emits release audit evidence.
 `GET /claims/review` reports active-like, queued, expired, and release-blocked claims for operator review without releasing, revoking, or renewing them. It supports `?now=...` for deterministic review timestamps.
 `GET /claims/cleanup-plan` prepares a read-only cleanup manifest for expired active-like claims, stale queued claims, blocked claims, and claims missing release evidence. It supports `?now=...` and does not release, revoke, renew, approve, or re-evaluate claims.
-`POST /claims/cleanup-requests` creates the approval request required before a future cleanup mutation may release, revoke, renew, take over, or re-evaluate a cleanup candidate.
+`POST /claims/cleanup-requests` creates the approval request required before cleanup execution may release, revoke, renew, take over, or re-evaluate a cleanup candidate.
 `POST /claims/cleanup-requests/approve` approves a pending cleanup request after validating that its claim is still a cleanup candidate. It does not mutate the claim.
 `POST /claims/cleanup-requests/execute` executes only an approved cleanup request after re-validating the cleanup candidate. It can mark an expired active-like claim expired, re-evaluate a stale queued claim, move a release-blocked claim to `releasing`, or revoke a blocked claim. Moving a claim to `releasing` does not free the resource.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.

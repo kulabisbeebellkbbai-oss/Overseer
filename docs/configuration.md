@@ -15,3 +15,4 @@ Overseer configuration lets an operator seed known resources, usage limits, heal
 - Config loading does not probe the host.
 - Config loading does not discover or probe devices that were not explicitly described by the operator.
 - Config loading should be combined with runtime identity checks before physical or security-sensitive use.
+- Physical identities loaded from config default to source `operator_declared`.

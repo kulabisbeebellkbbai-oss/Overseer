@@ -66,6 +66,7 @@ from overseer import (
     ProbeType,
     PhysicalAssetKind,
     PhysicalIdentity,
+    PhysicalIdentitySource,
     ProtectiveAction,
     SecurityIncident,
     SecuritySignal,
@@ -1185,8 +1186,11 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["power_risk"], 1)
         self.assertEqual(status["storage_risk"], 1)
         self.assertEqual(status["assets_by_kind"][PhysicalAssetKind.SERIAL_PORT.value], 1)
+        self.assertEqual(status["assets_by_source"][PhysicalIdentitySource.OPERATOR_DECLARED.value], 3)
+        self.assertEqual(status["assets_by_source"][PhysicalIdentitySource.DISCOVERED.value], 0)
         serial = next(item for item in status["items"] if item["stable_id"] == "serial.rs485-a")
         self.assertEqual(serial["observed_paths"], ["/dev/serial/by-id/rs485-a"])
+        self.assertEqual(serial["source"], PhysicalIdentitySource.OPERATOR_DECLARED.value)
 
     def test_virtual_summary_reports_checkout_readiness_and_claims(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4023,6 +4027,8 @@ class PhysicalDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(len(identities), 1)
             self.assertEqual(identities[0].kind, PhysicalAssetKind.SERIAL_PORT)
+            self.assertEqual(identities[0].source, PhysicalIdentitySource.DISCOVERED)
+            self.assertIsNotNone(identities[0].last_observed_at)
             self.assertTrue(identities[0].is_complete_for_exclusive_checkout())
 
     def test_discover_physical_status_reports_temp_entries(self):
@@ -4034,6 +4040,7 @@ class PhysicalDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(status["count"], 1)
             self.assertEqual(status["assets"][0]["kind"], PhysicalAssetKind.SERIAL_PORT.value)
+            self.assertEqual(status["assets"][0]["source"], PhysicalIdentitySource.DISCOVERED.value)
 
     def test_discover_physical_status_persists_to_explicit_store(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4050,6 +4057,10 @@ class PhysicalDiscoveryTests(unittest.TestCase):
             self.assertEqual(
                 store.load_physical_identity("serial.usb-serial-device-if00-port0").kind,
                 PhysicalAssetKind.SERIAL_PORT,
+            )
+            self.assertEqual(
+                store.load_physical_identity("serial.usb-serial-device-if00-port0").source,
+                PhysicalIdentitySource.DISCOVERED,
             )
             store.close()
 
@@ -4488,6 +4499,7 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(config.health_targets[0].probe_type, ProbeType.JSON)
         self.assertEqual(config.physical_identities[0].stable_id, "serial.config.rs485")
         self.assertIn("rs485", config.physical_identities[0].capabilities)
+        self.assertEqual(config.physical_identities[0].source, PhysicalIdentitySource.OPERATOR_DECLARED)
 
     def test_rejects_secret_like_config_keys(self):
         with self.assertRaises(ValueError):
@@ -4942,6 +4954,10 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.load_usage_limit("limit.seeded").remaining, 10)
             self.assertEqual(store.load_health_target("health.seeded").resource_id, "svc.seeded")
             self.assertEqual(store.load_physical_identity("storage.seeded").storage_profile, "read_only")
+            self.assertEqual(
+                store.load_physical_identity("storage.seeded").source,
+                PhysicalIdentitySource.OPERATOR_DECLARED,
+            )
             store.close()
 
 

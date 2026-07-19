@@ -96,7 +96,7 @@ from .maintenance import (
     assess_maintenance_readiness,
     can_close_maintenance,
 )
-from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_conflicts
+from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource, physical_identity_conflicts
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
@@ -226,6 +226,7 @@ __all__ = [
     "can_close_maintenance",
     "PhysicalAssetKind",
     "PhysicalIdentity",
+    "PhysicalIdentitySource",
     "physical_identity_conflicts",
     "PathPhysicalDiscoveryAdapter",
     "OperationPlanner",

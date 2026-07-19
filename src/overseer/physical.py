@@ -16,6 +16,11 @@ class PhysicalAssetKind(StrEnum):
     COMPOSITE = "composite_physical_asset"
 
 
+class PhysicalIdentitySource(StrEnum):
+    OPERATOR_DECLARED = "operator_declared"
+    DISCOVERED = "discovered"
+
+
 @dataclass(frozen=True)
 class PhysicalIdentity:
     kind: PhysicalAssetKind
@@ -29,6 +34,8 @@ class PhysicalIdentity:
     storage_profile: str | None = None
     exclusive_groups: frozenset[str] = field(default_factory=frozenset)
     depends_on: frozenset[str] = field(default_factory=frozenset)
+    source: PhysicalIdentitySource = PhysicalIdentitySource.OPERATOR_DECLARED
+    last_observed_at: str | None = None
 
     def identity_keys(self) -> frozenset[str]:
         keys = {f"stable:{self.stable_id}"}

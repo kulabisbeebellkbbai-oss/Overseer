@@ -143,7 +143,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `GET /usage/continuation-plan` returns persisted usage-limited continuation requests and their current ready, waiting, blocked, or escalated schedule without mutating host state.
 `POST /usage/continuation-requests` persists a Quark continuation request with `request_id`, `limit_id`, `resource_id`, `owner_thread`, `requested_units`, and `intent`; optional fields are `risk_level`, `earliest_start`, `deadline`, `requested_by`, and `requested_at`.
-`GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, and per-asset detail for Kira review.
+`GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, counts by kind and source, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
 `GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
-from .physical import PhysicalAssetKind, PhysicalIdentity
+from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 
 
 class PathPhysicalDiscoveryAdapter:
@@ -13,6 +14,7 @@ class PathPhysicalDiscoveryAdapter:
 
     def discover(self) -> tuple[PhysicalIdentity, ...]:
         identities: list[PhysicalIdentity] = []
+        observed_at = datetime.now(UTC).isoformat()
         for root in self.roots:
             if not root.exists() or not root.is_dir():
                 continue
@@ -24,6 +26,8 @@ class PathPhysicalDiscoveryAdapter:
                         kind=PhysicalAssetKind.SERIAL_PORT,
                         stable_id=f"serial.{_stable_name(path.name)}",
                         observed_paths=frozenset({str(path)}),
+                        source=PhysicalIdentitySource.DISCOVERED,
+                        last_observed_at=observed_at,
                     )
                 )
         return tuple(identities)

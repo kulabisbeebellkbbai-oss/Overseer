@@ -9,7 +9,7 @@ from typing import Any
 
 from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 from .health import HealthTarget, ProbeType
-from .physical import PhysicalAssetKind, PhysicalIdentity, physical_identity_conflicts
+from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource, physical_identity_conflicts
 from .store import SQLiteStore
 from .usage_limits import LimitKind, UsageLimit
 
@@ -159,6 +159,8 @@ def _physical_identity_from_mapping(data: dict[str, Any]) -> PhysicalIdentity:
         storage_profile=data.get("storage_profile"),
         exclusive_groups=frozenset(str(group) for group in data.get("exclusive_groups", ())),
         depends_on=frozenset(str(dependency) for dependency in data.get("depends_on", ())),
+        source=PhysicalIdentitySource(data.get("source", PhysicalIdentitySource.OPERATOR_DECLARED.value)),
+        last_observed_at=data.get("last_observed_at"),
     )
 
 

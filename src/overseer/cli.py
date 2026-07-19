@@ -53,7 +53,7 @@ from .ids_review import (
     write_ids_review_prompt_file,
 )
 from .live_health import HttpHealthProbeAdapter
-from .physical import PhysicalAssetKind, PhysicalIdentity
+from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
@@ -260,6 +260,8 @@ def discover_physical_status(roots: Sequence[str], store_path: str | Path | None
                 "stable_id": identity.stable_id,
                 "kind": identity.kind.value,
                 "observed_paths": sorted(identity.observed_paths),
+                "source": PhysicalIdentitySource(identity.source).value,
+                "last_observed_at": identity.last_observed_at,
                 "complete_for_checkout": identity.is_complete_for_exclusive_checkout(),
             }
             for identity in identities
@@ -285,6 +287,10 @@ def physical_summary_status(store_path: str | Path) -> dict[str, object]:
                 kind.value: sum(1 for identity in identities if identity.kind == kind)
                 for kind in PhysicalAssetKind
             },
+            "assets_by_source": {
+                source.value: sum(1 for identity in identities if identity.source == source)
+                for source in PhysicalIdentitySource
+            },
             "items": [physical_identity_status(identity) for identity in identities],
         }
     finally:
@@ -304,6 +310,8 @@ def physical_identity_status(identity: PhysicalIdentity) -> dict[str, object]:
         "storage_profile": identity.storage_profile,
         "exclusive_groups": sorted(identity.exclusive_groups),
         "depends_on": sorted(identity.depends_on),
+        "source": PhysicalIdentitySource(identity.source).value,
+        "last_observed_at": identity.last_observed_at,
         "complete_for_checkout": identity.is_complete_for_exclusive_checkout(),
         "power_risk": identity.has_power_risk(),
         "storage_risk": identity.has_storage_risk(),

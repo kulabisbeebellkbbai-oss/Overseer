@@ -18,4 +18,9 @@ PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-i
 PYTHONPATH=src python3 -m overseer.cli physical-summary --store state/overseer.sqlite3
 ```
 
-`physical-summary` is Kira's compact read model for persisted physical identities. It reports asset counts, checkout readiness, power risk, storage risk, counts by physical kind, and per-asset identity detail.
+`physical-summary` is Kira's compact read model for persisted physical identities. It reports asset counts, checkout readiness, power risk, storage risk, counts by physical kind, counts by identity source, and per-asset identity detail.
+
+Identity source distinguishes operator-declared records from read-only path discovery:
+
+- `operator_declared` means the asset came from explicit configuration or direct store seeding.
+- `discovered` means the asset came from directory discovery and carries a `last_observed_at` timestamp.

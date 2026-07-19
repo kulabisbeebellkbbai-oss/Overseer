@@ -83,6 +83,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli approve-admin-adapter-enablement --store state/overseer.sqlite3 --approval-id approval.admin.adapter.enable.block_ip --approved-by sisko` - approve a requested adapter enablement gate without approving a specific host change or running commands.
 - `PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqlite3` - summarize admin plans, pending approvals, execution outcomes, archive candidates, restore approvals, and admin audit events.
 - `PYTHONPATH=src python3 -m overseer.cli admin-execution-readiness --store state/overseer.sqlite3` - summarize which admin plans are ready for Overseer execution, need approval, need IDS review, or require manual execution.
+- `PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3` - evaluate stored admin plans against approval, adapter, IDS, rollback, verification, and risk policy gates.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-review --store state/overseer.sqlite3` - identify completed or canceled admin plans that are candidates for archive handling without deleting them.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-archive-plan --store state/overseer.sqlite3` - prepare a read-only archive manifest for inactive admin plans without mutating records.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-archives --store state/overseer.sqlite3 --plan-id admin.restart.example` - list persisted admin history archive records, optionally filtered by plan.
@@ -112,6 +113,7 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Approved project summary: `docs/project-summary.md`
 - DS9-inspired agent role map: `docs/agents.md`
 - Initial quality gates: `docs/quality-gates.md`
+- Policy evaluation: `docs/policies.md`
 - Command and safety model: `docs/command-safety-model.md`
 - Virtual asset checkout: `docs/virtual-asset-checkout.md`
 - Service health monitoring: `docs/service-health-monitoring.md`

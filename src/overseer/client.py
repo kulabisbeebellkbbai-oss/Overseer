@@ -388,6 +388,10 @@ class OverseerApiClient:
     def admin_execution_readiness(self) -> dict[str, Any]:
         return self._get("/admin/execution-readiness")
 
+    def admin_policies(self, plan_id: str | None = None) -> dict[str, Any]:
+        query = f"?{urlencode({'plan_id': plan_id})}" if plan_id else ""
+        return self._get(f"/admin/policies{query}")
+
     def admin_history_review(self) -> dict[str, Any]:
         return self._get("/admin/history-review")
 

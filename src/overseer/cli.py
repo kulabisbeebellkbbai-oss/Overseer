@@ -58,6 +58,7 @@ from .ids_review import (
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter
+from .policy import PolicyCheck, PolicyDecision, evaluate_admin_change_policy
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
 from .runtime_state import (
@@ -2754,6 +2755,56 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
         store.close()
 
 
+def admin_policy_status(store_path: str | Path, plan_id: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
+        plans = [
+            plan
+            for plan in store.list_admin_change_plans()
+            if not plan.archived and (plan_id is None or plan.id == plan_id)
+        ]
+        decisions = [
+            evaluate_admin_change_policy(
+                plan,
+                admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
+                store.list_host_security_ids_review_packages_for_plan(plan.id),
+            )
+            for plan in plans
+        ]
+        return {
+            "store": str(store.path),
+            "plan_id": plan_id,
+            "plans": len(decisions),
+            "pass": sum(1 for decision in decisions if decision.status.value == "pass"),
+            "warn": sum(1 for decision in decisions if decision.status.value == "warn"),
+            "block": sum(1 for decision in decisions if decision.status.value == "block"),
+            "items": [admin_policy_decision_status(decision) for decision in decisions],
+        }
+    finally:
+        store.close()
+
+
+def admin_policy_decision_status(decision: PolicyDecision) -> dict[str, object]:
+    return {
+        "subject_id": decision.subject_id,
+        "subject_kind": decision.subject_kind,
+        "status": decision.status.value,
+        "can_proceed": decision.can_proceed(),
+        "checks": [admin_policy_check_status(check) for check in decision.checks],
+    }
+
+
+def admin_policy_check_status(check: PolicyCheck) -> dict[str, object]:
+    return {
+        "id": check.id,
+        "status": check.status.value,
+        "owner_domain": OwnerDomain(check.owner_domain).value,
+        "summary": check.summary,
+        "evidence_ids": list(check.evidence_ids),
+    }
+
+
 def admin_history_review_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -5200,6 +5251,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
     admin_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_policy_parser = subparsers.add_parser("admin-policy-status", help="evaluate stored admin plans against Overseer policy gates")
+    admin_policy_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_policy_parser.add_argument("--plan-id", help="filter policy evaluation to one admin plan")
     admin_history_parser = subparsers.add_parser("admin-history-review", help="review inactive admin plans for archive handling")
     admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archive_plan_parser = subparsers.add_parser("admin-history-archive-plan", help="prepare a read-only archive manifest for inactive admin plans")
@@ -5711,6 +5765,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-execution-readiness":
         print(json.dumps(admin_execution_readiness_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-policy-status":
+        print(json.dumps(admin_policy_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "admin-history-review":

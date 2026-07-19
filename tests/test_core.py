@@ -64,6 +64,7 @@ from overseer import (
     OverseerConfig,
     OverseerCoordinator,
     PathPhysicalDiscoveryAdapter,
+    PolicyCheckStatus,
     ProbeResult,
     ProbeType,
     PhysicalAssetKind,
@@ -118,6 +119,7 @@ from overseer.cli import admin_adapter_capabilities_status
 from overseer.cli import admin_adapter_enablement_plan_status
 from overseer.cli import admin_executions_status
 from overseer.cli import admin_execution_readiness_status
+from overseer.cli import admin_policy_status
 from overseer.cli import admin_history_archive_plan_status
 from overseer.cli import admin_history_archives_status
 from overseer.cli import admin_history_review_status
@@ -3200,6 +3202,28 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(block["status"], AdminAdapterStatus.DISABLED.value)
             self.assertTrue(block["authorization_required_before_enable"])
 
+    def test_client_reads_admin_policies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                client.plan_admin_change(
+                    {
+                        "plan_id": "admin.restart.policy",
+                        "kind": AdminChangeKind.USER_SERVICE_RESTART.value,
+                        "target": "overseer-api.service",
+                        "reason": "reload policy code",
+                        "current_state": "active",
+                    }
+                )
+                policies = client.admin_policies("admin.restart.policy")
+
+            self.assertEqual(policies["plans"], 1)
+            self.assertEqual(policies["block"], 1)
+            self.assertEqual(policies["items"][0]["subject_id"], "admin.restart.policy")
+            self.assertEqual(policies["items"][0]["checks"][0]["id"], "admin.plan.state")
+
     def test_client_reads_admin_adapter_enablement_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4428,6 +4452,71 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
         self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(executed.command_results[0].command, ("sudo", "apt-get", "update"))
+
+    def test_admin_policy_status_blocks_unapproved_disabled_adapter_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.pending",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply approved patch",
+                "upgrade available",
+                packages=("sqlite3",),
+            )
+
+            status = admin_policy_status(store_path)
+            item = status["items"][0]
+            checks = {check["id"]: check for check in item["checks"]}
+
+        self.assertEqual(status["block"], 1)
+        self.assertEqual(item["status"], PolicyCheckStatus.BLOCK.value)
+        self.assertEqual(checks["admin.plan.approval"]["status"], PolicyCheckStatus.BLOCK.value)
+        self.assertEqual(checks["admin.adapter.enabled"]["status"], PolicyCheckStatus.BLOCK.value)
+        self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.WARN.value)
+
+    def test_admin_policy_status_warns_when_upgrade_is_approved_and_adapter_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.ready",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply approved patch",
+                "upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.APT_UPGRADE.value,
+                "sisko",
+                "2026-07-19T05:30:00+00:00",
+            )
+            approve_admin_adapter_enablement_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-19T05:31:00+00:00",
+            )
+            approve_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.ready",
+                "operator",
+                "2026-07-19T05:32:00+00:00",
+            )
+
+            status = admin_policy_status(store_path, "admin.apt.upgrade.ready")
+            item = status["items"][0]
+            checks = {check["id"]: check for check in item["checks"]}
+
+        self.assertEqual(status["warn"], 1)
+        self.assertEqual(item["status"], PolicyCheckStatus.WARN.value)
+        self.assertFalse(item["can_proceed"])
+        self.assertEqual(checks["admin.plan.approval"]["status"], PolicyCheckStatus.PASS.value)
+        self.assertEqual(checks["admin.adapter.enabled"]["status"], PolicyCheckStatus.PASS.value)
+        self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.WARN.value)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

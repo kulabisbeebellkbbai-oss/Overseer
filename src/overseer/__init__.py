@@ -101,6 +101,7 @@ from .maintenance import (
 )
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource, physical_identity_conflicts
 from .physical_discovery import PathPhysicalDiscoveryAdapter
+from .policy import PolicyCheck, PolicyCheckStatus, PolicyDecision, evaluate_admin_change_policy
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
 from .runtime import OverseerRuntime, RuntimeTick
@@ -238,6 +239,10 @@ __all__ = [
     "PhysicalIdentitySource",
     "physical_identity_conflicts",
     "PathPhysicalDiscoveryAdapter",
+    "PolicyCheck",
+    "PolicyCheckStatus",
+    "PolicyDecision",
+    "evaluate_admin_change_policy",
     "OperationPlanner",
     "PlannedOperation",
     "ClaimRecord",

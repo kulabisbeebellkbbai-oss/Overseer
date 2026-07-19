@@ -86,6 +86,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /health-targets`
 - `POST /health/probes/run`
 - `POST /host/inspect`
+- `POST /host/security/listener-review-queue/remediation-plans`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
 - `POST /host/security/ids-review-packages`
@@ -191,6 +192,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /host/security/ids-review-packages/prompts` writes the advisory prompt under the store directory and records the prompt path. It does not execute the advisor.
 `POST /host/security/ids-review-packages/dispatch` writes the advisory prompt when needed, resumes the registered Intrusion Detection Codex thread through `codex-projects`, records dispatch evidence, and leaves advisory acceptance as a separate result gate.
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
+`POST /host/security/listener-review-queue/remediation-plans` stages one approval-gated Odo firewall-deny plan per currently unplanned exposed TCP port in the listener review queue. It groups duplicate listeners by port and does not apply firewall rules.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `POST /usage-limits` records or updates a Quark usage-limit observation with `limit_id`, `resource_id`, `kind`, `capacity`, `remaining`, and `window`; optional fields are `resets_at`, `observed_at`, and `confidence`.

@@ -1802,6 +1802,67 @@ def plan_host_security_remediation_status(
         store.close()
 
 
+def plan_host_security_listener_queue_remediations_status(
+    store_path: str | Path,
+    snapshot_id: str | None = None,
+    requested_by: str = "odo",
+    plan_prefix: str = "admin.host-security.deny-tcp",
+) -> dict[str, object]:
+    queue = host_security_listener_review_queue_status(store_path, snapshot_id)
+    candidates_by_port: dict[str, list[dict[str, object]]] = {}
+    for item in queue["items"]:
+        port = str(item["port"])
+        if item["queue_status"] != "needs_exposure_review" or not port.isdigit():
+            continue
+        candidates_by_port.setdefault(port, []).append(item)
+    store = SQLiteStore(store_path)
+    staged = []
+    skipped = []
+    try:
+        existing_targets = {
+            plan.target
+            for plan in store.list_admin_change_plans()
+            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived
+        }
+        for port, items in sorted(candidates_by_port.items(), key=lambda entry: int(entry[0])):
+            target = f"tcp/{port}"
+            if target in existing_targets:
+                skipped.append({"port": port, "target": target, "reason": "active Odo firewall deny plan already exists"})
+                continue
+            plan_id = f"{plan_prefix}.{port}"
+            current_state = _listener_queue_plan_current_state(items)
+            reason = f"stage approval-gated firewall deny for exposed listener queue {target}; requested_by={requested_by}"
+            plan = plan_firewall_deny_tcp(plan_id, int(port), reason, current_state)
+            store.save_admin_change_plan(plan)
+            existing_targets.add(target)
+            staged.append({"port": port, "target": target, "plan_id": plan.id, "listeners": [item["listener"] for item in items]})
+        return {
+            "store": str(store.path),
+            "snapshot_id": queue["snapshot_id"],
+            "requested_by": requested_by,
+            "candidate_ports": len(candidates_by_port),
+            "staged_count": len(staged),
+            "skipped_count": len(skipped),
+            "staged": staged,
+            "skipped": skipped,
+            "host_mutation_performed": False,
+            "approval_boundary": (
+                "plans staged only; firewall, IDS, route, service-bind, or enforcement changes require "
+                "separate approval and Intrusion Detection advisory review"
+            ),
+        }
+    finally:
+        store.close()
+
+
+def _listener_queue_plan_current_state(items: Sequence[dict[str, object]]) -> str:
+    listeners = ", ".join(str(item["listener"]) for item in items)
+    severities = ", ".join(sorted({str(item["severity"]) for item in items}))
+    bind_scopes = ", ".join(sorted({str(item["bind_scope"]) for item in items}))
+    evidence = "; ".join("; ".join(str(line) for line in item["evidence"]) for item in items)
+    return f"listeners={listeners}; severities={severities}; bind_scopes={bind_scopes}; evidence={evidence}"
+
+
 def host_security_sources_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -5934,6 +5995,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     listener_queue_parser = subparsers.add_parser("host-security-listener-review-queue", help="summarize exposed listener review and remediation-plan state")
     listener_queue_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     listener_queue_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    listener_queue_plan_parser = subparsers.add_parser(
+        "plan-host-security-listener-queue-remediations",
+        help="stage approval-gated firewall deny plans for unplanned listener queue ports",
+    )
+    listener_queue_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    listener_queue_plan_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    listener_queue_plan_parser.add_argument("--requested-by", default="odo")
+    listener_queue_plan_parser.add_argument("--plan-prefix", default="admin.host-security.deny-tcp")
     host_sources_parser = subparsers.add_parser("host-security-sources", help="correlate established TCP sources to host security listeners")
     host_sources_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_sources_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
@@ -6506,6 +6575,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-listener-review-queue":
         print(json.dumps(host_security_listener_review_queue_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "plan-host-security-listener-queue-remediations":
+        print(
+            json.dumps(
+                plan_host_security_listener_queue_remediations_status(
+                    args.store,
+                    args.snapshot_id,
+                    args.requested_by,
+                    args.plan_prefix,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "host-security-sources":

@@ -505,6 +505,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
       if (action === "inspect-host") return await postJson("/host/inspect", {});
+      if (action === "plan-listener-queue-remediations") return await postJson("/host/security/listener-review-queue/remediation-plans", {requested_by: "odo"});
       if (action === "plan-host-security-remediation") return await planHostSecurityRemediation();
       if (action === "record-source-review") return await recordSourceReview();
       if (action === "plan-source-block") return await planSourceBlock();
@@ -1008,7 +1009,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const sourceQueue = state.data.sourceReviewQueue || {};
       document.getElementById("security").innerHTML = `
         <div class="grid">
-          <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button></div></div>
+          <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button><button class="action-btn" data-action="plan-listener-queue-remediations">Plan Listener Queue</button></div></div>
           ${metric("Alerts", security.alerts, "security", "span-3", security.alerts ? "bad" : "good")}
           ${metric("High", host.high_findings, "findings", "span-3", host.high_findings ? "bad" : "good")}
           ${metric("Warning", host.warning_findings, "findings", "span-3", host.warning_findings ? "warn" : "good")}

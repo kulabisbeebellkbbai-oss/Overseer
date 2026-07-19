@@ -69,6 +69,7 @@ from .cli import (
     list_state_status,
     maintenance_summary_status,
     operator_dashboard_status,
+    plan_host_security_listener_queue_remediations_status,
     plan_host_security_source_block_status,
     plan_host_security_remediation_status,
     physical_summary_status,
@@ -318,6 +319,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
+                return
+            if self.path == "/host/security/listener-review-queue/remediation-plans":
+                self._handle_json(lambda payload: plan_host_security_listener_queue_remediations_status(store_path, **_host_security_listener_queue_remediations_args(payload)))
                 return
             if self.path == "/host/security/source-reviews/block-plans":
                 self._handle_json(lambda payload: plan_host_security_source_block_status(store_path, **_host_security_source_block_args(payload)))
@@ -804,6 +808,14 @@ def _host_security_remediation_args(payload: dict[str, Any]) -> dict[str, Any]:
         "action": str(payload.get("action", "deny_tcp")),
         "reason": str(payload["reason"]) if payload.get("reason") else None,
         "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
+    }
+
+
+def _host_security_listener_queue_remediations_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
+        "requested_by": str(payload.get("requested_by", "odo")),
+        "plan_prefix": str(payload.get("plan_prefix", "admin.host-security.deny-tcp")),
     }
 
 

@@ -477,6 +477,9 @@ class OverseerApiClient:
     def plan_host_security_remediation(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/host/security/remediations/plans", payload)
 
+    def plan_host_security_listener_queue_remediations(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/host/security/listener-review-queue/remediation-plans", payload)
+
     def plan_admin_change(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/plans", payload)
 

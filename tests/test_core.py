@@ -1,3 +1,5 @@
+import contextlib
+import io
 import tempfile
 import threading
 import unittest
@@ -4259,6 +4261,34 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "install", "--only-upgrade", "--dry-run", "sqlite3"))
         self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "install", "--only-upgrade", "-y", "sqlite3"))
         self.assertEqual(plan.verification_steps[0].command, ("dpkg-query", "-W", "sqlite3"))
+
+    def test_plan_admin_change_cli_accepts_package_argument(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = cli_main(
+                    [
+                        "plan-admin-change",
+                        "--store",
+                        str(store_path),
+                        "--plan-id",
+                        "admin.apt.upgrade.cli",
+                        "--kind",
+                        AdminChangeKind.APT_UPGRADE.value,
+                        "--target",
+                        "sqlite3",
+                        "--package",
+                        "sqlite3",
+                        "--reason",
+                        "apply approved package patch",
+                    ]
+                )
+            status = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(status["steps"][0]["command"], ["sudo", "apt-get", "install", "--only-upgrade", "--dry-run", "sqlite3"])
+        self.assertEqual(status["steps"][1]["command"], ["sudo", "apt-get", "install", "--only-upgrade", "-y", "sqlite3"])
 
     def test_firewall_plan_has_critical_risk_and_delete_rollback(self):
         plan = plan_firewall_allow_tcp(

@@ -5328,7 +5328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--target", required=True)
     admin_plan_parser.add_argument("--reason", required=True)
     admin_plan_parser.add_argument("--current-state", default="unknown")
-    admin_plan_parser.add_argument("--package", action="append", default=())
+    admin_plan_parser.add_argument("--package", action="append")
     admin_plan_parser.add_argument("--port", type=int)
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -5854,7 +5854,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.target,
                     args.reason,
                     args.current_state,
-                    args.package,
+                    args.package or (),
                     args.port,
                 ),
                 sort_keys=True,

@@ -1030,6 +1030,58 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertTrue(block_item["adapter"]["approval_plan_required"])
         self.assertTrue(block_item["ids_review_gate_satisfied"])
 
+    def test_admin_execution_readiness_uses_approved_adapter_enablement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.BLOCK_IP.value,
+                "sisko",
+                "2026-07-18T21:00:00+00:00",
+            )
+            approve_admin_adapter_enablement_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T21:05:00+00:00",
+            )
+            block_plan = plan_admin_change_status(
+                store_path,
+                "admin.block.enabled-readiness",
+                AdminChangeKind.BLOCK_IP.value,
+                "8.8.4.4",
+                "block reviewed hostile source",
+                "not blocked",
+            )
+            ids_package = prepare_host_security_ids_review_package_status(
+                store_path,
+                block_plan["id"],
+                package_id="ids-review.admin.block.enabled-readiness",
+            )
+            submitted = submit_host_security_ids_review_package_status(
+                store_path,
+                ids_package["id"],
+                "odo",
+            )
+            record_host_security_ids_review_result_status(
+                store_path,
+                submitted["id"],
+                "accepted",
+                "approved staged block package",
+                "odo",
+            )
+            approve_admin_change_status(store_path, block_plan["id"], "sisko")
+
+            status = admin_execution_readiness_status(store_path)
+
+        item = next(item for item in status["items"] if item["id"] == "admin.block.enabled-readiness")
+        self.assertEqual(status["ready_for_overseer_execution"], 1)
+        self.assertEqual(status["manual_execution_required"], 0)
+        self.assertEqual(status["adapter_enabled"], 1)
+        self.assertEqual(item["readiness_state"], "ready_for_overseer_execution")
+        self.assertTrue(item["live_execution_supported"])
+        self.assertEqual(item["adapter_status"], AdminAdapterStatus.ENABLED.value)
+
     def test_admin_history_review_identifies_archive_candidates(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

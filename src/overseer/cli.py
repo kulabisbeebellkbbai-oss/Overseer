@@ -2584,6 +2584,7 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
     try:
         plans = store.list_admin_change_plans()
         executions_by_plan = {result.plan_id: result for result in store.list_admin_executions()}
+        enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
         packages_by_plan = {
             plan.id: store.list_host_security_ids_review_packages_for_plan(plan.id)
             for plan in plans
@@ -2593,6 +2594,7 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
                 plan,
                 packages_by_plan[plan.id],
                 executions_by_plan.get(plan.id),
+                enabled_adapter_kinds,
             )
             for plan in plans
         ]
@@ -3128,6 +3130,7 @@ def admin_change_execution_readiness_status(
     plan: AdminChangePlan,
     ids_review_packages: Sequence[HostSecurityIDSReviewPackage] = (),
     latest_execution: AdminExecutionResult | None = None,
+    enabled_adapter_kinds: Sequence[AdminChangeKind | str] = (),
 ) -> dict[str, object]:
     missing_fields = missing_admin_change_fields(plan)
     ids_review_required = admin_plan_requires_ids_review(plan)
@@ -3135,7 +3138,7 @@ def admin_change_execution_readiness_status(
         not ids_review_required
         or any(package.satisfies_pre_execution_review_gate() for package in ids_review_packages)
     )
-    capability = admin_execution_capability_for(AdminChangeKind(plan.kind))
+    capability = admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds)
     live_execution_supported = capability.can_execute_live()
     readiness_state, next_step = _admin_execution_readiness_state(
         plan,

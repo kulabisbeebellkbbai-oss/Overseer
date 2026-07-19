@@ -1652,8 +1652,8 @@ def host_security_listener_review_queue_status(store_path: str | Path, snapshot_
     triage = host_security_triage_status(store_path, snapshot_id)
     store = SQLiteStore(store_path)
     try:
-        revision_required_targets = {
-            package.target
+        revision_required_plan_ids = {
+            package.plan_id
             for package in store.list_host_security_ids_review_packages()
             if IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED
         }
@@ -1661,7 +1661,7 @@ def host_security_listener_review_queue_status(store_path: str | Path, snapshot_
             plan.target: plan
             for plan in store.list_admin_change_plans()
             if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived and not plan.canceled
-            and plan.target not in revision_required_targets
+            and plan.id not in revision_required_plan_ids
         }
     finally:
         store.close()
@@ -1874,8 +1874,8 @@ def plan_host_security_listener_queue_remediations_status(
     try:
         snapshot = _load_host_snapshot_for_status(store, snapshot_id)
         firewall_backend = _detected_firewall_backend(snapshot)
-        revision_required_targets = {
-            package.target
+        revision_required_plan_ids = {
+            package.plan_id
             for package in store.list_host_security_ids_review_packages()
             if IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED
         }
@@ -1883,7 +1883,7 @@ def plan_host_security_listener_queue_remediations_status(
             plan.target
             for plan in store.list_admin_change_plans()
             if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived and not plan.canceled
-            and plan.target not in revision_required_targets
+            and plan.id not in revision_required_plan_ids
         }
         for port, items in sorted(candidates_by_port.items(), key=lambda entry: int(entry[0])):
             target = f"tcp/{port}"

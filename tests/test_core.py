@@ -2422,6 +2422,8 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("<title>Overseer</title>", html)
             self.assertIn("Bearer token", html)
             self.assertIn("/operator-dashboard", html)
+            self.assertIn('apiBase = protectedGatewayPath ? "/Overseer" : ""', html)
+            self.assertIn("tokenStore = protectedGatewayPath ? sessionStorage : localStorage", html)
             self.assertIn("data-action=\"register-resource\"", html)
             self.assertIn("/resources", html)
             self.assertIn("data-view=\"claims\"", html)

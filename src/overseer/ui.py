@@ -397,18 +397,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       listenerReviewQueue: "/host/security/listener-review-queue",
       sourceReviewQueue: "/host/security/source-review-queue"
     };
+    const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
+    const apiBase = protectedGatewayPath ? "/Overseer" : "";
+    const tokenStore = protectedGatewayPath ? sessionStorage : localStorage;
     const state = {
       data: {},
       view: "overview",
-      token: localStorage.getItem("overseerToken") || "",
+      token: tokenStore.getItem("overseerToken") || "",
       lastAction: null
     };
     const tokenInput = document.getElementById("token");
     tokenInput.value = state.token;
     document.getElementById("save-token").addEventListener("click", () => {
       state.token = tokenInput.value.trim();
-      if (state.token) localStorage.setItem("overseerToken", state.token);
-      else localStorage.removeItem("overseerToken");
+      if (state.token) tokenStore.setItem("overseerToken", state.token);
+      else tokenStore.removeItem("overseerToken");
       refresh();
     });
     document.getElementById("refresh").addEventListener("click", refresh);
@@ -449,7 +452,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const headers = {};
       const token = tokenInput.value.trim() || state.token;
       if (token) headers.authorization = `Bearer ${token}`;
-      const response = await fetch(path, {headers});
+      const response = await fetch(`${apiBase}${path}`, {headers});
       if (!response.ok) throw new Error(`${path}: ${response.status}`);
       return await response.json();
     }
@@ -457,7 +460,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const headers = {"content-type": "application/json"};
       const token = tokenInput.value.trim() || state.token;
       if (token) headers.authorization = `Bearer ${token}`;
-      const response = await fetch(path, {method: "POST", headers, body: JSON.stringify(payload)});
+      const response = await fetch(`${apiBase}${path}`, {method: "POST", headers, body: JSON.stringify(payload)});
       if (!response.ok) throw new Error(`${path}: ${response.status}`);
       return await response.json();
     }

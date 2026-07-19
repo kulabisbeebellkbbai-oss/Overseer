@@ -394,6 +394,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       approvals: "/approvals-summary",
       claims: "/claims/review",
       claimCleanup: "/claims/cleanup-plan",
+      listenerReviewQueue: "/host/security/listener-review-queue",
       sourceReviewQueue: "/host/security/source-review-queue"
     };
     const state = {
@@ -1003,6 +1004,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const security = state.data.security || {};
       const host = security.host_security || {};
       const plans = (security.protective_plans || {}).items || [];
+      const listenerQueue = state.data.listenerReviewQueue || {};
       const sourceQueue = state.data.sourceReviewQueue || {};
       document.getElementById("security").innerHTML = `
         <div class="grid">
@@ -1061,6 +1063,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-8">${table("Protective Plans", plans, ["id", "kind", "target", "approved", "canceled"])}</div>
           <div class="panel span-4">${kv("IDS Review", security.ids_review || {})}</div>
+          <div class="panel span-12">${table("Listener Review Queue", listenerQueue.items || [], ["listener", "bind_scope", "severity", "queue_status", "plan_id", "next_step"])}</div>
           <div class="panel span-12">${table("Source Review Queue", sourceQueue.items || [], ["remote_address", "listener", "source_scope", "disposition", "queue_status", "next_step"])}</div>
         </div>`;
     }

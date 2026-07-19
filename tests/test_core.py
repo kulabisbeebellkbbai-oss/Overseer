@@ -182,6 +182,7 @@ from overseer.cli import export_host_security_ids_review_prompt_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
 from overseer.cli import host_security_findings_status
+from overseer.cli import host_security_listener_review_queue_status
 from overseer.cli import host_security_source_review_queue_status
 from overseer.cli import host_security_sources_status
 from overseer.cli import create_host_security_source_review_status
@@ -3397,6 +3398,37 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["connections"][0]["remote_address"], "8.8.8.8")
             self.assertEqual(status["connections"][0]["source_scope"], "external")
 
+    def test_client_reads_host_security_listener_review_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-client"
+                        if tuple(command) == ("hostname",)
+                        else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:03:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.host_security_listener_review_queue()
+
+            self.assertEqual(status["listener_count"], 1)
+            self.assertEqual(status["needs_exposure_review"], 1)
+            self.assertEqual(status["items"][0]["listener"], "0.0.0.0:22")
+            self.assertEqual(status["items"][0]["queue_status"], "needs_exposure_review")
+
     def test_client_reads_host_security_source_review_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4862,6 +4894,62 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(documentation_connection["source_scope"], "documentation")
         self.assertFalse(documentation_connection["can_stage_block_plan"])
         self.assertIn("read-only source correlation", status["correlation_boundary"])
+
+    def test_host_security_listener_review_queue_reconciles_findings_and_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "host-listener-queue"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        "LISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n"
+                        "LISTEN 0 128 10.50.0.100:9443 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:16:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            staged = plan_firewall_deny_tcp(
+                "admin.host-security.deny-tcp.22",
+                22,
+                "stage ssh exposure review",
+                "ssh exposed",
+            )
+            approved = approve_admin_change_plan(
+                plan_firewall_deny_tcp(
+                    "admin.host-security.deny-tcp.80",
+                    80,
+                    "stage http exposure review",
+                    "http exposed",
+                ),
+                "sisko",
+            )
+            store.save_admin_change_plan(staged)
+            store.save_admin_change_plan(approved)
+            store.close()
+
+            queue = host_security_listener_review_queue_status(store_path)
+
+        by_listener = {item["listener"]: item for item in queue["items"]}
+        self.assertEqual(queue["listener_count"], 3)
+        self.assertEqual(queue["needs_exposure_review"], 1)
+        self.assertEqual(queue["plan_staged"], 1)
+        self.assertEqual(queue["approved_for_execution"], 1)
+        self.assertEqual(queue["plan_canceled"], 0)
+        self.assertEqual(by_listener["0.0.0.0:22"]["queue_status"], "plan_staged")
+        self.assertEqual(by_listener["0.0.0.0:22"]["plan_id"], "admin.host-security.deny-tcp.22")
+        self.assertEqual(by_listener["0.0.0.0:80"]["queue_status"], "approved_for_execution")
+        self.assertEqual(by_listener["10.50.0.100:9443"]["queue_status"], "needs_exposure_review")
+        self.assertIn("read-only listener queue", queue["approval_boundary"])
 
     def test_host_security_source_review_requires_review_before_block_plan_readiness(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1647,6 +1647,80 @@ def host_security_triage_groups(findings: Sequence[dict[str, object]]) -> list[d
     return sorted(triage_groups, key=lambda item: (item["severity"] != HostFindingSeverity.HIGH.value, item["local"]))
 
 
+def host_security_listener_review_queue_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
+    triage = host_security_triage_status(store_path, snapshot_id)
+    store = SQLiteStore(store_path)
+    try:
+        plans_by_target = {
+            plan.target: plan
+            for plan in store.list_admin_change_plans()
+            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived
+        }
+    finally:
+        store.close()
+    items = []
+    for group in triage["listener_groups"]:
+        port = str(group["port"])
+        plan = plans_by_target.get(f"tcp/{port}") if port.isdigit() else None
+        status = _listener_review_queue_status(group, plan)
+        items.append(
+            {
+                "listener": group["local"],
+                "address": group["address"],
+                "port": port,
+                "bind_scope": group["bind_scope"],
+                "severity": group["severity"],
+                "finding_count": group["finding_count"],
+                "plan_id": plan.id if plan else None,
+                "plan_target": plan.target if plan else None,
+                "plan_approved": plan.approved if plan else False,
+                "plan_canceled": plan.canceled if plan else False,
+                "queue_status": status,
+                "next_step": _listener_review_queue_next_step(group, plan, status),
+                "recommended_mitigation_path": group["recommended_mitigation_path"],
+                "evidence": group["evidence"],
+            }
+        )
+    return {
+        "store": str(Path(store_path)),
+        "snapshot_id": triage["snapshot_id"],
+        "captured_at": triage["captured_at"],
+        "finding_count": triage["finding_count"],
+        "listener_count": triage["group_count"],
+        "needs_exposure_review": sum(1 for item in items if item["queue_status"] == "needs_exposure_review"),
+        "plan_staged": sum(1 for item in items if item["queue_status"] == "plan_staged"),
+        "approved_for_execution": sum(1 for item in items if item["queue_status"] == "approved_for_execution"),
+        "plan_canceled": sum(1 for item in items if item["queue_status"] == "plan_canceled"),
+        "items": items,
+        "approval_boundary": (
+            "read-only listener queue only; firewall, IDS, route, service-bind, or enforcement changes require "
+            "separate approval-gated remediation"
+        ),
+    }
+
+
+def _listener_review_queue_status(group: dict[str, object], plan: AdminChangePlan | None) -> str:
+    if plan is None:
+        return "needs_exposure_review"
+    if plan.canceled:
+        return "plan_canceled"
+    if plan.can_execute():
+        return "approved_for_execution"
+    return "plan_staged"
+
+
+def _listener_review_queue_next_step(group: dict[str, object], plan: AdminChangePlan | None, status: str) -> str:
+    if status == "needs_exposure_review":
+        if group["bind_scope"] == "all_interfaces":
+            return "stage an approval-gated exposure plan or document why all-interface binding is intentional"
+        return "confirm expected clients and document service owner before changing policy"
+    if status == "plan_canceled":
+        return "reassess current exposure and stage a new plan only if the listener is still unwanted"
+    if status == "approved_for_execution":
+        return "execute the approved plan only after required IDS review and human approval gates are satisfied"
+    return "complete IDS review and required approval before execution"
+
+
 def listener_from_finding(finding: dict[str, object]) -> dict[str, object]:
     summary = str(finding["summary"])
     match = re.search(r" on (?P<local>\S+)$", summary)
@@ -5857,6 +5931,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     host_triage_parser = subparsers.add_parser("host-security-triage", help="group host security findings by listener")
     host_triage_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_triage_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
+    listener_queue_parser = subparsers.add_parser("host-security-listener-review-queue", help="summarize exposed listener review and remediation-plan state")
+    listener_queue_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    listener_queue_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
     host_sources_parser = subparsers.add_parser("host-security-sources", help="correlate established TCP sources to host security listeners")
     host_sources_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     host_sources_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
@@ -6425,6 +6502,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "host-security-triage":
         print(json.dumps(host_security_triage_status(args.store, args.snapshot_id), sort_keys=True))
+        return 0
+
+    if args.command == "host-security-listener-review-queue":
+        print(json.dumps(host_security_listener_review_queue_status(args.store, args.snapshot_id), sort_keys=True))
         return 0
 
     if args.command == "host-security-sources":

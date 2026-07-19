@@ -62,7 +62,7 @@ from .ids_review import (
     record_ids_review_package_result,
     write_ids_review_prompt_file,
 )
-from .live_health import HttpHealthProbeAdapter, health_probe_adapter_for
+from .live_health import health_probe_adapter_for
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
 from .packages import AptPackageInspectionAdapter, PackageInspectionSnapshot, PackageUpdate
@@ -1239,7 +1239,6 @@ def run_status(
         tick = OverseerRuntime(
             store,
             probe_health_targets=probe_health_targets,
-            health_probe_adapter=HttpHealthProbeAdapter(timeout_seconds=health_probe_timeout_seconds),
             health_evidence_retention_per_target=health_evidence_retention_per_target,
             inspect_host=inspect_host,
         ).run(interval_seconds=interval_seconds, once=once)

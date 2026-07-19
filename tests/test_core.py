@@ -7351,6 +7351,39 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["health_probes"], 0)
             self.assertEqual(status["host_inspections"], 0)
 
+    def test_run_status_routes_process_health_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.run.process",
+                    name="Run Process",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_health_target(
+                HealthTarget(
+                    id="health.run.process",
+                    resource_id="svc.run.process",
+                    name="Run Process Health",
+                    probe_type=ProbeType.PROCESS,
+                    target=f"pid:{os.getpid()}",
+                )
+            )
+            store.close()
+
+            status = run_status(store_path, once=True, probe_health_targets=True)
+            store = SQLiteStore(store_path)
+            evidence = store.list_health_evidence()
+            store.close()
+
+        self.assertEqual(status["health_probes"], 1)
+        self.assertEqual(status["health_evidence"], 1)
+        self.assertEqual(evidence[0].observed_status, HealthStatus.HEALTHY)
+
     def test_persistence_security_status_reports_owner_only_store(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

@@ -17,9 +17,12 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 
 `GET /health` is always available for local service monitoring. All other endpoints require `Authorization: Bearer <token>` when `--auth-token-file` is configured.
 
+`GET /ui` serves the local operator console. The console shell does not embed or expose the bearer token; when the API is token-protected, enter the local token in the console to load protected JSON endpoints from the browser session.
+
 ## Read Endpoints
 
 - `GET /health`
+- `GET /ui`
 - `GET /service-status`
 - `GET /runtime-status`
 - `GET /persistence/security`

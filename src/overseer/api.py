@@ -86,6 +86,7 @@ from .cli import (
     unarchive_admin_history_status,
     virtual_summary_status,
 )
+from .ui import OPERATOR_CONSOLE_HTML
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
 
@@ -100,6 +101,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             query = parse_qs(route.query)
             if path == "/health":
                 self._write_json({"ok": True, "service": "overseer-api"})
+                return
+            if path == "/favicon.ico":
+                self._write_empty(HTTPStatus.NO_CONTENT)
+                return
+            if path in {"/", "/ui"}:
+                self._write_html(OPERATOR_CONSOLE_HTML)
                 return
             if not self._is_authorized():
                 self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
@@ -400,6 +407,20 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _write_html(self, html: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+            body = html.encode("utf-8")
+            self.send_response(int(status))
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("cache-control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _write_empty(self, status: HTTPStatus) -> None:
+            self.send_response(int(status))
+            self.send_header("content-length", "0")
+            self.end_headers()
 
     return OverseerApiHandler
 

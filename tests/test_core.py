@@ -263,6 +263,11 @@ class LocalOverseerApiServer:
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def get_text(self, path, headers=None):
+        request = Request(f"{self.url}{path}", headers=self._headers(headers))
+        with urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8"), response.headers.get("content-type")
+
     def post(self, path, payload):
         request = Request(
             f"{self.url}{path}",
@@ -1939,6 +1944,25 @@ class OverseerApiTests(unittest.TestCase):
 
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.api")
+
+    def test_loopback_api_serves_operator_console_without_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                html, content_type = server.get_text("/ui")
+                favicon_request = Request(f"{server.url}/favicon.ico")
+                with urlopen(favicon_request, timeout=5) as favicon_response:
+                    favicon_status = favicon_response.status
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(f"{server.url}/operator-dashboard", timeout=5)
+
+            self.assertIn("text/html", content_type)
+            self.assertEqual(favicon_status, 204)
+            self.assertIn("<title>Overseer</title>", html)
+            self.assertIn("Bearer token", html)
+            self.assertIn("/operator-dashboard", html)
+            self.assertEqual(error.exception.code, 401)
 
     def test_loopback_api_reports_runtime_status(self):
         with tempfile.TemporaryDirectory() as directory:

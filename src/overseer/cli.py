@@ -37,6 +37,7 @@ from .admin import (
     unarchive_admin_change_plan,
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
+from .codex_projects import CodexProjectThreadAdapter
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
@@ -3568,14 +3569,21 @@ def dispatch_usage_continuations_status(
     store_path: str | Path,
     dispatched_by: str = "quark",
     dispatched_at: str | None = None,
+    resume_codex_projects: bool = False,
+    codex_projects_registry: str | Path = "/home/god/.codex/codex-projects.csv",
+    thread_adapter: CodexProjectThreadAdapter | None = None,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         now = dispatched_at or datetime.now(UTC).isoformat()
+        adapter = thread_adapter
+        if resume_codex_projects and adapter is None:
+            adapter = CodexProjectThreadAdapter(codex_projects_registry)
         existing_dispatches = store.list_usage_continuation_dispatches()
         dispatched_request_ids = {dispatch.request_id for dispatch in existing_dispatches}
         dispatches: list[UsageContinuationDispatch] = []
         skipped: list[dict[str, object]] = []
+        resume_results: list[dict[str, object]] = []
         for request in store.list_usage_continuation_requests():
             if request.id in dispatched_request_ids:
                 skipped.append(
@@ -3605,6 +3613,9 @@ def dispatch_usage_continuations_status(
             if schedule.status != ScheduledWorkStatus.READY:
                 skipped.append(scheduled_work_status(schedule))
                 continue
+            resume_result = adapter.resume(request.owner_thread) if adapter is not None else None
+            if resume_result is not None:
+                resume_results.append(codex_project_resume_status(resume_result))
             dispatch = UsageContinuationDispatch(
                 id=f"usage.dispatch.{_status_id(request.id)}",
                 request_id=request.id,
@@ -3616,6 +3627,13 @@ def dispatch_usage_continuations_status(
                 dispatched_by=dispatched_by,
                 dispatched_at=now,
                 scheduled_for=schedule.scheduled_for,
+                resume_status=resume_result.status if resume_result else None,
+                resume_reason=resume_result.reason if resume_result else None,
+                resume_conversation_id=resume_result.conversation_id if resume_result else None,
+                resume_project=resume_result.project if resume_result else None,
+                resume_command=resume_result.command if resume_result else None,
+                resume_launcher=resume_result.launcher if resume_result else None,
+                resume_exit_code=resume_result.exit_code if resume_result else None,
             )
             store.save_usage_continuation_dispatch(dispatch)
             dispatches.append(dispatch)
@@ -3625,12 +3643,26 @@ def dispatch_usage_continuations_status(
             "skipped": len(skipped),
             "dispatches": [usage_continuation_dispatch_status(dispatch) for dispatch in dispatches],
             "skipped_items": skipped,
+            "resume_codex_projects": resume_codex_projects,
+            "resume_results": resume_results,
             "mutation_performed": bool(dispatches),
-            "host_mutation_performed": False,
-            "next_step": "external launcher may consume dispatch records; no host scheduler or thread wake was performed",
+            "host_mutation_performed": any(item["status"] in {"resumed", "already_running"} for item in resume_results),
+            "next_step": _dispatch_usage_continuations_next_step(resume_codex_projects, resume_results),
         }
     finally:
         store.close()
+
+
+def _dispatch_usage_continuations_next_step(resume_codex_projects: bool, resume_results: list[dict[str, object]]) -> str:
+    if not resume_codex_projects:
+        return "run with --resume-codex-projects to resume matched codex-projects threads"
+    if not resume_results:
+        return "no ready codex-projects threads were resumed"
+    if any(item["status"] == "failed" for item in resume_results):
+        return "inspect failed codex-projects resume results before retrying"
+    if any(item["status"] == "not_found" for item in resume_results):
+        return "register or correct owner_thread in codex-projects before retrying missing continuations"
+    return "ready codex-projects continuations have been handed to tmux"
 
 
 def usage_continuation_request_status(request: UsageContinuationRequest) -> dict[str, object]:
@@ -3661,6 +3693,28 @@ def usage_continuation_dispatch_status(dispatch: UsageContinuationDispatch) -> d
         "dispatched_by": dispatch.dispatched_by,
         "dispatched_at": dispatch.dispatched_at,
         "scheduled_for": dispatch.scheduled_for,
+        "resume_status": dispatch.resume_status,
+        "resume_reason": dispatch.resume_reason,
+        "resume_conversation_id": dispatch.resume_conversation_id,
+        "resume_project": dispatch.resume_project,
+        "resume_command": dispatch.resume_command,
+        "resume_launcher": dispatch.resume_launcher,
+        "resume_exit_code": dispatch.resume_exit_code,
+    }
+
+
+def codex_project_resume_status(result) -> dict[str, object]:
+    return {
+        "owner_thread": result.owner_thread,
+        "status": result.status,
+        "reason": result.reason,
+        "conversation_id": result.conversation_id,
+        "project": result.project,
+        "command": result.command,
+        "launcher": result.launcher,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
     }
 
 
@@ -4930,6 +4984,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     dispatch_usage_continuations_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     dispatch_usage_continuations_parser.add_argument("--dispatched-by", default="quark")
     dispatch_usage_continuations_parser.add_argument("--dispatched-at")
+    dispatch_usage_continuations_parser.add_argument(
+        "--resume-codex-projects",
+        action="store_true",
+        help="resume matched owner_thread values through the local codex-projects tmux registry",
+    )
+    dispatch_usage_continuations_parser.add_argument(
+        "--codex-projects-registry",
+        default="/home/god/.codex/codex-projects.csv",
+        help="codex-projects CSV registry path",
+    )
     request_usage_continuation_parser = subparsers.add_parser(
         "request-usage-continuation",
         help="persist a usage-limited continuation request without waking work",
@@ -5414,7 +5478,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "dispatch-usage-continuations":
         print(
             json.dumps(
-                dispatch_usage_continuations_status(args.store, args.dispatched_by, args.dispatched_at),
+                dispatch_usage_continuations_status(
+                    args.store,
+                    args.dispatched_by,
+                    args.dispatched_at,
+                    args.resume_codex_projects,
+                    args.codex_projects_registry,
+                ),
                 sort_keys=True,
             )
         )

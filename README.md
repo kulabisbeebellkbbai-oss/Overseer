@@ -51,6 +51,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli record-usage-limit --store state/overseer.sqlite3 --limit-id limit.service.requests --resource-id svc.service --kind requests --capacity 100 --remaining 25 --window hourly` - record or update Quark usage-limit evidence.
 - `PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3` - summarize Quark continuation requests and dispatch handoffs.
 - `PYTHONPATH=src python3 -m overseer.cli dispatch-usage-continuations --store state/overseer.sqlite3` - persist dispatch handoff records for ready usage-limited work.
+- `PYTHONPATH=src python3 -m overseer.cli dispatch-usage-continuations --store state/overseer.sqlite3 --resume-codex-projects` - resume ready registered Codex project threads through the local `codex-projects` tmux registry.
 - `PYTHONPATH=src python3 -m overseer.cli claim-review --store state/overseer.sqlite3` - review active, queued, expired, and release-blocked claims without releasing or revoking them.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.
 - `PYTHONPATH=src python3 -m overseer.cli assess-host-security --store state/overseer.sqlite3` - assess the latest persisted host snapshot for non-loopback TCP listeners.

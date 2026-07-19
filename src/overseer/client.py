@@ -121,10 +121,17 @@ class OverseerApiClient:
         self,
         dispatched_by: str = "quark",
         dispatched_at: str | None = None,
+        resume_codex_projects: bool = False,
+        codex_projects_registry: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"dispatched_by": dispatched_by}
+        payload: dict[str, Any] = {
+            "dispatched_by": dispatched_by,
+            "resume_codex_projects": resume_codex_projects,
+        }
         if dispatched_at:
             payload["dispatched_at"] = dispatched_at
+        if codex_projects_registry:
+            payload["codex_projects_registry"] = codex_projects_registry
         return self._post("/usage/continuation-dispatches", payload)
 
     def request_usage_continuation(

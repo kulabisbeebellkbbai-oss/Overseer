@@ -450,6 +450,8 @@ def _usage_continuation_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]
     return {
         "dispatched_by": str(payload.get("dispatched_by", "quark")),
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
+        "resume_codex_projects": bool(payload.get("resume_codex_projects", False)),
+        "codex_projects_registry": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
     }
 
 

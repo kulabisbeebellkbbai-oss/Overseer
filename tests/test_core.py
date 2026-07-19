@@ -17,6 +17,7 @@ from overseer import (
     Claim,
     ClaimStatus,
     ClaimType,
+    CodexProjectThreadAdapter,
     ConflictDecision,
     ConflictOutcome,
     DryRunExecutor,
@@ -4508,6 +4509,48 @@ class UsageLimitScheduleTests(unittest.TestCase):
 
 
 class UsageContinuationRequestTests(unittest.TestCase):
+    class _Completed:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class _FakeRunner:
+        def __init__(self):
+            self.commands = []
+
+        def __call__(self, command, text=True, capture_output=True):
+            self.commands.append(command)
+            if command[:2] == ["/tmp/tmux", "has-session"]:
+                return UsageContinuationRequestTests._Completed(returncode=1, stderr="no session")
+            return UsageContinuationRequestTests._Completed(returncode=0, stdout="started")
+
+    def test_codex_project_thread_adapter_resumes_registry_thread_detached(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f7140-debb-7c40-a056-d29be0630f01,Overseer,"
+                "/workspace/Overseer,codex-overseer-019f7140,/bin/codex-overseer-019f7140,"
+                "2026-07-17T18:05:04+00:00,2026-07-18T19:57:08+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            runner = self._FakeRunner()
+            adapter = CodexProjectThreadAdapter(
+                registry,
+                tmux_path="/tmp/tmux",
+                codex_memory_session_path="/tmp/codex-memory-session",
+                runner=runner,
+            )
+
+            result = adapter.resume("codex-overseer-019f7140")
+
+            self.assertEqual(result.status, "resumed")
+            self.assertEqual(result.conversation_id, "019f7140-debb-7c40-a056-d29be0630f01")
+            self.assertEqual(runner.commands[0], ["/tmp/tmux", "has-session", "-t", "codex-overseer-019f7140"])
+            self.assertEqual(runner.commands[1][0:6], ["/tmp/tmux", "new-session", "-d", "-s", "codex-overseer-019f7140", "-c"])
+            self.assertIn("/tmp/codex-memory-session", runner.commands[1])
+
     def test_records_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4676,6 +4719,61 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(second["skipped_items"][0]["status"], "already_dispatched")
             self.assertEqual(plan["dispatches"], 1)
             self.assertEqual(plan["undispatched_ready"], 0)
+
+    def test_dispatch_resumes_ready_codex_project_thread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f7140-debb-7c40-a056-d29be0630f01,Overseer,"
+                "/workspace/Overseer,codex-overseer-019f7140,/bin/codex-overseer-019f7140,"
+                "2026-07-17T18:05:04+00:00,2026-07-18T19:57:08+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            runner = self._FakeRunner()
+            adapter = CodexProjectThreadAdapter(
+                registry,
+                tmux_path="/tmp/tmux",
+                codex_memory_session_path="/tmp/codex-memory-session",
+                runner=runner,
+            )
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.github.requests",
+                    resource_id="svc.github",
+                    kind=LimitKind.REQUESTS,
+                    capacity=5000,
+                    remaining=100,
+                    resets_at="2026-07-18T11:00:00-04:00",
+                    window="hourly",
+                )
+            )
+            store.save_usage_continuation_request(
+                UsageContinuationRequest(
+                    id="work.sync",
+                    limit_id="limit.github.requests",
+                    resource_id="svc.github",
+                    owner_thread="codex-overseer-019f7140",
+                    requested_units=10,
+                    intent="sync issues",
+                )
+            )
+            store.close()
+
+            status = dispatch_usage_continuations_status(
+                store_path,
+                resume_codex_projects=True,
+                thread_adapter=adapter,
+            )
+            plan = usage_continuation_plan_status(store_path)
+
+            self.assertTrue(status["host_mutation_performed"])
+            self.assertEqual(status["resume_results"][0]["status"], "resumed")
+            self.assertEqual(status["dispatches"][0]["resume_status"], "resumed")
+            self.assertEqual(status["dispatches"][0]["resume_command"], "codex-overseer-019f7140")
+            self.assertEqual(plan["dispatch_items"][0]["resume_conversation_id"], "019f7140-debb-7c40-a056-d29be0630f01")
 
     def test_dispatch_skips_waiting_usage_continuation(self):
         with tempfile.TemporaryDirectory() as directory:

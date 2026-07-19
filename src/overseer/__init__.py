@@ -40,6 +40,7 @@ from .audit import (
     audit_event_from_decision,
 )
 from .config import ConfigSeedResult, OverseerConfig, config_from_mapping, load_config, seed_store_from_config, validate_config
+from .codex_projects import CodexProjectResumeResult, CodexProjectThread, CodexProjectThreadAdapter
 from .core import (
     ApprovalLevel,
     Claim,
@@ -174,6 +175,9 @@ __all__ = [
     "approval_from_decision",
     "audit_event_from_decision",
     "ConfigSeedResult",
+    "CodexProjectResumeResult",
+    "CodexProjectThread",
+    "CodexProjectThreadAdapter",
     "OverseerConfig",
     "config_from_mapping",
     "load_config",

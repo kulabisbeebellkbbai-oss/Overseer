@@ -95,6 +95,13 @@ class UsageContinuationDispatch:
     dispatched_by: str
     dispatched_at: str | None = None
     scheduled_for: str | None = None
+    resume_status: str | None = None
+    resume_reason: str | None = None
+    resume_conversation_id: str | None = None
+    resume_project: str | None = None
+    resume_command: str | None = None
+    resume_launcher: str | None = None
+    resume_exit_code: int | None = None
 
 
 @dataclass(frozen=True)

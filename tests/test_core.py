@@ -4223,6 +4223,31 @@ class PhysicalDiscoveryTests(unittest.TestCase):
             self.assertIsNotNone(identities[0].last_observed_at)
             self.assertTrue(identities[0].is_complete_for_exclusive_checkout())
 
+    def test_path_physical_discovery_enriches_usb_sysfs_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "serial"
+            dev = base / "dev"
+            sysfs_tty = base / "sys" / "class" / "tty"
+            root.mkdir()
+            dev.mkdir()
+            tty_path = dev / "ttyUSB0"
+            tty_path.touch()
+            (root / "usb-FTDI_RS485_A-if00-port0").symlink_to(tty_path)
+            device = sysfs_tty / "ttyUSB0" / "device"
+            device.mkdir(parents=True)
+            (device / "idVendor").write_text("0403\n", encoding="utf-8")
+            (device / "idProduct").write_text("6001\n", encoding="utf-8")
+            (device / "serial").write_text("FT1234\n", encoding="utf-8")
+
+            identities = PathPhysicalDiscoveryAdapter((root,), sysfs_tty_root=sysfs_tty).discover()
+
+            self.assertEqual(len(identities), 1)
+            self.assertEqual(identities[0].vendor_id, "0403")
+            self.assertEqual(identities[0].product_id, "6001")
+            self.assertEqual(identities[0].serial_number, "FT1234")
+            self.assertIn("usb", identities[0].capabilities)
+
     def test_discover_physical_status_reports_temp_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4233,6 +4258,7 @@ class PhysicalDiscoveryTests(unittest.TestCase):
             self.assertEqual(status["count"], 1)
             self.assertEqual(status["assets"][0]["kind"], PhysicalAssetKind.SERIAL_PORT.value)
             self.assertEqual(status["assets"][0]["source"], PhysicalIdentitySource.DISCOVERED.value)
+            self.assertIn("vendor_id", status["assets"][0])
 
     def test_discover_physical_status_persists_to_explicit_store(self):
         with tempfile.TemporaryDirectory() as directory:

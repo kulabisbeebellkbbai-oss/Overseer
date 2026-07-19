@@ -255,17 +255,7 @@ def discover_physical_status(roots: Sequence[str], store_path: str | Path | None
             store.close()
     status = {
         "count": len(identities),
-        "assets": [
-            {
-                "stable_id": identity.stable_id,
-                "kind": identity.kind.value,
-                "observed_paths": sorted(identity.observed_paths),
-                "source": PhysicalIdentitySource(identity.source).value,
-                "last_observed_at": identity.last_observed_at,
-                "complete_for_checkout": identity.is_complete_for_exclusive_checkout(),
-            }
-            for identity in identities
-        ],
+        "assets": [physical_identity_status(identity) for identity in identities],
     }
     if store_path is not None:
         status["store"] = str(Path(store_path))

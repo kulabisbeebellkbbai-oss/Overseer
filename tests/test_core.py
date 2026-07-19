@@ -73,6 +73,7 @@ from overseer import (
     SecurityStatus,
     SQLiteStore,
     ScheduledWorkStatus,
+    UsageContinuationRequest,
     UsageLimit,
     assess_freshness,
     approval_from_decision,
@@ -165,6 +166,7 @@ from overseer.cli import request_admin_history_restore_status
 from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
+from overseer.cli import request_usage_continuation_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
 from overseer.cli import security_summary_status
@@ -173,6 +175,7 @@ from overseer.cli import service_status
 from overseer.cli import unarchive_admin_history_status
 from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
+from overseer.cli import usage_continuation_plan_status
 from overseer.cli import virtual_summary_status
 
 
@@ -2123,6 +2126,40 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["limits"], 1)
             self.assertEqual(status["items"][0]["kind"], LimitKind.TOKENS.value)
+
+    def test_client_requests_usage_continuation_and_reads_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.client.ai",
+                    resource_id="svc.client.ai",
+                    kind=LimitKind.TOKENS,
+                    capacity=1000,
+                    remaining=0,
+                    resets_at="2026-07-18T19:00:00+00:00",
+                    window="hourly",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                request_status = client.request_usage_continuation(
+                    "work.client.ai",
+                    "limit.client.ai",
+                    "svc.client.ai",
+                    "thread-client",
+                    100,
+                    "continue client work",
+                )
+                plan = client.usage_continuation_plan()
+
+            self.assertFalse(request_status["host_mutation_performed"])
+            self.assertEqual(request_status["schedule"]["status"], ScheduledWorkStatus.WAITING.value)
+            self.assertEqual(plan["continuation_requests"], 1)
+            self.assertEqual(plan["waiting"], 1)
 
     def test_client_reads_physical_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4165,6 +4202,93 @@ class UsageLimitScheduleTests(unittest.TestCase):
 
         self.assertEqual(schedule.decision, LimitDecision.ESCALATE)
         self.assertEqual(schedule.approval_level, ApprovalLevel.SISKO)
+
+
+class UsageContinuationRequestTests(unittest.TestCase):
+    def test_persists_usage_continuation_request_and_plans_waiting_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.ai.tokens",
+                    resource_id="svc.ai",
+                    kind=LimitKind.TOKENS,
+                    capacity=100000,
+                    remaining=1000,
+                    resets_at="2026-07-18T12:00:00-04:00",
+                    window="daily",
+                )
+            )
+            store.close()
+
+            request_status = request_usage_continuation_status(
+                store_path,
+                "work.large-eval",
+                "limit.ai.tokens",
+                "svc.ai",
+                "thread-b",
+                5000,
+                "run eval after quota renewal",
+                requested_by="quark",
+                requested_at="2026-07-18T10:30:00-04:00",
+            )
+            plan = usage_continuation_plan_status(store_path)
+
+            self.assertTrue(request_status["mutation_performed"])
+            self.assertFalse(request_status["host_mutation_performed"])
+            self.assertEqual(request_status["schedule"]["status"], ScheduledWorkStatus.WAITING.value)
+            self.assertEqual(plan["continuation_requests"], 1)
+            self.assertEqual(plan["waiting"], 1)
+            self.assertFalse(plan["mutation_performed"])
+            self.assertEqual(plan["schedules"][0]["scheduled_for"], "2026-07-18T12:00:00-04:00")
+
+    def test_rejects_usage_continuation_for_mismatched_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.github.requests",
+                    resource_id="svc.github",
+                    kind=LimitKind.REQUESTS,
+                    capacity=5000,
+                    remaining=5000,
+                    resets_at="2026-07-18T11:00:00-04:00",
+                    window="hourly",
+                )
+            )
+            store.close()
+
+            with self.assertRaises(ValueError):
+                request_usage_continuation_status(
+                    store_path,
+                    "work.bad-resource",
+                    "limit.github.requests",
+                    "svc.ai",
+                    "thread-b",
+                    1,
+                    "use wrong service",
+                )
+
+    def test_store_round_trips_usage_continuation_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            request = UsageContinuationRequest(
+                id="work.sync",
+                limit_id="limit.github.requests",
+                resource_id="svc.github",
+                owner_thread="thread-a",
+                requested_units=10,
+                intent="sync issues",
+            )
+            store = SQLiteStore(store_path)
+            store.save_usage_continuation_request(request)
+
+            loaded = store.load_usage_continuation_request("work.sync")
+            store.close()
+
+            self.assertEqual(loaded, request)
 
 
 class LocalSchedulerTests(unittest.TestCase):

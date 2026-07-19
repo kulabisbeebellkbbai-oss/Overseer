@@ -87,6 +87,41 @@ class OverseerApiClient:
     def usage_summary(self) -> dict[str, Any]:
         return self._get("/usage-summary")
 
+    def usage_continuation_plan(self) -> dict[str, Any]:
+        return self._get("/usage/continuation-plan")
+
+    def request_usage_continuation(
+        self,
+        request_id: str,
+        limit_id: str,
+        resource_id: str,
+        owner_thread: str,
+        requested_units: int,
+        intent: str,
+        risk_level: str = "low",
+        earliest_start: str | None = None,
+        deadline: str | None = None,
+        requested_by: str = "quark",
+        requested_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "limit_id": limit_id,
+            "resource_id": resource_id,
+            "owner_thread": owner_thread,
+            "requested_units": requested_units,
+            "intent": intent,
+            "risk_level": risk_level,
+            "requested_by": requested_by,
+        }
+        if earliest_start:
+            payload["earliest_start"] = earliest_start
+        if deadline:
+            payload["deadline"] = deadline
+        if requested_at:
+            payload["requested_at"] = requested_at
+        return self._post("/usage/continuation-requests", payload)
+
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 

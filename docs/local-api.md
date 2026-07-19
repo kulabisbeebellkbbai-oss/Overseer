@@ -32,6 +32,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /approvals-summary`
 - `GET /security-summary`
 - `GET /usage-summary`
+- `GET /usage/continuation-plan`
 - `GET /physical-summary`
 - `GET /virtual-summary`
 - `GET /health-summary`
@@ -73,6 +74,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/ids-review-packages/prompts`
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
+- `POST /usage/continuation-requests`
 - `POST /admin/plans`
 - `POST /admin/approve`
 - `POST /admin/cancel`
@@ -138,6 +140,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
+`GET /usage/continuation-plan` returns persisted usage-limited continuation requests and their current ready, waiting, blocked, or escalated schedule without mutating host state.
+`POST /usage/continuation-requests` persists a Quark continuation request with `request_id`, `limit_id`, `resource_id`, `owner_thread`, `requested_units`, and `intent`; optional fields are `risk_level`, `earliest_start`, `deadline`, `requested_by`, and `requested_at`.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
 `GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.
@@ -158,6 +162,7 @@ alerts = client.alerts_summary()
 audit = client.audit_summary(owner="odo", subject_prefix="ids-review.")
 security = client.security_summary()
 usage = client.usage_summary()
+continuation_plan = client.usage_continuation_plan()
 physical = client.physical_summary()
 virtual = client.virtual_summary()
 efficiency = client.health_efficiency()

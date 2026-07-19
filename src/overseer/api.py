@@ -64,6 +64,7 @@ from .cli import (
     request_admin_adapter_enablement_status,
     request_admin_history_restore_status,
     request_daemon_migration_status,
+    request_usage_continuation_status,
     prepare_host_security_ids_review_package_status,
     persistence_security_status,
     request_claim_status,
@@ -71,6 +72,7 @@ from .cli import (
     service_status,
     runtime_status,
     security_summary_status,
+    usage_continuation_plan_status,
     usage_summary_status,
     submit_host_security_ids_review_package_status,
     unarchive_admin_history_status,
@@ -123,6 +125,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/usage-summary":
                 self._handle(lambda: usage_summary_status(store_path))
+                return
+            if path == "/usage/continuation-plan":
+                self._handle(lambda: usage_continuation_plan_status(store_path))
                 return
             if path == "/physical-summary":
                 self._handle(lambda: physical_summary_status(store_path))
@@ -297,6 +302,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/runtime/daemon-migration-requests/approve":
                 self._handle_json(lambda payload: approve_daemon_migration_status(store_path, **_approve_daemon_migration_args(payload)))
                 return
+            if self.path == "/usage/continuation-requests":
+                self._handle_json(lambda payload: request_usage_continuation_status(store_path, **_usage_continuation_request_args(payload)))
+                return
             if self.path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
                 return
@@ -397,6 +405,22 @@ def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "starts_at": str(payload["starts_at"]) if payload.get("starts_at") else None,
         "expires_at": str(payload["expires_at"]) if payload.get("expires_at") else None,
         "release_condition": str(payload["release_condition"]) if payload.get("release_condition") else None,
+    }
+
+
+def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "limit_id": str(payload["limit_id"]),
+        "resource_id": str(payload["resource_id"]),
+        "owner_thread": str(payload["owner_thread"]),
+        "requested_units": int(payload["requested_units"]),
+        "intent": str(payload["intent"]),
+        "risk_level": str(payload.get("risk_level", "low")),
+        "earliest_start": str(payload["earliest_start"]) if payload.get("earliest_start") else None,
+        "deadline": str(payload["deadline"]) if payload.get("deadline") else None,
+        "requested_by": str(payload.get("requested_by", "quark")),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") else None,
     }
 
 

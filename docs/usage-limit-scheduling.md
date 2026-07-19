@@ -41,3 +41,22 @@ PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqli
 ```
 
 `usage-summary` is Quark's compact read model for persisted service limits. It reports total limits, available capacity, exhausted limits, unknown reset times, low-confidence observations, the next reset timestamp, counts by limit kind, and per-limit details.
+
+## Continuation Requests
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli request-usage-continuation \
+  --store state/overseer.sqlite3 \
+  --request-id work.example \
+  --limit-id limit.service.requests \
+  --resource-id svc.service \
+  --owner-thread thread-example \
+  --requested-units 1 \
+  --intent "continue queued service work"
+
+PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3
+```
+
+`request-usage-continuation` persists a Quark planning record and immediately reports how the current limit would schedule it. `usage-continuation-plan` replays all persisted requests against current limit records and reports ready, waiting, blocked, and escalated work.
+
+This does not modify cron, systemd timers, shells, service state, network policy, or any external scheduler. It only records local planning state for a future authorized worker to consume.

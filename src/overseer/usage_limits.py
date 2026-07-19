@@ -57,6 +57,33 @@ class LimitedWorkRequest:
 
 
 @dataclass(frozen=True)
+class UsageContinuationRequest:
+    id: str
+    limit_id: str
+    resource_id: str
+    owner_thread: str
+    requested_units: int
+    intent: str
+    risk_level: RiskLevel = RiskLevel.LOW
+    earliest_start: str | None = None
+    deadline: str | None = None
+    requested_by: str = "quark"
+    requested_at: str | None = None
+
+    def to_limited_work_request(self) -> LimitedWorkRequest:
+        return LimitedWorkRequest(
+            id=self.id,
+            resource_id=self.resource_id,
+            owner_thread=self.owner_thread,
+            requested_units=self.requested_units,
+            intent=self.intent,
+            risk_level=self.risk_level,
+            earliest_start=self.earliest_start,
+            deadline=self.deadline,
+        )
+
+
+@dataclass(frozen=True)
 class UsageSchedule:
     decision: LimitDecision
     owner_domain: OwnerDomain

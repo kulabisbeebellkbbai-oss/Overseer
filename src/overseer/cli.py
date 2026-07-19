@@ -66,7 +66,8 @@ from .runtime_state import (
 from .service import OverseerCoordinator, coordinator_from_store
 from .source_review import HostSecuritySourceReview, SourceReviewDisposition
 from .store import SQLiteStore
-from .usage_limits import LimitKind, UsageLimit
+from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
+from .usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -3342,6 +3343,120 @@ def usage_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def request_usage_continuation_status(
+    store_path: str | Path,
+    request_id: str,
+    limit_id: str,
+    resource_id: str,
+    owner_thread: str,
+    requested_units: int,
+    intent: str,
+    risk_level: str = RiskLevel.LOW.value,
+    earliest_start: str | None = None,
+    deadline: str | None = None,
+    requested_by: str = "quark",
+    requested_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        limit = store.load_usage_limit(limit_id)
+        if limit.resource_id != resource_id:
+            raise ValueError("request resource_id does not match usage limit")
+        request = UsageContinuationRequest(
+            id=request_id,
+            limit_id=limit_id,
+            resource_id=resource_id,
+            owner_thread=owner_thread,
+            requested_units=requested_units,
+            intent=intent,
+            risk_level=RiskLevel(risk_level),
+            earliest_start=earliest_start,
+            deadline=deadline,
+            requested_by=requested_by,
+            requested_at=requested_at,
+        )
+        store.save_usage_continuation_request(request)
+        work = schedule_usage_limited_work(limit, request.to_limited_work_request())
+        return {
+            "store": str(store.path),
+            "request": usage_continuation_request_status(request),
+            "schedule": scheduled_work_status(work),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
+def usage_continuation_plan_status(store_path: str | Path) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        requests = store.list_usage_continuation_requests()
+        schedules = []
+        missing_limit_ids: list[str] = []
+        for request in requests:
+            try:
+                limit = store.load_usage_limit(request.limit_id)
+            except KeyError:
+                missing_limit_ids.append(request.limit_id)
+                schedules.append(
+                    {
+                        "id": request.id,
+                        "owner_thread": request.owner_thread,
+                        "resource_id": request.resource_id,
+                        "status": ScheduledWorkStatus.BLOCKED.value,
+                        "reason": "usage limit record is missing",
+                        "scheduled_for": None,
+                        "blocking_ids": (request.limit_id,),
+                    }
+                )
+                continue
+            schedules.append(scheduled_work_status(schedule_usage_limited_work(limit, request.to_limited_work_request())))
+        return {
+            "store": str(store.path),
+            "continuation_requests": len(requests),
+            "ready": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.READY.value),
+            "waiting": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.WAITING.value),
+            "blocked": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.BLOCKED.value),
+            "escalated": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.ESCALATED.value),
+            "missing_limit_ids": tuple(sorted(set(missing_limit_ids))),
+            "items": [usage_continuation_request_status(request) for request in requests],
+            "schedules": schedules,
+            "mutation_performed": False,
+            "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
+def usage_continuation_request_status(request: UsageContinuationRequest) -> dict[str, object]:
+    return {
+        "id": request.id,
+        "limit_id": request.limit_id,
+        "resource_id": request.resource_id,
+        "owner_thread": request.owner_thread,
+        "requested_units": request.requested_units,
+        "intent": request.intent,
+        "risk_level": RiskLevel(request.risk_level).value,
+        "earliest_start": request.earliest_start,
+        "deadline": request.deadline,
+        "requested_by": request.requested_by,
+        "requested_at": request.requested_at,
+    }
+
+
+def scheduled_work_status(work) -> dict[str, object]:
+    return {
+        "id": work.id,
+        "owner_thread": work.owner_thread,
+        "resource_id": work.resource_id,
+        "status": ScheduledWorkStatus(work.status).value,
+        "reason": work.reason,
+        "scheduled_for": work.scheduled_for,
+        "blocking_ids": work.blocking_ids,
+    }
+
+
 def usage_limit_status(limit: UsageLimit) -> dict[str, object]:
     return {
         "id": limit.id,
@@ -4547,6 +4662,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    usage_continuation_plan_parser = subparsers.add_parser(
+        "usage-continuation-plan",
+        help="summarize persisted usage-limited continuation requests",
+    )
+    usage_continuation_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    request_usage_continuation_parser = subparsers.add_parser(
+        "request-usage-continuation",
+        help="persist a usage-limited continuation request without waking work",
+    )
+    request_usage_continuation_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    request_usage_continuation_parser.add_argument("--request-id", required=True)
+    request_usage_continuation_parser.add_argument("--limit-id", required=True)
+    request_usage_continuation_parser.add_argument("--resource-id", required=True)
+    request_usage_continuation_parser.add_argument("--owner-thread", required=True)
+    request_usage_continuation_parser.add_argument("--requested-units", required=True, type=int)
+    request_usage_continuation_parser.add_argument("--intent", required=True)
+    request_usage_continuation_parser.add_argument("--risk-level", default=RiskLevel.LOW.value, choices=[item.value for item in RiskLevel])
+    request_usage_continuation_parser.add_argument("--earliest-start")
+    request_usage_continuation_parser.add_argument("--deadline")
+    request_usage_continuation_parser.add_argument("--requested-by", default="quark")
+    request_usage_continuation_parser.add_argument("--requested-at")
     claim_parser = subparsers.add_parser("request-claim", help="request a stored resource checkout or observation")
     claim_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_parser.add_argument("--claim-id", required=True)
@@ -4986,6 +5122,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-summary":
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "usage-continuation-plan":
+        print(json.dumps(usage_continuation_plan_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "request-usage-continuation":
+        print(
+            json.dumps(
+                request_usage_continuation_status(
+                    args.store,
+                    args.request_id,
+                    args.limit_id,
+                    args.resource_id,
+                    args.owner_thread,
+                    args.requested_units,
+                    args.intent,
+                    args.risk_level,
+                    args.earliest_start,
+                    args.deadline,
+                    args.requested_by,
+                    args.requested_at,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "claim-review":

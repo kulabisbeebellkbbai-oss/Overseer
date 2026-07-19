@@ -18,7 +18,7 @@ from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .source_review import HostSecuritySourceReview
-from .usage_limits import UsageLimit
+from .usage_limits import UsageContinuationRequest, UsageLimit
 
 
 class SQLiteStore:
@@ -61,6 +61,12 @@ class SQLiteStore:
             );
             CREATE TABLE IF NOT EXISTS usage_limits (
                 id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS usage_continuation_requests (
+                id TEXT PRIMARY KEY,
+                limit_id TEXT NOT NULL,
                 resource_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
@@ -135,6 +141,25 @@ class SQLiteStore:
 
     def list_usage_limits(self) -> tuple[UsageLimit, ...]:
         return tuple(_load_dataclass(UsageLimit, payload) for payload in self._list_payloads("usage_limits"))
+
+    def save_usage_continuation_request(self, request: UsageContinuationRequest) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO usage_continuation_requests (id, limit_id, resource_id, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (request.id, request.limit_id, request.resource_id, _dump(request)),
+        )
+        self._connection.commit()
+
+    def load_usage_continuation_request(self, request_id: str) -> UsageContinuationRequest:
+        return _load_dataclass(UsageContinuationRequest, self._get_payload("usage_continuation_requests", request_id))
+
+    def list_usage_continuation_requests(self) -> tuple[UsageContinuationRequest, ...]:
+        return tuple(
+            _load_dataclass(UsageContinuationRequest, payload)
+            for payload in self._list_payloads("usage_continuation_requests")
+        )
 
     def save_health_evidence(self, evidence: HealthEvidence) -> None:
         self._connection.execute(

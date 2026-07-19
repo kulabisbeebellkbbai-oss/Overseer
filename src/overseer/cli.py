@@ -1660,7 +1660,7 @@ def host_security_listener_review_queue_status(store_path: str | Path, snapshot_
         plans_by_target = {
             plan.target: plan
             for plan in store.list_admin_change_plans()
-            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived
+            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived and not plan.canceled
             and plan.target not in revision_required_targets
         }
     finally:
@@ -1882,7 +1882,7 @@ def plan_host_security_listener_queue_remediations_status(
         existing_targets = {
             plan.target
             for plan in store.list_admin_change_plans()
-            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived
+            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived and not plan.canceled
             and plan.target not in revision_required_targets
         }
         for port, items in sorted(candidates_by_port.items(), key=lambda entry: int(entry[0])):

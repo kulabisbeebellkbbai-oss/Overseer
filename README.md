@@ -31,7 +31,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli probe-config --config config/overseer.json --store state/overseer.sqlite3` - probe configured health targets and optionally persist evidence.
 - `PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-id` - read directory entries for physical device paths.
 - `PYTHONPATH=src python3 -m overseer.cli discover-physical --root /dev/serial/by-id --store state/overseer.sqlite3` - persist discovered path identities to an explicit ignored local database path.
-- `PYTHONPATH=src python3 -m overseer.cli physical-summary --store state/overseer.sqlite3` - summarize persisted physical identities, checkout readiness, power risk, and storage risk.
+- `PYTHONPATH=src python3 -m overseer.cli physical-summary --store state/overseer.sqlite3` - summarize persisted physical identities, checkout readiness, provenance, power risk, and storage risk.
 - `PYTHONPATH=src python3 -m overseer.cli virtual-summary --store state/overseer.sqlite3` - summarize persisted virtual assets, checkout readiness, active claims, queued claims, and reserved ports.
 - `PYTHONPATH=src python3 -m overseer.cli command-summary --store state/overseer.sqlite3` - summarize command-level service, resource, claim, health, usage, asset, admin, and alert state.
 - `PYTHONPATH=src python3 -m overseer.cli operator-dashboard --store state/overseer.sqlite3` - summarize all operator domains into one role-focused attention dashboard, including admin archive candidates, restore approvals, and security review gate blockers.

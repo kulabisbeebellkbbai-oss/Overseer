@@ -4703,7 +4703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
     admin_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
-    admin_history_parser = subparsers.add_parser("admin-history-review", help="review inactive admin plans for future archiving")
+    admin_history_parser = subparsers.add_parser("admin-history-review", help="review inactive admin plans for archive handling")
     admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archive_plan_parser = subparsers.add_parser("admin-history-archive-plan", help="prepare a read-only archive manifest for inactive admin plans")
     admin_archive_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")

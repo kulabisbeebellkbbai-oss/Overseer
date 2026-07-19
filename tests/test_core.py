@@ -72,6 +72,7 @@ from overseer import (
     SecuritySignalType,
     SecurityStatus,
     SQLiteStore,
+    CURRENT_SCHEMA_VERSION,
     ScheduledWorkStatus,
     UsageContinuationRequest,
     UsageLimit,
@@ -4775,6 +4776,22 @@ class ApprovalAuditTests(unittest.TestCase):
 
 
 class SQLiteStoreTests(unittest.TestCase):
+    def test_records_bootstrap_schema_migration_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            migrations = store.list_schema_migrations()
+            store.close()
+
+            reopened = SQLiteStore(store_path)
+            reopened_migrations = reopened.list_schema_migrations()
+            reopened.close()
+
+        self.assertEqual(len(migrations), 1)
+        self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
+        self.assertEqual(reopened_migrations, migrations)
+
     def test_persists_resource_claim_and_decision_in_explicit_temp_database(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteStore(Path(directory) / "overseer.sqlite3")
@@ -4971,6 +4988,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(status["recommended_mode"], "0600")
         self.assertEqual(status["warning_count"], 0)
         self.assertEqual(status["items"][0]["octal_mode"], "0o600")
+        self.assertTrue(status["schema"]["migration_ledger_present"])
+        self.assertEqual(status["schema"]["applied_schema_version"], CURRENT_SCHEMA_VERSION)
 
     def test_persistence_security_status_flags_group_or_other_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4995,6 +5014,8 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(status["status"], "missing")
         self.assertFalse(status["database_exists"])
+        self.assertFalse(status["schema"]["migration_ledger_present"])
+        self.assertEqual(status["schema"]["current_schema_version"], CURRENT_SCHEMA_VERSION)
 
     def test_runtime_can_probe_configured_health_targets_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
@@ -5685,6 +5706,7 @@ class RuntimeTests(unittest.TestCase):
             status = list_state_status(store_path)
 
             self.assertEqual(status["resources"][0]["id"], "proxy.state.cli")
+            self.assertEqual(status["schema_migrations"][0]["version"], CURRENT_SCHEMA_VERSION)
             self.assertEqual(status["claims"][0]["status"], ClaimStatus.REQUESTED.value)
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")

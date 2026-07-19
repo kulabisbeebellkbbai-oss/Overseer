@@ -129,7 +129,7 @@ from .scheduler import (
     schedule_maintenance_window,
     schedule_usage_limited_work,
 )
-from .store import SQLiteStore
+from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .usage_limits import (
     LimitDecision,
     LimitKind,
@@ -260,6 +260,8 @@ __all__ = [
     "schedule_maintenance_window",
     "schedule_usage_limited_work",
     "SQLiteStore",
+    "SchemaMigration",
+    "CURRENT_SCHEMA_VERSION",
     "LimitDecision",
     "LimitKind",
     "LimitedWorkRequest",

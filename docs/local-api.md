@@ -120,8 +120,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /claims/cleanup-requests/execute` executes only an approved cleanup request after re-validating the cleanup candidate. It can mark an expired active-like claim expired, re-evaluate a stale queued claim, move a release-blocked claim to `releasing`, or revoke a blocked claim. Moving a claim to `releasing` does not free the resource.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
-`GET /persistence/security` inspects SQLite store file ownership and permissions without creating a missing database or changing file modes.
-`GET /state` includes persisted resources, claims, approvals, audit events, usage limits, usage continuation requests, health records, runtime records, admin plans, and security review records.
+`GET /persistence/security` inspects SQLite store file ownership, permissions, sidecar files, and schema migration metadata without creating a missing database or changing file modes.
+`GET /state` includes schema migrations, persisted resources, claims, approvals, audit events, usage limits, usage continuation requests, health records, runtime records, admin plans, and security review records.
 `GET /state/redacted` returns a share-oriented state export with local paths, targets, errors, summaries, reasons, command text, prompt/advisory text, hostnames, listener addresses, and secret-like keys replaced by `[REDACTED]`.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 `GET /audit-summary` returns persisted audit events with optional `event_type`, `owner`, and `subject_prefix` query filters.

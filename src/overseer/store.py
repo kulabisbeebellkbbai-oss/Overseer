@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,16 @@ from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .source_review import HostSecuritySourceReview
 from .usage_limits import UsageContinuationRequest, UsageLimit
+
+
+CURRENT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class SchemaMigration:
+    version: int
+    description: str
+    applied_at: str
 
 
 class SQLiteStore:
@@ -36,6 +48,11 @@ class SQLiteStore:
     def initialize(self) -> None:
         self._connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                description TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS resources (
                 id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
@@ -118,7 +135,30 @@ class SQLiteStore:
             );
             """
         )
+        self._record_schema_migration(CURRENT_SCHEMA_VERSION, "bootstrap JSON payload store")
         self._connection.commit()
+
+    def _record_schema_migration(self, version: int, description: str) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (version, description, datetime.now(UTC).isoformat()),
+        )
+
+    def list_schema_migrations(self) -> tuple[SchemaMigration, ...]:
+        rows = self._connection.execute(
+            "SELECT version, description, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        return tuple(
+            SchemaMigration(
+                version=int(row["version"]),
+                description=str(row["description"]),
+                applied_at=str(row["applied_at"]),
+            )
+            for row in rows
+        )
 
     def save_resource(self, resource: Resource) -> None:
         self._upsert("resources", resource.id, _dump(resource))

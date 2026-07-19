@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import sqlite3
 import stat
 from collections.abc import Sequence
 from dataclasses import replace
@@ -65,7 +66,7 @@ from .runtime_state import (
 )
 from .service import OverseerCoordinator, coordinator_from_store
 from .source_review import HostSecuritySourceReview, SourceReviewDisposition
-from .store import SQLiteStore
+from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
 from .usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
 
@@ -1032,10 +1033,65 @@ def persistence_security_status(store_path: str | Path) -> dict[str, object]:
         "status": status,
         "recommended_mode": "0600",
         "database_exists": path.exists(),
+        "schema": _persistence_schema_status(path),
         "files_checked": len(items),
         "warning_count": len(risky),
         "items": items,
         "next_step": next_step,
+    }
+
+
+def _persistence_schema_status(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {
+            "current_schema_version": CURRENT_SCHEMA_VERSION,
+            "migration_ledger_present": False,
+            "applied_schema_version": None,
+            "migration_count": 0,
+            "migrations": [],
+        }
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        return {
+            "current_schema_version": CURRENT_SCHEMA_VERSION,
+            "migration_ledger_present": False,
+            "applied_schema_version": None,
+            "migration_count": 0,
+            "migrations": [],
+            "error": str(error),
+        }
+    try:
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        if table is None:
+            return {
+                "current_schema_version": CURRENT_SCHEMA_VERSION,
+                "migration_ledger_present": False,
+                "applied_schema_version": None,
+                "migration_count": 0,
+                "migrations": [],
+            }
+        rows = connection.execute(
+            "SELECT version, description, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    finally:
+        connection.close()
+    migrations = [
+        {
+            "version": int(row[0]),
+            "description": str(row[1]),
+            "applied_at": str(row[2]),
+        }
+        for row in rows
+    ]
+    return {
+        "current_schema_version": CURRENT_SCHEMA_VERSION,
+        "migration_ledger_present": True,
+        "applied_schema_version": migrations[-1]["version"] if migrations else None,
+        "migration_count": len(migrations),
+        "migrations": migrations,
     }
 
 
@@ -4034,6 +4090,7 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
 def list_state_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
+        schema_migrations = store.list_schema_migrations()
         resources = store.list_resources()
         usage_limits = store.list_usage_limits()
         usage_continuation_requests = store.list_usage_continuation_requests()
@@ -4051,6 +4108,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         admin_history_archives = store.list_admin_history_archives()
         return {
             "store": str(store.path),
+            "schema_migrations": [schema_migration_status(migration) for migration in schema_migrations],
             "resources": [
                 {
                     "id": resource.id,
@@ -4176,6 +4234,14 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         }
     finally:
         store.close()
+
+
+def schema_migration_status(migration: SchemaMigration) -> dict[str, object]:
+    return {
+        "version": migration.version,
+        "description": migration.description,
+        "applied_at": migration.applied_at,
+    }
 
 
 REDACTED_EXPORT_FIELD_KEYS = (

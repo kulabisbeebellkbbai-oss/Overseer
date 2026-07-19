@@ -109,6 +109,34 @@ class OverseerApiClient:
             payload["retention_per_target"] = retention_per_target
         return self._post("/health/probes/run", payload)
 
+    def record_health_target(
+        self,
+        target_id: str,
+        resource_id: str,
+        name: str,
+        probe_type: str,
+        target: str,
+        owner_domain: str = "julian",
+        expected_status: int | None = None,
+        expected_content_type: str | None = None,
+        latency_warn_ms: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "target_id": target_id,
+            "resource_id": resource_id,
+            "name": name,
+            "probe_type": probe_type,
+            "target": target,
+            "owner_domain": owner_domain,
+        }
+        if expected_status is not None:
+            payload["expected_status"] = expected_status
+        if expected_content_type:
+            payload["expected_content_type"] = expected_content_type
+        if latency_warn_ms is not None:
+            payload["latency_warn_ms"] = latency_warn_ms
+        return self._post("/health-targets", payload)
+
     def usage_summary(self) -> dict[str, Any]:
         return self._get("/usage-summary")
 

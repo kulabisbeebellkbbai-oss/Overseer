@@ -204,6 +204,7 @@ from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import probe_stored_health_status
+from overseer.cli import record_health_target_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_archive_status
@@ -1137,6 +1138,56 @@ class HealthSummaryTests(unittest.TestCase):
             self.assertEqual(status["healthy"], 1)
             self.assertEqual(status["unhealthy"], 0)
             self.assertEqual(status["summaries"][0]["latest_evidence_id"], "evidence.new")
+
+    def test_record_health_target_status_persists_target_for_known_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.registered",
+                    name="Registered Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            status = record_health_target_status(
+                store_path,
+                "health.registered.ready",
+                "svc.registered",
+                "Registered Ready",
+                ProbeType.COMMAND.value,
+                "command:test -e /tmp",
+                latency_warn_ms=250,
+            )
+
+            store = SQLiteStore(store_path)
+            target = store.load_health_target("health.registered.ready")
+            store.close()
+
+        self.assertTrue(status["mutation_performed"])
+        self.assertFalse(status["host_mutation_performed"])
+        self.assertEqual(status["probe_type"], ProbeType.COMMAND.value)
+        self.assertEqual(status["latency_warn_ms"], 250)
+        self.assertEqual(target.resource_id, "svc.registered")
+        self.assertEqual(target.target, "command:test -e /tmp")
+
+    def test_record_health_target_status_rejects_unknown_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with self.assertRaises(ValueError):
+                record_health_target_status(
+                    store_path,
+                    "health.missing",
+                    "svc.missing",
+                    "Missing",
+                    ProbeType.JSON.value,
+                    "http://127.0.0.1:1/health",
+                )
 
     def test_health_summary_cli_can_fail_on_unhealthy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2508,6 +2559,58 @@ class OverseerApiTests(unittest.TestCase):
             self.assertEqual(missing_record_error.exception.code, 404)
             self.assertEqual(missing_record_body["error"], "missing record: admin.missing")
 
+    def test_api_records_health_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.api.health-target",
+                    name="API Health Target Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                status = server.post(
+                    "/health-targets",
+                    {
+                        "target_id": "health.api.ready",
+                        "resource_id": "svc.api.health-target",
+                        "name": "API Ready",
+                        "probe_type": "process",
+                        "target": f"pid:{os.getpid()}",
+                    },
+                )
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["target_id"], "health.api.ready")
+
+    def test_api_rejects_health_target_for_unknown_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path) as server:
+                with self.assertRaises(HTTPError) as error:
+                    server.post(
+                        "/health-targets",
+                        {
+                            "target_id": "health.api.missing",
+                            "resource_id": "svc.api.missing",
+                            "name": "Missing",
+                            "probe_type": "json",
+                            "target": "http://127.0.0.1:1/health",
+                        },
+                    )
+                body = json.loads(error.exception.read().decode("utf-8"))
+
+            self.assertEqual(error.exception.code, 400)
+            self.assertEqual(body["error"], "unknown resource: svc.api.missing")
+
 
 class OverseerApiClientTests(unittest.TestCase):
     def test_client_reads_state_with_token_file(self):
@@ -3449,6 +3552,35 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["targets"], 1)
             self.assertEqual(status["healthy"], 1)
             self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
+
+    def test_client_records_health_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.client.health-target",
+                    name="Client Health Target Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.record_health_target(
+                    "health.client.ready",
+                    "svc.client.health-target",
+                    "Client Ready",
+                    "process",
+                    f"pid:{os.getpid()}",
+                )
+
+            self.assertEqual(status["target_id"], "health.client.ready")
+            self.assertEqual(status["owner_domain"], OwnerDomain.JULIAN.value)
+            self.assertTrue(status["mutation_performed"])
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

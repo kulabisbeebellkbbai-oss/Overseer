@@ -101,6 +101,16 @@ PYTHONPATH=src python3 -m overseer.cli health-efficiency --store state/overseer.
 
 It summarizes target status counts, probe-type coverage, owner routing, recovery requirements, missing evidence, and latest failures for MCP, hosted page, HTTPS, HTML, JSON, process, command, log, and manual health checks.
 
+## Register Health Targets
+
+Julian can persist a health target for a known resource without probing it immediately:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli record-health-target --store state/overseer.sqlite3 --target-id health.overseer.api --resource-id svc.overseer.api --name "Overseer API" --probe-type json --target http://127.0.0.1:8766/health --expected-status 200 --expected-content-type application/json
+```
+
+Registration validates that the target's resource already exists, records the target definition, and performs no host mutation. Stored targets can later be checked with `probe-stored-health`.
+
 ## Live Process Probes
 
 Julian can run read-only process probes for explicit process targets:

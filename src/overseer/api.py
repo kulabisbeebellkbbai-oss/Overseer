@@ -74,6 +74,7 @@ from .cli import (
     plan_package_updates_status,
     policy_customization_helper_cli_status,
     probe_stored_health_status,
+    record_health_target_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
     request_admin_adapter_enablement_status,
@@ -293,6 +294,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/health/probes/run":
                 self._handle_json(lambda payload: probe_stored_health_status(store_path, **_stored_health_probe_args(payload)))
+                return
+            if self.path == "/health-targets":
+                self._handle_json(lambda payload: record_health_target_status(store_path, **_health_target_args(payload)))
                 return
             if self.path == "/physical/discover-storage":
                 self._handle_json(lambda payload: discover_storage_status(**_physical_storage_discovery_args(store_path, payload)))
@@ -607,6 +611,20 @@ def _stored_health_probe_args(payload: dict[str, Any]) -> dict[str, Any]:
     if "retention_per_target" in payload:
         args["health_evidence_retention_per_target"] = int(payload["retention_per_target"])
     return args
+
+
+def _health_target_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target_id": str(payload["target_id"]),
+        "resource_id": str(payload["resource_id"]),
+        "name": str(payload["name"]),
+        "probe_type": str(payload["probe_type"]),
+        "target": str(payload["target"]),
+        "owner_domain": str(payload.get("owner_domain", "julian")),
+        "expected_status": int(payload["expected_status"]) if payload.get("expected_status") is not None else None,
+        "expected_content_type": str(payload["expected_content_type"]) if payload.get("expected_content_type") else None,
+        "latency_warn_ms": int(payload["latency_warn_ms"]) if payload.get("latency_warn_ms") is not None else None,
+    }
 
 
 def _approve_claim_cleanup_args(payload: dict[str, Any]) -> dict[str, Any]:

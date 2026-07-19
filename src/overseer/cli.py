@@ -298,6 +298,54 @@ def probe_stored_health_status(
         store.close()
 
 
+def record_health_target_status(
+    store_path: str | Path,
+    target_id: str,
+    resource_id: str,
+    name: str,
+    probe_type: str,
+    target: str,
+    owner_domain: str = OwnerDomain.JULIAN.value,
+    expected_status: int | None = None,
+    expected_content_type: str | None = None,
+    latency_warn_ms: int | None = None,
+) -> dict[str, object]:
+    health_target = HealthTarget(
+        id=target_id,
+        resource_id=resource_id,
+        name=name,
+        probe_type=ProbeType(probe_type),
+        target=target,
+        owner_domain=OwnerDomain(owner_domain),
+        expected_status=expected_status,
+        expected_content_type=expected_content_type,
+        latency_warn_ms=latency_warn_ms,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            store.load_resource(resource_id)
+        except KeyError as error:
+            raise ValueError(f"unknown resource: {resource_id}") from error
+        store.save_health_target(health_target)
+        return {
+            "store": str(store.path),
+            "target_id": health_target.id,
+            "resource_id": health_target.resource_id,
+            "name": health_target.name,
+            "probe_type": health_target.probe_type.value,
+            "target": health_target.target,
+            "owner_domain": health_target.owner_domain.value,
+            "expected_status": health_target.expected_status,
+            "expected_content_type": health_target.expected_content_type,
+            "latency_warn_ms": health_target.latency_warn_ms,
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
 def _health_evidence_item_status(evidence: HealthEvidence) -> dict[str, object]:
     return {
         "id": evidence.id,
@@ -5545,6 +5593,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_stored_health_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     probe_stored_health_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     probe_stored_health_parser.add_argument("--retention-per-target", type=int)
+    record_health_target_parser = subparsers.add_parser("record-health-target", help="record or update a persisted health target")
+    record_health_target_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_health_target_parser.add_argument("--target-id", required=True)
+    record_health_target_parser.add_argument("--resource-id", required=True)
+    record_health_target_parser.add_argument("--name", required=True)
+    record_health_target_parser.add_argument("--probe-type", required=True, choices=[item.value for item in ProbeType])
+    record_health_target_parser.add_argument("--target", required=True)
+    record_health_target_parser.add_argument("--owner-domain", default=OwnerDomain.JULIAN.value, choices=[item.value for item in OwnerDomain])
+    record_health_target_parser.add_argument("--expected-status", type=int)
+    record_health_target_parser.add_argument("--expected-content-type")
+    record_health_target_parser.add_argument("--latency-warn-ms", type=int)
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
@@ -6034,6 +6093,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "probe-stored-health":
         print(json.dumps(probe_stored_health_status(args.store, args.timeout_seconds, args.retention_per_target), sort_keys=True))
+        return 0
+
+    if args.command == "record-health-target":
+        print(
+            json.dumps(
+                record_health_target_status(
+                    args.store,
+                    args.target_id,
+                    args.resource_id,
+                    args.name,
+                    args.probe_type,
+                    args.target,
+                    args.owner_domain,
+                    args.expected_status,
+                    args.expected_content_type,
+                    args.latency_warn_ms,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "discover-physical":

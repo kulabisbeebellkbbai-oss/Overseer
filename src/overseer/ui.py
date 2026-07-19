@@ -484,6 +484,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "execute-claim-cleanup") return await executeClaimCleanup();
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
+      if (action === "record-usage-limit") return await recordUsageLimit();
+      if (action === "request-usage-continuation") return await requestUsageContinuation();
+      if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
       if (action === "plan-admin-change") return await planAdminChange();
       if (action === "approve-admin-change") return await approveAdminChange();
@@ -605,6 +608,45 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (expectedStatus) payload.expected_status = Number(expectedStatus);
       if (expectedContentType) payload.expected_content_type = expectedContentType;
       return await postJson("/health-targets", payload);
+    }
+    async function recordUsageLimit() {
+      const payload = {
+        limit_id: value("usage-limit-id"),
+        resource_id: value("usage-resource-id"),
+        kind: value("usage-kind"),
+        capacity: Number(value("usage-capacity")),
+        remaining: Number(value("usage-remaining")),
+        window: value("usage-window"),
+        confidence: Number(value("usage-confidence") || "1")
+      };
+      const resetsAt = value("usage-resets-at");
+      const observedAt = value("usage-observed-at");
+      if (resetsAt) payload.resets_at = resetsAt;
+      if (observedAt) payload.observed_at = observedAt;
+      return await postJson("/usage-limits", payload);
+    }
+    async function requestUsageContinuation() {
+      const payload = {
+        request_id: value("usage-request-id"),
+        limit_id: value("usage-request-limit-id"),
+        resource_id: value("usage-request-resource-id"),
+        owner_thread: value("usage-owner-thread"),
+        requested_units: Number(value("usage-requested-units")),
+        intent: value("usage-intent"),
+        risk_level: value("usage-risk"),
+        requested_by: value("usage-requested-by") || "quark"
+      };
+      const earliestStart = value("usage-earliest-start");
+      const deadline = value("usage-deadline");
+      if (earliestStart) payload.earliest_start = earliestStart;
+      if (deadline) payload.deadline = deadline;
+      return await postJson("/usage/continuation-requests", payload);
+    }
+    async function dispatchUsageContinuations() {
+      return await postJson("/usage/continuation-dispatches", {
+        dispatched_by: value("usage-dispatched-by") || "quark",
+        resume_codex_projects: document.getElementById("usage-resume-codex-projects").checked
+      });
     }
     function render() {
       const dashboard = state.data.dashboard || {};
@@ -868,11 +910,47 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const usage = state.data.usage || {};
       document.getElementById("usage").innerHTML = `
         <div class="grid">
-          <div class="section-head"><h3>Usage Actions</h3><div class="actions"><button class="action-btn" data-action="discover-codex-threads">Discover Codex Threads</button></div></div>
+          <div class="section-head"><h3>Usage Actions</h3><div class="actions"><button class="action-btn" data-action="discover-codex-threads">Discover Codex Threads</button><button class="action-btn" data-action="dispatch-usage-continuations">Dispatch Ready</button></div></div>
           ${metric("Limits", usage.limits, "tracked", "span-3")}
           ${metric("Available", usage.available, "limits", "span-3", "good")}
           ${metric("Exhausted", usage.exhausted, "limits", "span-3", usage.exhausted ? "warn" : "good")}
           ${metric("Low Confidence", usage.low_confidence, "limits", "span-3", usage.low_confidence ? "warn" : "good")}
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Record Limit</h3><button class="action-btn" data-action="record-usage-limit">Record Limit</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="usage-limit-id">Limit ID</label><input id="usage-limit-id" value="limit.service.requests"></div>
+              <div class="field span-6"><label for="usage-resource-id">Resource ID</label><input id="usage-resource-id" value="svc.service"></div>
+              <div class="field span-4"><label for="usage-kind">Kind</label><input id="usage-kind" value="requests"></div>
+              <div class="field span-4"><label for="usage-window">Window</label><input id="usage-window" value="hourly"></div>
+              <div class="field span-2"><label for="usage-capacity">Capacity</label><input id="usage-capacity" type="number" min="0" value="100"></div>
+              <div class="field span-2"><label for="usage-remaining">Remaining</label><input id="usage-remaining" type="number" min="0" value="0"></div>
+              <div class="field span-4"><label for="usage-confidence">Confidence</label><input id="usage-confidence" type="number" min="0" max="1" step="0.01" value="1"></div>
+              <div class="field span-4"><label for="usage-resets-at">Resets At</label><input id="usage-resets-at" placeholder="2026-07-19T18:00:00+00:00"></div>
+              <div class="field span-4"><label for="usage-observed-at">Observed At</label><input id="usage-observed-at" placeholder="optional"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Request Continuation</h3><button class="action-btn" data-action="request-usage-continuation">Request</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="usage-request-id">Request ID</label><input id="usage-request-id" value="work.service.continue"></div>
+              <div class="field span-6"><label for="usage-request-limit-id">Limit ID</label><input id="usage-request-limit-id" value="limit.service.requests"></div>
+              <div class="field span-6"><label for="usage-request-resource-id">Resource ID</label><input id="usage-request-resource-id" value="svc.service"></div>
+              <div class="field span-6"><label for="usage-owner-thread">Owner Thread</label><input id="usage-owner-thread" value="thread.service"></div>
+              <div class="field span-3"><label for="usage-requested-units">Units</label><input id="usage-requested-units" type="number" min="0" value="1"></div>
+              <div class="field span-3"><label for="usage-risk">Risk</label><select id="usage-risk">${riskOptions()}</select></div>
+              <div class="field span-6"><label for="usage-requested-by">Requested By</label><input id="usage-requested-by" value="quark"></div>
+              <div class="field span-12"><label for="usage-intent">Intent</label><input id="usage-intent" value="continue queued service work"></div>
+              <div class="field span-6"><label for="usage-earliest-start">Earliest Start</label><input id="usage-earliest-start" placeholder="optional"></div>
+              <div class="field span-6"><label for="usage-deadline">Deadline</label><input id="usage-deadline" placeholder="optional"></div>
+            </div>
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Dispatch Options</h3><button class="action-btn" data-action="dispatch-usage-continuations">Dispatch Ready</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="usage-dispatched-by">Dispatched By</label><input id="usage-dispatched-by" value="quark"></div>
+              <div class="field span-6 check-field"><label><input id="usage-resume-codex-projects" type="checkbox"> Resume Codex Projects</label></div>
+            </div>
+          </div>
           <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"])}</div>
         </div>`;
     }

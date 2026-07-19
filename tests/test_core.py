@@ -3625,6 +3625,12 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn("Plan Updates", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/codex-projects/discover-threads"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Discover Codex Threads", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/usage-limits"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/usage/continuation-requests"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/usage/continuation-dispatches"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="record-usage-limit"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="request-usage-continuation"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="dispatch-usage-continuations"', OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:

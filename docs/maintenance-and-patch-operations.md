@@ -44,8 +44,11 @@ O'Brien's compact operator read model is available with:
 ```bash
 PYTHONPATH=src python3 -m overseer.cli maintenance-summary --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli inspect-packages
+PYTHONPATH=src python3 -m overseer.cli plan-package-updates --store state/overseer.sqlite3
 ```
 
 It summarizes persisted maintenance targets plus install, package index refresh, package upgrade, and restart admin plans, approval state, rollback and verification step coverage, execution status, and risk distribution.
 
 `inspect-packages` is read-only. It runs `apt list --upgradable`, parses package names, candidate versions, installed versions, repository labels, and architectures, and does not run `apt-get update`, install packages, upgrade packages, remove packages, or use sudo.
+
+`plan-package-updates` uses the same read-only inspection result to stage O'Brien-owned admin plans for package metadata refresh and package upgrades. It writes only Overseer plan records; the normal approval, policy, rollback, and execution gates still decide whether package commands may run.

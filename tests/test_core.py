@@ -188,6 +188,7 @@ from overseer.cli import maintenance_summary_status
 from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
 from overseer.cli import persistence_security_status
+from overseer.cli import plan_package_updates_status
 from overseer.cli import prepare_host_security_ids_review_package_status
 from overseer.cli import host_security_ids_review_packages_status
 from overseer.cli import host_security_ids_review_summary_status
@@ -919,6 +920,50 @@ class PackageInspectionTests(unittest.TestCase):
         self.assertEqual(status["status"], "failed")
         self.assertEqual(status["upgradable"], 0)
         self.assertEqual(status["stderr"], "apt lock unavailable")
+
+    def test_plan_package_updates_stages_approval_gated_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "Listing...\nopenssl/oldstable-security 3.0.15-1 amd64 [upgradable from: 3.0.14-1]\n",
+                    "",
+                )
+
+            status = plan_package_updates_status(
+                store_path,
+                "2026-07-19T14:45:00+00:00",
+                adapter=AptPackageInspectionAdapter(command_runner=runner),
+            )
+            summary = admin_summary_status(store_path)
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["plans"], 2)
+            self.assertEqual(status["selected_packages"], ("openssl",))
+            self.assertEqual(status["items"][1]["kind"], AdminChangeKind.APT_UPGRADE.value)
+            self.assertIn("openssl", status["items"][1]["target"])
+            self.assertEqual(summary["plans"], 2)
+
+    def test_plan_package_updates_reports_failed_inspection_without_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command):
+                return subprocess.CompletedProcess(command, 100, "", "apt lock unavailable")
+
+            status = plan_package_updates_status(
+                store_path,
+                "2026-07-19T14:46:00+00:00",
+                adapter=AptPackageInspectionAdapter(command_runner=runner),
+            )
+
+            self.assertFalse(status["mutation_performed"])
+            self.assertEqual(status["plans"], 0)
+            self.assertEqual(status["inspection"]["status"], "failed")
 
 
 class HealthSummaryTests(unittest.TestCase):
@@ -2851,6 +2896,27 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertEqual(status["upgradable"], 1)
         self.assertEqual(status["items"][0]["name"], "openssl")
 
+    def test_client_plans_package_updates(self):
+        original = overseer_api.plan_package_updates_status
+        overseer_api.plan_package_updates_status = lambda store_path, **kwargs: {
+            "store": str(store_path),
+            "plans": 2,
+            "selected_packages": tuple(kwargs["packages"]),
+            "mutation_performed": True,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    client = OverseerApiClient(server.url, auth_token="client-secret")
+                    status = client.plan_package_updates(("openssl",), captured_at="2026-07-19T14:45:00+00:00")
+        finally:
+            overseer_api.plan_package_updates_status = original
+
+        self.assertEqual(status["plans"], 2)
+        self.assertEqual(status["selected_packages"], ["openssl"])
+
     def test_client_reads_security_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3209,6 +3275,10 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn("Package Status", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/services/discover-user"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Discover Services", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/maintenance/package-update-plans"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Plan Updates", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/codex-projects/discover-threads"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Discover Codex Threads", OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:

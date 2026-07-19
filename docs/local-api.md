@@ -31,6 +31,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /operator-dashboard`
 - `GET /maintenance-summary`
 - `GET /maintenance/package-status`
+- `POST /maintenance/package-update-plans`
 - `GET /alerts-summary`
 - `GET /audit-summary`
 - `GET /approvals-summary`
@@ -148,6 +149,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
 `GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, admin archive candidates, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
 `GET /maintenance/package-status` inspects apt package update availability without installing, upgrading, refreshing indexes, removing packages, or using sudo.
+`POST /maintenance/package-update-plans` inspects apt update availability and stages approval-gated package metadata refresh plus package upgrade plans for detected or selected packages. Optional fields are `packages` and `captured_at`; it does not execute package commands.
 `POST /claims/release` accepts optional `released_by`, `reason`, `evidence_ids`, and `released_at` fields and emits release audit evidence.
 `GET /claims/review` reports active-like, queued, expired, and release-blocked claims for operator review without releasing, revoking, or renewing them. It supports `?now=...` for deterministic review timestamps.
 `GET /claims/cleanup-plan` prepares a read-only cleanup manifest for expired active-like claims, stale queued claims, blocked claims, and claims missing release evidence. It supports `?now=...` and does not release, revoke, renew, approve, or re-evaluate claims.

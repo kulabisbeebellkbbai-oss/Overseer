@@ -70,6 +70,7 @@ from .cli import (
     plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
+    plan_package_updates_status,
     policy_customization_helper_cli_status,
     probe_stored_health_status,
     record_host_security_ids_review_result_status,
@@ -321,6 +322,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
+                return
+            if self.path == "/maintenance/package-update-plans":
+                self._handle_json(lambda payload: plan_package_updates_status(store_path, **_package_update_plan_args(payload)))
                 return
             if self.path == "/admin/approve":
                 self._handle_json(lambda payload: approve_admin_change_status(store_path, **_approve_admin_plan_args(payload)))
@@ -815,6 +819,13 @@ def _host_security_ids_review_result_args(payload: dict[str, Any]) -> dict[str, 
         "advisory_result": str(payload["advisory_result"]),
         "reviewed_by": str(payload["reviewed_by"]),
         "reviewed_at": str(payload["reviewed_at"]) if payload.get("reviewed_at") else None,
+    }
+
+
+def _package_update_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "captured_at": str(payload["captured_at"]) if payload.get("captured_at") else None,
+        "packages": tuple(str(package) for package in payload.get("packages", ())),
     }
 
 

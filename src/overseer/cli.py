@@ -719,6 +719,74 @@ def inspect_packages_status(
     return package_inspection_snapshot_status(snapshot)
 
 
+def plan_package_updates_status(
+    store_path: str | Path,
+    captured_at: str | None = None,
+    packages: Sequence[str] = (),
+    adapter: AptPackageInspectionAdapter | None = None,
+) -> dict[str, object]:
+    snapshot = (adapter or AptPackageInspectionAdapter()).inspect(captured_at)
+    inspection = package_inspection_snapshot_status(snapshot)
+    if not snapshot.succeeded():
+        return {
+            "store": str(store_path),
+            "inspection": inspection,
+            "plans": 0,
+            "items": [],
+            "mutation_performed": False,
+            "host_mutation_performed": False,
+            "next_step": "repair package inspection before staging update plans",
+        }
+    detected_names = tuple(update.name for update in snapshot.updates)
+    requested_names = tuple(name for name in packages if name)
+    selected_names = requested_names or detected_names
+    missing_names = tuple(name for name in requested_names if name not in detected_names)
+    if not selected_names:
+        return {
+            "store": str(store_path),
+            "inspection": inspection,
+            "plans": 0,
+            "items": [],
+            "missing_packages": missing_names,
+            "mutation_performed": False,
+            "host_mutation_performed": False,
+            "next_step": "no upgradable packages detected",
+        }
+
+    suffix = _status_id(snapshot.id)
+    current_state = _package_update_current_state(snapshot, selected_names)
+    plans = (
+        plan_apt_update(
+            f"admin.apt.update.{suffix}",
+            "refresh package metadata before detected package upgrades",
+            current_state,
+        ),
+        plan_apt_upgrade(
+            f"admin.apt.upgrade.{suffix}",
+            selected_names,
+            "apply detected package upgrades after approval",
+            current_state,
+        ),
+    )
+    store = SQLiteStore(store_path)
+    try:
+        for plan in plans:
+            store.save_admin_change_plan(plan)
+        return {
+            "store": str(store.path),
+            "inspection": inspection,
+            "plans": len(plans),
+            "items": [admin_change_plan_status(plan) for plan in plans],
+            "selected_packages": selected_names,
+            "missing_packages": missing_names,
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+            "next_step": "request approval for staged package update plans before execution",
+        }
+    finally:
+        store.close()
+
+
 def package_inspection_snapshot_status(snapshot: PackageInspectionSnapshot) -> dict[str, object]:
     return {
         "id": snapshot.id,
@@ -730,6 +798,19 @@ def package_inspection_snapshot_status(snapshot: PackageInspectionSnapshot) -> d
         "stderr": snapshot.stderr,
         "items": [package_update_status(update) for update in snapshot.updates],
     }
+
+
+def _package_update_current_state(snapshot: PackageInspectionSnapshot, package_names: Sequence[str]) -> str:
+    updates = {update.name: update for update in snapshot.updates}
+    parts = []
+    for name in package_names:
+        update = updates.get(name)
+        if update is None:
+            parts.append(f"{name}: not reported as upgradable")
+            continue
+        installed = update.installed_version or "unknown"
+        parts.append(f"{name}: {installed} -> {update.candidate_version} ({update.repository})")
+    return "; ".join(parts) or "no upgradable packages detected"
 
 
 def package_update_status(update: PackageUpdate) -> dict[str, object]:
@@ -5486,6 +5567,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     inspect_packages_parser = subparsers.add_parser("inspect-packages", help="read apt package update availability without changing packages")
     inspect_packages_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
+    plan_package_updates_parser = subparsers.add_parser(
+        "plan-package-updates",
+        help="stage approval-gated apt update and upgrade plans from current package inspection",
+    )
+    plan_package_updates_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    plan_package_updates_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
+    plan_package_updates_parser.add_argument("--package", action="append", default=(), help="limit upgrade plan to a detected package")
     security_summary_parser = subparsers.add_parser("security-summary", help="summarize security surfaces and alerts")
     security_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_efficiency_parser = subparsers.add_parser("health-efficiency", help="summarize service health efficiency")
@@ -5982,6 +6070,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "inspect-packages":
         print(json.dumps(inspect_packages_status(args.captured_at), sort_keys=True))
+        return 0
+
+    if args.command == "plan-package-updates":
+        print(json.dumps(plan_package_updates_status(args.store, args.captured_at, tuple(args.package)), sort_keys=True))
         return 0
 
     if args.command == "security-summary":

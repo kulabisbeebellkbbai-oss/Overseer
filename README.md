@@ -57,6 +57,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli claim-review --store state/overseer.sqlite3` - review active, queued, expired, and release-blocked claims without releasing or revoking them.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.
 - `PYTHONPATH=src python3 -m overseer.cli discover-user-services --store state/overseer.sqlite3` - capture running systemd user services as managed service resources with process health targets.
+- `PYTHONPATH=src python3 -m overseer.cli plan-package-updates --store state/overseer.sqlite3` - inspect apt updates and stage approval-gated metadata refresh plus package upgrade plans without executing them.
 - `PYTHONPATH=src python3 -m overseer.cli assess-host-security --store state/overseer.sqlite3` - assess the latest persisted host snapshot for non-loopback TCP listeners.
 - `PYTHONPATH=src python3 -m overseer.cli host-security-findings --store state/overseer.sqlite3` - list detailed host security findings and recommendations from the latest persisted host snapshot.
 - `PYTHONPATH=src python3 -m overseer.cli host-security-triage --store state/overseer.sqlite3` - group host security findings by listener with read-only mitigation paths and approval boundaries.

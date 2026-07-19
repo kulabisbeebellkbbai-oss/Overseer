@@ -81,6 +81,16 @@ class OverseerApiClient:
     def package_status(self) -> dict[str, Any]:
         return self._get("/maintenance/package-status")
 
+    def plan_package_updates(
+        self,
+        packages: list[str] | tuple[str, ...] = (),
+        captured_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"packages": list(packages)}
+        if captured_at:
+            payload["captured_at"] = captured_at
+        return self._post("/maintenance/package-update-plans", payload)
+
     def health_summary(self) -> dict[str, Any]:
         return self._get("/health-summary")
 

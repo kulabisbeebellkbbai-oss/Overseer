@@ -35,5 +35,4 @@ PYTHONPATH=src python3 -m overseer.cli execute-claim-cleanup --store state/overs
 
 1. Add a local service API around the stored registry.
 2. Add adapters for health probes, device discovery, usage-limit probes, and maintenance runners.
-3. Broaden approved stale-claim cleanup execution for blocked claims and missing release evidence.
-4. Add foreground-to-daemon migration only after an explicit operator approval plan.
+3. Add foreground-to-daemon migration only after an explicit operator approval plan.

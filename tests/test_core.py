@@ -5243,6 +5243,98 @@ class RuntimeTests(unittest.TestCase):
             {(event["id"], event["event_type"]) for event in state["audit_events"]},
         )
 
+    def test_execute_claim_cleanup_handles_missing_release_evidence_and_blocked_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.cleanup.execute.more.cli",
+                    name="Cleanup Execute More CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                    state=ResourceState.CHECKED_OUT,
+                    current_claim_id="claim.cleanup.execute.missing-release",
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.execute.missing-release",
+                    resource_id="proxy.cleanup.execute.more.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use proxy",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.execute.blocked",
+                    resource_id="proxy.cleanup.execute.more.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-b",
+                    owner_role=OwnerDomain.DAX,
+                    intent="blocked proxy use",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.BLOCKED,
+                )
+            )
+            store.close()
+
+            missing_requested = request_claim_cleanup_status(
+                store_path,
+                "claim.cleanup.execute.missing-release",
+                "sisko",
+                now="2026-07-18T20:30:00+00:00",
+            )
+            approve_claim_cleanup_status(
+                store_path,
+                missing_requested["approval_id"],
+                "sisko",
+                now="2026-07-18T20:35:00+00:00",
+            )
+            missing_executed = execute_claim_cleanup_status(
+                store_path,
+                missing_requested["approval_id"],
+                "sisko",
+                now="2026-07-18T20:40:00+00:00",
+            )
+            blocked_requested = request_claim_cleanup_status(
+                store_path,
+                "claim.cleanup.execute.blocked",
+                "dax",
+                now="2026-07-18T20:45:00+00:00",
+            )
+            approve_claim_cleanup_status(
+                store_path,
+                blocked_requested["approval_id"],
+                "dax",
+                now="2026-07-18T20:50:00+00:00",
+            )
+            blocked_executed = execute_claim_cleanup_status(
+                store_path,
+                blocked_requested["approval_id"],
+                "dax",
+                now="2026-07-18T20:55:00+00:00",
+            )
+            state = list_state_status(store_path)
+
+        claims = {claim["id"]: claim for claim in state["claims"]}
+        resources = {resource["id"]: resource for resource in state["resources"]}
+        self.assertEqual(missing_executed["cleanup_action"], "add_release_condition_or_evidence")
+        self.assertEqual(missing_executed["claim_status_after"], ClaimStatus.RELEASING.value)
+        self.assertEqual(claims["claim.cleanup.execute.missing-release"]["status"], ClaimStatus.RELEASING.value)
+        self.assertEqual(resources["proxy.cleanup.execute.more.cli"]["current_claim_id"], "claim.cleanup.execute.missing-release")
+        self.assertEqual(resources["proxy.cleanup.execute.more.cli"]["state"], ResourceState.CHECKED_OUT.value)
+        self.assertEqual(blocked_executed["cleanup_action"], "review_blocked_claim")
+        self.assertEqual(blocked_executed["claim_status_after"], ClaimStatus.REVOKED.value)
+        self.assertEqual(claims["claim.cleanup.execute.blocked"]["status"], ClaimStatus.REVOKED.value)
+
     def test_activate_claim_status_requires_approved_request(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

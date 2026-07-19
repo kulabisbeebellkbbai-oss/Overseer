@@ -3493,6 +3493,14 @@ def execute_claim_cleanup_status(
             updated_claim, decision = _re_evaluate_stale_queued_claim(store, claim, approval_id)
             store.save_claim(updated_claim, decision)
             execution_action = f"stale_queue_re_evaluated_{decision.outcome.value}"
+        elif before["cleanup_action"] == "add_release_condition_or_evidence":
+            updated_claim = replace(claim, status=ClaimStatus.RELEASING, evidence_ids=tuple((*claim.evidence_ids, approval_id)))
+            store.save_claim(updated_claim)
+            execution_action = "release_evidence_required_claim_marked_releasing"
+        elif before["cleanup_action"] == "review_blocked_claim":
+            updated_claim = replace(claim, status=ClaimStatus.REVOKED, evidence_ids=tuple((*claim.evidence_ids, approval_id)))
+            store.save_claim(updated_claim)
+            execution_action = "blocked_claim_revoked"
         else:
             raise ValueError(f"cleanup action is not executable yet: {before['cleanup_action']}")
         event = AuditEvent(

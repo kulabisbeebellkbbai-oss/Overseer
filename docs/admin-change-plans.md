@@ -46,7 +46,7 @@ Adapter enablement requests persist the human approval record for that work. App
 
 Canceling a plan keeps the record visible but removes it from the pending authorization queue and prevents execution. Use cancellation for placeholders, superseded plans, or plans created from disproven evidence.
 
-Live execution is currently limited to approved `user_service_restart` plans. Package installs, firewall rules, IP blocks, network exposure, and privilege changes remain blocked even if a plan is approved.
+Live execution support is controlled by the effective adapter table. User-service restart is enabled by default; package install, firewall allow/deny, and source-block execution require approved adapter enablement for the store plus the specific admin plan approval and any IDS review gate.
 
 Execution results are persisted and can be reviewed with `admin-executions` or the loopback API. Blocked execution attempts are also persisted so O'Brien and Sisko can see why a plan did not run.
 

@@ -2294,6 +2294,11 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             for approval in approvals
             if approval.id.startswith("approval.admin.restore.")
         ]
+        archive_approvals = [
+            approval
+            for approval in approvals
+            if approval.id.startswith("approval.admin.archive.")
+        ]
         adapter_enablement_approvals = [
             approval
             for approval in approvals
@@ -2314,6 +2319,7 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             "plans": len(active_plans),
             "archived_plans": len(plans) - len(active_plans),
             "pending_authorizations": len(pending)
+            + sum(1 for approval in archive_approvals if approval.status == ApprovalStatus.PENDING)
             + sum(1 for approval in restore_approvals if approval.status == ApprovalStatus.PENDING)
             + sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.PENDING)
             + sum(1 for approval in claim_cleanup_approvals if approval.status == ApprovalStatus.PENDING)
@@ -2331,6 +2337,16 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                 "archive_candidates": history_review["archive_candidates"],
                 "active_or_pending": history_review["active_or_pending"],
                 "by_disposition": history_review["by_disposition"],
+            },
+            "archive_approvals": {
+                "total": len(archive_approvals),
+                "pending": sum(1 for approval in archive_approvals if approval.status == ApprovalStatus.PENDING),
+                "approved": sum(1 for approval in archive_approvals if approval.status == ApprovalStatus.APPROVED),
+                "by_status": {
+                    status.value: sum(1 for approval in archive_approvals if approval.status == status)
+                    for status in ApprovalStatus
+                },
+                "items": [admin_history_archive_approval_status(approval) for approval in archive_approvals],
             },
             "restore_approvals": {
                 "total": len(restore_approvals),
@@ -2402,6 +2418,31 @@ def admin_history_restore_approval_status(approval: ApprovalRequest) -> dict[str
         "decided_at": approval.decided_at,
         "next_step": _admin_history_restore_approval_next_step(approval_status),
     }
+
+
+def admin_history_archive_approval_status(approval: ApprovalRequest) -> dict[str, object]:
+    approval_status = ApprovalStatus(approval.status)
+    return {
+        "id": approval.id,
+        "archive_subject": approval.subject_id,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+        "requester_thread": approval.requester_thread,
+        "owner_domain": OwnerDomain(approval.owner_domain).value,
+        "reason": approval.reason,
+        "status": approval_status.value,
+        "evidence_required": list(approval.evidence_required),
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+        "next_step": _admin_history_archive_approval_next_step(approval_status),
+    }
+
+
+def _admin_history_archive_approval_next_step(status: ApprovalStatus) -> str:
+    if status == ApprovalStatus.PENDING:
+        return "approve-admin-history-archive before archive-admin-history"
+    if status == ApprovalStatus.APPROVED:
+        return "archive-admin-history with the approved archive approval"
+    return "archive approval is not actionable"
 
 
 def _admin_history_restore_approval_next_step(status: ApprovalStatus) -> str:
@@ -2729,6 +2770,92 @@ def admin_history_restore_readiness_status(store_path: str | Path, plan_id: str 
         store.close()
 
 
+def request_admin_history_archive_status(
+    store_path: str | Path,
+    requested_by: str,
+    requested_at: str | None = None,
+    plan_id: str | None = None,
+) -> dict[str, object]:
+    if not requested_by.strip():
+        raise ValueError("requested_by is required")
+    archive_plan = admin_history_archive_plan_status(store_path)
+    candidate_ids = [str(item["id"]) for item in archive_plan["items"]]
+    if plan_id is not None and plan_id not in candidate_ids:
+        raise ValueError(f"admin plan is not archive-ready: {plan_id}")
+    if plan_id is None and not candidate_ids:
+        raise ValueError("no admin plans are archive-ready")
+    subject_id = f"admin.archive.{plan_id}" if plan_id else "admin.archive.all"
+    approval = ApprovalRequest(
+        id=f"approval.{subject_id}",
+        subject_id=subject_id,
+        approval_level=ApprovalLevel.SISKO,
+        requester_thread=requested_by,
+        owner_domain=OwnerDomain.SISKO,
+        reason=f"Archive inactive admin history for {plan_id or 'all archive-ready plans'}",
+        evidence_required=("admin.history.archive-plan",),
+    )
+    event = AuditEvent(
+        id=f"audit.{approval.id}.requested",
+        event_type=AuditEventType.REQUESTED,
+        owner_domain=OwnerDomain.SISKO,
+        subject_id=approval.subject_id,
+        summary=approval.reason,
+        risk_level=RiskLevel.LOW,
+        evidence_ids=approval.evidence_required,
+        occurred_at=requested_at,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_approval(approval)
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "approval_id": approval.id,
+            "subject_id": approval.subject_id,
+            "approval_status": ApprovalStatus(approval.status).value,
+            "approval_level": ApprovalLevel(approval.approval_level).value,
+            "requested_by": requested_by,
+            "requested_at": requested_at,
+            "plan_id": plan_id,
+            "archive_candidates": len(candidate_ids),
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
+def approve_admin_history_archive_status(
+    store_path: str | Path,
+    approval_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"archive approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.admin.archive."):
+            raise ValueError("admin history archive approval is required")
+        archive_subject = approval.subject_id
+    finally:
+        store.close()
+
+    approved = approve_claim_status(store_path, approval_id, approved_by, approved_at)
+    return {
+        **approved,
+        "archive_subject": archive_subject,
+        "archive_approval": True,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+    }
+
+
 def request_admin_history_restore_status(
     store_path: str | Path,
     plan_id: str,
@@ -2830,13 +2957,27 @@ def approve_admin_history_restore_status(
 def archive_admin_history_status(
     store_path: str | Path,
     archived_by: str,
+    approval_id: str,
     archived_at: str | None = None,
     plan_id: str | None = None,
 ) -> dict[str, object]:
     if not archived_by.strip():
         raise ValueError("archived_by is required")
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
     store = SQLiteStore(store_path)
     try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"archive approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.admin.archive."):
+            raise ValueError("admin history archive approval is required")
+        if ApprovalStatus(approval.status) != ApprovalStatus.APPROVED:
+            raise ValueError("admin history archive approval is not approved")
+        archive_scope = _admin_history_archive_scope_from_subject(approval.subject_id)
+        if archive_scope != "all" and plan_id != archive_scope:
+            raise ValueError("archive approval subject does not match requested plan")
         now = archived_at or datetime.now(UTC).isoformat()
         plans = store.list_admin_change_plans()
         executions = store.list_admin_executions()
@@ -2853,6 +2994,10 @@ def archive_admin_history_status(
             candidate_items = [item for item in candidate_items if item["id"] == plan_id]
             if not candidate_items:
                 raise ValueError(f"admin plan is not archive-ready: {plan_id}")
+        elif archive_scope != "all":
+            candidate_items = [item for item in candidate_items if item["id"] == archive_scope]
+            if not candidate_items:
+                raise ValueError(f"admin plan is not archive-ready: {archive_scope}")
         plans_by_id = {plan.id: plan for plan in plans}
         records = []
         for item in candidate_items:
@@ -2885,7 +3030,7 @@ def archive_admin_history_status(
                     subject_id=plan.id,
                     summary=record.summary,
                     risk_level=RiskLevel.LOW,
-                    evidence_ids=(record.id,) + evidence_ids,
+                    evidence_ids=(approval.id, record.id) + evidence_ids,
                     occurred_at=now,
                 )
             )
@@ -2896,10 +3041,18 @@ def archive_admin_history_status(
             "archived": len(records),
             "archived_by": archived_by,
             "archived_at": now,
+            "approval_id": approval.id,
             "records": [admin_history_archive_record_status(record) for record in records],
         }
     finally:
         store.close()
+
+
+def _admin_history_archive_scope_from_subject(subject_id: str) -> str:
+    prefix = "admin.archive."
+    if not subject_id.startswith(prefix):
+        raise ValueError("admin history archive approval subject is required")
+    return subject_id[len(prefix):]
 
 
 def unarchive_admin_history_status(
@@ -3246,6 +3399,12 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             if approval.id.startswith("approval.admin.restore.")
             and approval.status == ApprovalStatus.PENDING
         ]
+        pending_archive_approvals = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id.startswith("approval.admin.archive.")
+            and approval.status == ApprovalStatus.PENDING
+        ]
         pending_adapter_enablement_approvals = [
             approval
             for approval in store.list_approvals()
@@ -3276,15 +3435,18 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             "store": str(store.path),
             "pending": pending,
             "pending_count": len(pending)
+            + len(pending_archive_approvals)
             + len(pending_restore_approvals)
             + len(pending_adapter_enablement_approvals)
             + len(pending_claim_cleanup_approvals)
             + len(pending_daemon_migration_approvals),
             "pending_plan_count": len(pending),
+            "pending_archive_approval_count": len(pending_archive_approvals),
             "pending_restore_approval_count": len(pending_restore_approvals),
             "pending_adapter_enablement_approval_count": len(pending_adapter_enablement_approvals),
             "pending_claim_cleanup_approval_count": len(pending_claim_cleanup_approvals),
             "pending_daemon_migration_approval_count": len(pending_daemon_migration_approvals),
+            "archive_approvals": [admin_history_archive_approval_status(approval) for approval in pending_archive_approvals],
             "restore_approvals": [admin_history_restore_approval_status(approval) for approval in pending_restore_approvals],
             "adapter_enablement_approvals": [
                 admin_adapter_enablement_approval_status(approval)
@@ -4927,6 +5089,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_archives_parser = subparsers.add_parser("admin-history-archives", help="list persisted admin history archive records")
     admin_archives_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archives_parser.add_argument("--plan-id", help="filter archive records by admin plan id")
+    admin_archive_request_parser = subparsers.add_parser("request-admin-history-archive", help="request approval before archiving inactive admin plans")
+    admin_archive_request_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_archive_request_parser.add_argument("--requested-by", required=True)
+    admin_archive_request_parser.add_argument("--requested-at")
+    admin_archive_request_parser.add_argument("--plan-id", help="request approval for only one archive-ready admin plan")
+    admin_archive_approve_parser = subparsers.add_parser("approve-admin-history-archive", help="approve a requested admin history archive")
+    admin_archive_approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_archive_approve_parser.add_argument("--approval-id", required=True)
+    admin_archive_approve_parser.add_argument("--approved-by", required=True)
+    admin_archive_approve_parser.add_argument("--approved-at")
     admin_restore_readiness_parser = subparsers.add_parser("admin-history-restore-readiness", help="plan approval and evidence gates before restoring archived admin plans")
     admin_restore_readiness_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_restore_readiness_parser.add_argument("--plan-id", help="filter restore readiness by admin plan id")
@@ -4943,6 +5115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     archive_admin_history_parser = subparsers.add_parser("archive-admin-history", help="archive inactive admin plans after explicit approval")
     archive_admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     archive_admin_history_parser.add_argument("--archived-by", required=True)
+    archive_admin_history_parser.add_argument("--approval-id", required=True)
     archive_admin_history_parser.add_argument("--archived-at")
     archive_admin_history_parser.add_argument("--plan-id", help="archive only one eligible admin plan")
     unarchive_admin_history_parser = subparsers.add_parser("unarchive-admin-history", help="restore one archived admin plan to active admin history")
@@ -5416,6 +5589,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(admin_history_archives_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
+    if args.command == "request-admin-history-archive":
+        print(json.dumps(request_admin_history_archive_status(args.store, args.requested_by, args.requested_at, args.plan_id), sort_keys=True))
+        return 0
+
+    if args.command == "approve-admin-history-archive":
+        print(json.dumps(approve_admin_history_archive_status(args.store, args.approval_id, args.approved_by, args.approved_at), sort_keys=True))
+        return 0
+
     if args.command == "admin-history-restore-readiness":
         print(json.dumps(admin_history_restore_readiness_status(args.store, args.plan_id), sort_keys=True))
         return 0
@@ -5429,7 +5610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "archive-admin-history":
-        print(json.dumps(archive_admin_history_status(args.store, args.archived_by, args.archived_at, args.plan_id), sort_keys=True))
+        print(json.dumps(archive_admin_history_status(args.store, args.archived_by, args.approval_id, args.archived_at, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "unarchive-admin-history":

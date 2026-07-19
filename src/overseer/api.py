@@ -25,6 +25,7 @@ from .cli import (
     assess_host_security_status,
     approve_admin_change_status,
     approve_admin_adapter_enablement_status,
+    approve_admin_history_archive_status,
     approve_admin_history_restore_status,
     approve_claim_status,
     approve_claim_cleanup_status,
@@ -63,6 +64,7 @@ from .cli import (
     record_host_security_ids_review_result_status,
     release_claim_status,
     request_admin_adapter_enablement_status,
+    request_admin_history_archive_status,
     request_admin_history_restore_status,
     request_daemon_migration_status,
     request_usage_continuation_status,
@@ -285,6 +287,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/history-archive":
                 self._handle_json(lambda payload: archive_admin_history_status(store_path, **_archive_admin_history_args(payload)))
+                return
+            if self.path == "/admin/history-archive-requests":
+                self._handle_json(lambda payload: request_admin_history_archive_status(store_path, **_admin_history_archive_request_args(payload)))
+                return
+            if self.path == "/admin/history-archive-requests/approve":
+                self._handle_json(lambda payload: approve_admin_history_archive_status(store_path, **_approve_admin_history_archive_args(payload)))
                 return
             if self.path == "/admin/history-restore-requests":
                 self._handle_json(lambda payload: request_admin_history_restore_status(store_path, **_admin_history_restore_request_args(payload)))
@@ -522,8 +530,25 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
 def _archive_admin_history_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "archived_by": str(payload["archived_by"]),
+        "approval_id": str(payload["approval_id"]),
         "archived_at": str(payload["archived_at"]) if payload.get("archived_at") is not None else None,
         "plan_id": str(payload["plan_id"]) if payload.get("plan_id") is not None else None,
+    }
+
+
+def _admin_history_archive_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "requested_by": str(payload["requested_by"]),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
+        "plan_id": str(payload["plan_id"]) if payload.get("plan_id") is not None else None,
+    }
+
+
+def _approve_admin_history_archive_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
     }
 
 

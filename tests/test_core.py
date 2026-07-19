@@ -123,6 +123,7 @@ from overseer.cli import admin_summary_status
 from overseer.cli import archive_admin_history_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_admin_adapter_enablement_status
+from overseer.cli import approve_admin_history_archive_status
 from overseer.cli import approve_admin_history_restore_status
 from overseer.cli import approve_claim_cleanup_status
 from overseer.cli import approve_claim_status
@@ -166,6 +167,7 @@ from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_admin_adapter_enablement_status
+from overseer.cli import request_admin_history_archive_status
 from overseer.cli import request_admin_history_restore_status
 from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
@@ -1129,9 +1131,23 @@ class HealthSummaryTests(unittest.TestCase):
 
             status = admin_history_review_status(store_path)
             archive_plan = admin_history_archive_plan_status(store_path)
+            archive_request = request_admin_history_archive_status(
+                store_path,
+                "sisko",
+                "2026-07-18T22:08:00+00:00",
+                plan_id="admin.restart.completed",
+            )
+            pending_archive_authorizations = authorizations_required_status(store_path)
+            archive_approval = approve_admin_history_archive_status(
+                store_path,
+                archive_request["approval_id"],
+                "sisko",
+                "2026-07-18T22:09:00+00:00",
+            )
             archived = archive_admin_history_status(
                 store_path,
                 "sisko",
+                archive_request["approval_id"],
                 "2026-07-18T22:10:00+00:00",
                 plan_id="admin.restart.completed",
             )
@@ -3197,9 +3213,22 @@ class OverseerApiClientTests(unittest.TestCase):
                 )
             )
             store.close()
+            archive_request = request_admin_history_archive_status(
+                store_path,
+                "sisko",
+                "2026-07-18T22:38:00+00:00",
+                plan_id=completed["id"],
+            )
+            approve_admin_history_archive_status(
+                store_path,
+                archive_request["approval_id"],
+                "sisko",
+                "2026-07-18T22:39:00+00:00",
+            )
             archive_admin_history_status(
                 store_path,
                 "sisko",
+                archive_request["approval_id"],
                 "2026-07-18T22:40:00+00:00",
                 plan_id=completed["id"],
             )
@@ -3228,6 +3257,65 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(approved["plan_id"], completed["id"])
             self.assertEqual(after["pending_restore_approval_count"], 0)
+
+    def test_client_requests_approves_and_executes_admin_history_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            completed = plan_admin_change_status(
+                store_path,
+                "admin.restart.client.archive",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "reload approved code",
+                "active",
+            )
+            approve_admin_change_status(store_path, completed["id"], "sisko")
+            store = SQLiteStore(store_path)
+            store.save_admin_execution(
+                AdminExecutionResult(
+                    id="admin.exec.admin.restart.client.archive.completed",
+                    plan_id=completed["id"],
+                    status=AdminExecutionStatus.COMPLETED,
+                    summary="admin change completed and verified",
+                    command_results=(),
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_admin_history_archive(
+                    {
+                        "plan_id": completed["id"],
+                        "requested_by": "sisko",
+                        "requested_at": "2026-07-18T22:31:00+00:00",
+                    }
+                )
+                pending = client.authorizations_required()
+                approved = client.approve_admin_history_archive(
+                    {
+                        "approval_id": requested["approval_id"],
+                        "approved_by": "sisko",
+                        "approved_at": "2026-07-18T22:32:00+00:00",
+                    }
+                )
+                archived = client.archive_admin_history(
+                    {
+                        "plan_id": completed["id"],
+                        "approval_id": requested["approval_id"],
+                        "archived_by": "sisko",
+                        "archived_at": "2026-07-18T22:33:00+00:00",
+                    }
+                )
+                after = client.authorizations_required()
+
+            self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+            self.assertEqual(pending["pending_archive_approval_count"], 1)
+            self.assertTrue(approved["archive_approval"])
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertEqual(archived["archived"], 1)
+            self.assertEqual(archived["approval_id"], requested["approval_id"])
+            self.assertEqual(after["pending_archive_approval_count"], 0)
 
     def test_client_cancels_placeholder_admin_change_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3294,12 +3382,16 @@ class OverseerApiClientTests(unittest.TestCase):
                     )
                 except HTTPError as error:
                     restore_request_error = error
-                archive_result = client.archive_admin_history(
-                    {
-                        "archived_by": "sisko",
-                        "archived_at": "2026-07-18T22:15:00+00:00",
-                    }
-                )
+                archive_request_error = None
+                try:
+                    client.request_admin_history_archive(
+                        {
+                            "requested_by": "sisko",
+                            "requested_at": "2026-07-18T22:14:00+00:00",
+                        }
+                    )
+                except HTTPError as error:
+                    archive_request_error = error
                 unarchive_error = None
                 try:
                     client.unarchive_admin_history(
@@ -3326,7 +3418,8 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(filtered_restore_readiness["filters"]["plan_id"], "admin.restart.blocked")
             self.assertIsNotNone(restore_request_error)
             self.assertEqual(restore_request_error.code, 400)
-            self.assertFalse(archive_result["mutation_performed"])
+            self.assertIsNotNone(archive_request_error)
+            self.assertEqual(archive_request_error.code, 400)
             self.assertIsNotNone(unarchive_error)
             self.assertEqual(unarchive_error.code, 400)
             self.assertIn("is not archived", unarchive_error.read().decode("utf-8"))

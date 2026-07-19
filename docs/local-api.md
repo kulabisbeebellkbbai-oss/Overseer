@@ -86,6 +86,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /admin/adapter-enablement-requests`
 - `POST /admin/adapter-enablement-requests/approve`
 - `POST /admin/history-restore-requests`
+- `POST /admin/history-archive-requests`
+- `POST /admin/history-archive-requests/approve`
 - `POST /admin/history-archive`
 - `POST /admin/history-unarchive`
 - `POST /runtime/daemon-migration-requests`
@@ -97,8 +99,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
-`POST /admin/execute` executes only a stored plan that passes the existing approval and completeness gates, then persists the result. Current live execution support is limited to approved user-service restart plans; unsupported or unapproved plans return persisted `blocked` results.
-`GET /admin/authorizations-required` lists admin change plans and restore requests waiting for explicit approval.
+`POST /admin/execute` executes only a stored plan that passes the existing approval, completeness, adapter, and IDS gates, then persists the result. Unsupported, disabled, or unapproved plans return persisted `blocked` results.
+`GET /admin/authorizations-required` lists admin change plans, archive requests, restore requests, adapter enablement requests, claim cleanup requests, and daemon migration requests waiting for explicit approval.
 `GET /admin/adapter-capabilities` lists the effective live admin adapter table for the API store, including enabled user-service restart execution and any package/firewall/source-block adapters with approved adapter enablement records.
 `GET /admin/adapter-enablement-plan` prepares a read-only high-risk approval plan for enabling disabled live admin adapters. It supports `?kind=...` filtering and does not enable adapters or execute commands.
 `POST /admin/adapter-enablement-requests` creates the approval request required before a disabled live admin adapter can become effective for that store.
@@ -109,6 +111,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /admin/history-archive-plan` prepares a read-only archive manifest for inactive admin plans. It groups each archive candidate with related execution, IDS review, and audit records, and does not mutate state.
 `GET /admin/history-archives` lists persisted archive records and supports `?plan_id=...` filtering. It is read-only and does not restore or modify plans.
 `GET /admin/history-restore-readiness` lists archived plans with restore risk, required approval level, archive record presence, and related evidence. It supports `?plan_id=...` filtering and is read-only.
+`POST /admin/history-archive-requests` creates the approval request required before archive-ready inactive admin plans can be archived.
+`POST /admin/history-archive-requests/approve` approves a pending admin history archive request.
 `POST /admin/history-restore-requests` creates the approval request required before an archived plan can be restored.
 `POST /admin/history-restore-requests/approve` approves a pending admin history restore request after validating that it targets an archived admin plan with a matching archive record.
 `POST /admin/history-archive` marks archive-ready admin plans archived after explicit approval. It preserves the original plan, execution, IDS review, and audit records, persists an archive record, and emits an audit event.

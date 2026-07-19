@@ -51,6 +51,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /admin/history-archives`
 - `GET /admin/history-restore-readiness`
 - `GET /admin/summary`
+- `GET /runtime/daemon-migration-plan`
 - `GET /state`
 
 ## Claim Endpoints
@@ -77,6 +78,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /admin/cancel`
 - `POST /admin/execute`
 - `POST /admin/history-restore-requests`
+- `POST /runtime/daemon-migration-requests`
+- `POST /runtime/daemon-migration-requests/approve`
 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
@@ -101,6 +104,9 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/history-archive` marks archive-ready admin plans archived after explicit approval. It preserves the original plan, execution, IDS review, and audit records, persists an archive record, and emits an audit event.
 `POST /admin/history-unarchive` restores one archived admin plan to active admin history after the restore approval is approved. It keeps the archive record and emits an audit event.
 `GET /admin/summary` returns a compact operator view of admin plans, pending authorizations, execution outcomes, archive candidates, restore approvals, and recent admin audit events.
+`GET /runtime/daemon-migration-plan` prepares a read-only foreground-to-daemon migration plan with approval level, command boundary, rollback, risks, and evidence requirements.
+`POST /runtime/daemon-migration-requests` creates the approval request required before a future daemon migration changes user service enablement or runtime commands.
+`POST /runtime/daemon-migration-requests/approve` approves a pending daemon migration request without changing systemd state or running commands.
 
 `GET /command-summary` returns Sisko's compact cross-domain view of service freshness, resources, claims, health targets, usage limits, physical assets, virtual assets, admin plans, and alerts without persisting new records.
 `GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, admin archive candidates, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.

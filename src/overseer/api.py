@@ -28,6 +28,7 @@ from .cli import (
     approve_admin_history_restore_status,
     approve_claim_status,
     approve_claim_cleanup_status,
+    approve_daemon_migration_status,
     approvals_summary_status,
     alerts_summary_status,
     audit_summary_status,
@@ -37,6 +38,7 @@ from .cli import (
     claim_review_status,
     command_summary_status,
     create_host_security_source_review_status,
+    daemon_migration_plan_status,
     execute_admin_change_status,
     execute_claim_cleanup_status,
     export_host_security_ids_review_prompt_status,
@@ -61,6 +63,7 @@ from .cli import (
     release_claim_status,
     request_admin_adapter_enablement_status,
     request_admin_history_restore_status,
+    request_daemon_migration_status,
     prepare_host_security_ids_review_package_status,
     persistence_security_status,
     request_claim_status,
@@ -96,6 +99,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/runtime-status":
                 self._handle(lambda: runtime_status(store_path))
+                return
+            if path == "/runtime/daemon-migration-plan":
+                self._handle(lambda: daemon_migration_plan_status(store_path, _query_first(query, "service_name") or "overseer"))
                 return
             if path == "/persistence/security":
                 self._handle(lambda: persistence_security_status(store_path))
@@ -284,6 +290,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/adapter-enablement-requests/approve":
                 self._handle_json(lambda payload: approve_admin_adapter_enablement_status(store_path, **_approve_admin_adapter_enablement_args(payload)))
+                return
+            if self.path == "/runtime/daemon-migration-requests":
+                self._handle_json(lambda payload: request_daemon_migration_status(store_path, **_daemon_migration_request_args(payload)))
+                return
+            if self.path == "/runtime/daemon-migration-requests/approve":
+                self._handle_json(lambda payload: approve_daemon_migration_status(store_path, **_approve_daemon_migration_args(payload)))
                 return
             if self.path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
@@ -494,6 +506,22 @@ def _admin_adapter_enablement_request_args(payload: dict[str, Any]) -> dict[str,
 
 
 def _approve_admin_adapter_enablement_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+    }
+
+
+def _daemon_migration_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "service_name": str(payload.get("service_name", "overseer")),
+        "requested_by": str(payload["requested_by"]),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
+    }
+
+
+def _approve_daemon_migration_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "approval_id": str(payload["approval_id"]),
         "approved_by": str(payload["approved_by"]),

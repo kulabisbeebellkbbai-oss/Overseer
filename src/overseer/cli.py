@@ -2223,6 +2223,11 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             for approval in approvals
             if approval.id.startswith("approval.claim.cleanup.")
         ]
+        daemon_migration_approvals = [
+            approval
+            for approval in approvals
+            if approval.id.startswith("approval.runtime.daemon-migration.")
+        ]
         return {
             "store": str(store.path),
             "plans": len(active_plans),
@@ -2230,7 +2235,8 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             "pending_authorizations": len(pending)
             + sum(1 for approval in restore_approvals if approval.status == ApprovalStatus.PENDING)
             + sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.PENDING)
-            + sum(1 for approval in claim_cleanup_approvals if approval.status == ApprovalStatus.PENDING),
+            + sum(1 for approval in claim_cleanup_approvals if approval.status == ApprovalStatus.PENDING)
+            + sum(1 for approval in daemon_migration_approvals if approval.status == ApprovalStatus.PENDING),
             "approved_plans": sum(1 for plan in active_plans if plan.approved),
             "canceled_plans": sum(1 for plan in active_plans if plan.canceled),
             "executable_plans": sum(1 for plan in active_plans if plan.can_execute()),
@@ -2278,6 +2284,16 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                 },
                 "items": [claim_cleanup_approval_status(approval) for approval in claim_cleanup_approvals],
             },
+            "daemon_migration_approvals": {
+                "total": len(daemon_migration_approvals),
+                "pending": sum(1 for approval in daemon_migration_approvals if approval.status == ApprovalStatus.PENDING),
+                "approved": sum(1 for approval in daemon_migration_approvals if approval.status == ApprovalStatus.APPROVED),
+                "by_status": {
+                    status.value: sum(1 for approval in daemon_migration_approvals if approval.status == status)
+                    for status in ApprovalStatus
+                },
+                "items": [daemon_migration_approval_status(approval) for approval in daemon_migration_approvals],
+            },
             "pending": [
                 authorization_required_status_with_ids_review(
                     plan,
@@ -2313,6 +2329,164 @@ def _admin_history_restore_approval_next_step(status: ApprovalStatus) -> str:
     if status == ApprovalStatus.APPROVED:
         return "unarchive-admin-history with the approved restore approval"
     return "restore approval is not actionable"
+
+
+def daemon_migration_plan_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        heartbeats = store.list_runtime_heartbeats()
+        service_heartbeat = next((heartbeat for heartbeat in heartbeats if heartbeat.service_name == service_name), None)
+        return {
+            "store": str(store.path),
+            "mode": "read_only_daemon_migration_plan",
+            "mutation_performed": False,
+            "service_name": service_name,
+            "approval_required": True,
+            "approval_level": ApprovalLevel.HUMAN.value,
+            "current_runtime_evidence": {
+                "heartbeat_id": service_heartbeat.id if service_heartbeat else None,
+                "last_tick_at": service_heartbeat.last_tick_at if service_heartbeat else None,
+                "tick_count": service_heartbeat.tick_count if service_heartbeat else 0,
+            },
+            "proposed_state": f"run {service_name} as a persistent local user service after explicit approval",
+            "commands_in_scope": [
+                ["systemctl", "--user", "enable", "--now", f"{service_name}.service"],
+                ["systemctl", "--user", "status", f"{service_name}.service", "--no-pager"],
+                ["journalctl", "--user", "-u", f"{service_name}.service", "-n", "80", "--no-pager"],
+            ],
+            "rollback_plan": [
+                ["systemctl", "--user", "disable", "--now", f"{service_name}.service"],
+            ],
+            "required_evidence": [
+                "unit file path and exact ExecStart command",
+                "store path and auth-token handling if an API service is included",
+                "post-start runtime heartbeat",
+                "operator-facing rollback command",
+            ],
+            "risks": [
+                "persistent service may run probes or inspections repeatedly",
+                "bad ExecStart or working directory can hide failures until logs are reviewed",
+                "service restart can interrupt active local coordination",
+            ],
+            "next_step": "request-daemon-migration before changing user service enablement or runtime command",
+        }
+    finally:
+        store.close()
+
+
+def request_daemon_migration_status(
+    store_path: str | Path,
+    service_name: str,
+    requested_by: str,
+    requested_at: str | None = None,
+) -> dict[str, object]:
+    if not service_name.strip():
+        raise ValueError("service_name is required")
+    if not requested_by.strip():
+        raise ValueError("requested_by is required")
+    plan = daemon_migration_plan_status(store_path, service_name)
+    approval = ApprovalRequest(
+        id=f"approval.runtime.daemon-migration.{service_name}",
+        subject_id=f"runtime.daemon-migration.{service_name}",
+        approval_level=ApprovalLevel.HUMAN,
+        requester_thread=requested_by,
+        owner_domain=OwnerDomain.SISKO,
+        reason=f"Approve foreground-to-daemon migration for {service_name}",
+        evidence_required=(f"runtime.daemon-migration-plan.{service_name}",),
+    )
+    event = AuditEvent(
+        id=f"audit.{approval.id}.requested",
+        event_type=AuditEventType.REQUESTED,
+        owner_domain=OwnerDomain.SISKO,
+        subject_id=approval.subject_id,
+        summary=approval.reason,
+        risk_level=RiskLevel.HIGH,
+        evidence_ids=approval.evidence_required,
+        occurred_at=requested_at,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_approval(approval)
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "service_name": service_name,
+            "approval_id": approval.id,
+            "subject_id": approval.subject_id,
+            "approval_status": ApprovalStatus(approval.status).value,
+            "approval_level": ApprovalLevel(approval.approval_level).value,
+            "requested_by": requested_by,
+            "requested_at": requested_at,
+            "daemon_migration_plan": plan,
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
+def approve_daemon_migration_status(
+    store_path: str | Path,
+    approval_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"daemon migration approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.runtime.daemon-migration."):
+            raise ValueError("daemon migration approval is required")
+        service_name = _daemon_migration_service_from_subject(approval.subject_id)
+    finally:
+        store.close()
+
+    approved = approve_claim_status(store_path, approval_id, approved_by, approved_at)
+    return {
+        **approved,
+        "service_name": service_name,
+        "daemon_migration_approval": True,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+    }
+
+
+def daemon_migration_approval_status(approval: ApprovalRequest) -> dict[str, object]:
+    approval_status = ApprovalStatus(approval.status)
+    return {
+        "id": approval.id,
+        "service_name": _daemon_migration_service_from_subject(approval.subject_id),
+        "subject_id": approval.subject_id,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+        "requester_thread": approval.requester_thread,
+        "owner_domain": OwnerDomain(approval.owner_domain).value,
+        "reason": approval.reason,
+        "status": approval_status.value,
+        "evidence_required": list(approval.evidence_required),
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+        "next_step": _daemon_migration_approval_next_step(approval_status),
+    }
+
+
+def _daemon_migration_service_from_subject(subject_id: str) -> str:
+    prefix = "runtime.daemon-migration."
+    if not subject_id.startswith(prefix):
+        raise ValueError("daemon migration approval subject is required")
+    return subject_id[len(prefix):]
+
+
+def _daemon_migration_approval_next_step(status: ApprovalStatus) -> str:
+    if status == ApprovalStatus.PENDING:
+        return "approve-daemon-migration before changing user service enablement or runtime command"
+    if status == ApprovalStatus.APPROVED:
+        return "operator may apply only the approved service migration plan and rollback boundary"
+    return "daemon migration approval is not actionable"
 
 
 def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object]:
@@ -3000,6 +3174,12 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             if approval.id.startswith("approval.claim.cleanup.")
             and approval.status == ApprovalStatus.PENDING
         ]
+        pending_daemon_migration_approvals = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id.startswith("approval.runtime.daemon-migration.")
+            and approval.status == ApprovalStatus.PENDING
+        ]
         pending = [
             authorization_required_status_with_ids_review(
                 plan,
@@ -3014,11 +3194,13 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             "pending_count": len(pending)
             + len(pending_restore_approvals)
             + len(pending_adapter_enablement_approvals)
-            + len(pending_claim_cleanup_approvals),
+            + len(pending_claim_cleanup_approvals)
+            + len(pending_daemon_migration_approvals),
             "pending_plan_count": len(pending),
             "pending_restore_approval_count": len(pending_restore_approvals),
             "pending_adapter_enablement_approval_count": len(pending_adapter_enablement_approvals),
             "pending_claim_cleanup_approval_count": len(pending_claim_cleanup_approvals),
+            "pending_daemon_migration_approval_count": len(pending_daemon_migration_approvals),
             "restore_approvals": [admin_history_restore_approval_status(approval) for approval in pending_restore_approvals],
             "adapter_enablement_approvals": [
                 admin_adapter_enablement_approval_status(approval)
@@ -3027,6 +3209,10 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             "claim_cleanup_approvals": [
                 claim_cleanup_approval_status(approval)
                 for approval in pending_claim_cleanup_approvals
+            ],
+            "daemon_migration_approvals": [
+                daemon_migration_approval_status(approval)
+                for approval in pending_daemon_migration_approvals
             ],
         }
     finally:
@@ -4137,6 +4323,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_status_parser = subparsers.add_parser("runtime-status", help="read runtime heartbeat and latest host inspection status")
     runtime_status_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     runtime_status_parser.add_argument("--service-name", default="overseer")
+    daemon_plan_parser = subparsers.add_parser("daemon-migration-plan", help="prepare a read-only foreground-to-daemon migration approval plan")
+    daemon_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    daemon_plan_parser.add_argument("--service-name", default="overseer")
+    daemon_request_parser = subparsers.add_parser("request-daemon-migration", help="request approval before daemon migration")
+    daemon_request_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    daemon_request_parser.add_argument("--service-name", default="overseer")
+    daemon_request_parser.add_argument("--requested-by", required=True)
+    daemon_request_parser.add_argument("--requested-at")
+    daemon_approve_parser = subparsers.add_parser("approve-daemon-migration", help="approve a requested daemon migration")
+    daemon_approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    daemon_approve_parser.add_argument("--approval-id", required=True)
+    daemon_approve_parser.add_argument("--approved-by", required=True)
+    daemon_approve_parser.add_argument("--approved-at")
     persistence_security_parser = subparsers.add_parser(
         "persistence-security",
         help="inspect SQLite store file ownership and permissions without changing them",
@@ -4501,6 +4700,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "runtime-status":
         print(json.dumps(runtime_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "daemon-migration-plan":
+        print(json.dumps(daemon_migration_plan_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "request-daemon-migration":
+        print(json.dumps(request_daemon_migration_status(args.store, args.service_name, args.requested_by, args.requested_at), sort_keys=True))
+        return 0
+
+    if args.command == "approve-daemon-migration":
+        print(json.dumps(approve_daemon_migration_status(args.store, args.approval_id, args.approved_by, args.approved_at), sort_keys=True))
         return 0
 
     if args.command == "persistence-security":

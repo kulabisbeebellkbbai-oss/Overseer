@@ -22,12 +22,16 @@ PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli daemon-migration-plan --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli request-daemon-migration --store state/overseer.sqlite3 --requested-by sisko
 PYTHONPATH=src python3 -m overseer.cli alerts-summary --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sqlite3 --fail-on-unhealthy
 ```
 
 `runtime-status` is the monitor-friendly surface for Julian and Odo. It reports the service heartbeat, latest host inspection snapshot id and capture time, freshness state, and current high/warning host security finding counts without requiring consumers to parse raw snapshots.
+
+`daemon-migration-plan` is a read-only Sisko gate for foreground-to-daemon migration. `request-daemon-migration` and `approve-daemon-migration` record the approval state required before changing user service enablement or runtime commands; they do not edit systemd state or restart services.
 
 Default freshness thresholds:
 

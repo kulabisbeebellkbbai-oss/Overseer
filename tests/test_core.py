@@ -121,6 +121,7 @@ from overseer.cli import approve_admin_adapter_enablement_status
 from overseer.cli import approve_admin_history_restore_status
 from overseer.cli import approve_claim_cleanup_status
 from overseer.cli import approve_claim_status
+from overseer.cli import approve_daemon_migration_status
 from overseer.cli import approvals_summary_status
 from overseer.cli import alerts_summary_status
 from overseer.cli import audit_summary_status
@@ -130,6 +131,7 @@ from overseer.cli import cancel_admin_change_status
 from overseer.cli import claim_cleanup_plan_status
 from overseer.cli import claim_review_status
 from overseer.cli import command_summary_status
+from overseer.cli import daemon_migration_plan_status
 from overseer.cli import execute_admin_change_status
 from overseer.cli import execute_claim_cleanup_status
 from overseer.cli import export_state_redacted_status
@@ -162,6 +164,7 @@ from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_restore_status
 from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
+from overseer.cli import request_daemon_migration_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
 from overseer.cli import security_summary_status
@@ -1951,6 +1954,44 @@ class OverseerApiClientTests(unittest.TestCase):
                 status = client.runtime_status()
 
             self.assertEqual(status["service"]["tick_count"], 4)
+
+    def test_client_requests_and_approves_daemon_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T16:00:00+00:00",
+                    last_tick_at="2026-07-18T16:01:00+00:00",
+                    tick_count=7,
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                plan = client.daemon_migration_plan()
+                requested = client.request_daemon_migration("sisko", requested_at="2026-07-18T16:05:00+00:00")
+                pending = client.authorizations_required()
+                approved = client.approve_daemon_migration(
+                    requested["approval_id"],
+                    "sisko",
+                    approved_at="2026-07-18T16:10:00+00:00",
+                )
+                after = client.authorizations_required()
+
+            self.assertEqual(plan["mode"], "read_only_daemon_migration_plan")
+            self.assertFalse(plan["mutation_performed"])
+            self.assertEqual(plan["current_runtime_evidence"]["tick_count"], 7)
+            self.assertTrue(requested["mutation_performed"])
+            self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+            self.assertEqual(pending["pending_daemon_migration_approval_count"], 1)
+            self.assertEqual(pending["daemon_migration_approvals"][0]["service_name"], "overseer")
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertTrue(approved["daemon_migration_approval"])
+            self.assertEqual(after["pending_daemon_migration_approval_count"], 0)
 
     def test_client_reads_persistence_security(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4903,6 +4944,58 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(status["service_name"], "overseer")
             self.assertEqual(status["tick_count"], 2)
+
+    def test_daemon_migration_plan_and_approval_are_approval_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_runtime_heartbeat(
+                RuntimeHeartbeat(
+                    id="overseer",
+                    service_name="overseer",
+                    started_at="2026-07-18T13:00:00+00:00",
+                    last_tick_at="2026-07-18T13:02:00+00:00",
+                    tick_count=3,
+                )
+            )
+            store.close()
+
+            plan = daemon_migration_plan_status(store_path)
+            requested = request_daemon_migration_status(
+                store_path,
+                "overseer",
+                "sisko",
+                "2026-07-18T13:05:00+00:00",
+            )
+            pending = authorizations_required_status(store_path)
+            summary = admin_summary_status(store_path)
+            approved = approve_daemon_migration_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T13:10:00+00:00",
+            )
+            after = authorizations_required_status(store_path)
+            runtime = runtime_status(store_path)
+
+        self.assertEqual(plan["mode"], "read_only_daemon_migration_plan")
+        self.assertFalse(plan["mutation_performed"])
+        self.assertEqual(plan["approval_level"], ApprovalLevel.HUMAN.value)
+        self.assertIn("systemctl", plan["commands_in_scope"][0])
+        self.assertEqual(plan["current_runtime_evidence"]["tick_count"], 3)
+        self.assertTrue(requested["mutation_performed"])
+        self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+        self.assertEqual(requested["audit_event"]["event_type"], AuditEventType.REQUESTED.value)
+        self.assertEqual(pending["pending_daemon_migration_approval_count"], 1)
+        self.assertEqual(
+            pending["daemon_migration_approvals"][0]["next_step"],
+            "approve-daemon-migration before changing user service enablement or runtime command",
+        )
+        self.assertEqual(summary["daemon_migration_approvals"]["pending"], 1)
+        self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+        self.assertTrue(approved["daemon_migration_approval"])
+        self.assertEqual(after["pending_daemon_migration_approval_count"], 0)
+        self.assertEqual(runtime["service"]["tick_count"], 3)
 
     def test_request_claim_status_queues_against_active_stored_claim(self):
         with tempfile.TemporaryDirectory() as directory:

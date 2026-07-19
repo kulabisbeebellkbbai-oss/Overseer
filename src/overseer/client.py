@@ -32,6 +32,40 @@ class OverseerApiClient:
     def runtime_status(self) -> dict[str, Any]:
         return self._get("/runtime-status")
 
+    def daemon_migration_plan(self, service_name: str | None = None) -> dict[str, Any]:
+        path = "/runtime/daemon-migration-plan"
+        if service_name is not None:
+            path = f"{path}?{urlencode({'service_name': service_name})}"
+        return self._get(path)
+
+    def request_daemon_migration(
+        self,
+        requested_by: str,
+        service_name: str = "overseer",
+        requested_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "service_name": service_name,
+            "requested_by": requested_by,
+        }
+        if requested_at:
+            payload["requested_at"] = requested_at
+        return self._post("/runtime/daemon-migration-requests", payload)
+
+    def approve_daemon_migration(
+        self,
+        approval_id: str,
+        approved_by: str,
+        approved_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "approval_id": approval_id,
+            "approved_by": approved_by,
+        }
+        if approved_at:
+            payload["approved_at"] = approved_at
+        return self._post("/runtime/daemon-migration-requests/approve", payload)
+
     def persistence_security(self) -> dict[str, Any]:
         return self._get("/persistence/security")
 

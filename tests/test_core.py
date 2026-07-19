@@ -2769,6 +2769,23 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["assets"], 1)
             self.assertEqual(status["items"][0]["stable_id"], "usb.device-a")
 
+    def test_client_discovers_path_physical_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            root = Path(directory) / "serial"
+            root.mkdir()
+            (root / "usb-client-a").write_text("", encoding="utf-8")
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                discovered = client.discover_physical((str(root),))
+                summary = client.physical_summary()
+
+            self.assertEqual(discovered["count"], 1)
+            self.assertEqual(discovered["assets"][0]["stable_id"], "serial.usb-client-a")
+            self.assertEqual(summary["assets"], 1)
+            self.assertEqual(summary["items"][0]["kind"], PhysicalAssetKind.SERIAL_PORT.value)
+
     def test_client_discovers_storage_physical_identities(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3278,6 +3295,8 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn("Package Status", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/services/discover-user"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Discover Services", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/physical/discover"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Discover Devices", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/maintenance/package-update-plans"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Plan Updates", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/codex-projects/discover-threads"', OPERATOR_CONSOLE_HTML)

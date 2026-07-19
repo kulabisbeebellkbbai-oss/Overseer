@@ -46,6 +46,7 @@ from .cli import (
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
+    discover_physical_status,
     discover_user_services_status,
     discover_storage_status,
     discover_virtual_listeners_status,
@@ -286,6 +287,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/services/discover-user":
                 self._handle(lambda: discover_user_services_status(store_path))
+                return
+            if self.path == "/physical/discover":
+                self._handle_json(lambda payload: discover_physical_status(**_physical_discovery_args(store_path, payload)))
                 return
             if self.path == "/health/probes/run":
                 self._handle_json(lambda payload: probe_stored_health_status(store_path, **_stored_health_probe_args(payload)))
@@ -582,6 +586,16 @@ def _claim_cleanup_request_args(payload: dict[str, Any]) -> dict[str, Any]:
 def _physical_storage_discovery_args(store_path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "sysfs_block_root": str(payload.get("sysfs_block_root", "/sys/class/block")),
+        "store_path": store_path,
+    }
+
+
+def _physical_discovery_args(store_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    roots = payload.get("roots", ("/dev/serial/by-id", "/dev/serial/by-path"))
+    if isinstance(roots, str):
+        roots = (roots,)
+    return {
+        "roots": tuple(str(root) for root in roots),
         "store_path": store_path,
     }
 

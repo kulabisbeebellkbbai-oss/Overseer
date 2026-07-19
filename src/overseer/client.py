@@ -200,6 +200,12 @@ class OverseerApiClient:
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 
+    def discover_physical(self, roots: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if roots:
+            payload["roots"] = list(roots)
+        return self._post("/physical/discover", payload)
+
     def discover_storage(self, sysfs_block_root: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if sysfs_block_root:

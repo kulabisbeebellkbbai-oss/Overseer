@@ -435,6 +435,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       }
     }
     async function actionRequest(action) {
+      if (action === "discover-physical") return await postJson("/physical/discover", {});
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
@@ -524,7 +525,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const virtual = state.data.virtual || {};
       document.getElementById("assets").innerHTML = `
         <div class="grid">
-          <div class="section-head"><h3>Asset Actions</h3><div class="actions"><button class="action-btn" data-action="discover-storage">Discover Storage</button><button class="action-btn" data-action="discover-listeners">Discover Listeners</button></div></div>
+          <div class="section-head"><h3>Asset Actions</h3><div class="actions"><button class="action-btn" data-action="discover-physical">Discover Devices</button><button class="action-btn" data-action="discover-storage">Discover Storage</button><button class="action-btn" data-action="discover-listeners">Discover Listeners</button></div></div>
           ${metric("Physical", physical.assets, "assets", "span-3")}
           ${metric("Checkout Ready", physical.ready_for_checkout, "physical", "span-3")}
           ${metric("Virtual", virtual.assets, "assets", "span-3")}

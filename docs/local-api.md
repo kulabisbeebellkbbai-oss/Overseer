@@ -77,6 +77,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/cleanup-requests/approve`
 - `POST /claims/cleanup-requests/execute`
 - `POST /services/discover-user`
+- `POST /physical/discover`
 - `POST /physical/discover-storage`
 - `POST /virtual/discover-listeners`
 - `POST /health/probes/run`
@@ -157,6 +158,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /claims/cleanup-requests/approve` approves a pending cleanup request after validating that its claim is still a cleanup candidate. It does not mutate the claim.
 `POST /claims/cleanup-requests/execute` executes only an approved cleanup request after re-validating the cleanup candidate. It can mark an expired active-like claim expired, re-evaluate a stale queued claim, move a release-blocked claim to `releasing`, or revoke a blocked claim. Moving a claim to `releasing` does not free the resource.
 `POST /services/discover-user` captures read-only host evidence, persists running systemd user services as Julian-owned service resources, and creates matching process health targets. It does not start, stop, restart, enable, disable, or edit services.
+`POST /physical/discover` reads configured physical path roots, persists discovered serial/USB identities for Kira, and creates checkout-ready physical resources. Optional field: `roots`, either a string or list of strings. When omitted it checks `/dev/serial/by-id` and `/dev/serial/by-path`. It does not open devices, change permissions, mount storage, or write to hardware.
 `POST /physical/discover-storage` reads sysfs block-device metadata and persists discovered storage identities for Kira. Optional field: `sysfs_block_root`. It does not mount, unmount, format, partition, or write to devices.
 `POST /virtual/discover-listeners` reads local TCP listener evidence and persists discovered listener resources for Dax. It does not change firewall rules, routes, processes, service definitions, proxies, or network bindings.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.

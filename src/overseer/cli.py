@@ -9,6 +9,7 @@ import os
 import re
 import stat
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,8 +36,9 @@ from .admin import (
     unarchive_admin_change_plan,
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
-from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
+from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
+from .core import decide_claim
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import HostFindingSeverity, HostInspectionAdapter, HostInspectionSnapshot, host_security_status, host_snapshot_status
@@ -3453,6 +3455,77 @@ def approve_claim_cleanup_status(
     }
 
 
+def execute_claim_cleanup_status(
+    store_path: str | Path,
+    approval_id: str,
+    executed_by: str,
+    executed_at: str | None = None,
+    now: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    if not executed_by.strip():
+        raise ValueError("executed_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"claim cleanup approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.claim.cleanup."):
+            raise ValueError("claim cleanup approval is required")
+        if not approval.can_execute():
+            raise ValueError("claim cleanup approval is not approved")
+        claim_id = _claim_cleanup_claim_id_from_subject(approval.subject_id)
+        checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
+        before = _claim_cleanup_candidate_for_store(store, claim_id, checked_at)
+        claim = store.load_claim(claim_id)
+        resource = store.load_resource(claim.resource_id)
+        if before["cleanup_action"] == "review_expired_active_claim":
+            updated_claim = replace(claim, status=ClaimStatus.EXPIRED, evidence_ids=tuple((*claim.evidence_ids, approval_id)))
+            updated_resource = resource
+            if resource.current_claim_id == claim.id:
+                updated_resource = replace(resource, state=ResourceState.AVAILABLE, current_claim_id=None)
+            store.save_claim(updated_claim)
+            store.save_resource(updated_resource)
+            execution_action = "expired_claim_released_from_resource"
+        elif before["cleanup_action"] == "re_evaluate_stale_queue":
+            updated_claim, decision = _re_evaluate_stale_queued_claim(store, claim, approval_id)
+            store.save_claim(updated_claim, decision)
+            execution_action = f"stale_queue_re_evaluated_{decision.outcome.value}"
+        else:
+            raise ValueError(f"cleanup action is not executable yet: {before['cleanup_action']}")
+        event = AuditEvent(
+            id=f"audit.{approval.id}.executed",
+            event_type=AuditEventType.EXECUTED,
+            owner_domain=OwnerDomain.SISKO,
+            subject_id=approval.subject_id,
+            summary=f"Executed claim cleanup action {before['cleanup_action']} for {claim_id}",
+            risk_level=_claim_cleanup_risk_level(before),
+            evidence_ids=(approval_id,),
+            occurred_at=executed_at,
+        )
+        store.save_audit_event(event)
+        after_claim = store.load_claim(claim_id)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "claim_id": claim_id,
+            "approval_id": approval.id,
+            "executed_by": executed_by,
+            "executed_at": executed_at,
+            "checked_at": checked_at.isoformat(),
+            "cleanup_action": before["cleanup_action"],
+            "execution_action": execution_action,
+            "claim_status_before": ClaimStatus(claim.status).value,
+            "claim_status_after": ClaimStatus(after_claim.status).value,
+            "resource_id": after_claim.resource_id,
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
 def claim_cleanup_approval_status(approval: ApprovalRequest) -> dict[str, object]:
     approval_status = ApprovalStatus(approval.status)
     return {
@@ -3511,8 +3584,35 @@ def _claim_cleanup_approval_next_step(approval_status: ApprovalStatus) -> str:
     if approval_status == ApprovalStatus.PENDING:
         return "approve-claim-cleanup before cleanup mutation can be implemented or executed"
     if approval_status == ApprovalStatus.APPROVED:
-        return "cleanup mutation may proceed only for the approved claim and cleanup action"
+        return "execute-claim-cleanup may proceed only for the approved claim and cleanup action"
     return "claim cleanup approval is not actionable"
+
+
+def _re_evaluate_stale_queued_claim(
+    store: SQLiteStore,
+    claim: Claim,
+    approval_id: str,
+):
+    resources_by_id = {resource.id: resource for resource in store.list_resources()}
+    resource = resources_by_id[claim.resource_id]
+    active_claims = [
+        item
+        for item in store.list_claims()
+        if item.id != claim.id and item.is_active_like()
+    ]
+    decision = decide_claim(resource, claim, active_claims, resources_by_id)
+    if decision.outcome == ConflictOutcome.ALLOW:
+        status = ClaimStatus.APPROVED
+    elif decision.outcome == ConflictOutcome.QUEUE:
+        status = ClaimStatus.QUEUED
+    elif decision.outcome == ConflictOutcome.ESCALATE:
+        status = ClaimStatus.REQUESTED
+    elif decision.outcome == ConflictOutcome.QUARANTINE:
+        status = ClaimStatus.BLOCKED
+    else:
+        status = ClaimStatus.BLOCKED
+    updated = replace(claim, status=status, approval_id=approval_id, evidence_ids=tuple((*claim.evidence_ids, approval_id)))
+    return updated, decision
 
 
 def claim_cleanup_plan_item_status(
@@ -4275,6 +4375,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     approve_claim_cleanup_parser.add_argument("--approved-by", required=True)
     approve_claim_cleanup_parser.add_argument("--approved-at")
     approve_claim_cleanup_parser.add_argument("--now", help="override cleanup review timestamp for deterministic checks")
+    execute_claim_cleanup_parser = subparsers.add_parser("execute-claim-cleanup", help="execute an approved claim cleanup action")
+    execute_claim_cleanup_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    execute_claim_cleanup_parser.add_argument("--approval-id", required=True)
+    execute_claim_cleanup_parser.add_argument("--executed-by", required=True)
+    execute_claim_cleanup_parser.add_argument("--executed-at")
+    execute_claim_cleanup_parser.add_argument("--now", help="override cleanup review timestamp for deterministic checks")
     activate_parser = subparsers.add_parser("activate-claim", help="mark a stored claim active after approval")
     activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     activate_parser.add_argument("--claim-id", required=True)
@@ -4694,6 +4800,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.approval_id,
                     args.approved_by,
                     args.approved_at,
+                    args.now,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-claim-cleanup":
+        print(
+            json.dumps(
+                execute_claim_cleanup_status(
+                    args.store,
+                    args.approval_id,
+                    args.executed_by,
+                    args.executed_at,
                     args.now,
                 ),
                 sort_keys=True,

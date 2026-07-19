@@ -38,6 +38,7 @@ from .cli import (
     command_summary_status,
     create_host_security_source_review_status,
     execute_admin_change_status,
+    execute_claim_cleanup_status,
     export_host_security_ids_review_prompt_status,
     export_state_redacted_status,
     health_efficiency_summary_status,
@@ -229,6 +230,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/claims/cleanup-requests/approve":
                 self._handle_json(lambda payload: approve_claim_cleanup_status(store_path, **_approve_claim_cleanup_args(payload)))
+                return
+            if self.path == "/claims/cleanup-requests/execute":
+                self._handle_json(lambda payload: execute_claim_cleanup_status(store_path, **_execute_claim_cleanup_args(payload)))
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
@@ -423,6 +427,15 @@ def _approve_claim_cleanup_args(payload: dict[str, Any]) -> dict[str, Any]:
         "approval_id": str(payload["approval_id"]),
         "approved_by": str(payload["approved_by"]),
         "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+        "now": str(payload["now"]) if payload.get("now") is not None else None,
+    }
+
+
+def _execute_claim_cleanup_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "executed_by": str(payload["executed_by"]),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
         "now": str(payload["now"]) if payload.get("now") is not None else None,
     }
 

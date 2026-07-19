@@ -131,6 +131,7 @@ from overseer.cli import claim_cleanup_plan_status
 from overseer.cli import claim_review_status
 from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
+from overseer.cli import execute_claim_cleanup_status
 from overseer.cli import export_state_redacted_status
 from overseer.cli import export_host_security_ids_review_prompt_status
 from overseer.cli import health_efficiency_summary_status
@@ -2656,6 +2657,65 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(after["pending_claim_cleanup_approval_count"], 0)
             self.assertEqual(state["claims"][0]["status"], ClaimStatus.ACTIVE.value)
 
+    def test_client_executes_approved_claim_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.cleanup.execute.client",
+                    name="Client Cleanup Execute Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                    state=ResourceState.CHECKED_OUT,
+                    current_claim_id="claim.cleanup.execute.client",
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.execute.client",
+                    resource_id="gateway.cleanup.execute.client",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-client",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use gateway",
+                    requested_action="bind gateway",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                    expires_at="2026-07-18T20:00:00+00:00",
+                    release_condition="operator verified work stopped",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_claim_cleanup(
+                    "claim.cleanup.execute.client",
+                    "sisko",
+                    now="2026-07-18T20:30:00+00:00",
+                )
+                client.approve_claim_cleanup(
+                    requested["approval_id"],
+                    "sisko",
+                    now="2026-07-18T20:35:00+00:00",
+                )
+                executed = client.execute_claim_cleanup(
+                    requested["approval_id"],
+                    "sisko",
+                    executed_at="2026-07-18T20:40:00+00:00",
+                    now="2026-07-18T20:40:00+00:00",
+                )
+                state = client.state()
+
+            self.assertTrue(executed["mutation_performed"])
+            self.assertEqual(executed["claim_status_before"], ClaimStatus.ACTIVE.value)
+            self.assertEqual(executed["claim_status_after"], ClaimStatus.EXPIRED.value)
+            self.assertEqual(state["claims"][0]["status"], ClaimStatus.EXPIRED.value)
+            self.assertEqual(state["resources"][0]["state"], ResourceState.AVAILABLE.value)
+            self.assertIsNone(state["resources"][0]["current_claim_id"])
+
     def test_client_creates_admin_change_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -5096,6 +5156,91 @@ class RuntimeTests(unittest.TestCase):
                 "claim.cleanup.approval.cli": ClaimStatus.ACTIVE.value,
                 "claim.cleanup.not-candidate": ClaimStatus.RELEASED.value,
             },
+        )
+
+    def test_execute_claim_cleanup_re_evaluates_stale_queue_after_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.cleanup.execute.cli",
+                    name="Cleanup Execute CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.execute.released-blocker",
+                    resource_id="proxy.cleanup.execute.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="previous proxy use",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.RELEASED,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.execute.stale-queue",
+                    resource_id="proxy.cleanup.execute.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-b",
+                    owner_role=OwnerDomain.DAX,
+                    intent="queued proxy use",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.QUEUED,
+                ),
+                ConflictDecision(
+                    outcome=ConflictOutcome.QUEUE,
+                    reason="resource was claimed",
+                    blocking_claim_ids=("claim.cleanup.execute.released-blocker",),
+                ),
+            )
+            store.close()
+
+            requested = request_claim_cleanup_status(
+                store_path,
+                "claim.cleanup.execute.stale-queue",
+                "sisko",
+                now="2026-07-18T20:30:00+00:00",
+            )
+            with self.assertRaises(ValueError):
+                execute_claim_cleanup_status(store_path, requested["approval_id"], "sisko")
+            approve_claim_cleanup_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                now="2026-07-18T20:35:00+00:00",
+            )
+            executed = execute_claim_cleanup_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T20:40:00+00:00",
+                "2026-07-18T20:40:00+00:00",
+            )
+            state = list_state_status(store_path)
+
+        self.assertTrue(executed["mutation_performed"])
+        self.assertEqual(executed["cleanup_action"], "re_evaluate_stale_queue")
+        self.assertEqual(executed["claim_status_before"], ClaimStatus.QUEUED.value)
+        self.assertEqual(executed["claim_status_after"], ClaimStatus.REQUESTED.value)
+        self.assertEqual(
+            {claim["id"]: claim["status"] for claim in state["claims"]},
+            {
+                "claim.cleanup.execute.released-blocker": ClaimStatus.RELEASED.value,
+                "claim.cleanup.execute.stale-queue": ClaimStatus.REQUESTED.value,
+            },
+        )
+        self.assertIn(
+            ("audit.approval.claim.cleanup.claim.cleanup.execute.stale-queue.executed", AuditEventType.EXECUTED.value),
+            {(event["id"], event["event_type"]) for event in state["audit_events"]},
         )
 
     def test_activate_claim_status_requires_approved_request(self):

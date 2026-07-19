@@ -155,6 +155,23 @@ class OverseerApiClient:
             payload["now"] = now
         return self._post("/claims/cleanup-requests/approve", payload)
 
+    def execute_claim_cleanup(
+        self,
+        approval_id: str,
+        executed_by: str,
+        executed_at: str | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "approval_id": approval_id,
+            "executed_by": executed_by,
+        }
+        if executed_at:
+            payload["executed_at"] = executed_at
+        if now:
+            payload["now"] = now
+        return self._post("/claims/cleanup-requests/execute", payload)
+
     def request_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/request", payload)
 

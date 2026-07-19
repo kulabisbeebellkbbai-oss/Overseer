@@ -28,6 +28,7 @@ from .cli import (
     approve_admin_adapter_enablement_status,
     approve_admin_history_archive_status,
     approve_admin_history_restore_status,
+    approve_admin_policy_warning_status,
     approve_claim_status,
     approve_claim_cleanup_status,
     approve_daemon_migration_status,
@@ -68,6 +69,7 @@ from .cli import (
     request_admin_adapter_enablement_status,
     request_admin_history_archive_status,
     request_admin_history_restore_status,
+    request_admin_policy_warning_status,
     request_daemon_migration_status,
     request_usage_continuation_status,
     prepare_host_security_ids_review_package_status,
@@ -313,6 +315,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/admin/adapter-enablement-requests/approve":
                 self._handle_json(lambda payload: approve_admin_adapter_enablement_status(store_path, **_approve_admin_adapter_enablement_args(payload)))
+                return
+            if self.path == "/admin/policy-warning-requests":
+                self._handle_json(lambda payload: request_admin_policy_warning_status(store_path, **_admin_policy_warning_request_args(payload)))
+                return
+            if self.path == "/admin/policy-warning-requests/approve":
+                self._handle_json(lambda payload: approve_admin_policy_warning_status(store_path, **_approve_admin_policy_warning_args(payload)))
                 return
             if self.path == "/runtime/daemon-migration-requests":
                 self._handle_json(lambda payload: request_daemon_migration_status(store_path, **_daemon_migration_request_args(payload)))
@@ -594,6 +602,23 @@ def _admin_adapter_enablement_request_args(payload: dict[str, Any]) -> dict[str,
 
 
 def _approve_admin_adapter_enablement_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+    }
+
+
+def _admin_policy_warning_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "check_id": str(payload["check_id"]),
+        "requested_by": str(payload["requested_by"]),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
+    }
+
+
+def _approve_admin_policy_warning_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "approval_id": str(payload["approval_id"]),
         "approved_by": str(payload["approved_by"]),

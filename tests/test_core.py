@@ -3272,6 +3272,63 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertTrue(approved["adapter_enablement_approval"])
             self.assertEqual(after["pending_count"], 0)
 
+    def test_client_requests_and_approves_admin_policy_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                adapter_request = client.request_admin_adapter_enablement(
+                    {
+                        "kind": AdminChangeKind.APT_UPGRADE.value,
+                        "requested_by": "sisko",
+                    }
+                )
+                client.approve_admin_adapter_enablement(
+                    {
+                        "approval_id": adapter_request["approval_id"],
+                        "approved_by": "sisko",
+                    }
+                )
+                client.plan_admin_change(
+                    {
+                        "plan_id": "admin.apt.upgrade.policy-api",
+                        "kind": AdminChangeKind.APT_UPGRADE.value,
+                        "target": "sqlite3",
+                        "packages": ["sqlite3"],
+                        "reason": "apply approved package patch",
+                        "current_state": "sqlite3 upgrade available",
+                    }
+                )
+                client.approve_admin_change(
+                    {
+                        "plan_id": "admin.apt.upgrade.policy-api",
+                        "approved_by": "operator",
+                    }
+                )
+                requested = client.request_admin_policy_warning(
+                    {
+                        "plan_id": "admin.apt.upgrade.policy-api",
+                        "check_id": "admin.rollback",
+                        "requested_by": "sisko",
+                    }
+                )
+                pending = client.authorizations_required()
+                approved = client.approve_admin_policy_warning(
+                    {
+                        "approval_id": requested["approval_id"],
+                        "approved_by": "operator",
+                    }
+                )
+                policies = client.admin_policies("admin.apt.upgrade.policy-api")
+                checks = {check["id"]: check for check in policies["items"][0]["checks"]}
+
+            self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+            self.assertEqual(pending["pending_policy_warning_approval_count"], 1)
+            self.assertTrue(approved["policy_warning_approval"])
+            self.assertEqual(policies["items"][0]["status"], PolicyCheckStatus.PASS.value)
+            self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.PASS.value)
+
     def test_client_approves_admin_history_restore_request(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

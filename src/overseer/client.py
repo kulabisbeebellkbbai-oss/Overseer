@@ -382,6 +382,12 @@ class OverseerApiClient:
     def approve_admin_adapter_enablement(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/admin/adapter-enablement-requests/approve", payload)
 
+    def request_admin_policy_warning(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/policy-warning-requests", payload)
+
+    def approve_admin_policy_warning(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/policy-warning-requests/approve", payload)
+
     def admin_executions(self) -> dict[str, Any]:
         return self._get("/admin/executions")
 

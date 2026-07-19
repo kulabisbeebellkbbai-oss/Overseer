@@ -87,6 +87,33 @@ class OverseerApiClient:
     def usage_summary(self) -> dict[str, Any]:
         return self._get("/usage-summary")
 
+    def record_usage_limit(
+        self,
+        limit_id: str,
+        resource_id: str,
+        kind: str,
+        capacity: int,
+        remaining: int,
+        window: str,
+        resets_at: str | None = None,
+        observed_at: str | None = None,
+        confidence: float = 1.0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "limit_id": limit_id,
+            "resource_id": resource_id,
+            "kind": kind,
+            "capacity": capacity,
+            "remaining": remaining,
+            "window": window,
+            "confidence": confidence,
+        }
+        if resets_at:
+            payload["resets_at"] = resets_at
+        if observed_at:
+            payload["observed_at"] = observed_at
+        return self._post("/usage-limits", payload)
+
     def usage_continuation_plan(self) -> dict[str, Any]:
         return self._get("/usage/continuation-plan")
 

@@ -3435,6 +3435,50 @@ def usage_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def record_usage_limit_status(
+    store_path: str | Path,
+    limit_id: str,
+    resource_id: str,
+    kind: str,
+    capacity: int,
+    remaining: int,
+    window: str,
+    resets_at: str | None = None,
+    observed_at: str | None = None,
+    confidence: float = 1.0,
+) -> dict[str, object]:
+    if capacity < 0:
+        raise ValueError("capacity cannot be negative")
+    if remaining < 0:
+        raise ValueError("remaining cannot be negative")
+    if remaining > capacity:
+        raise ValueError("remaining cannot exceed capacity")
+    if confidence < 0 or confidence > 1:
+        raise ValueError("confidence must be between 0 and 1")
+    store = SQLiteStore(store_path)
+    try:
+        usage_limit = UsageLimit(
+            id=limit_id,
+            resource_id=resource_id,
+            kind=LimitKind(kind),
+            capacity=capacity,
+            remaining=remaining,
+            resets_at=resets_at,
+            window=window,
+            observed_at=observed_at,
+            confidence=confidence,
+        )
+        store.save_usage_limit(usage_limit)
+        return {
+            "store": str(store.path),
+            "limit": usage_limit_status(usage_limit),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
 def request_usage_continuation_status(
     store_path: str | Path,
     request_id: str,
@@ -4873,6 +4917,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_usage_limit_parser = subparsers.add_parser("record-usage-limit", help="record or update a usage-limit observation")
+    record_usage_limit_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_usage_limit_parser.add_argument("--limit-id", required=True)
+    record_usage_limit_parser.add_argument("--resource-id", required=True)
+    record_usage_limit_parser.add_argument("--kind", required=True, choices=[item.value for item in LimitKind])
+    record_usage_limit_parser.add_argument("--capacity", required=True, type=int)
+    record_usage_limit_parser.add_argument("--remaining", required=True, type=int)
+    record_usage_limit_parser.add_argument("--window", required=True)
+    record_usage_limit_parser.add_argument("--resets-at")
+    record_usage_limit_parser.add_argument("--observed-at")
+    record_usage_limit_parser.add_argument("--confidence", type=float, default=1.0)
     usage_continuation_plan_parser = subparsers.add_parser(
         "usage-continuation-plan",
         help="summarize persisted usage-limited continuation requests",
@@ -5340,6 +5395,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-summary":
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "record-usage-limit":
+        print(
+            json.dumps(
+                record_usage_limit_status(
+                    args.store,
+                    args.limit_id,
+                    args.resource_id,
+                    args.kind,
+                    args.capacity,
+                    args.remaining,
+                    args.window,
+                    args.resets_at,
+                    args.observed_at,
+                    args.confidence,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "usage-continuation-plan":

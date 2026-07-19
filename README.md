@@ -48,6 +48,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli audit-summary --store state/overseer.sqlite3 --owner odo --subject-prefix ids-review.` - summarize persisted audit events, optionally filtered by event type, owner, or subject prefix.
 - `PYTHONPATH=src python3 -m overseer.cli approvals-summary --store state/overseer.sqlite3 --status pending --owner dax` - summarize stored approval requests, optionally filtered by status, owner, approval level, or subject prefix.
 - `PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3` - summarize persisted usage limits, capacity state, reset timing, and confidence.
+- `PYTHONPATH=src python3 -m overseer.cli record-usage-limit --store state/overseer.sqlite3 --limit-id limit.service.requests --resource-id svc.service --kind requests --capacity 100 --remaining 25 --window hourly` - record or update Quark usage-limit evidence.
 - `PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3` - summarize Quark continuation requests and dispatch handoffs.
 - `PYTHONPATH=src python3 -m overseer.cli dispatch-usage-continuations --store state/overseer.sqlite3` - persist dispatch handoff records for ready usage-limited work.
 - `PYTHONPATH=src python3 -m overseer.cli claim-review --store state/overseer.sqlite3` - review active, queued, expired, and release-blocked claims without releasing or revoking them.

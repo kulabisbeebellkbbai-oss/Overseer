@@ -68,6 +68,7 @@ from .cli import (
     request_usage_continuation_status,
     prepare_host_security_ids_review_package_status,
     persistence_security_status,
+    record_usage_limit_status,
     request_claim_status,
     request_claim_cleanup_status,
     service_status,
@@ -306,6 +307,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/usage/continuation-requests":
                 self._handle_json(lambda payload: request_usage_continuation_status(store_path, **_usage_continuation_request_args(payload)))
                 return
+            if self.path == "/usage-limits":
+                self._handle_json(lambda payload: record_usage_limit_status(store_path, **_usage_limit_args(payload)))
+                return
             if self.path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
@@ -425,6 +429,20 @@ def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "deadline": str(payload["deadline"]) if payload.get("deadline") else None,
         "requested_by": str(payload.get("requested_by", "quark")),
         "requested_at": str(payload["requested_at"]) if payload.get("requested_at") else None,
+    }
+
+
+def _usage_limit_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "limit_id": str(payload["limit_id"]),
+        "resource_id": str(payload["resource_id"]),
+        "kind": str(payload["kind"]),
+        "capacity": int(payload["capacity"]),
+        "remaining": int(payload["remaining"]),
+        "window": str(payload["window"]),
+        "resets_at": str(payload["resets_at"]) if payload.get("resets_at") else None,
+        "observed_at": str(payload["observed_at"]) if payload.get("observed_at") else None,
+        "confidence": float(payload.get("confidence", 1.0)),
     }
 
 

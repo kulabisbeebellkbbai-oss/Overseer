@@ -169,6 +169,7 @@ from overseer.cli import request_admin_history_restore_status
 from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
+from overseer.cli import record_usage_limit_status
 from overseer.cli import request_usage_continuation_status
 from overseer.cli import dispatch_usage_continuations_status
 from overseer.cli import run_status
@@ -2365,6 +2366,30 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(plan["continuation_requests"], 1)
             self.assertEqual(plan["waiting"], 1)
 
+    def test_client_records_usage_limit_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.record_usage_limit(
+                    "limit.client.ai",
+                    "svc.client.ai",
+                    LimitKind.TOKENS.value,
+                    1000,
+                    900,
+                    "hourly",
+                    resets_at="2026-07-18T19:00:00+00:00",
+                    observed_at="2026-07-18T18:00:00+00:00",
+                    confidence=0.8,
+                )
+                summary = client.usage_summary()
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertEqual(status["limit"]["remaining"], 900)
+            self.assertEqual(summary["limits"], 1)
+            self.assertEqual(summary["items"][0]["confidence"], 0.8)
+
     def test_client_dispatches_ready_usage_continuation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4457,6 +4482,45 @@ class UsageLimitScheduleTests(unittest.TestCase):
 
 
 class UsageContinuationRequestTests(unittest.TestCase):
+    def test_records_usage_limit_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = record_usage_limit_status(
+                store_path,
+                "limit.github.requests",
+                "svc.github",
+                LimitKind.REQUESTS.value,
+                5000,
+                4000,
+                "hourly",
+                resets_at="2026-07-18T11:00:00-04:00",
+                observed_at="2026-07-18T10:30:00-04:00",
+                confidence=0.9,
+            )
+            summary = usage_summary_status(store_path)
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["limit"]["remaining"], 4000)
+            self.assertEqual(summary["limits"], 1)
+            self.assertEqual(summary["items"][0]["confidence"], 0.9)
+
+    def test_rejects_invalid_usage_limit_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with self.assertRaises(ValueError):
+                record_usage_limit_status(
+                    store_path,
+                    "limit.bad",
+                    "svc.bad",
+                    LimitKind.REQUESTS.value,
+                    10,
+                    11,
+                    "hourly",
+                )
+
     def test_persists_usage_continuation_request_and_plans_waiting_work(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

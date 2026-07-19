@@ -38,9 +38,20 @@ Overseer should avoid wasting limited service capacity. When a project thread ne
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli record-usage-limit \
+  --store state/overseer.sqlite3 \
+  --limit-id limit.service.requests \
+  --resource-id svc.service \
+  --kind requests \
+  --capacity 100 \
+  --remaining 25 \
+  --window hourly \
+  --resets-at 2026-07-18T12:00:00-04:00
 ```
 
 `usage-summary` is Quark's compact read model for persisted service limits. It reports total limits, available capacity, exhausted limits, unknown reset times, low-confidence observations, the next reset timestamp, counts by limit kind, and per-limit details.
+
+`record-usage-limit` records or updates the latest observed capacity state for a limited service without probing a live provider or mutating host state.
 
 ## Continuation Requests
 

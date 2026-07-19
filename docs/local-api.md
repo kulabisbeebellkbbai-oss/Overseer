@@ -76,6 +76,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/ids-review-packages/prompts`
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
+- `POST /usage-limits`
 - `POST /usage/continuation-requests`
 - `POST /usage/continuation-dispatches`
 - `POST /admin/plans`
@@ -148,6 +149,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
+`POST /usage-limits` records or updates a Quark usage-limit observation with `limit_id`, `resource_id`, `kind`, `capacity`, `remaining`, and `window`; optional fields are `resets_at`, `observed_at`, and `confidence`.
 `GET /usage/continuation-plan` returns persisted usage-limited continuation requests, dispatch records, and their current ready, waiting, blocked, or escalated schedule without mutating host state.
 `POST /usage/continuation-requests` persists a Quark continuation request with `request_id`, `limit_id`, `resource_id`, `owner_thread`, `requested_units`, and `intent`; optional fields are `risk_level`, `earliest_start`, `deadline`, `requested_by`, and `requested_at`.
 `POST /usage/continuation-dispatches` persists idempotent dispatch records for ready continuation requests; optional fields are `dispatched_by` and `dispatched_at`. It does not wake external threads or mutate host schedulers.

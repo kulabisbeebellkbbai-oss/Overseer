@@ -38,9 +38,18 @@ class SQLiteStore:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._connection = sqlite3.connect(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(self.path, timeout=30.0)
         self._connection.row_factory = sqlite3.Row
+        self._configure_connection()
         self.initialize()
+
+    def _configure_connection(self) -> None:
+        self._connection.execute("PRAGMA busy_timeout = 30000")
+        try:
+            self._connection.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         self._connection.close()

@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .cli import (
     activate_claim_status,
+    active_policy_profile_status,
     admin_adapter_capabilities_status,
     admin_adapter_enablement_plan_status,
     admin_executions_status,
@@ -212,6 +213,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/admin/policies":
                 self._handle(lambda: admin_policy_status(store_path, _query_first(query, "plan_id")))
+                return
+            if path == "/admin/active-policy-profile":
+                self._handle(lambda: active_policy_profile_status(store_path))
                 return
             if path == "/admin/policy-customization-helper":
                 self._handle(lambda: policy_customization_helper_cli_status())

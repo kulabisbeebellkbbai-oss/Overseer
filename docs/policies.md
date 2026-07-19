@@ -10,6 +10,7 @@ Admin policy evaluation is available with:
 PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api
 PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3 --policy-profile state/policy-profile.json
+PYTHONPATH=src python3 -m overseer.cli active-policy-profile --store state/overseer.sqlite3
 ```
 
 The matching API endpoint is:
@@ -17,7 +18,10 @@ The matching API endpoint is:
 ```text
 GET /admin/policies
 GET /admin/policies?plan_id=admin.restart.overseer-api
+GET /admin/active-policy-profile
 ```
+
+When `--policy-profile` is omitted, the CLI and API look for an active profile named `policy-profile.json` in the same directory as the selected store. For the default local store, that path is `state/policy-profile.json`. If the file is missing, Overseer uses the bundled `best-practice` profile.
 
 ## Checks
 
@@ -55,6 +59,7 @@ Generate the reusable customization questionnaire and JSON template with:
 PYTHONPATH=src python3 -m overseer.cli policy-customization-helper
 PYTHONPATH=src python3 -m overseer.cli policy-customization-helper --output state/policy-customization-helper.json
 PYTHONPATH=src python3 -m overseer.cli build-policy-profile --answers state/policy-answers.json --output state/policy-profile.json
+PYTHONPATH=src python3 -m overseer.cli active-policy-profile --store state/overseer.sqlite3
 ```
 
 The helper output contains:
@@ -75,6 +80,8 @@ The answer file is a JSON object keyed by stable question IDs. Example:
 ```
 
 Use the same helper on new installs before local policy customization sessions. Keep the generated policy profile out of public commits when it contains site-specific operational choices.
+
+Policy customization should be the final local setup step after the functional adapters and default gates are in place. Until then, use `active-policy-profile` to confirm that the best-practice defaults are active.
 
 ## Decision Status
 

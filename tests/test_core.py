@@ -130,6 +130,7 @@ from overseer.cli import discover_storage_status
 from overseer.cli import discover_virtual_listeners_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
+from overseer.cli import active_policy_profile_status
 from overseer.cli import admin_adapter_capabilities_status
 from overseer.cli import admin_adapter_enablement_plan_status
 from overseer.cli import admin_executions_status
@@ -3081,6 +3082,23 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertIn("questions", status)
             self.assertIn("next_step", status)
 
+    def test_client_reads_active_policy_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            (root / "policy-profile.json").write_text(
+                json.dumps({"profile": {"name": "client-active", "block_warnings_until_accepted": False}}),
+                encoding="utf-8",
+            )
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.active_policy_profile()
+
+            self.assertEqual(status["profile"]["name"], "client-active")
+            self.assertEqual(status["source"], "store_sibling_file")
+            self.assertTrue(status["active"])
+
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4843,6 +4861,69 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(checks["admin.adapter.enabled"]["status"], PolicyCheckStatus.PASS.value)
         self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.WARN.value)
 
+    def test_active_policy_profile_status_reports_best_practice_when_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = active_policy_profile_status(store_path)
+
+        self.assertEqual(status["profile"]["name"], "best-practice")
+        self.assertEqual(status["source"], "best_practice_default")
+        self.assertFalse(status["customized"])
+        self.assertTrue(status["path"].endswith("policy-profile.json"))
+        self.assertIn("build-policy-profile", status["next_step"])
+
+    def test_active_policy_profile_status_reports_store_sibling_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            profile_path = root / "policy-profile.json"
+            profile_path.write_text(
+                json.dumps(
+                    {
+                        "name": "store-profile",
+                        "block_warnings_until_accepted": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = active_policy_profile_status(store_path)
+
+        self.assertEqual(status["profile"]["name"], "store-profile")
+        self.assertEqual(status["source"], "store_sibling_file")
+        self.assertEqual(status["path"], str(profile_path))
+        self.assertTrue(status["customized"])
+
+    def test_admin_policy_status_uses_store_sibling_policy_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            (root / "policy-profile.json").write_text(
+                json.dumps({"name": "store-warning-observing", "block_warnings_until_accepted": False}),
+                encoding="utf-8",
+            )
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.active-profile",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply approved patch",
+                "upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
+            approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.active-profile", "operator")
+
+            status = admin_policy_status(store_path, "admin.apt.upgrade.active-profile")
+            item = status["items"][0]
+
+        self.assertEqual(status["policy_profile"], "store-warning-observing")
+        self.assertEqual(status["policy_profile_source"], "store_sibling_file")
+        self.assertEqual(item["status"], PolicyCheckStatus.WARN.value)
+        self.assertTrue(item["can_proceed"])
+
     def test_execute_admin_change_status_blocks_policy_warnings(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4872,6 +4953,42 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(result["status"], AdminExecutionStatus.BLOCKED.value)
         self.assertEqual(result["policy"]["status"], PolicyCheckStatus.WARN.value)
         self.assertIn("admin policy warn", result["summary"])
+
+    def test_execute_admin_change_status_uses_store_sibling_policy_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            (root / "policy-profile.json").write_text(
+                json.dumps({"profile": {"name": "store-execution-profile", "block_warnings_until_accepted": False}}),
+                encoding="utf-8",
+            )
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.active-profile-exec",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply approved patch",
+                "upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
+            approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.active-profile-exec", "operator")
+
+            result = execute_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.active-profile-exec",
+                runner=lambda step: AdminCommandResult(
+                    title=step.title,
+                    command=step.command,
+                    exit_code=0,
+                    stdout="ok",
+                ),
+            )
+
+        self.assertEqual(result["status"], AdminExecutionStatus.COMPLETED.value)
+        self.assertEqual(result["policy_profile"], "store-execution-profile")
+        self.assertEqual(result["policy_profile_source"], "store_sibling_file")
 
     def test_admin_policy_warning_approval_allows_residual_warning(self):
         with tempfile.TemporaryDirectory() as directory:

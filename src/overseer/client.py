@@ -419,6 +419,9 @@ class OverseerApiClient:
         query = f"?{urlencode({'plan_id': plan_id})}" if plan_id else ""
         return self._get(f"/admin/policies{query}")
 
+    def active_policy_profile(self) -> dict[str, Any]:
+        return self._get("/admin/active-policy-profile")
+
     def policy_customization_helper(self) -> dict[str, Any]:
         return self._get("/admin/policy-customization-helper")
 

@@ -66,6 +66,7 @@ from .policy import (
     policy_customization_helper_status,
     policy_profile_from_answers_status,
     policy_profile_from_mapping,
+    policy_profile_status,
 )
 from .policy import PolicyCheckStatus
 from .registry import ResourceRegistry
@@ -83,6 +84,8 @@ from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
 from .usage_limits import LimitKind, UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 from .virtual_discovery import ListenerVirtualDiscoveryAdapter
+
+POLICY_PROFILE_FILENAME = "policy-profile.json"
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -2180,7 +2183,7 @@ def execute_admin_change_status(
     runner=None,
     policy_profile_path: str | Path | None = None,
 ) -> dict[str, object]:
-    profile = load_policy_profile(policy_profile_path)
+    profile, profile_path, profile_source = load_active_policy_profile(store_path, policy_profile_path)
     store = SQLiteStore(store_path)
     try:
         plan = store.load_admin_change_plan(plan_id)
@@ -2208,11 +2211,24 @@ def execute_admin_change_status(
             )
             store.save_admin_execution(result)
             store.save_audit_event(audit_event_from_admin_execution(plan, result))
-            return {"store": str(store.path), "policy": admin_policy_decision_status(policy_decision), **admin_execution_status(result)}
+            return {
+                "store": str(store.path),
+                "policy_profile": profile.name,
+                "policy_profile_source": profile_source,
+                "policy_profile_path": str(profile_path),
+                "policy": admin_policy_decision_status(policy_decision),
+                **admin_execution_status(result),
+            }
         result = execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds)
         store.save_admin_execution(result)
         store.save_audit_event(audit_event_from_admin_execution(plan, result))
-        return {"store": str(store.path), **admin_execution_status(result)}
+        return {
+            "store": str(store.path),
+            "policy_profile": profile.name,
+            "policy_profile_source": profile_source,
+            "policy_profile_path": str(profile_path),
+            **admin_execution_status(result),
+        }
     finally:
         store.close()
 
@@ -2874,7 +2890,7 @@ def admin_policy_status(
     plan_id: str | None = None,
     policy_profile_path: str | Path | None = None,
 ) -> dict[str, object]:
-    profile = load_policy_profile(policy_profile_path)
+    profile, profile_path, profile_source = load_active_policy_profile(store_path, policy_profile_path)
     store = SQLiteStore(store_path)
     try:
         enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
@@ -2897,6 +2913,8 @@ def admin_policy_status(
             "store": str(store.path),
             "plan_id": plan_id,
             "policy_profile": profile.name,
+            "policy_profile_source": profile_source,
+            "policy_profile_path": str(profile_path),
             "plans": len(decisions),
             "pass": sum(1 for decision in decisions if decision.status.value == "pass"),
             "warn": sum(1 for decision in decisions if decision.status.value == "warn"),
@@ -2929,6 +2947,47 @@ def load_policy_profile(policy_profile_path: str | Path | None = None) -> Policy
     if not isinstance(profile, dict):
         raise ValueError("policy profile must be a JSON object")
     return policy_profile_from_mapping(profile)
+
+
+def active_policy_profile_path(store_path: str | Path) -> Path:
+    return Path(store_path).parent / POLICY_PROFILE_FILENAME
+
+
+def load_active_policy_profile(
+    store_path: str | Path,
+    policy_profile_path: str | Path | None = None,
+) -> tuple[PolicyProfile, Path, str]:
+    if policy_profile_path is not None:
+        path = Path(policy_profile_path)
+        return load_policy_profile(path), path, "explicit_file"
+    path = active_policy_profile_path(store_path)
+    if path.exists():
+        return load_policy_profile(path), path, "store_sibling_file"
+    return PolicyProfile(), path, "best_practice_default"
+
+
+def active_policy_profile_status(
+    store_path: str | Path,
+    policy_profile_path: str | Path | None = None,
+) -> dict[str, object]:
+    profile, path, source = load_active_policy_profile(store_path, policy_profile_path)
+    customized = profile.name != PolicyProfile().name
+    status: dict[str, object] = {
+        "store": str(Path(store_path)),
+        "path": str(path),
+        "source": source,
+        "active": True,
+        "customized": customized,
+        "profile": policy_profile_status(profile),
+    }
+    if source == "best_practice_default":
+        status["next_step"] = (
+            "Run policy-customization-helper and build-policy-profile after the customization Q/A session, "
+            f"then save the generated profile at {path}."
+        )
+    else:
+        status["next_step"] = "Evaluate admin-policy-status before executing privileged plans."
+    return status
 
 
 def policy_customization_helper_cli_status(output_path: str | Path | None = None) -> dict[str, object]:
@@ -5528,6 +5587,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_policy_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_policy_parser.add_argument("--plan-id", help="filter policy evaluation to one admin plan")
     admin_policy_parser.add_argument("--policy-profile", help="optional JSON policy profile generated by policy-customization-helper")
+    active_policy_profile_parser = subparsers.add_parser("active-policy-profile", help="show the policy profile currently active for a store")
+    active_policy_profile_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    active_policy_profile_parser.add_argument("--policy-profile", help="optional JSON policy profile to inspect instead of the store-local active profile")
     policy_helper_parser = subparsers.add_parser("policy-customization-helper", help="print best-practice policy defaults and reusable customization questions")
     policy_helper_parser.add_argument("--output", help="optional JSON output path for the helper payload")
     build_policy_profile_parser = subparsers.add_parser("build-policy-profile", help="build a policy profile JSON from policy customization answers")
@@ -6077,6 +6139,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-policy-status":
         print(json.dumps(admin_policy_status(args.store, args.plan_id, args.policy_profile), sort_keys=True))
+        return 0
+
+    if args.command == "active-policy-profile":
+        print(json.dumps(active_policy_profile_status(args.store, args.policy_profile), sort_keys=True))
         return 0
 
     if args.command == "policy-customization-helper":

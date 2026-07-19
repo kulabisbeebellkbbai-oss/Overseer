@@ -161,6 +161,7 @@ def seed_config_status(config_path: str | Path, store_path: str | Path) -> dict[
             "resources": result.resource_count,
             "usage_limits": result.usage_limit_count,
             "health_targets": result.health_target_count,
+            "physical_identities": result.physical_identity_count,
         }
     finally:
         store.close()

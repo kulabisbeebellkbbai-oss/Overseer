@@ -4469,6 +4469,15 @@ class ConfigLoadingTests(unittest.TestCase):
                         "expected_content_type": "application/json",
                     }
                 ],
+                "physical_identities": [
+                    {
+                        "kind": "serial_port",
+                        "stable_id": "serial.config.rs485",
+                        "observed_paths": ["/dev/serial/by-id/config-rs485"],
+                        "capabilities": ["rs485"],
+                        "exclusive_groups": ["rs485-bus"],
+                    }
+                ],
             }
         )
 
@@ -4477,6 +4486,8 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(config.resources[0].ports(), frozenset({8795}))
         self.assertEqual(config.usage_limits[0].remaining, 50)
         self.assertEqual(config.health_targets[0].probe_type, ProbeType.JSON)
+        self.assertEqual(config.physical_identities[0].stable_id, "serial.config.rs485")
+        self.assertIn("rs485", config.physical_identities[0].capabilities)
 
     def test_rejects_secret_like_config_keys(self):
         with self.assertRaises(ValueError):
@@ -4524,6 +4535,25 @@ class ConfigLoadingTests(unittest.TestCase):
                             "probe_type": "json",
                             "target": "http://127.0.0.1:8794/health",
                         }
+                    ]
+                }
+            )
+
+    def test_rejects_conflicting_physical_identities(self):
+        with self.assertRaises(ValueError):
+            config_from_mapping(
+                {
+                    "physical_identities": [
+                        {
+                            "kind": "serial_port",
+                            "stable_id": "serial.left",
+                            "observed_paths": ["/dev/ttyUSB0"],
+                        },
+                        {
+                            "kind": "serial_port",
+                            "stable_id": "serial.right",
+                            "observed_paths": ["/dev/ttyUSB0"],
+                        },
                     ]
                 }
             )
@@ -4704,6 +4734,13 @@ class CliDemoTests(unittest.TestCase):
                                 "window": "hourly",
                             }
                         ],
+                        "physical_identities": [
+                            {
+                                "kind": "serial_port",
+                                "stable_id": "serial.cli.config",
+                                "observed_paths": ["/dev/serial/by-id/cli-config"],
+                            }
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -4714,6 +4751,7 @@ class CliDemoTests(unittest.TestCase):
             self.assertEqual(status["store"], str(store_path))
             self.assertEqual(status["resources"], 1)
             self.assertEqual(status["usage_limits"], 1)
+            self.assertEqual(status["physical_identities"], 1)
 
 
 class ApprovalAuditTests(unittest.TestCase):
@@ -4884,6 +4922,13 @@ class SQLiteStoreTests(unittest.TestCase):
                             "target": "http://127.0.0.1:8794/health",
                         }
                     ],
+                    "physical_identities": [
+                        {
+                            "kind": "storage_array",
+                            "stable_id": "storage.seeded",
+                            "storage_profile": "read_only",
+                        }
+                    ],
                 }
             )
 
@@ -4892,9 +4937,11 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(result.resource_count, 1)
             self.assertEqual(result.usage_limit_count, 1)
             self.assertEqual(result.health_target_count, 1)
+            self.assertEqual(result.physical_identity_count, 1)
             self.assertEqual(store.load_resource("svc.seeded").owner_domain, OwnerDomain.JULIAN)
             self.assertEqual(store.load_usage_limit("limit.seeded").remaining, 10)
             self.assertEqual(store.load_health_target("health.seeded").resource_id, "svc.seeded")
+            self.assertEqual(store.load_physical_identity("storage.seeded").storage_profile, "read_only")
             store.close()
 
 

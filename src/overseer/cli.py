@@ -74,6 +74,7 @@ from .source_review import HostSecuritySourceReview, SourceReviewDisposition
 from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
 from .usage_limits import LimitKind, UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
+from .virtual_discovery import ListenerVirtualDiscoveryAdapter
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -381,6 +382,25 @@ def virtual_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def discover_virtual_listeners_status(
+    store_path: str | Path,
+    adapter: ListenerVirtualDiscoveryAdapter | None = None,
+    snapshot: HostInspectionSnapshot | None = None,
+) -> dict[str, object]:
+    resources = (adapter or ListenerVirtualDiscoveryAdapter()).discover(snapshot)
+    store = SQLiteStore(store_path)
+    try:
+        for resource in resources:
+            store.save_resource(resource)
+        return {
+            "store": str(store.path),
+            "count": len(resources),
+            "assets": [virtual_resource_status(resource, ()) for resource in resources],
+        }
+    finally:
+        store.close()
+
+
 def virtual_resource_kind(resource: Resource) -> str:
     kind = resource.identifiers.get("kind", "unknown")
     return str(kind) if str(kind) in VIRTUAL_ASSET_KINDS else "unknown"
@@ -405,6 +425,8 @@ def virtual_resource_status(resource: Resource, claims: Sequence[Claim]) -> dict
         "state": ResourceState(resource.state).value,
         "host": resource.identifiers.get("host"),
         "ports": sorted(resource.ports()),
+        "protocol": resource.identifiers.get("protocol"),
+        "bind_scope": resource.identifiers.get("bind_scope"),
         "networks": _sorted_identifier_values(resource, "networks"),
         "state_path": resource.identifiers.get("state_path"),
         "process_hint": resource.identifiers.get("process_hint"),
@@ -5163,6 +5185,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     physical_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     virtual_summary_parser = subparsers.add_parser("virtual-summary", help="summarize persisted virtual assets")
     virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    discover_virtual_parser = subparsers.add_parser("discover-virtual-listeners", help="discover local TCP listeners as virtual assets")
+    discover_virtual_parser.add_argument("--store", required=True, help="explicit SQLite store path for persisting discovered listener resources")
     command_summary_parser = subparsers.add_parser("command-summary", help="summarize command-level Overseer state")
     command_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     command_summary_parser.add_argument("--service-name", default="overseer")
@@ -5621,6 +5645,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "virtual-summary":
         print(json.dumps(virtual_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "discover-virtual-listeners":
+        print(json.dumps(discover_virtual_listeners_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "command-summary":

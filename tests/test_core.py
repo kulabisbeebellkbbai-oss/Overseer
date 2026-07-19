@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import overseer.api as overseer_api
 from overseer import (
     ApprovalLevel,
     ApprovalRequest,
@@ -52,6 +53,7 @@ from overseer import (
     HostCommandObservation,
     HostFindingSeverity,
     HostInspectionAdapter,
+    HostInspectionSnapshot,
     HttpHealthProbeAdapter,
     InterruptionPolicy,
     IDSReviewPackageStatus,
@@ -67,6 +69,7 @@ from overseer import (
     OverseerCoordinator,
     PathPhysicalDiscoveryAdapter,
     StoragePhysicalDiscoveryAdapter,
+    ListenerVirtualDiscoveryAdapter,
     PolicyCheckStatus,
     ProbeResult,
     ProbeType,
@@ -117,6 +120,7 @@ from overseer.client import OverseerApiClient
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import discover_storage_status
+from overseer.cli import discover_virtual_listeners_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_adapter_capabilities_status
@@ -197,6 +201,7 @@ from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
 from overseer.cli import usage_continuation_plan_status
 from overseer.cli import virtual_summary_status
+from overseer import parse_tcp_listeners
 
 
 class _JsonHealthHandler(BaseHTTPRequestHandler):
@@ -1986,6 +1991,41 @@ class OverseerApiTests(unittest.TestCase):
 
             self.assertEqual(status["service"]["tick_count"], 3)
             self.assertFalse(status["host_inspection"]["enabled"])
+
+    def test_loopback_api_discovers_virtual_listeners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            original = overseer_api.discover_virtual_listeners_status
+
+            def fake_discover(store_path):
+                store = SQLiteStore(store_path)
+                try:
+                    store.save_resource(
+                        Resource(
+                            id="listener.tcp.127-0-0-1.8766",
+                            name="TCP 127.0.0.1:8766",
+                            type=ResourceType.VIRTUAL_ASSET,
+                            owner_domain=OwnerDomain.DAX,
+                            risk_level=RiskLevel.LOW,
+                            identifiers={"kind": "proxy", "host": "127.0.0.1", "ports": [8766]},
+                            exclusive_groups=frozenset({"tcp.8766"}),
+                        )
+                    )
+                finally:
+                    store.close()
+                return {"store": str(store_path), "count": 1, "assets": []}
+
+            try:
+                overseer_api.discover_virtual_listeners_status = fake_discover
+                with LocalOverseerApiServer(store_path) as server:
+                    discovered = server.post("/virtual/discover-listeners", {})
+                    summary = server.get("/virtual-summary")
+            finally:
+                overseer_api.discover_virtual_listeners_status = original
+
+            self.assertEqual(discovered["count"], 1)
+            self.assertEqual(summary["assets"], 1)
+            self.assertEqual(summary["items"][0]["id"], "listener.tcp.127-0-0-1.8766")
 
     def test_loopback_api_reports_alerts_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4883,6 +4923,81 @@ class PhysicalDiscoveryTests(unittest.TestCase):
         self.assertEqual(loaded.kind, PhysicalAssetKind.STORAGE_ARRAY)
         self.assertEqual(loaded.source, PhysicalIdentitySource.DISCOVERED)
         store.close()
+
+
+class VirtualDiscoveryTests(unittest.TestCase):
+    def test_parse_tcp_listeners_extracts_unique_listen_sockets(self):
+        listeners = parse_tcp_listeners(
+            "\n".join(
+                (
+                    "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process",
+                    'LISTEN 0 4096 127.0.0.1:8766 0.0.0.0:* users:(("python3",pid=100,fd=3))',
+                    'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=101,fd=4))',
+                    'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=101,fd=4))',
+                )
+            )
+        )
+
+        self.assertEqual(len(listeners), 2)
+        self.assertEqual(listeners[0].address, "127.0.0.1")
+        self.assertEqual(listeners[0].port, 8766)
+        self.assertEqual(listeners[1].address, "0.0.0.0")
+        self.assertEqual(listeners[1].port, 22)
+
+    def test_listener_virtual_discovery_maps_snapshot_to_resources(self):
+        snapshot = HostInspectionSnapshot(
+            id="host.test",
+            captured_at="2026-07-19T09:00:00+00:00",
+            hostname="test-host",
+            os_release={},
+            observations=(
+                HostCommandObservation(
+                    name="ss",
+                    command=("ss", "-ltnp"),
+                    exit_code=0,
+                    stdout='LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=101,fd=4))',
+                ),
+            ),
+        )
+
+        resources = ListenerVirtualDiscoveryAdapter().discover(snapshot)
+
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0].id, "listener.tcp.0-0-0-0.22")
+        self.assertEqual(resources[0].type, ResourceType.VIRTUAL_ASSET)
+        self.assertEqual(resources[0].owner_domain, OwnerDomain.DAX)
+        self.assertEqual(resources[0].risk_level, RiskLevel.HIGH)
+        self.assertEqual(resources[0].identifiers["kind"], "gateway")
+        self.assertEqual(resources[0].identifiers["bind_scope"], "all_interfaces")
+        self.assertEqual(resources[0].ports(), frozenset({22}))
+        self.assertIn("tcp.22", resources[0].exclusive_groups)
+        self.assertIn("tcp.0-0-0-0.22", resources[0].exclusive_groups)
+
+    def test_discover_virtual_listeners_status_persists_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionSnapshot(
+                id="host.persist",
+                captured_at="2026-07-19T09:00:00+00:00",
+                hostname="test-host",
+                os_release={},
+                observations=(
+                    HostCommandObservation(
+                        name="ss",
+                        command=("ss", "-ltnp"),
+                        exit_code=0,
+                        stdout="LISTEN 0 4096 127.0.0.1:8766 0.0.0.0:*",
+                    ),
+                ),
+            )
+            status = discover_virtual_listeners_status(store_path, snapshot=snapshot)
+            summary = virtual_summary_status(store_path)
+
+        self.assertEqual(status["store"], str(store_path))
+        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["assets"][0]["protocol"], "tcp")
+        self.assertEqual(status["assets"][0]["bind_scope"], "loopback")
+        self.assertEqual(summary["assets"], status["count"])
 
 
 class MaintenancePlanTests(unittest.TestCase):

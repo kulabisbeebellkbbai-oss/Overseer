@@ -101,3 +101,24 @@ PYTHONPATH=src python3 -m overseer.cli virtual-summary --store state/overseer.sq
 ```
 
 `virtual-summary` is Dax's compact read model for persisted virtual resources. It reports asset counts, checkout readiness, active and queued claims, reserved ports, counts by virtual kind, state, and risk, plus per-asset topology identity details.
+
+## Live Listener Discovery
+
+Dax can discover local TCP listeners as virtual assets from read-only host inspection evidence:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli discover-virtual-listeners --store state/overseer.sqlite3
+```
+
+The adapter reads the existing `ss -ltnp` host-inspection observation and persists one `listener.tcp.*` virtual resource per unique listener. It does not change firewall rules, routes, service definitions, processes, proxies, or network bindings.
+
+Discovered listener assets include:
+
+- `kind`: `gateway` for all-interface listeners, otherwise `proxy`.
+- `protocol`: `tcp`.
+- `bind_scope`: `loopback`, `all_interfaces`, or `non_loopback`.
+- `host` and `ports`.
+- `exclusive_groups`: `tcp.<port>` plus the listener-specific `tcp.<host>.<port>` group.
+- `process_hint`: the source evidence line from `ss`.
+
+Risk routing is conservative: loopback listeners are low risk, non-loopback listeners are medium risk, and all-interface listeners are high risk.

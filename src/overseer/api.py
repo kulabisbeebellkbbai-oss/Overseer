@@ -45,6 +45,7 @@ from .cli import (
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
     discover_storage_status,
+    discover_virtual_listeners_status,
     execute_admin_change_status,
     execute_claim_cleanup_status,
     export_host_security_ids_review_prompt_status,
@@ -269,6 +270,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/physical/discover-storage":
                 self._handle_json(lambda payload: discover_storage_status(**_physical_storage_discovery_args(store_path, payload)))
+                return
+            if self.path == "/virtual/discover-listeners":
+                self._handle(lambda: discover_virtual_listeners_status(store_path))
                 return
             if self.path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))

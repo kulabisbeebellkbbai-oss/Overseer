@@ -178,6 +178,9 @@ class OverseerApiClient:
     def virtual_summary(self) -> dict[str, Any]:
         return self._get("/virtual-summary")
 
+    def discover_virtual_listeners(self) -> dict[str, Any]:
+        return self._post("/virtual/discover-listeners", {})
+
     def alerts_summary(self) -> dict[str, Any]:
         return self._get("/alerts-summary")
 

@@ -73,6 +73,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/cleanup-requests/approve`
 - `POST /claims/cleanup-requests/execute`
 - `POST /physical/discover-storage`
+- `POST /virtual/discover-listeners`
 - `POST /host/inspect`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
@@ -142,6 +143,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /claims/cleanup-requests/approve` approves a pending cleanup request after validating that its claim is still a cleanup candidate. It does not mutate the claim.
 `POST /claims/cleanup-requests/execute` executes only an approved cleanup request after re-validating the cleanup candidate. It can mark an expired active-like claim expired, re-evaluate a stale queued claim, move a release-blocked claim to `releasing`, or revoke a blocked claim. Moving a claim to `releasing` does not free the resource.
 `POST /physical/discover-storage` reads sysfs block-device metadata and persists discovered storage identities for Kira. Optional field: `sysfs_block_root`. It does not mount, unmount, format, partition, or write to devices.
+`POST /virtual/discover-listeners` reads local TCP listener evidence and persists discovered listener resources for Dax. It does not change firewall rules, routes, processes, service definitions, proxies, or network bindings.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership, permissions, sidecar files, and schema migration metadata without creating a missing database or changing file modes.
@@ -194,6 +196,7 @@ continuation_plan = client.usage_continuation_plan()
 physical = client.physical_summary()
 storage = client.discover_storage()
 virtual = client.virtual_summary()
+listeners = client.discover_virtual_listeners()
 efficiency = client.health_efficiency()
 summary = client.health_summary()
 snapshot = client.inspect_host()

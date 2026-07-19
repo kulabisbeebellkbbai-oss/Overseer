@@ -144,6 +144,7 @@ from .usage_limits import (
     UsageSchedule,
     schedule_limited_work,
 )
+from .virtual_discovery import ListenerVirtualDiscoveryAdapter, TcpListener, parse_tcp_listeners
 
 __all__ = [
     "DryRunExecutor",
@@ -286,4 +287,7 @@ __all__ = [
     "UsageLimit",
     "UsageSchedule",
     "schedule_limited_work",
+    "ListenerVirtualDiscoveryAdapter",
+    "TcpListener",
+    "parse_tcp_listeners",
 ]

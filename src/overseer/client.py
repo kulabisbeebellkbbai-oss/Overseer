@@ -132,6 +132,12 @@ class OverseerApiClient:
     def usage_continuation_plan(self) -> dict[str, Any]:
         return self._get("/usage/continuation-plan")
 
+    def discover_codex_project_threads(self, codex_projects_registry: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if codex_projects_registry:
+            payload["codex_projects_registry"] = codex_projects_registry
+        return self._post("/codex-projects/discover-threads", payload)
+
     def dispatch_usage_continuations(
         self,
         dispatched_by: str = "quark",

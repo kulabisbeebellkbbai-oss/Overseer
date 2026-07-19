@@ -53,6 +53,14 @@ PYTHONPATH=src python3 -m overseer.cli record-usage-limit \
 
 `record-usage-limit` records or updates the latest observed capacity state for a limited service without probing a live provider or mutating host state.
 
+## Codex Thread Registry
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli discover-codex-project-threads --store state/overseer.sqlite3
+```
+
+`discover-codex-project-threads` reads the local `codex-projects` CSV registry and imports each registered conversation as a Quark-owned `usage_limited_service` resource. This gives continuation requests a managed owner-thread resource before any resume action is attempted. The command does not start, resume, or stop Codex sessions.
+
 ## Continuation Requests
 
 ```bash

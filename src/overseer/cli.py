@@ -39,7 +39,7 @@ from .admin import (
     unarchive_admin_change_plan,
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
-from .codex_projects import CodexProjectThreadAdapter
+from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
@@ -4153,6 +4153,43 @@ def usage_summary_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def discover_codex_project_threads_status(
+    store_path: str | Path,
+    registry_path: str | Path = "/home/god/.codex/codex-projects.csv",
+    adapter: CodexProjectThreadAdapter | None = None,
+) -> dict[str, object]:
+    selected_adapter = adapter or CodexProjectThreadAdapter(registry_path)
+    threads = selected_adapter.list_threads()
+    resources = codex_project_thread_resources(threads)
+    store = SQLiteStore(store_path)
+    try:
+        for resource in resources:
+            store.save_resource(resource)
+        return {
+            "store": str(store.path),
+            "registry": str(selected_adapter.registry_path),
+            "threads": len(threads),
+            "resources": len(resources),
+            "items": [codex_project_thread_status(thread, resource) for thread, resource in zip(threads, resources, strict=True)],
+            "mutation_performed": bool(resources),
+            "host_mutation_performed": False,
+            "next_step": "review imported codex-project thread resources before scheduling continuation work",
+        }
+    finally:
+        store.close()
+
+
+def codex_project_thread_status(thread, resource: Resource | None = None) -> dict[str, object]:
+    return {
+        "conversation_id": thread.conversation_id,
+        "label": thread.label,
+        "project": thread.project,
+        "command": thread.command,
+        "launcher": thread.launcher,
+        "resource_id": resource.id if resource else None,
+    }
+
+
 def record_usage_limit_status(
     store_path: str | Path,
     limit_id: str,
@@ -5758,6 +5795,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    discover_codex_threads_parser = subparsers.add_parser(
+        "discover-codex-project-threads",
+        help="import local codex-projects registry rows as managed Overseer resources",
+    )
+    discover_codex_threads_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    discover_codex_threads_parser.add_argument(
+        "--codex-projects-registry",
+        default="/home/god/.codex/codex-projects.csv",
+        help="codex-projects CSV registry path",
+    )
     record_usage_limit_parser = subparsers.add_parser("record-usage-limit", help="record or update a usage-limit observation")
     record_usage_limit_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     record_usage_limit_parser.add_argument("--limit-id", required=True)
@@ -6337,6 +6384,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-summary":
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "discover-codex-project-threads":
+        print(json.dumps(discover_codex_project_threads_status(args.store, args.codex_projects_registry), sort_keys=True))
         return 0
 
     if args.command == "record-usage-limit":

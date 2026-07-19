@@ -42,6 +42,7 @@ from .cli import (
     claim_review_status,
     command_summary_status,
     create_host_security_source_review_status,
+    discover_codex_project_threads_status,
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
@@ -375,6 +376,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
+            if self.path == "/codex-projects/discover-threads":
+                self._handle_json(lambda payload: discover_codex_project_threads_status(store_path, **_codex_project_discovery_args(payload)))
+                return
             if self.path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
                 return
@@ -528,6 +532,12 @@ def _usage_continuation_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
         "resume_codex_projects": bool(payload.get("resume_codex_projects", False)),
         "codex_projects_registry": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
+    }
+
+
+def _codex_project_discovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "registry_path": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
     }
 
 

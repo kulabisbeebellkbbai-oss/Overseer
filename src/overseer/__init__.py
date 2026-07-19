@@ -42,7 +42,13 @@ from .audit import (
     audit_event_from_decision,
 )
 from .config import ConfigSeedResult, OverseerConfig, config_from_mapping, load_config, seed_store_from_config, validate_config
-from .codex_projects import CodexProjectResumeResult, CodexProjectThread, CodexProjectThreadAdapter
+from .codex_projects import (
+    CodexProjectResumeResult,
+    CodexProjectThread,
+    CodexProjectThreadAdapter,
+    codex_project_thread_resource,
+    codex_project_thread_resources,
+)
 from .core import (
     ApprovalLevel,
     Claim,

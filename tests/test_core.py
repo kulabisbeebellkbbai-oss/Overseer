@@ -22,6 +22,7 @@ from overseer import (
     Claim,
     ClaimStatus,
     ClaimType,
+    CodexProjectThread,
     CodexProjectThreadAdapter,
     ConflictDecision,
     ConflictOutcome,
@@ -98,6 +99,7 @@ from overseer import (
     audit_event_from_decision,
     can_close_maintenance,
     config_from_mapping,
+    codex_project_thread_resource,
     needs_operator_approval,
     physical_identity_conflicts,
     parse_apt_upgradable,
@@ -129,6 +131,7 @@ from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
 from overseer.ui import OPERATOR_CONSOLE_HTML
 from overseer.cli import demo_status
+from overseer.cli import discover_codex_project_threads_status
 from overseer.cli import discover_physical_status
 from overseer.cli import discover_storage_status
 from overseer.cli import discover_user_services_status
@@ -5795,6 +5798,64 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(runner.commands[0], ["/tmp/tmux", "has-session", "-t", "codex-overseer-019f7140"])
             self.assertEqual(runner.commands[1][0:6], ["/tmp/tmux", "new-session", "-d", "-s", "codex-overseer-019f7140", "-c"])
             self.assertIn("/tmp/codex-memory-session", runner.commands[1])
+
+    def test_maps_codex_project_thread_to_usage_limited_resource(self):
+        thread = CodexProjectThread(
+            conversation_id="019f7140-debb-7c40-a056-d29be0630f01",
+            label="Overseer",
+            project="/workspace/Overseer",
+            command="codex-overseer-019f7140",
+            launcher="/bin/codex-overseer-019f7140",
+        )
+
+        resource = codex_project_thread_resource(thread)
+
+        self.assertEqual(resource.id, "thread.codex.codex-overseer-019f7140")
+        self.assertEqual(resource.type, ResourceType.USAGE_LIMITED_SERVICE)
+        self.assertEqual(resource.owner_domain, OwnerDomain.QUARK)
+        self.assertEqual(resource.identifiers["conversation_id"], thread.conversation_id)
+
+    def test_discovers_codex_project_threads_as_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f7140-debb-7c40-a056-d29be0630f01,Overseer,"
+                "/workspace/Overseer,codex-overseer-019f7140,/bin/codex-overseer-019f7140,"
+                "2026-07-17T18:05:04+00:00,2026-07-18T19:57:08+00:00,registry,\n",
+                encoding="utf-8",
+            )
+
+            status = discover_codex_project_threads_status(store_path, registry)
+            store = SQLiteStore(store_path)
+            resource = store.load_resource("thread.codex.codex-overseer-019f7140")
+            store.close()
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["threads"], 1)
+            self.assertEqual(status["items"][0]["resource_id"], resource.id)
+            self.assertEqual(resource.identifiers["project"], "/workspace/Overseer")
+
+    def test_api_client_discovers_codex_project_threads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f7140-debb-7c40-a056-d29be0630f01,Overseer,"
+                "/workspace/Overseer,codex-overseer-019f7140,/bin/codex-overseer-019f7140,"
+                "2026-07-17T18:05:04+00:00,2026-07-18T19:57:08+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            with LocalOverseerApiServer(store_path, auth_token="secret") as harness:
+                client = OverseerApiClient(harness.url, auth_token="secret")
+
+                status = client.discover_codex_project_threads(str(registry))
+
+            self.assertEqual(status["threads"], 1)
+            self.assertEqual(status["items"][0]["command"], "codex-overseer-019f7140")
 
     def test_records_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:

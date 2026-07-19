@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import csv
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 
 
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
@@ -134,6 +137,28 @@ class CodexProjectThreadAdapter:
         return completed.returncode == 0
 
 
+def codex_project_thread_resource(thread: CodexProjectThread) -> Resource:
+    return Resource(
+        id=f"thread.codex.{_resource_id_part(thread.command or thread.conversation_id)}",
+        name=thread.label,
+        type=ResourceType.USAGE_LIMITED_SERVICE,
+        owner_domain=OwnerDomain.QUARK,
+        risk_level=RiskLevel.LOW,
+        state=ResourceState.AVAILABLE,
+        identifiers={
+            "conversation_id": thread.conversation_id,
+            "project": thread.project,
+            "command": thread.command,
+            "launcher": thread.launcher,
+        },
+        notes="Codex project thread imported from local codex-projects registry",
+    )
+
+
+def codex_project_thread_resources(threads: tuple[CodexProjectThread, ...]) -> tuple[Resource, ...]:
+    return tuple(codex_project_thread_resource(thread) for thread in threads)
+
+
 def _thread_result_fields(thread: CodexProjectThread) -> dict[str, str]:
     return {
         "conversation_id": thread.conversation_id,
@@ -141,3 +166,8 @@ def _thread_result_fields(thread: CodexProjectThread) -> dict[str, str]:
         "command": thread.command,
         "launcher": thread.launcher,
     }
+
+
+def _resource_id_part(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip().lower()).strip("-")
+    return cleaned or "unknown"

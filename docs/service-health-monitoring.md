@@ -164,3 +164,20 @@ Supported log target forms:
 - `log:/absolute/path?absent=<marker>`: healthy when the marker is absent.
 
 A log probe with a missing, unreadable, relative, or contradictory target is failed health evidence. The evidence records only summaries such as `expected log marker found` or `blocked log marker found`; it does not persist the sampled log content.
+
+## Manual Probes
+
+Manual probes let Julian record explicit operator health evidence without contacting a service:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.example --name "Manual Check" --probe-type manual --url "manual:degraded?error=operator%20observed%20slow%20response" --store state/overseer.sqlite3
+```
+
+Supported manual target forms:
+
+- `manual:healthy`
+- `manual:degraded?error=<reason>`
+- `manual:failed?error=<reason>`
+- `manual:unknown?error=<reason>`
+
+Manual degraded, failed, and unknown states require recovery handling. Invalid manual targets are stored as failed evidence. Manual probes do not mutate the host or contact external services.

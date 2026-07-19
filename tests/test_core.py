@@ -62,6 +62,7 @@ from overseer import (
     HttpHealthProbeAdapter,
     LocalCommandHealthProbeAdapter,
     LocalLogHealthProbeAdapter,
+    ManualHealthProbeAdapter,
     LocalProcessHealthProbeAdapter,
     RoutedHealthProbeAdapter,
     InterruptionPolicy,
@@ -898,6 +899,36 @@ class LiveHealthProbeTests(unittest.TestCase):
         self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
         self.assertTrue(evidence.recovery_required)
         self.assertEqual(evidence.observed_error, "blocked log marker found")
+
+    def test_manual_health_probe_adapter_records_explicit_healthy_status(self):
+        target = HealthTarget(
+            id="health.manual.ready",
+            resource_id="svc.manual.ready",
+            name="Manual Ready",
+            probe_type=ProbeType.MANUAL,
+            target="manual:healthy",
+        )
+
+        evidence = ManualHealthProbeAdapter().probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+        self.assertFalse(evidence.recovery_required)
+        self.assertEqual(evidence.observed_error, "")
+
+    def test_manual_health_probe_adapter_records_failed_status_with_error(self):
+        target = HealthTarget(
+            id="health.manual.failed",
+            resource_id="svc.manual.failed",
+            name="Manual Failed",
+            probe_type=ProbeType.MANUAL,
+            target="manual:failed?error=operator%20observed%20crash",
+        )
+
+        evidence = ManualHealthProbeAdapter().probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
+        self.assertTrue(evidence.recovery_required)
+        self.assertEqual(evidence.observed_error, "operator observed crash")
 
     def test_probe_config_status_probes_declared_targets_and_persists_evidence(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
@@ -3633,6 +3664,28 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["targets"], 1)
             self.assertEqual(status["healthy"], 1)
             self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
+
+    def test_probe_stored_health_status_probes_persisted_manual_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.manual.stored",
+                    resource_id="svc.manual.stored",
+                    name="Stored Manual",
+                    probe_type=ProbeType.MANUAL,
+                    target="manual:degraded?error=operator%20reported%20slow",
+                )
+            )
+            store.close()
+
+            status = probe_stored_health_status(store_path)
+
+        self.assertEqual(status["targets"], 1)
+        self.assertEqual(status["unhealthy"], 1)
+        self.assertEqual(status["evidence"][0]["status"], HealthStatus.DEGRADED.value)
+        self.assertEqual(status["evidence"][0]["error"], "operator reported slow")
 
     def test_client_records_health_target(self):
         with tempfile.TemporaryDirectory() as directory:

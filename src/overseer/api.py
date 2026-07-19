@@ -44,6 +44,7 @@ from .cli import (
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
+    discover_storage_status,
     execute_admin_change_status,
     execute_claim_cleanup_status,
     export_host_security_ids_review_prompt_status,
@@ -265,6 +266,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
+                return
+            if self.path == "/physical/discover-storage":
+                self._handle_json(lambda payload: discover_storage_status(**_physical_storage_discovery_args(store_path, payload)))
                 return
             if self.path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
@@ -531,6 +535,13 @@ def _claim_cleanup_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "requested_by": str(payload["requested_by"]),
         "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
         "now": str(payload["now"]) if payload.get("now") is not None else None,
+    }
+
+
+def _physical_storage_discovery_args(store_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sysfs_block_root": str(payload.get("sysfs_block_root", "/sys/class/block")),
+        "store_path": store_path,
     }
 
 

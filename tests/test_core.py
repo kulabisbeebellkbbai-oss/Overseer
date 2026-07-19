@@ -66,6 +66,7 @@ from overseer import (
     OverseerConfig,
     OverseerCoordinator,
     PathPhysicalDiscoveryAdapter,
+    StoragePhysicalDiscoveryAdapter,
     PolicyCheckStatus,
     ProbeResult,
     ProbeType,
@@ -115,6 +116,7 @@ from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
+from overseer.cli import discover_storage_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
 from overseer.cli import admin_adapter_capabilities_status
@@ -2517,6 +2519,26 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["assets"], 1)
             self.assertEqual(status["items"][0]["stable_id"], "usb.device-a")
 
+    def test_client_discovers_storage_physical_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            root = Path(directory) / "block"
+            device = root / "sdc" / "device"
+            device.mkdir(parents=True)
+            (root / "sdc" / "removable").write_text("1\n", encoding="utf-8")
+            (root / "sdc" / "ro").write_text("0\n", encoding="utf-8")
+            (device / "serial").write_text("CLIENT-STORAGE\n", encoding="utf-8")
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                discovered = client.discover_storage(str(root))
+                summary = client.physical_summary()
+
+            self.assertEqual(discovered["count"], 1)
+            self.assertEqual(discovered["assets"][0]["stable_id"], "storage.client-storage")
+            self.assertEqual(summary["assets"], 1)
+            self.assertEqual(summary["items"][0]["kind"], PhysicalAssetKind.STORAGE_ARRAY.value)
+
     def test_client_reads_virtual_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4811,6 +4833,56 @@ class PhysicalDiscoveryTests(unittest.TestCase):
                 PhysicalIdentitySource.DISCOVERED,
             )
             store.close()
+
+    def test_storage_physical_discovery_reads_sysfs_block_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "block"
+            device = root / "sdb" / "device"
+            device.mkdir(parents=True)
+            (root / "sdb" / "removable").write_text("1\n", encoding="utf-8")
+            (root / "sdb" / "ro").write_text("0\n", encoding="utf-8")
+            (root / "sdb" / "size").write_text("2048\n", encoding="utf-8")
+            (device / "model").write_text("Backup Stick\n", encoding="utf-8")
+            (device / "serial").write_text("USB123\n", encoding="utf-8")
+            (device / "idVendor").write_text("abcd\n", encoding="utf-8")
+            (device / "idProduct").write_text("1234\n", encoding="utf-8")
+            (root / "loop0").mkdir()
+
+            identities = StoragePhysicalDiscoveryAdapter(root).discover()
+
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(identities[0].kind, PhysicalAssetKind.STORAGE_ARRAY)
+        self.assertEqual(identities[0].stable_id, "storage.backup-stick-usb123")
+        self.assertEqual(identities[0].vendor_id, "abcd")
+        self.assertEqual(identities[0].product_id, "1234")
+        self.assertEqual(identities[0].serial_number, "USB123")
+        self.assertEqual(identities[0].storage_profile, "removable_read_write")
+        self.assertIn("block_storage", identities[0].capabilities)
+        self.assertIn("removable", identities[0].capabilities)
+        self.assertIn("usb", identities[0].capabilities)
+        self.assertTrue(identities[0].has_storage_risk())
+
+    def test_discover_storage_status_persists_to_explicit_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "block"
+            device = root / "sda" / "device"
+            device.mkdir(parents=True)
+            (root / "sda" / "removable").write_text("0\n", encoding="utf-8")
+            (root / "sda" / "ro").write_text("1\n", encoding="utf-8")
+            (device / "model").write_text("Readonly Array\n", encoding="utf-8")
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = discover_storage_status(root, store_path)
+            store = SQLiteStore(store_path)
+            loaded = store.load_physical_identity("storage.sda")
+
+        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["assets"][0]["kind"], PhysicalAssetKind.STORAGE_ARRAY.value)
+        self.assertEqual(status["assets"][0]["storage_profile"], "read_only")
+        self.assertFalse(status["assets"][0]["storage_risk"])
+        self.assertEqual(loaded.kind, PhysicalAssetKind.STORAGE_ARRAY)
+        self.assertEqual(loaded.source, PhysicalIdentitySource.DISCOVERED)
+        store.close()
 
 
 class MaintenancePlanTests(unittest.TestCase):

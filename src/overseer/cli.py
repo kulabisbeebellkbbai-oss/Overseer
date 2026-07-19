@@ -57,7 +57,7 @@ from .ids_review import (
 )
 from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
-from .physical_discovery import PathPhysicalDiscoveryAdapter
+from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
 from .policy import PolicyCheck, PolicyDecision, evaluate_admin_change_policy
 from .policy import PolicyCheckStatus
 from .registry import ResourceRegistry
@@ -251,6 +251,21 @@ def probe_config_status(
 
 def discover_physical_status(roots: Sequence[str], store_path: str | Path | None = None) -> dict[str, object]:
     identities = PathPhysicalDiscoveryAdapter(tuple(roots)).discover()
+    return discovered_physical_identities_status(identities, store_path)
+
+
+def discover_storage_status(
+    sysfs_block_root: str | Path = "/sys/class/block",
+    store_path: str | Path | None = None,
+) -> dict[str, object]:
+    identities = StoragePhysicalDiscoveryAdapter(sysfs_block_root).discover()
+    return discovered_physical_identities_status(identities, store_path)
+
+
+def discovered_physical_identities_status(
+    identities: Sequence[PhysicalIdentity],
+    store_path: str | Path | None = None,
+) -> dict[str, object]:
     if store_path is not None:
         store = SQLiteStore(store_path)
         try:
@@ -5141,6 +5156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
+    discover_storage_parser = subparsers.add_parser("discover-storage", help="read sysfs block devices as physical storage identities")
+    discover_storage_parser.add_argument("--sysfs-block-root", default="/sys/class/block", help="sysfs block root to inspect")
+    discover_storage_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered storage identities")
     physical_summary_parser = subparsers.add_parser("physical-summary", help="summarize persisted physical identities")
     physical_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     virtual_summary_parser = subparsers.add_parser("virtual-summary", help="summarize persisted virtual assets")
@@ -5591,6 +5609,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "discover-physical":
         print(json.dumps(discover_physical_status(args.root, args.store), sort_keys=True))
+        return 0
+
+    if args.command == "discover-storage":
+        print(json.dumps(discover_storage_status(args.sysfs_block_root, args.store), sort_keys=True))
         return 0
 
     if args.command == "physical-summary":

@@ -169,6 +169,12 @@ class OverseerApiClient:
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 
+    def discover_storage(self, sysfs_block_root: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if sysfs_block_root:
+            payload["sysfs_block_root"] = sysfs_block_root
+        return self._post("/physical/discover-storage", payload)
+
     def virtual_summary(self) -> dict[str, Any]:
         return self._get("/virtual-summary")
 

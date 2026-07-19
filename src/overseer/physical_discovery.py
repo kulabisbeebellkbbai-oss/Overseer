@@ -56,6 +56,70 @@ class PathPhysicalDiscoveryAdapter:
         return {}
 
 
+class StoragePhysicalDiscoveryAdapter:
+    def __init__(self, sysfs_block_root: str | Path = "/sys/class/block") -> None:
+        self.sysfs_block_root = Path(sysfs_block_root)
+
+    def discover(self) -> tuple[PhysicalIdentity, ...]:
+        if not self.sysfs_block_root.exists() or not self.sysfs_block_root.is_dir():
+            return ()
+        observed_at = datetime.now(UTC).isoformat()
+        identities: list[PhysicalIdentity] = []
+        for path in sorted(self.sysfs_block_root.iterdir(), key=lambda item: item.name):
+            if path.name.startswith(".") or _is_virtual_block_device(path.name):
+                continue
+            device_path = path / "device"
+            metadata = _read_storage_metadata(path, device_path)
+            stable_parts = [metadata.get("model"), metadata.get("serial_number")] if metadata.get("serial_number") else [path.name]
+            stable_name = _stable_name("-".join(part for part in stable_parts if part))
+            capabilities = {"block_storage"}
+            if metadata.get("removable") == "1":
+                capabilities.add("removable")
+            usb_metadata = _read_usb_metadata(device_path)
+            if usb_metadata:
+                capabilities.add("usb")
+                metadata.update(usb_metadata)
+            identities.append(
+                PhysicalIdentity(
+                    kind=PhysicalAssetKind.STORAGE_ARRAY,
+                    stable_id=f"storage.{stable_name}",
+                    observed_paths=frozenset({str(path), f"/dev/{path.name}"}),
+                    vendor_id=metadata.get("vendor_id"),
+                    product_id=metadata.get("product_id"),
+                    serial_number=metadata.get("serial_number"),
+                    capabilities=frozenset(sorted(capabilities)),
+                    storage_profile=_storage_profile(metadata),
+                    exclusive_groups=frozenset({f"storage.{path.name}"}),
+                    source=PhysicalIdentitySource.DISCOVERED,
+                    last_observed_at=observed_at,
+                )
+            )
+        return tuple(identities)
+
+
+def _is_virtual_block_device(name: str) -> bool:
+    return name.startswith(("loop", "ram", "zram")) or name in {"fd0"}
+
+
+def _read_storage_metadata(block_path: Path, device_path: Path) -> dict[str, str]:
+    fields = {
+        "model": _read_first_line(device_path / "model"),
+        "serial_number": _read_first_line(device_path / "serial"),
+        "removable": _read_first_line(block_path / "removable"),
+        "read_only": _read_first_line(block_path / "ro"),
+        "size_sectors": _read_first_line(block_path / "size"),
+    }
+    return {key: value for key, value in fields.items() if value}
+
+
+def _storage_profile(metadata: dict[str, str]) -> str:
+    if metadata.get("read_only") == "1":
+        return "read_only"
+    if metadata.get("removable") == "1":
+        return "removable_read_write"
+    return "read_write"
+
+
 def _stable_name(name: str) -> str:
     cleaned = "".join(character.lower() if character.isalnum() else "-" for character in name)
     return "-".join(part for part in cleaned.split("-") if part)

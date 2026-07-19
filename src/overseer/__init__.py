@@ -100,7 +100,7 @@ from .maintenance import (
     can_close_maintenance,
 )
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource, physical_identity_conflicts
-from .physical_discovery import PathPhysicalDiscoveryAdapter
+from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
 from .policy import PolicyCheck, PolicyCheckStatus, PolicyDecision, evaluate_admin_change_policy
 from .planner import OperationPlanner, PlannedOperation
 from .registry import ClaimRecord, ResourceRegistry
@@ -239,6 +239,7 @@ __all__ = [
     "PhysicalIdentitySource",
     "physical_identity_conflicts",
     "PathPhysicalDiscoveryAdapter",
+    "StoragePhysicalDiscoveryAdapter",
     "PolicyCheck",
     "PolicyCheckStatus",
     "PolicyDecision",

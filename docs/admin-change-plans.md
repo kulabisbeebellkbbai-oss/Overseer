@@ -53,6 +53,8 @@ Canceling a plan keeps the record visible but removes it from the pending author
 
 Live execution support is controlled by the effective adapter table. User-service restart is enabled by default; package install, package index refresh, package upgrade, firewall allow/deny, and source-block execution require approved adapter enablement for the store plus the specific admin plan approval and any IDS review gate.
 
+Approved apt-family execution uses a noninteractive apt/debconf environment with standard input closed. This keeps package operations from opening terminal dialogs after the command list has already been approved. Package defaults still apply unless the approved plan explicitly includes a different package configuration step.
+
 Execution results are persisted and can be reviewed with `admin-executions` or the loopback API. Blocked execution attempts are also persisted so O'Brien and Sisko can see why a plan did not run.
 
 Every execution attempt also writes an audit event keyed to the admin plan. Completed executions use `executed`; blocked or failed attempts use `blocked` and cite the execution result id as evidence.

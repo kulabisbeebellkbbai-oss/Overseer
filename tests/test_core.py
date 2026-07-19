@@ -9,10 +9,12 @@ import subprocess
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import overseer.api as overseer_api
+import overseer.admin as overseer_admin
 from overseer import (
     ApprovalLevel,
     ApprovalRequest,
@@ -34,6 +36,7 @@ from overseer import (
     AdminChangeKind,
     AdminAdapterStatus,
     AdminCommandResult,
+    AdminCommandStep,
     AdminExecutionResult,
     AdminExecutionStatus,
     AdminHistoryArchiveRecord,
@@ -5027,6 +5030,38 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
         self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(executed.command_results[0].command, ("sudo", "apt-get", "update"))
+
+    def test_apt_admin_command_runs_noninteractively(self):
+        step = AdminCommandStep(
+            "Upgrade packages",
+            ("sudo", "apt-get", "install", "--only-upgrade", "-y", "sqlite3"),
+            "apply approved upgrade",
+        )
+
+        with patch.object(overseer_admin.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(step.command, 0, "ok\n", "")
+            result = overseer_admin.run_admin_command_step(step)
+
+        kwargs = run.call_args.kwargs
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["env"]["DEBIAN_FRONTEND"], "noninteractive")
+        self.assertEqual(kwargs["env"]["DEBIAN_PRIORITY"], "critical")
+        self.assertEqual(kwargs["env"]["APT_LISTCHANGES_FRONTEND"], "none")
+
+    def test_non_apt_admin_command_uses_default_environment(self):
+        step = AdminCommandStep(
+            "Verify user service status",
+            ("systemctl", "--user", "status", "overseer-api.service", "--no-pager"),
+            "confirm service state",
+        )
+
+        with patch.object(overseer_admin.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(step.command, 0, "active\n", "")
+            result = overseer_admin.run_admin_command_step(step)
+
+        self.assertEqual(result.stdout, "active")
+        self.assertIsNone(run.call_args.kwargs["env"])
 
     def test_admin_policy_status_blocks_unapproved_disabled_adapter_plan(self):
         with tempfile.TemporaryDirectory() as directory:

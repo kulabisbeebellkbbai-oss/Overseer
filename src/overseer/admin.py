@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -86,6 +87,13 @@ class AdminExecutionCapability:
 
 
 AdminCommandRunner = Callable[[AdminCommandStep], AdminCommandResult]
+
+
+APT_NONINTERACTIVE_ENVIRONMENT: dict[str, str] = {
+    "DEBIAN_FRONTEND": "noninteractive",
+    "DEBIAN_PRIORITY": "critical",
+    "APT_LISTCHANGES_FRONTEND": "none",
+}
 
 
 @dataclass(frozen=True)
@@ -667,11 +675,14 @@ def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecuti
 
 
 def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
+    environment = _admin_command_environment(step.command)
     completed = subprocess.run(
         step.command,
         check=False,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         text=True,
+        env=environment,
     )
     return AdminCommandResult(
         title=step.title,
@@ -680,6 +691,18 @@ def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
         stdout=completed.stdout.strip(),
         stderr=completed.stderr.strip(),
     )
+
+
+def _admin_command_environment(command: tuple[str, ...]) -> dict[str, str] | None:
+    if _is_apt_command(command):
+        return os.environ | APT_NONINTERACTIVE_ENVIRONMENT
+    return None
+
+
+def _is_apt_command(command: tuple[str, ...]) -> bool:
+    if len(command) >= 2 and command[0] == "sudo" and command[1] == "apt-get":
+        return True
+    return bool(command and command[0] == "apt-get")
 
 
 def authorization_required_status(plan: AdminChangePlan) -> dict[str, object]:

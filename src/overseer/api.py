@@ -24,6 +24,7 @@ from .cli import (
     archive_admin_history_status,
     assess_host_security_status,
     approve_admin_change_status,
+    approve_admin_adapter_enablement_status,
     approve_admin_history_restore_status,
     approve_claim_status,
     alerts_summary_status,
@@ -53,6 +54,7 @@ from .cli import (
     plan_admin_change_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
+    request_admin_adapter_enablement_status,
     request_admin_history_restore_status,
     prepare_host_security_ids_review_package_status,
     request_claim_status,
@@ -241,6 +243,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/admin/history-restore-requests/approve":
                 self._handle_json(lambda payload: approve_admin_history_restore_status(store_path, **_approve_admin_history_restore_args(payload)))
                 return
+            if self.path == "/admin/adapter-enablement-requests":
+                self._handle_json(lambda payload: request_admin_adapter_enablement_status(store_path, **_admin_adapter_enablement_request_args(payload)))
+                return
+            if self.path == "/admin/adapter-enablement-requests/approve":
+                self._handle_json(lambda payload: approve_admin_adapter_enablement_status(store_path, **_approve_admin_adapter_enablement_args(payload)))
+                return
             if self.path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
                 return
@@ -407,6 +415,22 @@ def _admin_history_restore_request_args(payload: dict[str, Any]) -> dict[str, An
 
 
 def _approve_admin_history_restore_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+    }
+
+
+def _admin_adapter_enablement_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": str(payload["kind"]),
+        "requested_by": str(payload["requested_by"]),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
+    }
+
+
+def _approve_admin_adapter_enablement_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "approval_id": str(payload["approval_id"]),
         "approved_by": str(payload["approved_by"]),

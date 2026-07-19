@@ -117,6 +117,7 @@ from overseer.cli import admin_history_restore_readiness_status
 from overseer.cli import admin_summary_status
 from overseer.cli import archive_admin_history_status
 from overseer.cli import approve_admin_change_status
+from overseer.cli import approve_admin_adapter_enablement_status
 from overseer.cli import approve_admin_history_restore_status
 from overseer.cli import approve_claim_status
 from overseer.cli import alerts_summary_status
@@ -151,6 +152,7 @@ from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
+from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_restore_status
 from overseer.cli import request_claim_status
 from overseer.cli import run_status
@@ -752,6 +754,42 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertTrue(item["approval_required_before_enable"])
         self.assertIn("sudo", item["commands_in_scope"][0])
         self.assertIn("disable block_ip adapter capability", item["rollback_plan"][0])
+
+    def test_admin_adapter_enablement_request_is_approval_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            requested = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.BLOCK_IP.value,
+                "sisko",
+                "2026-07-18T20:00:00+00:00",
+            )
+            pending = authorizations_required_status(store_path)
+            summary = admin_summary_status(store_path)
+            approved = approve_admin_adapter_enablement_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T20:05:00+00:00",
+            )
+            after = authorizations_required_status(store_path)
+            after_summary = admin_summary_status(store_path)
+
+        block = next(item for item in admin_adapter_capabilities_status()["items"] if item["kind"] == AdminChangeKind.BLOCK_IP.value)
+        self.assertTrue(requested["mutation_performed"])
+        self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+        self.assertEqual(requested["kind"], AdminChangeKind.BLOCK_IP.value)
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertEqual(pending["pending_adapter_enablement_approval_count"], 1)
+        self.assertEqual(pending["adapter_enablement_approvals"][0]["next_step"], "approve-admin-adapter-enablement before enabling adapter code")
+        self.assertEqual(summary["pending_authorizations"], 1)
+        self.assertEqual(summary["adapter_enablement_approvals"]["pending"], 1)
+        self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+        self.assertTrue(approved["adapter_enablement_approval"])
+        self.assertEqual(after["pending_count"], 0)
+        self.assertEqual(after_summary["adapter_enablement_approvals"]["approved"], 1)
+        self.assertEqual(block["status"], AdminAdapterStatus.DISABLED.value)
 
     def test_admin_summary_reports_plans_executions_and_audit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2508,6 +2546,36 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(plan["approval_required"], 1)
             self.assertEqual(plan["items"][0]["current_status"], AdminAdapterStatus.DISABLED.value)
             self.assertTrue(plan["items"][0]["approval_required_before_enable"])
+
+    def test_client_requests_and_approves_admin_adapter_enablement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_admin_adapter_enablement(
+                    {
+                        "kind": AdminChangeKind.FIREWALL_DENY_TCP.value,
+                        "requested_by": "sisko",
+                        "requested_at": "2026-07-18T20:10:00+00:00",
+                    }
+                )
+                pending = client.authorizations_required()
+                approved = client.approve_admin_adapter_enablement(
+                    {
+                        "approval_id": requested["approval_id"],
+                        "approved_by": "sisko",
+                        "approved_at": "2026-07-18T20:15:00+00:00",
+                    }
+                )
+                after = client.authorizations_required()
+
+            self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+            self.assertEqual(requested["kind"], AdminChangeKind.FIREWALL_DENY_TCP.value)
+            self.assertEqual(pending["pending_adapter_enablement_approval_count"], 1)
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertTrue(approved["adapter_enablement_approval"])
+            self.assertEqual(after["pending_count"], 0)
 
     def test_client_approves_admin_history_restore_request(self):
         with tempfile.TemporaryDirectory() as directory:

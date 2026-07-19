@@ -1924,6 +1924,134 @@ def admin_adapter_enablement_plan_status(kind: str | None = None) -> dict[str, o
     }
 
 
+def request_admin_adapter_enablement_status(
+    store_path: str | Path,
+    kind: str,
+    requested_by: str,
+    requested_at: str | None = None,
+) -> dict[str, object]:
+    if not requested_by.strip():
+        raise ValueError("requested_by is required")
+    capability = admin_execution_capability_for(AdminChangeKind(kind))
+    if capability.can_execute_live():
+        raise ValueError(f"admin adapter is already enabled: {capability.kind.value}")
+    if not capability.authorization_required_before_enable:
+        raise ValueError(f"admin adapter does not require enablement approval: {capability.kind.value}")
+    plan = _admin_adapter_enablement_plan_item_status(capability)
+    approval = ApprovalRequest(
+        id=f"approval.admin.adapter.enable.{capability.kind.value}",
+        subject_id=f"admin.adapter.enable.{capability.kind.value}",
+        approval_level=ApprovalLevel.HUMAN,
+        requester_thread=requested_by,
+        owner_domain=OwnerDomain.SISKO,
+        reason=f"Enable live admin adapter {capability.adapter_name} for {capability.kind.value}",
+        evidence_required=(f"admin.adapter.enablement-plan.{capability.kind.value}",),
+    )
+    event = AuditEvent(
+        id=f"audit.{approval.id}.requested",
+        event_type=AuditEventType.REQUESTED,
+        owner_domain=OwnerDomain.SISKO,
+        subject_id=approval.subject_id,
+        summary=approval.reason,
+        risk_level=RiskLevel.CRITICAL,
+        evidence_ids=approval.evidence_required,
+        occurred_at=requested_at,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_approval(approval)
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "kind": capability.kind.value,
+            "adapter_name": capability.adapter_name,
+            "approval_id": approval.id,
+            "approval_status": ApprovalStatus(approval.status).value,
+            "approval_level": ApprovalLevel(approval.approval_level).value,
+            "requested_by": requested_by,
+            "requested_at": requested_at,
+            "enablement_plan": plan,
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
+def approve_admin_adapter_enablement_status(
+    store_path: str | Path,
+    approval_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"admin adapter enablement approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.admin.adapter.enable."):
+            raise ValueError("admin adapter enablement approval is required")
+        kind = _admin_adapter_enablement_kind_from_subject(approval.subject_id)
+        capability = admin_execution_capability_for(kind)
+        if capability.can_execute_live():
+            raise ValueError(f"admin adapter is already enabled: {capability.kind.value}")
+    finally:
+        store.close()
+
+    approved = approve_claim_status(store_path, approval_id, approved_by, approved_at)
+    return {
+        **approved,
+        "kind": capability.kind.value,
+        "adapter_name": capability.adapter_name,
+        "adapter_enablement_approval": True,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+    }
+
+
+def admin_adapter_enablement_approval_status(approval: ApprovalRequest) -> dict[str, object]:
+    approval_status = ApprovalStatus(approval.status)
+    kind = _admin_adapter_enablement_kind_from_subject(approval.subject_id)
+    capability = admin_execution_capability_for(kind)
+    return {
+        "id": approval.id,
+        "kind": kind.value,
+        "adapter_name": capability.adapter_name,
+        "subject_id": approval.subject_id,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+        "requester_thread": approval.requester_thread,
+        "owner_domain": OwnerDomain(approval.owner_domain).value,
+        "reason": approval.reason,
+        "status": approval_status.value,
+        "evidence_required": list(approval.evidence_required),
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+        "next_step": _admin_adapter_enablement_approval_next_step(approval_status, capability),
+    }
+
+
+def _admin_adapter_enablement_kind_from_subject(subject_id: str) -> AdminChangeKind:
+    prefix = "admin.adapter.enable."
+    if not subject_id.startswith(prefix):
+        raise ValueError("admin adapter enablement subject is required")
+    return AdminChangeKind(subject_id[len(prefix):])
+
+
+def _admin_adapter_enablement_approval_next_step(
+    approval_status: ApprovalStatus,
+    capability,
+) -> str:
+    if approval_status == ApprovalStatus.PENDING:
+        return "approve-admin-adapter-enablement before enabling adapter code"
+    if approval_status == ApprovalStatus.APPROVED:
+        return "implementation may enable adapter only for the approved kind and command boundary"
+    return "adapter enablement approval is not actionable"
+
+
 def _admin_adapter_enablement_plan_item_status(capability) -> dict[str, object]:
     approval_required = capability.authorization_required_before_enable or capability.approval_plan_required
     if capability.can_execute_live():
@@ -2015,11 +2143,18 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             for approval in approvals
             if approval.id.startswith("approval.admin.restore.")
         ]
+        adapter_enablement_approvals = [
+            approval
+            for approval in approvals
+            if approval.id.startswith("approval.admin.adapter.enable.")
+        ]
         return {
             "store": str(store.path),
             "plans": len(active_plans),
             "archived_plans": len(plans) - len(active_plans),
-            "pending_authorizations": len(pending),
+            "pending_authorizations": len(pending)
+            + sum(1 for approval in restore_approvals if approval.status == ApprovalStatus.PENDING)
+            + sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.PENDING),
             "approved_plans": sum(1 for plan in active_plans if plan.approved),
             "canceled_plans": sum(1 for plan in active_plans if plan.canceled),
             "executable_plans": sum(1 for plan in active_plans if plan.can_execute()),
@@ -2043,6 +2178,19 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                     for status in ApprovalStatus
                 },
                 "items": [admin_history_restore_approval_status(approval) for approval in restore_approvals],
+            },
+            "adapter_enablement_approvals": {
+                "total": len(adapter_enablement_approvals),
+                "pending": sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.PENDING),
+                "approved": sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.APPROVED),
+                "by_status": {
+                    status.value: sum(1 for approval in adapter_enablement_approvals if approval.status == status)
+                    for status in ApprovalStatus
+                },
+                "items": [
+                    admin_adapter_enablement_approval_status(approval)
+                    for approval in adapter_enablement_approvals
+                ],
             },
             "pending": [
                 authorization_required_status_with_ids_review(
@@ -2754,6 +2902,12 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             if approval.id.startswith("approval.admin.restore.")
             and approval.status == ApprovalStatus.PENDING
         ]
+        pending_adapter_enablement_approvals = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id.startswith("approval.admin.adapter.enable.")
+            and approval.status == ApprovalStatus.PENDING
+        ]
         pending = [
             authorization_required_status_with_ids_review(
                 plan,
@@ -2765,10 +2919,15 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "pending": pending,
-            "pending_count": len(pending) + len(pending_restore_approvals),
+            "pending_count": len(pending) + len(pending_restore_approvals) + len(pending_adapter_enablement_approvals),
             "pending_plan_count": len(pending),
             "pending_restore_approval_count": len(pending_restore_approvals),
+            "pending_adapter_enablement_approval_count": len(pending_adapter_enablement_approvals),
             "restore_approvals": [admin_history_restore_approval_status(approval) for approval in pending_restore_approvals],
+            "adapter_enablement_approvals": [
+                admin_adapter_enablement_approval_status(approval)
+                for approval in pending_adapter_enablement_approvals
+            ],
         }
     finally:
         store.close()
@@ -3536,6 +3695,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="prepare a read-only high-risk approval plan for enabling live admin adapters",
     )
     admin_adapter_plan_parser.add_argument("--kind", choices=[item.value for item in AdminChangeKind])
+    admin_adapter_request_parser = subparsers.add_parser(
+        "request-admin-adapter-enablement",
+        help="request approval before enabling a disabled live admin adapter",
+    )
+    admin_adapter_request_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_adapter_request_parser.add_argument("--kind", required=True, choices=[item.value for item in AdminChangeKind])
+    admin_adapter_request_parser.add_argument("--requested-by", required=True)
+    admin_adapter_request_parser.add_argument("--requested-at")
+    admin_adapter_approve_parser = subparsers.add_parser(
+        "approve-admin-adapter-enablement",
+        help="approve a requested live admin adapter enablement gate",
+    )
+    admin_adapter_approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_adapter_approve_parser.add_argument("--approval-id", required=True)
+    admin_adapter_approve_parser.add_argument("--approved-by", required=True)
+    admin_adapter_approve_parser.add_argument("--approved-at")
     admin_summary_parser = subparsers.add_parser("admin-summary", help="summarize admin plans, execution results, and audit events")
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
@@ -3909,6 +4084,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-adapter-enablement-plan":
         print(json.dumps(admin_adapter_enablement_plan_status(args.kind), sort_keys=True))
+        return 0
+
+    if args.command == "request-admin-adapter-enablement":
+        print(json.dumps(request_admin_adapter_enablement_status(args.store, args.kind, args.requested_by, args.requested_at), sort_keys=True))
+        return 0
+
+    if args.command == "approve-admin-adapter-enablement":
+        print(json.dumps(approve_admin_adapter_enablement_status(args.store, args.approval_id, args.approved_by, args.approved_at), sort_keys=True))
         return 0
 
     if args.command == "admin-summary":

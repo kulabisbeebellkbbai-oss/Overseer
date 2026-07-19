@@ -177,6 +177,12 @@ class OverseerApiClient:
             path = f"{path}?{urlencode({'kind': kind})}"
         return self._get(path)
 
+    def request_admin_adapter_enablement(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/adapter-enablement-requests", payload)
+
+    def approve_admin_adapter_enablement(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/admin/adapter-enablement-requests/approve", payload)
+
     def admin_executions(self) -> dict[str, Any]:
         return self._get("/admin/executions")
 

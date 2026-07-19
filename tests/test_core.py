@@ -3969,13 +3969,17 @@ class HostInspectionTests(unittest.TestCase):
             status = discover_user_services_status(store_path, snapshot=snapshot)
             store = SQLiteStore(store_path)
             resource = store.load_resource("svc.systemd-user.overseer-api")
+            target = store.load_health_target("health.systemd-user.overseer-api")
             snapshots = store.list_host_snapshots()
             store.close()
 
         self.assertEqual(status["count"], 1)
+        self.assertEqual(status["health_targets"], 1)
         self.assertEqual(status["items"][0]["unit"], "overseer-api.service")
         self.assertEqual(resource.owner_domain, OwnerDomain.JULIAN)
         self.assertEqual(resource.identifiers["description"], "Overseer localhost API")
+        self.assertEqual(target.resource_id, "svc.systemd-user.overseer-api")
+        self.assertEqual(target.target, "systemd:user:overseer-api.service")
         self.assertEqual(snapshots[0].id, "host.test.services")
 
     def test_alerts_summary_reports_only_alert_audit_events(self):

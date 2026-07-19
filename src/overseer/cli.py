@@ -1330,10 +1330,23 @@ def discover_user_services_status(
         store.save_host_snapshot(observed)
         for resource in resources:
             store.save_resource(resource)
+            unit = resource.identifiers.get("unit")
+            if unit:
+                store.save_health_target(
+                    HealthTarget(
+                        id=f"health.{resource.id.removeprefix('svc.')}",
+                        resource_id=resource.id,
+                        name=f"{resource.name} process",
+                        probe_type=ProbeType.PROCESS,
+                        target=f"systemd:user:{unit}",
+                        owner_domain=OwnerDomain.JULIAN,
+                    )
+                )
         return {
             "store": str(store.path),
             "snapshot_id": observed.id,
             "count": len(resources),
+            "health_targets": len(resources),
             "items": [discovered_service_resource_status(resource) for resource in resources],
         }
     finally:

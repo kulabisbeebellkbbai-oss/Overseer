@@ -27,7 +27,7 @@ PYTHONPATH=src python3 -m overseer.cli discover-user-services --store state/over
 
 Persisted snapshots appear in `list-state` under `host_snapshots`.
 
-`discover-user-services` captures the same read-only host snapshot and registers each running systemd user service as a `service` resource owned by Julian. It does not start, stop, restart, enable, disable, or edit any service.
+`discover-user-services` captures the same read-only host snapshot, registers each running systemd user service as a `service` resource owned by Julian, and creates a matching process health target for stored health probes. It does not start, stop, restart, enable, disable, or edit any service.
 
 ## Security Assessment
 

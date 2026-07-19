@@ -11,23 +11,31 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
   <title>Overseer</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --panel-2: #eef2f5;
-      --line: #ccd4dd;
-      --text: #17202a;
-      --muted: #5f6f7f;
-      --good: #176d3b;
-      --warn: #9a5b00;
-      --bad: #a3262a;
-      --focus: #0f6b8f;
+      color-scheme: dark;
+      --bg: #080b0d;
+      --deck: #111719;
+      --panel: #151d20;
+      --panel-2: #202b2e;
+      --line: #3b4647;
+      --line-hot: #c68a35;
+      --text: #f2ede4;
+      --muted: #a9b3ae;
+      --good: #58c6a9;
+      --warn: #e2a94a;
+      --bad: #e06d5f;
+      --focus: #7ab7d8;
+      --command: #d9a14a;
+      --ops: #2f766f;
+      --alert: #6f2f33;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-width: 320px;
-      background: var(--bg);
+      background:
+        linear-gradient(90deg, rgba(217, 161, 74, 0.12), transparent 18%, transparent 82%, rgba(47, 118, 111, 0.12)),
+        radial-gradient(circle at 50% -20%, rgba(122, 183, 216, 0.16), transparent 35%),
+        var(--bg);
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
@@ -37,17 +45,29 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .shell {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 260px minmax(0, 1fr);
+      grid-template-columns: 278px minmax(0, 1fr);
     }
     aside {
-      background: #202832;
-      color: #f8fafc;
+      position: relative;
+      background:
+        linear-gradient(180deg, #1d2424, #0e1314 58%, #111719),
+        var(--deck);
+      color: var(--text);
       padding: 18px 14px;
-      border-right: 1px solid #111820;
+      border-right: 1px solid #2e3838;
+      box-shadow: inset -5px 0 0 rgba(217, 161, 74, 0.24);
+    }
+    aside::before {
+      content: "";
+      display: block;
+      height: 10px;
+      margin: -4px 0 18px;
+      background: linear-gradient(90deg, var(--command) 0 26%, var(--ops) 26% 50%, var(--alert) 50% 66%, var(--focus) 66% 100%);
+      border-radius: 2px;
     }
     main {
       min-width: 0;
-      padding: 18px;
+      padding: 18px 20px 28px;
     }
     .brand {
       display: flex;
@@ -56,36 +76,46 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       margin-bottom: 18px;
     }
     .mark {
-      width: 34px;
-      height: 34px;
-      border-radius: 6px;
-      background: #d8aa3a;
-      color: #111820;
+      width: 42px;
+      height: 42px;
+      border-radius: 4px 13px 4px 13px;
+      background: linear-gradient(135deg, var(--command), #8e5d29);
+      color: #111719;
       display: grid;
       place-items: center;
       font-weight: 800;
+      box-shadow: 0 0 0 1px rgba(242, 237, 228, 0.18), 0 12px 28px rgba(0, 0, 0, 0.32);
     }
     h1, h2, h3, p { margin: 0; }
     h1 { font-size: 20px; font-weight: 760; letter-spacing: 0; }
     h2 { font-size: 17px; font-weight: 720; }
-    h3 { font-size: 14px; font-weight: 700; color: var(--muted); }
+    h3 {
+      font-size: 12px;
+      font-weight: 780;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
     .nav {
       display: grid;
       gap: 5px;
     }
     .nav button {
       width: 100%;
-      border: 0;
-      border-radius: 6px;
-      padding: 9px 10px;
-      background: transparent;
-      color: #dce5ed;
+      border: 1px solid transparent;
+      border-radius: 4px 12px 4px 12px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.03);
+      color: #d9ddd8;
       text-align: left;
       cursor: pointer;
+      min-height: 40px;
     }
     .nav button[aria-selected="true"] {
-      background: #344252;
-      color: #ffffff;
+      background: linear-gradient(90deg, rgba(217, 161, 74, 0.85), rgba(47, 118, 111, 0.42));
+      color: #fff7e8;
+      border-color: rgba(242, 237, 228, 0.24);
+      box-shadow: inset 4px 0 0 #f1c66d;
     }
     .topbar {
       display: grid;
@@ -93,6 +123,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 12px;
       align-items: center;
       margin-bottom: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: rgba(17, 23, 25, 0.82);
     }
     .status-line {
       display: flex;
@@ -107,21 +141,30 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       align-items: center;
     }
     .token input {
-      width: 230px;
+      width: 270px;
       min-width: 0;
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 4px;
       padding: 8px 10px;
-      background: #fff;
+      background: #090d0e;
       color: var(--text);
+    }
+    .token input:focus {
+      outline: 2px solid rgba(122, 183, 216, 0.42);
+      border-color: var(--focus);
     }
     .icon-btn, .action-btn {
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 4px 10px 4px 10px;
       min-height: 36px;
-      background: #fff;
+      background: linear-gradient(180deg, #243032, #12191b);
       color: var(--text);
       cursor: pointer;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .icon-btn:hover, .action-btn:hover {
+      border-color: var(--line-hot);
+      color: #fff7e8;
     }
     .icon-btn {
       width: 38px;
@@ -137,11 +180,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 12px;
     }
     .panel {
-      background: var(--panel);
+      position: relative;
+      background: linear-gradient(180deg, #172023, #111719);
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 4px;
       padding: 14px;
       min-width: 0;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 14px 32px rgba(0, 0, 0, 0.18);
+    }
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto auto 0;
+      width: 5px;
+      height: 42px;
+      background: var(--command);
+      border-radius: 3px 0 3px 0;
     }
     .span-3 { grid-column: span 3; }
     .span-4 { grid-column: span 4; }
@@ -151,7 +205,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .metric {
       display: grid;
       gap: 6px;
-      min-height: 92px;
+      min-height: 104px;
+      padding-left: 18px;
     }
     .metric .value {
       font-size: 30px;
@@ -166,14 +221,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       padding: 2px 8px;
       border-radius: 999px;
       border: 1px solid var(--line);
-      background: var(--panel-2);
+      background: rgba(32, 43, 46, 0.92);
       color: var(--text);
       font-size: 12px;
       white-space: nowrap;
     }
-    .pill.good { color: var(--good); border-color: #9cc9ad; background: #eef8f1; }
-    .pill.warn { color: var(--warn); border-color: #dfc17d; background: #fff7df; }
-    .pill.bad { color: var(--bad); border-color: #dda0a2; background: #fff0f0; }
+    .pill.good { color: var(--good); border-color: rgba(88, 198, 169, 0.55); background: rgba(39, 93, 82, 0.34); }
+    .pill.warn { color: var(--warn); border-color: rgba(226, 169, 74, 0.55); background: rgba(103, 72, 24, 0.36); }
+    .pill.bad { color: var(--bad); border-color: rgba(224, 109, 95, 0.55); background: rgba(111, 47, 51, 0.42); }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -185,7 +240,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       overflow-x: auto;
     }
     th, td {
-      border-bottom: 1px solid var(--line);
+      border-bottom: 1px solid rgba(169, 179, 174, 0.18);
       padding: 8px 6px;
       text-align: left;
       vertical-align: top;
@@ -244,11 +299,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       width: 100%;
       min-height: 36px;
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 4px;
       padding: 7px 9px;
-      background: #fff;
+      background: #090d0e;
       color: var(--text);
       min-width: 0;
+    }
+    .field input:focus, .field select:focus {
+      outline: 2px solid rgba(122, 183, 216, 0.34);
+      border-color: var(--focus);
     }
     .action-status {
       margin-bottom: 12px;
@@ -272,7 +331,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 10px;
       align-items: center;
       padding: 9px 0;
-      border-bottom: 1px solid var(--line);
+      border-bottom: 1px solid rgba(169, 179, 174, 0.16);
     }
     .row span, .row strong {
       min-width: 0;
@@ -282,9 +341,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       text-align: right;
     }
     .row:last-child { border-bottom: 0; }
+    .crew-card {
+      min-height: 190px;
+      padding-left: 18px;
+    }
+    .crew-card h3 {
+      color: var(--command);
+    }
+    .crew-card .list {
+      margin-top: 10px;
+    }
     .error {
-      border-color: #dda0a2;
-      background: #fff0f0;
+      border-color: rgba(224, 109, 95, 0.74);
+      background: rgba(111, 47, 51, 0.42);
       color: var(--bad);
     }
     @media (max-width: 900px) {
@@ -294,13 +363,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         top: 0;
         z-index: 2;
         border-right: 0;
-        border-bottom: 1px solid #111820;
+        border-bottom: 1px solid #2e3838;
+        box-shadow: inset 0 -5px 0 rgba(217, 161, 74, 0.22);
       }
       .nav {
         grid-template-columns: repeat(4, minmax(0, 1fr));
       }
       .nav button {
         text-align: center;
+        padding: 9px 7px;
       }
       .topbar {
         grid-template-columns: 1fr;
@@ -320,6 +391,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid { gap: 8px; }
       .panel { padding: 11px; }
+      .panel::before { height: 32px; }
       .token { flex-wrap: wrap; }
       .token input { width: 100%; flex-basis: 100%; }
       .field.span-2, .field.span-3, .field.span-6 { grid-column: span 6; }
@@ -333,7 +405,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <div class="mark">O</div>
         <div>
           <h1>Overseer</h1>
-          <p class="muted">Local command crew</p>
+          <p class="muted">Station operations</p>
         </div>
       </div>
       <nav class="nav" aria-label="Views">
@@ -350,15 +422,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     <main>
       <div class="topbar">
         <div>
-          <h2 id="view-title">Overview</h2>
+          <h2 id="view-title">Strategic Operations</h2>
           <div class="status-line">
             <span id="overall" class="pill">loading</span>
             <span id="updated" class="muted">not refreshed</span>
           </div>
         </div>
         <div class="token">
-          <input id="token" type="password" autocomplete="off" placeholder="Bearer token">
-          <button id="save-token" class="action-btn">Save</button>
+          <input id="token" type="password" autocomplete="off" aria-label="Overseer API token" placeholder="Overseer API token">
+          <button id="save-token" class="action-btn">Unlock</button>
           <button id="refresh" class="icon-btn" title="Refresh" aria-label="Refresh">R</button>
         </div>
       </div>
@@ -1188,7 +1260,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function crew(name, data) {
       const rows = Object.entries(data || {}).slice(0, 5).map(([key, value]) => `<div class="row"><span>${safe(labelize(key))}</span><strong>${safe(value ?? 0)}</strong></div>`).join("");
-      return `<div class="panel span-4"><h3>${safe(name)}</h3><div class="list">${rows || "<p class='muted'>No data</p>"}</div></div>`;
+      return `<div class="panel crew-card span-4"><h3>${safe(name)}</h3><p class="muted">${safe(crewStation(name))}</p><div class="list">${rows || "<p class='muted'>No data</p>"}</div></div>`;
+    }
+    function crewStation(name) {
+      const stations = {
+        "Sisko": "Command",
+        "Kira": "Physical assets",
+        "O'Brien": "Maintenance",
+        "Odo": "Security",
+        "Quark": "Service limits",
+        "Dax": "Virtual assets",
+        "Julian": "Health"
+      };
+      return stations[name] || "Operations";
     }
     function table(titleText, rows, keys) {
       const body = (rows || []).slice(0, 12).map((row) => `<tr>${keys.map((key) => `<td>${format(row?.[key])}</td>`).join("")}</tr>`).join("");
@@ -1237,7 +1321,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     if (state.token) {
       refresh();
     } else {
-      document.getElementById("updated").textContent = "enter bearer token";
+      document.getElementById("updated").textContent = "enter Overseer API token";
     }
   </script>
 </body>

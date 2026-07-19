@@ -2101,6 +2101,7 @@ def execute_admin_change_status(
             plan,
             admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
             ids_review_packages,
+            approved_admin_policy_warning_check_ids(store, plan.id),
         )
         if policy_decision.status != PolicyCheckStatus.PASS:
             blocking = tuple(
@@ -2792,6 +2793,7 @@ def admin_policy_status(store_path: str | Path, plan_id: str | None = None) -> d
                 plan,
                 admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
                 store.list_host_security_ids_review_packages_for_plan(plan.id),
+                approved_admin_policy_warning_check_ids(store, plan.id),
             )
             for plan in plans
         ]
@@ -2826,6 +2828,96 @@ def admin_policy_check_status(check: PolicyCheck) -> dict[str, object]:
         "summary": check.summary,
         "evidence_ids": list(check.evidence_ids),
     }
+
+
+def approved_admin_policy_warning_check_ids(store: SQLiteStore, plan_id: str) -> tuple[str, ...]:
+    prefix = f"admin.policy.warning.{plan_id}."
+    accepted: list[str] = []
+    for approval in store.list_approvals():
+        if ApprovalStatus(approval.status) != ApprovalStatus.APPROVED:
+            continue
+        if not approval.subject_id.startswith(prefix):
+            continue
+        accepted.append(approval.subject_id[len(prefix):])
+    return tuple(sorted(set(accepted)))
+
+
+def request_admin_policy_warning_status(
+    store_path: str | Path,
+    plan_id: str,
+    check_id: str,
+    requested_by: str,
+    requested_at: str | None = None,
+) -> dict[str, object]:
+    if not requested_by.strip():
+        raise ValueError("requested_by is required")
+    if not check_id.strip():
+        raise ValueError("check_id is required")
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        decision = evaluate_admin_change_policy(
+            plan,
+            admin_execution_capability_for(AdminChangeKind(plan.kind), approved_admin_adapter_enablement_kinds(store)),
+            store.list_host_security_ids_review_packages_for_plan(plan.id),
+            approved_admin_policy_warning_check_ids(store, plan.id),
+        )
+        warning_ids = {check.id for check in decision.checks if check.status == PolicyCheckStatus.WARN}
+        if check_id not in warning_ids:
+            raise ValueError("policy check is not an active warning for this plan")
+        approval = ApprovalRequest(
+            id=f"approval.admin.policy.warning.{plan_id}.{check_id}",
+            subject_id=f"admin.policy.warning.{plan_id}.{check_id}",
+            approval_level=ApprovalLevel.HUMAN,
+            requester_thread=requested_by,
+            owner_domain=OwnerDomain.SISKO,
+            reason=f"Accept residual policy warning {check_id} for admin plan {plan_id}",
+            evidence_required=(plan_id, check_id),
+        )
+        event = AuditEvent(
+            id=f"audit.{approval.id}.requested",
+            event_type=AuditEventType.REQUESTED,
+            owner_domain=OwnerDomain.SISKO,
+            subject_id=approval.subject_id,
+            summary=approval.reason,
+            risk_level=plan.risk_level,
+            evidence_ids=approval.evidence_required,
+            occurred_at=requested_at,
+        )
+        store.save_approval(approval)
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "approval_id": approval.id,
+            "plan_id": plan_id,
+            "check_id": check_id,
+            "approval_status": ApprovalStatus(approval.status).value,
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
+def approve_admin_policy_warning_status(
+    store_path: str | Path,
+    approval_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"admin policy warning approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.admin.policy.warning."):
+            raise ValueError("admin policy warning approval is required")
+    finally:
+        store.close()
+    approved = approve_claim_status(store_path, approval_id, approved_by, approved_at)
+    return {"policy_warning_approval": True, **approved}
 
 
 def admin_history_review_status(store_path: str | Path) -> dict[str, object]:
@@ -3585,6 +3677,12 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             if approval.id.startswith("approval.admin.adapter.enable.")
             and approval.status == ApprovalStatus.PENDING
         ]
+        pending_policy_warning_approvals = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id.startswith("approval.admin.policy.warning.")
+            and approval.status == ApprovalStatus.PENDING
+        ]
         pending_claim_cleanup_approvals = [
             approval
             for approval in store.list_approvals()
@@ -3612,12 +3710,14 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             + len(pending_archive_approvals)
             + len(pending_restore_approvals)
             + len(pending_adapter_enablement_approvals)
+            + len(pending_policy_warning_approvals)
             + len(pending_claim_cleanup_approvals)
             + len(pending_daemon_migration_approvals),
             "pending_plan_count": len(pending),
             "pending_archive_approval_count": len(pending_archive_approvals),
             "pending_restore_approval_count": len(pending_restore_approvals),
             "pending_adapter_enablement_approval_count": len(pending_adapter_enablement_approvals),
+            "pending_policy_warning_approval_count": len(pending_policy_warning_approvals),
             "pending_claim_cleanup_approval_count": len(pending_claim_cleanup_approvals),
             "pending_daemon_migration_approval_count": len(pending_daemon_migration_approvals),
             "archive_approvals": [admin_history_archive_approval_status(approval) for approval in pending_archive_approvals],
@@ -3625,6 +3725,10 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             "adapter_enablement_approvals": [
                 admin_adapter_enablement_approval_status(approval)
                 for approval in pending_adapter_enablement_approvals
+            ],
+            "policy_warning_approvals": [
+                approval_request_status(approval)
+                for approval in pending_policy_warning_approvals
             ],
             "claim_cleanup_approvals": [
                 claim_cleanup_approval_status(approval)
@@ -5277,6 +5381,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_policy_parser = subparsers.add_parser("admin-policy-status", help="evaluate stored admin plans against Overseer policy gates")
     admin_policy_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_policy_parser.add_argument("--plan-id", help="filter policy evaluation to one admin plan")
+    admin_policy_warning_request_parser = subparsers.add_parser(
+        "request-admin-policy-warning",
+        help="request approval to accept a residual policy warning for one admin plan",
+    )
+    admin_policy_warning_request_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_policy_warning_request_parser.add_argument("--plan-id", required=True)
+    admin_policy_warning_request_parser.add_argument("--check-id", required=True)
+    admin_policy_warning_request_parser.add_argument("--requested-by", required=True)
+    admin_policy_warning_request_parser.add_argument("--requested-at")
+    admin_policy_warning_approve_parser = subparsers.add_parser(
+        "approve-admin-policy-warning",
+        help="approve a requested residual policy warning acceptance",
+    )
+    admin_policy_warning_approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    admin_policy_warning_approve_parser.add_argument("--approval-id", required=True)
+    admin_policy_warning_approve_parser.add_argument("--approved-by", required=True)
+    admin_policy_warning_approve_parser.add_argument("--approved-at")
     admin_history_parser = subparsers.add_parser("admin-history-review", help="review inactive admin plans for archive handling")
     admin_history_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_archive_plan_parser = subparsers.add_parser("admin-history-archive-plan", help="prepare a read-only archive manifest for inactive admin plans")
@@ -5792,6 +5913,35 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-policy-status":
         print(json.dumps(admin_policy_status(args.store, args.plan_id), sort_keys=True))
+        return 0
+
+    if args.command == "request-admin-policy-warning":
+        print(
+            json.dumps(
+                request_admin_policy_warning_status(
+                    args.store,
+                    args.plan_id,
+                    args.check_id,
+                    args.requested_by,
+                    args.requested_at,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-admin-policy-warning":
+        print(
+            json.dumps(
+                approve_admin_policy_warning_status(
+                    args.store,
+                    args.approval_id,
+                    args.approved_by,
+                    args.approved_at,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "admin-history-review":

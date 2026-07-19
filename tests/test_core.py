@@ -130,6 +130,7 @@ from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_admin_adapter_enablement_status
 from overseer.cli import approve_admin_history_archive_status
 from overseer.cli import approve_admin_history_restore_status
+from overseer.cli import approve_admin_policy_warning_status
 from overseer.cli import approve_claim_cleanup_status
 from overseer.cli import approve_claim_status
 from overseer.cli import approve_daemon_migration_status
@@ -174,6 +175,7 @@ from overseer.cli import release_claim_status
 from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_archive_status
 from overseer.cli import request_admin_history_restore_status
+from overseer.cli import request_admin_policy_warning_status
 from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
@@ -4547,6 +4549,50 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(result["status"], AdminExecutionStatus.BLOCKED.value)
         self.assertEqual(result["policy"]["status"], PolicyCheckStatus.WARN.value)
         self.assertIn("admin policy warn", result["summary"])
+
+    def test_admin_policy_warning_approval_allows_residual_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.warning-accepted",
+                AdminChangeKind.APT_UPGRADE.value,
+                "libslirp0",
+                "apply approved package patch",
+                "upgrade available",
+                packages=("libslirp0",),
+            )
+            requested_adapter = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.APT_UPGRADE.value,
+                "sisko",
+            )
+            approve_admin_adapter_enablement_status(store_path, requested_adapter["approval_id"], "sisko")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.warning-accepted", "operator")
+
+            warning_request = request_admin_policy_warning_status(
+                store_path,
+                "admin.apt.upgrade.warning-accepted",
+                "admin.rollback",
+                "sisko",
+            )
+            pending = authorizations_required_status(store_path)
+            approved_warning = approve_admin_policy_warning_status(
+                store_path,
+                warning_request["approval_id"],
+                "operator",
+            )
+            status = admin_policy_status(store_path, "admin.apt.upgrade.warning-accepted")
+            checks = {check["id"]: check for check in status["items"][0]["checks"]}
+            after = authorizations_required_status(store_path)
+
+        self.assertEqual(warning_request["approval_status"], ApprovalStatus.PENDING.value)
+        self.assertEqual(pending["pending_policy_warning_approval_count"], 1)
+        self.assertTrue(approved_warning["policy_warning_approval"])
+        self.assertEqual(status["pass"], 1)
+        self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.PASS.value)
+        self.assertIn("accepted residual warning", checks["admin.rollback"]["summary"])
+        self.assertEqual(after["pending_policy_warning_approval_count"], 0)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

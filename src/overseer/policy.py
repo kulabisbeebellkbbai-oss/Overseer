@@ -40,8 +40,10 @@ def evaluate_admin_change_policy(
     plan: AdminChangePlan,
     capability: AdminExecutionCapability,
     ids_review_packages: tuple[HostSecurityIDSReviewPackage, ...] = (),
+    accepted_warning_check_ids: tuple[str, ...] = (),
 ) -> PolicyDecision:
-    checks = (
+    checks = _apply_warning_acceptance(
+        (
         _plan_state_check(plan),
         _plan_completeness_check(plan),
         _approval_check(plan),
@@ -50,6 +52,8 @@ def evaluate_admin_change_policy(
         _rollback_check(plan),
         _verification_check(plan),
         _risk_approval_check(plan),
+        ),
+        frozenset(accepted_warning_check_ids),
     )
     return PolicyDecision(
         subject_id=plan.id,
@@ -57,6 +61,27 @@ def evaluate_admin_change_policy(
         status=_overall_status(checks),
         checks=checks,
     )
+
+
+def _apply_warning_acceptance(
+    checks: tuple[PolicyCheck, ...],
+    accepted_warning_check_ids: frozenset[str],
+) -> tuple[PolicyCheck, ...]:
+    accepted: list[PolicyCheck] = []
+    for check in checks:
+        if check.status == PolicyCheckStatus.WARN and check.id in accepted_warning_check_ids:
+            accepted.append(
+                PolicyCheck(
+                    check.id,
+                    PolicyCheckStatus.PASS,
+                    check.owner_domain,
+                    f"accepted residual warning: {check.summary}",
+                    check.evidence_ids,
+                )
+            )
+        else:
+            accepted.append(check)
+    return tuple(accepted)
 
 
 def _overall_status(checks: tuple[PolicyCheck, ...]) -> PolicyCheckStatus:

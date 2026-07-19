@@ -74,6 +74,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/cleanup-requests/execute`
 - `POST /physical/discover-storage`
 - `POST /virtual/discover-listeners`
+- `POST /health/probes/run`
 - `POST /host/inspect`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
@@ -106,6 +107,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 
 `POST /host/inspect` captures read-only host evidence and persists it to the API store.
 Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through the HTTP adapter, and process targets through Julian's local read-only process adapter.
+`POST /health/probes/run` probes health targets already persisted in the API store and records Julian health evidence. Optional fields: `timeout_seconds`, `retention_per_target`.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
@@ -199,6 +201,7 @@ storage = client.discover_storage()
 virtual = client.virtual_summary()
 listeners = client.discover_virtual_listeners()
 efficiency = client.health_efficiency()
+probed = client.run_health_probes(retention_per_target=5)
 summary = client.health_summary()
 snapshot = client.inspect_host()
 findings = client.host_security_findings()

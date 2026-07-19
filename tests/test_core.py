@@ -182,6 +182,7 @@ from overseer.cli import plan_host_security_remediation_status
 from overseer.cli import plan_admin_change_status
 from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
+from overseer.cli import probe_stored_health_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_archive_status
@@ -825,6 +826,30 @@ class LiveHealthProbeTests(unittest.TestCase):
 
             self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
             self.assertEqual(store.load_health_evidence(status["id"]).observed_status, HealthStatus.HEALTHY)
+            store.close()
+
+    def test_probe_stored_health_status_probes_persisted_process_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.stored.process",
+                    resource_id="svc.stored.process",
+                    name="Stored Process",
+                    probe_type=ProbeType.PROCESS,
+                    target=f"pid:{os.getpid()}",
+                )
+            )
+            store.close()
+
+            status = probe_stored_health_status(store_path, timeout_seconds=2, health_evidence_retention_per_target=1)
+            store = SQLiteStore(store_path)
+
+            self.assertEqual(status["targets"], 1)
+            self.assertEqual(status["healthy"], 1)
+            self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
+            self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
 
 
@@ -3035,6 +3060,29 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["targets"], 1)
             self.assertEqual(status["missing_evidence"], 1)
+
+    def test_client_runs_stored_health_probes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.client.process",
+                    resource_id="svc.client.process",
+                    name="Client Process",
+                    probe_type=ProbeType.PROCESS,
+                    target=f"pid:{os.getpid()}",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.run_health_probes(timeout_seconds=2, retention_per_target=1)
+
+            self.assertEqual(status["targets"], 1)
+            self.assertEqual(status["healthy"], 1)
+            self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
 
     def test_client_runs_claim_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:

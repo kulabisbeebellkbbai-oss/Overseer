@@ -66,6 +66,7 @@ from .cli import (
     plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
+    probe_stored_health_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
     request_admin_adapter_enablement_status,
@@ -267,6 +268,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
+                return
+            if self.path == "/health/probes/run":
+                self._handle_json(lambda payload: probe_stored_health_status(store_path, **_stored_health_probe_args(payload)))
                 return
             if self.path == "/physical/discover-storage":
                 self._handle_json(lambda payload: discover_storage_status(**_physical_storage_discovery_args(store_path, payload)))
@@ -547,6 +551,15 @@ def _physical_storage_discovery_args(store_path: str, payload: dict[str, Any]) -
         "sysfs_block_root": str(payload.get("sysfs_block_root", "/sys/class/block")),
         "store_path": store_path,
     }
+
+
+def _stored_health_probe_args(payload: dict[str, Any]) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    if "timeout_seconds" in payload:
+        args["timeout_seconds"] = float(payload["timeout_seconds"])
+    if "retention_per_target" in payload:
+        args["health_evidence_retention_per_target"] = int(payload["retention_per_target"])
+    return args
 
 
 def _approve_claim_cleanup_args(payload: dict[str, Any]) -> dict[str, Any]:

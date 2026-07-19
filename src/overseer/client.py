@@ -84,6 +84,18 @@ class OverseerApiClient:
     def health_efficiency(self) -> dict[str, Any]:
         return self._get("/health-efficiency")
 
+    def run_health_probes(
+        self,
+        timeout_seconds: float | None = None,
+        retention_per_target: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
+        if retention_per_target is not None:
+            payload["retention_per_target"] = retention_per_target
+        return self._post("/health/probes/run", payload)
+
     def usage_summary(self) -> dict[str, Any]:
         return self._get("/usage-summary")
 

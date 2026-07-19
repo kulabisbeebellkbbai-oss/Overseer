@@ -252,6 +252,46 @@ def probe_config_status(
     return status
 
 
+def probe_stored_health_status(
+    store_path: str | Path,
+    timeout_seconds: float = 5.0,
+    health_evidence_retention_per_target: int | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        targets = store.list_health_targets()
+        evidence_items = [
+            health_probe_adapter_for(target, timeout_seconds=timeout_seconds).probe(target)
+            for target in targets
+        ]
+        for evidence in evidence_items:
+            store.save_health_evidence(evidence)
+        if health_evidence_retention_per_target is not None:
+            store.prune_health_evidence(health_evidence_retention_per_target)
+        return {
+            "store": str(store.path),
+            "targets": len(targets),
+            "healthy": sum(1 for evidence in evidence_items if evidence.observed_status == HealthStatus.HEALTHY),
+            "unhealthy": sum(1 for evidence in evidence_items if evidence.observed_status != HealthStatus.HEALTHY),
+            "evidence": [_health_evidence_item_status(evidence) for evidence in evidence_items],
+        }
+    finally:
+        store.close()
+
+
+def _health_evidence_item_status(evidence: HealthEvidence) -> dict[str, object]:
+    return {
+        "id": evidence.id,
+        "resource_id": evidence.resource_id,
+        "target": evidence.target,
+        "probe_type": evidence.probe_type.value,
+        "status": evidence.observed_status.value,
+        "owner_domain": evidence.owner_domain.value,
+        "recovery_required": evidence.recovery_required,
+        "error": evidence.observed_error,
+    }
+
+
 def discover_physical_status(roots: Sequence[str], store_path: str | Path | None = None) -> dict[str, object]:
     identities = PathPhysicalDiscoveryAdapter(tuple(roots)).discover()
     return discovered_physical_identities_status(identities, store_path)
@@ -5177,6 +5217,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe_config_parser.add_argument("--config", required=True, help="explicit JSON config path")
     probe_config_parser.add_argument("--store", help="explicit SQLite store path for persisting health evidence")
     probe_config_parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    probe_stored_health_parser = subparsers.add_parser("probe-stored-health", help="probe health targets already persisted in a SQLite store")
+    probe_stored_health_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    probe_stored_health_parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    probe_stored_health_parser.add_argument("--retention-per-target", type=int)
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
@@ -5631,6 +5675,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "probe-config":
         print(json.dumps(probe_config_status(args.config, args.store, args.timeout_seconds), sort_keys=True))
+        return 0
+
+    if args.command == "probe-stored-health":
+        print(json.dumps(probe_stored_health_status(args.store, args.timeout_seconds, args.retention_per_target), sort_keys=True))
         return 0
 
     if args.command == "discover-physical":

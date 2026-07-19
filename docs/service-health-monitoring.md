@@ -108,6 +108,7 @@ Julian can run read-only process probes for explicit process targets:
 ```bash
 PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.overseer.api --name "Overseer API" --probe-type process --url systemd:user:overseer-api.service --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.example --name "Example PID" --probe-type process --url pid:1234 --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli probe-stored-health --store state/overseer.sqlite3 --retention-per-target 5
 ```
 
 Supported process target forms:

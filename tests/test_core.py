@@ -124,6 +124,7 @@ from overseer import (
 )
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
+from overseer.ui import OPERATOR_CONSOLE_HTML
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import discover_storage_status
@@ -3098,6 +3099,10 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["profile"]["name"], "client-active")
             self.assertEqual(status["source"], "store_sibling_file")
             self.assertTrue(status["active"])
+
+    def test_operator_console_loads_active_policy_profile(self):
+        self.assertIn('activePolicy: "/admin/active-policy-profile"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Active Policy Profile", OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:

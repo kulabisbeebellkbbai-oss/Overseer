@@ -84,6 +84,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqlite3` - summarize admin plans, pending approvals, execution outcomes, archive candidates, restore approvals, and admin audit events.
 - `PYTHONPATH=src python3 -m overseer.cli admin-execution-readiness --store state/overseer.sqlite3` - summarize which admin plans are ready for Overseer execution, need approval, need IDS review, or require manual execution.
 - `PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3` - evaluate stored admin plans against approval, adapter, IDS, rollback, verification, and risk policy gates.
+- `PYTHONPATH=src python3 -m overseer.cli active-policy-profile --store state/overseer.sqlite3` - show the store-local active policy profile or the best-practice fallback.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-review --store state/overseer.sqlite3` - identify completed or canceled admin plans that are candidates for archive handling without deleting them.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-archive-plan --store state/overseer.sqlite3` - prepare a read-only archive manifest for inactive admin plans without mutating records.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-archives --store state/overseer.sqlite3 --plan-id admin.restart.example` - list persisted admin history archive records, optionally filtered by plan.

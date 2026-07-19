@@ -347,6 +347,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       authorizations: "/admin/authorizations-required",
       readiness: "/admin/execution-readiness",
       adapters: "/admin/adapter-capabilities",
+      activePolicy: "/admin/active-policy-profile",
       physical: "/physical-summary",
       virtual: "/virtual-summary",
       security: "/security-summary",
@@ -485,12 +486,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const adapters = state.data.adapters || {};
       const auth = state.data.authorizations || {};
       const readiness = state.data.readiness || {};
+      const activePolicy = state.data.activePolicy || {};
+      const profile = activePolicy.profile || {};
       document.getElementById("admin").innerHTML = `
         <div class="grid">
           ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good")}
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good")}
           ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3")}
           ${metric("Failed", readiness.failed, "plans", "span-3", readiness.failed ? "bad" : "good")}
+          <div class="panel span-12">${kv("Active Policy Profile", {
+            name: profile.name,
+            source: activePolicy.source,
+            customized: activePolicy.customized,
+            warnings_block_execution: profile.block_warnings_until_accepted,
+            path: activePolicy.path,
+            next_step: activePolicy.next_step
+          })}</div>
           <div class="panel span-6">${table("Adapter Capabilities", adapters.items || [], ["kind", "status", "adapter_name"])}</div>
           <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"])}</div>
         </div>`;

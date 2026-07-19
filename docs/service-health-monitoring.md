@@ -100,3 +100,21 @@ PYTHONPATH=src python3 -m overseer.cli health-efficiency --store state/overseer.
 ```
 
 It summarizes target status counts, probe-type coverage, owner routing, recovery requirements, missing evidence, and latest failures for MCP, hosted page, HTTPS, HTML, JSON, process, command, log, and manual health checks.
+
+## Live Process Probes
+
+Julian can run read-only process probes for explicit process targets:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.overseer.api --name "Overseer API" --probe-type process --url systemd:user:overseer-api.service --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.example --name "Example PID" --probe-type process --url pid:1234 --store state/overseer.sqlite3
+```
+
+Supported process target forms:
+
+- `systemd:user:<unit>`: checks `systemctl --user is-active <unit>`.
+- `systemd:system:<unit>`: checks `systemctl is-active <unit>`.
+- `pid:<pid>`: checks that a process ID is present with `ps`.
+- any other value: checks for a matching process with `pgrep -af`.
+
+These probes only observe process state. They do not start, stop, restart, enable, disable, install, remove, or reconfigure services.

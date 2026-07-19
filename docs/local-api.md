@@ -105,6 +105,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 All request bodies are JSON objects. Claim operations use the same field names as the CLI options, with underscores instead of hyphens.
 
 `POST /host/inspect` captures read-only host evidence and persists it to the API store.
+Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through the HTTP adapter, and process targets through Julian's local read-only process adapter.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.

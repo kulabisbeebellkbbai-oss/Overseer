@@ -55,7 +55,7 @@ from .ids_review import (
     record_ids_review_package_result,
     write_ids_review_prompt_file,
 )
-from .live_health import HttpHealthProbeAdapter
+from .live_health import HttpHealthProbeAdapter, health_probe_adapter_for
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
 from .policy import PolicyCheck, PolicyDecision, evaluate_admin_change_policy
@@ -192,7 +192,7 @@ def probe_health_status(
         expected_status=expected_status,
         expected_content_type=expected_content_type,
     )
-    evidence = HttpHealthProbeAdapter(timeout_seconds=timeout_seconds).probe(target)
+    evidence = health_probe_adapter_for(target, timeout_seconds=timeout_seconds).probe(target)
     if store_path is not None:
         store = SQLiteStore(store_path)
         try:
@@ -220,8 +220,10 @@ def probe_config_status(
     timeout_seconds: float = 5.0,
 ) -> dict[str, object]:
     config = load_config(config_path)
-    adapter = HttpHealthProbeAdapter(timeout_seconds=timeout_seconds)
-    evidence_items = [adapter.probe(target) for target in config.health_targets]
+    evidence_items = [
+        health_probe_adapter_for(target, timeout_seconds=timeout_seconds).probe(target)
+        for target in config.health_targets
+    ]
     if store_path is not None:
         store = SQLiteStore(store_path)
         try:
@@ -5162,10 +5164,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
     seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
     seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
-    probe_parser = subparsers.add_parser("probe-health", help="run a read-only HTTP health probe for an explicit URL")
+    probe_parser = subparsers.add_parser("probe-health", help="run a read-only health probe for an explicit target")
     probe_parser.add_argument("--resource-id", required=True)
     probe_parser.add_argument("--name", required=True)
-    probe_parser.add_argument("--url", required=True)
+    probe_parser.add_argument("--url", required=True, help="HTTP URL or process target such as systemd:user:overseer-api.service")
     probe_parser.add_argument("--probe-type", default=ProbeType.HTTP.value, choices=[item.value for item in ProbeType])
     probe_parser.add_argument("--expected-status", type=int)
     probe_parser.add_argument("--expected-content-type")

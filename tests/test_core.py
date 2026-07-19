@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import tempfile
 import threading
 import unittest
@@ -55,6 +56,7 @@ from overseer import (
     HostInspectionAdapter,
     HostInspectionSnapshot,
     HttpHealthProbeAdapter,
+    LocalProcessHealthProbeAdapter,
     InterruptionPolicy,
     IDSReviewPackageStatus,
     LimitDecision,
@@ -720,6 +722,51 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(store.load_health_evidence(status["id"]).observed_status, HealthStatus.HEALTHY)
             store.close()
 
+    def test_local_process_probe_adapter_classifies_active_systemd_unit(self):
+        def runner(command, timeout_seconds):
+            return HostCommandObservation(
+                name="systemctl",
+                command=tuple(command),
+                exit_code=0,
+                stdout="active\n",
+            )
+
+        target = HealthTarget(
+            id="health.overseer.api",
+            resource_id="svc.overseer.api",
+            name="Overseer API",
+            probe_type=ProbeType.PROCESS,
+            target="systemd:user:overseer-api.service",
+        )
+
+        evidence = LocalProcessHealthProbeAdapter(command_runner=runner).probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+        self.assertFalse(evidence.recovery_required)
+
+    def test_local_process_probe_adapter_preserves_failed_process_error(self):
+        def runner(command, timeout_seconds):
+            return HostCommandObservation(
+                name="systemctl",
+                command=tuple(command),
+                exit_code=3,
+                stdout="inactive\n",
+            )
+
+        target = HealthTarget(
+            id="health.overseer.api",
+            resource_id="svc.overseer.api",
+            name="Overseer API",
+            probe_type=ProbeType.PROCESS,
+            target="systemd:user:overseer-api.service",
+        )
+
+        evidence = LocalProcessHealthProbeAdapter(command_runner=runner).probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
+        self.assertTrue(evidence.recovery_required)
+        self.assertEqual(evidence.observed_error, "inactive")
+
     def test_probe_config_status_probes_declared_targets_and_persists_evidence(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
             root = Path(directory)
@@ -759,6 +806,24 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(status["healthy"], 1)
             self.assertEqual(status["evidence"][0]["status"], HealthStatus.HEALTHY.value)
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
+            store.close()
+
+    def test_probe_health_status_routes_process_probe_and_persists_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = probe_health_status(
+                "svc.current-process",
+                "Current Process",
+                f"pid:{os.getpid()}",
+                ProbeType.PROCESS.value,
+                timeout_seconds=2,
+                store_path=store_path,
+            )
+            store = SQLiteStore(store_path)
+
+            self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
+            self.assertEqual(store.load_health_evidence(status["id"]).observed_status, HealthStatus.HEALTHY)
             store.close()
 
 

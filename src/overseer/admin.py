@@ -157,7 +157,12 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         summary="live apt upgrades require a specific high-risk package-maintenance adapter approval plan before enablement",
         authorization_required_before_enable=True,
         approval_plan_required=True,
-        supported_commands=(("sudo", "apt-get", "upgrade"), ("sudo", "apt-get", "check"), ("apt", "list", "--upgradable")),
+        supported_commands=(
+            ("sudo", "apt-get", "upgrade"),
+            ("sudo", "apt-get", "install", "--only-upgrade"),
+            ("sudo", "apt-get", "check"),
+            ("apt", "list", "--upgradable"),
+        ),
     ),
     AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
@@ -371,8 +376,12 @@ def plan_apt_upgrade(
 ) -> AdminChangePlan:
     package_args = packages or ()
     target = " ".join(package_args) if package_args else "all upgradeable packages"
-    preview_command = ("sudo", "apt-get", "upgrade", "--dry-run", *package_args)
-    upgrade_command = ("sudo", "apt-get", "upgrade", "-y", *package_args)
+    if package_args:
+        preview_command = ("sudo", "apt-get", "install", "--only-upgrade", "--dry-run", *package_args)
+        upgrade_command = ("sudo", "apt-get", "install", "--only-upgrade", "-y", *package_args)
+    else:
+        preview_command = ("sudo", "apt-get", "upgrade", "--dry-run")
+        upgrade_command = ("sudo", "apt-get", "upgrade", "-y")
     verification_command = ("dpkg-query", "-W", *package_args) if package_args else ("sudo", "apt-get", "check")
     return AdminChangePlan(
         id=plan_id,

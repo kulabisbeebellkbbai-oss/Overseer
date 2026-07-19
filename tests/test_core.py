@@ -4256,8 +4256,8 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
         self.assertEqual(plan.risk_level, RiskLevel.HIGH)
         self.assertEqual(plan.target, "sqlite3")
-        self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "upgrade", "--dry-run", "sqlite3"))
-        self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "upgrade", "-y", "sqlite3"))
+        self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "install", "--only-upgrade", "--dry-run", "sqlite3"))
+        self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "install", "--only-upgrade", "-y", "sqlite3"))
         self.assertEqual(plan.verification_steps[0].command, ("dpkg-query", "-W", "sqlite3"))
 
     def test_firewall_plan_has_critical_risk_and_delete_rollback(self):

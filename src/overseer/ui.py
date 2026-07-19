@@ -340,6 +340,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <button data-view="overview" aria-selected="true">Overview</button>
         <button data-view="admin">Admin</button>
         <button data-view="assets">Assets</button>
+        <button data-view="claims">Claims</button>
         <button data-view="security">Security</button>
         <button data-view="health">Health</button>
         <button data-view="usage">Usage</button>
@@ -366,6 +367,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       <section id="overview" class="section active"></section>
       <section id="admin" class="section"></section>
       <section id="assets" class="section"></section>
+      <section id="claims" class="section"></section>
       <section id="security" class="section"></section>
       <section id="health" class="section"></section>
       <section id="usage" class="section"></section>
@@ -387,7 +389,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       healthSummary: "/health-summary",
       usage: "/usage-summary",
       audit: "/audit-summary",
-      approvals: "/approvals-summary"
+      approvals: "/approvals-summary",
+      claims: "/claims/review",
+      claimCleanup: "/claims/cleanup-plan"
     };
     const state = {
       data: {},
@@ -471,6 +475,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
       if (action === "register-resource") return await registerResource();
+      if (action === "request-claim") return await requestClaim();
+      if (action === "approve-claim") return await approveClaim();
+      if (action === "activate-claim") return await activateClaim();
+      if (action === "release-claim") return await releaseClaim();
+      if (action === "request-claim-cleanup") return await requestClaimCleanup();
+      if (action === "approve-claim-cleanup") return await approveClaimCleanup();
+      if (action === "execute-claim-cleanup") return await executeClaimCleanup();
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
@@ -488,6 +499,63 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const payload = {resource_id: resourceId, name, resource_type: resourceType, owner_domain: ownerDomain, risk_level: riskLevel};
       if (identifiersText) payload.identifiers = JSON.parse(identifiersText);
       return await postJson("/resources", payload);
+    }
+    async function requestClaim() {
+      const payload = {
+        claim_id: value("claim-id"),
+        resource_id: value("claim-resource-id"),
+        claim_type: value("claim-type"),
+        owner_thread: value("claim-owner-thread"),
+        owner_role: value("claim-owner-role"),
+        intent: value("claim-intent"),
+        requested_action: value("claim-action"),
+        risk_level: value("claim-risk")
+      };
+      const port = value("claim-port");
+      if (port) payload.ports = [Number(port)];
+      const expiresAt = value("claim-expires-at");
+      if (expiresAt) payload.expires_at = expiresAt;
+      const releaseCondition = value("claim-release-condition");
+      if (releaseCondition) payload.release_condition = releaseCondition;
+      return await postJson("/claims/request", payload);
+    }
+    async function approveClaim() {
+      return await postJson("/claims/approve", {
+        approval_id: value("claim-approval-id"),
+        decided_by: value("claim-decided-by")
+      });
+    }
+    async function activateClaim() {
+      const payload = {claim_id: value("claim-activate-id")};
+      const approvalId = value("claim-activate-approval-id");
+      if (approvalId) payload.approval_id = approvalId;
+      return await postJson("/claims/activate", payload);
+    }
+    async function releaseClaim() {
+      const payload = {claim_id: value("claim-release-id")};
+      const releasedBy = value("claim-released-by");
+      const reason = value("claim-release-reason");
+      if (releasedBy) payload.released_by = releasedBy;
+      if (reason) payload.reason = reason;
+      return await postJson("/claims/release", payload);
+    }
+    async function requestClaimCleanup() {
+      return await postJson("/claims/cleanup-requests", {
+        claim_id: value("cleanup-claim-id"),
+        requested_by: value("cleanup-requested-by")
+      });
+    }
+    async function approveClaimCleanup() {
+      return await postJson("/claims/cleanup-requests/approve", {
+        approval_id: value("cleanup-approval-id"),
+        approved_by: value("cleanup-approved-by")
+      });
+    }
+    async function executeClaimCleanup() {
+      return await postJson("/claims/cleanup-requests/execute", {
+        approval_id: value("cleanup-execute-approval-id"),
+        executed_by: value("cleanup-executed-by")
+      });
     }
     async function registerHealthTarget() {
       const targetId = document.getElementById("health-target-id").value.trim();
@@ -511,6 +579,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       renderOverview();
       renderAdmin();
       renderAssets();
+      renderClaims();
       renderSecurity();
       renderHealth();
       renderUsage();
@@ -603,6 +672,68 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Virtual Assets", virtual.items || [], ["id", "name", "state", "current_claim_id"])}</div>
         </div>`;
     }
+    function renderClaims() {
+      const claims = state.data.claims || {};
+      const cleanup = state.data.claimCleanup || {};
+      document.getElementById("claims").innerHTML = `
+        <div class="grid">
+          ${metric("Active", claims.active_like, "claims", "span-3")}
+          ${metric("Queued", claims.queued, "claims", "span-3", claims.queued ? "warn" : "good")}
+          ${metric("Review", claims.operator_review_required, "required", "span-3", claims.operator_review_required ? "bad" : "good")}
+          ${metric("Cleanup", cleanup.cleanup_candidates, "candidates", "span-3", cleanup.cleanup_candidates ? "warn" : "good")}
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Request Claim</h3><button class="action-btn" data-action="request-claim">Request Claim</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="claim-id">Claim ID</label><input id="claim-id" value="claim.local.resource"></div>
+              <div class="field span-2"><label for="claim-resource-id">Resource ID</label><input id="claim-resource-id" value="svc.systemd-user.overseer-api"></div>
+              <div class="field span-2"><label for="claim-type">Type</label><select id="claim-type">${claimTypeOptions()}</select></div>
+              <div class="field span-2"><label for="claim-owner-thread">Thread</label><input id="claim-owner-thread" value="operator-console"></div>
+              <div class="field span-2"><label for="claim-owner-role">Owner</label><select id="claim-owner-role">${ownerOptions()}</select></div>
+              <div class="field span-2"><label for="claim-risk">Risk</label><select id="claim-risk">${riskOptions()}</select></div>
+              <div class="field span-2"><label for="claim-port">Port</label><input id="claim-port" type="number" min="1" max="65535"></div>
+              <div class="field span-2"><label for="claim-expires-at">Expires At</label><input id="claim-expires-at"></div>
+              <div class="field span-2"><label for="claim-release-condition">Release Condition</label><input id="claim-release-condition"></div>
+              <div class="field span-3"><label for="claim-intent">Intent</label><input id="claim-intent" value="operate local resource"></div>
+              <div class="field span-3"><label for="claim-action">Action</label><input id="claim-action" value="observe health"></div>
+            </div>
+          </div>
+          <div class="panel span-4">
+            <div class="toolbar"><h3>Approve</h3><button class="action-btn" data-action="approve-claim">Approve</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="claim-approval-id">Approval ID</label><input id="claim-approval-id"></div>
+              <div class="field span-6"><label for="claim-decided-by">Decided By</label><input id="claim-decided-by" value="sisko"></div>
+            </div>
+          </div>
+          <div class="panel span-4">
+            <div class="toolbar"><h3>Activate</h3><button class="action-btn" data-action="activate-claim">Activate</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="claim-activate-id">Claim ID</label><input id="claim-activate-id"></div>
+              <div class="field span-6"><label for="claim-activate-approval-id">Approval ID</label><input id="claim-activate-approval-id"></div>
+            </div>
+          </div>
+          <div class="panel span-4">
+            <div class="toolbar"><h3>Release</h3><button class="action-btn" data-action="release-claim">Release</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="claim-release-id">Claim ID</label><input id="claim-release-id"></div>
+              <div class="field span-3"><label for="claim-released-by">By</label><input id="claim-released-by" value="sisko"></div>
+              <div class="field span-3"><label for="claim-release-reason">Reason</label><input id="claim-release-reason"></div>
+            </div>
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Cleanup</h3><div class="actions"><button class="action-btn" data-action="request-claim-cleanup">Request</button><button class="action-btn" data-action="approve-claim-cleanup">Approve</button><button class="action-btn" data-action="execute-claim-cleanup">Execute</button></div></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="cleanup-claim-id">Claim ID</label><input id="cleanup-claim-id"></div>
+              <div class="field span-2"><label for="cleanup-requested-by">Requested By</label><input id="cleanup-requested-by" value="sisko"></div>
+              <div class="field span-2"><label for="cleanup-approval-id">Approval ID</label><input id="cleanup-approval-id"></div>
+              <div class="field span-2"><label for="cleanup-approved-by">Approved By</label><input id="cleanup-approved-by" value="sisko"></div>
+              <div class="field span-2"><label for="cleanup-execute-approval-id">Execute Approval</label><input id="cleanup-execute-approval-id"></div>
+              <div class="field span-2"><label for="cleanup-executed-by">Executed By</label><input id="cleanup-executed-by" value="sisko"></div>
+            </div>
+          </div>
+          <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"])}</div>
+          <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"])}</div>
+        </div>`;
+    }
     function renderSecurity() {
       const security = state.data.security || {};
       const host = security.host_security || {};
@@ -653,6 +784,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function riskOptions() {
       return ["low", "medium", "high", "critical"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function claimTypeOptions() {
+      return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function value(id) {
+      const element = document.getElementById(id);
+      return element ? element.value.trim() : "";
     }
     function renderUsage() {
       const usage = state.data.usage || {};

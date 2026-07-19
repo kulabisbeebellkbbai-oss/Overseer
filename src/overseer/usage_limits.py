@@ -84,6 +84,20 @@ class UsageContinuationRequest:
 
 
 @dataclass(frozen=True)
+class UsageContinuationDispatch:
+    id: str
+    request_id: str
+    limit_id: str
+    resource_id: str
+    owner_thread: str
+    status: str
+    reason: str
+    dispatched_by: str
+    dispatched_at: str | None = None
+    scheduled_for: str | None = None
+
+
+@dataclass(frozen=True)
 class UsageSchedule:
     decision: LimitDecision
     owner_domain: OwnerDomain

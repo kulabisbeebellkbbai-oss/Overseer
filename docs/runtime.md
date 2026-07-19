@@ -1,6 +1,6 @@
 # Runtime
 
-The runtime entrypoint is the shape of the future Overseer daemon. The first version can run a single foreground tick against an explicit SQLite store, and this workstation has an approved user systemd service installed for continuous local operation.
+The runtime entrypoint can run a single foreground tick against an explicit SQLite store, and this workstation has an approved user systemd service installed for continuous local operation.
 
 ## Boundaries
 

@@ -77,6 +77,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
 - `POST /usage/continuation-requests`
+- `POST /usage/continuation-dispatches`
 - `POST /admin/plans`
 - `POST /admin/approve`
 - `POST /admin/cancel`
@@ -127,7 +128,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership, permissions, sidecar files, and schema migration metadata without creating a missing database or changing file modes.
-`GET /state` includes schema migrations, persisted resources, claims, approvals, audit events, usage limits, usage continuation requests, health records, runtime records, admin plans, and security review records.
+`GET /state` includes schema migrations, persisted resources, claims, approvals, audit events, usage limits, usage continuation requests, usage continuation dispatches, health records, runtime records, admin plans, and security review records.
 `GET /state/redacted` returns a share-oriented state export with local paths, targets, errors, summaries, reasons, command text, prompt/advisory text, hostnames, listener addresses, and secret-like keys replaced by `[REDACTED]`.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 `GET /audit-summary` returns persisted audit events with optional `event_type`, `owner`, and `subject_prefix` query filters.
@@ -147,8 +148,9 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
-`GET /usage/continuation-plan` returns persisted usage-limited continuation requests and their current ready, waiting, blocked, or escalated schedule without mutating host state.
+`GET /usage/continuation-plan` returns persisted usage-limited continuation requests, dispatch records, and their current ready, waiting, blocked, or escalated schedule without mutating host state.
 `POST /usage/continuation-requests` persists a Quark continuation request with `request_id`, `limit_id`, `resource_id`, `owner_thread`, `requested_units`, and `intent`; optional fields are `risk_level`, `earliest_start`, `deadline`, `requested_by`, and `requested_at`.
+`POST /usage/continuation-dispatches` persists idempotent dispatch records for ready continuation requests; optional fields are `dispatched_by` and `dispatched_at`. It does not wake external threads or mutate host schedulers.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, counts by kind and source, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
 `GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.

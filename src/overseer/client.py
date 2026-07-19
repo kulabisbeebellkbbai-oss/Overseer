@@ -90,6 +90,16 @@ class OverseerApiClient:
     def usage_continuation_plan(self) -> dict[str, Any]:
         return self._get("/usage/continuation-plan")
 
+    def dispatch_usage_continuations(
+        self,
+        dispatched_by: str = "quark",
+        dispatched_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"dispatched_by": dispatched_by}
+        if dispatched_at:
+            payload["dispatched_at"] = dispatched_at
+        return self._post("/usage/continuation-dispatches", payload)
+
     def request_usage_continuation(
         self,
         request_id: str,

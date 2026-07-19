@@ -68,7 +68,7 @@ from .service import OverseerCoordinator, coordinator_from_store
 from .source_review import HostSecuritySourceReview, SourceReviewDisposition
 from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
-from .usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
+from .usage_limits import LimitKind, UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -3484,6 +3484,8 @@ def usage_continuation_plan_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         requests = store.list_usage_continuation_requests()
+        dispatches = store.list_usage_continuation_dispatches()
+        dispatched_request_ids = {dispatch.request_id for dispatch in dispatches}
         schedules = []
         missing_limit_ids: list[str] = []
         for request in requests:
@@ -3507,15 +3509,91 @@ def usage_continuation_plan_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "continuation_requests": len(requests),
+            "dispatches": len(dispatches),
             "ready": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.READY.value),
             "waiting": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.WAITING.value),
             "blocked": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.BLOCKED.value),
             "escalated": sum(1 for item in schedules if item["status"] == ScheduledWorkStatus.ESCALATED.value),
+            "undispatched_ready": sum(
+                1
+                for item in schedules
+                if item["status"] == ScheduledWorkStatus.READY.value and item["id"] not in dispatched_request_ids
+            ),
             "missing_limit_ids": tuple(sorted(set(missing_limit_ids))),
             "items": [usage_continuation_request_status(request) for request in requests],
             "schedules": schedules,
+            "dispatch_items": [usage_continuation_dispatch_status(dispatch) for dispatch in dispatches],
             "mutation_performed": False,
             "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
+def dispatch_usage_continuations_status(
+    store_path: str | Path,
+    dispatched_by: str = "quark",
+    dispatched_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        now = dispatched_at or datetime.now(UTC).isoformat()
+        existing_dispatches = store.list_usage_continuation_dispatches()
+        dispatched_request_ids = {dispatch.request_id for dispatch in existing_dispatches}
+        dispatches: list[UsageContinuationDispatch] = []
+        skipped: list[dict[str, object]] = []
+        for request in store.list_usage_continuation_requests():
+            if request.id in dispatched_request_ids:
+                skipped.append(
+                    {
+                        "id": request.id,
+                        "owner_thread": request.owner_thread,
+                        "resource_id": request.resource_id,
+                        "status": "already_dispatched",
+                        "reason": "continuation request already has a dispatch record",
+                    }
+                )
+                continue
+            try:
+                limit = store.load_usage_limit(request.limit_id)
+            except KeyError:
+                skipped.append(
+                    {
+                        "id": request.id,
+                        "owner_thread": request.owner_thread,
+                        "resource_id": request.resource_id,
+                        "status": ScheduledWorkStatus.BLOCKED.value,
+                        "reason": "usage limit record is missing",
+                    }
+                )
+                continue
+            schedule = schedule_usage_limited_work(limit, request.to_limited_work_request())
+            if schedule.status != ScheduledWorkStatus.READY:
+                skipped.append(scheduled_work_status(schedule))
+                continue
+            dispatch = UsageContinuationDispatch(
+                id=f"usage.dispatch.{_status_id(request.id)}",
+                request_id=request.id,
+                limit_id=request.limit_id,
+                resource_id=request.resource_id,
+                owner_thread=request.owner_thread,
+                status="dispatched",
+                reason=schedule.reason,
+                dispatched_by=dispatched_by,
+                dispatched_at=now,
+                scheduled_for=schedule.scheduled_for,
+            )
+            store.save_usage_continuation_dispatch(dispatch)
+            dispatches.append(dispatch)
+        return {
+            "store": str(store.path),
+            "dispatched": len(dispatches),
+            "skipped": len(skipped),
+            "dispatches": [usage_continuation_dispatch_status(dispatch) for dispatch in dispatches],
+            "skipped_items": skipped,
+            "mutation_performed": bool(dispatches),
+            "host_mutation_performed": False,
+            "next_step": "external launcher may consume dispatch records; no host scheduler or thread wake was performed",
         }
     finally:
         store.close()
@@ -3534,6 +3612,21 @@ def usage_continuation_request_status(request: UsageContinuationRequest) -> dict
         "deadline": request.deadline,
         "requested_by": request.requested_by,
         "requested_at": request.requested_at,
+    }
+
+
+def usage_continuation_dispatch_status(dispatch: UsageContinuationDispatch) -> dict[str, object]:
+    return {
+        "id": dispatch.id,
+        "request_id": dispatch.request_id,
+        "limit_id": dispatch.limit_id,
+        "resource_id": dispatch.resource_id,
+        "owner_thread": dispatch.owner_thread,
+        "status": dispatch.status,
+        "reason": dispatch.reason,
+        "dispatched_by": dispatch.dispatched_by,
+        "dispatched_at": dispatch.dispatched_at,
+        "scheduled_for": dispatch.scheduled_for,
     }
 
 
@@ -4130,6 +4223,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         resources = store.list_resources()
         usage_limits = store.list_usage_limits()
         usage_continuation_requests = store.list_usage_continuation_requests()
+        usage_continuation_dispatches = store.list_usage_continuation_dispatches()
         health_targets = store.list_health_targets()
         health_evidence = store.list_health_evidence()
         claims = store.list_claims()
@@ -4171,6 +4265,10 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
             "usage_continuation_requests": [
                 usage_continuation_request_status(request)
                 for request in usage_continuation_requests
+            ],
+            "usage_continuation_dispatches": [
+                usage_continuation_dispatch_status(dispatch)
+                for dispatch in usage_continuation_dispatches
             ],
             "health_evidence": [
                 {
@@ -4780,6 +4878,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="summarize persisted usage-limited continuation requests",
     )
     usage_continuation_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    dispatch_usage_continuations_parser = subparsers.add_parser(
+        "dispatch-usage-continuations",
+        help="persist dispatch records for ready usage-limited continuation requests",
+    )
+    dispatch_usage_continuations_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    dispatch_usage_continuations_parser.add_argument("--dispatched-by", default="quark")
+    dispatch_usage_continuations_parser.add_argument("--dispatched-at")
     request_usage_continuation_parser = subparsers.add_parser(
         "request-usage-continuation",
         help="persist a usage-limited continuation request without waking work",
@@ -5239,6 +5344,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-continuation-plan":
         print(json.dumps(usage_continuation_plan_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "dispatch-usage-continuations":
+        print(
+            json.dumps(
+                dispatch_usage_continuations_status(args.store, args.dispatched_by, args.dispatched_at),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "request-usage-continuation":

@@ -55,8 +55,11 @@ PYTHONPATH=src python3 -m overseer.cli request-usage-continuation \
   --intent "continue queued service work"
 
 PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli dispatch-usage-continuations --store state/overseer.sqlite3
 ```
 
 `request-usage-continuation` persists a Quark planning record and immediately reports how the current limit would schedule it. `usage-continuation-plan` replays all persisted requests against current limit records and reports ready, waiting, blocked, and escalated work.
 
-This does not modify cron, systemd timers, shells, service state, network policy, or any external scheduler. It only records local planning state for a future authorized worker to consume.
+`dispatch-usage-continuations` persists idempotent dispatch records for ready continuation requests that do not already have a dispatch. It skips waiting, blocked, escalated, and already-dispatched requests.
+
+This does not modify cron, systemd timers, shells, service state, network policy, or any external scheduler. Dispatch records are local handoff evidence for a separately configured launcher or operator.

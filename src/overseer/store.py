@@ -20,7 +20,7 @@ from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .source_review import HostSecuritySourceReview
-from .usage_limits import UsageContinuationRequest, UsageLimit
+from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
 CURRENT_SCHEMA_VERSION = 1
@@ -85,6 +85,11 @@ class SQLiteStore:
                 id TEXT PRIMARY KEY,
                 limit_id TEXT NOT NULL,
                 resource_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS usage_continuation_dispatches (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS health_evidence (
@@ -199,6 +204,28 @@ class SQLiteStore:
         return tuple(
             _load_dataclass(UsageContinuationRequest, payload)
             for payload in self._list_payloads("usage_continuation_requests")
+        )
+
+    def save_usage_continuation_dispatch(self, dispatch: UsageContinuationDispatch) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO usage_continuation_dispatches (id, request_id, payload)
+            VALUES (?, ?, ?)
+            """,
+            (dispatch.id, dispatch.request_id, _dump(dispatch)),
+        )
+        self._connection.commit()
+
+    def load_usage_continuation_dispatch(self, dispatch_id: str) -> UsageContinuationDispatch:
+        return _load_dataclass(
+            UsageContinuationDispatch,
+            self._get_payload("usage_continuation_dispatches", dispatch_id),
+        )
+
+    def list_usage_continuation_dispatches(self) -> tuple[UsageContinuationDispatch, ...]:
+        return tuple(
+            _load_dataclass(UsageContinuationDispatch, payload)
+            for payload in self._list_payloads("usage_continuation_dispatches")
         )
 
     def save_health_evidence(self, evidence: HealthEvidence) -> None:

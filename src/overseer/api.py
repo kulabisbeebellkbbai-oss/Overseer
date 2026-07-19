@@ -38,6 +38,7 @@ from .cli import (
     claim_review_status,
     command_summary_status,
     create_host_security_source_review_status,
+    dispatch_usage_continuations_status,
     daemon_migration_plan_status,
     execute_admin_change_status,
     execute_claim_cleanup_status,
@@ -305,6 +306,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/usage/continuation-requests":
                 self._handle_json(lambda payload: request_usage_continuation_status(store_path, **_usage_continuation_request_args(payload)))
                 return
+            if self.path == "/usage/continuation-dispatches":
+                self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
+                return
             if self.path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
                 return
@@ -421,6 +425,13 @@ def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "deadline": str(payload["deadline"]) if payload.get("deadline") else None,
         "requested_by": str(payload.get("requested_by", "quark")),
         "requested_at": str(payload["requested_at"]) if payload.get("requested_at") else None,
+    }
+
+
+def _usage_continuation_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dispatched_by": str(payload.get("dispatched_by", "quark")),
+        "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
     }
 
 

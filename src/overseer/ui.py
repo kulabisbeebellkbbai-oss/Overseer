@@ -215,6 +215,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       justify-content: space-between;
       margin-bottom: 10px;
     }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .action-status {
+      margin-bottom: 12px;
+    }
     .section-head {
       grid-column: span 12;
       display: flex;
@@ -322,6 +331,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         </div>
       </div>
       <div id="error" class="panel error" hidden></div>
+      <div id="action-status" class="panel action-status" hidden></div>
       <section id="overview" class="section active"></section>
       <section id="admin" class="section"></section>
       <section id="assets" class="section"></section>
@@ -348,7 +358,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     const state = {
       data: {},
       view: "overview",
-      token: localStorage.getItem("overseerToken") || ""
+      token: localStorage.getItem("overseerToken") || "",
+      lastAction: null
     };
     const tokenInput = document.getElementById("token");
     tokenInput.value = state.token;
@@ -361,6 +372,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     document.getElementById("refresh").addEventListener("click", refresh);
     document.querySelectorAll(".nav button").forEach((button) => {
       button.addEventListener("click", () => selectView(button.dataset.view));
+    });
+    document.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-action]");
+      if (!button) return;
+      event.preventDefault();
+      await runAction(button.dataset.action);
     });
     function selectView(view) {
       state.view = view;
@@ -394,6 +411,33 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (!response.ok) throw new Error(`${path}: ${response.status}`);
       return await response.json();
     }
+    async function postJson(path, payload = {}) {
+      const headers = {"content-type": "application/json"};
+      const token = tokenInput.value.trim() || state.token;
+      if (token) headers.authorization = `Bearer ${token}`;
+      const response = await fetch(path, {method: "POST", headers, body: JSON.stringify(payload)});
+      if (!response.ok) throw new Error(`${path}: ${response.status}`);
+      return await response.json();
+    }
+    async function runAction(action) {
+      const status = document.getElementById("action-status");
+      status.hidden = false;
+      status.textContent = "Running action...";
+      try {
+        const result = await actionRequest(action);
+        state.lastAction = {action, result, at: new Date().toLocaleString()};
+        await refresh();
+      } catch (err) {
+        status.textContent = err.message;
+        status.className = "panel action-status error";
+      }
+    }
+    async function actionRequest(action) {
+      if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
+      if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
+      if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
+      throw new Error(`unsupported action: ${action}`);
+    }
     function render() {
       const dashboard = state.data.dashboard || {};
       const overall = dashboard.overall_status || "loading";
@@ -407,6 +451,16 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       renderHealth();
       renderUsage();
       renderAudit();
+      renderActionStatus();
+    }
+    function renderActionStatus() {
+      const status = document.getElementById("action-status");
+      if (!state.lastAction) return;
+      status.className = "panel action-status";
+      status.hidden = false;
+      const result = state.lastAction.result || {};
+      const detail = result.count ?? result.targets ?? result.status ?? "complete";
+      status.innerHTML = `<div class="toolbar"><h3>${safe(labelize(state.lastAction.action))}</h3><span class="pill good">${safe(detail)}</span></div><p class="muted">${safe(state.lastAction.at)}</p>`;
     }
     function renderOverview() {
       const focus = (state.data.dashboard || {}).role_focus || {};
@@ -446,6 +500,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const virtual = state.data.virtual || {};
       document.getElementById("assets").innerHTML = `
         <div class="grid">
+          <div class="section-head"><h3>Asset Actions</h3><div class="actions"><button class="action-btn" data-action="discover-storage">Discover Storage</button><button class="action-btn" data-action="discover-listeners">Discover Listeners</button></div></div>
           ${metric("Physical", physical.assets, "assets", "span-3")}
           ${metric("Checkout Ready", physical.ready_for_checkout, "physical", "span-3")}
           ${metric("Virtual", virtual.assets, "assets", "span-3")}
@@ -472,6 +527,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const health = state.data.health || {};
       document.getElementById("health").innerHTML = `
         <div class="grid">
+          <div class="section-head"><h3>Health Actions</h3><div class="actions"><button class="action-btn" data-action="run-health-probes">Run Probes</button></div></div>
           ${metric("Targets", health.targets, "registered", "span-3")}
           ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good")}
           ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good")}
@@ -551,7 +607,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     const style = document.createElement("style");
     style.textContent = ".good-text{color:var(--good)}.warn-text{color:var(--warn)}.bad-text{color:var(--bad)}";
     document.head.appendChild(style);
-    refresh();
+    render();
+    if (state.token) {
+      refresh();
+    } else {
+      document.getElementById("updated").textContent = "enter bearer token";
+    }
   </script>
 </body>
 </html>

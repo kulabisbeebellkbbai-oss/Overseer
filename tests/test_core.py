@@ -2060,6 +2060,9 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("<title>Overseer</title>", html)
             self.assertIn("Bearer token", html)
             self.assertIn("/operator-dashboard", html)
+            self.assertIn("data-action=\"discover-storage\"", html)
+            self.assertIn("data-action=\"discover-listeners\"", html)
+            self.assertIn("data-action=\"run-health-probes\"", html)
             self.assertEqual(error.exception.code, 401)
 
     def test_loopback_api_reports_runtime_status(self):

@@ -5753,6 +5753,38 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["health_targets"][0]["id"], "health.state")
             self.assertEqual(status["health_evidence"][0]["status"], HealthStatus.HEALTHY.value)
 
+    def test_list_state_status_reports_usage_limits_and_continuations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.state.ai",
+                    resource_id="svc.state.ai",
+                    kind=LimitKind.TOKENS,
+                    capacity=1000,
+                    remaining=0,
+                    resets_at="2026-07-18T20:00:00+00:00",
+                    window="hourly",
+                )
+            )
+            store.save_usage_continuation_request(
+                UsageContinuationRequest(
+                    id="work.state.ai",
+                    limit_id="limit.state.ai",
+                    resource_id="svc.state.ai",
+                    owner_thread="thread-state",
+                    requested_units=100,
+                    intent="continue state export work",
+                )
+            )
+            store.close()
+
+            status = list_state_status(store_path)
+
+            self.assertEqual(status["usage_limits"][0]["id"], "limit.state.ai")
+            self.assertEqual(status["usage_continuation_requests"][0]["id"], "work.state.ai")
+
     def test_release_claim_status_clears_stored_resource_claim(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

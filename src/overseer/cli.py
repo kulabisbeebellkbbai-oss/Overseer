@@ -4035,6 +4035,8 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         resources = store.list_resources()
+        usage_limits = store.list_usage_limits()
+        usage_continuation_requests = store.list_usage_continuation_requests()
         health_targets = store.list_health_targets()
         health_evidence = store.list_health_evidence()
         claims = store.list_claims()
@@ -4070,6 +4072,11 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                     "owner_domain": OwnerDomain(target.owner_domain).value,
                 }
                 for target in health_targets
+            ],
+            "usage_limits": [usage_limit_status(limit) for limit in usage_limits],
+            "usage_continuation_requests": [
+                usage_continuation_request_status(request)
+                for request in usage_continuation_requests
             ],
             "health_evidence": [
                 {

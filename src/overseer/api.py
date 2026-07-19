@@ -36,6 +36,7 @@ from .cli import (
     create_host_security_source_review_status,
     execute_admin_change_status,
     export_host_security_ids_review_prompt_status,
+    export_state_redacted_status,
     health_efficiency_summary_status,
     health_summary_status,
     host_security_findings_status,
@@ -180,6 +181,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/state":
                 self._handle(lambda: list_state_status(store_path))
+                return
+            if path == "/state/redacted":
+                self._handle(lambda: export_state_redacted_status(store_path))
                 return
             if path == "/claims/review":
                 self._handle(lambda: claim_review_status(store_path, _query_first(query, "now")))

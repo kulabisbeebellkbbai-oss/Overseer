@@ -128,6 +128,7 @@ from overseer.cli import cancel_admin_change_status
 from overseer.cli import claim_review_status
 from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
+from overseer.cli import export_state_redacted_status
 from overseer.cli import export_host_security_ids_review_prompt_status
 from overseer.cli import health_efficiency_summary_status
 from overseer.cli import health_summary_status
@@ -1892,6 +1893,38 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.client")
+
+    def test_client_reads_redacted_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.redacted.client",
+                    name="Client Redacted Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_health_target(
+                HealthTarget(
+                    id="health.redacted.client",
+                    resource_id="svc.redacted.client",
+                    name="Client Redacted Health",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8766/state",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                state = client.state_redacted()
+
+            self.assertEqual(state["store"], "[REDACTED]")
+            self.assertEqual(state["health_targets"][0]["target"], "[REDACTED]")
+            self.assertGreater(state["export"]["redaction_count"], 0)
 
     def test_client_reads_runtime_status(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4820,6 +4853,60 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")
             self.assertEqual(status["runtime_heartbeats"], [])
+
+    def test_export_state_redacted_status_removes_sensitive_operational_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="svc.export",
+                    name="Export Service",
+                    type=ResourceType.SERVICE,
+                    owner_domain=OwnerDomain.JULIAN,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_health_target(
+                HealthTarget(
+                    id="health.export",
+                    resource_id="svc.export",
+                    name="Export Health",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:8766/private-status",
+                )
+            )
+            store.save_health_evidence(
+                HealthEvidence(
+                    id="evidence.export",
+                    resource_id="svc.export",
+                    target="http://127.0.0.1:8766/private-status",
+                    probe_type=ProbeType.JSON,
+                    observed_status=HealthStatus.FAILED,
+                    owner_domain=OwnerDomain.JULIAN,
+                    observed_error="token appeared in upstream error text",
+                )
+            )
+            plan_admin_change_status(
+                store_path,
+                "admin.export",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "private-service.target",
+                "restart path includes local deployment details",
+                "active",
+            )
+            store.close()
+
+            status = export_state_redacted_status(store_path)
+
+        self.assertEqual(status["store"], "[REDACTED]")
+        self.assertEqual(status["health_targets"][0]["target"], "[REDACTED]")
+        self.assertEqual(status["health_evidence"][0]["target"], "[REDACTED]")
+        self.assertEqual(status["health_evidence"][0]["error"], "[REDACTED]")
+        self.assertEqual(status["admin_change_plans"][0]["target"], "[REDACTED]")
+        self.assertFalse(status["export"]["mutation_performed"])
+        self.assertIn("$.store", status["export"]["redacted_paths"])
+        self.assertIn("$.health_evidence[0].error", status["export"]["redacted_paths"])
 
     def test_list_state_status_reports_health_targets_and_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

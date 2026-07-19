@@ -34,7 +34,7 @@ from .admin import (
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
-from .config import load_config, seed_store_from_config
+from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .core import ApprovalLevel, Claim, ClaimType, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
@@ -3427,6 +3427,74 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+REDACTED_EXPORT_FIELD_KEYS = (
+    "advisory",
+    "command",
+    "error",
+    "hostname",
+    "listener",
+    "output",
+    "path",
+    "prompt",
+    "reason",
+    "remote_address",
+    "store",
+    "summary",
+    "target",
+)
+REDACTED_EXPORT_KEY_PARTS = SECRET_KEY_PARTS + REDACTED_EXPORT_FIELD_KEYS
+
+
+def export_state_redacted_status(store_path: str | Path) -> dict[str, object]:
+    state = list_state_status(store_path)
+    redacted, redactions = _redact_export_value(state)
+    if not isinstance(redacted, dict):
+        raise ValueError("redacted state export must be an object")
+    redacted["export"] = {
+        "mode": "redacted",
+        "mutation_performed": False,
+        "redaction_count": len(redactions),
+        "redacted_paths": redactions,
+        "redaction_policy": {
+            "key_parts": list(REDACTED_EXPORT_KEY_PARTS),
+            "replacement": "[REDACTED]",
+        },
+    }
+    return redacted
+
+
+def _redact_export_value(value: object, path: str = "$") -> tuple[object, list[str]]:
+    if isinstance(value, dict):
+        output: dict[str, object] = {}
+        redactions: list[str] = []
+        for key, nested in value.items():
+            child_path = f"{path}.{key}"
+            if _export_key_requires_redaction(str(key)):
+                output[str(key)] = "[REDACTED]"
+                redactions.append(child_path)
+                continue
+            redacted, child_redactions = _redact_export_value(nested, child_path)
+            output[str(key)] = redacted
+            redactions.extend(child_redactions)
+        return output, redactions
+    if isinstance(value, list):
+        output_items: list[object] = []
+        redactions: list[str] = []
+        for index, item in enumerate(value):
+            redacted, item_redactions = _redact_export_value(item, f"{path}[{index}]")
+            output_items.append(redacted)
+            redactions.extend(item_redactions)
+        return output_items, redactions
+    return value, []
+
+
+def _export_key_requires_redaction(key: str) -> bool:
+    lowered = key.lower()
+    if any(part in lowered for part in SECRET_KEY_PARTS):
+        return True
+    return any(lowered == part or lowered.endswith(f"_{part}") for part in REDACTED_EXPORT_FIELD_KEYS)
+
+
 def request_claim_status(
     store_path: str | Path,
     claim_id: str,
@@ -3618,6 +3686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--inspect-host", action="store_true", help="capture a read-only host inspection snapshot on each tick")
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    redacted_state_parser = subparsers.add_parser("export-state-redacted", help="print a redacted state export without writing files")
+    redacted_state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser = subparsers.add_parser("service-status", help="read stored runtime heartbeat for a local Overseer service")
     service_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_parser.add_argument("--service-name", default="overseer")
@@ -3946,6 +4016,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "list-state":
         print(json.dumps(list_state_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "export-state-redacted":
+        print(json.dumps(export_state_redacted_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "service-status":

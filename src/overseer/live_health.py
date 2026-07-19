@@ -84,6 +84,14 @@ class LocalProcessHealthProbeAdapter(HealthProbeAdapter):
         return classify_probe(target, result)
 
 
+class RoutedHealthProbeAdapter(HealthProbeAdapter):
+    def __init__(self, timeout_seconds: float = 5.0) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def probe(self, target: HealthTarget) -> HealthEvidence:
+        return health_probe_adapter_for(target, timeout_seconds=self.timeout_seconds).probe(target)
+
+
 def health_probe_adapter_for(target: HealthTarget, timeout_seconds: float = 5.0) -> HealthProbeAdapter:
     if target.probe_type == ProbeType.PROCESS:
         return LocalProcessHealthProbeAdapter(timeout_seconds=timeout_seconds)

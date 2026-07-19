@@ -57,6 +57,7 @@ from overseer import (
     HostInspectionSnapshot,
     HttpHealthProbeAdapter,
     LocalProcessHealthProbeAdapter,
+    RoutedHealthProbeAdapter,
     InterruptionPolicy,
     IDSReviewPackageStatus,
     LimitDecision,
@@ -6350,6 +6351,41 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(tick.health_probes, 1)
             self.assertEqual(tick.health_evidence, 1)
+            self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
+            store.close()
+
+    def test_runtime_default_probe_adapter_routes_process_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            seed_store_from_config(
+                config_from_mapping(
+                    {
+                        "resources": [
+                            {
+                                "id": "svc.runtime.process",
+                                "name": "Runtime Process",
+                                "type": "service",
+                                "owner_domain": "julian",
+                                "risk_level": "low",
+                            }
+                        ],
+                        "health_targets": [
+                            {
+                                "id": "health.runtime.process",
+                                "resource_id": "svc.runtime.process",
+                                "name": "Runtime Process",
+                                "probe_type": "process",
+                                "target": f"pid:{os.getpid()}",
+                            }
+                        ],
+                    }
+                ),
+                store,
+            )
+
+            tick = OverseerRuntime(store, probe_health_targets=True).run(once=True)
+
+            self.assertEqual(tick.health_probes, 1)
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
 

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 from .adapters import HealthProbeAdapter
 from .host import HostInspectionAdapter, assess_host_security
-from .live_health import HttpHealthProbeAdapter
+from .live_health import RoutedHealthProbeAdapter
 from .runtime_state import RuntimeHeartbeat
 from .store import SQLiteStore
 
@@ -42,7 +42,7 @@ class OverseerRuntime:
         self.store = store
         self.service_name = service_name
         self.probe_health_targets = probe_health_targets
-        self.health_probe_adapter = health_probe_adapter or HttpHealthProbeAdapter()
+        self.health_probe_adapter = health_probe_adapter or RoutedHealthProbeAdapter()
         self.health_evidence_retention_per_target = health_evidence_retention_per_target
         self.inspect_host = inspect_host
         self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter()

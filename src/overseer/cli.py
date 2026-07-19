@@ -59,6 +59,7 @@ from .live_health import HttpHealthProbeAdapter
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter
 from .policy import PolicyCheck, PolicyDecision, evaluate_admin_change_policy
+from .policy import PolicyCheckStatus
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
 from .runtime_state import (
@@ -2095,6 +2096,28 @@ def execute_admin_change_status(
     try:
         plan = store.load_admin_change_plan(plan_id)
         enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
+        ids_review_packages = store.list_host_security_ids_review_packages_for_plan(plan.id)
+        policy_decision = evaluate_admin_change_policy(
+            plan,
+            admin_execution_capability_for(AdminChangeKind(plan.kind), enabled_adapter_kinds),
+            ids_review_packages,
+        )
+        if policy_decision.status != PolicyCheckStatus.PASS:
+            blocking = tuple(
+                check
+                for check in policy_decision.checks
+                if check.status in {PolicyCheckStatus.BLOCK, PolicyCheckStatus.WARN}
+            )
+            result = AdminExecutionResult(
+                id=f"admin.exec.{plan.id}.blocked",
+                plan_id=plan.id,
+                status=AdminExecutionStatus.BLOCKED,
+                summary=f"admin policy {policy_decision.status.value}: {blocking[0].summary if blocking else 'policy gate blocked execution'}",
+                command_results=(),
+            )
+            store.save_admin_execution(result)
+            store.save_audit_event(audit_event_from_admin_execution(plan, result))
+            return {"store": str(store.path), "policy": admin_policy_decision_status(policy_decision), **admin_execution_status(result)}
         result = execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds)
         store.save_admin_execution(result)
         store.save_audit_event(audit_event_from_admin_execution(plan, result))

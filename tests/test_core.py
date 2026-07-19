@@ -4518,6 +4518,36 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(checks["admin.adapter.enabled"]["status"], PolicyCheckStatus.PASS.value)
         self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.WARN.value)
 
+    def test_execute_admin_change_status_blocks_policy_warnings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.warn-blocked",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply approved patch",
+                "upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.APT_UPGRADE.value,
+                "sisko",
+            )
+            approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.warn-blocked", "operator")
+
+            result = execute_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.warn-blocked",
+                runner=lambda step: self.fail("policy warnings must block command execution"),
+            )
+
+        self.assertEqual(result["status"], AdminExecutionStatus.BLOCKED.value)
+        self.assertEqual(result["policy"]["status"], PolicyCheckStatus.WARN.value)
+        self.assertIn("admin policy warn", result["summary"])
+
 
 class PhysicalIdentityTests(unittest.TestCase):
     def test_detects_same_serial_port_path_conflict(self):

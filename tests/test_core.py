@@ -3640,6 +3640,16 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn('data-action="inspect-host"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="record-source-review"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="prepare-ids-review-package"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('adminArchivePlan: "/admin/history-archive-plan"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('adminArchives: "/admin/history-archives"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/admin/history-archive-requests"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/admin/history-archive-requests/approve"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/admin/history-archive"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/admin/history-restore-requests"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/admin/history-restore-requests/approve"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/admin/history-unarchive"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="request-admin-archive"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="unarchive-admin-history"', OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:

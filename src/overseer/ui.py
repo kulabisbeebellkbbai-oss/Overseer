@@ -380,6 +380,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       authorizations: "/admin/authorizations-required",
       readiness: "/admin/execution-readiness",
       adapters: "/admin/adapter-capabilities",
+      adminArchivePlan: "/admin/history-archive-plan",
+      adminArchives: "/admin/history-archives",
       activePolicy: "/admin/active-policy-profile",
       packageStatus: "/maintenance/package-status",
       physical: "/physical-summary",
@@ -492,6 +494,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "approve-admin-change") return await approveAdminChange();
       if (action === "cancel-admin-change") return await cancelAdminChange();
       if (action === "execute-admin-change") return await executeAdminChange();
+      if (action === "request-admin-archive") return await requestAdminArchive();
+      if (action === "approve-admin-archive") return await approveAdminArchive();
+      if (action === "archive-admin-history") return await archiveAdminHistory();
+      if (action === "request-admin-restore") return await requestAdminRestore();
+      if (action === "approve-admin-restore") return await approveAdminRestore();
+      if (action === "unarchive-admin-history") return await unarchiveAdminHistory();
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
       if (action === "inspect-host") return await postJson("/host/inspect", {});
@@ -602,6 +610,46 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function executeAdminChange() {
       return await postJson("/admin/execute", {
         plan_id: value("admin-execute-plan-id")
+      });
+    }
+    async function requestAdminArchive() {
+      const payload = {requested_by: value("admin-archive-requested-by") || "sisko"};
+      const planId = value("admin-archive-plan-id");
+      if (planId) payload.plan_id = planId;
+      return await postJson("/admin/history-archive-requests", payload);
+    }
+    async function approveAdminArchive() {
+      return await postJson("/admin/history-archive-requests/approve", {
+        approval_id: value("admin-archive-approval-id"),
+        approved_by: value("admin-archive-approved-by") || "sisko"
+      });
+    }
+    async function archiveAdminHistory() {
+      const payload = {
+        approval_id: value("admin-archive-execute-approval-id"),
+        archived_by: value("admin-archived-by") || "sisko"
+      };
+      const planId = value("admin-archive-execute-plan-id");
+      if (planId) payload.plan_id = planId;
+      return await postJson("/admin/history-archive", payload);
+    }
+    async function requestAdminRestore() {
+      return await postJson("/admin/history-restore-requests", {
+        plan_id: value("admin-restore-plan-id"),
+        requested_by: value("admin-restore-requested-by") || "sisko"
+      });
+    }
+    async function approveAdminRestore() {
+      return await postJson("/admin/history-restore-requests/approve", {
+        approval_id: value("admin-restore-approval-id"),
+        approved_by: value("admin-restore-approved-by") || "sisko"
+      });
+    }
+    async function unarchiveAdminHistory() {
+      return await postJson("/admin/history-unarchive", {
+        plan_id: value("admin-unarchive-plan-id"),
+        approval_id: value("admin-unarchive-approval-id"),
+        restored_by: value("admin-unarchived-by") || "sisko"
       });
     }
     async function registerHealthTarget() {
@@ -775,6 +823,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const readiness = state.data.readiness || {};
       const activePolicy = state.data.activePolicy || {};
       const packageStatus = state.data.packageStatus || {};
+      const archivePlan = state.data.adminArchivePlan || {};
+      const archives = state.data.adminArchives || {};
       const profile = activePolicy.profile || {};
       document.getElementById("admin").innerHTML = `
         <div class="grid">
@@ -816,6 +866,30 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-3"><label for="admin-cancel-reason">Reason</label><input id="admin-cancel-reason"></div>
             </div>
           </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Archive History</h3><div class="actions"><button class="action-btn" data-action="request-admin-archive">Request</button><button class="action-btn" data-action="approve-admin-archive">Approve</button><button class="action-btn" data-action="archive-admin-history">Archive</button></div></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="admin-archive-plan-id">Plan ID</label><input id="admin-archive-plan-id"></div>
+              <div class="field span-4"><label for="admin-archive-requested-by">Requested By</label><input id="admin-archive-requested-by" value="sisko"></div>
+              <div class="field span-4"><label for="admin-archive-approval-id">Approval ID</label><input id="admin-archive-approval-id"></div>
+              <div class="field span-4"><label for="admin-archive-approved-by">Approved By</label><input id="admin-archive-approved-by" value="sisko"></div>
+              <div class="field span-4"><label for="admin-archive-execute-approval-id">Execute Approval</label><input id="admin-archive-execute-approval-id"></div>
+              <div class="field span-4"><label for="admin-archive-execute-plan-id">Execute Plan</label><input id="admin-archive-execute-plan-id"></div>
+              <div class="field span-4"><label for="admin-archived-by">Archived By</label><input id="admin-archived-by" value="sisko"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Restore History</h3><div class="actions"><button class="action-btn" data-action="request-admin-restore">Request</button><button class="action-btn" data-action="approve-admin-restore">Approve</button><button class="action-btn" data-action="unarchive-admin-history">Restore</button></div></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="admin-restore-plan-id">Plan ID</label><input id="admin-restore-plan-id"></div>
+              <div class="field span-4"><label for="admin-restore-requested-by">Requested By</label><input id="admin-restore-requested-by" value="sisko"></div>
+              <div class="field span-4"><label for="admin-restore-approval-id">Approval ID</label><input id="admin-restore-approval-id"></div>
+              <div class="field span-4"><label for="admin-restore-approved-by">Approved By</label><input id="admin-restore-approved-by" value="sisko"></div>
+              <div class="field span-4"><label for="admin-unarchive-plan-id">Restore Plan</label><input id="admin-unarchive-plan-id"></div>
+              <div class="field span-4"><label for="admin-unarchive-approval-id">Restore Approval</label><input id="admin-unarchive-approval-id"></div>
+              <div class="field span-4"><label for="admin-unarchived-by">Restored By</label><input id="admin-unarchived-by" value="sisko"></div>
+            </div>
+          </div>
           <div class="panel span-4">${kv("Package Status", {
             status: packageStatus.status,
             upgradable: packageStatus.upgradable,
@@ -833,6 +907,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           })}</div>
           <div class="panel span-6">${table("Adapter Capabilities", adapters.items || [], ["kind", "status", "adapter_name"])}</div>
           <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"])}</div>
+          <div class="panel span-6">${table("Archive Candidates", archivePlan.items || [], ["plan_id", "disposition", "next_step"])}</div>
+          <div class="panel span-6">${table("Archived Plans", archives.items || [], ["plan_id", "disposition", "archived_by", "archived_at"])}</div>
         </div>`;
     }
     function renderAssets() {

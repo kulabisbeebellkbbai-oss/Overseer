@@ -2383,6 +2383,8 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("<title>Overseer</title>", html)
             self.assertIn("Bearer token", html)
             self.assertIn("/operator-dashboard", html)
+            self.assertIn("data-action=\"register-resource\"", html)
+            self.assertIn("/resources", html)
             self.assertIn("data-action=\"discover-storage\"", html)
             self.assertIn("healthSummary: \"/health-summary\"", html)
             self.assertIn("data-action=\"register-health-target\"", html)

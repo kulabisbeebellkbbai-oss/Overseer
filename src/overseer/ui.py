@@ -470,12 +470,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-physical") return await postJson("/physical/discover", {});
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
+      if (action === "register-resource") return await registerResource();
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
       throw new Error(`unsupported action: ${action}`);
+    }
+    async function registerResource() {
+      const resourceId = document.getElementById("resource-id").value.trim();
+      const name = document.getElementById("resource-name").value.trim();
+      const resourceType = document.getElementById("resource-type").value;
+      const ownerDomain = document.getElementById("resource-owner").value;
+      const riskLevel = document.getElementById("resource-risk").value;
+      const identifiersText = document.getElementById("resource-identifiers").value.trim();
+      const payload = {resource_id: resourceId, name, resource_type: resourceType, owner_domain: ownerDomain, risk_level: riskLevel};
+      if (identifiersText) payload.identifiers = JSON.parse(identifiersText);
+      return await postJson("/resources", payload);
     }
     async function registerHealthTarget() {
       const targetId = document.getElementById("health-target-id").value.trim();
@@ -576,6 +588,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Checkout Ready", physical.ready_for_checkout, "physical", "span-3")}
           ${metric("Virtual", virtual.assets, "assets", "span-3")}
           ${metric("Active Claims", virtual.active_claims, "virtual", "span-3")}
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Register Resource</h3><button class="action-btn" data-action="register-resource">Record Resource</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="resource-id">Resource ID</label><input id="resource-id" value="svc.local.service"></div>
+              <div class="field span-2"><label for="resource-name">Name</label><input id="resource-name" value="Local Service"></div>
+              <div class="field span-2"><label for="resource-type">Type</label><select id="resource-type">${resourceTypeOptions()}</select></div>
+              <div class="field span-2"><label for="resource-owner">Owner</label><select id="resource-owner">${ownerOptions()}</select></div>
+              <div class="field span-2"><label for="resource-risk">Risk</label><select id="resource-risk">${riskOptions()}</select></div>
+              <div class="field span-6"><label for="resource-identifiers">Identifiers</label><input id="resource-identifiers" value='{"kind":"service"}'></div>
+            </div>
+          </div>
           <div class="panel span-6">${table("Physical Assets", physical.items || [], ["id", "kind", "stable_id", "checkout_ready"])}</div>
           <div class="panel span-6">${table("Virtual Assets", virtual.items || [], ["id", "name", "state", "current_claim_id"])}</div>
         </div>`;
@@ -621,6 +644,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function probeTypeOptions() {
       return ["json", "http", "https", "mcp", "html", "process", "command", "log", "manual"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function resourceTypeOptions() {
+      return ["service", "virtual_asset", "physical_asset", "usage_limited_service", "maintenance_target", "security_surface", "composite"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function ownerOptions() {
+      return ["julian", "dax", "kira", "obrien", "odo", "quark", "sisko", "ezri"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function riskOptions() {
+      return ["low", "medium", "high", "critical"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function renderUsage() {
       const usage = state.data.usage || {};

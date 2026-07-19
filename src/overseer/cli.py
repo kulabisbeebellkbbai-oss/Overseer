@@ -17,6 +17,7 @@ from .admin import (
     AdminExecutionResult,
     AdminExecutionStatus,
     AdminHistoryArchiveRecord,
+    admin_execution_capability_for,
     archive_admin_change_plan,
     approve_admin_change_plan,
     audit_event_from_admin_execution,
@@ -1882,6 +1883,28 @@ def admin_executions_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
+def admin_adapter_capabilities_status() -> dict[str, object]:
+    capabilities = [admin_execution_capability_for(kind) for kind in AdminChangeKind]
+    return {
+        "capabilities": len(capabilities),
+        "enabled": sum(1 for capability in capabilities if capability.status.value == "enabled"),
+        "disabled": sum(1 for capability in capabilities if capability.status.value == "disabled"),
+        "unsupported": sum(1 for capability in capabilities if capability.status.value == "unsupported"),
+        "items": [
+            {
+                "kind": capability.kind.value,
+                "adapter_name": capability.adapter_name,
+                "status": capability.status.value,
+                "summary": capability.summary,
+                "authorization_required_before_enable": capability.authorization_required_before_enable,
+                "approval_plan_required": capability.approval_plan_required,
+                "supported_commands": [list(command) for command in capability.supported_commands],
+            }
+            for capability in capabilities
+        ],
+    }
+
+
 def admin_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -2004,6 +2027,9 @@ def admin_execution_readiness_status(store_path: str | Path) -> dict[str, object
             "ids_review_blocked": sum(1 for item in items if item["readiness_state"] == "ids_review_blocked"),
             "incomplete": sum(1 for item in items if item["readiness_state"] == "incomplete"),
             "canceled": sum(1 for item in items if item["readiness_state"] == "canceled"),
+            "adapter_enabled": sum(1 for item in items if item["adapter_status"] == "enabled"),
+            "adapter_disabled": sum(1 for item in items if item["adapter_status"] == "disabled"),
+            "adapter_unsupported": sum(1 for item in items if item["adapter_status"] == "unsupported"),
             "by_kind": {
                 kind.value: sum(1 for plan in plans if plan.kind == kind)
                 for kind in AdminChangeKind
@@ -2529,7 +2555,8 @@ def admin_change_execution_readiness_status(
         not ids_review_required
         or any(package.satisfies_pre_execution_review_gate() for package in ids_review_packages)
     )
-    live_execution_supported = plan.kind == AdminChangeKind.USER_SERVICE_RESTART
+    capability = admin_execution_capability_for(AdminChangeKind(plan.kind))
+    live_execution_supported = capability.can_execute_live()
     readiness_state, next_step = _admin_execution_readiness_state(
         plan,
         missing_fields,
@@ -2550,6 +2577,15 @@ def admin_change_execution_readiness_status(
         "requires_explicit_approval": plan.requires_explicit_approval(),
         "can_execute_model": plan.can_execute(),
         "live_execution_supported": live_execution_supported,
+        "adapter": {
+            "name": capability.adapter_name,
+            "status": capability.status.value,
+            "summary": capability.summary,
+            "authorization_required_before_enable": capability.authorization_required_before_enable,
+            "approval_plan_required": capability.approval_plan_required,
+            "supported_commands": [list(command) for command in capability.supported_commands],
+        },
+        "adapter_status": capability.status.value,
         "ready_for_overseer_execution": readiness_state == "ready_for_overseer_execution",
         "readiness_state": readiness_state,
         "next_step": next_step,
@@ -2584,7 +2620,7 @@ def _admin_execution_readiness_state(
     if plan.requires_explicit_approval() and not plan.approved:
         return "approval_required", "request explicit approval before execution"
     if not live_execution_supported:
-        return "manual_execution_required", "manual execution is required; Overseer live execution currently supports user service restarts"
+        return "manual_execution_required", "specific live adapter approval and enablement is required before Overseer execution"
     return "ready_for_overseer_execution", "execute approved plan through Overseer"
 
 
@@ -3412,6 +3448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_admin_parser.add_argument("--plan-id", required=True)
     admin_executions_parser = subparsers.add_parser("admin-executions", help="list persisted admin change execution results")
     admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    subparsers.add_parser("admin-adapter-capabilities", help="list live admin adapter enablement status")
     admin_summary_parser = subparsers.add_parser("admin-summary", help="summarize admin plans, execution results, and audit events")
     admin_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_readiness_parser = subparsers.add_parser("admin-execution-readiness", help="summarize admin plan execution readiness")
@@ -3777,6 +3814,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "admin-executions":
         print(json.dumps(admin_executions_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "admin-adapter-capabilities":
+        print(json.dumps(admin_adapter_capabilities_status(), sort_keys=True))
         return 0
 
     if args.command == "admin-summary":

@@ -25,6 +25,7 @@ from overseer import (
     ExecutionStatus,
     FreshnessStatus,
     AdminChangeKind,
+    AdminAdapterStatus,
     AdminCommandResult,
     AdminExecutionResult,
     AdminExecutionStatus,
@@ -88,6 +89,7 @@ from overseer import (
     seed_store_from_config,
     validate_config,
     approve_admin_change_plan,
+    admin_execution_capability_for,
     audit_event_from_admin_execution,
     assess_host_security,
     execute_admin_change_plan,
@@ -104,6 +106,7 @@ from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
+from overseer.cli import admin_adapter_capabilities_status
 from overseer.cli import admin_executions_status
 from overseer.cli import admin_execution_readiness_status
 from overseer.cli import admin_history_archive_plan_status
@@ -723,6 +726,18 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["executions"][0]["plan_id"], "admin.restart.test")
         self.assertEqual(status["executions"][0]["status"], AdminExecutionStatus.BLOCKED.value)
 
+    def test_admin_adapter_capabilities_list_live_enablement(self):
+        status = admin_adapter_capabilities_status()
+        restart = next(item for item in status["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
+        package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
+
+        self.assertEqual(status["enabled"], 1)
+        self.assertEqual(status["disabled"], 4)
+        self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
+        self.assertFalse(restart["authorization_required_before_enable"])
+        self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
+        self.assertTrue(package["approval_plan_required"])
+
     def test_admin_summary_reports_plans_executions_and_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -791,10 +806,15 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["plans"], 2)
         self.assertEqual(status["ready_for_overseer_execution"], 1)
         self.assertEqual(status["manual_execution_required"], 1)
+        self.assertEqual(status["adapter_enabled"], 1)
+        self.assertEqual(status["adapter_disabled"], 1)
         self.assertEqual(restart_item["readiness_state"], "ready_for_overseer_execution")
         self.assertTrue(restart_item["live_execution_supported"])
+        self.assertEqual(restart_item["adapter_status"], AdminAdapterStatus.ENABLED.value)
         self.assertEqual(block_item["readiness_state"], "manual_execution_required")
         self.assertFalse(block_item["live_execution_supported"])
+        self.assertEqual(block_item["adapter_status"], AdminAdapterStatus.DISABLED.value)
+        self.assertTrue(block_item["adapter"]["approval_plan_required"])
         self.assertTrue(block_item["ids_review_gate_satisfied"])
 
     def test_admin_history_review_identifies_archive_candidates(self):
@@ -2446,6 +2466,20 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertTrue(approved["can_execute"])
             self.assertEqual(after["pending_count"], 0)
 
+    def test_client_reads_admin_adapter_capabilities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                capabilities = client.admin_adapter_capabilities()
+
+            restart = next(item for item in capabilities["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
+            block = next(item for item in capabilities["items"] if item["kind"] == AdminChangeKind.BLOCK_IP.value)
+            self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
+            self.assertEqual(block["status"], AdminAdapterStatus.DISABLED.value)
+            self.assertTrue(block["authorization_required_before_enable"])
+
     def test_client_approves_admin_history_restore_request(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3442,9 +3476,11 @@ class AdminChangePlanTests(unittest.TestCase):
         )
 
         result = execute_admin_change_plan(plan)
+        capability = admin_execution_capability_for(plan.kind)
 
         self.assertEqual(result.status, AdminExecutionStatus.BLOCKED)
-        self.assertIn("only implemented for approved user service restart", result.summary)
+        self.assertEqual(capability.status, AdminAdapterStatus.DISABLED)
+        self.assertIn("live adapter unavailable for apt_install", result.summary)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

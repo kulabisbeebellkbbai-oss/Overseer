@@ -26,6 +26,12 @@ class AdminExecutionStatus(StrEnum):
     FAILED = "failed"
 
 
+class AdminAdapterStatus(StrEnum):
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    UNSUPPORTED = "unsupported"
+
+
 @dataclass(frozen=True)
 class AdminCommandStep:
     title: str
@@ -63,6 +69,20 @@ class AdminHistoryArchiveRecord:
     evidence_ids: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class AdminExecutionCapability:
+    kind: AdminChangeKind
+    adapter_name: str
+    status: AdminAdapterStatus
+    summary: str
+    authorization_required_before_enable: bool
+    approval_plan_required: bool
+    supported_commands: tuple[tuple[str, ...], ...] = ()
+
+    def can_execute_live(self) -> bool:
+        return self.status == AdminAdapterStatus.ENABLED
+
+
 AdminCommandRunner = Callable[[AdminCommandStep], AdminCommandResult]
 
 
@@ -98,6 +118,69 @@ class AdminChangePlan:
 
     def can_execute(self) -> bool:
         return not self.archived and not self.canceled and self.approved and not missing_admin_change_fields(self)
+
+
+DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapability] = {
+    AdminChangeKind.USER_SERVICE_RESTART: AdminExecutionCapability(
+        kind=AdminChangeKind.USER_SERVICE_RESTART,
+        adapter_name="user-systemd-service",
+        status=AdminAdapterStatus.ENABLED,
+        summary="approved user service restart execution is enabled",
+        authorization_required_before_enable=False,
+        approval_plan_required=False,
+        supported_commands=(("systemctl", "--user", "restart"), ("systemctl", "--user", "status")),
+    ),
+    AdminChangeKind.APT_INSTALL: AdminExecutionCapability(
+        kind=AdminChangeKind.APT_INSTALL,
+        adapter_name="apt-package-install",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live apt installs require a specific high-risk package adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("sudo", "apt-get", "install"), ("dpkg-query", "-W")),
+    ),
+    AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
+        kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
+        adapter_name="ufw-firewall-allow",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live firewall allow rules require a specific high-risk firewall adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("sudo", "ufw", "allow"), ("sudo", "ufw", "status")),
+    ),
+    AdminChangeKind.FIREWALL_DENY_TCP: AdminExecutionCapability(
+        kind=AdminChangeKind.FIREWALL_DENY_TCP,
+        adapter_name="ufw-firewall-deny",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live firewall deny rules require a specific high-risk firewall adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("sudo", "ufw", "deny"), ("sudo", "ufw", "status")),
+    ),
+    AdminChangeKind.BLOCK_IP: AdminExecutionCapability(
+        kind=AdminChangeKind.BLOCK_IP,
+        adapter_name="ufw-source-block",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live source blocks require a specific high-risk firewall adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("sudo", "ufw", "deny", "from"), ("sudo", "ufw", "status")),
+    ),
+}
+
+
+def admin_execution_capability_for(kind: AdminChangeKind) -> AdminExecutionCapability:
+    return DEFAULT_ADMIN_EXECUTION_CAPABILITIES.get(
+        kind,
+        AdminExecutionCapability(
+            kind=kind,
+            adapter_name="unknown",
+            status=AdminAdapterStatus.UNSUPPORTED,
+            summary="no live admin adapter is registered for this plan kind",
+            authorization_required_before_enable=True,
+            approval_plan_required=True,
+        ),
+    )
 
 
 def archive_admin_change_plan(
@@ -385,12 +468,13 @@ def execute_admin_change_plan(
     plan: AdminChangePlan,
     runner: AdminCommandRunner | None = None,
 ) -> AdminExecutionResult:
-    if plan.kind != AdminChangeKind.USER_SERVICE_RESTART:
+    capability = admin_execution_capability_for(plan.kind)
+    if not capability.can_execute_live():
         return AdminExecutionResult(
             id=f"admin.exec.{plan.id}.blocked",
             plan_id=plan.id,
             status=AdminExecutionStatus.BLOCKED,
-            summary="live execution is only implemented for approved user service restart plans",
+            summary=f"live adapter unavailable for {AdminChangeKind(plan.kind).value}: {capability.summary}",
             command_results=(),
         )
     if not plan.can_execute():

@@ -168,6 +168,9 @@ class OverseerApiClient:
     def authorizations_required(self) -> dict[str, Any]:
         return self._get("/admin/authorizations-required")
 
+    def admin_adapter_capabilities(self) -> dict[str, Any]:
+        return self._get("/admin/adapter-capabilities")
+
     def admin_executions(self) -> dict[str, Any]:
         return self._get("/admin/executions")
 

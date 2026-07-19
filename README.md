@@ -122,6 +122,8 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Config validation: `docs/config-validation.md`
 - Live health probes: `docs/live-health-probes.md`
 - Physical discovery: `docs/physical-discovery.md`
-- Foreground runtime: `docs/runtime.md`
+- Foreground runtime and local API service: `docs/runtime.md`
 
-No runtime stack has been selected yet. Do not commit secrets, credentials, local databases, live service state, or personal exports.
+The current runtime is a Python package with CLI entrypoints, an optional localhost-only HTTP API, SQLite persistence, and CI-backed unit coverage. Live host mutation is intentionally limited to approved user-service restart plans; package installs, firewall changes, and source blocks remain disabled until their exact high-risk adapter enablement plans are approved.
+
+Do not commit secrets, credentials, local databases, live service state, or personal exports.

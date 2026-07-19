@@ -115,6 +115,16 @@ def run_read_only_command(command: Sequence[str], timeout_seconds: float) -> Hos
             stdout="",
             stderr=str(exc),
         )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+        return HostCommandObservation(
+            name=command[0],
+            command=tuple(command),
+            exit_code=124,
+            stdout=stdout.strip(),
+            stderr=(stderr.strip() or f"command timed out after {timeout_seconds} seconds"),
+        )
     return HostCommandObservation(
         name=command[0],
         command=tuple(command),

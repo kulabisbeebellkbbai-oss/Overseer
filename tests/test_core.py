@@ -137,6 +137,7 @@ from overseer import (
 )
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
+from overseer.host import run_read_only_command
 from overseer.ui import OPERATOR_CONSOLE_HTML
 from overseer.cli import demo_status
 from overseer.cli import discover_codex_project_threads_status
@@ -4733,6 +4734,14 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(snapshot.observation("firewalld-state").stdout, "running")
         self.assertEqual(snapshot.observation("firewalld-public-zone").command, ("firewall-cmd", "--zone=public", "--list-all"))
         self.assertIn(("df", "-h", "--output=source,size,used,avail,pcent,target"), commands)
+
+    def test_read_only_command_timeout_is_recorded_as_observation(self):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(("firewall-cmd", "--state"), 5.0)):
+            observation = run_read_only_command(("firewall-cmd", "--state"), 5.0)
+
+        self.assertEqual(observation.name, "firewall-cmd")
+        self.assertEqual(observation.exit_code, 124)
+        self.assertIn("timed out", observation.stderr)
 
     def test_host_snapshot_persists_and_appears_in_state(self):
         with tempfile.TemporaryDirectory() as directory:

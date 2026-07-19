@@ -20,6 +20,7 @@ The runtime entrypoint can run a single foreground tick against an explicit SQLi
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --probe-health-targets --health-evidence-retention-per-target 5
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host
+PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-crew-messages
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli daemon-migration-plan --store state/overseer.sqlite3
@@ -30,6 +31,8 @@ PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sql
 ```
 
 `runtime-status` is the monitor-friendly surface for Julian and Odo. It reports the service heartbeat, latest host inspection snapshot id and capture time, freshness state, and current high/warning host security finding counts without requiring consumers to parse raw snapshots.
+
+`--dispatch-crew-messages` lets Sisko drain open crew requests on each runtime tick. Dispatchers may inspect local state, refresh inventories, run health probes, create usage-continuation requests, stage claims, stage remediation plans, or approve exact Sisko-targeted plan IDs. They do not execute host changes.
 
 `daemon-migration-plan` is a read-only Sisko gate for foreground-to-daemon migration. `request-daemon-migration` and `approve-daemon-migration` record the approval state required before changing user service enablement or runtime commands; they do not edit systemd state or restart services.
 
@@ -53,7 +56,7 @@ Installed local unit:
 Runtime command:
 
 ```bash
-/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets --health-evidence-retention-per-target 5
+/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets --health-evidence-retention-per-target 5 --inspect-host --dispatch-crew-messages
 ```
 
 Operator commands:

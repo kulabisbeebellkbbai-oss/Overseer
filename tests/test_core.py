@@ -8079,6 +8079,42 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(store.list_host_snapshots()[0].hostname, "host-runtime")
             store.close()
 
+    def test_runtime_dispatches_crew_messages_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+
+            def fake_dispatcher(store_path: str) -> dict[str, object]:
+                return {"acknowledged": 2, "blocked": 1}
+
+            tick = OverseerRuntime(
+                store,
+                dispatch_crew_messages=True,
+                crew_dispatcher=fake_dispatcher,
+            ).run(once=True)
+
+            self.assertEqual(tick.crew_messages_dispatched, 2)
+            self.assertEqual(tick.crew_messages_blocked, 1)
+            store.close()
+
+    def test_run_status_dispatches_open_crew_messages_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.DAX.value,
+                "Virtual inventory",
+                "Refresh virtual inventory for checkout.",
+                RiskLevel.LOW.value,
+                message_id="crew.dax.runtime-dispatch",
+            )
+
+            status = run_status(store_path, once=True, dispatch_crew_messages=True)
+            messages = crew_messages_status(store_path, owner_domain=OwnerDomain.DAX.value)
+
+            self.assertEqual(status["crew_messages_dispatched"], 1)
+            self.assertEqual(status["crew_messages_blocked"], 0)
+            self.assertEqual(messages["items"][0]["status"], "acknowledged")
+
     def test_runtime_prunes_health_evidence_per_target(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
             store = SQLiteStore(Path(directory) / "overseer.sqlite3")

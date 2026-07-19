@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from .adapters import HealthProbeAdapter
 from .host import HostInspectionAdapter, assess_host_security
@@ -26,6 +28,8 @@ class RuntimeTick:
     host_inspections: int
     host_security_high_findings: int
     host_security_warning_findings: int
+    crew_messages_dispatched: int
+    crew_messages_blocked: int
 
 
 class OverseerRuntime:
@@ -38,6 +42,8 @@ class OverseerRuntime:
         health_evidence_retention_per_target: int = 5,
         inspect_host: bool = False,
         host_inspection_adapter: HostInspectionAdapter | None = None,
+        dispatch_crew_messages: bool = False,
+        crew_dispatcher: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.store = store
         self.service_name = service_name
@@ -46,6 +52,8 @@ class OverseerRuntime:
         self.health_evidence_retention_per_target = health_evidence_retention_per_target
         self.inspect_host = inspect_host
         self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter()
+        self.dispatch_crew_messages = dispatch_crew_messages
+        self.crew_dispatcher = crew_dispatcher
         self.started_at = _utc_now()
         self.tick_count = 0
 
@@ -53,6 +61,7 @@ class OverseerRuntime:
         self.tick_count += 1
         health_probes = self._probe_health_targets()
         host_inspections, host_high_findings, host_warning_findings = self._inspect_host()
+        crew_dispatched, crew_blocked = self._dispatch_crew_messages()
         self.store.save_runtime_heartbeat(
             RuntimeHeartbeat(
                 id=self.service_name,
@@ -74,6 +83,8 @@ class OverseerRuntime:
             host_inspections=host_inspections,
             host_security_high_findings=host_high_findings,
             host_security_warning_findings=host_warning_findings,
+            crew_messages_dispatched=crew_dispatched,
+            crew_messages_blocked=crew_blocked,
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:
@@ -102,6 +113,12 @@ class OverseerRuntime:
         high_findings = sum(1 for finding in findings if finding.severity == "high")
         warning_findings = sum(1 for finding in findings if finding.severity == "warning")
         return 1, high_findings, warning_findings
+
+    def _dispatch_crew_messages(self) -> tuple[int, int]:
+        if not self.dispatch_crew_messages or self.crew_dispatcher is None:
+            return 0, 0
+        result = self.crew_dispatcher(str(self.store.path))
+        return int(result.get("acknowledged", 0)), int(result.get("blocked", 0))
 
 
 def _utc_now() -> str:

@@ -31,7 +31,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    button, input {
+    button, input, select {
       font: inherit;
     }
     .shell {
@@ -221,6 +221,35 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 8px;
       align-items: center;
     }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+    .field {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .field.span-2 { grid-column: span 2; }
+    .field.span-3 { grid-column: span 3; }
+    .field.span-6 { grid-column: span 6; }
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .field input, .field select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 9px;
+      background: #fff;
+      color: var(--text);
+      min-width: 0;
+    }
     .action-status {
       margin-bottom: 12px;
     }
@@ -283,6 +312,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         flex: 1;
       }
       .span-3, .span-4, .span-6, .span-8 { grid-column: span 12; }
+      .field.span-2, .field.span-3 { grid-column: span 6; }
     }
     @media (max-width: 520px) {
       main { padding: 12px; }
@@ -292,6 +322,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       .panel { padding: 11px; }
       .token { flex-wrap: wrap; }
       .token input { width: 100%; flex-basis: 100%; }
+      .field.span-2, .field.span-3, .field.span-6 { grid-column: span 6; }
     }
   </style>
 </head>
@@ -353,6 +384,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       virtual: "/virtual-summary",
       security: "/security-summary",
       health: "/health-efficiency",
+      healthSummary: "/health-summary",
       usage: "/usage-summary",
       audit: "/audit-summary",
       approvals: "/approvals-summary"
@@ -442,7 +474,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
+      if (action === "register-health-target") return await registerHealthTarget();
       throw new Error(`unsupported action: ${action}`);
+    }
+    async function registerHealthTarget() {
+      const targetId = document.getElementById("health-target-id").value.trim();
+      const resourceId = document.getElementById("health-resource-id").value.trim();
+      const name = document.getElementById("health-name").value.trim();
+      const probeType = document.getElementById("health-probe-type").value;
+      const target = document.getElementById("health-target").value.trim();
+      const expectedStatus = document.getElementById("health-expected-status").value.trim();
+      const expectedContentType = document.getElementById("health-expected-content-type").value.trim();
+      const payload = {target_id: targetId, resource_id: resourceId, name, probe_type: probeType, target};
+      if (expectedStatus) payload.expected_status = Number(expectedStatus);
+      if (expectedContentType) payload.expected_content_type = expectedContentType;
+      return await postJson("/health-targets", payload);
     }
     function render() {
       const dashboard = state.data.dashboard || {};
@@ -550,6 +596,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function renderHealth() {
       const health = state.data.health || {};
+      const healthSummary = state.data.healthSummary || {};
       document.getElementById("health").innerHTML = `
         <div class="grid">
           <div class="section-head"><h3>Health Actions</h3><div class="actions"><button class="action-btn" data-action="run-health-probes">Run Probes</button></div></div>
@@ -557,8 +604,23 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good")}
           ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good")}
           ${metric("Failures", health.latest_failures, "latest", "span-3", health.latest_failures ? "bad" : "good")}
-          <div class="panel span-12">${table("Health Targets", health.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"])}</div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Register Target</h3><button class="action-btn" data-action="register-health-target">Record Target</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="health-target-id">Target ID</label><input id="health-target-id" value="health.local.service"></div>
+              <div class="field span-2"><label for="health-resource-id">Resource ID</label><input id="health-resource-id" value="svc.systemd-user.overseer-api"></div>
+              <div class="field span-2"><label for="health-name">Name</label><input id="health-name" value="Local Service"></div>
+              <div class="field span-2"><label for="health-probe-type">Probe</label><select id="health-probe-type">${probeTypeOptions()}</select></div>
+              <div class="field span-2"><label for="health-expected-status">Expected HTTP</label><input id="health-expected-status" type="number" min="100" max="599"></div>
+              <div class="field span-2"><label for="health-expected-content-type">Content Type</label><input id="health-expected-content-type"></div>
+              <div class="field span-6"><label for="health-target">Target</label><input id="health-target" value="http://127.0.0.1:8766/health"></div>
+            </div>
+          </div>
+          <div class="panel span-12">${table("Health Targets", healthSummary.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"])}</div>
         </div>`;
+    }
+    function probeTypeOptions() {
+      return ["json", "http", "https", "mcp", "html", "process", "command", "log", "manual"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function renderUsage() {
       const usage = state.data.usage || {};

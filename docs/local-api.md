@@ -97,10 +97,10 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 `POST /admin/execute` executes only a stored plan that passes the existing approval and completeness gates, then persists the result. Current live execution support is limited to approved user-service restart plans; unsupported or unapproved plans return persisted `blocked` results.
 `GET /admin/authorizations-required` lists admin change plans and restore requests waiting for explicit approval.
-`GET /admin/adapter-capabilities` lists the live admin adapter table, including enabled user-service restart execution and disabled package/firewall/source-block adapters that require a specific high-risk approval plan before enablement.
+`GET /admin/adapter-capabilities` lists the effective live admin adapter table for the API store, including enabled user-service restart execution and any package/firewall/source-block adapters with approved adapter enablement records.
 `GET /admin/adapter-enablement-plan` prepares a read-only high-risk approval plan for enabling disabled live admin adapters. It supports `?kind=...` filtering and does not enable adapters or execute commands.
-`POST /admin/adapter-enablement-requests` creates the approval request required before a future code/config change may enable a disabled live admin adapter.
-`POST /admin/adapter-enablement-requests/approve` approves a requested adapter enablement gate without enabling the adapter or running commands.
+`POST /admin/adapter-enablement-requests` creates the approval request required before a disabled live admin adapter can become effective for that store.
+`POST /admin/adapter-enablement-requests/approve` approves a requested adapter enablement gate for that store and adapter kind without approving a specific host change or running commands.
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
 `GET /admin/execution-readiness` explains each admin plan's execution gate state, including approval, missing fields, IDS review, manual execution, and Overseer-supported execution readiness.
 `GET /admin/history-review` identifies completed and canceled admin plans that are candidates for archive handling. It is read-only and does not delete plans or audit evidence.

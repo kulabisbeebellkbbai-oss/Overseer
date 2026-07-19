@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import replace
 from enum import StrEnum
@@ -169,11 +169,16 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
 }
 
 
-def admin_execution_capability_for(kind: AdminChangeKind) -> AdminExecutionCapability:
-    return DEFAULT_ADMIN_EXECUTION_CAPABILITIES.get(
-        kind,
+def admin_execution_capability_for(
+    kind: AdminChangeKind,
+    enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
+) -> AdminExecutionCapability:
+    normalized_kind = AdminChangeKind(kind)
+    enabled = {AdminChangeKind(candidate) for candidate in enabled_adapter_kinds}
+    capability = DEFAULT_ADMIN_EXECUTION_CAPABILITIES.get(
+        normalized_kind,
         AdminExecutionCapability(
-            kind=kind,
+            kind=normalized_kind,
             adapter_name="unknown",
             status=AdminAdapterStatus.UNSUPPORTED,
             summary="no live admin adapter is registered for this plan kind",
@@ -181,6 +186,13 @@ def admin_execution_capability_for(kind: AdminChangeKind) -> AdminExecutionCapab
             approval_plan_required=True,
         ),
     )
+    if capability.status == AdminAdapterStatus.DISABLED and normalized_kind in enabled:
+        return replace(
+            capability,
+            status=AdminAdapterStatus.ENABLED,
+            summary=f"approved live {capability.adapter_name} execution is enabled",
+        )
+    return capability
 
 
 def archive_admin_change_plan(
@@ -467,8 +479,9 @@ def cancel_admin_change_plan(
 def execute_admin_change_plan(
     plan: AdminChangePlan,
     runner: AdminCommandRunner | None = None,
+    enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
 ) -> AdminExecutionResult:
-    capability = admin_execution_capability_for(plan.kind)
+    capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
     if not capability.can_execute_live():
         return AdminExecutionResult(
             id=f"admin.exec.{plan.id}.blocked",

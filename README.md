@@ -70,10 +70,10 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"` - cancel a placeholder or superseded admin plan without deleting history.
 - `PYTHONPATH=src python3 -m overseer.cli execute-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api` - execute an approved user-service restart plan and persist the execution result.
 - `PYTHONPATH=src python3 -m overseer.cli admin-executions --store state/overseer.sqlite3` - list persisted admin execution results.
-- `PYTHONPATH=src python3 -m overseer.cli admin-adapter-capabilities` - list which live admin adapter classes are enabled, disabled pending approval, or unsupported.
+- `PYTHONPATH=src python3 -m overseer.cli admin-adapter-capabilities --store state/overseer.sqlite3` - list default and store-approved live admin adapter enablement status.
 - `PYTHONPATH=src python3 -m overseer.cli admin-adapter-enablement-plan --kind block_ip` - prepare a read-only high-risk approval plan before enabling a disabled live admin adapter.
-- `PYTHONPATH=src python3 -m overseer.cli request-admin-adapter-enablement --store state/overseer.sqlite3 --kind block_ip --requested-by sisko` - create the approval record required before a future code/config change may enable a disabled live admin adapter.
-- `PYTHONPATH=src python3 -m overseer.cli approve-admin-adapter-enablement --store state/overseer.sqlite3 --approval-id approval.admin.adapter.enable.block_ip --approved-by sisko` - approve a requested adapter enablement gate without enabling the adapter or running commands.
+- `PYTHONPATH=src python3 -m overseer.cli request-admin-adapter-enablement --store state/overseer.sqlite3 --kind block_ip --requested-by sisko` - create the approval record required before a disabled live admin adapter can become effective for that store.
+- `PYTHONPATH=src python3 -m overseer.cli approve-admin-adapter-enablement --store state/overseer.sqlite3 --approval-id approval.admin.adapter.enable.block_ip --approved-by sisko` - approve a requested adapter enablement gate without approving a specific host change or running commands.
 - `PYTHONPATH=src python3 -m overseer.cli admin-summary --store state/overseer.sqlite3` - summarize admin plans, pending approvals, execution outcomes, archive candidates, restore approvals, and admin audit events.
 - `PYTHONPATH=src python3 -m overseer.cli admin-execution-readiness --store state/overseer.sqlite3` - summarize which admin plans are ready for Overseer execution, need approval, need IDS review, or require manual execution.
 - `PYTHONPATH=src python3 -m overseer.cli admin-history-review --store state/overseer.sqlite3` - identify completed or canceled admin plans that are candidates for archive handling without deleting them.
@@ -124,6 +124,6 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Physical discovery: `docs/physical-discovery.md`
 - Foreground runtime and local API service: `docs/runtime.md`
 
-The current runtime is a Python package with CLI entrypoints, an optional localhost-only HTTP API, SQLite persistence, and CI-backed unit coverage. Live host mutation is intentionally limited to approved user-service restart plans; package installs, firewall changes, and source blocks remain disabled until their exact high-risk adapter enablement plans are approved.
+The current runtime is a Python package with CLI entrypoints, an optional localhost-only HTTP API, SQLite persistence, and CI-backed unit coverage. Live host mutation is intentionally limited to user-service restart plans by default. Package installs, firewall changes, and source blocks become eligible for Overseer execution only when the same store contains an approved adapter enablement request for that exact kind, and each admin change plan still requires its own approval, IDS review when applicable, execution evidence, and verification results.
 
 Do not commit secrets, credentials, local databases, live service state, or personal exports.

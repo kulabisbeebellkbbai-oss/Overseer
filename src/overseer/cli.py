@@ -1994,11 +1994,16 @@ def plan_admin_change_status(
         store.close()
 
 
-def execute_admin_change_status(store_path: str | Path, plan_id: str) -> dict[str, object]:
+def execute_admin_change_status(
+    store_path: str | Path,
+    plan_id: str,
+    runner=None,
+) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         plan = store.load_admin_change_plan(plan_id)
-        result = execute_admin_change_plan(plan)
+        enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
+        result = execute_admin_change_plan(plan, runner=runner, enabled_adapter_kinds=enabled_adapter_kinds)
         store.save_admin_execution(result)
         store.save_audit_event(audit_event_from_admin_execution(plan, result))
         return {"store": str(store.path), **admin_execution_status(result)}
@@ -2019,9 +2024,17 @@ def admin_executions_status(store_path: str | Path) -> dict[str, object]:
         store.close()
 
 
-def admin_adapter_capabilities_status() -> dict[str, object]:
-    capabilities = [admin_execution_capability_for(kind) for kind in AdminChangeKind]
+def admin_adapter_capabilities_status(store_path: str | Path | None = None) -> dict[str, object]:
+    enabled_adapter_kinds: tuple[AdminChangeKind, ...] = ()
+    if store_path is not None:
+        store = SQLiteStore(store_path)
+        try:
+            enabled_adapter_kinds = approved_admin_adapter_enablement_kinds(store)
+        finally:
+            store.close()
+    capabilities = [admin_execution_capability_for(kind, enabled_adapter_kinds) for kind in AdminChangeKind]
     return {
+        "store": str(Path(store_path)) if store_path is not None else None,
         "capabilities": len(capabilities),
         "enabled": sum(1 for capability in capabilities if capability.status.value == "enabled"),
         "disabled": sum(1 for capability in capabilities if capability.status.value == "disabled"),
@@ -2039,6 +2052,17 @@ def admin_adapter_capabilities_status() -> dict[str, object]:
             for capability in capabilities
         ],
     }
+
+
+def approved_admin_adapter_enablement_kinds(store: SQLiteStore) -> tuple[AdminChangeKind, ...]:
+    approved: list[AdminChangeKind] = []
+    for approval in store.list_approvals():
+        if ApprovalStatus(approval.status) != ApprovalStatus.APPROVED:
+            continue
+        if not approval.id.startswith("approval.admin.adapter.enable."):
+            continue
+        approved.append(_admin_adapter_enablement_kind_from_subject(approval.subject_id))
+    return tuple(sorted(set(approved), key=lambda item: item.value))
 
 
 def admin_adapter_enablement_plan_status(kind: str | None = None) -> dict[str, object]:
@@ -4677,7 +4701,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_admin_parser.add_argument("--plan-id", required=True)
     admin_executions_parser = subparsers.add_parser("admin-executions", help="list persisted admin change execution results")
     admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
-    subparsers.add_parser("admin-adapter-capabilities", help="list live admin adapter enablement status")
+    admin_adapter_capabilities_parser = subparsers.add_parser(
+        "admin-adapter-capabilities",
+        help="list live admin adapter enablement status",
+    )
+    admin_adapter_capabilities_parser.add_argument("--store", help="optional SQLite store path for approved enablement state")
     admin_adapter_plan_parser = subparsers.add_parser(
         "admin-adapter-enablement-plan",
         help="prepare a read-only high-risk approval plan for enabling live admin adapters",
@@ -5136,7 +5164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "admin-adapter-capabilities":
-        print(json.dumps(admin_adapter_capabilities_status(), sort_keys=True))
+        print(json.dumps(admin_adapter_capabilities_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "admin-adapter-enablement-plan":

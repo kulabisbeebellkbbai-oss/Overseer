@@ -822,12 +822,38 @@ class HealthSummaryTests(unittest.TestCase):
         restart = next(item for item in status["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
         package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
 
+        self.assertIsNone(status["store"])
         self.assertEqual(status["enabled"], 1)
         self.assertEqual(status["disabled"], 4)
         self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
         self.assertFalse(restart["authorization_required_before_enable"])
         self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
         self.assertTrue(package["approval_plan_required"])
+
+    def test_admin_adapter_capabilities_use_approved_store_enablement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.APT_INSTALL.value,
+                "sisko",
+                "2026-07-18T20:30:00+00:00",
+            )
+            approve_admin_adapter_enablement_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T20:35:00+00:00",
+            )
+
+            status = admin_adapter_capabilities_status(store_path)
+
+        package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
+        self.assertEqual(status["store"], str(store_path))
+        self.assertEqual(status["enabled"], 2)
+        self.assertEqual(status["disabled"], 3)
+        self.assertEqual(package["status"], AdminAdapterStatus.ENABLED.value)
+        self.assertIn("approved live", package["summary"])
 
     def test_admin_adapter_enablement_plan_describes_high_risk_gate(self):
         status = admin_adapter_enablement_plan_status(AdminChangeKind.BLOCK_IP.value)
@@ -878,6 +904,52 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(after["pending_count"], 0)
         self.assertEqual(after_summary["adapter_enablement_approvals"]["approved"], 1)
         self.assertEqual(block["status"], AdminAdapterStatus.DISABLED.value)
+
+    def test_approved_adapter_enablement_allows_mocked_live_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            requested = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.APT_INSTALL.value,
+                "sisko",
+                "2026-07-18T20:40:00+00:00",
+            )
+            approve_admin_adapter_enablement_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T20:45:00+00:00",
+            )
+            plan_admin_change_status(
+                store_path,
+                "admin.install.mocked",
+                AdminChangeKind.APT_INSTALL.value,
+                "nmap",
+                "enable approved local audit",
+                "not installed",
+                packages=("nmap",),
+            )
+            approve_admin_change_status(
+                store_path,
+                "admin.install.mocked",
+                "operator",
+                "2026-07-18T20:50:00+00:00",
+            )
+
+            status = execute_admin_change_status(
+                store_path,
+                "admin.install.mocked",
+                runner=lambda step: AdminCommandResult(
+                    title=step.title,
+                    command=step.command,
+                    exit_code=0,
+                    stdout="mocked",
+                ),
+            )
+
+        self.assertEqual(status["status"], AdminExecutionStatus.COMPLETED.value)
+        self.assertEqual(len(status["command_results"]), 2)
+        self.assertEqual(len(status["verification_results"]), 1)
 
     def test_admin_summary_reports_plans_executions_and_audit(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -255,9 +255,11 @@ class _JsonHealthHandler(BaseHTTPRequestHandler):
 class _FakeCodexProjectRunner:
     def __init__(self) -> None:
         self.commands = []
+        self.inputs = []
 
-    def __call__(self, command, text=True, capture_output=True):
+    def __call__(self, command, input=None, text=True, capture_output=True):
         self.commands.append(tuple(command))
+        self.inputs.append(input)
         if tuple(command[:3]) == ("/usr/bin/tmux", "has-session", "-t"):
             return subprocess.CompletedProcess(command, 1, "", "missing")
         return subprocess.CompletedProcess(command, 0, "resumed", "")
@@ -5305,7 +5307,9 @@ class HostInspectionTests(unittest.TestCase):
             prompt_exists = Path(dispatched["prompt_path"]).exists()
 
         self.assertEqual(dispatched["status"], IDSReviewPackageStatus.SUBMITTED.value)
-        self.assertEqual(dispatched["dispatch_status"], "resumed")
+        self.assertEqual(dispatched["dispatch_status"], "prompt_dispatched")
+        self.assertEqual(dispatched["dispatch_result"]["status"], "prompt_dispatched")
+        self.assertEqual(dispatched["resume_result"]["status"], "resumed")
         self.assertEqual(dispatched["dispatch_thread"], "codex-intrusion-detection-019f09da")
         self.assertEqual(dispatched["dispatch_conversation_id"], "019f09da-25c8-72b2-9730-9a0a17b9e177")
         self.assertTrue(prompt_exists)
@@ -5318,6 +5322,13 @@ class HostInspectionTests(unittest.TestCase):
             fake_runner.commands[0],
             ("/usr/bin/tmux", "has-session", "-t", "codex-intrusion-detection-019f09da"),
         )
+        self.assertEqual(fake_runner.commands[2], ("/usr/bin/tmux", "load-buffer", "-b", "overseer-dispatch", "-"))
+        self.assertIn("Evaluate this proposed Overseer security change before enforcement.", fake_runner.inputs[2])
+        self.assertEqual(
+            fake_runner.commands[3],
+            ("/usr/bin/tmux", "paste-buffer", "-b", "overseer-dispatch", "-t", "codex-intrusion-detection-019f09da"),
+        )
+        self.assertEqual(fake_runner.commands[4], ("/usr/bin/tmux", "send-keys", "-t", "codex-intrusion-detection-019f09da", "Enter"))
         self.assertEqual(fake_runner.commands[1][0:4], ("/usr/bin/tmux", "new-session", "-d", "-s"))
 
     def test_host_security_remediation_stages_deny_plan_without_execution(self):

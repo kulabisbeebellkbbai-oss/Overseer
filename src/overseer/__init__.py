@@ -43,6 +43,7 @@ from .audit import (
 )
 from .config import ConfigSeedResult, OverseerConfig, config_from_mapping, load_config, seed_store_from_config, validate_config
 from .codex_projects import (
+    CodexProjectPromptDispatchResult,
     CodexProjectResumeResult,
     CodexProjectThread,
     CodexProjectThreadAdapter,

@@ -39,6 +39,18 @@ class CodexProjectResumeResult:
     stderr: str = ""
 
 
+@dataclass(frozen=True)
+class CodexProjectPromptDispatchResult:
+    owner_thread: str
+    status: str
+    reason: str
+    resume_result: CodexProjectResumeResult
+    prompt_exit_code: int | None = None
+    enter_exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+
+
 class CodexProjectThreadAdapter:
     def __init__(
         self,
@@ -126,6 +138,74 @@ class CodexProjectThreadAdapter:
             stdout=completed.stdout,
             stderr=completed.stderr,
             **_thread_result_fields(thread),
+        )
+
+    def dispatch_prompt(self, owner_thread: str, prompt: str) -> CodexProjectPromptDispatchResult:
+        resume_result = self.resume(owner_thread)
+        if resume_result.status not in {"resumed", "already_running"}:
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status=resume_result.status,
+                reason=resume_result.reason,
+                resume_result=resume_result,
+                stdout=resume_result.stdout,
+                stderr=resume_result.stderr,
+            )
+        if not resume_result.command:
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status="failed",
+                reason="resolved codex-project thread did not include a tmux command name",
+                resume_result=resume_result,
+            )
+        prompt_result = self.runner(
+            [str(self.tmux_path), "load-buffer", "-b", "overseer-dispatch", "-"],
+            input=prompt,
+            text=True,
+            capture_output=True,
+        )
+        if prompt_result.returncode != 0:
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status="failed",
+                reason="tmux prompt buffer load failed",
+                resume_result=resume_result,
+                prompt_exit_code=prompt_result.returncode,
+                stdout=prompt_result.stdout,
+                stderr=prompt_result.stderr,
+            )
+        paste_result = self.runner(
+            [str(self.tmux_path), "paste-buffer", "-b", "overseer-dispatch", "-t", resume_result.command],
+            text=True,
+            capture_output=True,
+        )
+        if paste_result.returncode != 0:
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status="failed",
+                reason="tmux prompt paste failed",
+                resume_result=resume_result,
+                prompt_exit_code=prompt_result.returncode,
+                enter_exit_code=paste_result.returncode,
+                stdout=paste_result.stdout,
+                stderr=paste_result.stderr,
+            )
+        enter_result = self.runner(
+            [str(self.tmux_path), "send-keys", "-t", resume_result.command, "Enter"],
+            text=True,
+            capture_output=True,
+        )
+        status = "prompt_dispatched" if enter_result.returncode == 0 else "failed"
+        reason = "prompt delivered to codex project tmux session" if enter_result.returncode == 0 else "tmux prompt submit failed"
+        return CodexProjectPromptDispatchResult(
+            owner_thread=owner_thread,
+            status=status,
+            reason=reason,
+            resume_result=resume_result,
+            prompt_exit_code=prompt_result.returncode,
+            enter_exit_code=enter_result.returncode,
+            stdout=enter_result.stdout,
+            stderr=enter_result.stderr,
         )
 
     def _tmux_session_exists(self, session: str) -> bool:

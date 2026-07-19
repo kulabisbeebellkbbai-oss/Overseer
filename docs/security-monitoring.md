@@ -51,4 +51,4 @@ Firewall and source-block plans require an Intrusion Detection advisory package 
 PYTHONPATH=src python3 -m overseer.cli dispatch-host-security-ids-review-package --store state/overseer.sqlite3 --package-id ids-review.admin.host-security.block-source.8-8-8-8 --dispatched-by odo
 ```
 
-Dispatch records prompt path, thread id, conversation id, and resume status. It does not accept the advisory, approve the admin plan, or execute firewall changes; `record-host-security-ids-review-result --status accepted` remains the separate review gate.
+Dispatch resumes the registered thread when needed, then delivers the advisory prompt into the tmux-backed Codex session. It records prompt path, thread id, conversation id, resume status, and prompt-delivery status. It does not accept the advisory, approve the admin plan, or execute firewall changes; `record-host-security-ids-review-result --status accepted` remains the separate review gate.

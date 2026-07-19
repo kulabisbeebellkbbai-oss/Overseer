@@ -2460,19 +2460,22 @@ def dispatch_host_security_ids_review_package_status(
                 if codex_projects_registry
                 else CodexProjectThreadAdapter()
             )
-        resume_result = selected_adapter.resume(target_thread)
+        dispatch_result = selected_adapter.dispatch_prompt(target_thread, package.prompt)
+        resume_result = dispatch_result.resume_result
         dispatched = replace(
             package,
             dispatched_by=dispatched_by,
             dispatched_at=dispatched_at,
-            dispatch_status=resume_result.status,
-            dispatch_reason=resume_result.reason,
+            dispatch_status=dispatch_result.status,
+            dispatch_reason=dispatch_result.reason,
             dispatch_thread=target_thread,
             dispatch_conversation_id=resume_result.conversation_id,
             dispatch_command=resume_result.command,
-            dispatch_exit_code=resume_result.exit_code,
+            dispatch_exit_code=dispatch_result.enter_exit_code
+            if dispatch_result.enter_exit_code is not None
+            else resume_result.exit_code,
         )
-        if resume_result.status in {"resumed", "already_running"}:
+        if dispatch_result.status == "prompt_dispatched":
             dispatched = mark_ids_review_package_submitted(
                 dispatched,
                 submitted_by=dispatched_by,
@@ -2499,6 +2502,15 @@ def dispatch_host_security_ids_review_package_status(
                 "command": resume_result.command,
                 "launcher": resume_result.launcher,
                 "exit_code": resume_result.exit_code,
+            },
+            "dispatch_result": {
+                "owner_thread": dispatch_result.owner_thread,
+                "status": dispatch_result.status,
+                "reason": dispatch_result.reason,
+                "prompt_exit_code": dispatch_result.prompt_exit_code,
+                "enter_exit_code": dispatch_result.enter_exit_code,
+                "stdout": dispatch_result.stdout,
+                "stderr": dispatch_result.stderr,
             },
             **host_security_ids_review_package_status(dispatched),
         }

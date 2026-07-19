@@ -45,6 +45,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security/ids-review-packages`
 - `GET /host/security/ids-review-summary`
 - `GET /admin/authorizations-required`
+- `GET /admin/adapter-capabilities`
+- `GET /admin/adapter-enablement-plan`
 - `GET /admin/executions`
 - `GET /admin/execution-readiness`
 - `GET /admin/history-review`
@@ -79,7 +81,11 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /admin/approve`
 - `POST /admin/cancel`
 - `POST /admin/execute`
+- `POST /admin/adapter-enablement-requests`
+- `POST /admin/adapter-enablement-requests/approve`
 - `POST /admin/history-restore-requests`
+- `POST /admin/history-archive`
+- `POST /admin/history-unarchive`
 - `POST /runtime/daemon-migration-requests`
 - `POST /runtime/daemon-migration-requests/approve`
 

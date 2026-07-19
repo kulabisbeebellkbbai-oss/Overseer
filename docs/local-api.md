@@ -29,6 +29,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /maintenance-summary`
 - `GET /alerts-summary`
 - `GET /audit-summary`
+- `GET /approvals-summary`
 - `GET /security-summary`
 - `GET /usage-summary`
 - `GET /physical-summary`
@@ -107,6 +108,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /state/redacted` returns a share-oriented state export with local paths, targets, errors, summaries, reasons, command text, prompt/advisory text, hostnames, listener addresses, and secret-like keys replaced by `[REDACTED]`.
 `GET /alerts-summary` returns only persisted `alert` audit events, with counts by risk and owner domain for quick Odo/Julian review.
 `GET /audit-summary` returns persisted audit events with optional `event_type`, `owner`, and `subject_prefix` query filters.
+`GET /approvals-summary` returns stored approval requests with optional `status`, `owner`, `approval_level`, and `subject_prefix` query filters.
 `GET /security-summary` returns Odo's compact view of security surfaces, alert audit events, latest host security findings, protective firewall/block plans, and IDS review gates.
 `GET /host/security/findings` returns Odo's detailed host-security finding list, severity counts, evidence lines, and recommended actions from the latest persisted host snapshot.
 `GET /host/security/triage` groups Odo's host-security findings by listener, bind scope, severity, evidence, and read-only mitigation path. It does not change firewall, route, IDS, or service-bind state.

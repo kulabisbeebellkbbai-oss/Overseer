@@ -120,6 +120,7 @@ from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_admin_adapter_enablement_status
 from overseer.cli import approve_admin_history_restore_status
 from overseer.cli import approve_claim_status
+from overseer.cli import approvals_summary_status
 from overseer.cli import alerts_summary_status
 from overseer.cli import audit_summary_status
 from overseer.cli import assess_host_security_status
@@ -2016,6 +2017,43 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["event_count"], 1)
             self.assertEqual(status["events"][0]["id"], "audit.client.ids-review.approved")
+
+    def test_client_reads_filtered_approvals_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_approval(
+                ApprovalRequest(
+                    id="approval.client.pending",
+                    subject_id="claim.client.pending",
+                    approval_level=ApprovalLevel.SISKO,
+                    requester_thread="thread-client",
+                    owner_domain=OwnerDomain.DAX,
+                    reason="client pending approval",
+                )
+            )
+            store.save_approval(
+                ApprovalRequest(
+                    id="approval.client.approved",
+                    subject_id="claim.client.approved",
+                    approval_level=ApprovalLevel.HUMAN,
+                    requester_thread="thread-client",
+                    owner_domain=OwnerDomain.SISKO,
+                    reason="client approved approval",
+                    status=ApprovalStatus.APPROVED,
+                    decided_by="sisko",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.approvals_summary(status=ApprovalStatus.PENDING.value, owner=OwnerDomain.DAX.value)
+
+            self.assertEqual(status["approval_count"], 1)
+            self.assertEqual(status["pending_count"], 1)
+            self.assertEqual(status["approvals"][0]["id"], "approval.client.pending")
+            self.assertEqual(status["filters"]["status"], ApprovalStatus.PENDING.value)
 
     def test_client_reads_usage_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4853,6 +4891,52 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)
             self.assertEqual(status["audit_events"][0]["subject_id"], "claim.cli.state")
             self.assertEqual(status["runtime_heartbeats"], [])
+
+    def test_approvals_summary_status_filters_stored_approvals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_approval(
+                ApprovalRequest(
+                    id="approval.summary.pending",
+                    subject_id="claim.summary.pending",
+                    approval_level=ApprovalLevel.SISKO,
+                    requester_thread="thread-summary",
+                    owner_domain=OwnerDomain.DAX,
+                    reason="pending summary approval",
+                )
+            )
+            store.save_approval(
+                ApprovalRequest(
+                    id="approval.summary.approved",
+                    subject_id="admin.summary.approved",
+                    approval_level=ApprovalLevel.HUMAN,
+                    requester_thread="thread-summary",
+                    owner_domain=OwnerDomain.SISKO,
+                    reason="approved summary approval",
+                    status=ApprovalStatus.APPROVED,
+                    decided_by="sisko",
+                )
+            )
+            store.close()
+
+            pending = approvals_summary_status(
+                store_path,
+                status=ApprovalStatus.PENDING.value,
+                owner=OwnerDomain.DAX.value,
+                approval_level=ApprovalLevel.SISKO.value,
+                subject_prefix="claim.",
+            )
+            all_items = approvals_summary_status(store_path)
+
+        self.assertEqual(pending["approval_count"], 1)
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertEqual(pending["approved_count"], 0)
+        self.assertEqual(pending["approvals"][0]["id"], "approval.summary.pending")
+        self.assertEqual(pending["by_status"][ApprovalStatus.PENDING.value], 1)
+        self.assertEqual(pending["filters"]["subject_prefix"], "claim.")
+        self.assertEqual(all_items["approval_count"], 2)
+        self.assertEqual(all_items["approved_count"], 1)
 
     def test_export_state_redacted_status_removes_sensitive_operational_fields(self):
         with tempfile.TemporaryDirectory() as directory:

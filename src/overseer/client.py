@@ -80,6 +80,26 @@ class OverseerApiClient:
         suffix = f"?{urlencode(query)}" if query else ""
         return self._get(f"/audit-summary{suffix}")
 
+    def approvals_summary(
+        self,
+        status: str | None = None,
+        owner: str | None = None,
+        approval_level: str | None = None,
+        subject_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        query = {
+            key: value
+            for key, value in {
+                "status": status,
+                "owner": owner,
+                "approval_level": approval_level,
+                "subject_prefix": subject_prefix,
+            }.items()
+            if value
+        }
+        suffix = f"?{urlencode(query)}" if query else ""
+        return self._get(f"/approvals-summary{suffix}")
+
     def security_summary(self) -> dict[str, Any]:
         return self._get("/security-summary")
 

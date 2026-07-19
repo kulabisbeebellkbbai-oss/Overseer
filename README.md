@@ -46,6 +46,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli persistence-security --store state/overseer.sqlite3` - inspect SQLite store file ownership and permissions without creating or changing files.
 - `PYTHONPATH=src python3 -m overseer.cli alerts-summary --store state/overseer.sqlite3` - summarize persisted alert audit events without reading full state.
 - `PYTHONPATH=src python3 -m overseer.cli audit-summary --store state/overseer.sqlite3 --owner odo --subject-prefix ids-review.` - summarize persisted audit events, optionally filtered by event type, owner, or subject prefix.
+- `PYTHONPATH=src python3 -m overseer.cli approvals-summary --store state/overseer.sqlite3 --status pending --owner dax` - summarize stored approval requests, optionally filtered by status, owner, approval level, or subject prefix.
 - `PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3` - summarize persisted usage limits, capacity state, reset timing, and confidence.
 - `PYTHONPATH=src python3 -m overseer.cli claim-review --store state/overseer.sqlite3` - review active, queued, expired, and release-blocked claims without releasing or revoking them.
 - `PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3` - capture read-only host admin evidence for running user services, listeners, storage, kernel, and OS identity.

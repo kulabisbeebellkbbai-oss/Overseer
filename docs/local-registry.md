@@ -25,12 +25,12 @@ The first usable Overseer core is an in-memory registry backed by explicit SQLit
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli list-state --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli approvals-summary --store state/overseer.sqlite3 --status pending
 ```
 
 ## Immediate Growth Path
 
 1. Add a local service API around the stored registry.
 2. Add adapters for health probes, device discovery, usage-limit probes, and maintenance runners.
-3. Add richer event filters and approval review commands.
-4. Add lease expiry and stale-claim cleanup.
-5. Add foreground-to-daemon migration only after an explicit operator approval plan.
+3. Add lease expiry and stale-claim cleanup.
+4. Add foreground-to-daemon migration only after an explicit operator approval plan.

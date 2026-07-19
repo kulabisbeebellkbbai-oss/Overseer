@@ -3203,6 +3203,71 @@ def audit_summary_status(
         store.close()
 
 
+def approvals_summary_status(
+    store_path: str | Path,
+    status: str | None = None,
+    owner: str | None = None,
+    approval_level: str | None = None,
+    subject_prefix: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        approvals = list(store.list_approvals())
+        if status:
+            selected_status = ApprovalStatus(status)
+            approvals = [approval for approval in approvals if approval.status == selected_status]
+        if owner:
+            selected_owner = OwnerDomain(owner)
+            approvals = [approval for approval in approvals if approval.owner_domain == selected_owner]
+        if approval_level:
+            selected_level = ApprovalLevel(approval_level)
+            approvals = [approval for approval in approvals if approval.approval_level == selected_level]
+        if subject_prefix:
+            approvals = [approval for approval in approvals if approval.subject_id.startswith(subject_prefix)]
+        return {
+            "store": str(store.path),
+            "approvals": [approval_request_status(approval) for approval in approvals],
+            "approval_count": len(approvals),
+            "pending_count": sum(1 for approval in approvals if approval.status == ApprovalStatus.PENDING),
+            "approved_count": sum(1 for approval in approvals if approval.status == ApprovalStatus.APPROVED),
+            "by_status": {
+                item.value: sum(1 for approval in approvals if approval.status == item)
+                for item in ApprovalStatus
+            },
+            "by_owner": {
+                item.value: sum(1 for approval in approvals if approval.owner_domain == item)
+                for item in OwnerDomain
+            },
+            "by_approval_level": {
+                item.value: sum(1 for approval in approvals if approval.approval_level == item)
+                for item in ApprovalLevel
+            },
+            "filters": {
+                "status": status,
+                "owner": owner,
+                "approval_level": approval_level,
+                "subject_prefix": subject_prefix,
+            },
+        }
+    finally:
+        store.close()
+
+
+def approval_request_status(approval: ApprovalRequest) -> dict[str, object]:
+    return {
+        "id": approval.id,
+        "subject_id": approval.subject_id,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+        "requester_thread": approval.requester_thread,
+        "owner_domain": OwnerDomain(approval.owner_domain).value,
+        "reason": approval.reason,
+        "status": ApprovalStatus(approval.status).value,
+        "evidence_required": list(approval.evidence_required),
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+    }
+
+
 def audit_event_status(event: AuditEvent) -> dict[str, object]:
     return {
         "id": event.id,
@@ -3706,6 +3771,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit_summary_parser.add_argument("--event-type", choices=[item.value for item in AuditEventType])
     audit_summary_parser.add_argument("--owner", choices=[item.value for item in OwnerDomain])
     audit_summary_parser.add_argument("--subject-prefix")
+    approvals_summary_parser = subparsers.add_parser("approvals-summary", help="summarize stored approvals with optional filters")
+    approvals_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    approvals_summary_parser.add_argument("--status", choices=[item.value for item in ApprovalStatus])
+    approvals_summary_parser.add_argument("--owner", choices=[item.value for item in OwnerDomain])
+    approvals_summary_parser.add_argument("--approval-level", choices=[item.value for item in ApprovalLevel])
+    approvals_summary_parser.add_argument("--subject-prefix")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
     assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
@@ -4040,6 +4111,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "audit-summary":
         print(json.dumps(audit_summary_status(args.store, args.event_type, args.owner, args.subject_prefix), sort_keys=True))
+        return 0
+
+    if args.command == "approvals-summary":
+        print(json.dumps(approvals_summary_status(args.store, args.status, args.owner, args.approval_level, args.subject_prefix), sort_keys=True))
         return 0
 
     if args.command == "inspect-host":

@@ -27,6 +27,7 @@ from .cli import (
     approve_admin_adapter_enablement_status,
     approve_admin_history_restore_status,
     approve_claim_status,
+    approvals_summary_status,
     alerts_summary_status,
     audit_summary_status,
     authorizations_required_status,
@@ -124,6 +125,17 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/audit-summary":
                 self._handle(lambda: audit_summary_status(store_path, _query_first(query, "event_type"), _query_first(query, "owner"), _query_first(query, "subject_prefix")))
+                return
+            if path == "/approvals-summary":
+                self._handle(
+                    lambda: approvals_summary_status(
+                        store_path,
+                        _query_first(query, "status"),
+                        _query_first(query, "owner"),
+                        _query_first(query, "approval_level"),
+                        _query_first(query, "subject_prefix"),
+                    )
+                )
                 return
             if path == "/security-summary":
                 self._handle(lambda: security_summary_status(store_path))

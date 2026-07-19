@@ -4708,6 +4708,202 @@ def record_crew_message_status(
         store.close()
 
 
+def dispatch_crew_messages_status(
+    store_path: str | Path,
+    owner_domain: str | None = None,
+    message_id: str | None = None,
+    dispatched_by: str = "sisko",
+    dispatched_at: str | None = None,
+) -> dict[str, object]:
+    if owner_domain is not None:
+        OwnerDomain(owner_domain)
+    now = dispatched_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    store = SQLiteStore(store_path)
+    try:
+        messages = [
+            message
+            for message in store.list_crew_messages()
+            if message.status == CrewMessageStatus.OPEN
+            and (owner_domain is None or message.owner_domain == OwnerDomain(owner_domain))
+            and (message_id is None or message.id == message_id)
+        ]
+    finally:
+        store.close()
+
+    results = []
+    for message in sorted(messages, key=lambda item: item.created_at or item.id):
+        try:
+            result = _dispatch_crew_message(store_path, message, dispatched_by, now)
+            final_status = CrewMessageStatus.ACKNOWLEDGED
+        except (KeyError, ValueError) as error:
+            result = {
+                "message_id": message.id,
+                "owner_domain": message.owner_domain.value,
+                "dispatcher": message.owner_domain.value,
+                "status": "blocked",
+                "reason": str(error),
+                "actions": [],
+            }
+            final_status = CrewMessageStatus.OPEN
+        store = SQLiteStore(store_path)
+        try:
+            updated = replace(message, status=final_status, updated_at=now)
+            store.save_crew_message(updated)
+            store.save_audit_event(
+                AuditEvent(
+                    id=f"audit.{message.id}.dispatch.{_status_id(now)}",
+                    event_type=AuditEventType.EXECUTED if final_status == CrewMessageStatus.ACKNOWLEDGED else AuditEventType.BLOCKED,
+                    owner_domain=message.owner_domain,
+                    subject_id=message.id,
+                    summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
+                    risk_level=message.priority,
+                    occurred_at=now,
+                )
+            )
+            result["message_status"] = updated.status.value
+            results.append(result)
+        finally:
+            store.close()
+    return {
+        "store": str(Path(store_path)),
+        "requested_owner_domain": owner_domain,
+        "requested_message_id": message_id,
+        "dispatched_by": dispatched_by,
+        "dispatched_at": now,
+        "processed": len(results),
+        "acknowledged": sum(1 for result in results if result["message_status"] == CrewMessageStatus.ACKNOWLEDGED.value),
+        "blocked": sum(1 for result in results if result["message_status"] == CrewMessageStatus.OPEN.value),
+        "items": results,
+        "mutation_performed": bool(results),
+        "host_mutation_performed": False,
+    }
+
+
+def _dispatch_crew_message(
+    store_path: str | Path,
+    message,
+    dispatched_by: str,
+    dispatched_at: str,
+) -> dict[str, object]:
+    dispatcher = {
+        OwnerDomain.SISKO: _dispatch_sisko_message,
+        OwnerDomain.KIRA: _dispatch_kira_message,
+        OwnerDomain.OBRIEN: _dispatch_obrien_message,
+        OwnerDomain.ODO: _dispatch_odo_message,
+        OwnerDomain.QUARK: _dispatch_quark_message,
+        OwnerDomain.DAX: _dispatch_dax_message,
+        OwnerDomain.JULIAN: _dispatch_julian_message,
+    }.get(OwnerDomain(message.owner_domain))
+    if dispatcher is None:
+        return _crew_dispatch_result(message, "skipped", "no dispatcher is registered for this owner domain", [])
+    return dispatcher(store_path, message, dispatched_by, dispatched_at)
+
+
+def _dispatch_sisko_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_plan_id and message.related_plan_id != "all" and _message_mentions(message, "approve", "approval", "approved"):
+        approval = approve_admin_change_status(store_path, message.related_plan_id, "sisko", dispatched_at)
+        return _crew_dispatch_result(message, "dispatched", f"Sisko approved plan {message.related_plan_id}", [approval])
+    if message.related_plan_id == "all":
+        return _crew_dispatch_result(message, "skipped", "Sisko dispatch requires exact plan IDs; broad all-plan approval is not executed", [])
+    return _crew_dispatch_result(message, "skipped", "Sisko acknowledged command request; no exact approval target was provided", [])
+
+
+def _dispatch_kira_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    physical = discover_physical_status(("/dev/serial/by-id", "/dev/serial/by-path"), store_path)
+    storage = discover_storage_status(store_path=store_path)
+    return _crew_dispatch_result(message, "dispatched", "Kira refreshed physical device and storage inventories", [physical, storage])
+
+
+def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    packages = (message.related_resource_id,) if message.related_resource_id else ()
+    plan = plan_package_updates_status(store_path, captured_at=dispatched_at, packages=packages)
+    return _crew_dispatch_result(message, "dispatched", "O'Brien inspected packages and staged maintenance plans when upgrades were available", [plan])
+
+
+def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    inspection = inspect_host_status(store_path)
+    try:
+        remediation = plan_host_security_listener_queue_remediations_status(store_path, inspection["id"], requested_by="odo")
+    except ValueError as error:
+        remediation = {"status": "skipped", "reason": str(error)}
+    return _crew_dispatch_result(message, "dispatched", "Odo inspected host security and staged listener remediation plans when needed", [inspection, remediation])
+
+
+def _dispatch_quark_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if not message.related_limit_id:
+        return _crew_dispatch_result(message, "skipped", "Quark needs a related usage limit before scheduling continuation work", [])
+    store = SQLiteStore(store_path)
+    try:
+        limit = store.load_usage_limit(message.related_limit_id)
+        existing_request_ids = {request.id for request in store.list_usage_continuation_requests()}
+    finally:
+        store.close()
+    request_id = f"work.{message.id}"
+    if request_id in existing_request_ids:
+        plan = usage_continuation_plan_status(store_path)
+        return _crew_dispatch_result(message, "dispatched", f"Quark found existing continuation request {request_id}", [plan])
+    continuation = request_usage_continuation_status(
+        store_path,
+        request_id,
+        limit.id,
+        limit.resource_id,
+        message.requested_by or "operator",
+        1,
+        message.message,
+        RiskLevel(message.priority).value,
+        requested_by="quark",
+        requested_at=dispatched_at,
+    )
+    return _crew_dispatch_result(message, "dispatched", f"Quark scheduled continuation request {request_id}", [continuation])
+
+
+def _dispatch_dax_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_resource_id:
+        claim = request_claim_status(
+            store_path,
+            f"claim.{message.id}",
+            message.related_resource_id,
+            ClaimType.LEASE.value,
+            message.requested_by or "operator",
+            OwnerDomain.DAX.value,
+            message.message,
+            message.subject,
+            RiskLevel(message.priority).value,
+        )
+        return _crew_dispatch_result(message, "dispatched", f"Dax staged checkout claim for {message.related_resource_id}", [claim])
+    discovery = discover_virtual_listeners_status(store_path)
+    return _crew_dispatch_result(message, "dispatched", "Dax refreshed virtual listener inventory for checkout review", [discovery])
+
+
+def _dispatch_julian_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        target_count = len(store.list_health_targets())
+    finally:
+        store.close()
+    actions = []
+    if target_count == 0:
+        actions.append(discover_user_services_status(store_path))
+    actions.append(probe_stored_health_status(store_path, health_evidence_retention_per_target=5))
+    return _crew_dispatch_result(message, "dispatched", "Julian refreshed service health targets and ran stored health probes", actions)
+
+
+def _crew_dispatch_result(message, status: str, reason: str, actions: Sequence[dict[str, object]]) -> dict[str, object]:
+    return {
+        "message_id": message.id,
+        "owner_domain": message.owner_domain.value,
+        "dispatcher": message.owner_domain.value,
+        "status": status,
+        "reason": reason,
+        "actions": actions,
+    }
+
+
+def _message_mentions(message, *terms: str) -> bool:
+    text = f"{message.subject} {message.message}".lower()
+    return any(term in text for term in terms)
+
+
 def discover_codex_project_threads_status(
     store_path: str | Path,
     registry_path: str | Path = "/home/god/.codex/codex-projects.csv",
@@ -6449,6 +6645,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_crew_message_parser.add_argument("--related-resource-id")
     record_crew_message_parser.add_argument("--related-plan-id")
     record_crew_message_parser.add_argument("--related-limit-id")
+    dispatch_crew_parser = subparsers.add_parser("dispatch-crew-messages", help="dispatch open crew-scoped operator messages")
+    dispatch_crew_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    dispatch_crew_parser.add_argument("--owner-domain", choices=[item.value for item in OwnerDomain])
+    dispatch_crew_parser.add_argument("--message-id")
+    dispatch_crew_parser.add_argument("--dispatched-by", default="sisko")
+    dispatch_crew_parser.add_argument("--dispatched-at")
     usage_continuation_plan_parser = subparsers.add_parser(
         "usage-continuation-plan",
         help="summarize persisted usage-limited continuation requests",
@@ -7131,6 +7333,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.related_resource_id,
                     args.related_plan_id,
                     args.related_limit_id,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "dispatch-crew-messages":
+        print(
+            json.dumps(
+                dispatch_crew_messages_status(
+                    args.store,
+                    args.owner_domain,
+                    args.message_id,
+                    args.dispatched_by,
+                    args.dispatched_at,
                 ),
                 sort_keys=True,
             )

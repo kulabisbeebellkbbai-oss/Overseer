@@ -44,6 +44,7 @@ from .cli import (
     create_host_security_source_review_status,
     crew_messages_status,
     discover_codex_project_threads_status,
+    dispatch_crew_messages_status,
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
@@ -409,6 +410,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/crew/messages":
                 self._handle_json(lambda payload: record_crew_message_status(store_path, **_crew_message_args(payload)))
                 return
+            if self.path == "/crew/dispatch":
+                self._handle_json(lambda payload: dispatch_crew_messages_status(store_path, **_crew_dispatch_args(payload)))
+                return
             if self.path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
@@ -594,6 +598,15 @@ def _crew_message_args(payload: dict[str, Any]) -> dict[str, Any]:
         "related_resource_id": str(payload["related_resource_id"]) if payload.get("related_resource_id") else None,
         "related_plan_id": str(payload["related_plan_id"]) if payload.get("related_plan_id") else None,
         "related_limit_id": str(payload["related_limit_id"]) if payload.get("related_limit_id") else None,
+    }
+
+
+def _crew_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "owner_domain": str(payload["owner_domain"]) if payload.get("owner_domain") else None,
+        "message_id": str(payload["message_id"]) if payload.get("message_id") else None,
+        "dispatched_by": str(payload.get("dispatched_by", "sisko")),
+        "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
     }
 
 

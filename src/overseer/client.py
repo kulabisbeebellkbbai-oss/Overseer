@@ -292,6 +292,22 @@ class OverseerApiClient:
             payload["related_limit_id"] = related_limit_id
         return self._post("/crew/messages", payload)
 
+    def dispatch_crew_messages(
+        self,
+        owner_domain: str | None = None,
+        message_id: str | None = None,
+        dispatched_by: str = "sisko",
+        dispatched_at: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"dispatched_by": dispatched_by}
+        if owner_domain:
+            payload["owner_domain"] = owner_domain
+        if message_id:
+            payload["message_id"] = message_id
+        if dispatched_at:
+            payload["dispatched_at"] = dispatched_at
+        return self._post("/crew/dispatch", payload)
+
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 

@@ -223,7 +223,7 @@ from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
 from overseer.cli import record_usage_limit_status
-from overseer.cli import crew_messages_status, record_crew_message_status
+from overseer.cli import crew_messages_status, dispatch_crew_messages_status, record_crew_message_status
 from overseer.cli import request_usage_continuation_status
 from overseer.cli import dispatch_host_security_ids_review_package_status
 from overseer.cli import dispatch_usage_continuations_status
@@ -2430,6 +2430,8 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("/operator-dashboard", html)
             self.assertIn("crewMessages: \"/crew/messages\"", html)
             self.assertIn("data-action=\"send-crew-message\"", html)
+            self.assertIn("data-action=\"dispatch-crew-messages\"", html)
+            self.assertIn("/crew/dispatch", html)
             self.assertIn("MCP API quota scheduling", html)
             self.assertIn("limit.mcp.api.calls.daily", html)
             self.assertIn('apiBase = protectedGatewayPath ? "/Overseer" : ""', html)
@@ -6850,6 +6852,80 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["audit_event"]["event_type"], AuditEventType.REQUESTED.value)
             self.assertEqual(summary["messages"], 1)
             self.assertEqual(summary["items"][0]["subject"], "MCP API quota scheduling")
+
+    def test_dispatches_quark_message_to_usage_continuation_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.mcp.api.calls.daily",
+                    resource_id="svc.mcp.api-keyed",
+                    kind=LimitKind.DAILY_QUOTA,
+                    capacity=1000,
+                    remaining=0,
+                    resets_at="2026-07-20T00:00:00+00:00",
+                    window="daily",
+                )
+            )
+            store.close()
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.QUARK.value,
+                "MCP API quota scheduling",
+                "Continue API-keyed MCP work when quota resets.",
+                RiskLevel.MEDIUM.value,
+                requested_by="thread.mcp",
+                message_id="crew.quark.dispatch-quota",
+                related_limit_id="limit.mcp.api.calls.daily",
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                owner_domain=OwnerDomain.QUARK.value,
+                dispatched_at="2026-07-19T13:00:00+00:00",
+            )
+            summary = crew_messages_status(store_path, owner_domain=OwnerDomain.QUARK.value)
+            plan = usage_continuation_plan_status(store_path)
+
+            self.assertEqual(status["processed"], 1)
+            self.assertEqual(status["acknowledged"], 1)
+            self.assertEqual(summary["items"][0]["status"], "acknowledged")
+            self.assertEqual(plan["continuation_requests"], 1)
+            self.assertEqual(plan["items"][0]["id"], "work.crew.quark.dispatch-quota")
+
+    def test_dispatches_sisko_exact_plan_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.restart.dispatch-test",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "overseer-api.service",
+                "restart service after operator request",
+                "active",
+            )
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.SISKO.value,
+                "Approve plan",
+                "Approved for Sisko dispatch.",
+                RiskLevel.MEDIUM.value,
+                message_id="crew.sisko.approve-restart",
+                related_plan_id="admin.restart.dispatch-test",
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                owner_domain=OwnerDomain.SISKO.value,
+                dispatched_at="2026-07-19T13:05:00+00:00",
+            )
+            readiness = admin_execution_readiness_status(store_path)
+
+            self.assertEqual(status["processed"], 1)
+            self.assertEqual(status["items"][0]["status"], "dispatched")
+            approved = next(item for item in readiness["items"] if item["id"] == "admin.restart.dispatch-test")
+            self.assertTrue(approved["approved"])
 
     def test_rejects_invalid_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:

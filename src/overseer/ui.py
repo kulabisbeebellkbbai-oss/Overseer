@@ -563,6 +563,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
+      if (action === "dispatch-crew-messages") return await dispatchCrewMessages(source?.dataset?.role || "");
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
@@ -775,6 +776,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (limitId) payload.related_limit_id = limitId;
       return await postJson("/crew/messages", payload);
     }
+    async function dispatchCrewMessages(role) {
+      const payload = {dispatched_by: "sisko"};
+      if (role) payload.owner_domain = role;
+      return await postJson("/crew/dispatch", payload);
+    }
     async function requestUsageContinuation() {
       const payload = {
         request_id: value("usage-request-id"),
@@ -901,7 +907,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good")}
           ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good")}
           ${metric("O'Brien", focus.obrien?.executable_plans, "executable plans", "span-3")}
-          <div class="section-head"><h3>Command Crew</h3><span class="pill">${safe((state.data.dashboard || {}).service_name)}</span></div>
+          <div class="section-head"><h3>Command Crew</h3><div class="actions"><span class="pill">${safe((state.data.dashboard || {}).service_name)}</span><button class="action-btn" data-action="dispatch-crew-messages">Dispatch Open</button></div></div>
           ${crew("Sisko", focus.sisko)}
           ${crew("Kira", focus.kira)}
           ${crew("O'Brien", focus.obrien)}
@@ -1288,7 +1294,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const prefix = rolePrefix(`${role}-${subject}`);
       const recent = ((state.data.crewMessages || {}).items || []).filter((item) => item.owner_domain === role).slice(0, 5);
       return `<div class="panel span-12 officer-channel">
-        <div class="toolbar"><h3>${safe(officerName(role))} Channel</h3><button class="action-btn" data-action="send-crew-message" data-role="${safe(role)}" data-prefix="${safe(prefix)}">Send Request</button></div>
+        <div class="toolbar"><h3>${safe(officerName(role))} Channel</h3><div class="actions"><button class="action-btn" data-action="dispatch-crew-messages" data-role="${safe(role)}">Dispatch Open</button><button class="action-btn" data-action="send-crew-message" data-role="${safe(role)}" data-prefix="${safe(prefix)}">Send Request</button></div></div>
         <div class="form-grid">
           <div class="field span-3"><label for="${prefix}-subject">Subject</label><input id="${prefix}-subject" value="${safe(subject)}"></div>
           <div class="field span-2"><label for="${prefix}-priority">Priority</label><select id="${prefix}-priority">${riskOptions()}</select></div>

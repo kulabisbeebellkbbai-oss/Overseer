@@ -57,6 +57,7 @@ from .cli import (
     request_admin_adapter_enablement_status,
     request_admin_history_restore_status,
     prepare_host_security_ids_review_package_status,
+    persistence_security_status,
     request_claim_status,
     service_status,
     runtime_status,
@@ -89,6 +90,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/runtime-status":
                 self._handle(lambda: runtime_status(store_path))
+                return
+            if path == "/persistence/security":
+                self._handle(lambda: persistence_security_status(store_path))
                 return
             if path == "/command-summary":
                 self._handle(lambda: command_summary_status(store_path))

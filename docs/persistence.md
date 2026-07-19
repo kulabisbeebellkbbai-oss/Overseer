@@ -16,10 +16,10 @@ Overseer needs durable coordination state, but runtime databases must remain loc
 - The store must not persist secrets, credentials, tokens, personal exports, or raw service payloads.
 - Runtime state should live under an ignored operator-selected path such as `state/overseer.sqlite3`.
 - The persistence API stores typed records as JSON payloads so the domain model can continue to evolve before schema hardening.
+- `persistence-security` and `GET /persistence/security` inspect database and SQLite sidecar file permissions without creating missing files or changing modes.
 
 ## Next Hardening Steps
 
 - Add migrations before changing on-disk shape.
-- Add file permission checks for local stores.
 - Add explicit export redaction.
 - Add append-only audit storage once live actions exist.

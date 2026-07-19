@@ -32,6 +32,9 @@ class OverseerApiClient:
     def runtime_status(self) -> dict[str, Any]:
         return self._get("/runtime-status")
 
+    def persistence_security(self) -> dict[str, Any]:
+        return self._get("/persistence/security")
+
     def command_summary(self) -> dict[str, Any]:
         return self._get("/command-summary")
 

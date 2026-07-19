@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import re
+import stat
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1006,6 +1008,72 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
         }
     finally:
         store.close()
+
+
+def persistence_security_status(store_path: str | Path) -> dict[str, object]:
+    path = Path(store_path)
+    items = [_persistence_file_security_item(path, "database")]
+    for suffix, label in (("-wal", "write_ahead_log"), ("-shm", "shared_memory")):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            items.append(_persistence_file_security_item(sidecar, label))
+    risky = [item for item in items if item["status"] == "warning"]
+    missing_database = not path.exists()
+    status = "missing" if missing_database else "warning" if risky else "ok"
+    next_step = "create the store through an explicit operator-selected path" if missing_database else "keep store files owner-only readable and writable"
+    if risky:
+        next_step = "review store ownership and permissions before relying on persisted coordination state"
+    return {
+        "store": str(path),
+        "mutation_performed": False,
+        "status": status,
+        "recommended_mode": "0600",
+        "database_exists": path.exists(),
+        "files_checked": len(items),
+        "warning_count": len(risky),
+        "items": items,
+        "next_step": next_step,
+    }
+
+
+def _persistence_file_security_item(path: Path, label: str) -> dict[str, object]:
+    current_uid = os.getuid()
+    if not path.exists():
+        return {
+            "label": label,
+            "path": str(path),
+            "exists": False,
+            "status": "missing",
+            "mode": None,
+            "octal_mode": None,
+            "owner_uid": None,
+            "current_uid": current_uid,
+            "owner_matches_current_user": False,
+            "group_or_other_permissions": False,
+            "risks": ["file does not exist"],
+        }
+    file_stat = path.stat()
+    mode = stat.S_IMODE(file_stat.st_mode)
+    owner_matches = file_stat.st_uid == current_uid
+    group_or_other_permissions = bool(mode & 0o077)
+    risks: list[str] = []
+    if not owner_matches:
+        risks.append("file is not owned by the current user")
+    if group_or_other_permissions:
+        risks.append("group or other users have file permissions")
+    return {
+        "label": label,
+        "path": str(path),
+        "exists": True,
+        "status": "warning" if risks else "ok",
+        "mode": stat.filemode(file_stat.st_mode),
+        "octal_mode": oct(mode),
+        "owner_uid": file_stat.st_uid,
+        "current_uid": current_uid,
+        "owner_matches_current_user": owner_matches,
+        "group_or_other_permissions": group_or_other_permissions,
+        "risks": risks,
+    }
 
 
 def freshness_status(assessment: FreshnessAssessment) -> dict[str, object]:
@@ -3556,6 +3624,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_status_parser = subparsers.add_parser("runtime-status", help="read runtime heartbeat and latest host inspection status")
     runtime_status_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     runtime_status_parser.add_argument("--service-name", default="overseer")
+    persistence_security_parser = subparsers.add_parser(
+        "persistence-security",
+        help="inspect SQLite store file ownership and permissions without changing them",
+    )
+    persistence_security_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     alerts_summary_parser = subparsers.add_parser("alerts-summary", help="summarize persisted alert audit events")
     alerts_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     audit_summary_parser = subparsers.add_parser("audit-summary", help="summarize persisted audit events")
@@ -3881,6 +3954,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "runtime-status":
         print(json.dumps(runtime_status(args.store, args.service_name), sort_keys=True))
+        return 0
+
+    if args.command == "persistence-security":
+        print(json.dumps(persistence_security_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "alerts-summary":

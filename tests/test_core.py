@@ -142,6 +142,7 @@ from overseer.cli import main as cli_main
 from overseer.cli import maintenance_summary_status
 from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
+from overseer.cli import persistence_security_status
 from overseer.cli import prepare_host_security_ids_review_package_status
 from overseer.cli import host_security_ids_review_packages_status
 from overseer.cli import host_security_ids_review_summary_status
@@ -1912,6 +1913,20 @@ class OverseerApiClientTests(unittest.TestCase):
                 status = client.runtime_status()
 
             self.assertEqual(status["service"]["tick_count"], 4)
+
+    def test_client_reads_persistence_security(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            SQLiteStore(store_path).close()
+            store_path.chmod(0o600)
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.persistence_security()
+
+            self.assertFalse(status["mutation_performed"])
+            self.assertEqual(status["status"], "ok")
+            self.assertEqual(status["items"][0]["octal_mode"], "0o600")
 
     def test_client_reads_alerts_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4471,6 +4486,44 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["runtime_heartbeats"], 1)
             self.assertEqual(status["health_probes"], 0)
             self.assertEqual(status["host_inspections"], 0)
+
+    def test_persistence_security_status_reports_owner_only_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            SQLiteStore(store_path).close()
+            store_path.chmod(0o600)
+
+            status = persistence_security_status(store_path)
+
+        self.assertFalse(status["mutation_performed"])
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["recommended_mode"], "0600")
+        self.assertEqual(status["warning_count"], 0)
+        self.assertEqual(status["items"][0]["octal_mode"], "0o600")
+
+    def test_persistence_security_status_flags_group_or_other_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            SQLiteStore(store_path).close()
+            store_path.chmod(0o644)
+
+            status = persistence_security_status(store_path)
+
+        self.assertEqual(status["status"], "warning")
+        self.assertEqual(status["warning_count"], 1)
+        self.assertTrue(status["items"][0]["group_or_other_permissions"])
+        self.assertIn("group or other users have file permissions", status["items"][0]["risks"])
+
+    def test_persistence_security_status_does_not_create_missing_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "missing.sqlite3"
+
+            status = persistence_security_status(store_path)
+
+            self.assertFalse(store_path.exists())
+
+        self.assertEqual(status["status"], "missing")
+        self.assertFalse(status["database_exists"])
 
     def test_runtime_can_probe_configured_health_targets_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:

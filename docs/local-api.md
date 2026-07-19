@@ -60,6 +60,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/activate`
 - `POST /claims/release`
 - `GET /claims/review`
+- `GET /claims/cleanup-plan`
 - `POST /host/inspect`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
@@ -102,6 +103,7 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `GET /operator-dashboard` returns a unified role-focused dashboard with overall status, attention counts, admin archive candidates, security review gate blockers, and embedded command, physical, virtual, maintenance, security, usage, health, and health-efficiency summaries.
 `POST /claims/release` accepts optional `released_by`, `reason`, `evidence_ids`, and `released_at` fields and emits release audit evidence.
 `GET /claims/review` reports active-like, queued, expired, and release-blocked claims for operator review without releasing, revoking, or renewing them. It supports `?now=...` for deterministic review timestamps.
+`GET /claims/cleanup-plan` prepares a read-only cleanup manifest for expired active-like claims, stale queued claims, blocked claims, and claims missing release evidence. It supports `?now=...` and does not release, revoke, renew, approve, or re-evaluate claims.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership and permissions without creating a missing database or changing file modes.

@@ -3302,6 +3302,92 @@ def claim_review_status(store_path: str | Path, now: str | None = None) -> dict[
         store.close()
 
 
+def claim_cleanup_plan_status(store_path: str | Path, now: str | None = None) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
+        resources = {resource.id: resource for resource in store.list_resources()}
+        claims = store.list_claims()
+        claims_by_id = {claim.id: claim for claim in claims}
+        items = [
+            claim_cleanup_plan_item_status(store, claim, resources.get(claim.resource_id), claims_by_id, checked_at)
+            for claim in claims
+        ]
+        candidates = [item for item in items if item["cleanup_candidate"]]
+        return {
+            "store": str(store.path),
+            "checked_at": checked_at.isoformat(),
+            "mutation_performed": False,
+            "claims": len(items),
+            "cleanup_candidates": len(candidates),
+            "expired_active_like": sum(1 for item in candidates if item["cleanup_action"] == "review_expired_active_claim"),
+            "missing_release_condition": sum(1 for item in candidates if item["cleanup_action"] == "add_release_condition_or_evidence"),
+            "stale_queued": sum(1 for item in candidates if item["cleanup_action"] == "re_evaluate_stale_queue"),
+            "blocked": sum(1 for item in candidates if item["cleanup_action"] == "review_blocked_claim"),
+            "approval_required": any(item["approval_required"] for item in candidates),
+            "items": candidates,
+        }
+    finally:
+        store.close()
+
+
+def claim_cleanup_plan_item_status(
+    store: SQLiteStore,
+    claim: Claim,
+    resource: Resource | None,
+    claims_by_id: dict[str, Claim],
+    checked_at: datetime,
+) -> dict[str, object]:
+    review = claim_review_item_status(claim, resource, checked_at)
+    blocking_claim_ids = _claim_blocking_claim_ids(store, claim.id)
+    active_blocking_claim_ids = [
+        blocking_id
+        for blocking_id in blocking_claim_ids
+        if blocking_id in claims_by_id and claims_by_id[blocking_id].is_active_like()
+    ]
+    cleanup_action = "none"
+    next_step = "no cleanup action required"
+    approval_required = False
+    required_gate = "none"
+
+    if review["expired"] and review["active_like"]:
+        cleanup_action = "review_expired_active_claim"
+        next_step = "operator must approve release, revocation, renewal, or takeover"
+        approval_required = True
+        required_gate = "operator_review"
+    elif review["missing_release_condition"]:
+        cleanup_action = "add_release_condition_or_evidence"
+        next_step = "record release condition or evidence before cleanup can proceed"
+        required_gate = "owner_evidence"
+    elif claim.status == ClaimStatus.QUEUED and blocking_claim_ids and not active_blocking_claim_ids:
+        cleanup_action = "re_evaluate_stale_queue"
+        next_step = "re-run the claim decision because recorded blockers are no longer active-like"
+        required_gate = "decision_review"
+    elif claim.status == ClaimStatus.BLOCKED:
+        cleanup_action = "review_blocked_claim"
+        next_step = "operator should cancel, revise, or re-request the blocked claim"
+        required_gate = "operator_review"
+
+    return {
+        **review,
+        "cleanup_candidate": cleanup_action != "none",
+        "cleanup_action": cleanup_action,
+        "cleanup_next_step": next_step,
+        "approval_required": approval_required,
+        "required_gate": required_gate,
+        "blocking_claim_ids": blocking_claim_ids,
+        "active_blocking_claim_ids": active_blocking_claim_ids,
+    }
+
+
+def _claim_blocking_claim_ids(store: SQLiteStore, claim_id: str) -> list[str]:
+    try:
+        decision = store.load_decision(claim_id)
+    except KeyError:
+        return []
+    return list(decision.blocking_claim_ids)
+
+
 def claim_review_item_status(claim: Claim, resource: Resource | None, checked_at: datetime) -> dict[str, object]:
     expired = _claim_is_expired(claim, checked_at)
     missing_release_condition = claim.is_exclusive() and claim.is_active_like() and not claim.release_condition
@@ -3987,6 +4073,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_review_parser = subparsers.add_parser("claim-review", help="review active, queued, expired, and release-blocked claims")
     claim_review_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_review_parser.add_argument("--now", help="override review timestamp for deterministic checks")
+    claim_cleanup_plan_parser = subparsers.add_parser(
+        "claim-cleanup-plan",
+        help="prepare a read-only cleanup plan for expired, stale, blocked, or release-blocked claims",
+    )
+    claim_cleanup_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    claim_cleanup_plan_parser.add_argument("--now", help="override review timestamp for deterministic checks")
     activate_parser = subparsers.add_parser("activate-claim", help="mark a stored claim active after approval")
     activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     activate_parser.add_argument("--claim-id", required=True)
@@ -4377,6 +4469,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "claim-review":
         print(json.dumps(claim_review_status(args.store, args.now), sort_keys=True))
+        return 0
+
+    if args.command == "claim-cleanup-plan":
+        print(json.dumps(claim_cleanup_plan_status(args.store, args.now), sort_keys=True))
         return 0
 
     if args.command == "request-claim":

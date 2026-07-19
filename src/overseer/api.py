@@ -32,6 +32,7 @@ from .cli import (
     audit_summary_status,
     authorizations_required_status,
     cancel_admin_change_status,
+    claim_cleanup_plan_status,
     claim_review_status,
     command_summary_status,
     create_host_security_source_review_status,
@@ -199,6 +200,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/claims/review":
                 self._handle(lambda: claim_review_status(store_path, _query_first(query, "now")))
+                return
+            if path == "/claims/cleanup-plan":
+                self._handle(lambda: claim_cleanup_plan_status(store_path, _query_first(query, "now")))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

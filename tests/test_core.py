@@ -126,6 +126,7 @@ from overseer.cli import audit_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
 from overseer.cli import cancel_admin_change_status
+from overseer.cli import claim_cleanup_plan_status
 from overseer.cli import claim_review_status
 from overseer.cli import command_summary_status
 from overseer.cli import execute_admin_change_status
@@ -2554,6 +2555,47 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(review["operator_review_required"], 1)
             self.assertEqual(review["items"][0]["next_step"], "operator review required before release, revocation, renewal, or takeover")
 
+    def test_client_reads_claim_cleanup_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.cleanup.client",
+                    name="Client Cleanup Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.client.expired",
+                    resource_id="gateway.cleanup.client",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-client",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use gateway",
+                    requested_action="bind gateway",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                    expires_at="2026-07-18T20:00:00+00:00",
+                    release_condition="operator verified work stopped",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                plan = client.claim_cleanup_plan("2026-07-18T20:30:00+00:00")
+                state = client.state()
+
+            self.assertFalse(plan["mutation_performed"])
+            self.assertEqual(plan["cleanup_candidates"], 1)
+            self.assertEqual(plan["expired_active_like"], 1)
+            self.assertEqual(plan["items"][0]["cleanup_action"], "review_expired_active_claim")
+            self.assertEqual(state["claims"][0]["status"], ClaimStatus.ACTIVE.value)
+
     def test_client_creates_admin_change_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4826,6 +4868,89 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(review["items"][0]["expired"])
             self.assertEqual(command["claims"]["expired_active_like"], 1)
             self.assertEqual(command["claims"]["missing_release_condition"], 1)
+
+    def test_claim_cleanup_plan_status_identifies_expired_and_stale_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.cleanup.cli",
+                    name="Cleanup CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.expired",
+                    resource_id="proxy.cleanup.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use proxy",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                    expires_at="2026-07-18T20:00:00+00:00",
+                    release_condition="operator verified work stopped",
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.released-blocker",
+                    resource_id="proxy.cleanup.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-b",
+                    owner_role=OwnerDomain.DAX,
+                    intent="previous proxy use",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.RELEASED,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.stale-queue",
+                    resource_id="proxy.cleanup.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-c",
+                    owner_role=OwnerDomain.DAX,
+                    intent="queued proxy use",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.QUEUED,
+                ),
+                ConflictDecision(
+                    outcome=ConflictOutcome.QUEUE,
+                    reason="resource was claimed",
+                    blocking_claim_ids=("claim.cleanup.released-blocker",),
+                ),
+            )
+            store.close()
+
+            plan = claim_cleanup_plan_status(store_path, "2026-07-18T20:10:00+00:00")
+            state = list_state_status(store_path)
+
+            self.assertFalse(plan["mutation_performed"])
+            self.assertEqual(plan["cleanup_candidates"], 2)
+            self.assertEqual(plan["expired_active_like"], 1)
+            self.assertEqual(plan["stale_queued"], 1)
+            self.assertEqual(
+                [item["cleanup_action"] for item in plan["items"]],
+                ["review_expired_active_claim", "re_evaluate_stale_queue"],
+            )
+            self.assertEqual(plan["items"][1]["blocking_claim_ids"], ["claim.cleanup.released-blocker"])
+            self.assertEqual(plan["items"][1]["active_blocking_claim_ids"], [])
+            self.assertEqual(
+                {claim["id"]: claim["status"] for claim in state["claims"]},
+                {
+                    "claim.cleanup.expired": ClaimStatus.ACTIVE.value,
+                    "claim.cleanup.released-blocker": ClaimStatus.RELEASED.value,
+                    "claim.cleanup.stale-queue": ClaimStatus.QUEUED.value,
+                },
+            )
 
     def test_activate_claim_status_requires_approved_request(self):
         with tempfile.TemporaryDirectory() as directory:

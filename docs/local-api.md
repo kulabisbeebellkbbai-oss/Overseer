@@ -87,6 +87,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /admin/execute`
 - `POST /admin/adapter-enablement-requests`
 - `POST /admin/adapter-enablement-requests/approve`
+- `POST /admin/policy-warning-requests`
+- `POST /admin/policy-warning-requests/approve`
 - `POST /admin/history-restore-requests`
 - `POST /admin/history-archive-requests`
 - `POST /admin/history-archive-requests/approve`
@@ -102,11 +104,13 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
 `POST /admin/execute` executes only a stored plan that passes the existing approval, completeness, adapter, and IDS gates, then persists the result. Unsupported, disabled, or unapproved plans return persisted `blocked` results.
-`GET /admin/authorizations-required` lists admin change plans, archive requests, restore requests, adapter enablement requests, claim cleanup requests, and daemon migration requests waiting for explicit approval.
+`GET /admin/authorizations-required` lists admin change plans, archive requests, restore requests, adapter enablement requests, policy warning acceptance requests, claim cleanup requests, and daemon migration requests waiting for explicit approval.
 `GET /admin/adapter-capabilities` lists the effective live admin adapter table for the API store, including enabled user-service restart execution and any package install, package index refresh, package upgrade, firewall, or source-block adapters with approved adapter enablement records.
 `GET /admin/adapter-enablement-plan` prepares a read-only high-risk approval plan for enabling disabled live admin adapters. It supports `?kind=...` filtering and does not enable adapters or execute commands.
 `POST /admin/adapter-enablement-requests` creates the approval request required before a disabled live admin adapter can become effective for that store.
 `POST /admin/adapter-enablement-requests/approve` approves a requested adapter enablement gate for that store and adapter kind without approving a specific host change or running commands.
+`POST /admin/policy-warning-requests` requests explicit acceptance of an active residual policy warning for one admin plan, such as the package-upgrade rollback warning. It does not execute the plan.
+`POST /admin/policy-warning-requests/approve` approves a pending residual policy warning acceptance request. Approved warning acceptance changes that warning to a pass for the targeted plan only.
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
 `GET /admin/execution-readiness` explains each admin plan's execution gate state, including approval, missing fields, IDS review, manual execution, and Overseer-supported execution readiness.
 `GET /admin/policies` evaluates stored admin plans against approval, adapter, IDS, rollback, verification, and risk policy checks. It supports `?plan_id=...` filtering.
@@ -208,6 +212,12 @@ plan = client.plan_admin_change(
 )
 pending = client.authorizations_required()
 approved = client.approve_admin_change({"plan_id": "admin.restart.overseer-api", "approved_by": "sisko"})
+warning_request = client.request_admin_policy_warning(
+    {"plan_id": "admin.apt.upgrade.sqlite", "check_id": "admin.rollback", "requested_by": "sisko"}
+)
+warning_approval = client.approve_admin_policy_warning(
+    {"approval_id": warning_request["approval_id"], "approved_by": "sisko"}
+)
 execution = client.execute_admin_change({"plan_id": "admin.restart.overseer-api"})
 executions = client.admin_executions()
 admin = client.admin_summary()

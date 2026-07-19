@@ -22,9 +22,12 @@ Host inspection is Overseer's read-only system evidence layer for admin and DevO
 ```bash
 PYTHONPATH=src python3 -m overseer.cli inspect-host
 PYTHONPATH=src python3 -m overseer.cli inspect-host --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli discover-user-services --store state/overseer.sqlite3
 ```
 
 Persisted snapshots appear in `list-state` under `host_snapshots`.
+
+`discover-user-services` captures the same read-only host snapshot and registers each running systemd user service as a `service` resource owned by Julian. It does not start, stop, restart, enable, disable, or edit any service.
 
 ## Security Assessment
 

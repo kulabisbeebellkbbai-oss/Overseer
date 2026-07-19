@@ -45,7 +45,14 @@ from .core import ClaimStatus, ResourceState
 from .core import decide_claim
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
-from .host import HostFindingSeverity, HostInspectionAdapter, HostInspectionSnapshot, host_security_status, host_snapshot_status
+from .host import (
+    HostFindingSeverity,
+    HostInspectionAdapter,
+    HostInspectionSnapshot,
+    host_security_status,
+    host_snapshot_status,
+    systemd_user_service_resources,
+)
 from .ids_review import (
     HostSecurityIDSReviewPackage,
     IDSReviewPackageStatus,
@@ -1309,6 +1316,44 @@ def inspect_host_status(store_path: str | Path | None = None) -> dict[str, objec
         return {"store": str(store.path), **status}
     finally:
         store.close()
+
+
+def discover_user_services_status(
+    store_path: str | Path,
+    snapshot: HostInspectionSnapshot | None = None,
+    adapter: HostInspectionAdapter | None = None,
+) -> dict[str, object]:
+    observed = snapshot or (adapter or HostInspectionAdapter()).inspect()
+    resources = systemd_user_service_resources(observed)
+    store = SQLiteStore(store_path)
+    try:
+        store.save_host_snapshot(observed)
+        for resource in resources:
+            store.save_resource(resource)
+        return {
+            "store": str(store.path),
+            "snapshot_id": observed.id,
+            "count": len(resources),
+            "items": [discovered_service_resource_status(resource) for resource in resources],
+        }
+    finally:
+        store.close()
+
+
+def discovered_service_resource_status(resource: Resource) -> dict[str, object]:
+    return {
+        "id": resource.id,
+        "name": resource.name,
+        "type": ResourceType(resource.type).value,
+        "owner_domain": OwnerDomain(resource.owner_domain).value,
+        "risk_level": RiskLevel(resource.risk_level).value,
+        "state": ResourceState(resource.state).value,
+        "unit": resource.identifiers.get("unit"),
+        "active": resource.identifiers.get("active"),
+        "sub": resource.identifiers.get("sub"),
+        "description": resource.identifiers.get("description"),
+        "last_observed_at": resource.identifiers.get("last_observed_at"),
+    }
 
 
 def assess_host_security_status(store_path: str | Path, snapshot_id: str | None = None) -> dict[str, object]:
@@ -5446,6 +5491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     approvals_summary_parser.add_argument("--subject-prefix")
     inspect_parser = subparsers.add_parser("inspect-host", help="capture read-only host admin evidence")
     inspect_parser.add_argument("--store", help="explicit SQLite store path for persisting the host snapshot")
+    discover_services_parser = subparsers.add_parser("discover-user-services", help="discover running systemd user services as Overseer service resources")
+    discover_services_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     assess_host_parser = subparsers.add_parser("assess-host-security", help="assess a persisted host snapshot for exposure findings")
     assess_host_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     assess_host_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to the latest snapshot")
@@ -5948,6 +5995,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "inspect-host":
         print(json.dumps(inspect_host_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "discover-user-services":
+        print(json.dumps(discover_user_services_status(args.store), sort_keys=True))
         return 0
 
     if args.command == "assess-host-security":

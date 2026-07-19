@@ -101,6 +101,7 @@ from overseer import (
     needs_operator_approval,
     physical_identity_conflicts,
     parse_apt_upgradable,
+    parse_systemd_service_rows,
     recommend_security_response,
     schedule_maintenance_window,
     schedule_limited_work,
@@ -130,6 +131,7 @@ from overseer.ui import OPERATOR_CONSOLE_HTML
 from overseer.cli import demo_status
 from overseer.cli import discover_physical_status
 from overseer.cli import discover_storage_status
+from overseer.cli import discover_user_services_status
 from overseer.cli import discover_virtual_listeners_status
 from overseer.cli import persisted_demo_status
 from overseer.cli import activate_claim_status
@@ -2898,6 +2900,26 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["finding_count"], 1)
             self.assertEqual(status["findings"][0]["severity"], HostFindingSeverity.HIGH.value)
 
+    def test_client_discovers_user_services(self):
+        original = overseer_api.discover_user_services_status
+        overseer_api.discover_user_services_status = lambda store_path: {
+            "store": str(store_path),
+            "count": 1,
+            "items": [{"id": "svc.systemd-user.overseer-api", "unit": "overseer-api.service"}],
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    client = OverseerApiClient(server.url, auth_token="client-secret")
+                    status = client.discover_user_services()
+        finally:
+            overseer_api.discover_user_services_status = original
+
+        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["items"][0]["unit"], "overseer-api.service")
+
     def test_client_reads_host_security_triage(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3182,6 +3204,8 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn("Active Policy Profile", OPERATOR_CONSOLE_HTML)
         self.assertIn('packageStatus: "/maintenance/package-status"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Package Status", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/services/discover-user"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Discover Services", OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3907,6 +3931,53 @@ class OverseerApiClientTests(unittest.TestCase):
 
 
 class HostInspectionTests(unittest.TestCase):
+    def test_parse_systemd_service_rows_extracts_running_user_services(self):
+        rows = parse_systemd_service_rows(
+            "\n".join(
+                (
+                    "UNIT LOAD ACTIVE SUB DESCRIPTION",
+                    "overseer-api.service loaded active running Overseer localhost API",
+                    "sample.service loaded active running lowercase service description",
+                    "dbus.service loaded active running D-Bus User Message Bus",
+                    "LOAD   = Reflects whether the unit definition was properly loaded.",
+                )
+            )
+        )
+
+        self.assertEqual([row["unit"] for row in rows], ["overseer-api.service", "sample.service", "dbus.service"])
+        self.assertEqual(rows[0]["description"], "Overseer localhost API")
+        self.assertEqual(rows[1]["description"], "lowercase service description")
+
+    def test_discover_user_services_status_persists_service_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionSnapshot(
+                id="host.test.services",
+                captured_at="2026-07-19T15:00:00+00:00",
+                hostname="test-host",
+                os_release={"ID": "debian", "PRETTY_NAME": "Debian Test"},
+                observations=(
+                    HostCommandObservation(
+                        name="systemctl",
+                        command=("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"),
+                        exit_code=0,
+                        stdout="overseer-api.service loaded active running Overseer localhost API\n",
+                    ),
+                ),
+            )
+
+            status = discover_user_services_status(store_path, snapshot=snapshot)
+            store = SQLiteStore(store_path)
+            resource = store.load_resource("svc.systemd-user.overseer-api")
+            snapshots = store.list_host_snapshots()
+            store.close()
+
+        self.assertEqual(status["count"], 1)
+        self.assertEqual(status["items"][0]["unit"], "overseer-api.service")
+        self.assertEqual(resource.owner_domain, OwnerDomain.JULIAN)
+        self.assertEqual(resource.identifiers["description"], "Overseer localhost API")
+        self.assertEqual(snapshots[0].id, "host.test.services")
+
     def test_alerts_summary_reports_only_alert_audit_events(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

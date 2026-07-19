@@ -340,6 +340,9 @@ class OverseerApiClient:
     def inspect_host(self) -> dict[str, Any]:
         return self._post("/host/inspect", {})
 
+    def discover_user_services(self) -> dict[str, Any]:
+        return self._post("/services/discover-user", {})
+
     def host_security(self) -> dict[str, Any]:
         return self._get("/host/security")
 

@@ -45,6 +45,7 @@ from .cli import (
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
+    discover_user_services_status,
     discover_storage_status,
     discover_virtual_listeners_status,
     execute_admin_change_status,
@@ -280,6 +281,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
+                return
+            if self.path == "/services/discover-user":
+                self._handle(lambda: discover_user_services_status(store_path))
                 return
             if self.path == "/health/probes/run":
                 self._handle_json(lambda payload: probe_stored_health_status(store_path, **_stored_health_probe_args(payload)))

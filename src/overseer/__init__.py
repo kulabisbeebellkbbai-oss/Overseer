@@ -78,6 +78,8 @@ from .host import (
     host_security_status,
     host_snapshot_status,
     parse_os_release,
+    parse_systemd_service_rows,
+    systemd_user_service_resources,
 )
 from .ids_review import (
     HostSecurityIDSReviewPackage,
@@ -234,6 +236,8 @@ __all__ = [
     "host_security_status",
     "host_snapshot_status",
     "parse_os_release",
+    "parse_systemd_service_rows",
+    "systemd_user_service_resources",
     "HostSecurityIDSReviewPackage",
     "IDSReviewPackageStatus",
     "admin_plan_requires_ids_review",

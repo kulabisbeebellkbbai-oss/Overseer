@@ -437,6 +437,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function actionRequest(action) {
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
+      if (action === "discover-user-services") return await postJson("/services/discover-user", {});
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       throw new Error(`unsupported action: ${action}`);
     }
@@ -492,6 +493,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const profile = activePolicy.profile || {};
       document.getElementById("admin").innerHTML = `
         <div class="grid">
+          <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button></div></div>
           ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good")}
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good")}
           ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3")}

@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from .core import OwnerDomain, Resource, ResourceType, RiskLevel
+
 
 CommandRunner = Callable[[Sequence[str], float], "HostCommandObservation"]
 FileReader = Callable[[str], str]
@@ -218,6 +220,64 @@ def host_security_status(snapshot: HostInspectionSnapshot) -> dict[str, object]:
         "high_findings": sum(1 for finding in findings if finding.severity == HostFindingSeverity.HIGH),
         "warning_findings": sum(1 for finding in findings if finding.severity == HostFindingSeverity.WARNING),
     }
+
+
+def systemd_user_service_resources(snapshot: HostInspectionSnapshot) -> tuple[Resource, ...]:
+    try:
+        output = snapshot.observation("systemctl").stdout
+    except KeyError:
+        return ()
+    resources: list[Resource] = []
+    for row in parse_systemd_service_rows(output):
+        unit = row["unit"]
+        name = unit.removesuffix(".service")
+        resources.append(
+            Resource(
+                id=f"svc.systemd-user.{_safe_id(name)}",
+                name=name,
+                type=ResourceType.SERVICE,
+                owner_domain=OwnerDomain.JULIAN,
+                risk_level=RiskLevel.LOW,
+                identifiers={
+                    "kind": "systemd_user_service",
+                    "unit": unit,
+                    "load": row["load"],
+                    "active": row["active"],
+                    "sub": row["sub"],
+                    "description": row["description"],
+                    "hostname": snapshot.hostname,
+                    "last_observed_at": snapshot.captured_at,
+                },
+            )
+        )
+    return tuple(resources)
+
+
+def parse_systemd_service_rows(output: str) -> tuple[dict[str, str], ...]:
+    rows: list[dict[str, str]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip().lstrip("*").strip()
+        if (
+            not line
+            or line.startswith("UNIT ")
+            or line.startswith("LOAD ")
+            or line.startswith("Legend: ")
+            or line.endswith("loaded units listed.")
+        ):
+            continue
+        columns = line.split(None, 4)
+        if len(columns) < 4 or not columns[0].endswith(".service"):
+            continue
+        rows.append(
+            {
+                "unit": columns[0],
+                "load": columns[1],
+                "active": columns[2],
+                "sub": columns[3],
+                "description": columns[4] if len(columns) > 4 else "",
+            }
+        )
+    return tuple(rows)
 
 
 def _read_file(path: str) -> str:

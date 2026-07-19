@@ -494,6 +494,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "execute-admin-change") return await executeAdminChange();
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
+      if (action === "inspect-host") return await postJson("/host/inspect", {});
+      if (action === "plan-host-security-remediation") return await planHostSecurityRemediation();
+      if (action === "record-source-review") return await recordSourceReview();
+      if (action === "plan-source-block") return await planSourceBlock();
+      if (action === "prepare-ids-review-package") return await prepareIdsReviewPackage();
+      if (action === "export-ids-review-prompt") return await exportIdsReviewPrompt();
+      if (action === "dispatch-ids-review-package") return await dispatchIdsReviewPackage();
+      if (action === "record-ids-review-result") return await recordIdsReviewResult();
       throw new Error(`unsupported action: ${action}`);
     }
     async function registerResource() {
@@ -646,6 +654,75 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/usage/continuation-dispatches", {
         dispatched_by: value("usage-dispatched-by") || "quark",
         resume_codex_projects: document.getElementById("usage-resume-codex-projects").checked
+      });
+    }
+    async function planHostSecurityRemediation() {
+      const payload = {
+        listener: value("security-listener"),
+        action: value("security-remediation-action"),
+        reason: value("security-remediation-reason")
+      };
+      const planId = value("security-plan-id");
+      const snapshotId = value("security-snapshot-id");
+      if (planId) payload.plan_id = planId;
+      if (snapshotId) payload.snapshot_id = snapshotId;
+      return await postJson("/host/security/remediations/plans", payload);
+    }
+    async function recordSourceReview() {
+      const payload = {
+        remote_address: value("source-remote-address"),
+        listener: value("source-listener"),
+        disposition: value("source-disposition"),
+        rationale: value("source-rationale"),
+        reviewed_by: value("source-reviewed-by") || "odo"
+      };
+      const reviewId = value("source-review-id");
+      const snapshotId = value("source-snapshot-id");
+      if (reviewId) payload.review_id = reviewId;
+      if (snapshotId) payload.snapshot_id = snapshotId;
+      return await postJson("/host/security/source-reviews", payload);
+    }
+    async function planSourceBlock() {
+      const payload = {
+        review_id: value("source-block-review-id"),
+        action: value("source-block-action"),
+        reason: value("source-block-reason")
+      };
+      const planId = value("source-block-plan-id");
+      if (planId) payload.plan_id = planId;
+      return await postJson("/host/security/source-reviews/block-plans", payload);
+    }
+    async function prepareIdsReviewPackage() {
+      const payload = {
+        plan_id: value("ids-plan-id"),
+        requested_by: value("ids-requested-by") || "odo"
+      };
+      const packageId = value("ids-package-id");
+      const sourceReviewId = value("ids-source-review-id");
+      if (packageId) payload.package_id = packageId;
+      if (sourceReviewId) payload.source_review_id = sourceReviewId;
+      return await postJson("/host/security/ids-review-packages", payload);
+    }
+    async function exportIdsReviewPrompt() {
+      return await postJson("/host/security/ids-review-packages/prompts", {
+        package_id: value("ids-export-package-id")
+      });
+    }
+    async function dispatchIdsReviewPackage() {
+      const payload = {
+        package_id: value("ids-dispatch-package-id"),
+        dispatched_by: value("ids-dispatched-by") || "odo"
+      };
+      const ownerThread = value("ids-owner-thread");
+      if (ownerThread) payload.owner_thread = ownerThread;
+      return await postJson("/host/security/ids-review-packages/dispatch", payload);
+    }
+    async function recordIdsReviewResult() {
+      return await postJson("/host/security/ids-review-packages/results", {
+        package_id: value("ids-result-package-id"),
+        status: value("ids-result-status"),
+        advisory_result: value("ids-advisory-result"),
+        reviewed_by: value("ids-reviewed-by") || "odo"
       });
     }
     function render() {
@@ -851,10 +928,59 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const plans = (security.protective_plans || {}).items || [];
       document.getElementById("security").innerHTML = `
         <div class="grid">
+          <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button></div></div>
           ${metric("Alerts", security.alerts, "security", "span-3", security.alerts ? "bad" : "good")}
           ${metric("High", host.high_findings, "findings", "span-3", host.high_findings ? "bad" : "good")}
           ${metric("Warning", host.warning_findings, "findings", "span-3", host.warning_findings ? "warn" : "good")}
           ${metric("Plans", (security.protective_plans || {}).total, "protective", "span-3")}
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Plan Remediation</h3><button class="action-btn" data-action="plan-host-security-remediation">Plan</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="security-listener">Listener</label><input id="security-listener" value="0.0.0.0:22"></div>
+              <div class="field span-3"><label for="security-remediation-action">Action</label><input id="security-remediation-action" value="deny_tcp"></div>
+              <div class="field span-3"><label for="security-plan-id">Plan ID</label><input id="security-plan-id"></div>
+              <div class="field span-4"><label for="security-snapshot-id">Snapshot ID</label><input id="security-snapshot-id"></div>
+              <div class="field span-8"><label for="security-remediation-reason">Reason</label><input id="security-remediation-reason" value="review exposed listener"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Source Review</h3><button class="action-btn" data-action="record-source-review">Record</button></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="source-remote-address">Remote Address</label><input id="source-remote-address" value="192.0.2.10"></div>
+              <div class="field span-4"><label for="source-listener">Listener</label><input id="source-listener" value="0.0.0.0:22"></div>
+              <div class="field span-4"><label for="source-disposition">Disposition</label><select id="source-disposition">${sourceDispositionOptions()}</select></div>
+              <div class="field span-4"><label for="source-review-id">Review ID</label><input id="source-review-id"></div>
+              <div class="field span-4"><label for="source-snapshot-id">Snapshot ID</label><input id="source-snapshot-id"></div>
+              <div class="field span-4"><label for="source-reviewed-by">Reviewed By</label><input id="source-reviewed-by" value="odo"></div>
+              <div class="field span-12"><label for="source-rationale">Rationale</label><input id="source-rationale" value="pending Odo review"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Source Block</h3><button class="action-btn" data-action="plan-source-block">Plan Block</button></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="source-block-review-id">Review ID</label><input id="source-block-review-id"></div>
+              <div class="field span-4"><label for="source-block-action">Action</label><input id="source-block-action" value="block_ip"></div>
+              <div class="field span-4"><label for="source-block-plan-id">Plan ID</label><input id="source-block-plan-id"></div>
+              <div class="field span-12"><label for="source-block-reason">Reason</label><input id="source-block-reason" value="hostile source reviewed by Odo"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>IDS Review</h3><div class="actions"><button class="action-btn" data-action="prepare-ids-review-package">Prepare</button><button class="action-btn" data-action="export-ids-review-prompt">Export</button><button class="action-btn" data-action="dispatch-ids-review-package">Dispatch</button><button class="action-btn" data-action="record-ids-review-result">Record</button></div></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="ids-plan-id">Plan ID</label><input id="ids-plan-id"></div>
+              <div class="field span-4"><label for="ids-package-id">Package ID</label><input id="ids-package-id"></div>
+              <div class="field span-4"><label for="ids-source-review-id">Source Review</label><input id="ids-source-review-id"></div>
+              <div class="field span-3"><label for="ids-requested-by">Requested By</label><input id="ids-requested-by" value="odo"></div>
+              <div class="field span-3"><label for="ids-export-package-id">Export Package</label><input id="ids-export-package-id"></div>
+              <div class="field span-3"><label for="ids-dispatch-package-id">Dispatch Package</label><input id="ids-dispatch-package-id"></div>
+              <div class="field span-3"><label for="ids-dispatched-by">Dispatched By</label><input id="ids-dispatched-by" value="odo"></div>
+              <div class="field span-4"><label for="ids-owner-thread">Owner Thread</label><input id="ids-owner-thread"></div>
+              <div class="field span-4"><label for="ids-result-package-id">Result Package</label><input id="ids-result-package-id"></div>
+              <div class="field span-4"><label for="ids-result-status">Result Status</label><select id="ids-result-status">${idsReviewStatusOptions()}</select></div>
+              <div class="field span-4"><label for="ids-reviewed-by">Reviewed By</label><input id="ids-reviewed-by" value="odo"></div>
+              <div class="field span-8"><label for="ids-advisory-result">Advisory Result</label><input id="ids-advisory-result" value="accepted staged package"></div>
+            </div>
+          </div>
           <div class="panel span-8">${table("Protective Plans", plans, ["id", "kind", "target", "approved", "canceled"])}</div>
           <div class="panel span-4">${kv("IDS Review", security.ids_review || {})}</div>
         </div>`;
@@ -901,6 +1027,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function adminKindOptions() {
       return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function sourceDispositionOptions() {
+      return ["needs_review", "expected", "benign", "suspicious", "hostile"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function idsReviewStatusOptions() {
+      return ["accepted", "revision_required"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function value(id) {
       const element = document.getElementById(id);

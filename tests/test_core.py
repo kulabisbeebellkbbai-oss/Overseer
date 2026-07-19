@@ -3631,6 +3631,15 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn('data-action="record-usage-limit"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="request-usage-continuation"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="dispatch-usage-continuations"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/inspect"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/security/remediations/plans"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/security/source-reviews"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/security/source-reviews/block-plans"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/security/ids-review-packages"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/security/ids-review-packages/results"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="inspect-host"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="record-source-review"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="prepare-ids-review-package"', OPERATOR_CONSOLE_HTML)
 
     def test_client_builds_policy_profile_from_answers(self):
         with tempfile.TemporaryDirectory() as directory:

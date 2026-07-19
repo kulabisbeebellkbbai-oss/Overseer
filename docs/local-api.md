@@ -61,6 +61,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /claims/release`
 - `GET /claims/review`
 - `GET /claims/cleanup-plan`
+- `POST /claims/cleanup-requests`
+- `POST /claims/cleanup-requests/approve`
 - `POST /host/inspect`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
@@ -104,6 +106,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /claims/release` accepts optional `released_by`, `reason`, `evidence_ids`, and `released_at` fields and emits release audit evidence.
 `GET /claims/review` reports active-like, queued, expired, and release-blocked claims for operator review without releasing, revoking, or renewing them. It supports `?now=...` for deterministic review timestamps.
 `GET /claims/cleanup-plan` prepares a read-only cleanup manifest for expired active-like claims, stale queued claims, blocked claims, and claims missing release evidence. It supports `?now=...` and does not release, revoke, renew, approve, or re-evaluate claims.
+`POST /claims/cleanup-requests` creates the approval request required before a future cleanup mutation may release, revoke, renew, take over, or re-evaluate a cleanup candidate.
+`POST /claims/cleanup-requests/approve` approves a pending cleanup request after validating that its claim is still a cleanup candidate. It does not mutate the claim.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership and permissions without creating a missing database or changing file modes.

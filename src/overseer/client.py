@@ -121,6 +121,40 @@ class OverseerApiClient:
             path = f"{path}?{urlencode({'now': now})}"
         return self._get(path)
 
+    def request_claim_cleanup(
+        self,
+        claim_id: str,
+        requested_by: str,
+        requested_at: str | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "claim_id": claim_id,
+            "requested_by": requested_by,
+        }
+        if requested_at:
+            payload["requested_at"] = requested_at
+        if now:
+            payload["now"] = now
+        return self._post("/claims/cleanup-requests", payload)
+
+    def approve_claim_cleanup(
+        self,
+        approval_id: str,
+        approved_by: str,
+        approved_at: str | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "approval_id": approval_id,
+            "approved_by": approved_by,
+        }
+        if approved_at:
+            payload["approved_at"] = approved_at
+        if now:
+            payload["now"] = now
+        return self._post("/claims/cleanup-requests/approve", payload)
+
     def request_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/claims/request", payload)
 

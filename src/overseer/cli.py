@@ -2216,13 +2216,19 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
             for approval in approvals
             if approval.id.startswith("approval.admin.adapter.enable.")
         ]
+        claim_cleanup_approvals = [
+            approval
+            for approval in approvals
+            if approval.id.startswith("approval.claim.cleanup.")
+        ]
         return {
             "store": str(store.path),
             "plans": len(active_plans),
             "archived_plans": len(plans) - len(active_plans),
             "pending_authorizations": len(pending)
             + sum(1 for approval in restore_approvals if approval.status == ApprovalStatus.PENDING)
-            + sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.PENDING),
+            + sum(1 for approval in adapter_enablement_approvals if approval.status == ApprovalStatus.PENDING)
+            + sum(1 for approval in claim_cleanup_approvals if approval.status == ApprovalStatus.PENDING),
             "approved_plans": sum(1 for plan in active_plans if plan.approved),
             "canceled_plans": sum(1 for plan in active_plans if plan.canceled),
             "executable_plans": sum(1 for plan in active_plans if plan.can_execute()),
@@ -2259,6 +2265,16 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
                     admin_adapter_enablement_approval_status(approval)
                     for approval in adapter_enablement_approvals
                 ],
+            },
+            "claim_cleanup_approvals": {
+                "total": len(claim_cleanup_approvals),
+                "pending": sum(1 for approval in claim_cleanup_approvals if approval.status == ApprovalStatus.PENDING),
+                "approved": sum(1 for approval in claim_cleanup_approvals if approval.status == ApprovalStatus.APPROVED),
+                "by_status": {
+                    status.value: sum(1 for approval in claim_cleanup_approvals if approval.status == status)
+                    for status in ApprovalStatus
+                },
+                "items": [claim_cleanup_approval_status(approval) for approval in claim_cleanup_approvals],
             },
             "pending": [
                 authorization_required_status_with_ids_review(
@@ -2976,6 +2992,12 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
             if approval.id.startswith("approval.admin.adapter.enable.")
             and approval.status == ApprovalStatus.PENDING
         ]
+        pending_claim_cleanup_approvals = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id.startswith("approval.claim.cleanup.")
+            and approval.status == ApprovalStatus.PENDING
+        ]
         pending = [
             authorization_required_status_with_ids_review(
                 plan,
@@ -2987,14 +3009,22 @@ def authorizations_required_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "pending": pending,
-            "pending_count": len(pending) + len(pending_restore_approvals) + len(pending_adapter_enablement_approvals),
+            "pending_count": len(pending)
+            + len(pending_restore_approvals)
+            + len(pending_adapter_enablement_approvals)
+            + len(pending_claim_cleanup_approvals),
             "pending_plan_count": len(pending),
             "pending_restore_approval_count": len(pending_restore_approvals),
             "pending_adapter_enablement_approval_count": len(pending_adapter_enablement_approvals),
+            "pending_claim_cleanup_approval_count": len(pending_claim_cleanup_approvals),
             "restore_approvals": [admin_history_restore_approval_status(approval) for approval in pending_restore_approvals],
             "adapter_enablement_approvals": [
                 admin_adapter_enablement_approval_status(approval)
                 for approval in pending_adapter_enablement_approvals
+            ],
+            "claim_cleanup_approvals": [
+                claim_cleanup_approval_status(approval)
+                for approval in pending_claim_cleanup_approvals
             ],
         }
     finally:
@@ -3329,6 +3359,160 @@ def claim_cleanup_plan_status(store_path: str | Path, now: str | None = None) ->
         }
     finally:
         store.close()
+
+
+def request_claim_cleanup_status(
+    store_path: str | Path,
+    claim_id: str,
+    requested_by: str,
+    requested_at: str | None = None,
+    now: str | None = None,
+) -> dict[str, object]:
+    if not claim_id.strip():
+        raise ValueError("claim_id is required")
+    if not requested_by.strip():
+        raise ValueError("requested_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
+        item = _claim_cleanup_candidate_for_store(store, claim_id, checked_at)
+        approval_level = _claim_cleanup_approval_level(item)
+        subject_id = f"claim.cleanup.{claim_id}"
+        approval = ApprovalRequest(
+            id=f"approval.claim.cleanup.{claim_id}",
+            subject_id=subject_id,
+            approval_level=approval_level,
+            requester_thread=requested_by,
+            owner_domain=OwnerDomain.SISKO,
+            reason=f"Approve cleanup action {item['cleanup_action']} for claim {claim_id}",
+            evidence_required=(f"claim.cleanup-plan.{claim_id}",),
+        )
+        event = AuditEvent(
+            id=f"audit.{approval.id}.requested",
+            event_type=AuditEventType.REQUESTED,
+            owner_domain=OwnerDomain.SISKO,
+            subject_id=subject_id,
+            summary=approval.reason,
+            risk_level=_claim_cleanup_risk_level(item),
+            evidence_ids=approval.evidence_required,
+            occurred_at=requested_at,
+        )
+        store.save_approval(approval)
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "mutation_performed": True,
+            "claim_id": claim_id,
+            "cleanup_action": item["cleanup_action"],
+            "approval_id": approval.id,
+            "subject_id": approval.subject_id,
+            "approval_status": ApprovalStatus(approval.status).value,
+            "approval_level": ApprovalLevel(approval.approval_level).value,
+            "requested_by": requested_by,
+            "requested_at": requested_at,
+            "checked_at": checked_at.isoformat(),
+            "cleanup_plan_item": item,
+            "audit_event": audit_event_status(event),
+        }
+    finally:
+        store.close()
+
+
+def approve_claim_cleanup_status(
+    store_path: str | Path,
+    approval_id: str,
+    approved_by: str,
+    approved_at: str | None = None,
+    now: str | None = None,
+) -> dict[str, object]:
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            raise ValueError(f"claim cleanup approval does not exist: {approval_id}") from None
+        if not approval.id.startswith("approval.claim.cleanup."):
+            raise ValueError("claim cleanup approval is required")
+        claim_id = _claim_cleanup_claim_id_from_subject(approval.subject_id)
+        checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
+        item = _claim_cleanup_candidate_for_store(store, claim_id, checked_at)
+    finally:
+        store.close()
+
+    approved = approve_claim_status(store_path, approval_id, approved_by, approved_at)
+    return {
+        **approved,
+        "claim_id": claim_id,
+        "claim_cleanup_approval": True,
+        "cleanup_action": item["cleanup_action"],
+        "cleanup_plan_item": item,
+    }
+
+
+def claim_cleanup_approval_status(approval: ApprovalRequest) -> dict[str, object]:
+    approval_status = ApprovalStatus(approval.status)
+    return {
+        "id": approval.id,
+        "claim_id": _claim_cleanup_claim_id_from_subject(approval.subject_id),
+        "subject_id": approval.subject_id,
+        "approval_level": ApprovalLevel(approval.approval_level).value,
+        "requester_thread": approval.requester_thread,
+        "owner_domain": OwnerDomain(approval.owner_domain).value,
+        "reason": approval.reason,
+        "status": approval_status.value,
+        "evidence_required": list(approval.evidence_required),
+        "decided_by": approval.decided_by,
+        "decided_at": approval.decided_at,
+        "next_step": _claim_cleanup_approval_next_step(approval_status),
+    }
+
+
+def _claim_cleanup_candidate_for_store(store: SQLiteStore, claim_id: str, checked_at: datetime) -> dict[str, object]:
+    try:
+        claim = store.load_claim(claim_id)
+    except KeyError:
+        raise ValueError(f"claim does not exist: {claim_id}") from None
+    resources = {resource.id: resource for resource in store.list_resources()}
+    claims_by_id = {item.id: item for item in store.list_claims()}
+    item = claim_cleanup_plan_item_status(store, claim, resources.get(claim.resource_id), claims_by_id, checked_at)
+    if not item["cleanup_candidate"]:
+        raise ValueError(f"claim is not a cleanup candidate: {claim_id}")
+    return item
+
+
+def _claim_cleanup_approval_level(item: dict[str, object]) -> ApprovalLevel:
+    if item["approval_required"]:
+        return ApprovalLevel.SISKO
+    if item["cleanup_action"] in {"review_blocked_claim", "re_evaluate_stale_queue"}:
+        return ApprovalLevel.ROLE
+    return ApprovalLevel.SISKO
+
+
+def _claim_cleanup_risk_level(item: dict[str, object]) -> RiskLevel:
+    if item["approval_required"]:
+        return RiskLevel.HIGH
+    if item["cleanup_action"] == "re_evaluate_stale_queue":
+        return RiskLevel.MEDIUM
+    return RiskLevel.LOW
+
+
+def _claim_cleanup_claim_id_from_subject(subject_id: str) -> str:
+    prefix = "claim.cleanup."
+    if not subject_id.startswith(prefix):
+        raise ValueError("claim cleanup approval subject is required")
+    return subject_id[len(prefix):]
+
+
+def _claim_cleanup_approval_next_step(approval_status: ApprovalStatus) -> str:
+    if approval_status == ApprovalStatus.PENDING:
+        return "approve-claim-cleanup before cleanup mutation can be implemented or executed"
+    if approval_status == ApprovalStatus.APPROVED:
+        return "cleanup mutation may proceed only for the approved claim and cleanup action"
+    return "claim cleanup approval is not actionable"
 
 
 def claim_cleanup_plan_item_status(
@@ -4079,6 +4263,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     claim_cleanup_plan_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     claim_cleanup_plan_parser.add_argument("--now", help="override review timestamp for deterministic checks")
+    request_claim_cleanup_parser = subparsers.add_parser("request-claim-cleanup", help="request approval for a claim cleanup candidate")
+    request_claim_cleanup_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    request_claim_cleanup_parser.add_argument("--claim-id", required=True)
+    request_claim_cleanup_parser.add_argument("--requested-by", required=True)
+    request_claim_cleanup_parser.add_argument("--requested-at")
+    request_claim_cleanup_parser.add_argument("--now", help="override cleanup review timestamp for deterministic checks")
+    approve_claim_cleanup_parser = subparsers.add_parser("approve-claim-cleanup", help="approve a pending claim cleanup request")
+    approve_claim_cleanup_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    approve_claim_cleanup_parser.add_argument("--approval-id", required=True)
+    approve_claim_cleanup_parser.add_argument("--approved-by", required=True)
+    approve_claim_cleanup_parser.add_argument("--approved-at")
+    approve_claim_cleanup_parser.add_argument("--now", help="override cleanup review timestamp for deterministic checks")
     activate_parser = subparsers.add_parser("activate-claim", help="mark a stored claim active after approval")
     activate_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     activate_parser.add_argument("--claim-id", required=True)
@@ -4473,6 +4669,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "claim-cleanup-plan":
         print(json.dumps(claim_cleanup_plan_status(args.store, args.now), sort_keys=True))
+        return 0
+
+    if args.command == "request-claim-cleanup":
+        print(
+            json.dumps(
+                request_claim_cleanup_status(
+                    args.store,
+                    args.claim_id,
+                    args.requested_by,
+                    args.requested_at,
+                    args.now,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-claim-cleanup":
+        print(
+            json.dumps(
+                approve_claim_cleanup_status(
+                    args.store,
+                    args.approval_id,
+                    args.approved_by,
+                    args.approved_at,
+                    args.now,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "request-claim":

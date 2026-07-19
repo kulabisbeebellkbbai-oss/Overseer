@@ -27,6 +27,7 @@ from .cli import (
     approve_admin_adapter_enablement_status,
     approve_admin_history_restore_status,
     approve_claim_status,
+    approve_claim_cleanup_status,
     approvals_summary_status,
     alerts_summary_status,
     audit_summary_status,
@@ -62,6 +63,7 @@ from .cli import (
     prepare_host_security_ids_review_package_status,
     persistence_security_status,
     request_claim_status,
+    request_claim_cleanup_status,
     service_status,
     runtime_status,
     security_summary_status,
@@ -221,6 +223,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/claims/release":
                 self._handle_json(lambda payload: release_claim_status(store_path, **_release_claim_args(payload)))
+                return
+            if self.path == "/claims/cleanup-requests":
+                self._handle_json(lambda payload: request_claim_cleanup_status(store_path, **_claim_cleanup_request_args(payload)))
+                return
+            if self.path == "/claims/cleanup-requests/approve":
+                self._handle_json(lambda payload: approve_claim_cleanup_status(store_path, **_approve_claim_cleanup_args(payload)))
                 return
             if self.path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
@@ -398,6 +406,24 @@ def _release_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "reason": str(payload["reason"]) if payload.get("reason") else None,
         "evidence_ids": tuple(str(evidence_id) for evidence_id in payload.get("evidence_ids", ())),
         "released_at": str(payload["released_at"]) if payload.get("released_at") else None,
+    }
+
+
+def _claim_cleanup_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_id": str(payload["claim_id"]),
+        "requested_by": str(payload["requested_by"]),
+        "requested_at": str(payload["requested_at"]) if payload.get("requested_at") is not None else None,
+        "now": str(payload["now"]) if payload.get("now") is not None else None,
+    }
+
+
+def _approve_claim_cleanup_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "approval_id": str(payload["approval_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+        "now": str(payload["now"]) if payload.get("now") is not None else None,
     }
 
 

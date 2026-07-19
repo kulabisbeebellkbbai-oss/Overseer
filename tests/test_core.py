@@ -119,6 +119,7 @@ from overseer.cli import archive_admin_history_status
 from overseer.cli import approve_admin_change_status
 from overseer.cli import approve_admin_adapter_enablement_status
 from overseer.cli import approve_admin_history_restore_status
+from overseer.cli import approve_claim_cleanup_status
 from overseer.cli import approve_claim_status
 from overseer.cli import approvals_summary_status
 from overseer.cli import alerts_summary_status
@@ -158,6 +159,7 @@ from overseer.cli import probe_health_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_restore_status
+from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
@@ -2596,6 +2598,64 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(plan["items"][0]["cleanup_action"], "review_expired_active_claim")
             self.assertEqual(state["claims"][0]["status"], ClaimStatus.ACTIVE.value)
 
+    def test_client_requests_and_approves_claim_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="gateway.cleanup.approval.client",
+                    name="Client Cleanup Approval Gateway",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.approval.client",
+                    resource_id="gateway.cleanup.approval.client",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-client",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use gateway",
+                    requested_action="bind gateway",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                    expires_at="2026-07-18T20:00:00+00:00",
+                    release_condition="operator verified work stopped",
+                )
+            )
+            store.close()
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                requested = client.request_claim_cleanup(
+                    "claim.cleanup.approval.client",
+                    "sisko",
+                    requested_at="2026-07-18T20:30:00+00:00",
+                    now="2026-07-18T20:30:00+00:00",
+                )
+                pending = client.authorizations_required()
+                approved = client.approve_claim_cleanup(
+                    requested["approval_id"],
+                    "sisko",
+                    approved_at="2026-07-18T20:35:00+00:00",
+                    now="2026-07-18T20:35:00+00:00",
+                )
+                after = client.authorizations_required()
+                state = client.state()
+
+            self.assertTrue(requested["mutation_performed"])
+            self.assertEqual(requested["approval_status"], ApprovalStatus.PENDING.value)
+            self.assertEqual(requested["cleanup_action"], "review_expired_active_claim")
+            self.assertEqual(pending["pending_claim_cleanup_approval_count"], 1)
+            self.assertEqual(pending["claim_cleanup_approvals"][0]["claim_id"], "claim.cleanup.approval.client")
+            self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+            self.assertTrue(approved["claim_cleanup_approval"])
+            self.assertEqual(after["pending_claim_cleanup_approval_count"], 0)
+            self.assertEqual(state["claims"][0]["status"], ClaimStatus.ACTIVE.value)
+
     def test_client_creates_admin_change_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4951,6 +5011,92 @@ class RuntimeTests(unittest.TestCase):
                     "claim.cleanup.stale-queue": ClaimStatus.QUEUED.value,
                 },
             )
+
+    def test_claim_cleanup_request_requires_candidate_and_preserves_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(
+                Resource(
+                    id="proxy.cleanup.approval.cli",
+                    name="Cleanup Approval CLI Proxy",
+                    type=ResourceType.VIRTUAL_ASSET,
+                    owner_domain=OwnerDomain.DAX,
+                    risk_level=RiskLevel.LOW,
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.approval.cli",
+                    resource_id="proxy.cleanup.approval.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-a",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use proxy",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.ACTIVE,
+                    expires_at="2026-07-18T20:00:00+00:00",
+                    release_condition="operator verified work stopped",
+                )
+            )
+            store.save_claim(
+                Claim(
+                    id="claim.cleanup.not-candidate",
+                    resource_id="proxy.cleanup.approval.cli",
+                    claim_type=ClaimType.LEASE,
+                    owner_thread="thread-b",
+                    owner_role=OwnerDomain.DAX,
+                    intent="use proxy later",
+                    requested_action="bind proxy",
+                    risk_level=RiskLevel.LOW,
+                    status=ClaimStatus.RELEASED,
+                )
+            )
+            store.close()
+
+            requested = request_claim_cleanup_status(
+                store_path,
+                "claim.cleanup.approval.cli",
+                "sisko",
+                "2026-07-18T20:30:00+00:00",
+                "2026-07-18T20:30:00+00:00",
+            )
+            pending = authorizations_required_status(store_path)
+            summary = admin_summary_status(store_path)
+            approved = approve_claim_cleanup_status(
+                store_path,
+                requested["approval_id"],
+                "sisko",
+                "2026-07-18T20:35:00+00:00",
+                "2026-07-18T20:35:00+00:00",
+            )
+            after = authorizations_required_status(store_path)
+            state = list_state_status(store_path)
+
+            with self.assertRaises(ValueError):
+                request_claim_cleanup_status(store_path, "claim.cleanup.not-candidate", "sisko")
+
+        self.assertTrue(requested["mutation_performed"])
+        self.assertEqual(requested["approval_level"], ApprovalLevel.SISKO.value)
+        self.assertEqual(requested["audit_event"]["event_type"], AuditEventType.REQUESTED.value)
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertEqual(pending["pending_claim_cleanup_approval_count"], 1)
+        self.assertEqual(
+            pending["claim_cleanup_approvals"][0]["next_step"],
+            "approve-claim-cleanup before cleanup mutation can be implemented or executed",
+        )
+        self.assertEqual(summary["claim_cleanup_approvals"]["pending"], 1)
+        self.assertEqual(approved["approval_status"], ApprovalStatus.APPROVED.value)
+        self.assertTrue(approved["claim_cleanup_approval"])
+        self.assertEqual(after["pending_claim_cleanup_approval_count"], 0)
+        self.assertEqual(
+            {claim["id"]: claim["status"] for claim in state["claims"]},
+            {
+                "claim.cleanup.approval.cli": ClaimStatus.ACTIVE.value,
+                "claim.cleanup.not-candidate": ClaimStatus.RELEASED.value,
+            },
+        )
 
     def test_activate_claim_status_requires_approved_request(self):
         with tempfile.TemporaryDirectory() as directory:

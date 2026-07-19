@@ -6,8 +6,10 @@ import json
 import shlex
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlsplit
 
 from .adapters import HealthProbeAdapter
 from .health import HealthEvidence, HealthTarget, ProbeResult, ProbeType, classify_probe
@@ -117,6 +119,34 @@ class LocalCommandHealthProbeAdapter(HealthProbeAdapter):
         return classify_probe(target, result)
 
 
+class LocalLogHealthProbeAdapter(HealthProbeAdapter):
+    """Read-only log health probes that never persist raw log content."""
+
+    def __init__(self, max_tail_bytes: int = 4096) -> None:
+        self.max_tail_bytes = max_tail_bytes
+
+    def probe(self, target: HealthTarget) -> HealthEvidence:
+        captured_at = datetime.now(UTC).isoformat()
+        try:
+            path, contains, absent = _log_probe_target(target.target)
+            sample = _read_log_tail(path, self.max_tail_bytes)
+            body_summary, error = _classify_log_sample(sample, contains, absent)
+        except ValueError as error:
+            body_summary = ""
+            error = str(error)
+        except OSError as error:
+            body_summary = ""
+            error = f"log read failed: {error.strerror or error}"
+        result = ProbeResult(
+            target=target.target,
+            probe_type=target.probe_type,
+            body_summary=body_summary,
+            error=error,
+            captured_at=captured_at,
+        )
+        return classify_probe(target, result)
+
+
 class RoutedHealthProbeAdapter(HealthProbeAdapter):
     def __init__(self, timeout_seconds: float = 5.0) -> None:
         self.timeout_seconds = timeout_seconds
@@ -130,6 +160,8 @@ def health_probe_adapter_for(target: HealthTarget, timeout_seconds: float = 5.0)
         return LocalProcessHealthProbeAdapter(timeout_seconds=timeout_seconds)
     if target.probe_type == ProbeType.COMMAND:
         return LocalCommandHealthProbeAdapter(timeout_seconds=timeout_seconds)
+    if target.probe_type == ProbeType.LOG:
+        return LocalLogHealthProbeAdapter()
     return HttpHealthProbeAdapter(timeout_seconds=timeout_seconds)
 
 
@@ -184,6 +216,51 @@ def _is_read_only_health_command(command: tuple[str, ...]) -> bool:
     if len(command) == 4 and command[:3] == ("stat", "-c", "%F"):
         return bool(command[3].strip())
     return False
+
+
+def _log_probe_target(target: str) -> tuple[Path, str | None, str | None]:
+    parsed = urlsplit(target)
+    if parsed.scheme == "log":
+        path = Path(parsed.path)
+        query = parse_qs(parsed.query)
+    else:
+        path = Path(target.removeprefix("log:"))
+        query = {}
+    contains = _query_one(query, "contains")
+    absent = _query_one(query, "absent")
+    if contains and absent:
+        raise ValueError("log probe target cannot require both contains and absent markers")
+    if not path.is_absolute():
+        raise ValueError("log probe target path must be absolute")
+    return path, contains, absent
+
+
+def _query_one(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key, [])
+    if not values:
+        return None
+    value = values[0]
+    return value if value else None
+
+
+def _read_log_tail(path: Path, max_tail_bytes: int) -> str:
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - max_tail_bytes))
+        return handle.read(max_tail_bytes).decode("utf-8", errors="replace")
+
+
+def _classify_log_sample(sample: str, contains: str | None, absent: str | None) -> tuple[str, str]:
+    if contains is not None:
+        if contains in sample:
+            return "expected log marker found", ""
+        return "", "expected log marker not found"
+    if absent is not None:
+        if absent in sample:
+            return "", "blocked log marker found"
+        return "blocked log marker absent", ""
+    return "log readable", ""
 
 
 def _process_body_summary(observation: HostCommandObservation) -> str:

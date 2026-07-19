@@ -138,3 +138,19 @@ Supported command target shapes:
 - `command:stat -c %F <path>`
 
 Unsupported command targets are recorded as failed health evidence and are not executed. Command probes do not invoke a shell and do not run service mutation, package, firewall, permission, mount, or file-write commands.
+
+## Live Log Probes
+
+Log probes read only a bounded tail sample from an absolute path and persist only marker status, never raw log lines:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli probe-health --resource-id svc.example --name "Service Log" --probe-type log --url "log:/tmp/service.log?absent=traceback" --store state/overseer.sqlite3
+```
+
+Supported log target forms:
+
+- `log:/absolute/path`: healthy when the log can be read.
+- `log:/absolute/path?contains=<marker>`: healthy when the marker is present.
+- `log:/absolute/path?absent=<marker>`: healthy when the marker is absent.
+
+A log probe with a missing, unreadable, relative, or contradictory target is failed health evidence. The evidence records only summaries such as `expected log marker found` or `blocked log marker found`; it does not persist the sampled log content.

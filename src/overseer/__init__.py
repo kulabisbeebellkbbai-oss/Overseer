@@ -99,6 +99,7 @@ from .ids_review import (
 from .live_health import (
     HttpHealthProbeAdapter,
     LocalCommandHealthProbeAdapter,
+    LocalLogHealthProbeAdapter,
     LocalProcessHealthProbeAdapter,
     RoutedHealthProbeAdapter,
     health_probe_adapter_for,
@@ -259,6 +260,7 @@ __all__ = [
     "write_ids_review_prompt_file",
     "HttpHealthProbeAdapter",
     "LocalCommandHealthProbeAdapter",
+    "LocalLogHealthProbeAdapter",
     "LocalProcessHealthProbeAdapter",
     "RoutedHealthProbeAdapter",
     "health_probe_adapter_for",

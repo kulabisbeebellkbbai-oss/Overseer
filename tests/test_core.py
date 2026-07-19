@@ -61,6 +61,7 @@ from overseer import (
     HostInspectionSnapshot,
     HttpHealthProbeAdapter,
     LocalCommandHealthProbeAdapter,
+    LocalLogHealthProbeAdapter,
     LocalProcessHealthProbeAdapter,
     RoutedHealthProbeAdapter,
     InterruptionPolicy,
@@ -736,6 +737,22 @@ class LiveHealthProbeTests(unittest.TestCase):
         self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
         self.assertEqual(status["probe_type"], ProbeType.COMMAND.value)
 
+    def test_probe_health_status_reports_log_target_without_raw_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "service.log"
+            log_path.write_text("token=SECRET\nservice ready\n", encoding="utf-8")
+
+            status = probe_health_status(
+                "svc.log.file",
+                "Log File",
+                f"log:{log_path}?contains=service%20ready",
+                ProbeType.LOG.value,
+            )
+
+        self.assertEqual(status["status"], HealthStatus.HEALTHY.value)
+        self.assertEqual(status["probe_type"], ProbeType.LOG.value)
+        self.assertEqual(status["error"], "")
+
     def test_probe_health_status_persists_evidence_to_explicit_store(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -843,6 +860,42 @@ class LiveHealthProbeTests(unittest.TestCase):
         self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
         self.assertTrue(evidence.recovery_required)
         self.assertIn("unsupported command probe target", evidence.observed_error)
+
+    def test_local_log_probe_adapter_does_not_persist_raw_log_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "service.log"
+            log_path.write_text("api-key=SECRET\nservice ready\n", encoding="utf-8")
+            target = HealthTarget(
+                id="health.log.ready",
+                resource_id="svc.log.ready",
+                name="Ready Log",
+                probe_type=ProbeType.LOG,
+                target=f"log:{log_path}?contains=service%20ready",
+            )
+
+            evidence = LocalLogHealthProbeAdapter().probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+        self.assertFalse(evidence.recovery_required)
+        self.assertNotIn("SECRET", evidence.observed_error)
+
+    def test_local_log_probe_adapter_fails_when_blocked_marker_is_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "service.log"
+            log_path.write_text("startup ok\ntraceback detected\n", encoding="utf-8")
+            target = HealthTarget(
+                id="health.log.blocked",
+                resource_id="svc.log.blocked",
+                name="Blocked Log",
+                probe_type=ProbeType.LOG,
+                target=f"log:{log_path}?absent=traceback",
+            )
+
+            evidence = LocalLogHealthProbeAdapter().probe(target)
+
+        self.assertEqual(evidence.observed_status, HealthStatus.FAILED)
+        self.assertTrue(evidence.recovery_required)
+        self.assertEqual(evidence.observed_error, "blocked log marker found")
 
     def test_probe_config_status_probes_declared_targets_and_persists_evidence(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:

@@ -125,6 +125,7 @@ from overseer import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_user_service_restart,
@@ -4706,6 +4707,9 @@ class HostInspectionTests(unittest.TestCase):
                 ("ss", "-ltnp"): "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*\n",
                 ("ss", "-tnp"): "ESTAB 0 0 127.0.0.1:8766 127.0.0.1:40000\n",
                 ("df", "-h", "--output=source,size,used,avail,pcent,target"): "Filesystem Size Used Avail Use% Mounted on\n/dev/root 20G 10G 10G 50% /\n",
+                ("firewall-cmd", "--state"): "running\n",
+                ("firewall-cmd", "--get-active-zones"): "public\n  interfaces: enp3s0\n",
+                ("firewall-cmd", "--zone=public", "--list-all"): "public (active)\n  services: ssh\n",
             }[tuple(command)]
             return HostCommandObservation(
                 name=command[0],
@@ -4725,6 +4729,8 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(snapshot.os_release["ID"], "debian")
         self.assertEqual(snapshot.observation("ss").stdout, "LISTEN 0 5 127.0.0.1:8766 0.0.0.0:*")
         self.assertEqual(snapshot.observation("ss-established").stdout, "ESTAB 0 0 127.0.0.1:8766 127.0.0.1:40000")
+        self.assertEqual(snapshot.observation("firewalld-state").stdout, "running")
+        self.assertEqual(snapshot.observation("firewalld-public-zone").command, ("firewall-cmd", "--zone=public", "--list-all"))
         self.assertIn(("df", "-h", "--output=source,size,used,avail,pcent,target"), commands)
 
     def test_host_snapshot_persists_and_appears_in_state(self):
@@ -4748,7 +4754,7 @@ class HostInspectionTests(unittest.TestCase):
 
         self.assertEqual(loaded.hostname, "host-a")
         self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
-        self.assertEqual(state["host_snapshots"][0]["observation_count"], 5)
+        self.assertEqual(state["host_snapshots"][0]["observation_count"], 8)
 
     def test_host_security_assessment_flags_non_loopback_listeners(self):
         snapshot = HostInspectionAdapter(
@@ -5365,6 +5371,43 @@ class HostInspectionTests(unittest.TestCase):
         self.assertFalse(status["can_execute"])
         self.assertEqual(plan.target, "tcp/22")
 
+    def test_host_security_remediation_uses_detected_firewalld_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command, timeout_seconds):
+                stdout = "ok"
+                if tuple(command) == ("hostname",):
+                    stdout = "host-firewalld"
+                elif tuple(command) == ("ss", "-ltnp"):
+                    stdout = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                elif tuple(command) == ("firewall-cmd", "--state"):
+                    stdout = "running"
+                return HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=stdout,
+                )
+
+            snapshot = HostInspectionAdapter(
+                command_runner=runner,
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:05:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            status = plan_host_security_remediation_status(store_path, "0.0.0.0:22")
+            loaded = SQLiteStore(store_path)
+            plan = loaded.load_admin_change_plan("admin.host-security.deny-tcp.22")
+            loaded.close()
+
+        self.assertEqual(status["firewall_backend"], "firewalld")
+        self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
+        self.assertIn("--add-rich-rule=", plan.steps[0].command[4])
+        self.assertEqual(plan.steps[1].command, ("sudo", "firewall-cmd", "--reload"))
+
     def test_runtime_status_reports_latest_host_security_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -5579,6 +5622,24 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
         self.assertEqual(plan.steps[0].command, ("sudo", "ufw", "deny", "22/tcp"))
         self.assertEqual(plan.rollback_steps[0].command, ("sudo", "ufw", "delete", "deny", "22/tcp"))
+
+    def test_firewalld_deny_plan_has_matching_rollback_and_logging(self):
+        plan = plan_firewalld_deny_tcp(
+            "admin.firewalld.deny.22",
+            22,
+            "close exposed ssh listener",
+            "open",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.FIREWALL_DENY_TCP)
+        self.assertEqual(plan.risk_level, RiskLevel.CRITICAL)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
+        self.assertIn('port="22"', plan.steps[0].command[4])
+        self.assertIn('log prefix="overseer-deny-22 ', plan.steps[0].command[4])
+        self.assertEqual(plan.steps[1].command, ("sudo", "firewall-cmd", "--reload"))
+        self.assertIn("--remove-rich-rule=", plan.rollback_steps[0].command[4])
+        self.assertEqual(plan.verification_steps[0].command, ("sudo", "firewall-cmd", "--zone=public", "--list-all"))
 
     def test_admin_change_plan_persists_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

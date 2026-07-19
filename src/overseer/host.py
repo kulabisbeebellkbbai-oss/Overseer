@@ -85,6 +85,9 @@ class HostInspectionAdapter:
                 stderr=established_tcp.stderr,
             ),
             self.command_runner(("df", "-h", "--output=source,size,used,avail,pcent,target"), self.timeout_seconds),
+            _named_observation("firewalld-state", self.command_runner(("firewall-cmd", "--state"), self.timeout_seconds)),
+            _named_observation("firewalld-active-zones", self.command_runner(("firewall-cmd", "--get-active-zones"), self.timeout_seconds)),
+            _named_observation("firewalld-public-zone", self.command_runner(("firewall-cmd", "--zone=public", "--list-all"), self.timeout_seconds)),
         )
         return HostInspectionSnapshot(
             id=f"host.{_safe_id(hostname)}.{_safe_id(captured)}",
@@ -96,19 +99,38 @@ class HostInspectionAdapter:
 
 
 def run_read_only_command(command: Sequence[str], timeout_seconds: float) -> HostCommandObservation:
-    completed = subprocess.run(
-        tuple(command),
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-    )
+    try:
+        completed = subprocess.run(
+            tuple(command),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        return HostCommandObservation(
+            name=command[0],
+            command=tuple(command),
+            exit_code=127,
+            stdout="",
+            stderr=str(exc),
+        )
     return HostCommandObservation(
         name=command[0],
         command=tuple(command),
         exit_code=completed.returncode,
         stdout=completed.stdout.strip(),
         stderr=completed.stderr.strip(),
+    )
+
+
+def _named_observation(name: str, observation: HostCommandObservation) -> HostCommandObservation:
+    return HostCommandObservation(
+        name=name,
+        command=observation.command,
+        exit_code=observation.exit_code,
+        stdout=observation.stdout,
+        stderr=observation.stderr,
     )
 
 

@@ -33,6 +33,7 @@ from .admin import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_user_service_restart,
@@ -1651,10 +1652,16 @@ def host_security_listener_review_queue_status(store_path: str | Path, snapshot_
     triage = host_security_triage_status(store_path, snapshot_id)
     store = SQLiteStore(store_path)
     try:
+        revision_required_targets = {
+            package.target
+            for package in store.list_host_security_ids_review_packages()
+            if IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED
+        }
         plans_by_target = {
             plan.target: plan
             for plan in store.list_admin_change_plans()
             if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived
+            and plan.target not in revision_required_targets
         }
     finally:
         store.close()
@@ -1768,6 +1775,38 @@ def host_security_recommended_path(bind_scope: str, severity: str) -> str:
     return "capture fresh evidence and assign Odo review before any mitigation"
 
 
+def _load_host_snapshot_for_status(store: SQLiteStore, snapshot_id: str | None) -> HostInspectionSnapshot:
+    if snapshot_id is not None:
+        return store.load_host_snapshot(snapshot_id)
+    snapshots = store.list_host_snapshots()
+    if not snapshots:
+        raise ValueError("no host snapshots are available")
+    return sorted(snapshots, key=lambda item: item.captured_at)[-1]
+
+
+def _detected_firewall_backend(snapshot: HostInspectionSnapshot) -> str:
+    try:
+        firewalld_state = snapshot.observation("firewalld-state")
+    except KeyError:
+        return "ufw"
+    if firewalld_state.exit_code == 0 and firewalld_state.stdout.strip() == "running":
+        return "firewalld"
+    return "ufw"
+
+
+def _plan_firewall_deny_tcp_for_snapshot(
+    snapshot: HostInspectionSnapshot,
+    plan_id: str,
+    port: int,
+    reason: str,
+    current_state: str,
+) -> tuple[AdminChangePlan, str]:
+    backend = _detected_firewall_backend(snapshot)
+    if backend == "firewalld":
+        return plan_firewalld_deny_tcp(plan_id, port, reason, current_state), backend
+    return plan_firewall_deny_tcp(plan_id, port, reason, current_state), backend
+
+
 def plan_host_security_remediation_status(
     store_path: str | Path,
     listener: str,
@@ -1788,12 +1827,20 @@ def plan_host_security_remediation_status(
     default_plan_id = f"admin.host-security.deny-tcp.{port_value}"
     default_reason = f"stage approval-gated firewall deny for host security listener {listener}"
     current_state = f"{group['severity']} listener {listener}; bind_scope={group['bind_scope']}; evidence={'; '.join(group['evidence'])}"
-    plan = plan_firewall_deny_tcp(plan_id or default_plan_id, int(port_value), reason or default_reason, current_state)
     store = SQLiteStore(store_path)
     try:
+        snapshot = _load_host_snapshot_for_status(store, snapshot_id)
+        plan, firewall_backend = _plan_firewall_deny_tcp_for_snapshot(
+            snapshot,
+            plan_id or default_plan_id,
+            int(port_value),
+            reason or default_reason,
+            current_state,
+        )
         store.save_admin_change_plan(plan)
         return {
             "store": str(store.path),
+            "firewall_backend": firewall_backend,
             "remediation_action": action,
             "listener": group,
             **admin_change_plan_status(plan),
@@ -1819,10 +1866,18 @@ def plan_host_security_listener_queue_remediations_status(
     staged = []
     skipped = []
     try:
+        snapshot = _load_host_snapshot_for_status(store, snapshot_id)
+        firewall_backend = _detected_firewall_backend(snapshot)
+        revision_required_targets = {
+            package.target
+            for package in store.list_host_security_ids_review_packages()
+            if IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED
+        }
         existing_targets = {
             plan.target
             for plan in store.list_admin_change_plans()
             if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived
+            and plan.target not in revision_required_targets
         }
         for port, items in sorted(candidates_by_port.items(), key=lambda entry: int(entry[0])):
             target = f"tcp/{port}"
@@ -1832,14 +1887,23 @@ def plan_host_security_listener_queue_remediations_status(
             plan_id = f"{plan_prefix}.{port}"
             current_state = _listener_queue_plan_current_state(items)
             reason = f"stage approval-gated firewall deny for exposed listener queue {target}; requested_by={requested_by}"
-            plan = plan_firewall_deny_tcp(plan_id, int(port), reason, current_state)
+            plan, selected_backend = _plan_firewall_deny_tcp_for_snapshot(snapshot, plan_id, int(port), reason, current_state)
             store.save_admin_change_plan(plan)
             existing_targets.add(target)
-            staged.append({"port": port, "target": target, "plan_id": plan.id, "listeners": [item["listener"] for item in items]})
+            staged.append(
+                {
+                    "port": port,
+                    "target": target,
+                    "plan_id": plan.id,
+                    "firewall_backend": selected_backend,
+                    "listeners": [item["listener"] for item in items],
+                }
+            )
         return {
             "store": str(store.path),
             "snapshot_id": queue["snapshot_id"],
             "requested_by": requested_by,
+            "firewall_backend": firewall_backend,
             "candidate_ports": len(candidates_by_port),
             "staged_count": len(staged),
             "skipped_count": len(skipped),

@@ -183,12 +183,18 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
     ),
     AdminChangeKind.FIREWALL_DENY_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_DENY_TCP,
-        adapter_name="ufw-firewall-deny",
+        adapter_name="host-firewall-deny",
         status=AdminAdapterStatus.DISABLED,
         summary="live firewall deny rules require a specific high-risk firewall adapter approval plan before enablement",
         authorization_required_before_enable=True,
         approval_plan_required=True,
-        supported_commands=(("sudo", "ufw", "deny"), ("sudo", "ufw", "status")),
+        supported_commands=(
+            ("sudo", "ufw", "deny"),
+            ("sudo", "ufw", "status"),
+            ("sudo", "firewall-cmd", "--zone=public", "--add-rich-rule"),
+            ("sudo", "firewall-cmd", "--reload"),
+            ("sudo", "firewall-cmd", "--zone=public", "--list-all"),
+        ),
     ),
     AdminChangeKind.BLOCK_IP: AdminExecutionCapability(
         kind=AdminChangeKind.BLOCK_IP,
@@ -509,6 +515,71 @@ def plan_firewall_deny_tcp(plan_id: str, port: int, reason: str, current_state: 
             AdminCommandStep(
                 "Verify firewall status",
                 ("sudo", "ufw", "status", "verbose"),
+                "confirm the deny rule exists only as approved",
+            ),
+        ),
+    )
+
+
+def plan_firewalld_deny_tcp(
+    plan_id: str,
+    port: int,
+    reason: str,
+    current_state: str = "unknown",
+    zone: str = "public",
+) -> AdminChangePlan:
+    if port < 1 or port > 65535:
+        raise ValueError("port must be between 1 and 65535")
+    if not zone.strip():
+        raise ValueError("zone is required")
+    rich_rule = (
+        f'rule port port="{port}" protocol="tcp" '
+        f'log prefix="overseer-deny-{port} " level="warning" limit value="5/m" reject'
+    )
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.FIREWALL_DENY_TCP,
+        owner_domain=OwnerDomain.ODO,
+        risk_level=RiskLevel.CRITICAL,
+        approval_level=ApprovalLevel.HUMAN,
+        target=f"tcp/{port}",
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"deny inbound TCP traffic on port {port} in firewalld zone {zone}",
+        steps=(
+            AdminCommandStep(
+                "Add firewalld deny rich rule",
+                ("sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--add-rich-rule={rich_rule}"),
+                "stage the approved TCP deny rule with bounded logging",
+            ),
+            AdminCommandStep(
+                "Reload firewalld",
+                ("sudo", "firewall-cmd", "--reload"),
+                "apply the approved permanent firewall rule",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Remove firewalld deny rich rule",
+                ("sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--remove-rich-rule={rich_rule}"),
+                "remove the deny rule if it disrupts legitimate work",
+            ),
+            AdminCommandStep(
+                "Reload firewalld after rollback",
+                ("sudo", "firewall-cmd", "--reload"),
+                "apply the rollback firewall state",
+            ),
+        ),
+        risks=(
+            "legitimate clients may lose access",
+            "firewall policy changes require audit review",
+            "zone selection errors may affect the wrong interface set",
+            "service may still listen until its bind configuration is changed",
+        ),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify firewalld zone",
+                ("sudo", "firewall-cmd", f"--zone={zone}", "--list-all"),
                 "confirm the deny rule exists only as approved",
             ),
         ),

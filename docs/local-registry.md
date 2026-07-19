@@ -24,6 +24,7 @@ The first usable Overseer core is an in-memory registry backed by explicit SQLit
 ## CLI Inspection
 
 ```bash
+PYTHONPATH=src python3 -m overseer.cli record-resource --store state/overseer.sqlite3 --resource-id svc.example --name "Example Service" --resource-type service --owner-domain julian --risk-level low --identifier-json '{"port": 8080}'
 PYTHONPATH=src python3 -m overseer.cli list-state --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli approvals-summary --store state/overseer.sqlite3 --status pending
 PYTHONPATH=src python3 -m overseer.cli claim-cleanup-plan --store state/overseer.sqlite3

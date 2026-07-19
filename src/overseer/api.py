@@ -74,6 +74,7 @@ from .cli import (
     plan_package_updates_status,
     policy_customization_helper_cli_status,
     probe_stored_health_status,
+    record_resource_status,
     record_health_target_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
@@ -264,6 +265,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if self.path == "/claims/request":
                 self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
+                return
+            if self.path == "/resources":
+                self._handle_json(lambda payload: record_resource_status(store_path, **_resource_args(payload)))
                 return
             if self.path == "/claims/approve":
                 self._handle_json(lambda payload: approve_claim_status(store_path, **_approve_claim_args(payload)))
@@ -505,6 +509,26 @@ def _request_claim_args(payload: dict[str, Any]) -> dict[str, Any]:
         "starts_at": str(payload["starts_at"]) if payload.get("starts_at") else None,
         "expires_at": str(payload["expires_at"]) if payload.get("expires_at") else None,
         "release_condition": str(payload["release_condition"]) if payload.get("release_condition") else None,
+    }
+
+
+def _resource_args(payload: dict[str, Any]) -> dict[str, Any]:
+    identifiers = payload.get("identifiers", {})
+    if not isinstance(identifiers, dict):
+        raise ValueError("identifiers must be a JSON object")
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "name": str(payload["name"]),
+        "resource_type": str(payload["resource_type"]),
+        "owner_domain": str(payload["owner_domain"]),
+        "risk_level": str(payload["risk_level"]),
+        "state": str(payload.get("state", "available")),
+        "identifiers": identifiers,
+        "dependencies": tuple(str(item) for item in payload.get("dependencies", ())),
+        "exclusive_groups": tuple(str(item) for item in payload.get("exclusive_groups", ())),
+        "current_claim_id": str(payload["current_claim_id"]) if payload.get("current_claim_id") else None,
+        "last_verified_at": str(payload["last_verified_at"]) if payload.get("last_verified_at") else None,
+        "notes": str(payload.get("notes", "")),
     }
 
 

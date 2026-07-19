@@ -205,6 +205,7 @@ from overseer.cli import probe_config_status
 from overseer.cli import probe_health_status
 from overseer.cli import probe_stored_health_status
 from overseer.cli import record_health_target_status
+from overseer.cli import record_resource_status
 from overseer.cli import release_claim_status
 from overseer.cli import request_admin_adapter_enablement_status
 from overseer.cli import request_admin_history_archive_status
@@ -2319,6 +2320,52 @@ class OverseerApiTests(unittest.TestCase):
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.api")
 
+    def test_api_records_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                status = server.post(
+                    "/resources",
+                    {
+                        "resource_id": "gateway.api",
+                        "name": "API Gateway",
+                        "resource_type": "virtual_asset",
+                        "owner_domain": "dax",
+                        "risk_level": "high",
+                        "identifiers": {"kind": "gateway", "ports": [8795]},
+                        "exclusive_groups": ["protected-gateway"],
+                    },
+                )
+                state = server.get("/state")
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["resource"]["id"], "gateway.api")
+            self.assertEqual(state["resources"][0]["identifiers"]["kind"], "gateway")
+
+    def test_api_rejects_resource_identifiers_that_are_not_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path) as server:
+                with self.assertRaises(HTTPError) as error:
+                    server.post(
+                        "/resources",
+                        {
+                            "resource_id": "bad.identifiers",
+                            "name": "Bad",
+                            "resource_type": "service",
+                            "owner_domain": "julian",
+                            "risk_level": "low",
+                            "identifiers": ["not", "an", "object"],
+                        },
+                    )
+                body = json.loads(error.exception.read().decode("utf-8"))
+
+            self.assertEqual(error.exception.code, 400)
+            self.assertEqual(body["error"], "identifiers must be a JSON object")
+
     def test_loopback_api_serves_operator_console_without_token(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2640,6 +2687,25 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.client")
+
+    def test_client_records_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.record_resource(
+                    "svc.client.registered",
+                    "Client Registered Service",
+                    "service",
+                    "julian",
+                    "low",
+                    identifiers={"kind": "api-test"},
+                )
+
+            self.assertEqual(status["resource"]["id"], "svc.client.registered")
+            self.assertEqual(status["resource"]["identifiers"]["kind"], "api-test")
+            self.assertTrue(status["mutation_performed"])
 
     def test_client_reads_redacted_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6848,6 +6914,34 @@ class CliDemoTests(unittest.TestCase):
             self.assertEqual(status["decision"], ConflictOutcome.ESCALATE.value)
             self.assertTrue(store_path.exists())
 
+    def test_record_resource_status_persists_structured_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            status = record_resource_status(
+                store_path,
+                "vm.local.android",
+                "Local Android VM",
+                ResourceType.VIRTUAL_ASSET.value,
+                OwnerDomain.DAX.value,
+                RiskLevel.MEDIUM.value,
+                identifiers={"kind": "vm", "ports": [5555]},
+                dependencies=("svc.systemd-user.protected-service-gateway",),
+                exclusive_groups=("android-emulator",),
+                notes="registered by test",
+            )
+
+            store = SQLiteStore(store_path)
+            resource = store.load_resource("vm.local.android")
+            store.close()
+
+        self.assertTrue(status["mutation_performed"])
+        self.assertFalse(status["host_mutation_performed"])
+        self.assertEqual(status["resource"]["id"], "vm.local.android")
+        self.assertEqual(status["resource"]["identifiers"]["ports"], [5555])
+        self.assertEqual(resource.owner_domain, OwnerDomain.DAX)
+        self.assertEqual(resource.exclusive_groups, frozenset({"android-emulator"}))
+
     def test_seed_config_status_uses_explicit_config_and_store_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "overseer.json"
@@ -7933,6 +8027,8 @@ class RuntimeTests(unittest.TestCase):
             status = list_state_status(store_path)
 
             self.assertEqual(status["resources"][0]["id"], "proxy.state.cli")
+            self.assertEqual(status["resources"][0]["name"], "State CLI Proxy")
+            self.assertEqual(status["resources"][0]["identifiers"], {})
             self.assertEqual(status["schema_migrations"][0]["version"], CURRENT_SCHEMA_VERSION)
             self.assertEqual(status["claims"][0]["status"], ClaimStatus.REQUESTED.value)
             self.assertEqual(status["approvals"][0]["status"], ApprovalStatus.APPROVED.value)

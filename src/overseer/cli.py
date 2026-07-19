@@ -192,6 +192,48 @@ def seed_config_status(config_path: str | Path, store_path: str | Path) -> dict[
         store.close()
 
 
+def record_resource_status(
+    store_path: str | Path,
+    resource_id: str,
+    name: str,
+    resource_type: str,
+    owner_domain: str,
+    risk_level: str,
+    state: str = ResourceState.AVAILABLE.value,
+    identifiers: dict[str, object] | None = None,
+    dependencies: Sequence[str] = (),
+    exclusive_groups: Sequence[str] = (),
+    current_claim_id: str | None = None,
+    last_verified_at: str | None = None,
+    notes: str = "",
+) -> dict[str, object]:
+    resource = Resource(
+        id=resource_id,
+        name=name,
+        type=ResourceType(resource_type),
+        owner_domain=OwnerDomain(owner_domain),
+        risk_level=RiskLevel(risk_level),
+        state=ResourceState(state),
+        identifiers=identifiers or {},
+        dependencies=frozenset(dependencies),
+        exclusive_groups=frozenset(exclusive_groups),
+        current_claim_id=current_claim_id,
+        last_verified_at=last_verified_at,
+        notes=notes,
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_resource(resource)
+        return {
+            "store": str(store.path),
+            "resource": resource_status(resource),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
 def probe_health_status(
     resource_id: str,
     name: str,
@@ -5220,17 +5262,7 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "schema_migrations": [schema_migration_status(migration) for migration in schema_migrations],
-            "resources": [
-                {
-                    "id": resource.id,
-                    "type": ResourceType(resource.type).value,
-                    "owner_domain": OwnerDomain(resource.owner_domain).value,
-                    "risk_level": RiskLevel(resource.risk_level).value,
-                    "state": ResourceState(resource.state).value,
-                    "current_claim_id": resource.current_claim_id,
-                }
-                for resource in resources
-            ],
+            "resources": [resource_status(resource) for resource in resources],
             "health_targets": [
                 {
                     "id": target.id,
@@ -5349,6 +5381,30 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         }
     finally:
         store.close()
+
+
+def resource_status(resource: Resource) -> dict[str, object]:
+    return {
+        "id": resource.id,
+        "name": resource.name,
+        "type": ResourceType(resource.type).value,
+        "owner_domain": OwnerDomain(resource.owner_domain).value,
+        "risk_level": RiskLevel(resource.risk_level).value,
+        "state": ResourceState(resource.state).value,
+        "identifiers": dict(resource.identifiers),
+        "dependencies": sorted(resource.dependencies),
+        "exclusive_groups": sorted(resource.exclusive_groups),
+        "current_claim_id": resource.current_claim_id,
+        "last_verified_at": resource.last_verified_at,
+        "notes": resource.notes,
+    }
+
+
+def _json_object_arg(value: str, label: str) -> dict[str, object]:
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return parsed
 
 
 def schema_migration_status(migration: SchemaMigration) -> dict[str, object]:
@@ -5576,6 +5632,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
     seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
     seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_resource_parser = subparsers.add_parser("record-resource", help="record or update a managed resource")
+    record_resource_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    record_resource_parser.add_argument("--resource-id", required=True)
+    record_resource_parser.add_argument("--name", required=True)
+    record_resource_parser.add_argument("--resource-type", required=True, choices=[item.value for item in ResourceType])
+    record_resource_parser.add_argument("--owner-domain", required=True, choices=[item.value for item in OwnerDomain])
+    record_resource_parser.add_argument("--risk-level", required=True, choices=[item.value for item in RiskLevel])
+    record_resource_parser.add_argument("--state", default=ResourceState.AVAILABLE.value, choices=[item.value for item in ResourceState])
+    record_resource_parser.add_argument("--identifier-json", default="{}", help="JSON object with structured resource identifiers")
+    record_resource_parser.add_argument("--dependency", action="append", default=())
+    record_resource_parser.add_argument("--exclusive-group", action="append", default=())
+    record_resource_parser.add_argument("--current-claim-id")
+    record_resource_parser.add_argument("--last-verified-at")
+    record_resource_parser.add_argument("--notes", default="")
     probe_parser = subparsers.add_parser("probe-health", help="run a read-only health probe for an explicit target")
     probe_parser.add_argument("--resource-id", required=True)
     probe_parser.add_argument("--name", required=True)
@@ -6067,6 +6137,29 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "seed-config":
         print(json.dumps(seed_config_status(args.config, args.store), sort_keys=True))
+        return 0
+
+    if args.command == "record-resource":
+        print(
+            json.dumps(
+                record_resource_status(
+                    args.store,
+                    args.resource_id,
+                    args.name,
+                    args.resource_type,
+                    args.owner_domain,
+                    args.risk_level,
+                    args.state,
+                    _json_object_arg(args.identifier_json, "identifier-json"),
+                    tuple(args.dependency),
+                    tuple(args.exclusive_group),
+                    args.current_claim_id,
+                    args.last_verified_at,
+                    args.notes,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "probe-health":

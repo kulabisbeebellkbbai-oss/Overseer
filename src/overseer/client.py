@@ -72,6 +72,39 @@ class OverseerApiClient:
     def command_summary(self) -> dict[str, Any]:
         return self._get("/command-summary")
 
+    def record_resource(
+        self,
+        resource_id: str,
+        name: str,
+        resource_type: str,
+        owner_domain: str,
+        risk_level: str,
+        state: str = "available",
+        identifiers: dict[str, Any] | None = None,
+        dependencies: list[str] | tuple[str, ...] = (),
+        exclusive_groups: list[str] | tuple[str, ...] = (),
+        current_claim_id: str | None = None,
+        last_verified_at: str | None = None,
+        notes: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "resource_id": resource_id,
+            "name": name,
+            "resource_type": resource_type,
+            "owner_domain": owner_domain,
+            "risk_level": risk_level,
+            "state": state,
+            "identifiers": identifiers or {},
+            "dependencies": list(dependencies),
+            "exclusive_groups": list(exclusive_groups),
+            "notes": notes,
+        }
+        if current_claim_id:
+            payload["current_claim_id"] = current_claim_id
+        if last_verified_at:
+            payload["last_verified_at"] = last_verified_at
+        return self._post("/resources", payload)
+
     def operator_dashboard(self) -> dict[str, Any]:
         return self._get("/operator-dashboard")
 

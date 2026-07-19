@@ -7,6 +7,7 @@ from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
 import re
+import shlex
 
 from .admin import AdminChangeKind, AdminChangePlan
 from .source_review import HostSecuritySourceReview, SourceReviewDisposition
@@ -99,7 +100,7 @@ def build_ids_review_package(
     logging_plan = _logging_plan(plan)
     test_plan = _test_plan(plan)
     rollback_plan = "; ".join(
-        f"{step.title}: {' '.join(step.command)} ({step.reason})" for step in plan.rollback_steps
+        f"{step.title}: {shlex.join(step.command)} ({step.reason})" for step in plan.rollback_steps
     )
     approval_boundary = (
         "Prepared review package only. Do not apply firewall, IDS, IPS, route, VPN, NAT, service-bind, "
@@ -234,7 +235,7 @@ def _intended_traffic(plan: AdminChangePlan) -> str:
 
 
 def _firewall_rule_drafts(plan: AdminChangePlan) -> tuple[str, ...]:
-    return tuple(f"{step.title}: {' '.join(step.command)} ({step.reason})" for step in plan.steps)
+    return tuple(f"{step.title}: {shlex.join(step.command)} ({step.reason})" for step in plan.steps)
 
 
 def _ids_rule_drafts(

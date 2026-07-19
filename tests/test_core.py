@@ -103,6 +103,7 @@ from overseer import (
     approval_from_decision,
     assess_maintenance_readiness,
     audit_event_from_decision,
+    build_ids_review_package,
     can_close_maintenance,
     config_from_mapping,
     codex_project_thread_resource,
@@ -5647,6 +5648,20 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.steps[1].command, ("sudo", "firewall-cmd", "--reload"))
         self.assertIn("--remove-rich-rule=", plan.rollback_steps[0].command[4])
         self.assertEqual(plan.verification_steps[0].command, ("sudo", "firewall-cmd", "--zone=public", "--list-all"))
+
+    def test_ids_review_prompt_shell_quotes_firewalld_rich_rules(self):
+        plan = plan_firewalld_deny_tcp(
+            "admin.firewalld.deny.22",
+            22,
+            "close exposed ssh listener",
+            "open",
+        )
+
+        package = build_ids_review_package(plan)
+
+        self.assertIn("'--add-rich-rule=rule port port=\"22\"", package.prompt)
+        self.assertIn("'--remove-rich-rule=rule port port=\"22\"", package.prompt)
+        self.assertIn("overseer-deny-22 ", package.prompt)
 
     def test_admin_change_plan_persists_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -451,6 +451,9 @@ class OperationPlannerTests(unittest.TestCase):
 
         self.assertTrue(operation.requires_approval())
         self.assertEqual(operation.approval_level, ApprovalLevel.SISKO)
+        self.assertIsNotNone(operation.approval_request)
+        self.assertEqual(operation.approval_request.id, "approval.operation.maint.gateway.patch")
+        self.assertEqual(operation.approval_request.evidence_required, ("health.before",))
         self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
         self.assertFalse(operation.result.changed_host_state())
 
@@ -471,6 +474,9 @@ class OperationPlannerTests(unittest.TestCase):
 
         self.assertTrue(operation.requires_approval())
         self.assertEqual(operation.approval_level, ApprovalLevel.SISKO)
+        self.assertIsNotNone(operation.approval_request)
+        self.assertEqual(operation.approval_request.owner_domain, OwnerDomain.DAX)
+        self.assertEqual(operation.approval_request.evidence_required, ("vm.intrusion",))
         self.assertEqual(operation.request.action, "security:quarantine")
         self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
 

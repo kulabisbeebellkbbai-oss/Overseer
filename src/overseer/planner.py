@@ -8,7 +8,9 @@ from .adapters import DryRunExecutor, ExecutionMode, ExecutionRequest, Execution
 from .audit import ApprovalRequest
 from .core import ApprovalLevel, OwnerDomain
 from .maintenance import MaintenancePlan, assess_maintenance_readiness
+from .scheduler import ScheduledWork, schedule_maintenance_window, schedule_usage_limited_work
 from .security import SecuritySignal, recommend_security_response
+from .usage_limits import LimitedWorkRequest, UsageLimit
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,7 @@ class PlannedOperation:
     approval_level: ApprovalLevel
     reason: str
     approval_request: ApprovalRequest | None = None
+    scheduled_work: ScheduledWork | None = None
 
     def requires_approval(self) -> bool:
         return self.approval_level != ApprovalLevel.NONE
@@ -27,8 +30,9 @@ class OperationPlanner:
     def __init__(self, executor: DryRunExecutor | None = None) -> None:
         self.executor = executor or DryRunExecutor()
 
-    def plan_maintenance(self, plan: MaintenancePlan) -> PlannedOperation:
+    def plan_maintenance(self, plan: MaintenancePlan, active_plans: tuple[MaintenancePlan, ...] = ()) -> PlannedOperation:
         readiness = assess_maintenance_readiness(plan)
+        scheduled_work = schedule_maintenance_window(plan, active_plans)
         approval = readiness.approval_level
         request = ExecutionRequest(
             id=plan.id,
@@ -36,7 +40,7 @@ class OperationPlanner:
             target_resource_id=plan.resource_id,
             owner_domain=OwnerDomain.OBRIEN,
             mode=ExecutionMode.DRY_RUN,
-            reason=readiness.reason,
+            reason=_operation_reason(readiness.reason, scheduled_work.reason),
         )
         result = self.executor.execute(request)
         approval_request = _approval_request_for_operation(
@@ -45,7 +49,7 @@ class OperationPlanner:
             readiness.reason,
             evidence_required=plan.precheck_ids,
         )
-        return PlannedOperation(request, result, approval, readiness.reason, approval_request)
+        return PlannedOperation(request, result, approval, readiness.reason, approval_request, scheduled_work)
 
     def plan_security_response(self, signal: SecuritySignal) -> PlannedOperation:
         response = recommend_security_response(signal)
@@ -66,6 +70,9 @@ class OperationPlanner:
         )
         return PlannedOperation(request, result, response.approval_level, response.reason, approval_request)
 
+    def plan_usage_limited_work(self, limit: UsageLimit, request: LimitedWorkRequest) -> ScheduledWork:
+        return schedule_usage_limited_work(limit, request)
+
 
 def _approval_request_for_operation(
     request: ExecutionRequest,
@@ -84,3 +91,9 @@ def _approval_request_for_operation(
         reason=reason,
         evidence_required=evidence_required,
     )
+
+
+def _operation_reason(readiness_reason: str, schedule_reason: str) -> str:
+    if readiness_reason == schedule_reason:
+        return readiness_reason
+    return f"{readiness_reason}; {schedule_reason}"

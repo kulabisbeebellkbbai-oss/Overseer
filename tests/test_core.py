@@ -454,8 +454,51 @@ class OperationPlannerTests(unittest.TestCase):
         self.assertIsNotNone(operation.approval_request)
         self.assertEqual(operation.approval_request.id, "approval.operation.maint.gateway.patch")
         self.assertEqual(operation.approval_request.evidence_required, ("health.before",))
+        self.assertIsNotNone(operation.scheduled_work)
+        self.assertEqual(operation.scheduled_work.status, ScheduledWorkStatus.READY)
+        self.assertEqual(operation.scheduled_work.scheduled_for, "2026-07-18T12:00:00-04:00")
         self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
         self.assertFalse(operation.result.changed_host_state())
+
+    def test_plans_overlapping_maintenance_as_waiting_dry_run(self):
+        planner = OperationPlanner()
+        active = MaintenancePlan(
+            id="maint.active",
+            resource_id="gateway.protected",
+            kind=MaintenanceKind.PATCH,
+            requested_state="1.2.2",
+            risk_level=RiskLevel.MEDIUM,
+            window=MaintenanceWindow(
+                id="window.active",
+                starts_at="2026-07-18T12:00:00-04:00",
+                ends_at="2026-07-18T12:45:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.EXCLUSIVE_WINDOW_REQUIRED,
+            precheck_ids=("health.before.active",),
+            rollback_plan="restore active gateway config",
+        )
+        requested = MaintenancePlan(
+            id="maint.requested",
+            resource_id="gateway.protected",
+            kind=MaintenanceKind.PATCH,
+            requested_state="1.2.3",
+            risk_level=RiskLevel.MEDIUM,
+            window=MaintenanceWindow(
+                id="window.requested",
+                starts_at="2026-07-18T12:15:00-04:00",
+                ends_at="2026-07-18T12:30:00-04:00",
+            ),
+            interruption_policy=InterruptionPolicy.EXCLUSIVE_WINDOW_REQUIRED,
+            precheck_ids=("health.before.requested",),
+            rollback_plan="restore requested gateway config",
+        )
+
+        operation = planner.plan_maintenance(requested, (active,))
+
+        self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
+        self.assertIsNotNone(operation.scheduled_work)
+        self.assertEqual(operation.scheduled_work.status, ScheduledWorkStatus.WAITING)
+        self.assertEqual(operation.scheduled_work.blocking_ids, ("maint.active",))
 
     def test_plans_security_response_as_dry_run_even_for_active_defense(self):
         planner = OperationPlanner()
@@ -479,6 +522,30 @@ class OperationPlannerTests(unittest.TestCase):
         self.assertEqual(operation.approval_request.evidence_required, ("vm.intrusion",))
         self.assertEqual(operation.request.action, "security:quarantine")
         self.assertEqual(operation.result.mode, ExecutionMode.DRY_RUN)
+
+    def test_plans_usage_limited_work_until_reset(self):
+        planner = OperationPlanner()
+        work = planner.plan_usage_limited_work(
+            UsageLimit(
+                id="limit.planner.ai",
+                resource_id="svc.ai",
+                kind=LimitKind.TOKENS,
+                capacity=100,
+                remaining=0,
+                resets_at="2026-07-18T16:00:00-04:00",
+                window="hourly",
+            ),
+            LimitedWorkRequest(
+                id="work.planner.ai",
+                resource_id="svc.ai",
+                owner_thread="thread-planner",
+                requested_units=10,
+                intent="continue planned work",
+            ),
+        )
+
+        self.assertEqual(work.status, ScheduledWorkStatus.WAITING)
+        self.assertEqual(work.scheduled_for, "2026-07-18T16:00:00-04:00")
 
 
 class HealthClassificationTests(unittest.TestCase):

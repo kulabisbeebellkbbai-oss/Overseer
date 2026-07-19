@@ -9,6 +9,7 @@ Admin policy evaluation is available with:
 ```bash
 PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api
+PYTHONPATH=src python3 -m overseer.cli admin-policy-status --store state/overseer.sqlite3 --policy-profile state/policy-profile.json
 ```
 
 The matching API endpoint is:
@@ -30,6 +31,38 @@ Each admin plan is evaluated against:
 - rollback: rollback evidence must exist; irreversible package upgrades produce a warning
 - verification: post-change verification steps must be present
 - risk approval: high and critical risks must use an appropriate approval level
+
+## Best-Practice Policy Profile
+
+When no custom profile is provided, Overseer uses the bundled `best-practice` profile:
+
+- low risk: no minimum approval beyond the plan's own approval requirement
+- medium risk: Sisko approval
+- high risk: Sisko approval
+- critical risk: human approval
+- live execution requires an enabled adapter for the exact admin change kind
+- rollback steps are required
+- package upgrades keep a residual rollback warning until explicitly accepted
+- verification steps are required
+- firewall-affecting plans require accepted Intrusion Detection advisory review
+- warnings block execution until they are explicitly accepted
+
+## Customization Helper
+
+Generate the reusable customization questionnaire and JSON template with:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli policy-customization-helper
+PYTHONPATH=src python3 -m overseer.cli policy-customization-helper --output state/policy-customization-helper.json
+```
+
+The helper output contains:
+
+- `profile`: the best-practice JSON profile that can be copied into a custom policy profile file
+- `questions`: stable question IDs, profile keys, defaults, options, and rationale
+- `next_step`: the handoff instruction for applying the customized profile
+
+Use the same helper on new installs before local policy customization sessions. Keep the generated policy profile out of public commits when it contains site-specific operational choices.
 
 ## Decision Status
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Mapping
 
 from .admin import AdminChangeKind, AdminChangePlan, AdminExecutionCapability, missing_admin_change_fields
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
@@ -31,9 +32,53 @@ class PolicyDecision:
     subject_kind: str
     status: PolicyCheckStatus
     checks: tuple[PolicyCheck, ...]
+    warnings_block_execution: bool = True
 
     def can_proceed(self) -> bool:
-        return self.status == PolicyCheckStatus.PASS
+        return self.status == PolicyCheckStatus.PASS or (
+            self.status == PolicyCheckStatus.WARN and not self.warnings_block_execution
+        )
+
+
+APPROVAL_RANK: dict[ApprovalLevel, int] = {
+    ApprovalLevel.NONE: 0,
+    ApprovalLevel.ROLE: 1,
+    ApprovalLevel.SISKO: 2,
+    ApprovalLevel.HUMAN: 3,
+}
+
+
+@dataclass(frozen=True)
+class PolicyQuestion:
+    id: str
+    prompt: str
+    profile_key: str
+    default: object
+    options: tuple[object, ...]
+    rationale: str
+
+
+@dataclass(frozen=True)
+class PolicyProfile:
+    name: str = "best-practice"
+    description: str = "Conservative local-admin defaults for Overseer-controlled host changes."
+    minimum_approval_by_risk: Mapping[RiskLevel, ApprovalLevel] = field(
+        default_factory=lambda: {
+            RiskLevel.LOW: ApprovalLevel.NONE,
+            RiskLevel.MEDIUM: ApprovalLevel.SISKO,
+            RiskLevel.HIGH: ApprovalLevel.SISKO,
+            RiskLevel.CRITICAL: ApprovalLevel.HUMAN,
+        }
+    )
+    require_live_adapter_enabled: bool = True
+    require_rollback_steps: bool = True
+    warn_on_apt_upgrade_rollback: bool = True
+    require_verification_steps: bool = True
+    require_ids_review_for_firewall: bool = True
+    block_warnings_until_accepted: bool = True
+
+
+BEST_PRACTICE_POLICY_PROFILE = PolicyProfile()
 
 
 def evaluate_admin_change_policy(
@@ -41,17 +86,18 @@ def evaluate_admin_change_policy(
     capability: AdminExecutionCapability,
     ids_review_packages: tuple[HostSecurityIDSReviewPackage, ...] = (),
     accepted_warning_check_ids: tuple[str, ...] = (),
+    profile: PolicyProfile = BEST_PRACTICE_POLICY_PROFILE,
 ) -> PolicyDecision:
     checks = _apply_warning_acceptance(
         (
         _plan_state_check(plan),
         _plan_completeness_check(plan),
         _approval_check(plan),
-        _adapter_check(plan, capability),
-        _ids_review_check(plan, ids_review_packages),
-        _rollback_check(plan),
-        _verification_check(plan),
-        _risk_approval_check(plan),
+        _adapter_check(plan, capability, profile),
+        _ids_review_check(plan, ids_review_packages, profile),
+        _rollback_check(plan, profile),
+        _verification_check(plan, profile),
+        _risk_approval_check(plan, profile),
         ),
         frozenset(accepted_warning_check_ids),
     )
@@ -60,6 +106,7 @@ def evaluate_admin_change_policy(
         subject_kind=AdminChangeKind(plan.kind).value,
         status=_overall_status(checks),
         checks=checks,
+        warnings_block_execution=profile.block_warnings_until_accepted,
     )
 
 
@@ -146,7 +193,14 @@ def _approval_check(plan: AdminChangePlan) -> PolicyCheck:
     return PolicyCheck("admin.plan.approval", PolicyCheckStatus.PASS, plan.owner_domain, "no explicit approval required")
 
 
-def _adapter_check(plan: AdminChangePlan, capability: AdminExecutionCapability) -> PolicyCheck:
+def _adapter_check(plan: AdminChangePlan, capability: AdminExecutionCapability, profile: PolicyProfile) -> PolicyCheck:
+    if not profile.require_live_adapter_enabled:
+        return PolicyCheck(
+            "admin.adapter.enabled",
+            PolicyCheckStatus.WARN,
+            plan.owner_domain,
+            "policy profile does not block on live adapter status; executor capability still applies",
+        )
     if not capability.can_execute_live():
         return PolicyCheck(
             "admin.adapter.enabled",
@@ -165,7 +219,16 @@ def _adapter_check(plan: AdminChangePlan, capability: AdminExecutionCapability) 
 def _ids_review_check(
     plan: AdminChangePlan,
     ids_review_packages: tuple[HostSecurityIDSReviewPackage, ...],
+    profile: PolicyProfile,
 ) -> PolicyCheck:
+    if not profile.require_ids_review_for_firewall:
+        return PolicyCheck(
+            "admin.ids.review",
+            PolicyCheckStatus.WARN,
+            OwnerDomain.ODO,
+            "policy profile does not block firewall-affecting plans on IDS advisory review",
+            tuple(package.id for package in ids_review_packages),
+        )
     if not admin_plan_requires_ids_review(plan):
         return PolicyCheck("admin.ids.review", PolicyCheckStatus.PASS, OwnerDomain.ODO, "IDS review is not required")
     accepted = tuple(package for package in ids_review_packages if package.satisfies_pre_execution_review_gate())
@@ -186,10 +249,12 @@ def _ids_review_check(
     )
 
 
-def _rollback_check(plan: AdminChangePlan) -> PolicyCheck:
+def _rollback_check(plan: AdminChangePlan, profile: PolicyProfile) -> PolicyCheck:
+    if not profile.require_rollback_steps:
+        return PolicyCheck("admin.rollback", PolicyCheckStatus.WARN, plan.owner_domain, "policy profile allows missing rollback steps")
     if not plan.rollback_steps:
         return PolicyCheck("admin.rollback", PolicyCheckStatus.BLOCK, plan.owner_domain, "rollback steps are required")
-    if AdminChangeKind(plan.kind) == AdminChangeKind.APT_UPGRADE:
+    if profile.warn_on_apt_upgrade_rollback and AdminChangeKind(plan.kind) == AdminChangeKind.APT_UPGRADE:
         return PolicyCheck(
             "admin.rollback",
             PolicyCheckStatus.WARN,
@@ -199,28 +264,24 @@ def _rollback_check(plan: AdminChangePlan) -> PolicyCheck:
     return PolicyCheck("admin.rollback", PolicyCheckStatus.PASS, plan.owner_domain, "rollback steps are recorded")
 
 
-def _verification_check(plan: AdminChangePlan) -> PolicyCheck:
+def _verification_check(plan: AdminChangePlan, profile: PolicyProfile) -> PolicyCheck:
+    if not profile.require_verification_steps:
+        return PolicyCheck("admin.verification", PolicyCheckStatus.WARN, OwnerDomain.JULIAN, "policy profile allows missing verification steps")
     if not plan.verification_steps:
         return PolicyCheck("admin.verification", PolicyCheckStatus.BLOCK, plan.owner_domain, "verification steps are required")
     return PolicyCheck("admin.verification", PolicyCheckStatus.PASS, OwnerDomain.JULIAN, "verification steps are recorded")
 
 
-def _risk_approval_check(plan: AdminChangePlan) -> PolicyCheck:
+def _risk_approval_check(plan: AdminChangePlan, profile: PolicyProfile) -> PolicyCheck:
     risk_level = RiskLevel(plan.risk_level)
     approval_level = ApprovalLevel(plan.approval_level)
-    if risk_level == RiskLevel.CRITICAL and approval_level != ApprovalLevel.HUMAN:
+    minimum = ApprovalLevel(profile.minimum_approval_by_risk.get(risk_level, ApprovalLevel.HUMAN))
+    if APPROVAL_RANK[approval_level] < APPROVAL_RANK[minimum]:
         return PolicyCheck(
             "admin.risk.approval-level",
             PolicyCheckStatus.BLOCK,
             OwnerDomain.SISKO,
-            "critical admin changes require human approval",
-        )
-    if risk_level == RiskLevel.HIGH and approval_level in {ApprovalLevel.NONE, ApprovalLevel.ROLE}:
-        return PolicyCheck(
-            "admin.risk.approval-level",
-            PolicyCheckStatus.BLOCK,
-            OwnerDomain.SISKO,
-            "high-risk admin changes require Sisko or human approval",
+            f"{risk_level.value}-risk admin changes require at least {minimum.value} approval",
         )
     return PolicyCheck(
         "admin.risk.approval-level",
@@ -228,3 +289,159 @@ def _risk_approval_check(plan: AdminChangePlan) -> PolicyCheck:
         OwnerDomain.SISKO,
         "risk level and approval level are compatible",
     )
+
+
+def policy_profile_from_mapping(mapping: Mapping[str, object]) -> PolicyProfile:
+    approvals = mapping.get("minimum_approval_by_risk", {})
+    if not isinstance(approvals, Mapping):
+        raise ValueError("minimum_approval_by_risk must be an object")
+    return PolicyProfile(
+        name=str(mapping.get("name", BEST_PRACTICE_POLICY_PROFILE.name)),
+        description=str(mapping.get("description", BEST_PRACTICE_POLICY_PROFILE.description)),
+        minimum_approval_by_risk={
+            RiskLevel(risk): ApprovalLevel(level)
+            for risk, level in ({
+                risk.value: BEST_PRACTICE_POLICY_PROFILE.minimum_approval_by_risk[risk].value
+                for risk in RiskLevel
+            } | {str(risk): str(level) for risk, level in approvals.items()}).items()
+        },
+        require_live_adapter_enabled=_bool_setting(mapping, "require_live_adapter_enabled", True),
+        require_rollback_steps=_bool_setting(mapping, "require_rollback_steps", True),
+        warn_on_apt_upgrade_rollback=_bool_setting(mapping, "warn_on_apt_upgrade_rollback", True),
+        require_verification_steps=_bool_setting(mapping, "require_verification_steps", True),
+        require_ids_review_for_firewall=_bool_setting(mapping, "require_ids_review_for_firewall", True),
+        block_warnings_until_accepted=_bool_setting(mapping, "block_warnings_until_accepted", True),
+    )
+
+
+def _bool_setting(mapping: Mapping[str, object], key: str, default: bool) -> bool:
+    value = mapping.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "on"}:
+            return True
+        if lowered in {"false", "no", "0", "off"}:
+            return False
+    raise ValueError(f"{key} must be a boolean")
+
+
+def policy_profile_status(profile: PolicyProfile = BEST_PRACTICE_POLICY_PROFILE) -> dict[str, object]:
+    return {
+        "name": profile.name,
+        "description": profile.description,
+        "minimum_approval_by_risk": {
+            risk.value: ApprovalLevel(profile.minimum_approval_by_risk[risk]).value
+            for risk in RiskLevel
+        },
+        "require_live_adapter_enabled": profile.require_live_adapter_enabled,
+        "require_rollback_steps": profile.require_rollback_steps,
+        "warn_on_apt_upgrade_rollback": profile.warn_on_apt_upgrade_rollback,
+        "require_verification_steps": profile.require_verification_steps,
+        "require_ids_review_for_firewall": profile.require_ids_review_for_firewall,
+        "block_warnings_until_accepted": profile.block_warnings_until_accepted,
+    }
+
+
+def policy_customization_questions() -> tuple[PolicyQuestion, ...]:
+    return (
+        PolicyQuestion(
+            id="risk-low-approval",
+            prompt="What minimum approval should low-risk admin changes require?",
+            profile_key="minimum_approval_by_risk.low",
+            default=ApprovalLevel.NONE.value,
+            options=tuple(level.value for level in ApprovalLevel),
+            rationale="Low-risk observation or localhost maintenance should not create unnecessary friction.",
+        ),
+        PolicyQuestion(
+            id="risk-medium-approval",
+            prompt="What minimum approval should medium-risk admin changes require?",
+            profile_key="minimum_approval_by_risk.medium",
+            default=ApprovalLevel.SISKO.value,
+            options=tuple(level.value for level in ApprovalLevel),
+            rationale="Medium-risk service or package work can interrupt local coordination.",
+        ),
+        PolicyQuestion(
+            id="risk-high-approval",
+            prompt="What minimum approval should high-risk admin changes require?",
+            profile_key="minimum_approval_by_risk.high",
+            default=ApprovalLevel.SISKO.value,
+            options=tuple(level.value for level in ApprovalLevel),
+            rationale="High-risk changes can affect network exposure, packages, or shared resources.",
+        ),
+        PolicyQuestion(
+            id="risk-critical-approval",
+            prompt="What minimum approval should critical admin changes require?",
+            profile_key="minimum_approval_by_risk.critical",
+            default=ApprovalLevel.HUMAN.value,
+            options=tuple(level.value for level in ApprovalLevel),
+            rationale="Critical changes should preserve a manual decision point.",
+        ),
+        PolicyQuestion(
+            id="live-adapter-required",
+            prompt="Should execution require an enabled live adapter for the exact change kind?",
+            profile_key="require_live_adapter_enabled",
+            default=True,
+            options=(True, False),
+            rationale="Typed adapters keep command boundaries auditable and prevent accidental shell execution.",
+        ),
+        PolicyQuestion(
+            id="rollback-required",
+            prompt="Should admin plans require rollback steps before execution?",
+            profile_key="require_rollback_steps",
+            default=True,
+            options=(True, False),
+            rationale="Rollback evidence is needed to recover from failed host changes.",
+        ),
+        PolicyQuestion(
+            id="apt-upgrade-warning",
+            prompt="Should package upgrades keep a residual rollback warning until explicitly accepted?",
+            profile_key="warn_on_apt_upgrade_rollback",
+            default=True,
+            options=(True, False),
+            rationale="Package downgrades are not always available or safe.",
+        ),
+        PolicyQuestion(
+            id="verification-required",
+            prompt="Should admin plans require post-change verification steps?",
+            profile_key="require_verification_steps",
+            default=True,
+            options=(True, False),
+            rationale="Verification confirms the requested state actually changed and the service is usable.",
+        ),
+        PolicyQuestion(
+            id="ids-review-required",
+            prompt="Should firewall-affecting plans require accepted Intrusion Detection advisory review?",
+            profile_key="require_ids_review_for_firewall",
+            default=True,
+            options=(True, False),
+            rationale="IDS review reduces the chance of weakening network defenses or blocking legitimate work.",
+        ),
+        PolicyQuestion(
+            id="warnings-block",
+            prompt="Should warning policy decisions block execution until explicitly accepted?",
+            profile_key="block_warnings_until_accepted",
+            default=True,
+            options=(True, False),
+            rationale="Warnings represent residual risk that should be acknowledged before execution.",
+        ),
+    )
+
+
+def policy_customization_helper_status(profile: PolicyProfile = BEST_PRACTICE_POLICY_PROFILE) -> dict[str, object]:
+    return {
+        "profile": policy_profile_status(profile),
+        "questions": [
+            {
+                "id": question.id,
+                "prompt": question.prompt,
+                "profile_key": question.profile_key,
+                "default": question.default,
+                "options": list(question.options),
+                "rationale": question.rationale,
+            }
+            for question in policy_customization_questions()
+        ],
+        "next_step": "answer the questions, update the profile JSON fields, then pass the file with --policy-profile",
+    }

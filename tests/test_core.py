@@ -73,6 +73,7 @@ from overseer import (
     PathPhysicalDiscoveryAdapter,
     StoragePhysicalDiscoveryAdapter,
     ListenerVirtualDiscoveryAdapter,
+    PolicyProfile,
     PolicyCheckStatus,
     ProbeResult,
     ProbeType,
@@ -116,6 +117,8 @@ from overseer import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_user_service_restart,
+    policy_customization_helper_status,
+    policy_profile_from_mapping,
     SourceReviewDisposition,
 )
 from overseer.api import make_api_handler, run_api_server
@@ -3064,6 +3067,18 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(status["targets"], 1)
             self.assertEqual(status["missing_evidence"], 1)
 
+    def test_client_reads_policy_customization_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                client = OverseerApiClient(server.url, auth_token="client-secret")
+                status = client.policy_customization_helper()
+
+            self.assertEqual(status["profile"]["name"], "best-practice")
+            self.assertIn("questions", status)
+            self.assertIn("next_step", status)
+
     def test_client_runs_stored_health_probes(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4883,6 +4898,71 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.PASS.value)
         self.assertIn("accepted residual warning", checks["admin.rollback"]["summary"])
         self.assertEqual(after["pending_policy_warning_approval_count"], 0)
+
+    def test_policy_customization_helper_reports_best_practice_questions(self):
+        status = policy_customization_helper_status()
+        question_ids = {question["id"] for question in status["questions"]}
+
+        self.assertEqual(status["profile"]["name"], "best-practice")
+        self.assertEqual(status["profile"]["minimum_approval_by_risk"]["medium"], ApprovalLevel.SISKO.value)
+        self.assertIn("risk-medium-approval", question_ids)
+        self.assertIn("warnings-block", question_ids)
+
+    def test_policy_profile_from_mapping_customizes_warning_execution_gate(self):
+        profile = policy_profile_from_mapping(
+            {
+                "name": "lab-relaxed",
+                "block_warnings_until_accepted": False,
+                "minimum_approval_by_risk": {"medium": "role"},
+            }
+        )
+
+        self.assertEqual(profile.name, "lab-relaxed")
+        self.assertFalse(profile.block_warnings_until_accepted)
+        self.assertEqual(profile.minimum_approval_by_risk[RiskLevel.MEDIUM], ApprovalLevel.ROLE)
+
+    def test_execute_admin_change_status_can_use_policy_profile_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            profile_path = root / "policy-profile.json"
+            profile_path.write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "warning-observing",
+                            "block_warnings_until_accepted": False,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.profile",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply approved patch",
+                "upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
+            approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.profile", "operator")
+
+            result = execute_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.profile",
+                runner=lambda step: AdminCommandResult(
+                    title=step.title,
+                    command=step.command,
+                    exit_code=0,
+                    stdout="ok",
+                ),
+                policy_profile_path=profile_path,
+            )
+
+        self.assertEqual(result["status"], AdminExecutionStatus.COMPLETED.value)
 
 
 class PhysicalIdentityTests(unittest.TestCase):

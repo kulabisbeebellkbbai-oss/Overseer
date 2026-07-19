@@ -53,6 +53,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /admin/executions`
 - `GET /admin/execution-readiness`
 - `GET /admin/policies`
+- `GET /admin/policy-customization-helper`
 - `GET /admin/history-review`
 - `GET /admin/history-archive-plan`
 - `GET /admin/history-archives`
@@ -122,6 +123,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `GET /admin/executions` lists persisted admin execution results, including blocked and failed attempts.
 `GET /admin/execution-readiness` explains each admin plan's execution gate state, including approval, missing fields, IDS review, manual execution, and Overseer-supported execution readiness.
 `GET /admin/policies` evaluates stored admin plans against approval, adapter, IDS, rollback, verification, and risk policy checks. It supports `?plan_id=...` filtering.
+`GET /admin/policy-customization-helper` returns Sisko's best-practice policy profile plus stable Q/A prompts for creating a custom policy profile on this or any new Overseer install.
 `GET /admin/history-review` identifies completed and canceled admin plans that are candidates for archive handling. It is read-only and does not delete plans or audit evidence.
 `GET /admin/history-archive-plan` prepares a read-only archive manifest for inactive admin plans. It groups each archive candidate with related execution, IDS review, and audit records, and does not mutate state.
 `GET /admin/history-archives` lists persisted archive records and supports `?plan_id=...` filtering. It is read-only and does not restore or modify plans.
@@ -234,6 +236,7 @@ warning_approval = client.approve_admin_policy_warning(
 execution = client.execute_admin_change({"plan_id": "admin.restart.overseer-api"})
 executions = client.admin_executions()
 admin = client.admin_summary()
+policy_helper = client.policy_customization_helper()
 canceled = client.cancel_admin_change(
     {
         "plan_id": "admin.block.example",

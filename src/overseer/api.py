@@ -66,6 +66,7 @@ from .cli import (
     plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
+    policy_customization_helper_cli_status,
     probe_stored_health_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
@@ -211,6 +212,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/admin/policies":
                 self._handle(lambda: admin_policy_status(store_path, _query_first(query, "plan_id")))
+                return
+            if path == "/admin/policy-customization-helper":
+                self._handle(lambda: policy_customization_helper_cli_status())
                 return
             if path == "/admin/history-review":
                 self._handle(lambda: admin_history_review_status(store_path))

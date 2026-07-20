@@ -20,6 +20,20 @@
       "type": "service",
       "owner_domain": "julian",
       "risk_level": "low"
+    },
+    {
+      "id": "svc.mcp.documents",
+      "name": "Documents MCP",
+      "type": "service",
+      "owner_domain": "ezri",
+      "risk_level": "medium",
+      "identifiers": {
+        "kind": "stdio_mcp",
+        "command": "/home/god/.local/bin/overseer-documents-mcp",
+        "vault": "/home/god/Documents/Overseer Documents",
+        "env_file": "/home/god/.local/share/overseer/secrets/obsidian-mcp.env"
+      },
+      "notes": "Obsidian-backed Documents MCP. Secret file stores OBSIDIAN_API_KEY outside git; health target is deferred until token and Local REST API listener are active."
     }
   ],
   "health_targets": [

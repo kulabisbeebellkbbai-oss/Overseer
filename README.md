@@ -141,6 +141,7 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Live health probes: `docs/live-health-probes.md`
 - Physical discovery: `docs/physical-discovery.md`
 - Foreground runtime and local API service: `docs/runtime.md`
+- Documents MCP setup: `docs/documents-mcp.md`
 
 The current runtime is a Python package with CLI entrypoints, an optional localhost-only HTTP API, SQLite persistence, and CI-backed unit coverage. Live host mutation is intentionally limited to user-service restart plans by default. Package installs, package index refreshes, package upgrades, firewall changes, and source blocks become eligible for Overseer execution only when the same store contains an approved adapter enablement request for that exact kind, and each admin change plan still requires its own approval, IDS review when applicable, execution evidence, and verification results.
 

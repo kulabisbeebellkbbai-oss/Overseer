@@ -12,6 +12,7 @@ The runtime entrypoint can run a single foreground tick against an explicit SQLi
 - Configured health probes are read-only HTTP requests and run only when `--probe-health-targets` is supplied.
 - Runtime health evidence is pruned per target with `--health-evidence-retention-per-target`.
 - Host inspection snapshots are read-only command and file observations and run only when `--inspect-host` is supplied.
+- Knowledge capture writes crew-message and audit-event notes through Ezri's Documents API only when `--capture-knowledge-events` is supplied.
 - Enabling host inspection in the installed user service changes the service runtime command and requires an explicit approved admin plan before restart.
 
 ## CLI
@@ -22,6 +23,7 @@ PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-crew-messages
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-usage-continuations
+PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --capture-knowledge-events
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli daemon-migration-plan --store state/overseer.sqlite3
@@ -36,6 +38,8 @@ PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sql
 `--dispatch-crew-messages` lets Sisko drain open crew requests on each runtime tick. Dispatchers may inspect local state, refresh inventories, run health probes, create usage-continuation requests, stage claims, stage remediation plans, or approve exact Sisko-targeted plan IDs. They do not execute host changes.
 
 `--dispatch-usage-continuations` lets Quark persist dispatch handoff records for usage-limited work that is ready on each runtime tick. It does not resume Codex threads; use `dispatch-usage-continuations --resume-codex-projects` for an explicit live resume action.
+
+`--capture-knowledge-events` lets Ezri write deterministic Documents notes for persisted crew messages and audit events. It uses the same local Obsidian env file as the Documents CLI and records captured/failed counts in the runtime tick output.
 
 `daemon-migration-plan` is a read-only Sisko gate for foreground-to-daemon migration. `request-daemon-migration` and `approve-daemon-migration` record the approval state required before changing user service enablement or runtime commands; they do not edit systemd state or restart services.
 

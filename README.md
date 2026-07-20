@@ -45,6 +45,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --inspect-host` - run one tick and capture read-only host admin evidence.
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-crew-messages` - run one tick and let Sisko dispatch open crew messages without executing host changes.
 - `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-usage-continuations` - run one tick and let Quark dispatch ready usage-limited continuation handoffs without resuming threads.
+- `PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --capture-knowledge-events` - run one tick and let Ezri capture crew messages and audit events into Documents notes.
 - `PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3` - read the stored runtime heartbeat for the local service.
 - `PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3` - read runtime heartbeat plus latest host-inspection freshness, stale-state assessment, security finding counts, and persisted freshness alert IDs.
 - `PYTHONPATH=src python3 -m overseer.cli persistence-security --store state/overseer.sqlite3` - inspect SQLite store file ownership and permissions without creating or changing files.
@@ -57,6 +58,7 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli documents-status` - check Ezri's Obsidian Local REST API readiness through the ignored local env file.
 - `PYTHONPATH=src python3 -m overseer.cli documents-search --query Overseer` - search the local Obsidian vault through Ezri without exposing the Obsidian token.
 - `PYTHONPATH=src python3 -m overseer.cli documents-write-note --path Overseer/Inbox/operator-note.md --content-file /path/to/note.md` - append markdown to an approved Documents vault path.
+- `PYTHONPATH=src python3 -m overseer.cli capture-knowledge-events --store state/overseer.sqlite3 --dry-run` - preview crew-message and audit-event notes Ezri can capture under `Overseer/Knowledge/`.
 - `PYTHONPATH=src python3 -m overseer.cli discover-codex-project-threads --store state/overseer.sqlite3` - import local `codex-projects` registry rows as Quark-owned thread resources without starting sessions.
 - `PYTHONPATH=src python3 -m overseer.cli record-usage-limit --store state/overseer.sqlite3 --limit-id limit.service.requests --resource-id svc.service --kind requests --capacity 100 --remaining 25 --window hourly` - record or update Quark usage-limit evidence.
 - `PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3` - summarize Quark continuation requests and dispatch handoffs.

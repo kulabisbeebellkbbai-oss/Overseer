@@ -66,9 +66,27 @@ The operator console's Documents tab uses Overseer API routes instead of reading
 
 - `GET /documents/status` checks plugin availability, authentication, version metadata, and the write-prefix boundary.
 - `GET /documents/notes?folder=Overseer` lists notes in a vault folder.
+- `GET /documents/knowledge-capture-plan?kind=crew&limit=12` previews crew-message and audit-event notes that Ezri can write.
 - `POST /documents/search` searches the vault with a JSON body containing `query` and optional `context_length`.
 - `POST /documents/notes` appends or replaces a markdown note under `Overseer/` or `Inbox/`.
+- `POST /documents/knowledge-capture` writes selected crew-message and audit-event notes under `Overseer/Knowledge/`.
 
 These routes still require the Overseer API bearer token when the local API is started with `--auth-token-file`.
 
-The matching CLI commands are `documents-status`, `documents-notes`, `documents-search`, and `documents-write-note`. `documents-write-note` reads markdown from `--content-file` and still enforces the `Overseer/` or `Inbox/` write-prefix boundary.
+The matching CLI commands are `documents-status`, `documents-notes`, `documents-search`, `documents-write-note`, and `capture-knowledge-events`. `documents-write-note` reads markdown from `--content-file` and still enforces the `Overseer/` or `Inbox/` write-prefix boundary.
+
+## Knowledge Capture
+
+Ezri can capture Overseer crew messages and audit events into stable markdown notes:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli capture-knowledge-events --store state/overseer.sqlite3 --dry-run
+PYTHONPATH=src python3 -m overseer.cli capture-knowledge-events --store state/overseer.sqlite3 --kind crew --kind audit --limit 25
+```
+
+Capture uses `replace` writes to deterministic paths so repeated runs update the same notes instead of appending duplicates. Note paths are grouped by owner:
+
+- `Overseer/Knowledge/Crew/<owner>/<message-id>.md`
+- `Overseer/Knowledge/Events/<owner>/<event-id>.md`
+
+Long IDs use a readable prefix plus a short hash suffix to avoid filename collisions. Capture never passes the Obsidian API key through command-line arguments or browser JavaScript.

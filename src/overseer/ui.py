@@ -577,6 +577,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "approve-admin-change") return await approveAdminChange();
       if (action === "cancel-admin-change") return await cancelAdminChange();
       if (action === "execute-admin-change") return await executeAdminChange();
+      if (action === "request-admin-adapter-enablement") return await requestAdminAdapterEnablement();
+      if (action === "approve-admin-adapter-enablement") return await approveAdminAdapterEnablement();
       if (action === "request-admin-archive") return await requestAdminArchive();
       if (action === "approve-admin-archive") return await approveAdminArchive();
       if (action === "archive-admin-history") return await archiveAdminHistory();
@@ -694,6 +696,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function executeAdminChange() {
       return await postJson("/admin/execute", {
         plan_id: value("admin-execute-plan-id")
+      });
+    }
+    async function requestAdminAdapterEnablement() {
+      return await postJson("/admin/adapter-enablement-requests", {
+        kind: value("admin-adapter-kind"),
+        requested_by: value("admin-adapter-requested-by") || "sisko"
+      });
+    }
+    async function approveAdminAdapterEnablement() {
+      return await postJson("/admin/adapter-enablement-requests/approve", {
+        approval_id: value("admin-adapter-approval-id"),
+        approved_by: value("admin-adapter-approved-by") || "sisko"
       });
     }
     async function requestAdminArchive() {
@@ -976,6 +990,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="admin-cancel-plan-id">Plan ID</label><input id="admin-cancel-plan-id"></div>
               <div class="field span-3"><label for="admin-canceled-by">By</label><input id="admin-canceled-by" value="sisko"></div>
               <div class="field span-3"><label for="admin-cancel-reason">Reason</label><input id="admin-cancel-reason"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Adapter Enablement</h3><div class="actions"><button class="action-btn" data-action="request-admin-adapter-enablement">Request</button><button class="action-btn" data-action="approve-admin-adapter-enablement">Approve</button></div></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="admin-adapter-kind">Kind</label><select id="admin-adapter-kind">${adminKindOptions()}</select></div>
+              <div class="field span-4"><label for="admin-adapter-requested-by">Requested By</label><input id="admin-adapter-requested-by" value="sisko"></div>
+              <div class="field span-4"><label for="admin-adapter-approval-id">Approval ID</label><input id="admin-adapter-approval-id"></div>
+              <div class="field span-4"><label for="admin-adapter-approved-by">Approved By</label><input id="admin-adapter-approved-by" value="sisko"></div>
             </div>
           </div>
           <div class="panel span-6">

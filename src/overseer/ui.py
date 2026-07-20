@@ -221,6 +221,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .pill.good { color: var(--good); border-color: rgba(123, 216, 143, 0.48); background: rgba(43, 83, 58, 0.30); }
     .pill.warn { color: var(--warn); border-color: rgba(240, 195, 106, 0.50); background: rgba(92, 68, 29, 0.30); }
     .pill.bad { color: var(--bad); border-color: rgba(255, 122, 120, 0.50); background: rgba(101, 45, 50, 0.34); }
+    .mini-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 12px;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -1297,9 +1303,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function officerPanel(role, subject, prompt, relatedLimitId = "") {
       const prefix = rolePrefix(`${role}-${subject}`);
-      const recent = ((state.data.crewMessages || {}).items || []).filter((item) => item.owner_domain === role).slice(0, 5);
+      const crewData = state.data.crewMessages || {};
+      const crewCounts = ((crewData.by_owner_domain || {})[role]) || {};
+      const messages = (crewData.items || []).filter((item) => item.owner_domain === role);
+      const openMessages = messages.filter((item) => item.status === "open");
+      const recentMessages = messages.slice(0, 5);
+      const dispatches = (crewData.recent_dispatches || []).filter((item) => item.owner_domain === role);
+      const blockedDispatches = dispatches.filter((item) => item.event_type === "blocked");
       return `<div class="panel span-12 officer-channel">
         <div class="toolbar"><h3>${safe(officerName(role))} Channel</h3><div class="actions"><button class="action-btn" data-action="dispatch-crew-messages" data-role="${safe(role)}">Dispatch Open</button><button class="action-btn" data-action="send-crew-message" data-role="${safe(role)}" data-prefix="${safe(prefix)}">Send Request</button></div></div>
+        <div class="mini-metrics">
+          <span class="pill">${safe(crewCounts.open ?? 0)} open</span>
+          <span class="pill">${safe(crewCounts.dispatches ?? 0)} dispatched</span>
+          <span class="pill ${crewCounts.blocked_dispatches ? "warn" : "good"}">${safe(crewCounts.blocked_dispatches ?? 0)} blocked</span>
+        </div>
         <div class="form-grid">
           <div class="field span-3"><label for="${prefix}-subject">Subject</label><input id="${prefix}-subject" value="${safe(subject)}"></div>
           <div class="field span-2"><label for="${prefix}-priority">Priority</label><select id="${prefix}-priority">${riskOptions()}</select></div>
@@ -1308,7 +1325,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="field span-2"><label for="${prefix}-plan-id">Plan</label><input id="${prefix}-plan-id"></div>
           <div class="field span-2"><label for="${prefix}-limit-id">Limit</label><input id="${prefix}-limit-id" value="${safe(relatedLimitId)}"></div>
           <div class="field span-6"><label for="${prefix}-message">Issue</label><textarea id="${prefix}-message">${safe(prompt)}</textarea></div>
-          <div class="field span-6">${table("Recent Requests", recent, ["id", "priority", "status", "subject", "created_at"])}</div>
+          <div class="field span-6">${table("Open Queue", openMessages, ["id", "priority", "subject", "created_at"])}</div>
+          <div class="field span-6">${table("Dispatch History", dispatches, ["occurred_at", "event_type", "message_id", "reason"])}</div>
+          <div class="field span-6">${table("Blocked Reasons", blockedDispatches, ["occurred_at", "message_id", "reason"])}</div>
+          <div class="field span-12">${table("Recent Requests", recentMessages, ["id", "priority", "status", "subject", "created_at"])}</div>
         </div>
       </div>`;
     }

@@ -1271,6 +1271,7 @@ def run_status(
             probe_health_targets=probe_health_targets,
             health_evidence_retention_per_target=health_evidence_retention_per_target,
             inspect_host=inspect_host,
+            host_security_advancer=lambda path, snapshot_id: advance_odo_security_status(path, snapshot_id),
             dispatch_crew_messages=dispatch_crew_messages,
             crew_dispatcher=lambda path: dispatch_crew_messages_status(path, dispatched_by="sisko"),
             dispatch_usage_continuations=dispatch_usage_continuations,
@@ -1291,6 +1292,10 @@ def run_status(
             "host_inspections": tick.host_inspections,
             "host_security_high_findings": tick.host_security_high_findings,
             "host_security_warning_findings": tick.host_security_warning_findings,
+            "host_security_remediation_plans_staged": tick.host_security_remediation_plans_staged,
+            "host_security_ids_reviews_prepared": tick.host_security_ids_reviews_prepared,
+            "host_security_sisko_requests": tick.host_security_sisko_requests,
+            "host_security_auto_executions": tick.host_security_auto_executions,
             "crew_messages_dispatched": tick.crew_messages_dispatched,
             "crew_messages_blocked": tick.crew_messages_blocked,
             "usage_continuations_dispatched": tick.usage_continuations_dispatched,
@@ -4955,16 +4960,40 @@ def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str
 def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
     inspection = inspect_host_status(store_path)
     try:
-        remediation = plan_host_security_listener_queue_remediations_status(store_path, inspection["id"], requested_by="odo")
+        advancement = advance_odo_security_status(store_path, str(inspection["id"]), advanced_at=dispatched_at)
     except ValueError as error:
-        remediation = {"status": "skipped", "reason": str(error)}
-    advancement = _advance_odo_remediation_plans(store_path, remediation, dispatched_at)
+        advancement = {"status": "skipped", "reason": str(error)}
     return _crew_dispatch_result(
         message,
         "dispatched",
         "Odo inspected host security, staged listener remediation plans, and advanced exact approval or execution gates",
-        [inspection, remediation, advancement],
+        [inspection, advancement],
     )
+
+
+def advance_odo_security_status(
+    store_path: str | Path,
+    snapshot_id: str | None = None,
+    requested_by: str = "odo",
+    advanced_at: str | None = None,
+) -> dict[str, object]:
+    now = advanced_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    remediation = plan_host_security_listener_queue_remediations_status(
+        store_path,
+        snapshot_id=snapshot_id,
+        requested_by=requested_by,
+    )
+    advancement = _advance_odo_remediation_plans(store_path, remediation, now)
+    return {
+        "store": str(Path(store_path)),
+        "status": "advanced",
+        "snapshot_id": remediation.get("snapshot_id"),
+        "staged_count": remediation.get("staged_count", 0),
+        "skipped_count": remediation.get("skipped_count", 0),
+        "candidate_ports": remediation.get("candidate_ports", 0),
+        "remediation": remediation,
+        **advancement,
+    }
 
 
 def _advance_odo_remediation_plans(

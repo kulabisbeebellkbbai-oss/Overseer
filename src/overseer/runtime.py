@@ -28,6 +28,10 @@ class RuntimeTick:
     host_inspections: int
     host_security_high_findings: int
     host_security_warning_findings: int
+    host_security_remediation_plans_staged: int
+    host_security_ids_reviews_prepared: int
+    host_security_sisko_requests: int
+    host_security_auto_executions: int
     crew_messages_dispatched: int
     crew_messages_blocked: int
     usage_continuations_dispatched: int
@@ -46,6 +50,7 @@ class OverseerRuntime:
         health_evidence_retention_per_target: int = 5,
         inspect_host: bool = False,
         host_inspection_adapter: HostInspectionAdapter | None = None,
+        host_security_advancer: Callable[[str, str], dict[str, Any]] | None = None,
         dispatch_crew_messages: bool = False,
         crew_dispatcher: Callable[[str], dict[str, Any]] | None = None,
         dispatch_usage_continuations: bool = False,
@@ -60,6 +65,7 @@ class OverseerRuntime:
         self.health_evidence_retention_per_target = health_evidence_retention_per_target
         self.inspect_host = inspect_host
         self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter()
+        self.host_security_advancer = host_security_advancer
         self.dispatch_crew_messages = dispatch_crew_messages
         self.crew_dispatcher = crew_dispatcher
         self.dispatch_usage_continuations = dispatch_usage_continuations
@@ -72,7 +78,15 @@ class OverseerRuntime:
     def tick(self) -> RuntimeTick:
         self.tick_count += 1
         health_probes = self._probe_health_targets()
-        host_inspections, host_high_findings, host_warning_findings = self._inspect_host()
+        (
+            host_inspections,
+            host_high_findings,
+            host_warning_findings,
+            remediation_plans_staged,
+            ids_reviews_prepared,
+            sisko_requests,
+            auto_executions,
+        ) = self._inspect_host()
         crew_dispatched, crew_blocked = self._dispatch_crew_messages()
         usage_dispatched, usage_skipped = self._dispatch_usage_continuations()
         knowledge_captured, knowledge_failed = self._capture_knowledge_events()
@@ -97,6 +111,10 @@ class OverseerRuntime:
             host_inspections=host_inspections,
             host_security_high_findings=host_high_findings,
             host_security_warning_findings=host_warning_findings,
+            host_security_remediation_plans_staged=remediation_plans_staged,
+            host_security_ids_reviews_prepared=ids_reviews_prepared,
+            host_security_sisko_requests=sisko_requests,
+            host_security_auto_executions=auto_executions,
             crew_messages_dispatched=crew_dispatched,
             crew_messages_blocked=crew_blocked,
             usage_continuations_dispatched=usage_dispatched,
@@ -122,15 +140,26 @@ class OverseerRuntime:
         self.store.prune_health_evidence(self.health_evidence_retention_per_target)
         return len(targets)
 
-    def _inspect_host(self) -> tuple[int, int, int]:
+    def _inspect_host(self) -> tuple[int, int, int, int, int, int, int]:
         if not self.inspect_host:
-            return 0, 0, 0
+            return 0, 0, 0, 0, 0, 0, 0
         snapshot = self.host_inspection_adapter.inspect()
         self.store.save_host_snapshot(snapshot)
         findings = assess_host_security(snapshot)
         high_findings = sum(1 for finding in findings if finding.severity == "high")
         warning_findings = sum(1 for finding in findings if finding.severity == "warning")
-        return 1, high_findings, warning_findings
+        if self.host_security_advancer is None:
+            return 1, high_findings, warning_findings, 0, 0, 0, 0
+        advancement = self.host_security_advancer(str(self.store.path), snapshot.id)
+        return (
+            1,
+            high_findings,
+            warning_findings,
+            int(advancement.get("staged_count", 0)),
+            int(advancement.get("ids_reviews_prepared", 0)),
+            int(advancement.get("sisko_requests", 0)),
+            int(advancement.get("executions", 0)),
+        )
 
     def _dispatch_crew_messages(self) -> tuple[int, int]:
         if not self.dispatch_crew_messages or self.crew_dispatcher is None:

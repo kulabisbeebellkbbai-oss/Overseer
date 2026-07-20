@@ -12,6 +12,7 @@ The runtime entrypoint can run a single foreground tick against an explicit SQLi
 - Configured health probes are read-only HTTP requests and run only when `--probe-health-targets` is supplied.
 - Runtime health evidence is pruned per target with `--health-evidence-retention-per-target`.
 - Host inspection snapshots are read-only command and file observations and run only when `--inspect-host` is supplied.
+- Each host inspection automatically lets Odo advance security findings to the next safe gate: stage remediation plans, prepare IDS/firewall review packages, queue exact Sisko approval requests, or execute only plans that have no approval gate.
 - Knowledge capture writes crew-message and audit-event notes through Ezri's Documents API only when `--capture-knowledge-events` is supplied.
 - Enabling host inspection in the installed user service changes the service runtime command and requires an explicit approved admin plan before restart.
 
@@ -35,7 +36,9 @@ PYTHONPATH=src python3 -m overseer.cli health-summary --store state/overseer.sql
 
 `runtime-status` is the monitor-friendly surface for Julian and Odo. It reports the service heartbeat, latest host inspection snapshot id and capture time, freshness state, and current high/warning host security finding counts without requiring consumers to parse raw snapshots.
 
-`--dispatch-crew-messages` lets Sisko drain open crew requests on each runtime tick. Dispatchers may inspect local state, refresh inventories, run health probes, create usage-continuation requests, stage claims, stage remediation plans, or approve exact Sisko-targeted plan IDs. They do not execute host changes.
+When `--inspect-host` is enabled, Odo does not wait for an operator crew message to work the security queue. The runtime stages listener remediation plans from the latest snapshot, prepares IDS/firewall advisory packages when those gates apply, and creates exact Sisko messages tied to the plan IDs. Firewall, IDS, route, bind, service, and other high-risk changes remain blocked until the applicable IDS, Sisko, and human approval gates are satisfied. Plans with no approval gate may execute automatically after policy and adapter checks pass.
+
+`--dispatch-crew-messages` lets Sisko drain open crew requests on each runtime tick. Dispatchers may inspect local state, refresh inventories, run health probes, create usage-continuation requests, stage claims, stage remediation plans, approve exact Sisko-targeted plan IDs, or execute no-approval plans after policy checks pass.
 
 `--dispatch-usage-continuations` lets Quark persist dispatch handoff records for usage-limited work that is ready on each runtime tick. It does not resume Codex threads; use `dispatch-usage-continuations --resume-codex-projects` for an explicit live resume action.
 

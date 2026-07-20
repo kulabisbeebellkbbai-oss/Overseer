@@ -8744,7 +8744,60 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tick.host_inspections, 1)
             self.assertEqual(tick.host_security_high_findings, 1)
             self.assertEqual(tick.host_security_warning_findings, 0)
+            self.assertEqual(tick.host_security_remediation_plans_staged, 0)
+            self.assertEqual(tick.host_security_ids_reviews_prepared, 0)
+            self.assertEqual(tick.host_security_sisko_requests, 0)
+            self.assertEqual(tick.host_security_auto_executions, 0)
             self.assertEqual(store.list_host_snapshots()[0].hostname, "host-runtime")
+            store.close()
+
+    def test_runtime_advances_host_security_after_inspection_when_configured(self):
+        class FakeHostInspectionAdapter:
+            def inspect(self):
+                return HostInspectionAdapter(
+                    command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                        name=command[0],
+                        command=tuple(command),
+                        exit_code=0,
+                        stdout=(
+                            "host-runtime"
+                            if tuple(command) == ("hostname",)
+                            else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                            if tuple(command) == ("ss", "-ltnp")
+                            else "ok"
+                        ),
+                    ),
+                    file_reader=lambda path: "ID=debian\n",
+                ).inspect("2026-07-18T17:01:00+00:00")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            calls = []
+
+            def fake_advancer(store_path: str, snapshot_id: str) -> dict[str, object]:
+                calls.append((store_path, snapshot_id))
+                return {
+                    "staged_count": 2,
+                    "ids_reviews_prepared": 2,
+                    "sisko_requests": 2,
+                    "executions": 0,
+                }
+
+            tick = OverseerRuntime(
+                store,
+                inspect_host=True,
+                host_inspection_adapter=FakeHostInspectionAdapter(),
+                host_security_advancer=fake_advancer,
+            ).run(once=True)
+
+            self.assertEqual(tick.host_inspections, 1)
+            self.assertEqual(tick.host_security_high_findings, 1)
+            self.assertEqual(tick.host_security_remediation_plans_staged, 2)
+            self.assertEqual(tick.host_security_ids_reviews_prepared, 2)
+            self.assertEqual(tick.host_security_sisko_requests, 2)
+            self.assertEqual(tick.host_security_auto_executions, 0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][1], store.list_host_snapshots()[0].id)
             store.close()
 
     def test_runtime_dispatches_crew_messages_when_enabled(self):

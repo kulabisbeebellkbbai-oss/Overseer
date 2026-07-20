@@ -604,7 +604,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <button data-view="security">Security</button>
         <button data-view="health">Health</button>
         <button data-view="usage">Usage</button>
-        <button data-view="ezri">Ezri</button>
+        <button data-view="ezri">Documents</button>
         <button data-view="audit">Audit</button>
       </nav>
     </aside>
@@ -1589,25 +1589,27 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const primary = candidates[0] || {};
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
-          ${stationIntro("Ezri", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
+          ${stationIntro("Documents", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
           <div class="panel span-12">
             <div class="toolbar"><h3>Recommended Integration</h3><span class="pill good">open source</span></div>
             <div class="kb-grid">
               ${candidates.slice(0, 3).map((candidate) => kbCandidateCard(candidate)).join("")}
             </div>
           </div>
-          <div class="panel span-6">${kv("Ezri Default", {
+          <div class="panel span-6">${kv("Documents Default", {
             server: primary.name,
             license: primary.license,
             transport: primary.transport,
             source: primary.source,
-            install_boundary: "vault path and credential posture"
+            install_boundary: "Obsidian REST token and local vault configuration",
+            route_approval: "Obsidian REST/API-key approved"
           })}</div>
           <div class="panel span-6">${kv("Integration Notes", {
             primary_fit: "Obsidian vault read, write, search, and targeted edit tools",
-            fallback_fit: "direct filesystem vault access when Obsidian app or REST API is not desired",
+            approved_route: "Obsidian Local REST API with local bearer token storage",
+            fallback_fit: "direct filesystem vault access if REST is unavailable",
             storage_model: "local markdown vault",
-            approval_boundary: "external MCP install and vault path selection"
+            secret_boundary: "token must be stored locally and never committed"
           })}</div>
           <div class="panel span-12">${table("Knowledge Base Candidates", candidates, ["rank", "name", "license", "transport", "fit", "source"])}</div>
           ${officerPanel("ezri", "Documentation and knowledge base", "Capture or retrieve docs, runbooks, decisions, troubleshooting notes, and knowledge-base MCP integration requests.")}

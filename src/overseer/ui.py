@@ -459,6 +459,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       adminArchivePlan: "/admin/history-archive-plan",
       adminArchives: "/admin/history-archives",
       activePolicy: "/admin/active-policy-profile",
+      policyHelper: "/admin/policy-customization-helper",
       packageStatus: "/maintenance/package-status",
       physical: "/physical-summary",
       virtual: "/virtual-summary",
@@ -580,6 +581,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "execute-admin-change") return await executeAdminChange();
       if (action === "request-admin-adapter-enablement") return await requestAdminAdapterEnablement();
       if (action === "approve-admin-adapter-enablement") return await approveAdminAdapterEnablement();
+      if (action === "build-policy-profile") return await buildPolicyProfile();
+      if (action === "request-policy-warning") return await requestPolicyWarning();
+      if (action === "approve-policy-warning") return await approvePolicyWarning();
       if (action === "request-admin-archive") return await requestAdminArchive();
       if (action === "approve-admin-archive") return await approveAdminArchive();
       if (action === "archive-admin-history") return await archiveAdminHistory();
@@ -709,6 +713,29 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/admin/adapter-enablement-requests/approve", {
         approval_id: value("admin-adapter-approval-id"),
         approved_by: value("admin-adapter-approved-by") || "sisko"
+      });
+    }
+    async function buildPolicyProfile() {
+      const answers = {
+        name: value("policy-profile-name") || "custom",
+        description: value("policy-profile-description") || "Customized Overseer policy profile."
+      };
+      ((state.data.policyHelper || {}).questions || []).forEach((question) => {
+        answers[question.id] = typedPolicyAnswer(question, value(`policy-answer-${question.id}`));
+      });
+      return await postJson("/admin/policy-customization-helper/profile", {answers});
+    }
+    async function requestPolicyWarning() {
+      return await postJson("/admin/policy-warning-requests", {
+        plan_id: value("policy-warning-plan-id"),
+        check_id: value("policy-warning-check-id"),
+        requested_by: value("policy-warning-requested-by") || "sisko"
+      });
+    }
+    async function approvePolicyWarning() {
+      return await postJson("/admin/policy-warning-requests/approve", {
+        approval_id: value("policy-warning-approval-id"),
+        approved_by: value("policy-warning-approved-by") || "human"
       });
     }
     async function requestAdminArchive() {
@@ -951,6 +978,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const auth = state.data.authorizations || {};
       const readiness = state.data.readiness || {};
       const activePolicy = state.data.activePolicy || {};
+      const policyHelper = state.data.policyHelper || {};
       const packageStatus = state.data.packageStatus || {};
       const archivePlan = state.data.adminArchivePlan || {};
       const archives = state.data.adminArchives || {};
@@ -1043,6 +1071,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             path: activePolicy.path,
             next_step: activePolicy.next_step
           })}</div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Policy Customization Helper</h3><button class="action-btn" data-action="build-policy-profile">Build Profile</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="policy-profile-name">Name</label><input id="policy-profile-name" value="custom"></div>
+              <div class="field span-9"><label for="policy-profile-description">Description</label><input id="policy-profile-description" value="Customized Overseer policy profile."></div>
+              ${policyQuestionControls(policyHelper.questions || [])}
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Policy Warning Acceptance</h3><div class="actions"><button class="action-btn" data-action="request-policy-warning">Request</button><button class="action-btn" data-action="approve-policy-warning">Approve</button></div></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="policy-warning-plan-id">Plan ID</label><input id="policy-warning-plan-id"></div>
+              <div class="field span-4"><label for="policy-warning-check-id">Check ID</label><input id="policy-warning-check-id" value="admin.rollback"></div>
+              <div class="field span-4"><label for="policy-warning-requested-by">Requested By</label><input id="policy-warning-requested-by" value="sisko"></div>
+              <div class="field span-4"><label for="policy-warning-approval-id">Approval ID</label><input id="policy-warning-approval-id"></div>
+              <div class="field span-4"><label for="policy-warning-approved-by">Approved By</label><input id="policy-warning-approved-by" value="human"></div>
+            </div>
+          </div>
           <div class="panel span-6">${table("Adapter Capabilities", adapters.items || [], ["kind", "status", "adapter_name"])}</div>
           <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"])}</div>
           <div class="panel span-6">${table("Archive Candidates", archivePlan.items || [], ["plan_id", "disposition", "next_step"])}</div>
@@ -1274,6 +1320,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function idsReviewStatusOptions() {
       return ["accepted", "revision_required"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function policyQuestionControls(questions) {
+      return (questions || []).map((question) => {
+        const options = (question.options || []).map((option) => {
+          const selected = String(option) === String(question.default) ? " selected" : "";
+          return `<option value="${safe(option)}"${selected}>${safe(option)}</option>`;
+        }).join("");
+        return `<div class="field span-6"><label for="policy-answer-${safe(question.id)}">${safe(question.prompt)}</label><select id="policy-answer-${safe(question.id)}">${options}</select></div>`;
+      }).join("");
+    }
+    function typedPolicyAnswer(question, rawValue) {
+      const sample = (question.options || [])[0];
+      if (typeof sample === "boolean") return rawValue === "true";
+      return rawValue;
     }
     function value(id) {
       const element = document.getElementById(id);

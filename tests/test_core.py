@@ -2463,6 +2463,7 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("<button data-view=\"ezri\">Documents</button>", html)
             self.assertIn("<section id=\"ezri\"", html)
             self.assertIn("function renderEzri()", html)
+            self.assertIn('stationIntro("Ezri", "Knowledge Base"', html)
             self.assertIn("Documents Default", html)
             self.assertIn("Obsidian REST/API-key approved", html)
             self.assertIn("token must be stored locally and never committed", html)

@@ -1589,7 +1589,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const primary = candidates[0] || {};
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
-          ${stationIntro("Documents", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
+          ${stationIntro("Ezri", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
           <div class="panel span-12">
             <div class="toolbar"><h3>Recommended Integration</h3><span class="pill good">open source</span></div>
             <div class="kb-grid">

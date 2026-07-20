@@ -971,6 +971,7 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
                 store.path,
                 store.list_host_security_ids_review_packages(),
                 audit_events,
+                plans,
             ),
             "surfaces": [security_surface_status(resource) for resource in resources],
             "events": [audit_event_status(event) for event in alerts],
@@ -2405,6 +2406,7 @@ def host_security_ids_review_summary_status(store_path: str | Path) -> dict[str,
             store.path,
             store.list_host_security_ids_review_packages(),
             store.list_audit_events(),
+            store.list_admin_change_plans(),
         )
     finally:
         store.close()
@@ -2414,48 +2416,64 @@ def _host_security_ids_review_summary_payload(
     store_path: Path,
     packages: Sequence[HostSecurityIDSReviewPackage],
     audit_events: Sequence[AuditEvent],
+    plans: Sequence[AdminChangePlan] = (),
 ) -> dict[str, object]:
     ids_audit_events = [
         event
         for event in audit_events
         if event.id.startswith("audit.ids-review.") or event.subject_id.startswith("ids-review.")
     ]
+    plans_by_id = {plan.id: plan for plan in plans}
+    active_packages = [
+        package
+        for package in packages
+        if package.plan_id not in plans_by_id
+        or (not plans_by_id[package.plan_id].canceled and not plans_by_id[package.plan_id].archived)
+    ]
     return {
         "store": str(store_path),
-        "package_count": len(packages),
+        "package_count": len(active_packages),
+        "total_package_count": len(packages),
+        "inactive_plan_package_count": len(packages) - len(active_packages),
         "by_status": {
-            status.value: sum(1 for package in packages if package.status == status)
+            status.value: sum(1 for package in active_packages if package.status == status)
             for status in IDSReviewPackageStatus
         },
-        "gate_satisfied": sum(1 for package in packages if package.satisfies_pre_execution_review_gate()),
-        "gate_blocked": sum(1 for package in packages if not package.satisfies_pre_execution_review_gate()),
+        "gate_satisfied": sum(1 for package in active_packages if package.satisfies_pre_execution_review_gate()),
+        "gate_blocked": sum(1 for package in active_packages if not package.satisfies_pre_execution_review_gate()),
         "prepared_without_prompt": sum(
             1
-            for package in packages
+            for package in active_packages
             if package.status == IDSReviewPackageStatus.PREPARED and not package.prompt_path
         ),
         "prepared_with_prompt": sum(
             1
-            for package in packages
+            for package in active_packages
             if package.status == IDSReviewPackageStatus.PREPARED and package.prompt_path
         ),
         "submitted_without_result": sum(
             1
-            for package in packages
+            for package in active_packages
             if package.status == IDSReviewPackageStatus.SUBMITTED and not package.advisory_result
         ),
         "revision_required": sum(
             1
-            for package in packages
+            for package in active_packages
             if package.status == IDSReviewPackageStatus.REVISION_REQUIRED
         ),
         "latest_audit_events": [audit_event_status(event) for event in ids_audit_events[:5]],
-        "packages": [_host_security_ids_review_package_summary_status(package) for package in packages],
+        "packages": [
+            _host_security_ids_review_package_summary_status(package, plans_by_id.get(package.plan_id))
+            for package in packages
+        ],
     }
 
 
-def _host_security_ids_review_package_summary_status(package: HostSecurityIDSReviewPackage) -> dict[str, object]:
-    return {
+def _host_security_ids_review_package_summary_status(
+    package: HostSecurityIDSReviewPackage,
+    plan: AdminChangePlan | None = None,
+) -> dict[str, object]:
+    payload = {
         "id": package.id,
         "plan_id": package.plan_id,
         "plan_kind": AdminChangeKind(package.plan_kind).value,
@@ -2472,6 +2490,15 @@ def _host_security_ids_review_package_summary_status(package: HostSecurityIDSRev
         "satisfies_pre_execution_review_gate": package.satisfies_pre_execution_review_gate(),
         "next_step": _ids_review_package_next_step(package),
     }
+    if plan is not None:
+        payload["plan_active"] = not plan.canceled and not plan.archived
+        payload["plan_canceled"] = plan.canceled
+        payload["plan_archived"] = plan.archived
+        if plan.canceled:
+            payload["next_step"] = "linked admin plan is canceled; package retained for audit history"
+        elif plan.archived:
+            payload["next_step"] = "linked admin plan is archived; package retained for audit history"
+    return payload
 
 
 def _ids_review_package_next_step(package: HostSecurityIDSReviewPackage) -> str:

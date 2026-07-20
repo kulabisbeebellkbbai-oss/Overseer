@@ -5386,6 +5386,56 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(fake_runner.commands[4], ("/usr/bin/tmux", "send-keys", "-t", "codex-intrusion-detection-019f09da", "Enter"))
         self.assertEqual(fake_runner.commands[1][0:4], ("/usr/bin/tmux", "new-session", "-d", "-s"))
 
+    def test_ids_review_summary_excludes_canceled_plan_packages_from_active_gate_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = plan_admin_change_status(
+                store_path,
+                "admin.host-security.firewalld-deny-tcp.8088",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/8088",
+                "stage listener deny after Odo review",
+                "listener evidence requires IDS review",
+                port=8088,
+            )
+            package = prepare_host_security_ids_review_package_status(store_path, plan["id"])
+            submit_host_security_ids_review_package_status(
+                store_path,
+                package["id"],
+                "odo",
+                prompt_path="/tmp/ids-review.prompt.md",
+            )
+            record_host_security_ids_review_result_status(
+                store_path,
+                package["id"],
+                IDSReviewPackageStatus.REVISION_REQUIRED.value,
+                "revise the package before enforcement",
+                "odo",
+            )
+
+            before_cancel = host_security_ids_review_summary_status(store_path)
+            cancel_admin_change_status(
+                store_path,
+                plan["id"],
+                "sisko",
+                "cancel superseded firewall deny plan",
+            )
+            after_cancel = host_security_ids_review_summary_status(store_path)
+
+        self.assertEqual(before_cancel["package_count"], 1)
+        self.assertEqual(before_cancel["gate_blocked"], 1)
+        self.assertEqual(before_cancel["revision_required"], 1)
+        self.assertEqual(after_cancel["package_count"], 0)
+        self.assertEqual(after_cancel["total_package_count"], 1)
+        self.assertEqual(after_cancel["inactive_plan_package_count"], 1)
+        self.assertEqual(after_cancel["gate_blocked"], 0)
+        self.assertEqual(after_cancel["revision_required"], 0)
+        self.assertTrue(after_cancel["packages"][0]["plan_canceled"])
+        self.assertEqual(
+            after_cancel["packages"][0]["next_step"],
+            "linked admin plan is canceled; package retained for audit history",
+        )
+
     def test_host_security_remediation_stages_deny_plan_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

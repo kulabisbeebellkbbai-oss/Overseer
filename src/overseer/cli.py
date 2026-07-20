@@ -1263,6 +1263,8 @@ def run_status(
     dispatch_crew_messages: bool = False,
     dispatch_usage_continuations: bool = False,
     capture_knowledge_events: bool = False,
+    audit_station: bool = False,
+    station_audit_interval_ticks: int = 120,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -1278,6 +1280,9 @@ def run_status(
             usage_continuation_dispatcher=lambda path: dispatch_usage_continuations_status(path, dispatched_by="quark"),
             capture_knowledge_events=capture_knowledge_events,
             knowledge_capture_dispatcher=lambda path: knowledge_capture_status(path, limit=DEFAULT_KNOWLEDGE_LIMIT),
+            audit_station=audit_station,
+            station_auditor=lambda path, snapshot_id: audit_station_status(path, snapshot_id=snapshot_id),
+            station_audit_interval_ticks=station_audit_interval_ticks,
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),
@@ -1302,6 +1307,10 @@ def run_status(
             "usage_continuations_skipped": tick.usage_continuations_skipped,
             "knowledge_events_captured": tick.knowledge_events_captured,
             "knowledge_events_failed": tick.knowledge_events_failed,
+            "station_audits": tick.station_audits,
+            "station_audit_actions": tick.station_audit_actions,
+            "station_audit_odo_referrals": tick.station_audit_odo_referrals,
+            "station_audit_sisko_requests": tick.station_audit_sisko_requests,
         }
     finally:
         store.close()
@@ -4996,6 +5005,160 @@ def advance_odo_security_status(
     }
 
 
+def audit_station_status(
+    store_path: str | Path,
+    snapshot_id: str | None = None,
+    audited_at: str | None = None,
+) -> dict[str, object]:
+    now = audited_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    snapshot = _load_optional_host_snapshot(store_path, snapshot_id)
+    actions: list[dict[str, object]] = []
+    referrals: list[dict[str, object]] = []
+
+    actions.append({"owner_domain": OwnerDomain.KIRA.value, "action": "discover_physical", **discover_physical_status(("/dev/serial/by-id", "/dev/serial/by-path"), store_path)})
+    actions.append({"owner_domain": OwnerDomain.KIRA.value, "action": "discover_storage", **discover_storage_status(store_path=store_path)})
+    actions.append({"owner_domain": OwnerDomain.DAX.value, "action": "discover_virtual_listeners", **discover_virtual_listeners_status(store_path, snapshot=snapshot)})
+    actions.append({"owner_domain": OwnerDomain.JULIAN.value, "action": "discover_user_services", **discover_user_services_status(store_path, snapshot=snapshot)})
+    actions.append({"owner_domain": OwnerDomain.OBRIEN.value, "action": "plan_package_updates", **plan_package_updates_status(store_path, captured_at=now)})
+    actions.append({"owner_domain": OwnerDomain.QUARK.value, "action": "discover_codex_threads", **discover_codex_project_threads_status(store_path)})
+    actions.append({"owner_domain": OwnerDomain.EZRI.value, "action": "capture_knowledge_events", **knowledge_capture_status(store_path, limit=DEFAULT_KNOWLEDGE_LIMIT)})
+
+    referrals.extend(_refer_physical_unknowns_to_odo(store_path, actions, now))
+    referrals.extend(_refer_virtual_unknowns_to_odo(store_path, actions, now))
+    sisko_requests = _count_sisko_requests(actions)
+    return {
+        "store": str(Path(store_path)),
+        "status": "audited",
+        "audited_at": now,
+        "snapshot_id": snapshot.id if snapshot else None,
+        "actions": len(actions),
+        "odo_referrals": len(referrals),
+        "sisko_requests": sisko_requests,
+        "items": actions,
+        "odo_referral_messages": referrals,
+        "host_mutation_performed": any(_nested_host_mutation_performed(action) for action in actions),
+        "next_step": "continue station audits; only exact approval-gated items should pause",
+    }
+
+
+def _load_optional_host_snapshot(store_path: str | Path, snapshot_id: str | None) -> HostInspectionSnapshot | None:
+    if snapshot_id is None:
+        return None
+    store = SQLiteStore(store_path)
+    try:
+        return store.load_host_snapshot(snapshot_id)
+    finally:
+        store.close()
+
+
+def _refer_physical_unknowns_to_odo(
+    store_path: str | Path,
+    actions: Sequence[dict[str, object]],
+    created_at: str,
+) -> list[dict[str, object]]:
+    referrals: list[dict[str, object]] = []
+    for action in actions:
+        if action.get("owner_domain") != OwnerDomain.KIRA.value:
+            continue
+        for asset in action.get("assets", []):
+            if not isinstance(asset, dict):
+                continue
+            if not (asset.get("storage_risk") or not asset.get("complete_for_checkout", True)):
+                continue
+            stable_id = str(asset.get("stable_id") or "unknown-physical")
+            referrals.append(
+                _ensure_odo_review_message(
+                    store_path,
+                    subject=f"Review physical asset {stable_id}",
+                    message=(
+                        f"Kira audit found physical asset {stable_id} requiring security verification. "
+                        f"kind={asset.get('kind')}; storage_risk={asset.get('storage_risk')}; "
+                        f"complete_for_checkout={asset.get('complete_for_checkout')}."
+                    ),
+                    priority=RiskLevel.HIGH.value if asset.get("storage_risk") else RiskLevel.MEDIUM.value,
+                    related_resource_id=stable_id,
+                    created_at=created_at,
+                )
+            )
+    return referrals
+
+
+def _refer_virtual_unknowns_to_odo(
+    store_path: str | Path,
+    actions: Sequence[dict[str, object]],
+    created_at: str,
+) -> list[dict[str, object]]:
+    referrals: list[dict[str, object]] = []
+    for action in actions:
+        if action.get("owner_domain") != OwnerDomain.DAX.value:
+            continue
+        for asset in action.get("assets", []):
+            if not isinstance(asset, dict):
+                continue
+            bind_scope = str(asset.get("bind_scope") or "")
+            kind = str(asset.get("kind") or "unknown")
+            if kind != "unknown" and bind_scope not in {"all_interfaces", "non_loopback"}:
+                continue
+            resource_id = str(asset.get("id") or "unknown-virtual")
+            referrals.append(
+                _ensure_odo_review_message(
+                    store_path,
+                    subject=f"Review virtual asset {resource_id}",
+                    message=(
+                        f"Dax audit found virtual asset {resource_id} requiring security verification. "
+                        f"kind={kind}; bind_scope={bind_scope}; ports={asset.get('ports')}; "
+                        f"process_hint={asset.get('process_hint')}."
+                    ),
+                    priority=RiskLevel.HIGH.value if bind_scope == "all_interfaces" else RiskLevel.MEDIUM.value,
+                    related_resource_id=resource_id,
+                    created_at=created_at,
+                )
+            )
+    return referrals
+
+
+def _ensure_odo_review_message(
+    store_path: str | Path,
+    subject: str,
+    message: str,
+    priority: str,
+    related_resource_id: str,
+    created_at: str,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        for existing in store.list_crew_messages():
+            if (
+                existing.owner_domain == OwnerDomain.ODO
+                and existing.related_resource_id == related_resource_id
+                and existing.status == CrewMessageStatus.OPEN
+            ):
+                return {"existing": True, **crew_message_status(existing)}
+    finally:
+        store.close()
+    status = record_crew_message_status(
+        store_path,
+        OwnerDomain.ODO.value,
+        subject,
+        message,
+        priority,
+        requested_by="station-audit",
+        message_id=f"crew.odo.review.{_status_id(related_resource_id)}",
+        created_at=created_at,
+        related_resource_id=related_resource_id,
+    )
+    return {"existing": False, **status["message"]}
+
+
+def _count_sisko_requests(actions: Sequence[dict[str, object]]) -> int:
+    total = 0
+    for action in actions:
+        if action.get("owner_domain") != OwnerDomain.OBRIEN.value:
+            continue
+        total += int(action.get("plans", 0) or 0)
+    return total
+
+
 def _advance_odo_remediation_plans(
     store_path: str | Path,
     remediation: dict[str, object],
@@ -6671,9 +6834,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--health-probe-timeout-seconds", type=float, default=5.0)
     run_parser.add_argument("--health-evidence-retention-per-target", type=int, default=5)
     run_parser.add_argument("--inspect-host", action="store_true", help="capture a read-only host inspection snapshot on each tick")
-    run_parser.add_argument("--dispatch-crew-messages", action="store_true", help="dispatch open crew messages on each tick without executing host changes")
+    run_parser.add_argument("--dispatch-crew-messages", action="store_true", help="dispatch open crew messages on each tick while preserving exact approval gates")
     run_parser.add_argument("--dispatch-usage-continuations", action="store_true", help="dispatch ready usage-limited continuation handoffs on each tick without resuming threads")
     run_parser.add_argument("--capture-knowledge-events", action="store_true", help="capture crew messages and audit events into Ezri's Documents vault")
+    run_parser.add_argument("--audit-station", action="store_true", help="run periodic safe crew-domain audits and route unknowns to Odo")
+    run_parser.add_argument("--station-audit-interval-ticks", type=int, default=120, help="runtime ticks between station audits")
+    station_audit_parser = subparsers.add_parser("audit-station", help="run one safe crew-domain station audit and route unknowns to Odo")
+    station_audit_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    station_audit_parser.add_argument("--snapshot-id", help="host snapshot id; defaults to fresh discovery where needed")
+    station_audit_parser.add_argument("--audited-at")
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     redacted_state_parser = subparsers.add_parser("export-state-redacted", help="print a redacted state export without writing files")
@@ -7285,10 +7454,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.dispatch_crew_messages,
                     args.dispatch_usage_continuations,
                     args.capture_knowledge_events,
+                    args.audit_station,
+                    args.station_audit_interval_ticks,
                 ),
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "audit-station":
+        print(json.dumps(audit_station_status(args.store, args.snapshot_id, args.audited_at), sort_keys=True))
         return 0
 
     if args.command == "list-state":

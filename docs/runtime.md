@@ -13,6 +13,7 @@ The runtime entrypoint can run a single foreground tick against an explicit SQLi
 - Runtime health evidence is pruned per target with `--health-evidence-retention-per-target`.
 - Host inspection snapshots are read-only command and file observations and run only when `--inspect-host` is supplied.
 - Each host inspection automatically lets Odo advance security findings to the next safe gate: stage remediation plans, prepare IDS/firewall review packages, queue exact Sisko approval requests, or execute only plans that have no approval gate.
+- Station audits run only when `--audit-station` is supplied. The audit lets each crew domain perform safe discovery or staging, route unknown or unplanned resources to Odo, and continue unrelated work while exact approval-gated items wait.
 - Knowledge capture writes crew-message and audit-event notes through Ezri's Documents API only when `--capture-knowledge-events` is supplied.
 - Enabling host inspection in the installed user service changes the service runtime command and requires an explicit approved admin plan before restart.
 
@@ -25,6 +26,8 @@ PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-crew-messages
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --dispatch-usage-continuations
 PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --capture-knowledge-events
+PYTHONPATH=src python3 -m overseer.cli run --store state/overseer.sqlite3 --once --audit-station
+PYTHONPATH=src python3 -m overseer.cli audit-station --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli service-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli runtime-status --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli daemon-migration-plan --store state/overseer.sqlite3
@@ -43,6 +46,8 @@ When `--inspect-host` is enabled, Odo does not wait for an operator crew message
 `--dispatch-usage-continuations` lets Quark persist dispatch handoff records for usage-limited work that is ready on each runtime tick. It does not resume Codex threads; use `dispatch-usage-continuations --resume-codex-projects` for an explicit live resume action.
 
 `--capture-knowledge-events` lets Ezri write deterministic Documents notes for persisted crew messages and audit events. It uses the same local Obsidian env file as the Documents CLI and records captured/failed counts in the runtime tick output.
+
+`--audit-station` lets the command crew run periodic station operations without waiting for a user prompt. Kira refreshes physical and storage identities, Dax refreshes listener-backed virtual assets, Julian refreshes service resources and health targets, O'Brien stages package maintenance plans, Quark imports Codex project thread resources, and Ezri captures knowledge events. Storage-risk, incomplete, exposed, or unknown resources are routed to Odo for security verification. Package/update plans and other high-risk work are staged but remain paused at their exact approval gates.
 
 `daemon-migration-plan` is a read-only Sisko gate for foreground-to-daemon migration. `request-daemon-migration` and `approve-daemon-migration` record the approval state required before changing user service enablement or runtime commands; they do not edit systemd state or restart services.
 
@@ -66,7 +71,7 @@ Installed local unit:
 Runtime command:
 
 ```bash
-/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets --health-evidence-retention-per-target 5 --inspect-host --dispatch-crew-messages --dispatch-usage-continuations
+/usr/bin/python3 -m overseer.cli run --store /home/god/.local/share/overseer/project/state/overseer.sqlite3 --probe-health-targets --health-evidence-retention-per-target 5 --inspect-host --dispatch-crew-messages --dispatch-usage-continuations --audit-station --station-audit-interval-ticks 120
 ```
 
 Operator commands:

@@ -38,6 +38,10 @@ class RuntimeTick:
     usage_continuations_skipped: int
     knowledge_events_captured: int
     knowledge_events_failed: int
+    station_audits: int
+    station_audit_actions: int
+    station_audit_odo_referrals: int
+    station_audit_sisko_requests: int
 
 
 class OverseerRuntime:
@@ -57,6 +61,9 @@ class OverseerRuntime:
         usage_continuation_dispatcher: Callable[[str], dict[str, Any]] | None = None,
         capture_knowledge_events: bool = False,
         knowledge_capture_dispatcher: Callable[[str], dict[str, Any]] | None = None,
+        audit_station: bool = False,
+        station_auditor: Callable[[str, str | None], dict[str, Any]] | None = None,
+        station_audit_interval_ticks: int = 120,
     ) -> None:
         self.store = store
         self.service_name = service_name
@@ -72,6 +79,9 @@ class OverseerRuntime:
         self.usage_continuation_dispatcher = usage_continuation_dispatcher
         self.capture_knowledge_events = capture_knowledge_events
         self.knowledge_capture_dispatcher = knowledge_capture_dispatcher
+        self.audit_station = audit_station
+        self.station_auditor = station_auditor
+        self.station_audit_interval_ticks = max(1, station_audit_interval_ticks)
         self.started_at = _utc_now()
         self.tick_count = 0
 
@@ -90,6 +100,7 @@ class OverseerRuntime:
         crew_dispatched, crew_blocked = self._dispatch_crew_messages()
         usage_dispatched, usage_skipped = self._dispatch_usage_continuations()
         knowledge_captured, knowledge_failed = self._capture_knowledge_events()
+        station_audits, station_actions, station_odo_referrals, station_sisko_requests = self._audit_station()
         self.store.save_runtime_heartbeat(
             RuntimeHeartbeat(
                 id=self.service_name,
@@ -121,6 +132,10 @@ class OverseerRuntime:
             usage_continuations_skipped=usage_skipped,
             knowledge_events_captured=knowledge_captured,
             knowledge_events_failed=knowledge_failed,
+            station_audits=station_audits,
+            station_audit_actions=station_actions,
+            station_audit_odo_referrals=station_odo_referrals,
+            station_audit_sisko_requests=station_sisko_requests,
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:
@@ -178,6 +193,21 @@ class OverseerRuntime:
             return 0, 0
         result = self.knowledge_capture_dispatcher(str(self.store.path))
         return int(result.get("captured", 0)), int(result.get("failed", 0))
+
+    def _audit_station(self) -> tuple[int, int, int, int]:
+        if not self.audit_station or self.station_auditor is None:
+            return 0, 0, 0, 0
+        if (self.tick_count - 1) % self.station_audit_interval_ticks != 0:
+            return 0, 0, 0, 0
+        snapshots = self.store.list_host_snapshots()
+        latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        result = self.station_auditor(str(self.store.path), latest_snapshot.id if latest_snapshot else None)
+        return (
+            1,
+            int(result.get("actions", 0)),
+            int(result.get("odo_referrals", 0)),
+            int(result.get("sisko_requests", 0)),
+        )
 
 
 def _utc_now() -> str:

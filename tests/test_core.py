@@ -174,6 +174,7 @@ from overseer.cli import approve_claim_status
 from overseer.cli import approve_daemon_migration_status
 from overseer.cli import approvals_summary_status
 from overseer.cli import alerts_summary_status
+from overseer.cli import audit_station_status
 from overseer.cli import audit_summary_status
 from overseer.cli import assess_host_security_status
 from overseer.cli import authorizations_required_status
@@ -8798,6 +8799,89 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tick.host_security_auto_executions, 0)
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0][1], store.list_host_snapshots()[0].id)
+            store.close()
+
+    def test_station_audit_routes_unknowns_to_odo_and_counts_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            with (
+                patch(
+                    "overseer.cli.discover_physical_status",
+                    return_value={
+                        "count": 1,
+                        "assets": [
+                            {
+                                "stable_id": "storage.unknown",
+                                "kind": "storage_array",
+                                "complete_for_checkout": True,
+                                "storage_risk": True,
+                            }
+                        ],
+                    },
+                ),
+                patch("overseer.cli.discover_storage_status", return_value={"count": 0, "assets": []}),
+                patch(
+                    "overseer.cli.discover_virtual_listeners_status",
+                    return_value={
+                        "count": 1,
+                        "assets": [
+                            {
+                                "id": "listener.tcp.any.8080",
+                                "kind": "gateway",
+                                "bind_scope": "all_interfaces",
+                                "ports": [8080],
+                                "process_hint": "LISTEN 0 128 0.0.0.0:8080",
+                            }
+                        ],
+                    },
+                ),
+                patch("overseer.cli.discover_user_services_status", return_value={"count": 1, "health_targets": 1, "items": []}),
+                patch("overseer.cli.plan_package_updates_status", return_value={"plans": 2, "items": [], "host_mutation_performed": False}),
+                patch("overseer.cli.discover_codex_project_threads_status", return_value={"threads": 1, "resources": 1}),
+                patch("overseer.cli.knowledge_capture_status", return_value={"captured": 1, "failed": 0, "host_mutation_performed": False}),
+            ):
+                status = audit_station_status(
+                    store_path,
+                    audited_at="2026-07-20T17:30:00+00:00",
+                )
+            messages = crew_messages_status(store_path, owner_domain=OwnerDomain.ODO.value, status=CrewMessageStatus.OPEN.value)
+
+        self.assertEqual(status["actions"], 7)
+        self.assertEqual(status["odo_referrals"], 2)
+        self.assertEqual(status["sisko_requests"], 2)
+        self.assertFalse(status["host_mutation_performed"])
+        self.assertEqual(messages["open"], 2)
+        self.assertEqual(
+            {item["related_resource_id"] for item in messages["items"]},
+            {"storage.unknown", "listener.tcp.any.8080"},
+        )
+
+    def test_runtime_runs_station_audit_on_configured_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            calls = []
+
+            def fake_auditor(store_path: str, snapshot_id: str | None) -> dict[str, object]:
+                calls.append((store_path, snapshot_id))
+                return {"actions": 7, "odo_referrals": 3, "sisko_requests": 1}
+
+            runtime = OverseerRuntime(
+                store,
+                audit_station=True,
+                station_auditor=fake_auditor,
+                station_audit_interval_ticks=2,
+            )
+            first = runtime.run(once=True)
+            second = runtime.run(once=True)
+            third = runtime.run(once=True)
+
+            self.assertEqual(first.station_audits, 1)
+            self.assertEqual(first.station_audit_actions, 7)
+            self.assertEqual(first.station_audit_odo_referrals, 3)
+            self.assertEqual(first.station_audit_sisko_requests, 1)
+            self.assertEqual(second.station_audits, 0)
+            self.assertEqual(third.station_audits, 1)
+            self.assertEqual(len(calls), 2)
             store.close()
 
     def test_runtime_dispatches_crew_messages_when_enabled(self):

@@ -452,6 +452,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
   <script>
     const endpoints = {
       dashboard: "/operator-dashboard",
+      runtime: "/runtime-status",
       authorizations: "/admin/authorizations-required",
       readiness: "/admin/execution-readiness",
       adapters: "/admin/adapter-capabilities",
@@ -921,6 +922,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderOverview() {
       const focus = (state.data.dashboard || {}).role_focus || {};
       const attention = (state.data.dashboard || {}).attention || {};
+      const runtime = state.data.runtime || {};
       const crewSummary = (state.data.crewMessages || {}).summary || {};
       const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
       document.getElementById("overview").innerHTML = `
@@ -929,6 +931,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good")}
           ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good")}
           ${metric("O'Brien", focus.obrien?.executable_plans, "executable plans", "span-3")}
+          ${metric("Runtime", runtime.service?.freshness?.status, "heartbeat freshness", "span-3", freshnessTone(runtime.service?.freshness?.status))}
           ${metric("Crew Queue", crewSummary.open, "open requests", "span-3", crewSummary.open ? "warn" : "good")}
           ${metric("Dispatch Blocks", crewSummary.blocked_dispatches, "blocked dispatches", "span-3", crewSummary.blocked_dispatches ? "warn" : "good")}
           <div class="section-head"><h3>Command Crew</h3><div class="actions"><span class="pill">${safe((state.data.dashboard || {}).service_name)}</span><button class="action-btn" data-action="dispatch-crew-messages">Dispatch Open</button></div></div>
@@ -1209,6 +1212,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderHealth() {
       const health = state.data.health || {};
       const healthSummary = state.data.healthSummary || {};
+      const runtime = state.data.runtime || {};
       document.getElementById("health").innerHTML = `
         <div class="grid">
           <div class="section-head"><h3>Health Actions</h3><div class="actions"><button class="action-btn" data-action="run-health-probes">Run Probes</button></div></div>
@@ -1216,6 +1220,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good")}
           ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good")}
           ${metric("Failures", health.latest_failures, "latest", "span-3", health.latest_failures ? "bad" : "good")}
+          <div class="panel span-6">${kv("Runtime Heartbeat", {
+            service: runtime.service?.service_name,
+            freshness: runtime.service?.freshness?.status,
+            tick_count: runtime.service?.tick_count,
+            last_tick_at: runtime.service?.last_tick_at,
+            next_step: runtime.service?.freshness?.next_step
+          })}</div>
+          <div class="panel span-6">${kv("Host Inspection Freshness", {
+            enabled: runtime.host_inspection?.enabled,
+            freshness: runtime.host_inspection?.freshness?.status,
+            high_findings: runtime.host_inspection?.high_findings,
+            warning_findings: runtime.host_inspection?.warning_findings,
+            latest_captured_at: runtime.host_inspection?.latest_captured_at,
+            next_step: runtime.host_inspection?.freshness?.next_step
+          })}</div>
           <div class="panel span-12">
             <div class="toolbar"><h3>Register Target</h3><button class="action-btn" data-action="register-health-target">Record Target</button></div>
             <div class="form-grid">
@@ -1425,6 +1444,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function toneClass(tone) {
       return tone === "bad" ? "bad-text" : tone === "warn" ? "warn-text" : tone === "good" ? "good-text" : "";
+    }
+    function freshnessTone(status) {
+      if (status === "ok") return "good";
+      if (status === "warning") return "warn";
+      if (status === "high" || status === "missing") return "bad";
+      return "";
     }
     const style = document.createElement("style");
     style.textContent = ".good-text{color:var(--good)}.warn-text{color:var(--warn)}.bad-text{color:var(--bad)}";

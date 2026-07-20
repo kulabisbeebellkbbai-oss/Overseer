@@ -1617,34 +1617,34 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         </div>`;
     }
     function renderEzri() {
-      const candidates = knowledgeBaseCandidates();
-      const primary = candidates[0] || {};
       const status = state.data.documentsStatus || {};
       const notes = state.data.documentsNotes || {};
       const capture = state.data.knowledgeCapturePlan || {};
+      const files = (notes.files || []).map((file) => ({file}));
+      const captureItems = capture.items || [];
+      const captureTone = capture.failed ? "bad" : capture.candidate_count ? "pending" : "good";
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
-          ${stationIntro("Ezri", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
+          ${stationIntro("Ezri", "Knowledge Base", "Operational notes, event capture, runbooks, and vault search.", ["documents", "capture", "runbooks"])}
           ${metric("REST API", status.available ? "online" : "offline", "Obsidian Local REST", "span-3", status.available ? "good" : "bad")}
           ${metric("Auth", status.authenticated ? "valid" : "blocked", "stored bearer token", "span-3", status.authenticated ? "good" : "warn")}
-          ${metric("Notes", notes.count, "Overseer folder", "span-3")}
-          ${metric("Writes", (status.allowed_write_prefixes || []).join(", "), "allowed prefixes", "span-3", "pending")}
+          ${metric("Vault Notes", notes.count, notes.folder || "Overseer", "span-3")}
+          ${metric("Capture Queue", capture.candidate_count, "crew and audit events", "span-3", captureTone)}
           <div class="panel span-6">${kv("Documents Runtime", {
-            service: status.service,
-            plugin: status.manifest?.name,
-            plugin_version: status.manifest?.version,
-            obsidian_version: status.versions?.obsidian,
-            base_url: status.base_url,
-            configured: status.configured
+            service: status.service || "unavailable",
+            status: status.available ? "online" : "offline",
+            authenticated: status.authenticated ? "yes" : "no",
+            obsidian: status.versions?.obsidian,
+            plugin: status.manifest?.version,
+            writes: (status.allowed_write_prefixes || []).join(", ")
           })}</div>
-          <div class="panel span-6">${table("Overseer Notes", (notes.files || []).map((file) => ({file})), ["file"])}</div>
+          <div class="panel span-6">${table("Current Folder", files, ["file"])}</div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>Vault Search</h3><button class="action-btn" data-action="documents-search">Search</button></div>
+            <div class="toolbar"><h3>Search and List</h3><div class="actions"><button class="action-btn" data-action="documents-search">Search</button><button class="action-btn" data-action="documents-list-notes">List Folder</button></div></div>
             <div class="form-grid">
               <div class="field span-6"><label for="documents-query">Query</label><input id="documents-query" value="Overseer"></div>
               <div class="field span-3"><label for="documents-context-length">Context</label><input id="documents-context-length" type="number" min="0" value="100"></div>
               <div class="field span-3"><label for="documents-folder">Folder</label><input id="documents-folder" value="Overseer"></div>
-              <div class="field span-6"><button class="action-btn" data-action="documents-list-notes">List Folder</button></div>
             </div>
           </div>
           <div class="panel span-6">
@@ -1660,31 +1660,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <div class="form-grid">
               <div class="field span-3"><label for="knowledge-capture-limit">Limit</label><input id="knowledge-capture-limit" type="number" min="1" value="${safe(capture.limit || 12)}"></div>
             </div>
-            ${table("Capture Candidates", capture.items || [], ["kind", "source_id", "owner_domain", "path"])}
+            ${table("Capture Candidates", captureItems, ["kind", "source_id", "owner_domain", "path"])}
           </div>
-          <div class="panel span-12">
-            <div class="toolbar"><h3>Recommended Integration</h3><span class="pill good">open source</span></div>
-            <div class="kb-grid">
-              ${candidates.slice(0, 3).map((candidate) => kbCandidateCard(candidate)).join("")}
-            </div>
-          </div>
-          <div class="panel span-6">${kv("Documents Default", {
-            server: primary.name,
-            license: primary.license,
-            transport: primary.transport,
-            source: primary.source,
-            install_boundary: "Obsidian REST token and local vault configuration",
-            route_approval: "Obsidian REST/API-key approved"
-          })}</div>
-          <div class="panel span-6">${kv("Integration Notes", {
-            primary_fit: "Obsidian vault read, write, search, and targeted edit tools",
-            approved_route: "Obsidian Local REST API with local bearer token storage",
-            fallback_fit: "direct filesystem vault access if REST is unavailable",
-            storage_model: "local markdown vault",
-            secret_boundary: "token must be stored locally and never committed"
-          })}</div>
-          <div class="panel span-12">${table("Knowledge Base Candidates", candidates, ["rank", "name", "license", "transport", "fit", "source"])}</div>
-          ${officerPanel("ezri", "Documentation and knowledge base", "Capture or retrieve docs, runbooks, decisions, troubleshooting notes, and knowledge-base MCP integration requests.")}
+          ${officerPanel("ezri", "Documentation support", "Capture, find, summarize, or update Overseer docs, runbooks, decisions, and troubleshooting notes.")}
         </div>`;
     }
     function renderAudit() {
@@ -1709,25 +1687,6 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="station-strip">${chipMarkup}</div>
         </div>
         <div class="station-code"><span>${safe(officer)}</span><span>${safe(crewStation(officer))}</span></div>
-      </div>`;
-    }
-    function knowledgeBaseCandidates() {
-      return [
-        {rank: "Primary", name: "cyanheads/obsidian-mcp-server", license: "Apache-2.0", transport: "STDIO or Streamable HTTP", fit: "Obsidian vault read, write, search, and targeted edits", source: "github.com/cyanheads/obsidian-mcp-server"},
-        {rank: "Fallback", name: "Piotr1215/mcp-obsidian", license: "open source", transport: "direct filesystem", fit: "Obsidian vault access without app or REST plugin", source: "github.com/Piotr1215/mcp-obsidian"},
-        {rank: "Popular", name: "MarkusPfundstein/mcp-obsidian", license: "MIT", transport: "Obsidian Local REST API", fit: "REST-backed vault tools when an API key is acceptable", source: "github.com/MarkusPfundstein/mcp-obsidian"},
-        {rank: "Semantic Docs", name: "mjm.local.docs", license: "open source", transport: "HTTP MCP plus web UI", fit: "Local semantic search for PDFs, Word, Markdown, and text", source: "dev.to/markjackmilian/mjmlocaldocs-open-source-local-knowledge-base-with-mcp-3711"},
-        {rank: "Lightweight", name: "lethain/library-mcp", license: "open source", transport: "local markdown folders", fit: "Simple folder-backed knowledge-base queries", source: "github.com/lethain/library-mcp"}
-      ];
-    }
-    function kbCandidateCard(candidate) {
-      const primaryClass = candidate.rank === "Primary" ? " primary" : "";
-      return `<div class="kb-card${primaryClass}">
-        <div class="toolbar"><h3>${safe(candidate.rank)}</h3><span class="pill">${safe(candidate.license)}</span></div>
-        <strong>${safe(candidate.name)}</strong>
-        <p class="muted">${safe(candidate.fit)}</p>
-        <span class="pill">${safe(candidate.transport)}</span>
-        <p class="source">${safe(candidate.source)}</p>
       </div>`;
     }
     function metric(label, value, hint, span = "span-3", tone = "") {

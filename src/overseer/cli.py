@@ -70,6 +70,7 @@ from .ids_review import (
     record_ids_review_package_result,
     write_ids_review_prompt_file,
 )
+from .knowledge import DEFAULT_KNOWLEDGE_LIMIT, knowledge_capture_status
 from .live_health import health_probe_adapter_for
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
@@ -1261,6 +1262,7 @@ def run_status(
     inspect_host: bool = False,
     dispatch_crew_messages: bool = False,
     dispatch_usage_continuations: bool = False,
+    capture_knowledge_events: bool = False,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -1273,6 +1275,8 @@ def run_status(
             crew_dispatcher=lambda path: dispatch_crew_messages_status(path, dispatched_by="sisko"),
             dispatch_usage_continuations=dispatch_usage_continuations,
             usage_continuation_dispatcher=lambda path: dispatch_usage_continuations_status(path, dispatched_by="quark"),
+            capture_knowledge_events=capture_knowledge_events,
+            knowledge_capture_dispatcher=lambda path: knowledge_capture_status(path, limit=DEFAULT_KNOWLEDGE_LIMIT),
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),
@@ -1291,6 +1295,8 @@ def run_status(
             "crew_messages_blocked": tick.crew_messages_blocked,
             "usage_continuations_dispatched": tick.usage_continuations_dispatched,
             "usage_continuations_skipped": tick.usage_continuations_skipped,
+            "knowledge_events_captured": tick.knowledge_events_captured,
+            "knowledge_events_failed": tick.knowledge_events_failed,
         }
     finally:
         store.close()
@@ -6433,6 +6439,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--inspect-host", action="store_true", help="capture a read-only host inspection snapshot on each tick")
     run_parser.add_argument("--dispatch-crew-messages", action="store_true", help="dispatch open crew messages on each tick without executing host changes")
     run_parser.add_argument("--dispatch-usage-continuations", action="store_true", help="dispatch ready usage-limited continuation handoffs on each tick without resuming threads")
+    run_parser.add_argument("--capture-knowledge-events", action="store_true", help="capture crew messages and audit events into Ezri's Documents vault")
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     redacted_state_parser = subparsers.add_parser("export-state-redacted", help="print a redacted state export without writing files")
@@ -6758,6 +6765,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     documents_write_parser.add_argument("--path", required=True)
     documents_write_parser.add_argument("--content-file", required=True, help="markdown file whose contents will be written")
     documents_write_parser.add_argument("--mode", default="append", choices=("append", "replace"))
+    knowledge_capture_parser = subparsers.add_parser("capture-knowledge-events", help="capture crew messages and audit events into Ezri's Documents vault")
+    knowledge_capture_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    knowledge_capture_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
+    knowledge_capture_parser.add_argument("--kind", action="append", choices=("crew", "audit"), default=[])
+    knowledge_capture_parser.add_argument("--limit", type=int, default=DEFAULT_KNOWLEDGE_LIMIT)
+    knowledge_capture_parser.add_argument("--dry-run", action="store_true")
     discover_codex_threads_parser = subparsers.add_parser(
         "discover-codex-project-threads",
         help="import local codex-projects registry rows as managed Overseer resources",
@@ -7037,6 +7050,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.inspect_host,
                     args.dispatch_crew_messages,
                     args.dispatch_usage_continuations,
+                    args.capture_knowledge_events,
                 ),
                 sort_keys=True,
             )
@@ -7471,6 +7485,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.path,
                     Path(args.content_file).read_text(encoding="utf-8"),
                     args.mode,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "capture-knowledge-events":
+        print(
+            json.dumps(
+                knowledge_capture_status(
+                    args.store,
+                    _documents_env_file_arg(args.env_file),
+                    tuple(args.kind),
+                    args.limit,
+                    args.dry_run,
                 ),
                 sort_keys=True,
             )

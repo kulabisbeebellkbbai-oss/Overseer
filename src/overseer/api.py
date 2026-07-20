@@ -110,6 +110,7 @@ from .documents import (
     documents_search_status,
     documents_write_note_status,
 )
+from .knowledge import knowledge_capture_status
 from .ui import OPERATOR_CONSOLE_HTML
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
@@ -176,6 +177,16 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/documents/notes":
                 self._handle(lambda: documents_list_notes_status(folder=_query_first(query, "folder") or ""))
+                return
+            if path == "/documents/knowledge-capture-plan":
+                self._handle(
+                    lambda: knowledge_capture_status(
+                        store_path,
+                        kinds=_query_values(query, "kind"),
+                        limit=int(_query_first(query, "limit") or "50"),
+                        dry_run=True,
+                    )
+                )
                 return
             if path == "/usage/continuation-plan":
                 self._handle(lambda: usage_continuation_plan_status(store_path))
@@ -431,6 +442,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/documents/notes":
                 self._handle_json(lambda payload: documents_write_note_status(**_documents_write_args(payload)))
                 return
+            if self.path == "/documents/knowledge-capture":
+                self._handle_json(lambda payload: knowledge_capture_status(store_path, **_knowledge_capture_args(payload)))
+                return
             if self.path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
@@ -640,6 +654,19 @@ def _documents_write_args(payload: dict[str, Any]) -> dict[str, Any]:
         "path": str(payload["path"]),
         "content": str(payload["content"]),
         "mode": str(payload.get("mode", "append")),
+    }
+
+
+def _knowledge_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
+    kinds = payload.get("kinds", ())
+    if isinstance(kinds, str):
+        kinds = (kinds,)
+    if not isinstance(kinds, (list, tuple)):
+        raise ValueError("kinds must be a list")
+    return {
+        "kinds": tuple(str(kind) for kind in kinds),
+        "limit": int(payload.get("limit", 50)),
+        "dry_run": bool(payload.get("dry_run", False)),
     }
 
 
@@ -933,6 +960,10 @@ def _submit_host_security_ids_review_package_args(payload: dict[str, Any]) -> di
 def _query_first(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _query_values(query: dict[str, list[str]], key: str) -> tuple[str, ...]:
+    return tuple(query.get(key, ()))
 
 
 def _export_host_security_ids_review_prompt_args(payload: dict[str, Any]) -> dict[str, Any]:

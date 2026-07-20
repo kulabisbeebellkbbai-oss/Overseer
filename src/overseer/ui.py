@@ -656,6 +656,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       usage: "/usage-summary",
       documentsStatus: "/documents/status",
       documentsNotes: "/documents/notes?folder=Overseer",
+      knowledgeCapturePlan: "/documents/knowledge-capture-plan?limit=12",
       crewMessages: "/crew/messages",
       audit: "/audit-summary",
       approvals: "/approvals-summary",
@@ -765,6 +766,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "documents-list-notes") return await listDocumentsNotes();
       if (action === "documents-search") return await searchDocuments();
       if (action === "documents-write-note") return await writeDocumentNote();
+      if (action === "documents-capture-knowledge") return await captureKnowledge();
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
@@ -1038,6 +1040,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         path: value("documents-note-path"),
         mode: value("documents-note-mode"),
         content: value("documents-note-content")
+      });
+    }
+    async function captureKnowledge() {
+      return await postJson("/documents/knowledge-capture", {
+        kinds: ["crew", "audit"],
+        limit: Number(value("knowledge-capture-limit") || "12"),
+        dry_run: false
       });
     }
     async function requestUsageContinuation() {
@@ -1612,6 +1621,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const primary = candidates[0] || {};
       const status = state.data.documentsStatus || {};
       const notes = state.data.documentsNotes || {};
+      const capture = state.data.knowledgeCapturePlan || {};
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
           ${stationIntro("Ezri", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
@@ -1644,6 +1654,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-3"><label for="documents-note-mode">Mode</label><select id="documents-note-mode"><option value="append">append</option><option value="replace">replace</option></select></div>
               <div class="field span-6"><label for="documents-note-content">Content</label><textarea id="documents-note-content">## Operator note&#10;&#10;</textarea></div>
             </div>
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Knowledge Capture</h3><div class="actions"><span class="pill pending">${safe(capture.candidate_count ?? 0)} queued</span><button class="action-btn" data-action="documents-capture-knowledge">Capture</button></div></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="knowledge-capture-limit">Limit</label><input id="knowledge-capture-limit" type="number" min="1" value="${safe(capture.limit || 12)}"></div>
+            </div>
+            ${table("Capture Candidates", capture.items || [], ["kind", "source_id", "owner_domain", "path"])}
           </div>
           <div class="panel span-12">
             <div class="toolbar"><h3>Recommended Integration</h3><span class="pill good">open source</span></div>

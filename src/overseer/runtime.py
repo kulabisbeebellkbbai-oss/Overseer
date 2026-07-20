@@ -32,6 +32,8 @@ class RuntimeTick:
     crew_messages_blocked: int
     usage_continuations_dispatched: int
     usage_continuations_skipped: int
+    knowledge_events_captured: int
+    knowledge_events_failed: int
 
 
 class OverseerRuntime:
@@ -48,6 +50,8 @@ class OverseerRuntime:
         crew_dispatcher: Callable[[str], dict[str, Any]] | None = None,
         dispatch_usage_continuations: bool = False,
         usage_continuation_dispatcher: Callable[[str], dict[str, Any]] | None = None,
+        capture_knowledge_events: bool = False,
+        knowledge_capture_dispatcher: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.store = store
         self.service_name = service_name
@@ -60,6 +64,8 @@ class OverseerRuntime:
         self.crew_dispatcher = crew_dispatcher
         self.dispatch_usage_continuations = dispatch_usage_continuations
         self.usage_continuation_dispatcher = usage_continuation_dispatcher
+        self.capture_knowledge_events = capture_knowledge_events
+        self.knowledge_capture_dispatcher = knowledge_capture_dispatcher
         self.started_at = _utc_now()
         self.tick_count = 0
 
@@ -69,6 +75,7 @@ class OverseerRuntime:
         host_inspections, host_high_findings, host_warning_findings = self._inspect_host()
         crew_dispatched, crew_blocked = self._dispatch_crew_messages()
         usage_dispatched, usage_skipped = self._dispatch_usage_continuations()
+        knowledge_captured, knowledge_failed = self._capture_knowledge_events()
         self.store.save_runtime_heartbeat(
             RuntimeHeartbeat(
                 id=self.service_name,
@@ -94,6 +101,8 @@ class OverseerRuntime:
             crew_messages_blocked=crew_blocked,
             usage_continuations_dispatched=usage_dispatched,
             usage_continuations_skipped=usage_skipped,
+            knowledge_events_captured=knowledge_captured,
+            knowledge_events_failed=knowledge_failed,
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:
@@ -134,6 +143,12 @@ class OverseerRuntime:
             return 0, 0
         result = self.usage_continuation_dispatcher(str(self.store.path))
         return int(result.get("dispatched", 0)), int(result.get("skipped", 0))
+
+    def _capture_knowledge_events(self) -> tuple[int, int]:
+        if not self.capture_knowledge_events or self.knowledge_capture_dispatcher is None:
+            return 0, 0
+        result = self.knowledge_capture_dispatcher(str(self.store.path))
+        return int(result.get("captured", 0)), int(result.get("failed", 0))
 
 
 def _utc_now() -> str:

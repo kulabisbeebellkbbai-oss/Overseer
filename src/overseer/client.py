@@ -331,6 +331,33 @@ class OverseerApiClient:
             },
         )
 
+    def documents_knowledge_capture_plan(
+        self,
+        kinds: list[str] | tuple[str, ...] = (),
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        params: list[tuple[str, Any]] = []
+        for kind in kinds:
+            params.append(("kind", kind))
+        if limit is not None:
+            params.append(("limit", limit))
+        query = f"?{urlencode(params)}" if params else ""
+        return self._get(f"/documents/knowledge-capture-plan{query}")
+
+    def documents_capture_knowledge(
+        self,
+        kinds: list[str] | tuple[str, ...] = (),
+        limit: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kinds": list(kinds),
+            "dry_run": dry_run,
+        }
+        if limit is not None:
+            payload["limit"] = limit
+        return self._post("/documents/knowledge-capture", payload)
+
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 

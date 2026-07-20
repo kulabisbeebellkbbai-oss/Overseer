@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 import overseer.api as overseer_api
 import overseer.admin as overseer_admin
 import overseer.documents as overseer_documents
+import overseer.knowledge as overseer_knowledge
 from overseer import (
     ApprovalLevel,
     ApprovalRequest,
@@ -295,7 +296,7 @@ class _FakeObsidianHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/search/simple/"):
             self._json([{"filename": "Overseer/Runbooks/REST.md", "score": 1, "matches": [{"match": "Overseer"}]}])
             return
-        if self.path == "/vault/Overseer/Inbox/operator-note.md":
+        if self.path == "/vault/Overseer/Inbox/operator-note.md" or self.path.startswith("/vault/Overseer/Knowledge/"):
             self.send_response(204)
             self.end_headers()
             return
@@ -303,7 +304,19 @@ class _FakeObsidianHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_PUT(self):
-        self.do_POST()
+        length = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        self.__class__.calls.append(("PUT", self.path, self.headers.get("authorization"), body))
+        if self.headers.get("authorization") != "Bearer test-token":
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path == "/vault/Overseer/Inbox/operator-note.md" or self.path.startswith("/vault/Overseer/Knowledge/"):
+            self.send_response(204)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def _json(self, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -2530,6 +2543,75 @@ class OverseerApiTests(unittest.TestCase):
 
         self.assertEqual(str(error.exception), "path is outside allowed Documents write folders")
 
+    def test_knowledge_capture_builds_dry_run_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_crew_message(
+                CrewMessage(
+                    id="crew.odo.review-source",
+                    owner_domain=OwnerDomain.ODO,
+                    subject="Review source",
+                    message="Check suspicious source traffic.",
+                    priority=RiskLevel.HIGH,
+                    requested_by="operator",
+                    created_at="2026-07-20T12:00:00+00:00",
+                    updated_at="2026-07-20T12:00:00+00:00",
+                )
+            )
+            store.save_audit_event(
+                AuditEvent(
+                    id="audit.odo.review-source",
+                    event_type=AuditEventType.ALERT,
+                    owner_domain=OwnerDomain.ODO,
+                    subject_id="source.192-0-2-10",
+                    summary="Suspicious source was observed.",
+                    risk_level=RiskLevel.HIGH,
+                    occurred_at="2026-07-20T12:01:00+00:00",
+                )
+            )
+            store.close()
+
+            status = overseer_knowledge.knowledge_capture_status(store_path, kinds=("crew", "audit"), limit=10, dry_run=True)
+
+        self.assertEqual(status["candidate_count"], 2)
+        self.assertEqual(status["captured"], 0)
+        self.assertTrue(status["dry_run"])
+        self.assertEqual(status["items"][0]["path"], "Overseer/Knowledge/Events/odo/audit.odo.review-source.md")
+        self.assertEqual(status["items"][1]["path"], "Overseer/Knowledge/Crew/odo/crew.odo.review-source.md")
+
+    def test_knowledge_capture_writes_to_documents_without_exposing_token(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.EZRI.value,
+                "Capture runbook",
+                "Create a note for the latest runbook decision.",
+                RiskLevel.LOW.value,
+                message_id="crew.ezri.capture-runbook",
+                created_at="2026-07-20T12:00:00+00:00",
+            )
+
+            status = overseer_knowledge.knowledge_capture_status(
+                store_path,
+                str(env_file),
+                kinds=("crew",),
+                limit=5,
+                dry_run=False,
+            )
+
+        self.assertEqual(status["captured"], 1)
+        self.assertEqual(status["failed"], 0)
+        self.assertTrue(status["mutation_performed"])
+        self.assertNotIn("test-token", json.dumps(status))
+        self.assertTrue(any(call[0] == "PUT" and call[1].startswith("/vault/Overseer/Knowledge/Crew/ezri/") for call in obsidian.calls))
+
     def test_documents_cli_status_and_search_use_env_file(self):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
             env_file = Path(directory) / "obsidian.env"
@@ -2592,6 +2674,39 @@ class OverseerApiTests(unittest.TestCase):
         self.assertEqual(status["path"], "Overseer/Inbox/operator-note.md")
         self.assertTrue(status["mutation_performed"])
 
+    def test_knowledge_capture_cli_supports_dry_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.DAX.value,
+                "Document checkout",
+                "Capture the latest virtual asset checkout.",
+                RiskLevel.MEDIUM.value,
+                message_id="crew.dax.document-checkout",
+                created_at="2026-07-20T12:00:00+00:00",
+            )
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = cli_main(
+                    [
+                        "capture-knowledge-events",
+                        "--store",
+                        str(store_path),
+                        "--kind",
+                        "crew",
+                        "--limit",
+                        "3",
+                        "--dry-run",
+                    ]
+                )
+            status = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(status["candidate_count"], 1)
+        self.assertEqual(status["items"][0]["path"], "Overseer/Knowledge/Crew/dax/crew.dax.document-checkout.md")
+
     def test_api_exposes_documents_routes_behind_overseer_auth(self):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
             env_file = Path(directory) / "obsidian.env"
@@ -2620,6 +2735,40 @@ class OverseerApiTests(unittest.TestCase):
             self.assertTrue(status["available"])
             self.assertEqual(notes["count"], 2)
             self.assertEqual(search["count"], 1)
+
+    def test_api_exposes_knowledge_capture_routes_behind_overseer_auth(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.EZRI.value,
+                "Capture API route",
+                "Capture via the API route.",
+                RiskLevel.LOW.value,
+                message_id="crew.ezri.capture-api-route",
+                created_at="2026-07-20T12:00:00+00:00",
+            )
+
+            def capture_with_env(path, kinds=(), limit=50, dry_run=False):
+                return overseer_knowledge.knowledge_capture_status(path, str(env_file), kinds, limit, dry_run)
+
+            with patch.object(overseer_api, "knowledge_capture_status", capture_with_env):
+                with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                    plan = server.get("/documents/knowledge-capture-plan?kind=crew&limit=5")
+                    captured = server.post(
+                        "/documents/knowledge-capture",
+                        {"kinds": ["crew"], "limit": 5, "dry_run": False},
+                    )
+
+        self.assertEqual(plan["candidate_count"], 1)
+        self.assertTrue(plan["dry_run"])
+        self.assertEqual(captured["captured"], 1)
+        self.assertTrue(any(call[0] == "PUT" and call[1].startswith("/vault/Overseer/Knowledge/Crew/ezri/") for call in obsidian.calls))
 
     def test_loopback_api_serves_operator_console_without_token(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3053,6 +3202,38 @@ class OverseerApiClientTests(unittest.TestCase):
             self.assertEqual(notes["count"], 2)
             self.assertEqual(search["count"], 1)
             self.assertTrue(write["mutation_performed"])
+
+    def test_client_uses_knowledge_capture_routes(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.EZRI.value,
+                "Capture client route",
+                "Capture via the client helper.",
+                RiskLevel.LOW.value,
+                message_id="crew.ezri.capture-client-route",
+                created_at="2026-07-20T12:00:00+00:00",
+            )
+
+            def capture_with_env(path, kinds=(), limit=50, dry_run=False):
+                return overseer_knowledge.knowledge_capture_status(path, str(env_file), kinds, limit, dry_run)
+
+            with patch.object(overseer_api, "knowledge_capture_status", capture_with_env):
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    client = OverseerApiClient(server.url, auth_token="client-secret")
+                    plan = client.documents_knowledge_capture_plan(kinds=("crew",), limit=5)
+                    captured = client.documents_capture_knowledge(kinds=("crew",), limit=5)
+
+        self.assertEqual(plan["candidate_count"], 1)
+        self.assertTrue(plan["dry_run"])
+        self.assertEqual(captured["captured"], 1)
+        self.assertTrue(any(call[0] == "PUT" and call[1].startswith("/vault/Overseer/Knowledge/Crew/ezri/") for call in obsidian.calls))
 
     def test_client_records_resource(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8499,6 +8680,23 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(tick.usage_continuations_dispatched, 3)
             self.assertEqual(tick.usage_continuations_skipped, 2)
+            store.close()
+
+    def test_runtime_captures_knowledge_events_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+
+            def fake_capture(store_path: str) -> dict[str, object]:
+                return {"captured": 4, "failed": 1}
+
+            tick = OverseerRuntime(
+                store,
+                capture_knowledge_events=True,
+                knowledge_capture_dispatcher=fake_capture,
+            ).run(once=True)
+
+            self.assertEqual(tick.knowledge_events_captured, 4)
+            self.assertEqual(tick.knowledge_events_failed, 1)
             store.close()
 
     def test_run_status_dispatches_open_crew_messages_when_enabled(self):

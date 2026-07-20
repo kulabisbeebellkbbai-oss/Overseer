@@ -638,6 +638,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
   </div>
   <script>
     const endpoints = {
+      auth: "/auth-check",
       dashboard: "/operator-dashboard",
       runtime: "/runtime-status",
       authorizations: "/admin/authorizations-required",
@@ -665,7 +666,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       listenerReviewQueue: "/host/security/listener-review-queue",
       sourceReviewQueue: "/host/security/source-review-queue"
     };
-    const requiredEndpointKeys = new Set(["dashboard"]);
+    const requiredEndpointKeys = new Set(["auth"]);
     const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
     const apiBase = protectedGatewayPath ? "/Overseer" : "";
     const tokenStore = protectedGatewayPath ? sessionStorage : localStorage;
@@ -709,8 +710,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function refresh() {
       const error = document.getElementById("error");
       error.hidden = true;
-      const endpointEntries = Object.entries(endpoints);
-      const results = await Promise.allSettled(endpointEntries.map(async ([key, path]) => [key, await getJson(path)]));
+      let authPayload;
+      try {
+        authPayload = await getJson(endpoints.auth);
+      } catch (err) {
+        error.textContent = formatEndpointError({path: endpoints.auth, message: err.message});
+        error.hidden = false;
+        return;
+      }
+      state.data = {...state.data, auth: authPayload};
+      state.loadErrors = [];
+      document.getElementById("updated").textContent = new Date().toLocaleString();
+      render();
+      const endpointEntries = Object.entries(endpoints).filter(([key]) => !requiredEndpointKeys.has(key));
+      const results = await mapEndpointEntries(endpointEntries, 4);
       const nextData = {...state.data};
       const failures = [];
       results.forEach((result, index) => {
@@ -721,12 +734,6 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           failures.push({key, path, message: result.reason.message});
         }
       });
-      const requiredFailure = failures.find((failure) => requiredEndpointKeys.has(failure.key));
-      if (requiredFailure) {
-        error.textContent = formatEndpointError(requiredFailure);
-        error.hidden = false;
-        return;
-      }
       state.data = nextData;
       state.loadErrors = failures;
       if (failures.length) {
@@ -743,6 +750,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function formatEndpointError(failure) {
       return `${failure.path}: ${failure.message}`;
+    }
+    async function mapEndpointEntries(entries, concurrency) {
+      const results = new Array(entries.length);
+      let nextIndex = 0;
+      async function worker() {
+        while (nextIndex < entries.length) {
+          const index = nextIndex;
+          nextIndex += 1;
+          const [key, path] = entries[index];
+          try {
+            results[index] = {status: "fulfilled", value: [key, await getJson(path)]};
+          } catch (reason) {
+            results[index] = {status: "rejected", reason};
+          }
+        }
+      }
+      await Promise.all(Array.from({length: Math.min(concurrency, entries.length)}, worker));
+      return results;
     }
     async function getJson(path) {
       const headers = {};

@@ -2782,11 +2782,13 @@ class OverseerApiTests(unittest.TestCase):
                 favicon_request = Request(f"{server.url}/favicon.ico")
                 with urlopen(favicon_request, timeout=5) as favicon_response:
                     favicon_status = favicon_response.status
+                auth_check = server.get("/auth-check")
                 with self.assertRaises(HTTPError) as error:
                     urlopen(f"{server.url}/operator-dashboard", timeout=5)
 
             self.assertIn("text/html", content_type)
             self.assertEqual(favicon_status, 204)
+            self.assertTrue(auth_check["authorized"])
             self.assertIn("<title>Overseer</title>", html)
             self.assertIn("Station operations", html)
             self.assertIn("Overseer API token", html)
@@ -2822,9 +2824,12 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("function stationIntro", html)
             self.assertIn('apiBase = protectedGatewayPath ? "/Overseer" : ""', html)
             self.assertIn("tokenStore = protectedGatewayPath ? sessionStorage : localStorage", html)
-            self.assertIn("Promise.allSettled", html)
+            self.assertIn('auth: "/auth-check"', html)
+            self.assertIn('requiredEndpointKeys = new Set(["auth"])', html)
+            self.assertIn("authPayload = await getJson(endpoints.auth)", html)
+            self.assertIn("filter(([key]) => !requiredEndpointKeys.has(key))", html)
+            self.assertIn("mapEndpointEntries(endpointEntries, 4)", html)
             self.assertIn("Loaded with panel errors", html)
-            self.assertIn('requiredEndpointKeys = new Set(["dashboard"])', html)
             self.assertIn("data-action=\"register-resource\"", html)
             self.assertIn("/resources", html)
             self.assertIn("data-view=\"claims\"", html)

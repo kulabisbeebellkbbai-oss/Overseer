@@ -136,6 +136,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if not self._is_authorized():
                 self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
                 return
+            if path == "/auth-check":
+                self._write_json({"ok": True, "service": "overseer-api", "authorized": True})
+                return
             if path == "/service-status":
                 self._handle(lambda: service_status(store_path))
                 return
@@ -513,7 +516,10 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                return
 
         def _write_html(self, html: str, status: HTTPStatus = HTTPStatus.OK) -> None:
             body = html.encode("utf-8")

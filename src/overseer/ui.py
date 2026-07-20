@@ -37,6 +37,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       --command: #f2b84b;
       --ops: #7f69ff;
       --alert: #ff5f61;
+      --station-accent: var(--lcars-amber);
+      --station-accent-2: var(--lcars-orange);
+      --station-accent-3: var(--lcars-peach);
     }
     * { box-sizing: border-box; }
     body {
@@ -49,6 +52,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
+    body[data-station="overview"] { --station-accent: var(--lcars-amber); --station-accent-2: var(--lcars-orange); --station-accent-3: var(--lcars-peach); }
+    body[data-station="admin"] { --station-accent: var(--lcars-peach); --station-accent-2: var(--lcars-amber); --station-accent-3: var(--lcars-cyan); }
+    body[data-station="assets"] { --station-accent: var(--lcars-orange); --station-accent-2: var(--lcars-violet); --station-accent-3: var(--lcars-peach); }
+    body[data-station="claims"] { --station-accent: var(--lcars-violet); --station-accent-2: var(--lcars-lavender); --station-accent-3: var(--lcars-cyan); }
+    body[data-station="security"] { --station-accent: var(--bad); --station-accent-2: var(--lcars-orange); --station-accent-3: var(--warn); }
+    body[data-station="health"] { --station-accent: var(--lcars-cyan); --station-accent-2: var(--lcars-blue); --station-accent-3: var(--lcars-lavender); }
+    body[data-station="usage"] { --station-accent: var(--lcars-pink); --station-accent-2: var(--lcars-lavender); --station-accent-3: var(--lcars-amber); }
+    body[data-station="ezri"] { --station-accent: var(--lcars-lavender); --station-accent-2: var(--lcars-cyan); --station-accent-3: var(--lcars-peach); }
+    body[data-station="audit"] { --station-accent: var(--inactive); --station-accent-2: var(--lcars-amber); --station-accent-3: var(--lcars-violet); }
     button, input, select, textarea {
       font: inherit;
     }
@@ -131,10 +143,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .nav button:nth-child(3n) { background: var(--lcars-peach); }
     .nav button:nth-child(4n) { background: var(--lcars-violet); color: #fff6e8; }
     .nav button[aria-selected="true"] {
-      background: var(--lcars-cyan);
+      background: var(--station-accent);
       color: #050506;
       border-color: #000;
-      box-shadow: inset -20px 0 0 var(--lcars-blue), 0 0 0 2px #000;
+      box-shadow: inset -20px 0 0 var(--station-accent-2), 0 0 0 2px #000;
     }
     .topbar {
       display: grid;
@@ -146,8 +158,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       border: 0;
       border-radius: 0 22px 22px 0;
       background:
-        linear-gradient(90deg, var(--lcars-amber) 0 14px, #000 14px 20px, rgba(16, 16, 23, 0.96) 20px 100%);
-      box-shadow: inset 0 -4px 0 var(--lcars-orange);
+        linear-gradient(90deg, var(--station-accent) 0 14px, #000 14px 20px, rgba(16, 16, 23, 0.96) 20px 100%);
+      box-shadow: inset 0 -4px 0 var(--station-accent-2);
     }
     .status-line {
       display: flex;
@@ -219,7 +231,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       inset: 0 auto auto 0;
       width: 7px;
       height: 54px;
-      background: var(--lcars-amber);
+      background: var(--station-accent);
       border-radius: 0 0 4px 0;
     }
     .panel.good { box-shadow: inset 7px 0 0 var(--good), 0 14px 32px rgba(0, 0, 0, 0.22); }
@@ -377,7 +389,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       padding: 4px 12px 4px 18px;
       border-radius: 22px 4px 4px 22px;
       background:
-        linear-gradient(90deg, var(--lcars-orange) 0 22px, #000 22px 28px, var(--lcars-amber) 28px 58%, #000 58% 60%, var(--lcars-violet) 60% 100%);
+        linear-gradient(90deg, var(--station-accent-2) 0 22px, #000 22px 28px, var(--station-accent) 28px 58%, #000 58% 60%, var(--station-accent-3) 60% 100%);
       color: #050506;
     }
     .section-head h3 {
@@ -429,8 +441,105 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .officer-channel {
       border-radius: 0 24px 4px 0;
       background:
-        linear-gradient(90deg, rgba(242, 184, 75, 0.18), transparent 26%),
+        linear-gradient(90deg, color-mix(in srgb, var(--station-accent) 22%, transparent), transparent 26%),
         var(--panel);
+    }
+    .station-intro {
+      grid-column: span 12;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(168px, auto);
+      gap: 16px;
+      align-items: stretch;
+      min-height: 132px;
+      padding: 18px 18px 18px 30px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 0 34px 6px 0;
+      background:
+        linear-gradient(90deg, var(--station-accent) 0 16px, #000 16px 24px, rgba(16, 16, 23, 0.96) 24px 100%),
+        var(--panel);
+      box-shadow: inset 0 -7px 0 var(--station-accent-2), 0 18px 34px rgba(0, 0, 0, 0.24);
+    }
+    .station-intro h2 {
+      font-size: 24px;
+      line-height: 1.08;
+      text-transform: uppercase;
+    }
+    .station-intro p {
+      margin-top: 8px;
+      color: var(--muted);
+      max-width: 780px;
+    }
+    .station-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .station-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 3px 10px;
+      border: 2px solid #000;
+      border-radius: 999px 4px 4px 999px;
+      background: var(--station-accent-3);
+      color: #050506;
+      font-size: 12px;
+      font-weight: 820;
+      text-transform: uppercase;
+    }
+    .station-code {
+      display: grid;
+      align-content: center;
+      justify-items: end;
+      gap: 8px;
+      min-width: 0;
+      padding: 12px 14px;
+      border-radius: 28px 4px 4px 28px;
+      background: var(--station-accent);
+      color: #050506;
+      box-shadow: inset -18px 0 0 var(--station-accent-2);
+      text-align: right;
+      font-weight: 840;
+      text-transform: uppercase;
+    }
+    .station-code span:first-child {
+      font-size: 28px;
+      line-height: 1;
+    }
+    .station-code span:last-child {
+      max-width: 180px;
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .kb-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .kb-card {
+      display: grid;
+      gap: 9px;
+      min-height: 180px;
+      padding: 14px 14px 14px 20px;
+      border: 1px solid rgba(185, 166, 255, 0.26);
+      border-radius: 0 22px 4px 0;
+      background:
+        linear-gradient(90deg, var(--station-accent-2) 0 8px, transparent 8px 100%),
+        rgba(23, 22, 33, 0.84);
+    }
+    .kb-card.primary {
+      background:
+        linear-gradient(90deg, var(--good) 0 8px, transparent 8px 100%),
+        rgba(23, 22, 33, 0.92);
+    }
+    .kb-card h3 {
+      color: var(--station-accent-3);
+    }
+    .kb-card .source {
+      color: var(--lcars-cyan);
+      overflow-wrap: anywhere;
+      font-size: 12px;
     }
     @media (max-width: 900px) {
       .shell { grid-template-columns: 1fr; }
@@ -460,6 +569,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       }
       .span-3, .span-4, .span-6, .span-8 { grid-column: span 12; }
       .field.span-1, .field.span-2, .field.span-3 { grid-column: span 6; }
+      .station-intro { grid-template-columns: 1fr; }
+      .station-code { justify-items: start; text-align: left; }
+      .kb-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 520px) {
       main { padding: 12px; }
@@ -474,7 +586,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
   </style>
 </head>
-<body>
+<body data-station="overview">
   <div class="shell">
     <aside>
       <div class="brand">
@@ -492,6 +604,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <button data-view="security">Security</button>
         <button data-view="health">Health</button>
         <button data-view="usage">Usage</button>
+        <button data-view="ezri">Ezri</button>
         <button data-view="audit">Audit</button>
       </nav>
     </aside>
@@ -519,6 +632,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       <section id="security" class="section"></section>
       <section id="health" class="section"></section>
       <section id="usage" class="section"></section>
+      <section id="ezri" class="section"></section>
       <section id="audit" class="section"></section>
     </main>
   </div>
@@ -577,6 +691,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     });
     function selectView(view) {
       state.view = view;
+      document.body.dataset.station = view;
       document.querySelectorAll(".nav button").forEach((button) => {
         button.setAttribute("aria-selected", String(button.dataset.view === view));
       });
@@ -1007,6 +1122,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       renderSecurity();
       renderHealth();
       renderUsage();
+      renderEzri();
       renderAudit();
       renderActionStatus();
     }
@@ -1027,6 +1143,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
       document.getElementById("overview").innerHTML = `
         <div class="grid">
+          ${stationIntro("Sisko", "Strategic Operations", "Command routing, runtime cadence, and crew dispatch.", ["authorizations", "crew queue", "runtime"])}
           ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3")}
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good")}
           ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good")}
@@ -1058,6 +1175,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const profile = activePolicy.profile || {};
       document.getElementById("admin").innerHTML = `
         <div class="grid">
+          ${stationIntro("O'Brien", "Maintenance Operations", "Protected changes, package work, and service restart gates.", ["admin plans", "policy profile", "maintenance"])}
           <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button><button class="action-btn" data-action="plan-package-updates">Plan Updates</button></div></div>
           ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good")}
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good")}
@@ -1175,6 +1293,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const virtual = state.data.virtual || {};
       document.getElementById("assets").innerHTML = `
         <div class="grid">
+          ${stationIntro("Kira / Dax", "Asset Control", "Physical inventory and virtual checkout surfaces.", ["USB and storage", "listeners", "virtual assets"])}
           <div class="section-head"><h3>Asset Actions</h3><div class="actions"><button class="action-btn" data-action="discover-physical">Discover Devices</button><button class="action-btn" data-action="discover-storage">Discover Storage</button><button class="action-btn" data-action="discover-listeners">Discover Listeners</button></div></div>
           ${metric("Physical", physical.assets, "assets", "span-3")}
           ${metric("Checkout Ready", physical.ready_for_checkout, "physical", "span-3")}
@@ -1202,6 +1321,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const cleanup = state.data.claimCleanup || {};
       document.getElementById("claims").innerHTML = `
         <div class="grid">
+          ${stationIntro("Dax", "Deconfliction Matrix", "Claims, leases, locks, and cleanup handoffs.", ["active claims", "approvals", "cleanup"])}
           ${metric("Active", claims.active_like, "claims", "span-3")}
           ${metric("Queued", claims.queued, "claims", "span-3", claims.queued ? "warn" : "good")}
           ${metric("Review", claims.operator_review_required, "required", "span-3", claims.operator_review_required ? "bad" : "good")}
@@ -1268,6 +1388,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const sourceQueue = state.data.sourceReviewQueue || {};
       document.getElementById("security").innerHTML = `
         <div class="grid">
+          ${stationIntro("Odo", "Security Board", "Host inspection, source review, and protective action staging.", ["listeners", "source review", "IDS package"])}
           <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button><button class="action-btn" data-action="plan-listener-queue-remediations">Plan Listener Queue</button></div></div>
           ${metric("Alerts", security.alerts, "security", "span-3", security.alerts ? "bad" : "good")}
           ${metric("High", host.high_findings, "findings", "span-3", host.high_findings ? "bad" : "good")}
@@ -1334,6 +1455,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const runtime = state.data.runtime || {};
       document.getElementById("health").innerHTML = `
         <div class="grid">
+          ${stationIntro("Julian", "Diagnostics Lab", "Service health, probe failures, and runtime freshness.", ["probes", "MCP checks", "HTML and JSON"])}
           <div class="section-head"><h3>Health Actions</h3><div class="actions"><button class="action-btn" data-action="run-health-probes">Run Probes</button></div></div>
           ${metric("Targets", health.targets, "registered", "span-3")}
           ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good")}
@@ -1416,6 +1538,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const usage = state.data.usage || {};
       document.getElementById("usage").innerHTML = `
         <div class="grid">
+          ${stationIntro("Quark", "Quota Exchange", "Usage-limited services, renewal windows, and continuation dispatch.", ["API-keyed MCP", "renewals", "queued work"])}
           <div class="section-head"><h3>Usage Actions</h3><div class="actions"><button class="action-btn" data-action="discover-codex-threads">Discover Codex Threads</button><button class="action-btn" data-action="dispatch-usage-continuations">Dispatch Ready</button></div></div>
           ${metric("Limits", usage.limits, "tracked", "span-3")}
           ${metric("Available", usage.available, "limits", "span-3", "good")}
@@ -1461,17 +1584,77 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${officerPanel("quark", "MCP API quota scheduling", "Track API-keyed MCP call limits and schedule continuation after the quota window resets.", "limit.mcp.api.calls.daily")}
         </div>`;
     }
+    function renderEzri() {
+      const candidates = knowledgeBaseCandidates();
+      const primary = candidates[0] || {};
+      document.getElementById("ezri").innerHTML = `
+        <div class="grid">
+          ${stationIntro("Ezri", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Recommended Integration</h3><span class="pill good">open source</span></div>
+            <div class="kb-grid">
+              ${candidates.slice(0, 3).map((candidate) => kbCandidateCard(candidate)).join("")}
+            </div>
+          </div>
+          <div class="panel span-6">${kv("Ezri Default", {
+            server: primary.name,
+            license: primary.license,
+            transport: primary.transport,
+            source: primary.source,
+            install_boundary: "vault path and credential posture"
+          })}</div>
+          <div class="panel span-6">${kv("Integration Notes", {
+            primary_fit: "Obsidian vault read, write, search, and targeted edit tools",
+            fallback_fit: "direct filesystem vault access when Obsidian app or REST API is not desired",
+            storage_model: "local markdown vault",
+            approval_boundary: "external MCP install and vault path selection"
+          })}</div>
+          <div class="panel span-12">${table("Knowledge Base Candidates", candidates, ["rank", "name", "license", "transport", "fit", "source"])}</div>
+          ${officerPanel("ezri", "Documentation and knowledge base", "Capture or retrieve docs, runbooks, decisions, troubleshooting notes, and knowledge-base MCP integration requests.")}
+        </div>`;
+    }
     function renderAudit() {
       const audit = state.data.audit || {};
       const approvals = state.data.approvals || {};
       document.getElementById("audit").innerHTML = `
         <div class="grid">
+          ${stationIntro("Sisko", "Audit Log", "Decision history, approvals, and operational evidence.", ["approvals", "events", "policy evidence"])}
           ${metric("Audit Events", audit.event_count, "stored", "span-3")}
           ${metric("Approvals", approvals.approval_count, "stored", "span-3")}
           <div class="panel span-6">${table("Recent Audit", audit.events || [], ["id", "event_type", "owner_domain", "summary"])}</div>
           <div class="panel span-6">${table("Approvals", approvals.items || [], ["id", "status", "owner_domain", "reason"])}</div>
           ${officerPanel("sisko", "Audit review", "Review decision history, approvals, evidence, or policy concerns.")}
         </div>`;
+    }
+    function stationIntro(officer, titleText, summary, chips) {
+      const chipMarkup = (chips || []).map((chip) => `<span class="station-chip">${safe(chip)}</span>`).join("");
+      return `<div class="station-intro">
+        <div>
+          <h2>${safe(titleText)}</h2>
+          <p>${safe(summary)}</p>
+          <div class="station-strip">${chipMarkup}</div>
+        </div>
+        <div class="station-code"><span>${safe(officer)}</span><span>${safe(crewStation(officer))}</span></div>
+      </div>`;
+    }
+    function knowledgeBaseCandidates() {
+      return [
+        {rank: "Primary", name: "cyanheads/obsidian-mcp-server", license: "Apache-2.0", transport: "STDIO or Streamable HTTP", fit: "Obsidian vault read, write, search, and targeted edits", source: "github.com/cyanheads/obsidian-mcp-server"},
+        {rank: "Fallback", name: "Piotr1215/mcp-obsidian", license: "open source", transport: "direct filesystem", fit: "Obsidian vault access without app or REST plugin", source: "github.com/Piotr1215/mcp-obsidian"},
+        {rank: "Popular", name: "MarkusPfundstein/mcp-obsidian", license: "MIT", transport: "Obsidian Local REST API", fit: "REST-backed vault tools when an API key is acceptable", source: "github.com/MarkusPfundstein/mcp-obsidian"},
+        {rank: "Semantic Docs", name: "mjm.local.docs", license: "open source", transport: "HTTP MCP plus web UI", fit: "Local semantic search for PDFs, Word, Markdown, and text", source: "dev.to/markjackmilian/mjmlocaldocs-open-source-local-knowledge-base-with-mcp-3711"},
+        {rank: "Lightweight", name: "lethain/library-mcp", license: "open source", transport: "local markdown folders", fit: "Simple folder-backed knowledge-base queries", source: "github.com/lethain/library-mcp"}
+      ];
+    }
+    function kbCandidateCard(candidate) {
+      const primaryClass = candidate.rank === "Primary" ? " primary" : "";
+      return `<div class="kb-card${primaryClass}">
+        <div class="toolbar"><h3>${safe(candidate.rank)}</h3><span class="pill">${safe(candidate.license)}</span></div>
+        <strong>${safe(candidate.name)}</strong>
+        <p class="muted">${safe(candidate.fit)}</p>
+        <span class="pill">${safe(candidate.transport)}</span>
+        <p class="source">${safe(candidate.source)}</p>
+      </div>`;
     }
     function metric(label, value, hint, span = "span-3", tone = "") {
       const panelTone = normalizeTone(tone);
@@ -1519,7 +1702,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         odo: "Odo",
         quark: "Quark",
         dax: "Dax",
-        julian: "Julian"
+        julian: "Julian",
+        ezri: "Ezri"
       };
       return names[role] || labelize(role);
     }
@@ -1531,11 +1715,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const stations = {
         "Sisko": "Command",
         "Kira": "Physical assets",
+        "Kira / Dax": "Asset control",
         "O'Brien": "Maintenance",
         "Odo": "Security",
         "Quark": "Service limits",
         "Dax": "Virtual assets",
-        "Julian": "Health"
+        "Julian": "Health",
+        "Ezri": "Documentation"
       };
       return stations[name] || "Operations";
     }

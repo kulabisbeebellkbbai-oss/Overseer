@@ -254,11 +254,38 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 6px;
       min-height: 104px;
       padding-left: 24px;
+      text-align: left;
+      color: var(--text);
+    }
+    button.metric,
+    button.crew-card,
+    .cell-link {
+      cursor: pointer;
+    }
+    button.metric,
+    button.crew-card {
+      width: 100%;
+      border: 1px solid rgba(185, 166, 255, 0.28);
+      font: inherit;
+    }
+    button.metric:hover,
+    button.crew-card:hover {
+      border-color: var(--focus);
+      filter: brightness(1.08);
     }
     .metric .value {
       font-size: 30px;
       line-height: 1;
       font-weight: 780;
+    }
+    .cell-link {
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: var(--lcars-cyan);
+      text-align: left;
+      text-decoration: underline;
+      overflow-wrap: anywhere;
     }
     .muted { color: var(--muted); }
     .pill {
@@ -332,6 +359,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       flex-wrap: wrap;
       gap: 8px;
       align-items: center;
+    }
+    .decision-card .list {
+      margin: 10px 0;
     }
     .form-grid {
       display: grid;
@@ -617,11 +647,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <span id="updated" class="muted">not refreshed</span>
           </div>
         </div>
-        <div class="token">
+        <form id="token-form" class="token">
           <input id="token" type="password" autocomplete="off" aria-label="Overseer API token" placeholder="Overseer API token">
-          <button id="save-token" class="action-btn">Unlock</button>
-          <button id="refresh" class="icon-btn" title="Refresh" aria-label="Refresh">R</button>
-        </div>
+          <button id="save-token" type="submit" class="action-btn">Unlock</button>
+          <button id="refresh" type="button" class="icon-btn" title="Refresh" aria-label="Refresh">R</button>
+        </form>
       </div>
       <div id="error" class="panel error" hidden></div>
       <div id="action-status" class="panel action-status" hidden></div>
@@ -679,7 +709,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     };
     const tokenInput = document.getElementById("token");
     tokenInput.value = state.token;
-    document.getElementById("save-token").addEventListener("click", () => {
+    document.getElementById("token-form").addEventListener("submit", (event) => {
+      event.preventDefault();
       state.token = tokenInput.value.trim();
       if (state.token) tokenStore.setItem("overseerToken", state.token);
       else tokenStore.removeItem("overseerToken");
@@ -690,6 +721,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       button.addEventListener("click", () => selectView(button.dataset.view));
     });
     document.addEventListener("click", async (event) => {
+      const fillTarget = event.target.closest("[data-fill]");
+      if (fillTarget) {
+        event.preventDefault();
+        applyFill(fillTarget.dataset.fill);
+        const targetView = fillTarget.dataset.viewTarget;
+        if (targetView && !fillTarget.dataset.action) selectView(targetView);
+        if (!fillTarget.dataset.action) return;
+      }
+      const viewTarget = event.target.closest("[data-view-target]");
+      if (viewTarget && !viewTarget.dataset.action) {
+        event.preventDefault();
+        selectView(viewTarget.dataset.viewTarget);
+        return;
+      }
       const button = event.target.closest("[data-action]");
       if (!button) return;
       event.preventDefault();
@@ -1234,13 +1279,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("overview").innerHTML = `
         <div class="grid">
           ${stationIntro("Sisko", "Strategic Operations", "Command routing, runtime cadence, and crew dispatch.", ["authorizations", "crew queue", "runtime"])}
-          ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3")}
-          ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good")}
-          ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good")}
-          ${metric("O'Brien", focus.obrien?.executable_plans, "executable plans", "span-3")}
-          ${metric("Runtime", runtime.service?.freshness?.status, "heartbeat freshness", "span-3", freshnessTone(runtime.service?.freshness?.status))}
-          ${metric("Crew Queue", crewSummary.open, "open requests", "span-3", crewSummary.open ? "warn" : "good")}
-          ${metric("Dispatch Blocks", crewSummary.blocked_dispatches, "blocked dispatches", "span-3", crewSummary.blocked_dispatches ? "warn" : "good")}
+          ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3", attention.pending_authorizations ? "warn" : "good", "admin")}
+          ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good", "security")}
+          ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good", "health")}
+          ${metric("O'Brien", focus.obrien?.executable_plans, "executable plans", "span-3", "", "admin")}
+          ${metric("Runtime", runtime.service?.freshness?.status, "heartbeat freshness", "span-3", freshnessTone(runtime.service?.freshness?.status), "health")}
+          ${metric("Crew Queue", crewSummary.open, "open requests", "span-3", crewSummary.open ? "warn" : "good", "audit")}
+          ${metric("Dispatch Blocks", crewSummary.blocked_dispatches, "blocked dispatches", "span-3", crewSummary.blocked_dispatches ? "warn" : "good", "audit")}
           <div class="section-head"><h3>Command Crew</h3><div class="actions"><span class="pill">${safe((state.data.dashboard || {}).service_name)}</span><button class="action-btn" data-action="dispatch-crew-messages">Dispatch Open</button></div></div>
           ${crew("Sisko", focus.sisko)}
           ${crew("Kira", focus.kira)}
@@ -1249,7 +1294,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${crew("Quark", focus.quark)}
           ${crew("Dax", focus.dax)}
           ${crew("Julian", focus.julian)}
-          <div class="panel span-12">${table("Recent Crew Dispatches", dispatches, ["occurred_at", "owner_domain", "event_type", "message_id", "reason"])}</div>
+          <div class="panel span-12">${table("Recent Crew Dispatches", dispatches, ["occurred_at", "owner_domain", "event_type", "message_id", "reason"], {links: {owner_domain: (row) => domainView(row.owner_domain)}})}</div>
           ${officerPanel("sisko", "Command routing", "Coordinate this issue across the crew.")}
         </div>`;
     }
@@ -1267,10 +1312,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <div class="grid">
           ${stationIntro("O'Brien", "Maintenance Operations", "Protected changes, package work, and service restart gates.", ["admin plans", "policy profile", "maintenance"])}
           <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button><button class="action-btn" data-action="plan-package-updates">Plan Updates</button></div></div>
-          ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good")}
-          ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good")}
-          ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3")}
-          ${metric("Failed", readiness.failed, "plans", "span-3", readiness.failed ? "bad" : "good")}
+          ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good", "admin")}
+          ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good", "admin")}
+          ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3", "", "admin")}
+          ${metric("Failed", readiness.failed, "plans", "span-3", readiness.failed ? "bad" : "good", "audit")}
           <div class="panel span-12">
             <div class="toolbar"><h3>Plan Admin Change</h3><button class="action-btn" data-action="plan-admin-change">Plan Change</button></div>
             <div class="form-grid">
@@ -1370,8 +1415,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-4"><label for="policy-warning-approved-by">Approved By</label><input id="policy-warning-approved-by" value="human"></div>
             </div>
           </div>
+          ${authorizationDecisionBoard(auth, readiness)}
           <div class="panel span-6">${table("Adapter Capabilities", adapters.items || [], ["kind", "status", "adapter_name"])}</div>
-          <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"])}</div>
+          <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"], {fills: {id: (row) => adminPlanFill(row.id)}, fillView: "admin"})}</div>
           <div class="panel span-6">${table("Archive Candidates", archivePlan.items || [], ["plan_id", "disposition", "next_step"])}</div>
           <div class="panel span-6">${table("Archived Plans", archives.items || [], ["plan_id", "disposition", "archived_by", "archived_at"])}</div>
           ${officerPanel("sisko", "Administrative decision", "Plan, approve, or coordinate a protected administrative change.")}
@@ -1385,10 +1431,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <div class="grid">
           ${stationIntro("Kira / Dax", "Asset Control", "Physical inventory and virtual checkout surfaces.", ["USB and storage", "listeners", "virtual assets"])}
           <div class="section-head"><h3>Asset Actions</h3><div class="actions"><button class="action-btn" data-action="discover-physical">Discover Devices</button><button class="action-btn" data-action="discover-storage">Discover Storage</button><button class="action-btn" data-action="discover-listeners">Discover Listeners</button></div></div>
-          ${metric("Physical", physical.assets, "assets", "span-3")}
-          ${metric("Checkout Ready", physical.ready_for_checkout, "physical", "span-3")}
-          ${metric("Virtual", virtual.assets, "assets", "span-3")}
-          ${metric("Active Claims", virtual.active_claims, "virtual", "span-3")}
+          ${metric("Physical", physical.assets, "assets", "span-3", "", "assets")}
+          ${metric("Checkout Ready", physical.ready_for_checkout, "physical", "span-3", "", "claims")}
+          ${metric("Virtual", virtual.assets, "assets", "span-3", "", "assets")}
+          ${metric("Active Claims", virtual.active_claims, "virtual", "span-3", virtual.active_claims ? "warn" : "good", "claims")}
           <div class="panel span-12">
             <div class="toolbar"><h3>Register Resource</h3><button class="action-btn" data-action="register-resource">Record Resource</button></div>
             <div class="form-grid">
@@ -1400,8 +1446,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="resource-identifiers">Identifiers</label><input id="resource-identifiers" value='{"kind":"service"}'></div>
             </div>
           </div>
-          <div class="panel span-6">${table("Physical Assets", physical.items || [], ["id", "kind", "stable_id", "checkout_ready"])}</div>
-          <div class="panel span-6">${table("Virtual Assets", virtual.items || [], ["id", "name", "state", "current_claim_id"])}</div>
+          <div class="panel span-6">${table("Physical Assets", physical.items || [], ["id", "kind", "stable_id", "checkout_ready"], {fills: {id: (row) => resourceClaimFill(row.id, "kira")}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Virtual Assets", virtual.items || [], ["id", "name", "state", "current_claim_id"], {fills: {id: (row) => resourceClaimFill(row.id, "dax"), current_claim_id: (row) => claimFill(row.current_claim_id)}, fillView: "claims"})}</div>
           ${officerPanel("kira", "Physical asset issue", "Handle a USB, serial, power, storage, or connected-device issue.")}
           ${officerPanel("dax", "Virtual asset checkout", "Handle an emulator, VM, gateway, proxy, listener, or virtual checkout issue.")}
         </div>`;
@@ -1412,10 +1458,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("claims").innerHTML = `
         <div class="grid">
           ${stationIntro("Dax", "Deconfliction Matrix", "Claims, leases, locks, and cleanup handoffs.", ["active claims", "approvals", "cleanup"])}
-          ${metric("Active", claims.active_like, "claims", "span-3")}
-          ${metric("Queued", claims.queued, "claims", "span-3", claims.queued ? "warn" : "good")}
-          ${metric("Review", claims.operator_review_required, "required", "span-3", claims.operator_review_required ? "bad" : "good")}
-          ${metric("Cleanup", cleanup.cleanup_candidates, "candidates", "span-3", cleanup.cleanup_candidates ? "warn" : "good")}
+          ${metric("Active", claims.active_like, "claims", "span-3", "", "claims")}
+          ${metric("Queued", claims.queued, "claims", "span-3", claims.queued ? "warn" : "good", "claims")}
+          ${metric("Review", claims.operator_review_required, "required", "span-3", claims.operator_review_required ? "bad" : "good", "claims")}
+          ${metric("Cleanup", cleanup.cleanup_candidates, "candidates", "span-3", cleanup.cleanup_candidates ? "warn" : "good", "claims")}
           <div class="panel span-12">
             <div class="toolbar"><h3>Request Claim</h3><button class="action-btn" data-action="request-claim">Request Claim</button></div>
             <div class="form-grid">
@@ -1465,8 +1511,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-2"><label for="cleanup-executed-by">Executed By</label><input id="cleanup-executed-by" value="sisko"></div>
             </div>
           </div>
-          <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"])}</div>
-          <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"])}</div>
+          <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"], {fills: {id: (row) => claimFill(row.id), resource_id: (row) => resourceClaimFill(row.resource_id, row.owner_role || "dax")}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"], {fills: {id: (row) => cleanupFill(row)}, fillView: "claims"})}</div>
           ${officerPanel("dax", "Checkout conflict", "Deconflict a claim, lease, lock, or cleanup request.")}
         </div>`;
     }
@@ -1480,10 +1526,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <div class="grid">
           ${stationIntro("Odo", "Security Board", "Host inspection, source review, and protective action staging.", ["listeners", "source review", "IDS package"])}
           <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button><button class="action-btn" data-action="plan-listener-queue-remediations">Plan Listener Queue</button></div></div>
-          ${metric("Alerts", security.alerts, "security", "span-3", security.alerts ? "bad" : "good")}
-          ${metric("High", host.high_findings, "findings", "span-3", host.high_findings ? "bad" : "good")}
-          ${metric("Warning", host.warning_findings, "findings", "span-3", host.warning_findings ? "warn" : "good")}
-          ${metric("Plans", (security.protective_plans || {}).total, "protective", "span-3")}
+          ${metric("Alerts", security.alerts, "security", "span-3", security.alerts ? "bad" : "good", "audit")}
+          ${metric("High", host.high_findings, "findings", "span-3", host.high_findings ? "bad" : "good", "security")}
+          ${metric("Warning", host.warning_findings, "findings", "span-3", host.warning_findings ? "warn" : "good", "security")}
+          ${metric("Plans", (security.protective_plans || {}).total, "protective", "span-3", "", "admin")}
           <div class="panel span-6">
             <div class="toolbar"><h3>Plan Remediation</h3><button class="action-btn" data-action="plan-host-security-remediation">Plan</button></div>
             <div class="form-grid">
@@ -1532,10 +1578,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-8"><label for="ids-advisory-result">Advisory Result</label><input id="ids-advisory-result" value="accepted staged package"></div>
             </div>
           </div>
-          <div class="panel span-8">${table("Protective Plans", plans, ["id", "kind", "target", "approved", "canceled"])}</div>
+          <div class="panel span-8">${table("Protective Plans", plans, ["id", "kind", "target", "approved", "canceled"], {fills: {id: (row) => adminPlanFill(row.id)}, fillView: "admin"})}</div>
           <div class="panel span-4">${kv("IDS Review", security.ids_review || {})}</div>
-          <div class="panel span-12">${table("Listener Review Queue", listenerQueue.items || [], ["listener", "bind_scope", "severity", "queue_status", "plan_id", "next_step"])}</div>
-          <div class="panel span-12">${table("Source Review Queue", sourceQueue.items || [], ["remote_address", "listener", "source_scope", "disposition", "queue_status", "next_step"])}</div>
+          <div class="panel span-12">${table("Listener Review Queue", listenerQueue.items || [], ["listener", "bind_scope", "severity", "queue_status", "plan_id", "next_step"], {fills: {listener: (row) => listenerFill(row), plan_id: (row) => adminPlanFill(row.plan_id)}, fillView: "security"})}</div>
+          <div class="panel span-12">${table("Source Review Queue", sourceQueue.items || [], ["remote_address", "listener", "source_scope", "disposition", "queue_status", "next_step"], {fills: {remote_address: (row) => sourceReviewFill(row), listener: (row) => sourceReviewFill(row)}, fillView: "security"})}</div>
           ${officerPanel("odo", "Security investigation", "Investigate traffic, exposed listeners, intrusion signals, or protective actions.")}
         </div>`;
     }
@@ -1547,10 +1593,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <div class="grid">
           ${stationIntro("Julian", "Diagnostics Lab", "Service health, probe failures, and runtime freshness.", ["probes", "MCP checks", "HTML and JSON"])}
           <div class="section-head"><h3>Health Actions</h3><div class="actions"><button class="action-btn" data-action="run-health-probes">Run Probes</button></div></div>
-          ${metric("Targets", health.targets, "registered", "span-3")}
-          ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good")}
-          ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good")}
-          ${metric("Failures", health.latest_failures, "latest", "span-3", health.latest_failures ? "bad" : "good")}
+          ${metric("Targets", health.targets, "registered", "span-3", "", "health")}
+          ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good", "health")}
+          ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good", "health")}
+          ${metric("Failures", health.latest_failures, "latest", "span-3", health.latest_failures ? "bad" : "good", "audit")}
           <div class="panel span-6">${kv("Runtime Heartbeat", {
             service: runtime.service?.service_name,
             freshness: runtime.service?.freshness?.status,
@@ -1578,7 +1624,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="health-target">Target</label><input id="health-target" value="http://127.0.0.1:8766/health"></div>
             </div>
           </div>
-          <div class="panel span-12">${table("Health Targets", healthSummary.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"])}</div>
+          <div class="panel span-12">${table("Health Targets", healthSummary.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id, "health-name": row.name || "" })}, fillView: "health"})}</div>
           ${officerPanel("julian", "Service health issue", "Diagnose MCP, HTTP, HTML, JSON, process, or probe failures.")}
         </div>`;
     }
@@ -1624,16 +1670,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const element = document.getElementById(id);
       return element ? element.value.trim() : "";
     }
+    function applyFill(encoded) {
+      if (!encoded) return;
+      const fields = JSON.parse(encoded);
+      Object.entries(fields).forEach(([id, val]) => {
+        const element = document.getElementById(id);
+        if (element) element.value = val ?? "";
+      });
+    }
     function renderUsage() {
       const usage = state.data.usage || {};
       document.getElementById("usage").innerHTML = `
         <div class="grid">
           ${stationIntro("Quark", "Quota Exchange", "Usage-limited services, renewal windows, and continuation dispatch.", ["API-keyed MCP", "renewals", "queued work"])}
           <div class="section-head"><h3>Usage Actions</h3><div class="actions"><button class="action-btn" data-action="discover-codex-threads">Discover Codex Threads</button><button class="action-btn" data-action="dispatch-usage-continuations">Dispatch Ready</button></div></div>
-          ${metric("Limits", usage.limits, "tracked", "span-3")}
-          ${metric("Available", usage.available, "limits", "span-3", "good")}
-          ${metric("Exhausted", usage.exhausted, "limits", "span-3", usage.exhausted ? "warn" : "good")}
-          ${metric("Low Confidence", usage.low_confidence, "limits", "span-3", usage.low_confidence ? "warn" : "good")}
+          ${metric("Limits", usage.limits, "tracked", "span-3", "", "usage")}
+          ${metric("Available", usage.available, "limits", "span-3", "good", "usage")}
+          ${metric("Exhausted", usage.exhausted, "limits", "span-3", usage.exhausted ? "warn" : "good", "usage")}
+          ${metric("Low Confidence", usage.low_confidence, "limits", "span-3", usage.low_confidence ? "warn" : "good", "usage")}
           <div class="panel span-6">
             <div class="toolbar"><h3>Record Limit</h3><button class="action-btn" data-action="record-usage-limit">Record Limit</button></div>
             <div class="form-grid">
@@ -1670,7 +1724,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6 check-field"><label><input id="usage-resume-codex-projects" type="checkbox"> Resume Codex Projects</label></div>
             </div>
           </div>
-          <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"])}</div>
+          <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"], {fills: {limit_id: (row) => usageLimitFill(row), resource_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           ${officerPanel("quark", "MCP API quota scheduling", "Track API-keyed MCP call limits and schedule continuation after the quota window resets.", "limit.mcp.api.calls.daily")}
         </div>`;
     }
@@ -1684,10 +1738,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
           ${stationIntro("Ezri", "Knowledge Base", "Operational notes, event capture, runbooks, and vault search.", ["documents", "capture", "runbooks"])}
-          ${metric("REST API", status.available ? "online" : "offline", "Obsidian Local REST", "span-3", status.available ? "good" : "bad")}
-          ${metric("Auth", status.authenticated ? "valid" : "blocked", "stored bearer token", "span-3", status.authenticated ? "good" : "warn")}
-          ${metric("Vault Notes", notes.count, notes.folder || "Overseer", "span-3")}
-          ${metric("Capture Queue", capture.candidate_count, "crew and audit events", "span-3", captureTone)}
+          ${metric("REST API", status.available ? "online" : "offline", "Obsidian Local REST", "span-3", status.available ? "good" : "bad", "ezri")}
+          ${metric("Auth", status.authenticated ? "valid" : "blocked", "stored bearer token", "span-3", status.authenticated ? "good" : "warn", "ezri")}
+          ${metric("Vault Notes", notes.count, notes.folder || "Overseer", "span-3", "", "ezri")}
+          ${metric("Capture Queue", capture.candidate_count, "crew and audit events", "span-3", captureTone, "ezri")}
           <div class="panel span-6">${kv("Documents Runtime", {
             service: status.service || "unavailable",
             status: status.available ? "online" : "offline",
@@ -1696,7 +1750,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             plugin: status.manifest?.version,
             writes: (status.allowed_write_prefixes || []).join(", ")
           })}</div>
-          <div class="panel span-6">${table("Current Folder", files, ["file"])}</div>
+          <div class="panel span-6">${table("Current Folder", files, ["file"], {fills: {file: (row) => ({ "documents-note-path": row.file || "" })}, fillView: "ezri"})}</div>
           <div class="panel span-6">
             <div class="toolbar"><h3>Search and List</h3><div class="actions"><button class="action-btn" data-action="documents-search">Search</button><button class="action-btn" data-action="documents-list-notes">List Folder</button></div></div>
             <div class="form-grid">
@@ -1718,7 +1772,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <div class="form-grid">
               <div class="field span-3"><label for="knowledge-capture-limit">Limit</label><input id="knowledge-capture-limit" type="number" min="1" value="${safe(capture.limit || 12)}"></div>
             </div>
-            ${table("Capture Candidates", captureItems, ["kind", "source_id", "owner_domain", "path"])}
+            ${table("Capture Candidates", captureItems, ["kind", "source_id", "owner_domain", "path"], {links: {owner_domain: (row) => domainView(row.owner_domain)}, fills: {path: (row) => ({ "documents-note-path": row.path || "" })}, fillView: "ezri"})}
           </div>
           ${officerPanel("ezri", "Documentation support", "Capture, find, summarize, or update Overseer docs, runbooks, decisions, and troubleshooting notes.")}
         </div>`;
@@ -1729,10 +1783,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("audit").innerHTML = `
         <div class="grid">
           ${stationIntro("Sisko", "Audit Log", "Decision history, approvals, and operational evidence.", ["approvals", "events", "policy evidence"])}
-          ${metric("Audit Events", audit.event_count, "stored", "span-3")}
-          ${metric("Approvals", approvals.approval_count, "stored", "span-3")}
-          <div class="panel span-6">${table("Recent Audit", audit.events || [], ["id", "event_type", "owner_domain", "summary"])}</div>
-          <div class="panel span-6">${table("Approvals", approvals.items || [], ["id", "status", "owner_domain", "reason"])}</div>
+          ${metric("Audit Events", audit.event_count, "stored", "span-3", "", "audit")}
+          ${metric("Approvals", approvals.approval_count, "stored", "span-3", approvals.pending_count ? "warn" : "good", "admin")}
+          <div class="panel span-6">${table("Recent Audit", audit.events || [], ["id", "event_type", "owner_domain", "summary"], {links: {owner_domain: (row) => domainView(row.owner_domain)}})}</div>
+          <div class="panel span-6">${table("Approvals", approvals.approvals || approvals.items || [], ["id", "status", "owner_domain", "reason"], {links: {owner_domain: (row) => domainView(row.owner_domain)}, fills: {id: (row) => approvalFill(row)}, fillView: "admin"})}</div>
           ${officerPanel("sisko", "Audit review", "Review decision history, approvals, evidence, or policy concerns.")}
         </div>`;
     }
@@ -1747,9 +1801,189 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         <div class="station-code"><span>${safe(officer)}</span><span>${safe(crewStation(officer))}</span></div>
       </div>`;
     }
-    function metric(label, value, hint, span = "span-3", tone = "") {
+    function authorizationDecisionBoard(auth, readiness) {
+      const pendingPlans = auth.pending || [];
+      const approvalGroups = [
+        ...(auth.adapter_enablement_approvals || []),
+        ...(auth.archive_approvals || []),
+        ...(auth.restore_approvals || []),
+        ...(auth.policy_warning_approvals || []),
+        ...(auth.claim_cleanup_approvals || []),
+        ...(auth.daemon_migration_approvals || [])
+      ];
+      const readinessById = Object.fromEntries((readiness.items || []).map((item) => [item.id, item]));
+      const cards = [
+        ...pendingPlans.map((plan) => adminPlanDecisionCard(plan, readinessById[plan.id] || {})),
+        ...approvalGroups.map((approval) => approvalDecisionCard(approval))
+      ].join("");
+      return `<div class="panel span-12 decision-card">
+        <div class="toolbar"><h3>Approval Decisions</h3><span class="pill ${auth.pending_count ? "warn" : "good"}">${safe(auth.pending_count || 0)} pending</span></div>
+        <div class="grid">${cards || "<p class='muted'>No pending approval decisions.</p>"}</div>
+      </div>`;
+    }
+    function adminPlanDecisionCard(plan, readiness) {
+      const planId = plan.id || readiness.id || "";
+      const fields = adminPlanFill(planId);
+      const requestChange = {
+        ...fields,
+        "admin-cancel-reason": `changes requested before approval: ${plan.next_step || readiness.next_step || plan.reason || ""}`
+      };
+      return `<div class="panel span-6 decision-card ${normalizeTone(stateTone(plan.risk_level))}">
+        <div class="toolbar"><h3>${safe(plan.kind || "Admin Plan")}</h3><span class="pill ${stateTone(plan.risk_level)}">${safe(plan.approval_level || "approval")}</span></div>
+        ${kv("Decision Context", {
+          plan_id: planId,
+          owner: plan.owner_domain,
+          target: plan.target,
+          risk: plan.risk_level,
+          reason: plan.reason,
+          readiness: readiness.readiness_state,
+          ids_review: plan.ids_review_gate_satisfied ? "satisfied" : "required",
+          next_step: plan.next_step || readiness.next_step
+        })}
+        <div class="actions">
+          ${fillButton("Review Source", fields, "admin")}
+          ${fillButton("Approve", fields, "admin", "approve-admin-change")}
+          ${fillButton("Request Changes", requestChange, "admin", "cancel-admin-change")}
+        </div>
+      </div>`;
+    }
+    function approvalDecisionCard(approval) {
+      const fields = approvalFill(approval);
+      const approveAction = approvalAction(approval);
+      const changeFields = crewDecisionFill("sisko", "Administrative decision", {
+        subject: `Request changes for ${approval.id || approval.subject_id || "approval"}`,
+        message: `${approval.reason || "Approval needs revision."}\n\nEvidence required: ${(approval.evidence_required || []).join(", ")}`
+      });
+      const siskoDecisionPrefix = rolePrefix("sisko-Administrative decision");
+      return `<div class="panel span-6 decision-card ${stateTone(approval.status)}">
+        <div class="toolbar"><h3>${safe(approval.owner_domain || "Approval")}</h3><span class="pill ${stateTone(approval.status)}">${safe(approval.status || "pending")}</span></div>
+        ${kv("Approval Context", {
+          approval_id: approval.id,
+          subject: approval.subject_id,
+          level: approval.approval_level,
+          requester: approval.requester_thread,
+          reason: approval.reason,
+          evidence: (approval.evidence_required || []).join(", "),
+          next_step: approval.next_step
+        })}
+        <div class="actions">
+          ${fillButton("Review Source", fields, "admin")}
+          ${approveAction ? fillButton("Approve", fields, "admin", approveAction) : fillButton("Load Approval", fields, "admin")}
+          ${fillButton("Request Changes", changeFields, "admin", "send-crew-message", {"data-role": "sisko", "data-prefix": siskoDecisionPrefix})}
+        </div>
+      </div>`;
+    }
+    function fillButton(label, fields, view = "", action = "", attrs = {}) {
+      const extra = Object.entries(attrs).map(([key, value]) => ` ${safe(key)}="${safe(value)}"`).join("");
+      return `<button type="button" class="action-btn" data-fill="${safe(JSON.stringify(fields || {}))}"${view ? ` data-view-target="${safe(view)}"` : ""}${action ? ` data-action="${safe(action)}"` : ""}${extra}>${safe(label)}</button>`;
+    }
+    function approvalAction(approval) {
+      const id = approval?.id || "";
+      if (id.startsWith("approval.admin.adapter.enable.")) return "approve-admin-adapter-enablement";
+      if (id.startsWith("approval.admin.archive.")) return "approve-admin-archive";
+      if (id.startsWith("approval.admin.restore.")) return "approve-admin-restore";
+      if (id.startsWith("approval.admin.policy.warning.")) return "approve-policy-warning";
+      if (id.startsWith("approval.claim.cleanup.")) return "approve-claim-cleanup";
+      return "";
+    }
+    function adminPlanFill(planId) {
+      return {
+        "admin-approval-plan-id": planId || "",
+        "admin-execute-plan-id": planId || "",
+        "admin-cancel-plan-id": planId || "",
+        "policy-warning-plan-id": planId || ""
+      };
+    }
+    function approvalFill(approval) {
+      const id = approval?.id || "";
+      const subject = approval?.subject_id || "";
+      if (id.startsWith("approval.admin.adapter.enable.")) return {"admin-adapter-approval-id": id};
+      if (id.startsWith("approval.admin.archive.")) return {"admin-archive-approval-id": id, "admin-archive-execute-approval-id": id};
+      if (id.startsWith("approval.admin.restore.")) return {"admin-restore-approval-id": id, "admin-unarchive-approval-id": id};
+      if (id.startsWith("approval.admin.policy.warning.")) return {"policy-warning-approval-id": id, "policy-warning-plan-id": subject.replace(/^admin\\.policy\\.warning\\./, "").split(".admin.")[0]};
+      if (id.startsWith("approval.claim.cleanup.")) return {"cleanup-approval-id": id, "cleanup-execute-approval-id": id};
+      if (id.includes("daemon-migration")) return crewDecisionFill("sisko", "Administrative decision", {subject: `Review ${id}`, message: approval.reason || ""});
+      return {"admin-approval-plan-id": subject || id};
+    }
+    function crewDecisionFill(role, subject, values) {
+      const prefix = rolePrefix(`${role}-${subject}`);
+      return {
+        [`${prefix}-subject`]: values.subject || subject,
+        [`${prefix}-message`]: values.message || "",
+        [`${prefix}-priority`]: values.priority || "medium",
+        [`${prefix}-requested-by`]: values.requested_by || "operator",
+        [`${prefix}-plan-id`]: values.plan_id || "",
+        [`${prefix}-resource-id`]: values.resource_id || "",
+        [`${prefix}-limit-id`]: values.limit_id || ""
+      };
+    }
+    function resourceClaimFill(resourceId, role = "dax") {
+      return {
+        "claim-resource-id": resourceId || "",
+        "claim-owner-role": role || "dax",
+        "claim-intent": `coordinate work on ${resourceId || "resource"}`,
+        "claim-action": "review and deconflict requested work"
+      };
+    }
+    function claimFill(claimId) {
+      return {
+        "claim-approval-id": claimId || "",
+        "claim-activate-id": claimId || "",
+        "claim-release-id": claimId || "",
+        "cleanup-claim-id": claimId || ""
+      };
+    }
+    function cleanupFill(row) {
+      return {
+        "cleanup-claim-id": row?.id || "",
+        "cleanup-approval-id": row?.approval_id || "",
+        "cleanup-execute-approval-id": row?.approval_id || ""
+      };
+    }
+    function listenerFill(row) {
+      return {
+        "security-listener": row?.listener || "",
+        "security-plan-id": row?.plan_id || "",
+        "security-remediation-reason": row?.next_step || "review exposed listener"
+      };
+    }
+    function sourceReviewFill(row) {
+      return {
+        "source-remote-address": row?.remote_address || "",
+        "source-listener": row?.listener || "",
+        "source-disposition": row?.disposition || "needs_review",
+        "source-rationale": row?.next_step || "review source activity"
+      };
+    }
+    function usageLimitFill(row) {
+      return {
+        "usage-limit-id": row?.limit_id || "",
+        "usage-request-limit-id": row?.limit_id || "",
+        "usage-resource-id": row?.resource_id || "",
+        "usage-request-resource-id": row?.resource_id || "",
+        "usage-capacity": row?.capacity ?? "",
+        "usage-remaining": row?.remaining ?? "",
+        "usage-resets-at": row?.resets_at || ""
+      };
+    }
+    function domainView(domain) {
+      const views = {
+        sisko: "admin",
+        kira: "assets",
+        obrien: "admin",
+        odo: "security",
+        quark: "usage",
+        dax: "claims",
+        julian: "health",
+        ezri: "ezri"
+      };
+      return views[String(domain || "").toLowerCase()] || "audit";
+    }
+    function metric(label, value, hint, span = "span-3", tone = "", targetView = "") {
       const panelTone = normalizeTone(tone);
-      return `<div class="panel metric ${span} ${panelTone}"><h3>${safe(label)}</h3><div class="value ${toneClass(panelTone)}">${safe(value ?? 0)}</div><p class="muted">${safe(hint)}</p></div>`;
+      const tag = targetView ? "button" : "div";
+      const attrs = targetView ? ` type="button" data-view-target="${safe(targetView)}" title="Open ${safe(title(targetView))}"` : "";
+      return `<${tag} class="panel metric ${span} ${panelTone}"${attrs}><h3>${safe(label)}</h3><div class="value ${toneClass(panelTone)}">${safe(value ?? 0)}</div><p class="muted">${safe(hint)}</p></${tag}>`;
     }
     function officerPanel(role, subject, prompt, relatedLimitId = "") {
       const prefix = rolePrefix(`${role}-${subject}`);
@@ -1800,7 +2034,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function crew(name, data) {
       const rows = Object.entries(data || {}).slice(0, 5).map(([key, value]) => `<div class="row"><span>${safe(labelize(key))}</span><strong>${safe(value ?? 0)}</strong></div>`).join("");
-      return `<div class="panel crew-card span-4"><h3>${safe(name)}</h3><p class="muted">${safe(crewStation(name))}</p><div class="list">${rows || "<p class='muted'>No data</p>"}</div></div>`;
+      const view = crewView(name);
+      return `<button type="button" class="panel crew-card span-4" data-view-target="${safe(view)}" title="Open ${safe(name)} station"><h3>${safe(name)}</h3><p class="muted">${safe(crewStation(name))}</p><div class="list">${rows || "<p class='muted'>No data</p>"}</div></button>`;
+    }
+    function crewView(name) {
+      const views = {
+        "Sisko": "admin",
+        "Kira": "assets",
+        "O'Brien": "admin",
+        "Odo": "security",
+        "Quark": "usage",
+        "Dax": "claims",
+        "Julian": "health",
+        "Ezri": "ezri"
+      };
+      return views[name] || "overview";
     }
     function crewStation(name) {
       const stations = {
@@ -1816,9 +2064,23 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       };
       return stations[name] || "Operations";
     }
-    function table(titleText, rows, keys) {
-      const body = (rows || []).slice(0, 12).map((row) => `<tr>${keys.map((key) => `<td>${format(row?.[key])}</td>`).join("")}</tr>`).join("");
+    function table(titleText, rows, keys, options = {}) {
+      const body = (rows || []).slice(0, 12).map((row) => `<tr>${keys.map((key) => `<td>${formatCell(row, key, options)}</td>`).join("")}</tr>`).join("");
       return `<div class="toolbar"><h3>${safe(titleText)}</h3><span class="pill">${(rows || []).length}</span></div><div class="table-scroll"><table><thead><tr>${keys.map((key) => `<th>${safe(labelize(key))}</th>`).join("")}</tr></thead><tbody>${body || `<tr><td colspan="${keys.length}" class="muted">No rows</td></tr>`}</tbody></table></div>`;
+    }
+    function formatCell(row, key, options = {}) {
+      const value = row?.[key];
+      const link = options.links?.[key];
+      if (link) {
+        const target = typeof link === "function" ? link(row, key, value) : link;
+        if (target) return `<button type="button" class="cell-link" data-view-target="${safe(target)}">${format(value)}</button>`;
+      }
+      const fill = options.fills?.[key];
+      if (fill) {
+        const fields = fill(row, key, value);
+        if (fields) return `<button type="button" class="cell-link" data-fill="${safe(JSON.stringify(fields))}" data-view-target="${safe(options.fillView || state.view)}">${format(value)}</button>`;
+      }
+      return format(value);
     }
     function kv(titleText, value) {
       const rows = Object.entries(value || {}).slice(0, 12).map(([key, val]) => `<div class="row"><span>${safe(labelize(key))}</span><strong>${format(val)}</strong></div>`).join("");

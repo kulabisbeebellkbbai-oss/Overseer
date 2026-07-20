@@ -4907,7 +4907,7 @@ def dispatch_crew_messages_status(
         "blocked": sum(1 for result in results if result["message_status"] == CrewMessageStatus.OPEN.value),
         "items": results,
         "mutation_performed": bool(results),
-        "host_mutation_performed": False,
+        "host_mutation_performed": any(_crew_dispatch_result_mutated_host(result) for result in results),
     }
 
 
@@ -4958,7 +4958,193 @@ def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, d
         remediation = plan_host_security_listener_queue_remediations_status(store_path, inspection["id"], requested_by="odo")
     except ValueError as error:
         remediation = {"status": "skipped", "reason": str(error)}
-    return _crew_dispatch_result(message, "dispatched", "Odo inspected host security and staged listener remediation plans when needed", [inspection, remediation])
+    advancement = _advance_odo_remediation_plans(store_path, remediation, dispatched_at)
+    return _crew_dispatch_result(
+        message,
+        "dispatched",
+        "Odo inspected host security, staged listener remediation plans, and advanced exact approval or execution gates",
+        [inspection, remediation, advancement],
+    )
+
+
+def _advance_odo_remediation_plans(
+    store_path: str | Path,
+    remediation: dict[str, object],
+    advanced_at: str,
+) -> dict[str, object]:
+    staged_plan_ids = [
+        str(item["plan_id"])
+        for item in remediation.get("staged", [])
+        if isinstance(item, dict) and item.get("plan_id")
+    ]
+    store = SQLiteStore(store_path)
+    try:
+        candidate_ids = set(staged_plan_ids)
+        for plan in store.list_admin_change_plans():
+            if plan.owner_domain == OwnerDomain.ODO and not plan.canceled and not plan.archived:
+                candidate_ids.add(plan.id)
+    finally:
+        store.close()
+
+    prepared_reviews = []
+    sisko_requests = []
+    executions = []
+    skipped = []
+    for plan_id in sorted(candidate_ids):
+        status = _advance_admin_plan_after_dispatch(store_path, plan_id, advanced_at)
+        state = status.get("readiness_state")
+        if status.get("ids_review_package"):
+            prepared_reviews.append(status["ids_review_package"])
+        if status.get("sisko_message"):
+            sisko_requests.append(status["sisko_message"])
+        if status.get("execution"):
+            executions.append(status["execution"])
+        if state not in {"ids_review_blocked", "approval_required", "ready_for_overseer_execution", "completed"}:
+            skipped.append({"plan_id": plan_id, "readiness_state": state, "next_step": status.get("next_step")})
+    return {
+        "status": "advanced",
+        "candidate_plans": len(candidate_ids),
+        "ids_reviews_prepared": len(prepared_reviews),
+        "sisko_requests": len(sisko_requests),
+        "executions": len(executions),
+        "skipped": skipped,
+        "ids_review_packages": prepared_reviews,
+        "sisko_messages": sisko_requests,
+        "execution_results": executions,
+        "host_mutation_performed": any(item.get("host_mutation_performed") for item in executions if isinstance(item, dict)),
+        "approval_boundary": (
+            "Odo may stage remediation and review packages automatically; Sisko or human approval remains exact-plan "
+            "based, and only plans with no approval gate are executed automatically."
+        ),
+    }
+
+
+def _advance_admin_plan_after_dispatch(store_path: str | Path, plan_id: str, advanced_at: str) -> dict[str, object]:
+    readiness = _admin_plan_readiness_item(store_path, plan_id)
+    state = str(readiness["readiness_state"])
+    result: dict[str, object] = {
+        "plan_id": plan_id,
+        "readiness_state": state,
+        "next_step": readiness["next_step"],
+    }
+    if state == "ids_review_blocked":
+        ids_package = _ensure_ids_review_package_for_plan(store_path, plan_id, advanced_at)
+        result["ids_review_package"] = ids_package
+        result["sisko_message"] = _ensure_sisko_plan_message(
+            store_path,
+            plan_id,
+            subject=f"IDS review needed for {plan_id}",
+            message=(
+                f"Odo staged remediation plan {plan_id}, but IDS/firewall advisory review must be accepted "
+                "before Sisko can approve execution. Review the exported advisory package and keep this exact "
+                "plan visible for the command decision."
+            ),
+            priority=RiskLevel.HIGH.value,
+            created_at=advanced_at,
+        )
+        return result
+    if state == "approval_required":
+        result["sisko_message"] = _ensure_sisko_plan_message(
+            store_path,
+            plan_id,
+            subject=f"Approve plan {plan_id}",
+            message=(
+                f"Odo advanced remediation plan {plan_id}. I reviewed the evidence and request Sisko approval "
+                "for this exact plan before Overseer execution."
+            ),
+            priority=str(readiness["risk_level"]),
+            created_at=advanced_at,
+        )
+        return result
+    if state == "ready_for_overseer_execution":
+        result["execution"] = _execute_no_approval_admin_plan(store_path, plan_id, advanced_at)
+        return result
+    return result
+
+
+def _admin_plan_readiness_item(store_path: str | Path, plan_id: str) -> dict[str, object]:
+    readiness = admin_execution_readiness_status(store_path)
+    for item in readiness["items"]:
+        if item["id"] == plan_id:
+            return item
+    raise ValueError(f"admin change plan does not exist: {plan_id}")
+
+
+def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, created_at: str) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        packages = [
+            package
+            for package in store.list_host_security_ids_review_packages_for_plan(plan_id)
+            if not package.satisfies_pre_execution_review_gate()
+        ]
+    finally:
+        store.close()
+    package_id = f"ids-review.{plan_id}"
+    if packages:
+        package_id = packages[0].id
+    prepared = prepare_host_security_ids_review_package_status(
+        store_path,
+        plan_id,
+        package_id=package_id,
+        requested_by="odo",
+        created_at=created_at,
+    )
+    try:
+        exported = export_host_security_ids_review_prompt_status(store_path, str(prepared["id"]))
+    except ValueError as error:
+        prepared["prompt_export_error"] = str(error)
+        return prepared
+    return exported
+
+
+def _ensure_sisko_plan_message(
+    store_path: str | Path,
+    plan_id: str,
+    subject: str,
+    message: str,
+    priority: str,
+    created_at: str,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        for existing in store.list_crew_messages():
+            if (
+                existing.owner_domain == OwnerDomain.SISKO
+                and existing.related_plan_id == plan_id
+                and existing.status == CrewMessageStatus.OPEN
+            ):
+                return {"existing": True, **crew_message_status(existing)}
+    finally:
+        store.close()
+    message_id = f"crew.sisko.{_status_id(plan_id)}"
+    status = record_crew_message_status(
+        store_path,
+        OwnerDomain.SISKO.value,
+        subject,
+        message,
+        priority,
+        requested_by="odo",
+        message_id=message_id,
+        created_at=created_at,
+        related_plan_id=plan_id,
+    )
+    return {"existing": False, **status["message"]}
+
+
+def _execute_no_approval_admin_plan(store_path: str | Path, plan_id: str, approved_at: str) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        if plan.requires_explicit_approval():
+            raise ValueError("auto-execution is only allowed for plans with no explicit approval gate")
+        approved = approve_admin_change_plan(plan, "odo-auto", approved_at)
+        store.save_admin_change_plan(approved)
+    finally:
+        store.close()
+    execution = execute_admin_change_status(store_path, plan_id)
+    execution["host_mutation_performed"] = execution.get("status") == AdminExecutionStatus.COMPLETED.value
+    return execution
 
 
 def _dispatch_quark_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
@@ -5029,6 +5215,25 @@ def _crew_dispatch_result(message, status: str, reason: str, actions: Sequence[d
         "reason": reason,
         "actions": actions,
     }
+
+
+def _crew_dispatch_result_mutated_host(result: dict[str, object]) -> bool:
+    if bool(result.get("host_mutation_performed")):
+        return True
+    actions = result.get("actions", [])
+    if not isinstance(actions, list):
+        return False
+    return any(_nested_host_mutation_performed(action) for action in actions)
+
+
+def _nested_host_mutation_performed(value: object) -> bool:
+    if isinstance(value, dict):
+        if bool(value.get("host_mutation_performed")):
+            return True
+        return any(_nested_host_mutation_performed(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_nested_host_mutation_performed(item) for item in value)
+    return False
 
 
 def _message_mentions(message, *terms: str) -> bool:

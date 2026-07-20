@@ -102,6 +102,7 @@ from overseer import (
     UsageContinuationDispatch,
     UsageLimit,
     CrewMessage,
+    CrewMessageStatus,
     assess_freshness,
     approval_from_decision,
     assess_maintenance_readiness,
@@ -226,6 +227,7 @@ from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
 from overseer.cli import record_usage_limit_status
 from overseer.cli import crew_messages_status, dispatch_crew_messages_status, record_crew_message_status
+from overseer.cli import _advance_admin_plan_after_dispatch
 from overseer.cli import request_usage_continuation_status
 from overseer.cli import dispatch_host_security_ids_review_package_status
 from overseer.cli import dispatch_usage_continuations_status
@@ -7496,6 +7498,102 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["items"][0]["status"], "dispatched")
             approved = next(item for item in readiness["items"] if item["id"] == "admin.restart.dispatch-test")
             self.assertTrue(approved["approved"])
+
+    def test_dispatching_odo_stages_exact_sisko_and_ids_review_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            snapshot = HostInspectionAdapter(
+                command_runner=lambda command, timeout_seconds: HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=(
+                        "odo-dispatch-host"
+                        if tuple(command) == ("hostname",)
+                        else "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+                        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                        if tuple(command) == ("ss", "-ltnp")
+                        else "ok"
+                    ),
+                ),
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-19T13:06:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.ODO.value,
+                "Resolve exposure findings",
+                "I reviewed the high and warning exposure findings. Odo is approved to stage remediation for Sisko.",
+                RiskLevel.HIGH.value,
+                message_id="crew.odo.resolve-exposure",
+                requested_by="operator",
+            )
+
+            with patch("overseer.cli.inspect_host_status", return_value={"id": snapshot.id}):
+                status = dispatch_crew_messages_status(
+                    store_path,
+                    owner_domain=OwnerDomain.ODO.value,
+                    dispatched_at="2026-07-19T13:07:00+00:00",
+                )
+            readiness = admin_execution_readiness_status(store_path)
+            messages = crew_messages_status(store_path, owner_domain=OwnerDomain.SISKO.value, status=CrewMessageStatus.OPEN.value)
+            ids_packages = host_security_ids_review_packages_status(store_path)
+
+        self.assertEqual(status["processed"], 1)
+        self.assertEqual(status["items"][0]["status"], "dispatched")
+        staged = next(item for item in readiness["items"] if item["id"] == "admin.host-security.deny-tcp.22")
+        self.assertEqual(staged["readiness_state"], "ids_review_blocked")
+        self.assertEqual(ids_packages["package_count"], 1)
+        self.assertEqual(ids_packages["packages"][0]["plan_id"], "admin.host-security.deny-tcp.22")
+        self.assertEqual(ids_packages["packages"][0]["status"], "prepared")
+        self.assertTrue(ids_packages["packages"][0]["prompt_path"])
+        self.assertEqual(messages["open"], 1)
+        self.assertEqual(messages["items"][0]["related_plan_id"], "admin.host-security.deny-tcp.22")
+        self.assertIn("IDS review", messages["items"][0]["subject"])
+
+    def test_odo_advancement_executes_no_approval_ready_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = replace(
+                plan_user_service_restart(
+                    "admin.odo.low-risk-restart",
+                    "overseer-api.service",
+                    "low-risk restart selected by policy",
+                    "active",
+                ),
+                owner_domain=OwnerDomain.ODO,
+                risk_level=RiskLevel.LOW,
+                approval_level=ApprovalLevel.NONE,
+            )
+            store = SQLiteStore(store_path)
+            store.save_admin_change_plan(plan)
+            store.close()
+
+            with patch(
+                "overseer.cli.execute_admin_change_status",
+                return_value={
+                    "id": "admin.exec.admin.odo.low-risk-restart.completed",
+                    "plan_id": "admin.odo.low-risk-restart",
+                    "status": AdminExecutionStatus.COMPLETED.value,
+                },
+            ) as execute:
+                status = _advance_admin_plan_after_dispatch(
+                    store_path,
+                    "admin.odo.low-risk-restart",
+                    "2026-07-19T13:08:00+00:00",
+                )
+            store = SQLiteStore(store_path)
+            approved = store.load_admin_change_plan("admin.odo.low-risk-restart")
+            store.close()
+
+        self.assertEqual(status["readiness_state"], "ready_for_overseer_execution")
+        self.assertEqual(status["execution"]["status"], AdminExecutionStatus.COMPLETED.value)
+        self.assertTrue(status["execution"]["host_mutation_performed"])
+        self.assertTrue(approved.approved)
+        self.assertEqual(approved.approved_by, "odo-auto")
+        execute.assert_called_once_with(store_path, "admin.odo.low-risk-restart")
 
     def test_rejects_invalid_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:

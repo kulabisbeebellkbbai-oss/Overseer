@@ -288,7 +288,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .field.span-1 { grid-column: span 1; }
     .field.span-2 { grid-column: span 2; }
     .field.span-3 { grid-column: span 3; }
+    .field.span-4 { grid-column: span 4; }
+    .field.span-5 { grid-column: span 5; }
     .field.span-6 { grid-column: span 6; }
+    .field.span-8, .field.span-9, .field.span-12 { grid-column: span 6; }
     label {
       color: var(--muted);
       font-size: 12px;

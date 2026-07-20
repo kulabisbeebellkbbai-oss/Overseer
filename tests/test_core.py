@@ -2441,6 +2441,8 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("Dispatch History", html)
             self.assertIn("Blocked Reasons", html)
             self.assertIn("mini-metrics", html)
+            self.assertIn(".field.span-4 { grid-column: span 4; }", html)
+            self.assertIn(".field.span-8, .field.span-9, .field.span-12 { grid-column: span 6; }", html)
             self.assertIn("data-action=\"send-crew-message\"", html)
             self.assertIn("data-action=\"dispatch-crew-messages\"", html)
             self.assertIn("/crew/dispatch", html)

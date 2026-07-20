@@ -64,16 +64,18 @@ class HostInspectionAdapter:
         command_runner: CommandRunner | None = None,
         file_reader: FileReader | None = None,
         timeout_seconds: float = 5.0,
+        collect_firewall_commands: bool = True,
     ) -> None:
         self.command_runner = command_runner or run_read_only_command
         self.file_reader = file_reader or _read_file
         self.timeout_seconds = timeout_seconds
+        self.collect_firewall_commands = collect_firewall_commands
 
     def inspect(self, captured_at: str | None = None) -> HostInspectionSnapshot:
         captured = captured_at or datetime.now(UTC).isoformat()
         hostname = self.command_runner(("hostname",), self.timeout_seconds).stdout.strip()
         established_tcp = self.command_runner(("ss", "-tnp"), self.timeout_seconds)
-        observations = (
+        observations = [
             self.command_runner(("uname", "-a"), self.timeout_seconds),
             self.command_runner(("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"), self.timeout_seconds),
             self.command_runner(("ss", "-ltnp"), self.timeout_seconds),
@@ -85,16 +87,21 @@ class HostInspectionAdapter:
                 stderr=established_tcp.stderr,
             ),
             self.command_runner(("df", "-h", "--output=source,size,used,avail,pcent,target"), self.timeout_seconds),
-            _named_observation("firewalld-state", self.command_runner(("firewall-cmd", "--state"), self.timeout_seconds)),
-            _named_observation("firewalld-active-zones", self.command_runner(("firewall-cmd", "--get-active-zones"), self.timeout_seconds)),
-            _named_observation("firewalld-public-zone", self.command_runner(("firewall-cmd", "--zone=public", "--list-all"), self.timeout_seconds)),
-        )
+        ]
+        if self.collect_firewall_commands:
+            observations.extend(
+                (
+                    _named_observation("firewalld-state", self.command_runner(("firewall-cmd", "--state"), self.timeout_seconds)),
+                    _named_observation("firewalld-active-zones", self.command_runner(("firewall-cmd", "--get-active-zones"), self.timeout_seconds)),
+                    _named_observation("firewalld-public-zone", self.command_runner(("firewall-cmd", "--zone=public", "--list-all"), self.timeout_seconds)),
+                )
+            )
         return HostInspectionSnapshot(
             id=f"host.{_safe_id(hostname)}.{_safe_id(captured)}",
             captured_at=captured,
             hostname=hostname,
             os_release=parse_os_release(self.file_reader("/etc/os-release")),
-            observations=observations,
+            observations=tuple(observations),
         )
 
 

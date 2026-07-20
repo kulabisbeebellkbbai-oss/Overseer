@@ -1531,8 +1531,8 @@ def freshness_alert_event(subject_id: str, owner_domain: OwnerDomain, assessment
     )
 
 
-def inspect_host_status(store_path: str | Path | None = None) -> dict[str, object]:
-    snapshot = HostInspectionAdapter().inspect()
+def inspect_host_status(store_path: str | Path | None = None, collect_firewall_commands: bool = True) -> dict[str, object]:
+    snapshot = HostInspectionAdapter(collect_firewall_commands=collect_firewall_commands).inspect()
     status = host_snapshot_status(snapshot)
     if store_path is None:
         return status
@@ -4967,7 +4967,7 @@ def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str
 
 
 def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
-    inspection = inspect_host_status(store_path)
+    inspection = inspect_host_status(store_path, collect_firewall_commands=False)
     try:
         advancement = advance_odo_security_status(store_path, str(inspection["id"]), advanced_at=dispatched_at)
     except ValueError as error:
@@ -5043,7 +5043,7 @@ def audit_station_status(
 
 def _load_optional_host_snapshot(store_path: str | Path, snapshot_id: str | None) -> HostInspectionSnapshot | None:
     if snapshot_id is None:
-        return None
+        return HostInspectionAdapter(collect_firewall_commands=False).inspect()
     store = SQLiteStore(store_path)
     try:
         return store.load_host_snapshot(snapshot_id)

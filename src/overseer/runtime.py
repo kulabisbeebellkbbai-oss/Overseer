@@ -71,7 +71,7 @@ class OverseerRuntime:
         self.health_probe_adapter = health_probe_adapter or RoutedHealthProbeAdapter()
         self.health_evidence_retention_per_target = health_evidence_retention_per_target
         self.inspect_host = inspect_host
-        self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter()
+        self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter(collect_firewall_commands=False)
         self.host_security_advancer = host_security_advancer
         self.dispatch_crew_messages = dispatch_crew_messages
         self.crew_dispatcher = crew_dispatcher
@@ -87,6 +87,7 @@ class OverseerRuntime:
 
     def tick(self) -> RuntimeTick:
         self.tick_count += 1
+        self._save_heartbeat()
         health_probes = self._probe_health_targets()
         (
             host_inspections,
@@ -101,15 +102,7 @@ class OverseerRuntime:
         usage_dispatched, usage_skipped = self._dispatch_usage_continuations()
         knowledge_captured, knowledge_failed = self._capture_knowledge_events()
         station_audits, station_actions, station_odo_referrals, station_sisko_requests = self._audit_station()
-        self.store.save_runtime_heartbeat(
-            RuntimeHeartbeat(
-                id=self.service_name,
-                service_name=self.service_name,
-                started_at=self.started_at,
-                last_tick_at=_utc_now(),
-                tick_count=self.tick_count,
-            )
-        )
+        self._save_heartbeat()
         return RuntimeTick(
             resources=len(self.store.list_resources()),
             usage_limits=len(self.store.list_usage_limits()),
@@ -197,7 +190,7 @@ class OverseerRuntime:
     def _audit_station(self) -> tuple[int, int, int, int]:
         if not self.audit_station or self.station_auditor is None:
             return 0, 0, 0, 0
-        if (self.tick_count - 1) % self.station_audit_interval_ticks != 0:
+        if self.tick_count % self.station_audit_interval_ticks != 0:
             return 0, 0, 0, 0
         snapshots = self.store.list_host_snapshots()
         latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
@@ -207,6 +200,17 @@ class OverseerRuntime:
             int(result.get("actions", 0)),
             int(result.get("odo_referrals", 0)),
             int(result.get("sisko_requests", 0)),
+        )
+
+    def _save_heartbeat(self) -> None:
+        self.store.save_runtime_heartbeat(
+            RuntimeHeartbeat(
+                id=self.service_name,
+                service_name=self.service_name,
+                started_at=self.started_at,
+                last_tick_at=_utc_now(),
+                tick_count=self.tick_count,
+            )
         )
 
 

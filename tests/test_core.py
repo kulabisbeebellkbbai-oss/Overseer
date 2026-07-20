@@ -5243,6 +5243,28 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(observation.exit_code, 124)
         self.assertIn("timed out", observation.stderr)
 
+    def test_host_inspection_can_skip_firewall_commands_for_daemon_runtime(self):
+        commands = []
+
+        def runner(command, timeout_seconds):
+            commands.append(tuple(command))
+            return HostCommandObservation(
+                name=command[0],
+                command=tuple(command),
+                exit_code=0,
+                stdout="workstation" if tuple(command) == ("hostname",) else "ok",
+            )
+
+        snapshot = HostInspectionAdapter(
+            command_runner=runner,
+            file_reader=lambda path: "ID=debian\n",
+            collect_firewall_commands=False,
+        ).inspect("2026-07-18T16:00:00+00:00")
+
+        self.assertNotIn(("firewall-cmd", "--state"), commands)
+        with self.assertRaises(KeyError):
+            snapshot.observation("firewalld-state")
+
     def test_host_snapshot_persists_and_appears_in_state(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -8874,13 +8896,15 @@ class RuntimeTests(unittest.TestCase):
             first = runtime.run(once=True)
             second = runtime.run(once=True)
             third = runtime.run(once=True)
+            fourth = runtime.run(once=True)
 
-            self.assertEqual(first.station_audits, 1)
-            self.assertEqual(first.station_audit_actions, 7)
-            self.assertEqual(first.station_audit_odo_referrals, 3)
-            self.assertEqual(first.station_audit_sisko_requests, 1)
-            self.assertEqual(second.station_audits, 0)
-            self.assertEqual(third.station_audits, 1)
+            self.assertEqual(first.station_audits, 0)
+            self.assertEqual(second.station_audits, 1)
+            self.assertEqual(second.station_audit_actions, 7)
+            self.assertEqual(second.station_audit_odo_referrals, 3)
+            self.assertEqual(second.station_audit_sisko_requests, 1)
+            self.assertEqual(third.station_audits, 0)
+            self.assertEqual(fourth.station_audits, 1)
             self.assertEqual(len(calls), 2)
             store.close()
 

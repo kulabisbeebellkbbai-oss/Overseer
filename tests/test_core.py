@@ -2429,6 +2429,9 @@ class OverseerApiTests(unittest.TestCase):
             self.assertNotIn("aside::before", html)
             self.assertIn("/operator-dashboard", html)
             self.assertIn("crewMessages: \"/crew/messages\"", html)
+            self.assertIn("Crew Queue", html)
+            self.assertIn("Dispatch Blocks", html)
+            self.assertIn("Recent Crew Dispatches", html)
             self.assertIn("data-action=\"send-crew-message\"", html)
             self.assertIn("data-action=\"dispatch-crew-messages\"", html)
             self.assertIn("/crew/dispatch", html)
@@ -6851,6 +6854,9 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["message"]["related_limit_id"], "limit.mcp.api.calls.daily")
             self.assertEqual(status["audit_event"]["event_type"], AuditEventType.REQUESTED.value)
             self.assertEqual(summary["messages"], 1)
+            self.assertEqual(summary["summary"]["open"], 1)
+            self.assertEqual(summary["by_status"]["open"], 1)
+            self.assertEqual(summary["by_owner_domain"]["quark"]["open"], 1)
             self.assertEqual(summary["items"][0]["subject"], "MCP API quota scheduling")
 
     def test_dispatches_quark_message_to_usage_continuation_request(self):
@@ -6891,8 +6897,42 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["processed"], 1)
             self.assertEqual(status["acknowledged"], 1)
             self.assertEqual(summary["items"][0]["status"], "acknowledged")
+            self.assertEqual(summary["summary"]["acknowledged"], 1)
+            self.assertEqual(summary["by_owner_domain"]["quark"]["dispatches"], 1)
+            self.assertEqual(summary["recent_dispatches"][0]["message_id"], "crew.quark.dispatch-quota")
+            self.assertEqual(summary["recent_dispatches"][0]["event_type"], AuditEventType.EXECUTED.value)
+            self.assertIn("quark dispatch", summary["recent_dispatches"][0]["reason"])
             self.assertEqual(plan["continuation_requests"], 1)
             self.assertEqual(plan["items"][0]["id"], "work.crew.quark.dispatch-quota")
+
+    def test_crew_message_summary_reports_blocked_dispatch_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.QUARK.value,
+                "Missing limit",
+                "Continue work after a limit that has not been registered.",
+                RiskLevel.MEDIUM.value,
+                requested_by="thread.missing-limit",
+                message_id="crew.quark.missing-limit",
+                related_limit_id="limit.missing",
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                owner_domain=OwnerDomain.QUARK.value,
+                dispatched_at="2026-07-19T13:02:00+00:00",
+            )
+            summary = crew_messages_status(store_path)
+
+            self.assertEqual(status["processed"], 1)
+            self.assertEqual(status["blocked"], 1)
+            self.assertEqual(summary["summary"]["open"], 1)
+            self.assertEqual(summary["summary"]["blocked_dispatches"], 1)
+            self.assertEqual(summary["by_owner_domain"]["quark"]["blocked_dispatches"], 1)
+            self.assertEqual(summary["recent_dispatches"][0]["event_type"], AuditEventType.BLOCKED.value)
+            self.assertIn("limit.missing", summary["recent_dispatches"][0]["reason"])
 
     def test_dispatches_sisko_exact_plan_approval(self):
         with tempfile.TemporaryDirectory() as directory:

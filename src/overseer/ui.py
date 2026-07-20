@@ -901,12 +901,16 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderOverview() {
       const focus = (state.data.dashboard || {}).role_focus || {};
       const attention = (state.data.dashboard || {}).attention || {};
+      const crewSummary = (state.data.crewMessages || {}).summary || {};
+      const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
       document.getElementById("overview").innerHTML = `
         <div class="grid">
           ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3")}
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good")}
           ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good")}
           ${metric("O'Brien", focus.obrien?.executable_plans, "executable plans", "span-3")}
+          ${metric("Crew Queue", crewSummary.open, "open requests", "span-3", crewSummary.open ? "warn" : "good")}
+          ${metric("Dispatch Blocks", crewSummary.blocked_dispatches, "blocked dispatches", "span-3", crewSummary.blocked_dispatches ? "warn" : "good")}
           <div class="section-head"><h3>Command Crew</h3><div class="actions"><span class="pill">${safe((state.data.dashboard || {}).service_name)}</span><button class="action-btn" data-action="dispatch-crew-messages">Dispatch Open</button></div></div>
           ${crew("Sisko", focus.sisko)}
           ${crew("Kira", focus.kira)}
@@ -915,6 +919,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${crew("Quark", focus.quark)}
           ${crew("Dax", focus.dax)}
           ${crew("Julian", focus.julian)}
+          <div class="panel span-12">${table("Recent Crew Dispatches", dispatches, ["occurred_at", "owner_domain", "event_type", "message_id", "reason"])}</div>
           ${officerPanel("sisko", "Command routing", "Coordinate this issue across the crew.")}
         </div>`;
     }

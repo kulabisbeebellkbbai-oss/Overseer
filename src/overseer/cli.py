@@ -1079,12 +1079,15 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
     usage = usage_summary_status(store_path)
     health = health_summary_status(store_path)
     health_efficiency = health_efficiency_summary_status(store_path)
+    crew_messages = crew_messages_status(store_path)
     attention = operator_dashboard_attention(command, admin, admin_history, physical, virtual, maintenance, security, usage, health_efficiency)
+    crew_by_owner = crew_messages["by_owner_domain"]
     return {
         "store": command["store"],
         "service_name": service_name,
         "overall_status": operator_dashboard_overall_status(attention),
         "attention": attention,
+        "crew_messages": crew_messages["summary"],
         "role_focus": {
             "sisko": {
                 "pending_authorizations": attention["pending_authorizations"],
@@ -1093,16 +1096,22 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
                 "service_freshness": attention["service_freshness"],
                 "admin_archive_candidates": attention["admin_archive_candidates"],
                 "pending_restore_approvals": attention["pending_restore_approvals"],
+                "open_messages": crew_by_owner["sisko"]["open"],
+                "blocked_dispatches": crew_by_owner["sisko"]["blocked_dispatches"],
             },
             "kira": {
                 "assets": physical["assets"],
                 "power_risk": attention["physical_power_risk"],
                 "storage_risk": attention["physical_storage_risk"],
+                "open_messages": crew_by_owner["kira"]["open"],
+                "blocked_dispatches": crew_by_owner["kira"]["blocked_dispatches"],
             },
             "obrien": {
                 "plans": maintenance["plans"],
                 "pending_authorizations": attention["maintenance_pending_authorizations"],
                 "executable_plans": maintenance["executable_plans"],
+                "open_messages": crew_by_owner["obrien"]["open"],
+                "blocked_dispatches": crew_by_owner["obrien"]["blocked_dispatches"],
             },
             "odo": {
                 "alerts": attention["security_alerts"],
@@ -1110,22 +1119,30 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
                 "pending_protective_authorizations": attention["security_pending_authorizations"],
                 "ids_review_gate_blocked": attention["security_ids_review_gate_blocked"],
                 "ids_review_revision_required": attention["security_ids_review_revision_required"],
+                "open_messages": crew_by_owner["odo"]["open"],
+                "blocked_dispatches": crew_by_owner["odo"]["blocked_dispatches"],
             },
             "quark": {
                 "limits": usage["limits"],
                 "exhausted": attention["exhausted_usage_limits"],
                 "next_reset_at": usage["next_reset_at"],
+                "open_messages": crew_by_owner["quark"]["open"],
+                "blocked_dispatches": crew_by_owner["quark"]["blocked_dispatches"],
             },
             "dax": {
                 "assets": virtual["assets"],
                 "active_claims": attention["virtual_active_claims"],
                 "queued_claims": attention["virtual_queued_claims"],
+                "open_messages": crew_by_owner["dax"]["open"],
+                "blocked_dispatches": crew_by_owner["dax"]["blocked_dispatches"],
             },
             "julian": {
                 "targets": health_efficiency["targets"],
                 "unhealthy": attention["unhealthy_health_targets"],
                 "recovery_required": attention["recovery_required"],
                 "latest_failures": attention["latest_failures"],
+                "open_messages": crew_by_owner["julian"]["open"],
+                "blocked_dispatches": crew_by_owner["julian"]["blocked_dispatches"],
             },
         },
         "summaries": {
@@ -4641,7 +4658,9 @@ def crew_messages_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        messages = list(store.list_crew_messages())
+        all_messages = list(store.list_crew_messages())
+        audit_events = list(store.list_audit_events())
+        messages = list(all_messages)
         if owner_domain:
             selected_owner = OwnerDomain(owner_domain)
             messages = [message for message in messages if message.owner_domain == selected_owner]
@@ -4649,10 +4668,26 @@ def crew_messages_status(
             selected_status = CrewMessageStatus(status)
             messages = [message for message in messages if message.status == selected_status]
         messages = sorted(messages, key=lambda message: message.created_at or message.id, reverse=True)
+        all_dispatch_history = crew_dispatch_history(audit_events)
+        dispatch_history = crew_dispatch_history(audit_events, owner_domain=owner_domain)
+        by_owner = crew_message_counts_by_owner(all_messages, audit_events)
         return {
             "store": str(store.path),
             "messages": len(messages),
             "open": sum(1 for message in messages if message.status == CrewMessageStatus.OPEN),
+            "summary": {
+                "total": len(all_messages),
+                "open": sum(1 for message in all_messages if message.status == CrewMessageStatus.OPEN),
+                "acknowledged": sum(1 for message in all_messages if message.status == CrewMessageStatus.ACKNOWLEDGED),
+                "closed": sum(1 for message in all_messages if message.status == CrewMessageStatus.CLOSED),
+                "blocked_dispatches": len([item for item in all_dispatch_history if item["event_type"] == AuditEventType.BLOCKED.value]),
+            },
+            "by_status": {
+                item.value: sum(1 for message in messages if message.status == item)
+                for item in CrewMessageStatus
+            },
+            "by_owner_domain": by_owner,
+            "recent_dispatches": dispatch_history,
             "items": [crew_message_status(message) for message in messages],
             "filters": {
                 "owner_domain": owner_domain,
@@ -4661,6 +4696,54 @@ def crew_messages_status(
         }
     finally:
         store.close()
+
+
+def crew_message_counts_by_owner(messages, audit_events) -> dict[str, dict[str, int]]:
+    dispatch_events = [
+        event
+        for event in audit_events
+        if event.subject_id.startswith("crew.")
+        and event.event_type in {AuditEventType.EXECUTED, AuditEventType.BLOCKED}
+    ]
+    return {
+        owner.value: {
+            "total": sum(1 for message in messages if message.owner_domain == owner),
+            "open": sum(1 for message in messages if message.owner_domain == owner and message.status == CrewMessageStatus.OPEN),
+            "acknowledged": sum(1 for message in messages if message.owner_domain == owner and message.status == CrewMessageStatus.ACKNOWLEDGED),
+            "closed": sum(1 for message in messages if message.owner_domain == owner and message.status == CrewMessageStatus.CLOSED),
+            "dispatches": sum(1 for event in dispatch_events if event.owner_domain == owner),
+            "blocked_dispatches": sum(1 for event in dispatch_events if event.owner_domain == owner and event.event_type == AuditEventType.BLOCKED),
+        }
+        for owner in OwnerDomain
+    }
+
+
+def crew_dispatch_history(
+    audit_events,
+    owner_domain: str | None = None,
+    limit: int = 12,
+) -> list[dict[str, object]]:
+    selected_owner = OwnerDomain(owner_domain) if owner_domain else None
+    events = [
+        event
+        for event in audit_events
+        if event.subject_id.startswith("crew.")
+        and event.event_type in {AuditEventType.EXECUTED, AuditEventType.BLOCKED}
+        and (selected_owner is None or event.owner_domain == selected_owner)
+    ]
+    events = sorted(events, key=lambda event: event.occurred_at or event.id, reverse=True)
+    return [
+        {
+            "id": event.id,
+            "message_id": event.subject_id,
+            "owner_domain": OwnerDomain(event.owner_domain).value,
+            "event_type": AuditEventType(event.event_type).value,
+            "risk_level": RiskLevel(event.risk_level).value,
+            "reason": event.summary,
+            "occurred_at": event.occurred_at,
+        }
+        for event in events[:limit]
+    ]
 
 
 def record_crew_message_status(

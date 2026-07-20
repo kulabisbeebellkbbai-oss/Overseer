@@ -665,6 +665,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       listenerReviewQueue: "/host/security/listener-review-queue",
       sourceReviewQueue: "/host/security/source-review-queue"
     };
+    const requiredEndpointKeys = new Set(["dashboard"]);
     const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
     const apiBase = protectedGatewayPath ? "/Overseer" : "";
     const tokenStore = protectedGatewayPath ? sessionStorage : localStorage;
@@ -672,6 +673,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       data: {},
       view: "overview",
       token: tokenStore.getItem("overseerToken") || "",
+      loadErrors: [],
       lastAction: null
     };
     const tokenInput = document.getElementById("token");
@@ -707,9 +709,31 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function refresh() {
       const error = document.getElementById("error");
       error.hidden = true;
+      const endpointEntries = Object.entries(endpoints);
+      const results = await Promise.allSettled(endpointEntries.map(async ([key, path]) => [key, await getJson(path)]));
+      const nextData = {...state.data};
+      const failures = [];
+      results.forEach((result, index) => {
+        const [key, path] = endpointEntries[index];
+        if (result.status === "fulfilled") {
+          nextData[result.value[0]] = result.value[1];
+        } else {
+          failures.push({key, path, message: result.reason.message});
+        }
+      });
+      const requiredFailure = failures.find((failure) => requiredEndpointKeys.has(failure.key));
+      if (requiredFailure) {
+        error.textContent = formatEndpointError(requiredFailure);
+        error.hidden = false;
+        return;
+      }
+      state.data = nextData;
+      state.loadErrors = failures;
+      if (failures.length) {
+        error.textContent = `Loaded with panel errors: ${failures.map(formatEndpointError).join("; ")}`;
+        error.hidden = false;
+      }
       try {
-        const entries = await Promise.all(Object.entries(endpoints).map(async ([key, path]) => [key, await getJson(path)]));
-        state.data = Object.fromEntries(entries);
         document.getElementById("updated").textContent = new Date().toLocaleString();
         render();
       } catch (err) {
@@ -717,12 +741,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         error.hidden = false;
       }
     }
+    function formatEndpointError(failure) {
+      return `${failure.path}: ${failure.message}`;
+    }
     async function getJson(path) {
       const headers = {};
       const token = tokenInput.value.trim() || state.token;
       if (token) headers.authorization = `Bearer ${token}`;
-      const response = await fetch(`${apiBase}${path}`, {headers});
-      if (!response.ok) throw new Error(`${path}: ${response.status}`);
+      const target = `${apiBase}${path}`;
+      let response;
+      try {
+        response = await fetch(target, {headers});
+      } catch (err) {
+        throw new Error(`request failed at ${target}`);
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return await response.json();
     }
     async function postJson(path, payload = {}) {

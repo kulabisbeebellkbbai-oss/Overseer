@@ -12,29 +12,39 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0e1117;
-      --deck: #151922;
-      --panel: #1b2028;
-      --panel-2: #252c36;
-      --line: #3a4350;
-      --line-hot: #9bb7d4;
-      --text: #eef2f6;
-      --muted: #a6b0bd;
-      --good: #7bd88f;
-      --warn: #f0c36a;
-      --bad: #ff7a78;
-      --focus: #8bbfe8;
-      --command: #c7a76c;
-      --ops: #667d94;
-      --alert: #8b4e5a;
+      --bg: #050506;
+      --deck: #08080b;
+      --panel: #101017;
+      --panel-2: #171621;
+      --line: #383447;
+      --line-hot: #f6be63;
+      --text: #fff6e8;
+      --muted: #b8b0c8;
+      --lcars-amber: #f2b84b;
+      --lcars-orange: #ff8f35;
+      --lcars-peach: #ffc08f;
+      --lcars-lavender: #b9a6ff;
+      --lcars-violet: #7f69ff;
+      --lcars-blue: #4ea4ff;
+      --lcars-cyan: #78d6ff;
+      --lcars-pink: #ef80b8;
+      --good: #76d6ff;
+      --warn: #f2b84b;
+      --bad: #ff5f61;
+      --pending: #b9a6ff;
+      --inactive: #6f6a83;
+      --focus: #78d6ff;
+      --command: #f2b84b;
+      --ops: #7f69ff;
+      --alert: #ff5f61;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-width: 320px;
       background:
-        linear-gradient(120deg, rgba(199, 167, 108, 0.07), transparent 24%, transparent 76%, rgba(102, 125, 148, 0.09)),
-        radial-gradient(circle at 50% -20%, rgba(139, 191, 232, 0.10), transparent 38%),
+        linear-gradient(90deg, rgba(242, 184, 75, 0.08) 0 12px, transparent 12px 100%),
+        linear-gradient(180deg, #050506 0%, #09080d 62%, #050506 100%),
         var(--bg);
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -45,69 +55,86 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .shell {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 278px minmax(0, 1fr);
+      grid-template-columns: 294px minmax(0, 1fr);
     }
     aside {
       position: relative;
       background:
-        linear-gradient(180deg, #1a202a, #11161e 58%, #0d1117),
+        linear-gradient(180deg, #08080b, #050506 58%, #090711),
         var(--deck);
       color: var(--text);
-      padding: 18px 14px;
-      border-right: 1px solid #2d3540;
-      box-shadow: inset -5px 0 0 rgba(199, 167, 108, 0.14);
+      padding: 18px 14px 18px 18px;
+      border-right: 4px solid var(--lcars-amber);
+      box-shadow: inset -18px 0 0 #000, inset -25px 0 0 var(--lcars-orange);
+    }
+    aside::before {
+      content: "";
+      display: block;
+      height: 34px;
+      margin-bottom: 14px;
+      border-radius: 18px 18px 0 18px;
+      background:
+        linear-gradient(90deg, var(--lcars-amber) 0 44%, #000 44% 47%, var(--lcars-peach) 47% 69%, #000 69% 72%, var(--lcars-violet) 72% 100%);
     }
     main {
       min-width: 0;
-      padding: 18px 20px 28px;
+      padding: 16px 20px 28px;
     }
     .brand {
       display: flex;
       align-items: center;
       gap: 10px;
       margin-bottom: 18px;
+      padding-right: 20px;
     }
     .mark {
-      width: 42px;
-      height: 42px;
-      border-radius: 4px 13px 4px 13px;
-      background: linear-gradient(135deg, var(--command), #6f7f90);
-      color: #101318;
+      width: 58px;
+      height: 44px;
+      border-radius: 22px 4px 4px 22px;
+      background: linear-gradient(90deg, var(--lcars-orange), var(--lcars-amber));
+      color: #09080d;
       display: grid;
       place-items: center;
       font-weight: 800;
-      box-shadow: 0 0 0 1px rgba(242, 237, 228, 0.18), 0 12px 28px rgba(0, 0, 0, 0.32);
+      box-shadow: inset -10px 0 0 var(--lcars-peach);
     }
     h1, h2, h3, p { margin: 0; }
-    h1 { font-size: 20px; font-weight: 760; letter-spacing: 0; }
+    h1 { font-size: 22px; font-weight: 820; letter-spacing: 0; text-transform: uppercase; }
     h2 { font-size: 17px; font-weight: 720; }
     h3 {
       font-size: 12px;
       font-weight: 780;
-      color: var(--muted);
+      color: var(--lcars-peach);
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }
     .nav {
       display: grid;
-      gap: 5px;
+      gap: 8px;
+      padding-right: 20px;
     }
     .nav button {
       width: 100%;
       border: 1px solid transparent;
-      border-radius: 4px 12px 4px 12px;
+      border-radius: 18px 4px 4px 18px;
       padding: 10px 12px;
-      background: rgba(238, 242, 246, 0.035);
-      color: #d8dee7;
+      background: var(--lcars-lavender);
+      color: #08080b;
       text-align: left;
       cursor: pointer;
       min-height: 40px;
+      font-weight: 800;
+      text-transform: uppercase;
+      box-shadow: inset -16px 0 0 rgba(0, 0, 0, 0.18);
     }
+    .nav button:nth-child(2n) { background: var(--lcars-amber); }
+    .nav button:nth-child(3n) { background: var(--lcars-peach); }
+    .nav button:nth-child(4n) { background: var(--lcars-violet); color: #fff6e8; }
     .nav button[aria-selected="true"] {
-      background: linear-gradient(90deg, rgba(102, 125, 148, 0.58), rgba(199, 167, 108, 0.18));
-      color: #ffffff;
-      border-color: rgba(155, 183, 212, 0.42);
-      box-shadow: inset 4px 0 0 var(--focus);
+      background: var(--lcars-cyan);
+      color: #050506;
+      border-color: #000;
+      box-shadow: inset -20px 0 0 var(--lcars-blue), 0 0 0 2px #000;
     }
     .topbar {
       display: grid;
@@ -115,10 +142,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 12px;
       align-items: center;
       margin-bottom: 16px;
-      padding: 12px 14px;
-      border: 1px solid var(--line);
-      border-radius: 4px;
-      background: rgba(18, 23, 31, 0.88);
+      padding: 10px 14px 10px 22px;
+      border: 0;
+      border-radius: 0 22px 22px 0;
+      background:
+        linear-gradient(90deg, var(--lcars-amber) 0 14px, #000 14px 20px, rgba(16, 16, 23, 0.96) 20px 100%);
+      box-shadow: inset 0 -4px 0 var(--lcars-orange);
     }
     .status-line {
       display: flex;
@@ -135,10 +164,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .token input {
       width: 270px;
       min-width: 0;
-      border: 1px solid var(--line);
-      border-radius: 4px;
+      border: 2px solid #000;
+      border-radius: 16px 4px 4px 16px;
       padding: 8px 10px;
-      background: #0b0f15;
+      background: #171621;
       color: var(--text);
     }
     .token input:focus {
@@ -146,17 +175,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       border-color: var(--focus);
     }
     .icon-btn, .action-btn {
-      border: 1px solid var(--line);
-      border-radius: 4px 10px 4px 10px;
+      border: 2px solid #000;
+      border-radius: 16px 4px 4px 16px;
       min-height: 36px;
-      background: linear-gradient(180deg, #26303b, #141922);
-      color: var(--text);
+      background: var(--lcars-amber);
+      color: #050506;
       cursor: pointer;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      font-weight: 800;
+      text-transform: uppercase;
+      box-shadow: inset -10px 0 0 rgba(0, 0, 0, 0.14);
     }
     .icon-btn:hover, .action-btn:hover {
-      border-color: var(--line-hot);
-      color: #ffffff;
+      background: var(--lcars-cyan);
+      color: #050506;
     }
     .icon-btn {
       width: 38px;
@@ -173,22 +204,34 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     .panel {
       position: relative;
-      background: linear-gradient(180deg, #1d242d, #151a22);
-      border: 1px solid var(--line);
-      border-radius: 4px;
-      padding: 14px;
+      background:
+        linear-gradient(90deg, var(--panel) 0 100%),
+        var(--panel);
+      border: 1px solid rgba(185, 166, 255, 0.28);
+      border-radius: 0 18px 4px 0;
+      padding: 14px 14px 14px 22px;
       min-width: 0;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 14px 32px rgba(0, 0, 0, 0.16);
+      box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.05), inset 7px 0 0 var(--lcars-lavender), 0 14px 32px rgba(0, 0, 0, 0.22);
     }
     .panel::before {
       content: "";
       position: absolute;
       inset: 0 auto auto 0;
-      width: 5px;
-      height: 42px;
-      background: var(--command);
-      border-radius: 3px 0 3px 0;
+      width: 7px;
+      height: 54px;
+      background: var(--lcars-amber);
+      border-radius: 0 0 4px 0;
     }
+    .panel.good { box-shadow: inset 7px 0 0 var(--good), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .panel.warn { box-shadow: inset 7px 0 0 var(--warn), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .panel.bad { box-shadow: inset 7px 0 0 var(--bad), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .panel.pending { box-shadow: inset 7px 0 0 var(--pending), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .panel.inactive { box-shadow: inset 7px 0 0 var(--inactive), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .panel.good::before { background: var(--good); }
+    .panel.warn::before { background: var(--warn); }
+    .panel.bad::before { background: var(--bad); }
+    .panel.pending::before { background: var(--pending); }
+    .panel.inactive::before { background: var(--inactive); }
     .span-3 { grid-column: span 3; }
     .span-4 { grid-column: span 4; }
     .span-6 { grid-column: span 6; }
@@ -198,7 +241,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       display: grid;
       gap: 6px;
       min-height: 104px;
-      padding-left: 18px;
+      padding-left: 24px;
     }
     .metric .value {
       font-size: 30px;
@@ -210,17 +253,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       display: inline-flex;
       align-items: center;
       min-height: 24px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(32, 43, 46, 0.92);
-      color: var(--text);
+      padding: 2px 10px;
+      border-radius: 999px 4px 4px 999px;
+      border: 2px solid #000;
+      background: var(--lcars-lavender);
+      color: #050506;
       font-size: 12px;
+      font-weight: 800;
       white-space: nowrap;
     }
-    .pill.good { color: var(--good); border-color: rgba(123, 216, 143, 0.48); background: rgba(43, 83, 58, 0.30); }
-    .pill.warn { color: var(--warn); border-color: rgba(240, 195, 106, 0.50); background: rgba(92, 68, 29, 0.30); }
-    .pill.bad { color: var(--bad); border-color: rgba(255, 122, 120, 0.50); background: rgba(101, 45, 50, 0.34); }
+    .pill.good { color: #050506; background: var(--good); }
+    .pill.warn { color: #050506; background: var(--warn); }
+    .pill.bad { color: #050506; background: var(--bad); }
+    .pill.pending { color: #050506; background: var(--pending); }
+    .pill.inactive { color: #050506; background: var(--inactive); }
     .mini-metrics {
       display: flex;
       flex-wrap: wrap;
@@ -238,16 +284,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       overflow-x: auto;
     }
     th, td {
-      border-bottom: 1px solid rgba(169, 179, 174, 0.18);
+      border-bottom: 1px solid rgba(185, 166, 255, 0.18);
       padding: 8px 6px;
       text-align: left;
       vertical-align: top;
       overflow-wrap: anywhere;
     }
     th {
-      color: var(--muted);
+      color: var(--lcars-peach);
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 800;
+      text-transform: uppercase;
     }
     tr:last-child td { border-bottom: 0; }
     .section {
@@ -293,17 +340,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .field.span-6 { grid-column: span 6; }
     .field.span-8, .field.span-9, .field.span-12 { grid-column: span 6; }
     label {
-      color: var(--muted);
+      color: var(--lcars-peach);
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 800;
+      text-transform: uppercase;
     }
     .field input, .field select, .field textarea {
       width: 100%;
       min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 4px;
+      border: 2px solid #000;
+      border-radius: 14px 4px 4px 14px;
       padding: 7px 9px;
-      background: #0b0f15;
+      background: #171621;
       color: var(--text);
       min-width: 0;
     }
@@ -325,7 +373,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 8px;
       align-items: center;
       justify-content: space-between;
-      padding: 2px 0;
+      min-height: 42px;
+      padding: 4px 12px 4px 18px;
+      border-radius: 22px 4px 4px 22px;
+      background:
+        linear-gradient(90deg, var(--lcars-orange) 0 22px, #000 22px 28px, var(--lcars-amber) 28px 58%, #000 58% 60%, var(--lcars-violet) 60% 100%);
+      color: #050506;
+    }
+    .section-head h3 {
+      color: #050506;
+      font-size: 13px;
+    }
+    .section-head .pill,
+    .section-head .action-btn {
+      border-color: #050506;
     }
     .list {
       display: grid;
@@ -337,7 +398,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       gap: 10px;
       align-items: center;
       padding: 9px 0;
-      border-bottom: 1px solid rgba(169, 179, 174, 0.16);
+      border-bottom: 1px solid rgba(185, 166, 255, 0.16);
     }
     .row span, .row strong {
       min-width: 0;
@@ -349,18 +410,27 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .row:last-child { border-bottom: 0; }
     .crew-card {
       min-height: 190px;
-      padding-left: 18px;
+      padding-left: 24px;
     }
+    .crew-card:nth-of-type(3n + 1) { box-shadow: inset 7px 0 0 var(--lcars-amber), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .crew-card:nth-of-type(3n + 2) { box-shadow: inset 7px 0 0 var(--lcars-lavender), 0 14px 32px rgba(0, 0, 0, 0.22); }
+    .crew-card:nth-of-type(3n) { box-shadow: inset 7px 0 0 var(--lcars-blue), 0 14px 32px rgba(0, 0, 0, 0.22); }
     .crew-card h3 {
-      color: var(--command);
+      color: var(--lcars-amber);
     }
     .crew-card .list {
       margin-top: 10px;
     }
     .error {
-      border-color: rgba(224, 109, 95, 0.74);
-      background: rgba(101, 45, 50, 0.34);
-      color: var(--bad);
+      border-color: var(--bad);
+      background: rgba(65, 11, 18, 0.82);
+      color: #ffd7d7;
+    }
+    .officer-channel {
+      border-radius: 0 24px 4px 0;
+      background:
+        linear-gradient(90deg, rgba(242, 184, 75, 0.18), transparent 26%),
+        var(--panel);
     }
     @media (max-width: 900px) {
       .shell { grid-template-columns: 1fr; }
@@ -943,7 +1013,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderActionStatus() {
       const status = document.getElementById("action-status");
       if (!state.lastAction) return;
-      status.className = "panel action-status";
+      status.className = "panel action-status good";
       status.hidden = false;
       const result = state.lastAction.result || {};
       const detail = result.count ?? result.targets ?? result.resources ?? result.plans ?? result.status ?? "complete";
@@ -1404,7 +1474,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         </div>`;
     }
     function metric(label, value, hint, span = "span-3", tone = "") {
-      return `<div class="panel metric ${span}"><h3>${safe(label)}</h3><div class="value ${toneClass(tone)}">${safe(value ?? 0)}</div><p class="muted">${safe(hint)}</p></div>`;
+      const panelTone = normalizeTone(tone);
+      return `<div class="panel metric ${span} ${panelTone}"><h3>${safe(label)}</h3><div class="value ${toneClass(panelTone)}">${safe(value ?? 0)}</div><p class="muted">${safe(hint)}</p></div>`;
     }
     function officerPanel(role, subject, prompt, relatedLimitId = "") {
       const prefix = rolePrefix(`${role}-${subject}`);
@@ -1484,11 +1555,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function format(value) {
       if (value === null || value === undefined || value === "") return "<span class='muted'>none</span>";
-      if (typeof value === "boolean") return value ? "<span class='pill good'>yes</span>" : "<span class='pill'>no</span>";
+      if (typeof value === "boolean") return value ? "<span class='pill good'>yes</span>" : "<span class='pill inactive'>no</span>";
       if (Array.isArray(value)) return safe(value.join(", "));
       if (typeof value === "object") return safe(JSON.stringify(value));
       const text = String(value);
-      const cls = text === "enabled" || text === "completed" || text === "pass" || text === "ok" ? "good" : text === "failed" || text === "blocked" || text === "critical" ? "bad" : text === "warning" || text === "pending" ? "warn" : "";
+      const cls = stateTone(text);
       return cls ? `<span class="pill ${cls}">${safe(text)}</span>` : safe(text);
     }
     function safe(value) {
@@ -1501,12 +1572,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       });
     }
     function overallClass(value) {
-      if (value === "ok") return "good";
-      if (value === "critical") return "bad";
-      return "warn";
+      return stateTone(value) || "warn";
     }
     function toneClass(tone) {
-      return tone === "bad" ? "bad-text" : tone === "warn" ? "warn-text" : tone === "good" ? "good-text" : "";
+      return tone === "bad" ? "bad-text" : tone === "warn" ? "warn-text" : tone === "good" ? "good-text" : tone === "pending" ? "pending-text" : tone === "inactive" ? "inactive-text" : "";
     }
     function freshnessTone(status) {
       if (status === "ok") return "good";
@@ -1514,8 +1583,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (status === "high" || status === "missing") return "bad";
       return "";
     }
+    function normalizeTone(tone) {
+      return ["good", "warn", "bad", "pending", "inactive"].includes(tone) ? tone : "";
+    }
+    function stateTone(value) {
+      const text = String(value ?? "").toLowerCase().replaceAll("_", " ");
+      if (["ok", "pass", "passed", "enabled", "completed", "complete", "healthy", "ready", "accepted", "active", "running", "fresh"].includes(text)) return "good";
+      if (["critical", "failed", "failure", "blocked", "error", "bad", "unhealthy", "missing", "rejected", "hostile"].includes(text)) return "bad";
+      if (["warning", "warn", "pending", "queued", "submitted", "waiting", "stale", "revision required", "approval required", "needs review"].includes(text)) return "warn";
+      if (["prepared", "requested", "open", "manual execution required", "ids review blocked"].includes(text)) return "pending";
+      if (["disabled", "canceled", "cancelled", "archived", "inactive", "none", "not found", "unsupported"].includes(text)) return "inactive";
+      return "";
+    }
     const style = document.createElement("style");
-    style.textContent = ".good-text{color:var(--good)}.warn-text{color:var(--warn)}.bad-text{color:var(--bad)}";
+    style.textContent = ".good-text{color:var(--good)}.warn-text{color:var(--warn)}.bad-text{color:var(--bad)}.pending-text{color:var(--pending)}.inactive-text{color:var(--inactive)}";
     document.head.appendChild(style);
     render();
     if (state.token) {

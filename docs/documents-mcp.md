@@ -51,8 +51,24 @@ The default write scope is limited to `Overseer/` and `Inbox/` inside the vault.
 ```bash
 codex mcp get documents
 /home/god/.local/bin/overseer-documents-mcp
+curl -H "Authorization: Bearer $(tr -d '\n' < state/api-token)" http://127.0.0.1:8766/documents/status
+PYTHONPATH=src python3 -m overseer.cli documents-status
+PYTHONPATH=src python3 -m overseer.cli documents-search --query Overseer
 ```
 
 The wrapper should start the MCP server once `OBSIDIAN_API_KEY` is set and the Obsidian Local REST API is listening.
 
 If it exits with `OBSIDIAN_API_KEY is empty`, fill the local secret file. If it starts but tool calls fail, confirm Obsidian is open with the prepared vault and the Local REST API plugin is enabled.
+
+## Overseer API Surface
+
+The operator console's Documents tab uses Overseer API routes instead of reading the Obsidian token in the browser:
+
+- `GET /documents/status` checks plugin availability, authentication, version metadata, and the write-prefix boundary.
+- `GET /documents/notes?folder=Overseer` lists notes in a vault folder.
+- `POST /documents/search` searches the vault with a JSON body containing `query` and optional `context_length`.
+- `POST /documents/notes` appends or replaces a markdown note under `Overseer/` or `Inbox/`.
+
+These routes still require the Overseer API bearer token when the local API is started with `--auth-token-file`.
+
+The matching CLI commands are `documents-status`, `documents-notes`, `documents-search`, and `documents-write-note`. `documents-write-note` reads markdown from `--content-file` and still enforces the `Overseer/` or `Inbox/` write-prefix boundary.

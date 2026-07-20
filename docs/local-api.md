@@ -37,6 +37,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /approvals-summary`
 - `GET /security-summary`
 - `GET /usage-summary`
+- `GET /documents/status`
+- `GET /documents/notes`
 - `GET /usage/continuation-plan`
 - `GET /physical-summary`
 - `GET /virtual-summary`
@@ -96,6 +98,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
 - `POST /usage-limits`
+- `POST /documents/search`
+- `POST /documents/notes`
 - `POST /usage/continuation-requests`
 - `POST /usage/continuation-dispatches`
 - `POST /admin/plans`
@@ -196,6 +200,11 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `POST /usage-limits` records or updates a Quark usage-limit observation with `limit_id`, `resource_id`, `kind`, `capacity`, `remaining`, and `window`; optional fields are `resets_at`, `observed_at`, and `confidence`.
+`GET /documents/status` reports Ezri's Obsidian Local REST API readiness using the ignored local secret env file. It redacts secret material and rejects non-loopback Obsidian API URLs.
+`GET /documents/notes` lists vault entries for an optional `?folder=...` query. It is read-only and uses the stored Obsidian REST token server-side.
+`POST /documents/search` searches the Obsidian vault with `query` and optional `context_length`. It does not expose the Obsidian API key to the browser.
+`POST /documents/notes` writes markdown using `path`, `content`, and optional `mode` of `append` or `replace`. Writes are restricted to the approved `Overseer/` and `Inbox/` vault prefixes and do not mutate host services.
+The CLI equivalents are `documents-status`, `documents-notes`, `documents-search`, and `documents-write-note`; they read the same ignored Obsidian env file by default and never require the Obsidian token as a command-line argument.
 `POST /codex-projects/discover-threads` imports local `codex-projects` registry rows as Quark-owned usage-limited thread resources. Optional field: `codex_projects_registry`.
 `GET /usage/continuation-plan` returns persisted usage-limited continuation requests, dispatch records, and their current ready, waiting, blocked, or escalated schedule without mutating host state.
 `POST /usage/continuation-requests` persists a Quark continuation request with `request_id`, `limit_id`, `resource_id`, `owner_thread`, `requested_units`, and `intent`; optional fields are `risk_level`, `earliest_start`, `deadline`, `requested_by`, and `requested_at`.
@@ -228,6 +237,9 @@ storage = client.discover_storage()
 virtual = client.virtual_summary()
 listeners = client.discover_virtual_listeners()
 efficiency = client.health_efficiency()
+documents = client.documents_status()
+notes = client.documents_notes("Overseer")
+search = client.documents_search("Overseer", context_length=40)
 target = client.record_health_target("health.overseer.api", "svc.overseer.api", "Overseer API", "json", "http://127.0.0.1:8766/health")
 probed = client.run_health_probes(retention_per_target=5)
 summary = client.health_summary()

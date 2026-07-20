@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 import overseer.api as overseer_api
 import overseer.admin as overseer_admin
+import overseer.documents as overseer_documents
 from overseer import (
     ApprovalLevel,
     ApprovalRequest,
@@ -257,6 +258,65 @@ class _JsonHealthHandler(BaseHTTPRequestHandler):
         return
 
 
+class _FakeObsidianHandler(BaseHTTPRequestHandler):
+    calls = []
+
+    def do_GET(self):
+        self.__class__.calls.append(("GET", self.path, self.headers.get("authorization"), ""))
+        if self.headers.get("authorization") != "Bearer test-token":
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path == "/":
+            self._json(
+                {
+                    "status": "OK",
+                    "service": "Obsidian Local REST API",
+                    "authenticated": True,
+                    "versions": {"obsidian": "1.12.7", "self": "4.1.7"},
+                    "manifest": {"id": "obsidian-local-rest-api", "name": "Local REST API with MCP", "version": "4.1.7"},
+                }
+            )
+            return
+        if self.path == "/vault/Overseer/":
+            self._json({"files": ["Inbox/operator-note.md", "Runbooks/REST.md"]})
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        self.__class__.calls.append(("POST", self.path, self.headers.get("authorization"), body))
+        if self.headers.get("authorization") != "Bearer test-token":
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path.startswith("/search/simple/"):
+            self._json([{"filename": "Overseer/Runbooks/REST.md", "score": 1, "matches": [{"match": "Overseer"}]}])
+            return
+        if self.path == "/vault/Overseer/Inbox/operator-note.md":
+            self.send_response(204)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self):
+        self.do_POST()
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
 class _FakeCodexProjectRunner:
     def __init__(self) -> None:
         self.commands = []
@@ -283,6 +343,26 @@ class LocalHttpServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+
+
+class LocalFakeObsidianServer:
+    def __enter__(self):
+        _FakeObsidianHandler.calls = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeObsidianHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.url = f"http://{host}:{port}"
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    @property
+    def calls(self):
+        return _FakeObsidianHandler.calls
 
 
 class LocalOverseerApiServer:
@@ -2407,6 +2487,140 @@ class OverseerApiTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 400)
             self.assertEqual(body["error"], "identifiers must be a JSON object")
 
+    def test_documents_client_uses_local_secret_without_exposing_token(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+
+            status = overseer_documents.documents_config_status(str(env_file))
+            notes = overseer_documents.documents_list_notes_status(str(env_file), "Overseer")
+            search = overseer_documents.documents_search_status(str(env_file), "Overseer", 20)
+            write = overseer_documents.documents_write_note_status(
+                str(env_file),
+                "Overseer/Inbox/operator-note.md",
+                "## Operator note\n",
+                "append",
+            )
+
+        self.assertTrue(status["available"])
+        self.assertTrue(status["authenticated"])
+        self.assertEqual(notes["files"], ["Inbox/operator-note.md", "Runbooks/REST.md"])
+        self.assertEqual(search["results"][0]["filename"], "Overseer/Runbooks/REST.md")
+        self.assertTrue(write["mutation_performed"])
+        self.assertNotIn("test-token", json.dumps(status))
+
+    def test_documents_client_rejects_writes_outside_allowed_folders(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError) as error:
+                overseer_documents.documents_write_note_status(
+                    str(env_file),
+                    "Private/export.md",
+                    "secret",
+                    "append",
+                )
+
+        self.assertEqual(str(error.exception), "path is outside allowed Documents write folders")
+
+    def test_documents_cli_status_and_search_use_env_file(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = cli_main(["documents-status", "--env-file", str(env_file)])
+            status = json.loads(stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                search_exit = cli_main(
+                    [
+                        "documents-search",
+                        "--env-file",
+                        str(env_file),
+                        "--query",
+                        "Overseer",
+                        "--context-length",
+                        "20",
+                    ]
+                )
+            search = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(search_exit, 0)
+        self.assertTrue(status["available"])
+        self.assertEqual(search["count"], 1)
+
+    def test_documents_cli_write_uses_content_file(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            content_file = Path(directory) / "note.md"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            content_file.write_text("## Operator note\n", encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = cli_main(
+                    [
+                        "documents-write-note",
+                        "--env-file",
+                        str(env_file),
+                        "--path",
+                        "Overseer/Inbox/operator-note.md",
+                        "--content-file",
+                        str(content_file),
+                    ]
+                )
+            status = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(status["path"], "Overseer/Inbox/operator-note.md")
+        self.assertTrue(status["mutation_performed"])
+
+    def test_api_exposes_documents_routes_behind_overseer_auth(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with patch.object(overseer_api, "documents_config_status", lambda: overseer_documents.documents_config_status(str(env_file))):
+                with patch.object(
+                    overseer_api,
+                    "documents_list_notes_status",
+                    lambda folder="": overseer_documents.documents_list_notes_status(str(env_file), folder),
+                ):
+                    with patch.object(
+                        overseer_api,
+                        "documents_search_status",
+                        lambda query="", context_length=100: overseer_documents.documents_search_status(str(env_file), query, context_length),
+                    ):
+                        with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                            status = server.get("/documents/status")
+                            notes = server.get("/documents/notes?folder=Overseer")
+                            search = server.post("/documents/search", {"query": "Overseer"})
+
+            self.assertTrue(status["available"])
+            self.assertEqual(notes["count"], 2)
+            self.assertEqual(search["count"], 1)
+
     def test_loopback_api_serves_operator_console_without_token(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2794,6 +3008,51 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertTrue(health["ok"])
             self.assertEqual(state["resources"][0]["id"], "svc.client")
+
+    def test_client_uses_documents_routes(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                encoding="utf-8",
+            )
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with patch.object(overseer_api, "documents_config_status", lambda: overseer_documents.documents_config_status(str(env_file))):
+                with patch.object(
+                    overseer_api,
+                    "documents_list_notes_status",
+                    lambda folder="": overseer_documents.documents_list_notes_status(str(env_file), folder),
+                ):
+                    with patch.object(
+                        overseer_api,
+                        "documents_search_status",
+                        lambda query="", context_length=100: overseer_documents.documents_search_status(str(env_file), query, context_length),
+                    ):
+                        with patch.object(
+                            overseer_api,
+                            "documents_write_note_status",
+                            lambda path="", content="", mode="append": overseer_documents.documents_write_note_status(
+                                str(env_file),
+                                path,
+                                content,
+                                mode,
+                            ),
+                        ):
+                            with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                                client = OverseerApiClient(server.url, auth_token="client-secret")
+                                status = client.documents_status()
+                                notes = client.documents_notes("Overseer")
+                                search = client.documents_search("Overseer", context_length=20)
+                                write = client.documents_write_note(
+                                    "Overseer/Inbox/operator-note.md",
+                                    "## Operator note\n",
+                                )
+
+            self.assertTrue(status["available"])
+            self.assertEqual(notes["count"], 2)
+            self.assertEqual(search["count"], 1)
+            self.assertTrue(write["mutation_performed"])
 
     def test_client_records_resource(self):
         with tempfile.TemporaryDirectory() as directory:

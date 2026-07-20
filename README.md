@@ -22,6 +22,7 @@ The first release should include a working initial slice for every major domain:
 
 ## Development Commands
 
+- `pytest -q` - run the current unit test suite with the configured `src/` import path.
 - `PYTHONPATH=src python3 -m unittest discover -s tests -v` - run the current unit test suite.
 - `PYTHONPATH=src python3 -m overseer.cli demo` - print a read-only demo checkout decision.
 - `PYTHONPATH=src python3 -m overseer.cli demo --store state/overseer.sqlite3` - persist the demo decision to an explicit ignored local database path.
@@ -51,6 +52,11 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli audit-summary --store state/overseer.sqlite3 --owner odo --subject-prefix ids-review.` - summarize persisted audit events, optionally filtered by event type, owner, or subject prefix.
 - `PYTHONPATH=src python3 -m overseer.cli approvals-summary --store state/overseer.sqlite3 --status pending --owner dax` - summarize stored approval requests, optionally filtered by status, owner, approval level, or subject prefix.
 - `PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3` - summarize persisted usage limits, capacity state, reset timing, and confidence.
+- `curl -H "Authorization: Bearer $(tr -d '\n' < state/api-token)" http://127.0.0.1:8766/documents/status` - check Ezri's Obsidian Local REST API readiness without exposing the Obsidian token.
+- `curl -H "Authorization: Bearer $(tr -d '\n' < state/api-token)" 'http://127.0.0.1:8766/documents/notes?folder=Overseer'` - list Ezri-managed vault notes through Overseer.
+- `PYTHONPATH=src python3 -m overseer.cli documents-status` - check Ezri's Obsidian Local REST API readiness through the ignored local env file.
+- `PYTHONPATH=src python3 -m overseer.cli documents-search --query Overseer` - search the local Obsidian vault through Ezri without exposing the Obsidian token.
+- `PYTHONPATH=src python3 -m overseer.cli documents-write-note --path Overseer/Inbox/operator-note.md --content-file /path/to/note.md` - append markdown to an approved Documents vault path.
 - `PYTHONPATH=src python3 -m overseer.cli discover-codex-project-threads --store state/overseer.sqlite3` - import local `codex-projects` registry rows as Quark-owned thread resources without starting sessions.
 - `PYTHONPATH=src python3 -m overseer.cli record-usage-limit --store state/overseer.sqlite3 --limit-id limit.service.requests --resource-id svc.service --kind requests --capacity 100 --remaining 25 --window hourly` - record or update Quark usage-limit evidence.
 - `PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3` - summarize Quark continuation requests and dispatch handoffs.

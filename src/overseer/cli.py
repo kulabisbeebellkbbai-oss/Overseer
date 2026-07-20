@@ -45,6 +45,12 @@ from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain,
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
 from .crew import CrewMessageStatus, build_crew_message, crew_message_status
+from .documents import (
+    documents_config_status,
+    documents_list_notes_status,
+    documents_search_status,
+    documents_write_note_status,
+)
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import (
@@ -6109,6 +6115,14 @@ def _json_object_arg(value: str, label: str) -> dict[str, object]:
     return parsed
 
 
+def _documents_env_file_arg(value: str | None) -> str:
+    if value:
+        return value
+    from .documents import DEFAULT_OBSIDIAN_ENV_FILE
+
+    return DEFAULT_OBSIDIAN_ENV_FILE
+
+
 def schema_migration_status(migration: SchemaMigration) -> dict[str, object]:
     return {
         "version": migration.version,
@@ -6730,6 +6744,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    documents_status_parser = subparsers.add_parser("documents-status", help="check Ezri's Obsidian Documents API readiness")
+    documents_status_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
+    documents_notes_parser = subparsers.add_parser("documents-notes", help="list Obsidian vault notes through Ezri")
+    documents_notes_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
+    documents_notes_parser.add_argument("--folder", default="")
+    documents_search_parser = subparsers.add_parser("documents-search", help="search Obsidian vault notes through Ezri")
+    documents_search_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
+    documents_search_parser.add_argument("--query", required=True)
+    documents_search_parser.add_argument("--context-length", type=int, default=100)
+    documents_write_parser = subparsers.add_parser("documents-write-note", help="append or replace an approved Obsidian vault note")
+    documents_write_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
+    documents_write_parser.add_argument("--path", required=True)
+    documents_write_parser.add_argument("--content-file", required=True, help="markdown file whose contents will be written")
+    documents_write_parser.add_argument("--mode", default="append", choices=("append", "replace"))
     discover_codex_threads_parser = subparsers.add_parser(
         "discover-codex-project-threads",
         help="import local codex-projects registry rows as managed Overseer resources",
@@ -7412,6 +7440,41 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-summary":
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "documents-status":
+        print(json.dumps(documents_config_status(_documents_env_file_arg(args.env_file)), sort_keys=True))
+        return 0
+
+    if args.command == "documents-notes":
+        print(json.dumps(documents_list_notes_status(_documents_env_file_arg(args.env_file), args.folder), sort_keys=True))
+        return 0
+
+    if args.command == "documents-search":
+        print(
+            json.dumps(
+                documents_search_status(
+                    _documents_env_file_arg(args.env_file),
+                    args.query,
+                    args.context_length,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "documents-write-note":
+        print(
+            json.dumps(
+                documents_write_note_status(
+                    _documents_env_file_arg(args.env_file),
+                    args.path,
+                    Path(args.content_file).read_text(encoding="utf-8"),
+                    args.mode,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "discover-codex-project-threads":

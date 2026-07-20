@@ -104,6 +104,12 @@ from .cli import (
     unarchive_admin_history_status,
     virtual_summary_status,
 )
+from .documents import (
+    documents_config_status,
+    documents_list_notes_status,
+    documents_search_status,
+    documents_write_note_status,
+)
 from .ui import OPERATOR_CONSOLE_HTML
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
@@ -164,6 +170,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/crew/messages":
                 self._handle(lambda: crew_messages_status(store_path, _query_first(query, "owner_domain"), _query_first(query, "status")))
+                return
+            if path == "/documents/status":
+                self._handle(lambda: documents_config_status())
+                return
+            if path == "/documents/notes":
+                self._handle(lambda: documents_list_notes_status(folder=_query_first(query, "folder") or ""))
                 return
             if path == "/usage/continuation-plan":
                 self._handle(lambda: usage_continuation_plan_status(store_path))
@@ -413,6 +425,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if self.path == "/crew/dispatch":
                 self._handle_json(lambda payload: dispatch_crew_messages_status(store_path, **_crew_dispatch_args(payload)))
                 return
+            if self.path == "/documents/search":
+                self._handle_json(lambda payload: documents_search_status(**_documents_search_args(payload)))
+                return
+            if self.path == "/documents/notes":
+                self._handle_json(lambda payload: documents_write_note_status(**_documents_write_args(payload)))
+                return
             if self.path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
@@ -607,6 +625,21 @@ def _crew_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
         "message_id": str(payload["message_id"]) if payload.get("message_id") else None,
         "dispatched_by": str(payload.get("dispatched_by", "sisko")),
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
+    }
+
+
+def _documents_search_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "query": str(payload["query"]),
+        "context_length": int(payload.get("context_length", 100)),
+    }
+
+
+def _documents_write_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": str(payload["path"]),
+        "content": str(payload["content"]),
+        "mode": str(payload.get("mode", "append")),
     }
 
 

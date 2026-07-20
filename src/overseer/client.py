@@ -308,6 +308,29 @@ class OverseerApiClient:
             payload["dispatched_at"] = dispatched_at
         return self._post("/crew/dispatch", payload)
 
+    def documents_status(self) -> dict[str, Any]:
+        return self._get("/documents/status")
+
+    def documents_notes(self, folder: str | None = None) -> dict[str, Any]:
+        query = f"?{urlencode({'folder': folder})}" if folder else ""
+        return self._get(f"/documents/notes{query}")
+
+    def documents_search(self, query: str, context_length: int | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"query": query}
+        if context_length is not None:
+            payload["context_length"] = context_length
+        return self._post("/documents/search", payload)
+
+    def documents_write_note(self, path: str, content: str, mode: str = "append") -> dict[str, Any]:
+        return self._post(
+            "/documents/notes",
+            {
+                "path": path,
+                "content": content,
+                "mode": mode,
+            },
+        )
+
     def physical_summary(self) -> dict[str, Any]:
         return self._get("/physical-summary")
 

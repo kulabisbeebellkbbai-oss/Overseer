@@ -654,6 +654,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       health: "/health-efficiency",
       healthSummary: "/health-summary",
       usage: "/usage-summary",
+      documentsStatus: "/documents/status",
+      documentsNotes: "/documents/notes?folder=Overseer",
       crewMessages: "/crew/messages",
       audit: "/audit-summary",
       approvals: "/approvals-summary",
@@ -760,6 +762,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
       if (action === "dispatch-crew-messages") return await dispatchCrewMessages(source?.dataset?.role || "");
+      if (action === "documents-list-notes") return await listDocumentsNotes();
+      if (action === "documents-search") return await searchDocuments();
+      if (action === "documents-write-note") return await writeDocumentNote();
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
@@ -1016,6 +1021,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const payload = {dispatched_by: "sisko"};
       if (role) payload.owner_domain = role;
       return await postJson("/crew/dispatch", payload);
+    }
+    async function listDocumentsNotes() {
+      const folder = value("documents-folder");
+      const suffix = folder ? `?folder=${encodeURIComponent(folder)}` : "";
+      return await getJson(`/documents/notes${suffix}`);
+    }
+    async function searchDocuments() {
+      return await postJson("/documents/search", {
+        query: value("documents-query"),
+        context_length: Number(value("documents-context-length") || "100")
+      });
+    }
+    async function writeDocumentNote() {
+      return await postJson("/documents/notes", {
+        path: value("documents-note-path"),
+        mode: value("documents-note-mode"),
+        content: value("documents-note-content")
+      });
     }
     async function requestUsageContinuation() {
       const payload = {
@@ -1587,9 +1610,41 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderEzri() {
       const candidates = knowledgeBaseCandidates();
       const primary = candidates[0] || {};
+      const status = state.data.documentsStatus || {};
+      const notes = state.data.documentsNotes || {};
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
           ${stationIntro("Ezri", "Knowledge Base", "Docs, runbooks, decisions, and note-backed MCP integration.", ["operator docs", "runbooks", "vault search"])}
+          ${metric("REST API", status.available ? "online" : "offline", "Obsidian Local REST", "span-3", status.available ? "good" : "bad")}
+          ${metric("Auth", status.authenticated ? "valid" : "blocked", "stored bearer token", "span-3", status.authenticated ? "good" : "warn")}
+          ${metric("Notes", notes.count, "Overseer folder", "span-3")}
+          ${metric("Writes", (status.allowed_write_prefixes || []).join(", "), "allowed prefixes", "span-3", "pending")}
+          <div class="panel span-6">${kv("Documents Runtime", {
+            service: status.service,
+            plugin: status.manifest?.name,
+            plugin_version: status.manifest?.version,
+            obsidian_version: status.versions?.obsidian,
+            base_url: status.base_url,
+            configured: status.configured
+          })}</div>
+          <div class="panel span-6">${table("Overseer Notes", (notes.files || []).map((file) => ({file})), ["file"])}</div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Vault Search</h3><button class="action-btn" data-action="documents-search">Search</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="documents-query">Query</label><input id="documents-query" value="Overseer"></div>
+              <div class="field span-3"><label for="documents-context-length">Context</label><input id="documents-context-length" type="number" min="0" value="100"></div>
+              <div class="field span-3"><label for="documents-folder">Folder</label><input id="documents-folder" value="Overseer"></div>
+              <div class="field span-6"><button class="action-btn" data-action="documents-list-notes">List Folder</button></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Write Note</h3><button class="action-btn" data-action="documents-write-note">Save</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="documents-note-path">Path</label><input id="documents-note-path" value="Overseer/Inbox/operator-note.md"></div>
+              <div class="field span-3"><label for="documents-note-mode">Mode</label><select id="documents-note-mode"><option value="append">append</option><option value="replace">replace</option></select></div>
+              <div class="field span-6"><label for="documents-note-content">Content</label><textarea id="documents-note-content">## Operator note&#10;&#10;</textarea></div>
+            </div>
+          </div>
           <div class="panel span-12">
             <div class="toolbar"><h3>Recommended Integration</h3><span class="pill good">open source</span></div>
             <div class="kb-grid">

@@ -1253,6 +1253,7 @@ def run_status(
     health_evidence_retention_per_target: int = 5,
     inspect_host: bool = False,
     dispatch_crew_messages: bool = False,
+    dispatch_usage_continuations: bool = False,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -1263,6 +1264,8 @@ def run_status(
             inspect_host=inspect_host,
             dispatch_crew_messages=dispatch_crew_messages,
             crew_dispatcher=lambda path: dispatch_crew_messages_status(path, dispatched_by="sisko"),
+            dispatch_usage_continuations=dispatch_usage_continuations,
+            usage_continuation_dispatcher=lambda path: dispatch_usage_continuations_status(path, dispatched_by="quark"),
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),
@@ -1279,6 +1282,8 @@ def run_status(
             "host_security_warning_findings": tick.host_security_warning_findings,
             "crew_messages_dispatched": tick.crew_messages_dispatched,
             "crew_messages_blocked": tick.crew_messages_blocked,
+            "usage_continuations_dispatched": tick.usage_continuations_dispatched,
+            "usage_continuations_skipped": tick.usage_continuations_skipped,
         }
     finally:
         store.close()
@@ -6386,6 +6391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--health-evidence-retention-per-target", type=int, default=5)
     run_parser.add_argument("--inspect-host", action="store_true", help="capture a read-only host inspection snapshot on each tick")
     run_parser.add_argument("--dispatch-crew-messages", action="store_true", help="dispatch open crew messages on each tick without executing host changes")
+    run_parser.add_argument("--dispatch-usage-continuations", action="store_true", help="dispatch ready usage-limited continuation handoffs on each tick without resuming threads")
     state_parser = subparsers.add_parser("list-state", help="list stored Overseer resources, claims, approvals, and audit events")
     state_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     redacted_state_parser = subparsers.add_parser("export-state-redacted", help="print a redacted state export without writing files")
@@ -6975,6 +6981,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.health_evidence_retention_per_target,
                     args.inspect_host,
                     args.dispatch_crew_messages,
+                    args.dispatch_usage_continuations,
                 ),
                 sort_keys=True,
             )

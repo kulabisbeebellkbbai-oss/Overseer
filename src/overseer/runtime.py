@@ -30,6 +30,8 @@ class RuntimeTick:
     host_security_warning_findings: int
     crew_messages_dispatched: int
     crew_messages_blocked: int
+    usage_continuations_dispatched: int
+    usage_continuations_skipped: int
 
 
 class OverseerRuntime:
@@ -44,6 +46,8 @@ class OverseerRuntime:
         host_inspection_adapter: HostInspectionAdapter | None = None,
         dispatch_crew_messages: bool = False,
         crew_dispatcher: Callable[[str], dict[str, Any]] | None = None,
+        dispatch_usage_continuations: bool = False,
+        usage_continuation_dispatcher: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.store = store
         self.service_name = service_name
@@ -54,6 +58,8 @@ class OverseerRuntime:
         self.host_inspection_adapter = host_inspection_adapter or HostInspectionAdapter()
         self.dispatch_crew_messages = dispatch_crew_messages
         self.crew_dispatcher = crew_dispatcher
+        self.dispatch_usage_continuations = dispatch_usage_continuations
+        self.usage_continuation_dispatcher = usage_continuation_dispatcher
         self.started_at = _utc_now()
         self.tick_count = 0
 
@@ -62,6 +68,7 @@ class OverseerRuntime:
         health_probes = self._probe_health_targets()
         host_inspections, host_high_findings, host_warning_findings = self._inspect_host()
         crew_dispatched, crew_blocked = self._dispatch_crew_messages()
+        usage_dispatched, usage_skipped = self._dispatch_usage_continuations()
         self.store.save_runtime_heartbeat(
             RuntimeHeartbeat(
                 id=self.service_name,
@@ -85,6 +92,8 @@ class OverseerRuntime:
             host_security_warning_findings=host_warning_findings,
             crew_messages_dispatched=crew_dispatched,
             crew_messages_blocked=crew_blocked,
+            usage_continuations_dispatched=usage_dispatched,
+            usage_continuations_skipped=usage_skipped,
         )
 
     def run(self, interval_seconds: float = 30.0, once: bool = False) -> RuntimeTick:
@@ -119,6 +128,12 @@ class OverseerRuntime:
             return 0, 0
         result = self.crew_dispatcher(str(self.store.path))
         return int(result.get("acknowledged", 0)), int(result.get("blocked", 0))
+
+    def _dispatch_usage_continuations(self) -> tuple[int, int]:
+        if not self.dispatch_usage_continuations or self.usage_continuation_dispatcher is None:
+            return 0, 0
+        result = self.usage_continuation_dispatcher(str(self.store.path))
+        return int(result.get("dispatched", 0)), int(result.get("skipped", 0))
 
 
 def _utc_now() -> str:

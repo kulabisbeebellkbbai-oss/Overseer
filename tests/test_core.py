@@ -8140,6 +8140,23 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tick.crew_messages_blocked, 1)
             store.close()
 
+    def test_runtime_dispatches_usage_continuations_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+
+            def fake_dispatcher(store_path: str) -> dict[str, object]:
+                return {"dispatched": 3, "skipped": 2}
+
+            tick = OverseerRuntime(
+                store,
+                dispatch_usage_continuations=True,
+                usage_continuation_dispatcher=fake_dispatcher,
+            ).run(once=True)
+
+            self.assertEqual(tick.usage_continuations_dispatched, 3)
+            self.assertEqual(tick.usage_continuations_skipped, 2)
+            store.close()
+
     def test_run_status_dispatches_open_crew_messages_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -8158,6 +8175,40 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(status["crew_messages_dispatched"], 1)
             self.assertEqual(status["crew_messages_blocked"], 0)
             self.assertEqual(messages["items"][0]["status"], "acknowledged")
+
+    def test_run_status_dispatches_ready_usage_continuations_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.runtime.quota",
+                    resource_id="svc.runtime.quota",
+                    kind=LimitKind.DAILY_QUOTA,
+                    capacity=100,
+                    remaining=10,
+                    resets_at="2026-07-20T00:00:00+00:00",
+                    window="daily",
+                )
+            )
+            store.close()
+            request_usage_continuation_status(
+                store_path,
+                "work.runtime.quota",
+                "limit.runtime.quota",
+                "svc.runtime.quota",
+                "thread.runtime.quota",
+                5,
+                "continue after quota is ready",
+            )
+
+            status = run_status(store_path, once=True, dispatch_usage_continuations=True)
+            plan = usage_continuation_plan_status(store_path)
+
+            self.assertEqual(status["usage_continuations_dispatched"], 1)
+            self.assertEqual(status["usage_continuations_skipped"], 0)
+            self.assertEqual(plan["dispatches"], 1)
+            self.assertEqual(plan["dispatch_items"][0]["request_id"], "work.runtime.quota")
 
     def test_runtime_prunes_health_evidence_per_target(self):
         with tempfile.TemporaryDirectory() as directory, LocalHttpServer() as server:

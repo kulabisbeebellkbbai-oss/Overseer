@@ -32,6 +32,7 @@ Thumbs.db
 .vscode/
 
 # Build/cache output
+artifacts/
 dist/
 build/
 coverage/

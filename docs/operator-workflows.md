@@ -361,8 +361,8 @@ PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . -
 2. Review Active, Queued, Review, and Cleanup metrics.
 3. Read the Claims table for resource id, status, type, and next step.
 4. Click resource ids to populate claim fields.
-5. Review Virtual Runtime Evidence, Runtime Records, Snapshot Requests, and
-   Restore Requests for current Dax state.
+5. Review Virtual Runtime Evidence, Runtime Records, Snapshot Requests,
+   Restore Requests, and Execution Records for current Dax state.
 6. Use Cleanup Candidates for stale or expired leases.
 
 ### Record Virtual Runtime State
@@ -382,8 +382,28 @@ PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . -
 3. Click a runtime record or fill Resource ID, Snapshot Name, Requested By, and
    Reason.
 4. Click Stage Snapshot.
-5. Wait for human approval before invoking VM, container, emulator, gateway, or
-   proxy snapshot adapters.
+5. Review the staged request row and confirm the next step.
+
+### Approve Virtual Snapshot Request
+
+1. Open Claims.
+2. Review claims, runtime record, adapter, snapshot target, and staged
+   snapshot request.
+3. Click the staged snapshot request row to fill Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request status changes to approved.
+
+### Execute Virtual Snapshot Request
+
+1. Open Claims.
+2. Confirm the snapshot request is approved.
+3. Fill Request ID, Executed By, and Provider.
+4. Click Execute.
+5. Review Virtual Execution Records and manifest path.
+6. Real Docker, Podman, libvirt/QEMU, emulator, gateway, or proxy providers
+   remain blocked until their live adapters and exact disposable targets are
+   declared.
 
 ### Stage Virtual Restore Request
 
@@ -393,8 +413,29 @@ PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . -
 3. Click a snapshot request or fill Resource ID, Restore Point, Requested By,
    and Reason.
 4. Click Stage Restore.
-5. Wait for human approval before invoking VM, container, emulator, gateway, or
-   proxy restore adapters.
+5. Review the staged request row and confirm the next step.
+
+### Approve Virtual Restore Request
+
+1. Open Claims.
+2. Review claims, runtime record, failed-state evidence, restore point, and
+   staged restore request.
+3. Click the staged restore request row to fill Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request status changes to approved.
+
+### Execute Virtual Restore Request
+
+1. Open Claims.
+2. Confirm the restore request is approved.
+3. Fill Request ID, Executed By, and Provider.
+4. Click Execute.
+5. Review Virtual Execution Records and manifest path.
+6. Have Julian validate service health before returning the runtime to service.
+7. Real Docker, Podman, libvirt/QEMU, emulator, gateway, or proxy providers
+   remain blocked until their live adapters and exact disposable targets are
+   declared.
 
 ### Request A VM, Port, Gateway, Or Device Claim
 

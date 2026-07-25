@@ -146,9 +146,11 @@ environment-specific policy wiring:
 - approved privileged/system journal content capture after staged access
   requests.
 - firewall desired-policy execution after IDS review and human approval.
-- approved live backup execution, restore execution, and cleanup execution.
-- VM/container/emulator live adapter inventory, snapshot execution, restore
-  execution, start, stop, and destroy actions after explicit approval.
+- approved live backup execution and restore execution.
+- VM/container/emulator live adapter inventory plus real-provider snapshot,
+  restore, start, stop, and destroy actions after explicit approval. Dax local
+  fixture snapshot/restore execution is implemented for regression-safe
+  lifecycle validation.
 - secret rotation execution and service-account change execution.
 
 ## Tests

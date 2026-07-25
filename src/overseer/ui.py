@@ -912,7 +912,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
       if (action === "record-virtual-runtime") return await recordVirtualRuntime();
       if (action === "stage-virtual-snapshot-request") return await stageVirtualSnapshotRequest();
+      if (action === "approve-virtual-snapshot-request") return await approveVirtualSnapshotRequest();
+      if (action === "execute-virtual-snapshot-request") return await executeVirtualSnapshotRequest();
       if (action === "stage-virtual-restore-request") return await stageVirtualRestoreRequest();
+      if (action === "approve-virtual-restore-request") return await approveVirtualRestoreRequest();
+      if (action === "execute-virtual-restore-request") return await executeVirtualRestoreRequest();
       if (action === "record-backup-job") return await recordBackupJob();
       if (action === "record-restore-test") return await recordRestoreTest();
       if (action === "stage-backup-cleanup-request") return await stageBackupCleanupRequest();
@@ -1052,12 +1056,38 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         snapshot_name: value("snapshot-name")
       });
     }
+    async function approveVirtualSnapshotRequest() {
+      return await postJson("/virtual/snapshot-requests/approve", {
+        request_id: value("snapshot-request-id"),
+        approved_by: value("snapshot-approved-by") || "sisko"
+      });
+    }
+    async function executeVirtualSnapshotRequest() {
+      return await postJson("/virtual/snapshot-requests/execute", {
+        request_id: value("snapshot-request-id"),
+        executed_by: value("snapshot-executed-by") || "dax",
+        provider: value("snapshot-provider") || "local_fixture"
+      });
+    }
     async function stageVirtualRestoreRequest() {
       return await postJson("/virtual/restore-requests", {
         resource_id: value("restore-virtual-resource-id"),
         restore_point: value("restore-virtual-point"),
         requested_by: value("restore-virtual-requested-by") || "dax",
         reason: value("restore-virtual-reason") || "stage virtual restore after failed change"
+      });
+    }
+    async function approveVirtualRestoreRequest() {
+      return await postJson("/virtual/restore-requests/approve", {
+        request_id: value("restore-virtual-request-id"),
+        approved_by: value("restore-virtual-approved-by") || "sisko"
+      });
+    }
+    async function executeVirtualRestoreRequest() {
+      return await postJson("/virtual/restore-requests/execute", {
+        request_id: value("restore-virtual-request-id"),
+        executed_by: value("restore-virtual-executed-by") || "dax",
+        provider: value("restore-virtual-provider") || "local_fixture"
       });
     }
     async function requestClaim() {
@@ -1936,29 +1966,38 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>Virtual Snapshot Request</h3><button class="action-btn" data-action="stage-virtual-snapshot-request">Stage Snapshot</button></div>
+            <div class="toolbar"><h3>Virtual Snapshot Request</h3><div class="actions"><button class="action-btn" data-action="stage-virtual-snapshot-request">Stage</button><button class="action-btn" data-action="approve-virtual-snapshot-request">Approve</button><button class="action-btn" data-action="execute-virtual-snapshot-request">Execute</button></div></div>
             <div class="form-grid">
+              <div class="field span-6"><label for="snapshot-request-id">Request ID</label><input id="snapshot-request-id"></div>
               <div class="field span-6"><label for="snapshot-resource-id">Resource ID</label><input id="snapshot-resource-id" value="vm.local.resource"></div>
               <div class="field span-6"><label for="snapshot-name">Snapshot Name</label><input id="snapshot-name" value="before-maintenance"></div>
-              <div class="field span-4"><label for="snapshot-requested-by">Requested By</label><input id="snapshot-requested-by" value="dax"></div>
-              <div class="field span-8"><label for="snapshot-reason">Reason</label><input id="snapshot-reason" value="stage virtual snapshot before maintenance"></div>
+              <div class="field span-3"><label for="snapshot-requested-by">Requested By</label><input id="snapshot-requested-by" value="dax"></div>
+              <div class="field span-3"><label for="snapshot-approved-by">Approved By</label><input id="snapshot-approved-by" value="sisko"></div>
+              <div class="field span-3"><label for="snapshot-executed-by">Executed By</label><input id="snapshot-executed-by" value="dax"></div>
+              <div class="field span-3"><label for="snapshot-provider">Provider</label><input id="snapshot-provider" value="local_fixture"></div>
+              <div class="field span-12"><label for="snapshot-reason">Reason</label><input id="snapshot-reason" value="stage virtual snapshot before maintenance"></div>
             </div>
           </div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>Virtual Restore Request</h3><button class="action-btn" data-action="stage-virtual-restore-request">Stage Restore</button></div>
+            <div class="toolbar"><h3>Virtual Restore Request</h3><div class="actions"><button class="action-btn" data-action="stage-virtual-restore-request">Stage</button><button class="action-btn" data-action="approve-virtual-restore-request">Approve</button><button class="action-btn" data-action="execute-virtual-restore-request">Execute</button></div></div>
             <div class="form-grid">
+              <div class="field span-6"><label for="restore-virtual-request-id">Request ID</label><input id="restore-virtual-request-id"></div>
               <div class="field span-6"><label for="restore-virtual-resource-id">Resource ID</label><input id="restore-virtual-resource-id" value="vm.local.resource"></div>
               <div class="field span-6"><label for="restore-virtual-point">Restore Point</label><input id="restore-virtual-point" value="before-maintenance"></div>
-              <div class="field span-4"><label for="restore-virtual-requested-by">Requested By</label><input id="restore-virtual-requested-by" value="dax"></div>
-              <div class="field span-8"><label for="restore-virtual-reason">Reason</label><input id="restore-virtual-reason" value="stage virtual restore after failed change"></div>
+              <div class="field span-3"><label for="restore-virtual-requested-by">Requested By</label><input id="restore-virtual-requested-by" value="dax"></div>
+              <div class="field span-3"><label for="restore-virtual-approved-by">Approved By</label><input id="restore-virtual-approved-by" value="sisko"></div>
+              <div class="field span-3"><label for="restore-virtual-executed-by">Executed By</label><input id="restore-virtual-executed-by" value="dax"></div>
+              <div class="field span-3"><label for="restore-virtual-provider">Provider</label><input id="restore-virtual-provider" value="local_fixture"></div>
+              <div class="field span-12"><label for="restore-virtual-reason">Reason</label><input id="restore-virtual-reason" value="stage virtual restore after failed change"></div>
             </div>
           </div>
           <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"], {fills: {id: (row) => claimFill(row.id), resource_id: (row) => resourceClaimFill(row.resource_id, row.owner_role || "dax")}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"], {fills: {id: (row) => cleanupFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Runtime Evidence", virtualEvidence.items || [], ["resource_id", "kind", "state", "ports", "active_claims", "snapshot_status", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Runtime Records", virtualOperations.runtime_records || virtualEvidence.runtime_records || [], ["resource_id", "kind", "state", "adapter", "ports", "next_step"], {fills: {resource_id: (row) => virtualRuntimeFill(row)}, fillView: "claims"})}</div>
-          <div class="panel span-6">${table("Virtual Snapshot Requests", virtualOperations.snapshot_requests || virtualEvidence.snapshot_requests || [], ["id", "resource_id", "status", "approval_required", "next_step"], {fills: {resource_id: (row) => virtualSnapshotFill(row)}, fillView: "claims"})}</div>
-          <div class="panel span-6">${table("Virtual Restore Requests", virtualOperations.restore_requests || virtualEvidence.restore_requests || [], ["id", "resource_id", "restore_point", "status", "approval_required"], {fills: {resource_id: (row) => virtualRestoreFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Virtual Snapshot Requests", virtualOperations.snapshot_requests || virtualEvidence.snapshot_requests || [], ["id", "resource_id", "status", "approved_by", "next_step"], {fills: {id: (row) => virtualSnapshotFill(row), resource_id: (row) => virtualSnapshotFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Virtual Restore Requests", virtualOperations.restore_requests || virtualEvidence.restore_requests || [], ["id", "resource_id", "restore_point", "status", "approved_by"], {fills: {id: (row) => virtualRestoreFill(row), resource_id: (row) => virtualRestoreFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Virtual Execution Records", virtualOperations.execution_records || [], ["id", "request_id", "resource_id", "action", "status", "provider", "manifest_path"])}</div>
           <div class="panel span-12">${table("Runtime Adapter Availability", virtualEvidence.runtime_adapters || [], ["adapter", "available", "status", "mutation_boundary"])}</div>
           <div class="panel span-6">${table("Port Pool Evidence", virtualEvidence.port_pool || [], ["port", "owner_count", "status", "owners"])}</div>
           <div class="panel span-6">${table("Virtual Cleanup Evidence", virtualEvidence.cleanup || [], ["claim_id", "resource_id", "status", "next_step"], {fills: {claim_id: (row) => cleanupFill({id: row.claim_id})}, fillView: "claims"})}</div>
@@ -2420,7 +2459,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "View VM leases and virtual claims", page: "Claims", owner: "Dax", action: "open Claims", source, query: "View VM leases and virtual claims"},
         {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
         {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},
+        {workflow: "Approve virtual snapshot request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-snapshot-request", source, query: "Approve virtual snapshot request"},
+        {workflow: "Execute virtual snapshot request", page: "Claims", owner: "Dax", action: "execute-virtual-snapshot-request", source, query: "Execute virtual snapshot request"},
         {workflow: "Stage virtual restore request", page: "Claims", owner: "Dax", action: "stage-virtual-restore-request", source, query: "Stage virtual restore request"},
+        {workflow: "Approve virtual restore request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-restore-request", source, query: "Approve virtual restore request"},
+        {workflow: "Execute virtual restore request", page: "Claims", owner: "Dax", action: "execute-virtual-restore-request", source, query: "Execute virtual restore request"},
         {workflow: "Request a VM, port, gateway, or device claim", page: "Claims", owner: "Dax", action: "request-claim", source, query: "Request a VM port gateway or device claim"},
         {workflow: "Approve a resource claim", page: "Claims", owner: "Sisko / Dax", action: "approve-claim", source, query: "Approve a resource claim"},
         {workflow: "Activate an approved claim", page: "Claims", owner: "Dax", action: "activate-claim", source, query: "Activate an approved claim"},
@@ -2704,18 +2747,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function virtualSnapshotFill(row) {
       return {
+        "snapshot-request-id": row?.id || "",
         "snapshot-resource-id": row?.resource_id || "",
         "snapshot-name": row?.snapshot_name || "",
         "snapshot-reason": row?.reason || row?.next_step || "stage virtual snapshot before maintenance",
+        "snapshot-approved-by": row?.approved_by || "sisko",
+        "snapshot-executed-by": row?.executed_by || "dax",
         "restore-virtual-resource-id": row?.resource_id || "",
         "restore-virtual-point": row?.snapshot_name || row?.id || ""
       };
     }
     function virtualRestoreFill(row) {
       return {
+        "restore-virtual-request-id": row?.id || "",
         "restore-virtual-resource-id": row?.resource_id || "",
         "restore-virtual-point": row?.restore_point || "",
-        "restore-virtual-reason": row?.reason || row?.next_step || "stage virtual restore after failed change"
+        "restore-virtual-reason": row?.reason || row?.next_step || "stage virtual restore after failed change",
+        "restore-virtual-approved-by": row?.approved_by || "sisko",
+        "restore-virtual-executed-by": row?.executed_by || "dax"
       };
     }
     function claimFill(claimId) {

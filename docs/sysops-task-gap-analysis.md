@@ -224,15 +224,17 @@ Gaps:
 
 Coverage: strong for checkout, conflict prevention, and staged lifecycle
 planning. Dax covers virtual claims, listener discovery, leases, release,
-cleanup, runtime state records, and staged snapshot/restore requests without
-mutating live virtual assets.
+cleanup, runtime state records, staged snapshot/restore requests, and
+approval-gated `local_fixture` snapshot/restore execution with manifests under
+`local-secrets`.
 
 Gaps:
 
 - No approved live adapter inventory with state, image, CPU, memory, disk,
   network, and owner gathered directly from Docker, Podman, virsh, QEMU, or
   emulator backends.
-- No approved live snapshot or restore execution runner.
+- No approved real-provider snapshot or restore runner for Docker, Podman,
+  libvirt/QEMU, VirtualBox, Android Emulator, Renode, or gateway/proxy backends.
 - No container image vulnerability/provenance panel.
 - No resource-capacity planning for CPU, memory, disk, and port pools.
 

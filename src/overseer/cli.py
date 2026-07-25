@@ -105,6 +105,16 @@ from .store import CURRENT_SCHEMA_VERSION, SQLiteStore, SchemaMigration
 from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
 from .usage_limits import LimitKind, UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 from .virtual_discovery import ListenerVirtualDiscoveryAdapter
+from .virtual_ops import (
+    approve_virtual_restore_request_status,
+    approve_virtual_snapshot_request_status,
+    execute_virtual_restore_request_status,
+    execute_virtual_snapshot_request_status,
+    record_virtual_runtime_status,
+    stage_virtual_restore_request_status,
+    stage_virtual_snapshot_request_status,
+    virtual_operations_status,
+)
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 
@@ -7339,8 +7349,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     physical_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     virtual_summary_parser = subparsers.add_parser("virtual-summary", help="summarize persisted virtual assets")
     virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    virtual_operations_parser = subparsers.add_parser("virtual-operations", help="summarize staged Dax virtual runtime operations")
+    virtual_operations_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
     discover_virtual_parser = subparsers.add_parser("discover-virtual-listeners", help="discover local TCP listeners as virtual assets")
     discover_virtual_parser.add_argument("--store", required=True, help="explicit SQLite store path for persisting discovered listener resources")
+    record_virtual_runtime_parser = subparsers.add_parser("record-virtual-runtime", help="record Dax virtual runtime state")
+    record_virtual_runtime_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    record_virtual_runtime_parser.add_argument("--resource-id", required=True)
+    record_virtual_runtime_parser.add_argument("--kind", default="vm")
+    record_virtual_runtime_parser.add_argument("--state", default="observed")
+    record_virtual_runtime_parser.add_argument("--adapter", default="manual")
+    record_virtual_runtime_parser.add_argument("--port", action="append", default=[], type=int)
+    record_virtual_runtime_parser.add_argument("--snapshot-hint", default="")
+    record_virtual_runtime_parser.add_argument("--notes", default="")
+    stage_virtual_snapshot_parser = subparsers.add_parser("stage-virtual-snapshot", help="stage a Dax virtual runtime snapshot request")
+    stage_virtual_snapshot_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    stage_virtual_snapshot_parser.add_argument("--resource-id", required=True)
+    stage_virtual_snapshot_parser.add_argument("--requested-by", default="dax")
+    stage_virtual_snapshot_parser.add_argument("--reason", default="stage virtual snapshot before maintenance")
+    stage_virtual_snapshot_parser.add_argument("--snapshot-name", default="")
+    approve_virtual_snapshot_parser = subparsers.add_parser("approve-virtual-snapshot", help="approve a staged Dax virtual runtime snapshot request")
+    approve_virtual_snapshot_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    approve_virtual_snapshot_parser.add_argument("--request-id", required=True)
+    approve_virtual_snapshot_parser.add_argument("--approved-by", default="sisko")
+    approve_virtual_snapshot_parser.add_argument("--approved-at")
+    execute_virtual_snapshot_parser = subparsers.add_parser("execute-virtual-snapshot", help="execute an approved Dax virtual runtime snapshot request")
+    execute_virtual_snapshot_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    execute_virtual_snapshot_parser.add_argument("--request-id", required=True)
+    execute_virtual_snapshot_parser.add_argument("--executed-by", default="dax")
+    execute_virtual_snapshot_parser.add_argument("--provider", default="local_fixture")
+    execute_virtual_snapshot_parser.add_argument("--executed-at")
+    stage_virtual_restore_parser = subparsers.add_parser("stage-virtual-restore", help="stage a Dax virtual runtime restore request")
+    stage_virtual_restore_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    stage_virtual_restore_parser.add_argument("--resource-id", required=True)
+    stage_virtual_restore_parser.add_argument("--restore-point", required=True)
+    stage_virtual_restore_parser.add_argument("--requested-by", default="dax")
+    stage_virtual_restore_parser.add_argument("--reason", default="stage virtual restore after failed change")
+    approve_virtual_restore_parser = subparsers.add_parser("approve-virtual-restore", help="approve a staged Dax virtual runtime restore request")
+    approve_virtual_restore_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    approve_virtual_restore_parser.add_argument("--request-id", required=True)
+    approve_virtual_restore_parser.add_argument("--approved-by", default="sisko")
+    approve_virtual_restore_parser.add_argument("--approved-at")
+    execute_virtual_restore_parser = subparsers.add_parser("execute-virtual-restore", help="execute an approved Dax virtual runtime restore request")
+    execute_virtual_restore_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    execute_virtual_restore_parser.add_argument("--request-id", required=True)
+    execute_virtual_restore_parser.add_argument("--executed-by", default="dax")
+    execute_virtual_restore_parser.add_argument("--provider", default="local_fixture")
+    execute_virtual_restore_parser.add_argument("--executed-at")
     stage_backup_cleanup_parser = subparsers.add_parser("stage-backup-cleanup", help="stage a Kira backup cleanup request")
     stage_backup_cleanup_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
     stage_backup_cleanup_parser.add_argument("--path", required=True)
@@ -7974,8 +8029,96 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(virtual_summary_status(args.store), sort_keys=True))
         return 0
 
+    if args.command == "virtual-operations":
+        print(json.dumps(virtual_operations_status(args.project_root), sort_keys=True))
+        return 0
+
     if args.command == "discover-virtual-listeners":
         print(json.dumps(discover_virtual_listeners_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "record-virtual-runtime":
+        print(
+            json.dumps(
+                record_virtual_runtime_status(
+                    args.project_root,
+                    args.resource_id,
+                    args.kind,
+                    args.state,
+                    args.adapter,
+                    args.port,
+                    args.snapshot_hint,
+                    args.notes,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "stage-virtual-snapshot":
+        print(
+            json.dumps(
+                stage_virtual_snapshot_request_status(
+                    args.project_root,
+                    args.resource_id,
+                    args.requested_by,
+                    args.reason,
+                    args.snapshot_name,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-virtual-snapshot":
+        print(
+            json.dumps(
+                approve_virtual_snapshot_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-virtual-snapshot":
+        print(
+            json.dumps(
+                execute_virtual_snapshot_request_status(args.project_root, args.request_id, args.executed_by, args.provider, args.executed_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "stage-virtual-restore":
+        print(
+            json.dumps(
+                stage_virtual_restore_request_status(
+                    args.project_root,
+                    args.resource_id,
+                    args.restore_point,
+                    args.requested_by,
+                    args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-virtual-restore":
+        print(
+            json.dumps(
+                approve_virtual_restore_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-virtual-restore":
+        print(
+            json.dumps(
+                execute_virtual_restore_request_status(args.project_root, args.request_id, args.executed_by, args.provider, args.executed_at),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "stage-backup-cleanup":

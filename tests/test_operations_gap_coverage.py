@@ -34,6 +34,10 @@ from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
 from overseer.virtual_evidence import virtual_evidence_status
 from overseer.virtual_ops import (
+    approve_virtual_restore_request_status,
+    approve_virtual_snapshot_request_status,
+    execute_virtual_restore_request_status,
+    execute_virtual_snapshot_request_status,
     record_virtual_runtime_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
@@ -462,6 +466,67 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertFalse(unapproved["host_mutation_performed"])
         self.assertEqual(blocked["status"], "blocked")
         self.assertIn("project-relative", blocked["summary"])
+
+    def test_virtual_snapshot_and_restore_execute_against_local_fixture_with_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "vm.fixture"
+            target.mkdir(parents=True)
+            (target / "state.txt").write_text("before\n", encoding="utf-8")
+            runtime = record_virtual_runtime_status(
+                root,
+                "vm.fixture",
+                kind="vm",
+                state="running",
+                adapter="local_fixture",
+                snapshot_hint="local-secrets/virtual-runtime-targets/vm.fixture",
+            )
+            staged_snapshot = stage_virtual_snapshot_request_status(root, "vm.fixture", snapshot_name="before-change")
+            approved_snapshot = approve_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "sisko")
+            snapshot = execute_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "dax")
+            (target / "state.txt").write_text("after\n", encoding="utf-8")
+            staged_restore = stage_virtual_restore_request_status(root, "vm.fixture", "before-change")
+            approved_restore = approve_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "sisko")
+            restore = execute_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "dax")
+            status = virtual_operations_status(root)
+            restored_text = (target / "state.txt").read_text(encoding="utf-8")
+            snapshot_manifest_exists = (root / snapshot["manifest"]["manifest_path"]).exists()
+            restore_manifest_exists = (root / restore["manifest"]["manifest_path"]).exists()
+
+        self.assertEqual(runtime["runtime_record"]["adapter"], "local_fixture")
+        self.assertEqual(approved_snapshot["snapshot_request"]["status"], "approved")
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(approved_restore["restore_request"]["status"], "approved")
+        self.assertEqual(restore["status"], "completed")
+        self.assertEqual(restored_text, "before\n")
+        self.assertTrue(snapshot_manifest_exists)
+        self.assertTrue(restore_manifest_exists)
+        self.assertEqual(status["execution_record_count"], 2)
+
+    def test_virtual_execution_blocks_unapproved_unsupported_or_unsafe_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "vm.fixture"
+            target.mkdir(parents=True)
+            (target / "state.txt").write_text("state\n", encoding="utf-8")
+            record_virtual_runtime_status(
+                root,
+                "vm.fixture",
+                kind="vm",
+                state="running",
+                adapter="local_fixture",
+                snapshot_hint="local-secrets/virtual-runtime-targets/vm.fixture",
+            )
+            staged = stage_virtual_snapshot_request_status(root, "vm.fixture", snapshot_name="blocked")
+            unapproved = execute_virtual_snapshot_request_status(root, staged["snapshot_request"]["id"], "dax")
+            staged_unsupported = stage_virtual_snapshot_request_status(root, "vm.fixture", snapshot_name="unsupported")
+            approve_virtual_snapshot_request_status(root, staged_unsupported["snapshot_request"]["id"], "sisko")
+            unsupported = execute_virtual_snapshot_request_status(root, staged_unsupported["snapshot_request"]["id"], "dax", provider="libvirt")
+
+        self.assertEqual(unapproved["status"], "blocked")
+        self.assertFalse(unapproved["host_mutation_performed"])
+        self.assertEqual(unsupported["status"], "blocked")
+        self.assertIn("not implemented", unsupported["summary"])
 
     def test_virtual_evidence_detects_port_conflicts_and_cleanup_candidates(self):
         with tempfile.TemporaryDirectory() as directory:

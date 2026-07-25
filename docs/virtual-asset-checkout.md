@@ -134,7 +134,11 @@ Protected gateway routes:
 - `GET /Overseer/virtual/operations`
 - `POST /Overseer/virtual/runtime-records`
 - `POST /Overseer/virtual/snapshot-requests`
+- `POST /Overseer/virtual/snapshot-requests/approve`
+- `POST /Overseer/virtual/snapshot-requests/execute`
 - `POST /Overseer/virtual/restore-requests`
+- `POST /Overseer/virtual/restore-requests/approve`
+- `POST /Overseer/virtual/restore-requests/execute`
 
 Operator controls live on the Claims page:
 
@@ -143,7 +147,26 @@ Operator controls live on the Claims page:
 - Virtual Snapshot Request stages a snapshot plan and waits for approval.
 - Virtual Restore Request stages a rollback plan and waits for approval.
 
-These routes do not start, stop, pause, snapshot, restore, destroy, reconfigure,
-or expose a VM, container, emulator, gateway, proxy, or tunnel. Live adapter
-execution remains approval-bound and must preserve checkout, security, health,
-and rollback evidence before mutation.
+Snapshot and restore execution is implemented first through the conservative
+`local_fixture` adapter. It only operates on project-relative targets under
+`local-secrets/virtual-runtime-targets` and writes manifests under
+`local-secrets/virtual-runtime-manifests`. This lets Dax exercise the full
+approval and rollback lifecycle in regression without touching real hypervisor,
+container, emulator, gateway, proxy, or tunnel state.
+
+CLI:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli record-virtual-runtime --project-root . --resource-id vm.fixture --adapter local_fixture --snapshot-hint local-secrets/virtual-runtime-targets/vm.fixture
+PYTHONPATH=src python3 -m overseer.cli stage-virtual-snapshot --project-root . --resource-id vm.fixture --snapshot-name before-change
+PYTHONPATH=src python3 -m overseer.cli approve-virtual-snapshot --project-root . --request-id virtual-snapshot.vm.fixture --approved-by sisko
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-snapshot --project-root . --request-id virtual-snapshot.vm.fixture
+PYTHONPATH=src python3 -m overseer.cli stage-virtual-restore --project-root . --resource-id vm.fixture --restore-point before-change
+PYTHONPATH=src python3 -m overseer.cli approve-virtual-restore --project-root . --request-id virtual-restore.vm.fixture --approved-by sisko
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-restore --project-root . --request-id virtual-restore.vm.fixture
+```
+
+Docker, Podman, libvirt/QEMU, VirtualBox, Android Emulator, Renode, and gateway
+provider adapters remain explicit live-provider work. Until one of those
+providers is implemented and selected for a declared disposable target,
+execution returns a blocked record rather than mutating the host.

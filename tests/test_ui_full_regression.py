@@ -143,6 +143,8 @@ ACTION_ROUTES = {
     "approve-claim": ("POST", "/claims/approve"),
     "approve-claim-cleanup": ("POST", "/claims/cleanup-requests/approve"),
     "approve-policy-warning": ("POST", "/admin/policy-warning-requests/approve"),
+    "approve-virtual-restore-request": ("POST", "/virtual/restore-requests/approve"),
+    "approve-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/approve"),
     "archive-admin-history": ("POST", "/admin/history-archive"),
     "build-policy-profile": ("POST", "/admin/policy-customization-helper/profile"),
     "cancel-admin-change": ("POST", "/admin/cancel"),
@@ -162,6 +164,8 @@ ACTION_ROUTES = {
     "execute-admin-change": ("POST", "/admin/execute"),
     "execute-backup-cleanup-request": ("POST", "/storage/cleanup-requests/execute"),
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
+    "execute-virtual-restore-request": ("POST", "/virtual/restore-requests/execute"),
+    "execute-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/execute"),
     "export-ids-review-prompt": ("POST", "/host/security/ids-review-packages/prompts"),
     "inspect-host": ("POST", "/host/inspect"),
     "plan-admin-change": ("POST", "/admin/plans"),
@@ -289,9 +293,9 @@ SAFE_POST_PAYLOADS = {
         "resource_id": "vm.ui.full",
         "kind": "container",
         "state": "running",
-        "adapter": "manual",
+        "adapter": "local_fixture",
         "ports": [8080],
-        "snapshot_hint": "snapshots/vm.ui.full.before",
+        "snapshot_hint": "local-secrets/virtual-runtime-targets/vm.ui.full",
         "notes": "exercise disposable virtual runtime workflow",
     },
     "/virtual/snapshot-requests": {
@@ -300,11 +304,29 @@ SAFE_POST_PAYLOADS = {
         "requested_by": "dax",
         "reason": "exercise disposable virtual snapshot staging workflow",
     },
+    "/virtual/snapshot-requests/approve": {
+        "request_id": "virtual-snapshot.vm.ui.full",
+        "approved_by": "sisko",
+    },
+    "/virtual/snapshot-requests/execute": {
+        "request_id": "virtual-snapshot.vm.ui.full",
+        "executed_by": "dax",
+        "provider": "local_fixture",
+    },
     "/virtual/restore-requests": {
         "resource_id": "vm.ui.full",
-        "restore_point": "snapshots/vm.ui.full.before",
+        "restore_point": "before-ui-full-regression",
         "requested_by": "dax",
         "reason": "exercise disposable virtual restore staging workflow",
+    },
+    "/virtual/restore-requests/approve": {
+        "request_id": "virtual-restore.vm.ui.full",
+        "approved_by": "sisko",
+    },
+    "/virtual/restore-requests/execute": {
+        "request_id": "virtual-restore.vm.ui.full",
+        "executed_by": "dax",
+        "provider": "local_fixture",
     },
     "/identity/rotation-requests": {
         "subject": "local-secrets/test-token",
@@ -738,7 +760,11 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "View logs from an unhealthy service",
             "Record virtual runtime state",
             "Stage virtual snapshot request",
+            "Approve virtual snapshot request",
+            "Execute virtual snapshot request",
             "Stage virtual restore request",
+            "Approve virtual restore request",
+            "Execute virtual restore request",
             "Stage system journal access request",
             "Capture metric history snapshot",
             "Check an exhausted limit refresh",
@@ -766,6 +792,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             cleanup_target = Path(directory) / "artifacts" / "ui-cleanup"
             cleanup_target.mkdir(parents=True)
             (cleanup_target / "old-result.txt").write_text("generated result", encoding="utf-8")
+            virtual_target = Path(directory) / "local-secrets" / "virtual-runtime-targets" / "vm.ui.full"
+            virtual_target.mkdir(parents=True)
+            (virtual_target / "state.txt").write_text("before\n", encoding="utf-8")
             store_path = Path(directory) / "state" / "overseer.sqlite3"
             store_path.parent.mkdir(parents=True)
             with LocalApiHarness(store_path) as server:
@@ -808,9 +837,26 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                     "/Overseer/virtual/snapshot-requests",
                     SAFE_POST_PAYLOADS["/virtual/snapshot-requests"],
                 )
+                virtual_snapshot_approval = server.post_json(
+                    "/Overseer/virtual/snapshot-requests/approve",
+                    SAFE_POST_PAYLOADS["/virtual/snapshot-requests/approve"],
+                )
+                virtual_snapshot_execution = server.post_json(
+                    "/Overseer/virtual/snapshot-requests/execute",
+                    SAFE_POST_PAYLOADS["/virtual/snapshot-requests/execute"],
+                )
+                (virtual_target / "state.txt").write_text("after\n", encoding="utf-8")
                 virtual_restore = server.post_json(
                     "/Overseer/virtual/restore-requests",
                     SAFE_POST_PAYLOADS["/virtual/restore-requests"],
+                )
+                virtual_restore_approval = server.post_json(
+                    "/Overseer/virtual/restore-requests/approve",
+                    SAFE_POST_PAYLOADS["/virtual/restore-requests/approve"],
+                )
+                virtual_restore_execution = server.post_json(
+                    "/Overseer/virtual/restore-requests/execute",
+                    SAFE_POST_PAYLOADS["/virtual/restore-requests/execute"],
                 )
                 identity_rotation = server.post_json(
                     "/Overseer/identity/rotation-requests",
@@ -857,6 +903,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 approvals = server.get_json("/Overseer/approvals-summary")
                 root_notes = server.get_json("/Overseer/documents/notes?folder=Overseer")
                 runbook_notes = server.get_json("/Overseer/documents/notes?folder=Overseer%2FRunbooks")
+                virtual_restored_text = (virtual_target / "state.txt").read_text(encoding="utf-8")
 
         self.assertTrue(resource["mutation_performed"])
         self.assertEqual(claim["claim"], "claim.ui.full")
@@ -876,7 +923,12 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertFalse(cleanup_target.exists())
         self.assertEqual(virtual_runtime["runtime_record"]["resource_id"], "vm.ui.full")
         self.assertEqual(virtual_snapshot["snapshot_request"]["status"], "waiting_approval")
+        self.assertEqual(virtual_snapshot_approval["snapshot_request"]["status"], "approved")
+        self.assertEqual(virtual_snapshot_execution["status"], "completed")
         self.assertEqual(virtual_restore["restore_request"]["status"], "waiting_approval")
+        self.assertEqual(virtual_restore_approval["restore_request"]["status"], "approved")
+        self.assertEqual(virtual_restore_execution["status"], "completed")
+        self.assertEqual(virtual_restored_text, "before\n")
         self.assertFalse(virtual_restore["host_mutation_performed"])
         self.assertEqual(identity_rotation["request"]["status"], "waiting_approval")
         self.assertFalse(identity_rotation["host_mutation_performed"])

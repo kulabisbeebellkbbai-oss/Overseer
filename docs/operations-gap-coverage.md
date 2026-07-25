@@ -105,8 +105,9 @@ The third pass added read-only evidence depth for the remaining gap categories:
   Exceptions, Desired State Baselines, Desired State Drift, Local Secret Guards,
   Compliance Evidence Matrix, Maintenance Schedule, and Maintenance Schedules.
 - Assets: Storage And Backup, Mount Health, SMART Health, Backup Markers,
-  Backup Jobs, Restore Tests, Backup Cleanup Requests, Storage Cleanup
-  Candidates, Capacity Summary, and Physical Lifecycle.
+  Backup Jobs, Restore Tests, Backup Cleanup Requests, approved cleanup
+  execution with local manifests, Storage Cleanup Candidates, Capacity
+  Summary, and Physical Lifecycle.
 - Claims: Virtual Runtime Evidence, Virtual Runtime Records, Virtual Snapshot
   Requests, Virtual Restore Requests, Port Pool Evidence, Virtual Cleanup
   Evidence, Runtime Adapter Availability, and Virtual Runtime Inventory.

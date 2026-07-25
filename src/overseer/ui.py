@@ -916,6 +916,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "record-backup-job") return await recordBackupJob();
       if (action === "record-restore-test") return await recordRestoreTest();
       if (action === "stage-backup-cleanup-request") return await stageBackupCleanupRequest();
+      if (action === "approve-backup-cleanup-request") return await approveBackupCleanupRequest();
+      if (action === "execute-backup-cleanup-request") return await executeBackupCleanupRequest();
       if (action === "register-resource") return await registerResource();
       if (action === "request-claim") return await requestClaim();
       if (action === "approve-claim") return await approveClaim();
@@ -1012,6 +1014,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         path: value("backup-cleanup-path"),
         requested_by: value("backup-cleanup-requested-by") || "kira",
         reason: value("backup-cleanup-reason") || "review generated storage cleanup candidate"
+      });
+    }
+    async function approveBackupCleanupRequest() {
+      return await postJson("/storage/cleanup-requests/approve", {
+        request_id: value("backup-cleanup-request-id"),
+        approved_by: value("backup-cleanup-approved-by") || "kira"
+      });
+    }
+    async function executeBackupCleanupRequest() {
+      return await postJson("/storage/cleanup-requests/execute", {
+        request_id: value("backup-cleanup-request-id"),
+        executed_by: value("backup-cleanup-executed-by") || "kira"
       });
     }
     async function recordVirtualRuntime() {
@@ -1823,10 +1837,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>Backup Cleanup Request</h3><button class="action-btn" data-action="stage-backup-cleanup-request">Stage Request</button></div>
+            <div class="toolbar"><h3>Backup Cleanup Request</h3><div class="actions"><button class="action-btn" data-action="stage-backup-cleanup-request">Stage</button><button class="action-btn" data-action="approve-backup-cleanup-request">Approve</button><button class="action-btn" data-action="execute-backup-cleanup-request">Execute</button></div></div>
             <div class="form-grid">
+              <div class="field span-6"><label for="backup-cleanup-request-id">Request ID</label><input id="backup-cleanup-request-id"></div>
               <div class="field span-6"><label for="backup-cleanup-path">Path</label><input id="backup-cleanup-path" value="artifacts"></div>
               <div class="field span-3"><label for="backup-cleanup-requested-by">Requested By</label><input id="backup-cleanup-requested-by" value="kira"></div>
+              <div class="field span-3"><label for="backup-cleanup-approved-by">Approved By</label><input id="backup-cleanup-approved-by" value="kira"></div>
+              <div class="field span-3"><label for="backup-cleanup-executed-by">Executed By</label><input id="backup-cleanup-executed-by" value="kira"></div>
               <div class="field span-12"><label for="backup-cleanup-reason">Reason</label><input id="backup-cleanup-reason" value="review generated storage cleanup candidate"></div>
             </div>
           </div>
@@ -2398,6 +2415,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Record a backup job", page: "Assets", owner: "Kira", action: "record-backup-job", source, query: "Record a backup job"},
         {workflow: "Record a restore test", page: "Assets", owner: "Kira", action: "record-restore-test", source, query: "Record a restore test"},
         {workflow: "Stage backup cleanup request", page: "Assets", owner: "Kira", action: "stage-backup-cleanup-request", source, query: "Stage backup cleanup request"},
+        {workflow: "Approve backup cleanup request", page: "Assets", owner: "Kira", action: "approve-backup-cleanup-request", source, query: "Approve backup cleanup request"},
+        {workflow: "Execute backup cleanup request", page: "Assets", owner: "Kira", action: "execute-backup-cleanup-request", source, query: "Execute backup cleanup request"},
         {workflow: "View VM leases and virtual claims", page: "Claims", owner: "Dax", action: "open Claims", source, query: "View VM leases and virtual claims"},
         {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
         {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},
@@ -2663,8 +2682,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function backupCleanupFill(row) {
       return {
+        "backup-cleanup-request-id": row?.id || "",
         "backup-cleanup-path": row?.path || "",
-        "backup-cleanup-reason": row?.next_step || "review generated storage cleanup candidate"
+        "backup-cleanup-reason": row?.reason || row?.next_step || "review generated storage cleanup candidate",
+        "backup-cleanup-approved-by": row?.approved_by || "kira",
+        "backup-cleanup-executed-by": row?.executed_by || "kira"
       };
     }
     function virtualRuntimeFill(row) {

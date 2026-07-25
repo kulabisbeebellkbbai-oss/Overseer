@@ -323,8 +323,35 @@ blackouts, rollback expectations, and validation requirements.
 2. Review Storage Cleanup Candidates and Backup Cleanup Requests.
 3. Fill Path, Requested By, and Reason.
 4. Click Stage Request.
-5. Wait for human approval before deleting backup, restore, generated, or
-   storage-related files.
+5. Review the generated Request ID and path before approval.
+
+### Approve Backup Cleanup Request
+
+1. Open Assets.
+2. Review Backup Cleanup Requests.
+3. Click the request row to fill Request ID and path details.
+4. Confirm the target is project-relative and limited to generated artifacts or
+   backups.
+5. Fill Approved By.
+6. Click Approve.
+
+### Execute Backup Cleanup Request
+
+1. Open Assets.
+2. Review the approved Backup Cleanup Request.
+3. Confirm the target is inside `artifacts/` or `backups/`.
+4. Fill Executed By.
+5. Click Execute.
+6. Review Backup Cleanup Requests afterward for completed, blocked, or failed
+   status and the generated cleanup manifest path.
+
+CLI equivalent:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli stage-backup-cleanup --project-root . --path artifacts/old-run --requested-by kira
+PYTHONPATH=src python3 -m overseer.cli approve-backup-cleanup --project-root . --request-id backup-cleanup.artifacts-old-run --approved-by kira
+PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . --request-id backup-cleanup.artifacts-old-run --executed-by kira
+```
 
 ## Claims: Dax
 

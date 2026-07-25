@@ -51,6 +51,8 @@ EXPECTED_VIEWS = {
             "record-backup-job",
             "record-restore-test",
             "stage-backup-cleanup-request",
+            "approve-backup-cleanup-request",
+            "execute-backup-cleanup-request",
             "send-crew-message",
         },
         "officers": {"Kira", "Dax"},
@@ -137,6 +139,7 @@ ACTION_ROUTES = {
     "approve-admin-archive": ("POST", "/admin/history-archive-requests/approve"),
     "approve-admin-change": ("POST", "/admin/approve"),
     "approve-admin-restore": ("POST", "/admin/history-restore-requests/approve"),
+    "approve-backup-cleanup-request": ("POST", "/storage/cleanup-requests/approve"),
     "approve-claim": ("POST", "/claims/approve"),
     "approve-claim-cleanup": ("POST", "/claims/cleanup-requests/approve"),
     "approve-policy-warning": ("POST", "/admin/policy-warning-requests/approve"),
@@ -157,6 +160,7 @@ ACTION_ROUTES = {
     "documents-search": ("POST", "/documents/search"),
     "documents-write-note": ("POST", "/documents/notes"),
     "execute-admin-change": ("POST", "/admin/execute"),
+    "execute-backup-cleanup-request": ("POST", "/storage/cleanup-requests/execute"),
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
     "export-ids-review-prompt": ("POST", "/host/security/ids-review-packages/prompts"),
     "inspect-host": ("POST", "/host/inspect"),
@@ -269,9 +273,17 @@ SAFE_POST_PAYLOADS = {
         "validated_by": "kira",
     },
     "/storage/cleanup-requests": {
-        "path": "artifacts",
+        "path": "artifacts/ui-cleanup",
         "requested_by": "kira",
         "reason": "exercise disposable backup cleanup request workflow",
+    },
+    "/storage/cleanup-requests/approve": {
+        "request_id": "backup-cleanup.artifacts-ui-cleanup",
+        "approved_by": "kira",
+    },
+    "/storage/cleanup-requests/execute": {
+        "request_id": "backup-cleanup.artifacts-ui-cleanup",
+        "executed_by": "kira",
     },
     "/virtual/runtime-records": {
         "resource_id": "vm.ui.full",
@@ -488,6 +500,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "advisory-source",
             "backup-cleanup-path",
             "backup-cleanup-reason",
+            "backup-cleanup-request-id",
+            "backup-cleanup-approved-by",
+            "backup-cleanup-executed-by",
             "backup-cleanup-requested-by",
             "backup-job-id",
             "backup-notes",
@@ -748,7 +763,12 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
 
     def test_safe_disposable_workflows_execute_through_gateway_routes(self):
         with tempfile.TemporaryDirectory() as directory:
-            with LocalApiHarness(Path(directory) / "overseer.sqlite3") as server:
+            cleanup_target = Path(directory) / "artifacts" / "ui-cleanup"
+            cleanup_target.mkdir(parents=True)
+            (cleanup_target / "old-result.txt").write_text("generated result", encoding="utf-8")
+            store_path = Path(directory) / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir(parents=True)
+            with LocalApiHarness(store_path) as server:
                 resource = server.post_json("/Overseer/resources", SAFE_POST_PAYLOADS["/resources"])
                 claim = server.post_json("/Overseer/claims/request", SAFE_POST_PAYLOADS["/claims/request"])
                 usage_limit = server.post_json("/Overseer/usage-limits", SAFE_POST_PAYLOADS["/usage-limits"])
@@ -771,6 +791,14 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 backup_cleanup = server.post_json(
                     "/Overseer/storage/cleanup-requests",
                     SAFE_POST_PAYLOADS["/storage/cleanup-requests"],
+                )
+                backup_cleanup_approval = server.post_json(
+                    "/Overseer/storage/cleanup-requests/approve",
+                    SAFE_POST_PAYLOADS["/storage/cleanup-requests/approve"],
+                )
+                backup_cleanup_execution = server.post_json(
+                    "/Overseer/storage/cleanup-requests/execute",
+                    SAFE_POST_PAYLOADS["/storage/cleanup-requests/execute"],
                 )
                 virtual_runtime = server.post_json(
                     "/Overseer/virtual/runtime-records",
@@ -843,6 +871,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertEqual(restore_test["restore_test"]["id"], "restore.ui.full")
         self.assertEqual(backup_cleanup["cleanup_request"]["status"], "waiting_approval")
         self.assertFalse(backup_cleanup["host_mutation_performed"])
+        self.assertEqual(backup_cleanup_approval["cleanup_request"]["status"], "approved")
+        self.assertEqual(backup_cleanup_execution["status"], "completed")
+        self.assertFalse(cleanup_target.exists())
         self.assertEqual(virtual_runtime["runtime_record"]["resource_id"], "vm.ui.full")
         self.assertEqual(virtual_snapshot["snapshot_request"]["status"], "waiting_approval")
         self.assertEqual(virtual_restore["restore_request"]["status"], "waiting_approval")

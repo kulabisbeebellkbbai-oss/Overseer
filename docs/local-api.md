@@ -187,6 +187,8 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /virtual/runtime-records` records observed virtual runtime state for a VM, container, emulator, gateway, or proxy. It does not start, stop, snapshot, restore, destroy, or reconfigure the runtime.
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. It does not invoke any live virtual adapter.
 `POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. It does not invoke any live virtual adapter.
+`POST /storage/cleanup-requests/approve` approves a staged Kira backup cleanup request without deleting files.
+`POST /storage/cleanup-requests/execute` executes only an approved Kira cleanup request for project-relative `artifacts/` or `backups/` paths, writes a local cleanup manifest, and blocks unsafe absolute, traversal, missing, or unapproved targets.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `POST /maintenance/package-maintenance-cycle` runs the approved O'Brien apt maintenance cycle: stage and execute package metadata refresh, inspect refreshed package updates, stage upgrades, advance Sisko-level approvals, execute plans that pass policy, and persist command, verification, rollback, audit, blocked, or failed evidence.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.

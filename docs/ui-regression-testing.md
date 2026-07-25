@@ -184,7 +184,7 @@ After fixing a UI auth issue:
 Last local packaged run:
 
 ```text
-artifacts/regression/full-regression-20260725T080737Z.json
+artifacts/regression/full-regression-20260725T151023Z.json
 ```
 
 Result:

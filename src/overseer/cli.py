@@ -55,6 +55,7 @@ from .documents import (
 )
 from .git import git_status_status
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
+from .backup_ops import approve_backup_cleanup_request_status, execute_backup_cleanup_request_status, stage_backup_cleanup_request_status
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import (
     HostFindingSeverity,
@@ -7340,6 +7341,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     discover_virtual_parser = subparsers.add_parser("discover-virtual-listeners", help="discover local TCP listeners as virtual assets")
     discover_virtual_parser.add_argument("--store", required=True, help="explicit SQLite store path for persisting discovered listener resources")
+    stage_backup_cleanup_parser = subparsers.add_parser("stage-backup-cleanup", help="stage a Kira backup cleanup request")
+    stage_backup_cleanup_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    stage_backup_cleanup_parser.add_argument("--path", required=True)
+    stage_backup_cleanup_parser.add_argument("--requested-by", default="kira")
+    stage_backup_cleanup_parser.add_argument("--reason", default="review generated storage cleanup candidate")
+    approve_backup_cleanup_parser = subparsers.add_parser("approve-backup-cleanup", help="approve a staged Kira backup cleanup request")
+    approve_backup_cleanup_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    approve_backup_cleanup_parser.add_argument("--request-id", required=True)
+    approve_backup_cleanup_parser.add_argument("--approved-by", default="kira")
+    approve_backup_cleanup_parser.add_argument("--approved-at")
+    execute_backup_cleanup_parser = subparsers.add_parser("execute-backup-cleanup", help="execute an approved Kira backup cleanup request")
+    execute_backup_cleanup_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    execute_backup_cleanup_parser.add_argument("--request-id", required=True)
+    execute_backup_cleanup_parser.add_argument("--executed-by", default="kira")
+    execute_backup_cleanup_parser.add_argument("--executed-at")
     command_summary_parser = subparsers.add_parser("command-summary", help="summarize command-level Overseer state")
     command_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     command_summary_parser.add_argument("--service-name", default="overseer")
@@ -7960,6 +7976,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "discover-virtual-listeners":
         print(json.dumps(discover_virtual_listeners_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "stage-backup-cleanup":
+        print(
+            json.dumps(
+                stage_backup_cleanup_request_status(args.project_root, args.path, args.requested_by, args.reason),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-backup-cleanup":
+        print(
+            json.dumps(
+                approve_backup_cleanup_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-backup-cleanup":
+        print(
+            json.dumps(
+                execute_backup_cleanup_request_status(args.project_root, args.request_id, args.executed_by, args.executed_at),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "command-summary":

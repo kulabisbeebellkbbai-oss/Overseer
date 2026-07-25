@@ -4,7 +4,14 @@ import unittest
 from pathlib import Path
 
 from overseer.advisories import advisory_status, refresh_advisories_status
-from overseer.backup_ops import backup_operations_status, record_backup_job_status, record_restore_test_status, stage_backup_cleanup_request_status
+from overseer.backup_ops import (
+    approve_backup_cleanup_request_status,
+    backup_operations_status,
+    execute_backup_cleanup_request_status,
+    record_backup_job_status,
+    record_restore_test_status,
+    stage_backup_cleanup_request_status,
+)
 from overseer.compliance_evidence import compliance_evidence_status
 from overseer.core import Claim, ClaimStatus, ClaimType, OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 from overseer.documentation_evidence import documentation_evidence_status
@@ -421,6 +428,40 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(status["restore_test_count"], 1)
         self.assertEqual(evidence["backup_jobs"][0]["id"], "backup.test")
         self.assertFalse(cleanup["host_mutation_performed"])
+
+    def test_approved_backup_cleanup_deletes_project_artifact_with_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "artifacts" / "cleanup-test"
+            target.mkdir(parents=True)
+            (target / "old-result.txt").write_text("old generated result", encoding="utf-8")
+            staged = stage_backup_cleanup_request_status(root, "artifacts/cleanup-test")
+            approved = approve_backup_cleanup_request_status(root, staged["cleanup_request"]["id"], "kira")
+            executed = execute_backup_cleanup_request_status(root, staged["cleanup_request"]["id"], "kira")
+            status = backup_operations_status(root)
+            manifest_exists = (root / executed["manifest"]["manifest_path"]).exists()
+
+            self.assertEqual(approved["cleanup_request"]["status"], "approved")
+            self.assertEqual(executed["status"], "completed")
+            self.assertTrue(executed["host_mutation_performed"])
+            self.assertFalse(target.exists())
+            self.assertTrue(manifest_exists)
+            self.assertEqual(status["cleanup_requests"][0]["status"], "completed")
+
+    def test_backup_cleanup_execution_blocks_unapproved_or_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "artifacts" / "cleanup-test").mkdir(parents=True)
+            staged = stage_backup_cleanup_request_status(root, "artifacts/cleanup-test")
+            unapproved = execute_backup_cleanup_request_status(root, staged["cleanup_request"]["id"], "kira")
+            unsafe = stage_backup_cleanup_request_status(root, "../outside")
+            approve_backup_cleanup_request_status(root, unsafe["cleanup_request"]["id"], "kira")
+            blocked = execute_backup_cleanup_request_status(root, unsafe["cleanup_request"]["id"], "kira")
+
+        self.assertEqual(unapproved["status"], "blocked")
+        self.assertFalse(unapproved["host_mutation_performed"])
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("project-relative", blocked["summary"])
 
     def test_virtual_evidence_detects_port_conflicts_and_cleanup_candidates(self):
         with tempfile.TemporaryDirectory() as directory:

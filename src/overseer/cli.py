@@ -33,9 +33,11 @@ from .admin import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
+    plan_npm_global_install,
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
@@ -51,6 +53,7 @@ from .documents import (
     documents_search_status,
     documents_write_note_status,
 )
+from .git import git_status_status
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import (
@@ -880,7 +883,7 @@ def plan_package_updates_status(
             "missing_packages": missing_names,
             "mutation_performed": True,
             "host_mutation_performed": False,
-            "next_step": "request approval for staged package update plans before execution",
+            "next_step": "dispatch O'Brien to advance staged package maintenance through allowed gates",
         }
     finally:
         store.close()
@@ -1076,7 +1079,13 @@ def health_failure_status(summary) -> dict[str, object]:
     }
 
 
-def operator_dashboard_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+def operator_dashboard_status(
+    store_path: str | Path,
+    service_name: str = "overseer",
+    include_summaries: bool = True,
+) -> dict[str, object]:
+    if not include_summaries:
+        return operator_dashboard_compact_status(store_path, service_name)
     command = command_summary_status(store_path, service_name)
     admin = admin_summary_status(store_path)
     admin_history = admin_history_review_status(store_path)
@@ -1090,7 +1099,7 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
     crew_messages = crew_messages_status(store_path)
     attention = operator_dashboard_attention(command, admin, admin_history, physical, virtual, maintenance, security, usage, health_efficiency)
     crew_by_owner = crew_messages["by_owner_domain"]
-    return {
+    payload = {
         "store": command["store"],
         "service_name": service_name,
         "overall_status": operator_dashboard_overall_status(attention),
@@ -1153,7 +1162,9 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
                 "blocked_dispatches": crew_by_owner["julian"]["blocked_dispatches"],
             },
         },
-        "summaries": {
+    }
+    if include_summaries:
+        payload["summaries"] = {
             "command": command,
             "admin": admin,
             "admin_history": admin_history,
@@ -1164,8 +1175,185 @@ def operator_dashboard_status(store_path: str | Path, service_name: str = "overs
             "usage": usage,
             "health": health,
             "health_efficiency": health_efficiency,
-        },
-    }
+        }
+    return payload
+
+
+def operator_dashboard_compact_status(store_path: str | Path, service_name: str = "overseer") -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        resources = store.list_resources()
+        claims = store.list_claims()
+        approvals = store.list_approvals()
+        audit_events = store.list_audit_events()
+        usage_limits = store.list_usage_limits()
+        physical_identities = store.list_physical_identities()
+        health_summaries = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
+        admin_plans = active_admin_change_plans(store.list_admin_change_plans())
+        admin_executions = store.list_admin_executions()
+        heartbeats = store.list_runtime_heartbeats()
+        crew_messages = store.list_crew_messages()
+        ids_packages = store.list_host_security_ids_review_packages()
+        latest_snapshot = store.load_latest_host_snapshot()
+        host_security = host_security_status(latest_snapshot) if latest_snapshot else {"high_findings": 0, "warning_findings": 0}
+        heartbeat = next((item for item in heartbeats if item.service_name == service_name), None)
+        freshness = assess_freshness(heartbeat.last_tick_at if heartbeat else None, policy=DEFAULT_RUNTIME_FRESHNESS_POLICY)
+        alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
+        pending_approvals = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
+        pending_admin_plans = [
+            plan
+            for plan in admin_plans
+            if plan.requires_explicit_approval() and not plan.approved and not plan.canceled
+        ]
+        maintenance_plans = [
+            plan
+            for plan in admin_plans
+            if plan.owner_domain == OwnerDomain.OBRIEN
+            or plan.kind
+            in {
+                AdminChangeKind.USER_SERVICE_RESTART,
+                AdminChangeKind.APT_INSTALL,
+                AdminChangeKind.APT_UPDATE,
+                AdminChangeKind.APT_UPGRADE,
+                AdminChangeKind.FLATPAK_INSTALL,
+                AdminChangeKind.NPM_GLOBAL_INSTALL,
+            }
+        ]
+        protective_plans = [
+            plan
+            for plan in admin_plans
+            if plan.owner_domain == OwnerDomain.ODO
+            or plan.kind in {AdminChangeKind.BLOCK_IP, AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP}
+        ]
+        admin_history = _compact_admin_history(admin_plans, admin_executions)
+        health_failures = [
+            summary
+            for summary in health_summaries
+            if summary.latest_status in {HealthStatus.DEGRADED, HealthStatus.FAILED, HealthStatus.UNKNOWN}
+        ]
+        virtual_claims = [
+            claim
+            for claim in claims
+            if claim.is_active_like()
+            and any(resource.id == claim.resource_id and resource.type == ResourceType.VIRTUAL_ASSET for resource in resources)
+        ]
+        ids_summary = _host_security_ids_review_summary_payload(Path(store.path), ids_packages, audit_events, protective_plans)
+        crew_by_owner = crew_message_counts_by_owner(crew_messages, audit_events)
+        dispatch_history = crew_dispatch_history(audit_events)
+        crew_summary = {
+            "total": len(crew_messages),
+            "open": sum(1 for message in crew_messages if message.status == CrewMessageStatus.OPEN),
+            "acknowledged": sum(1 for message in crew_messages if message.status == CrewMessageStatus.ACKNOWLEDGED),
+            "closed": sum(1 for message in crew_messages if message.status == CrewMessageStatus.CLOSED),
+            "blocked_dispatches": len([item for item in dispatch_history if item["event_type"] == AuditEventType.BLOCKED.value]),
+        }
+        usage_reset_times = sorted(limit.resets_at for limit in usage_limits if limit.resets_at)
+        attention = {
+            "service_freshness": freshness.status.value,
+            "pending_authorizations": len(pending_admin_plans),
+            "pending_restore_approvals": sum(1 for approval in pending_approvals if approval.subject_id.startswith("admin.restore.")),
+            "pending_claim_approvals": len(pending_approvals),
+            "queued_claims": sum(1 for claim in claims if claim.status == ClaimStatus.QUEUED),
+            "blocked_claims": sum(1 for claim in claims if claim.status == ClaimStatus.BLOCKED),
+            "admin_archive_candidates": admin_history["archive_candidates"],
+            "unhealthy_health_targets": len(health_failures),
+            "recovery_required": sum(1 for summary in health_failures if summary.recovery_required),
+            "latest_failures": len(health_failures),
+            "exhausted_usage_limits": sum(1 for limit in usage_limits if limit.is_exhausted()),
+            "low_confidence_usage_limits": sum(1 for limit in usage_limits if limit.confidence < 0.5),
+            "physical_power_risk": sum(1 for identity in physical_identities if identity.has_power_risk()),
+            "physical_storage_risk": sum(1 for identity in physical_identities if identity.has_storage_risk()),
+            "virtual_active_claims": len(virtual_claims),
+            "virtual_queued_claims": sum(1 for claim in claims if claim.status == ClaimStatus.QUEUED),
+            "maintenance_pending_authorizations": sum(1 for plan in maintenance_plans if plan.requires_explicit_approval() and not plan.approved and not plan.canceled),
+            "security_alerts": len(alerts),
+            "security_pending_authorizations": sum(1 for plan in protective_plans if plan.requires_explicit_approval() and not plan.approved and not plan.canceled),
+            "security_ids_review_gate_blocked": ids_summary["gate_blocked"],
+            "security_ids_review_revision_required": ids_summary["revision_required"],
+            "security_ids_review_submitted_without_result": ids_summary["submitted_without_result"],
+            "high_security_findings": host_security["high_findings"],
+            "warning_security_findings": host_security["warning_findings"],
+        }
+        role_focus = {
+            "sisko": {
+                "pending_authorizations": attention["pending_authorizations"],
+                "queued_claims": attention["queued_claims"],
+                "blocked_claims": attention["blocked_claims"],
+                "service_freshness": attention["service_freshness"],
+                "admin_archive_candidates": attention["admin_archive_candidates"],
+                "pending_restore_approvals": attention["pending_restore_approvals"],
+                "open_messages": crew_by_owner["sisko"]["open"],
+                "blocked_dispatches": crew_by_owner["sisko"]["blocked_dispatches"],
+            },
+            "kira": {
+                "assets": len(physical_identities),
+                "power_risk": attention["physical_power_risk"],
+                "storage_risk": attention["physical_storage_risk"],
+                "open_messages": crew_by_owner["kira"]["open"],
+                "blocked_dispatches": crew_by_owner["kira"]["blocked_dispatches"],
+            },
+            "obrien": {
+                "plans": len(maintenance_plans),
+                "pending_authorizations": attention["maintenance_pending_authorizations"],
+                "executable_plans": sum(1 for plan in maintenance_plans if plan.can_execute()),
+                "open_messages": crew_by_owner["obrien"]["open"],
+                "blocked_dispatches": crew_by_owner["obrien"]["blocked_dispatches"],
+            },
+            "odo": {
+                "alerts": attention["security_alerts"],
+                "high_findings": attention["high_security_findings"],
+                "pending_protective_authorizations": attention["security_pending_authorizations"],
+                "ids_review_gate_blocked": attention["security_ids_review_gate_blocked"],
+                "ids_review_revision_required": attention["security_ids_review_revision_required"],
+                "open_messages": crew_by_owner["odo"]["open"],
+                "blocked_dispatches": crew_by_owner["odo"]["blocked_dispatches"],
+            },
+            "quark": {
+                "limits": len(usage_limits),
+                "exhausted": attention["exhausted_usage_limits"],
+                "next_reset_at": usage_reset_times[0] if usage_reset_times else None,
+                "open_messages": crew_by_owner["quark"]["open"],
+                "blocked_dispatches": crew_by_owner["quark"]["blocked_dispatches"],
+            },
+            "dax": {
+                "assets": sum(1 for resource in resources if resource.type == ResourceType.VIRTUAL_ASSET),
+                "active_claims": attention["virtual_active_claims"],
+                "queued_claims": attention["virtual_queued_claims"],
+                "open_messages": crew_by_owner["dax"]["open"],
+                "blocked_dispatches": crew_by_owner["dax"]["blocked_dispatches"],
+            },
+            "julian": {
+                "targets": len(health_summaries),
+                "unhealthy": attention["unhealthy_health_targets"],
+                "recovery_required": attention["recovery_required"],
+                "latest_failures": attention["latest_failures"],
+                "open_messages": crew_by_owner["julian"]["open"],
+                "blocked_dispatches": crew_by_owner["julian"]["blocked_dispatches"],
+            },
+        }
+        return {
+            "store": str(store.path),
+            "service_name": service_name,
+            "overall_status": operator_dashboard_overall_status(attention),
+            "attention": attention,
+            "crew_messages": crew_summary,
+            "role_focus": role_focus,
+        }
+    finally:
+        store.close()
+
+
+def _compact_admin_history(
+    plans: Sequence[AdminChangePlan],
+    executions: Sequence[AdminExecutionResult],
+) -> dict[str, int]:
+    executions_by_plan = {result.plan_id: result for result in executions}
+    archive_candidates = 0
+    for plan in plans:
+        _disposition, archive_candidate, _next_step = _admin_history_disposition(plan, executions_by_plan.get(plan.id))
+        if archive_candidate:
+            archive_candidates += 1
+    return {"archive_candidates": archive_candidates}
 
 
 def operator_dashboard_attention(
@@ -1601,10 +1789,9 @@ def assess_host_security_status(store_path: str | Path, snapshot_id: str | None 
         if snapshot_id is not None:
             snapshot = store.load_host_snapshot(snapshot_id)
         else:
-            snapshots = store.list_host_snapshots()
-            if not snapshots:
+            snapshot = store.load_latest_host_snapshot()
+            if snapshot is None:
                 raise ValueError("no host snapshots are available")
-            snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1]
         return {"store": str(store.path), **host_security_status(snapshot)}
     finally:
         store.close()
@@ -1839,7 +2026,9 @@ def _load_host_snapshot_for_status(store: SQLiteStore, snapshot_id: str | None) 
     return sorted(snapshots, key=lambda item: item.captured_at)[-1]
 
 
-def _detected_firewall_backend(snapshot: HostInspectionSnapshot) -> str:
+def _detected_firewall_backend(snapshot: HostInspectionSnapshot | None) -> str:
+    if snapshot is None:
+        return "ufw"
     try:
         firewalld_state = snapshot.observation("firewalld-state")
     except KeyError:
@@ -1856,7 +2045,7 @@ def _detected_firewall_backend(snapshot: HostInspectionSnapshot) -> str:
 
 
 def _plan_firewall_deny_tcp_for_snapshot(
-    snapshot: HostInspectionSnapshot,
+    snapshot: HostInspectionSnapshot | None,
     plan_id: str,
     port: int,
     reason: str,
@@ -1994,10 +2183,9 @@ def host_security_sources_status(store_path: str | Path, snapshot_id: str | None
         if snapshot_id is not None:
             snapshot = store.load_host_snapshot(snapshot_id)
         else:
-            snapshots = store.list_host_snapshots()
-            if not snapshots:
+            snapshot = store.load_latest_host_snapshot()
+            if snapshot is None:
                 raise ValueError("no host snapshots are available")
-            snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1]
     finally:
         store.close()
     triage = host_security_triage_status(store_path, snapshot.id)
@@ -2343,6 +2531,97 @@ def plan_host_security_source_block_status(
         }
     finally:
         store.close()
+
+
+def plan_firewall_policy_diff_enforcement_status(
+    store_path: str | Path,
+    rule_index: int,
+    plan_id: str | None = None,
+    requested_by: str = "odo",
+    reason: str | None = None,
+) -> dict[str, object]:
+    root = Path(store_path).resolve().parent.parent if Path(store_path).resolve().parent.name == "state" else Path.cwd()
+    rule = _desired_firewall_rule(root, rule_index)
+    action = str(rule.get("action") or "").lower()
+    protocol = str(rule.get("protocol") or "tcp").lower()
+    if protocol != "tcp":
+        raise ValueError("only tcp desired-firewall rules are supported for staging")
+    try:
+        port = int(rule["port"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("desired firewall rule requires a numeric port") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("desired firewall rule port must be between 1 and 65535")
+
+    normalized_action = action.replace("-", "_")
+    if normalized_action not in {"allow_tcp", "deny_tcp"}:
+        raise ValueError("desired firewall rule action must be allow_tcp or deny_tcp")
+    default_plan_id = plan_id or f"admin.firewall-policy.rule-{rule_index}.{normalized_action}.{port}"
+    operational_reason = reason or str(rule.get("reason") or f"stage desired firewall policy rule {rule_index}")
+    current_state = (
+        f"desired_firewall_rule_index={rule_index}; requested_by={requested_by}; "
+        f"rule={json.dumps(rule, sort_keys=True)}"
+    )
+    store = SQLiteStore(store_path)
+    try:
+        snapshots = store.list_host_snapshots()
+        snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        if normalized_action == "allow_tcp":
+            plan = plan_firewall_allow_tcp(default_plan_id, port, operational_reason, current_state)
+            firewall_backend = _detected_firewall_backend(snapshot)
+        else:
+            plan, firewall_backend = _plan_firewall_deny_tcp_for_snapshot(snapshot, default_plan_id, port, operational_reason, current_state)
+        store.save_admin_change_plan(plan)
+        package = build_ids_review_package(
+            plan,
+            package_id=f"ids-review.{plan.id}",
+            requested_by=requested_by,
+            created_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+        )
+        exported_package, prompt_path = write_ids_review_prompt_file(package, _ids_review_prompt_dir(store.path))
+        store.save_host_security_ids_review_package(exported_package)
+        return {
+            "store": str(store.path),
+            "rule_index": rule_index,
+            "rule": rule,
+            "firewall_backend": firewall_backend,
+            "ids_review_required_before_approval": True,
+            "ids_review_package": host_security_ids_review_package_status(exported_package),
+            "prompt_path": str(prompt_path),
+            "approval_boundary": (
+                "firewall policy plan and IDS review package staged only; no firewall, IDS, route, "
+                "service-bind, reload, restart, or alerting changes were applied"
+            ),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+            **admin_change_plan_status(plan),
+        }
+    finally:
+        store.close()
+
+
+def _desired_firewall_rule(root: Path, rule_index: int) -> dict[str, object]:
+    path = root / "config" / "desired-firewall.json"
+    if not path.exists():
+        raise ValueError("config/desired-firewall.json is required before staging desired firewall enforcement")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("desired firewall JSON is unreadable or invalid") from exc
+    rules = data.get("rules")
+    if not isinstance(rules, list):
+        raise ValueError("desired firewall JSON requires a rules list")
+    if rule_index < 0 or rule_index >= len(rules):
+        raise ValueError("desired firewall rule index is out of range")
+    rule = rules[rule_index]
+    if not isinstance(rule, dict):
+        raise ValueError("desired firewall rule must be an object")
+    return rule
+
+
+def _ids_review_prompt_dir(store_path: str | Path) -> Path:
+    state_dir = Path(store_path).resolve().parent
+    return state_dir / "advisories"
 
 
 def host_security_ids_review_package_status(package: HostSecurityIDSReviewPackage) -> dict[str, object]:
@@ -2766,6 +3045,7 @@ def admin_execution_status(result: AdminExecutionResult) -> dict[str, object]:
         "summary": result.summary,
         "command_results": [_admin_command_result_status(item) for item in result.command_results],
         "verification_results": [_admin_command_result_status(item) for item in result.verification_results],
+        "rollback_results": [_admin_command_result_status(item) for item in result.rollback_results],
     }
 
 
@@ -2800,6 +3080,10 @@ def plan_admin_change_status(
         plan = plan_apt_update(plan_id, reason, current_state)
     elif plan_kind == AdminChangeKind.APT_UPGRADE:
         plan = plan_apt_upgrade(plan_id, tuple(packages), reason, current_state)
+    elif plan_kind == AdminChangeKind.FLATPAK_INSTALL:
+        plan = plan_flatpak_install(plan_id, target, reason, current_state)
+    elif plan_kind == AdminChangeKind.NPM_GLOBAL_INSTALL:
+        plan = plan_npm_global_install(plan_id, target, reason, current_state)
     elif plan_kind == AdminChangeKind.FIREWALL_ALLOW_TCP:
         if port is None:
             raise ValueError("port is required for firewall_allow_tcp")
@@ -3128,10 +3412,16 @@ def _admin_adapter_enablement_plan_item_status(capability) -> dict[str, object]:
 
 
 def _admin_adapter_enablement_risks(kind: AdminChangeKind) -> list[str]:
-    if kind in {AdminChangeKind.APT_INSTALL, AdminChangeKind.APT_UPDATE, AdminChangeKind.APT_UPGRADE}:
+    if kind in {
+        AdminChangeKind.APT_INSTALL,
+        AdminChangeKind.APT_UPDATE,
+        AdminChangeKind.APT_UPGRADE,
+        AdminChangeKind.FLATPAK_INSTALL,
+        AdminChangeKind.NPM_GLOBAL_INSTALL,
+    }:
         return [
-            "sudo package changes may alter shared host dependencies",
-            "package installation or upgrade may restart or change local services",
+            "package-provider changes may alter shared host dependencies or developer tooling",
+            "package installation or upgrade may restart, add, or change local services",
             "rollback may not fully restore transitive package state",
         ]
     if kind in {AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP, AdminChangeKind.BLOCK_IP}:
@@ -3694,6 +3984,7 @@ def request_admin_policy_warning_status(
         raise ValueError("requested_by is required")
     if not check_id.strip():
         raise ValueError("check_id is required")
+    profile, _, _ = load_active_policy_profile(store_path)
     store = SQLiteStore(store_path)
     try:
         plan = store.load_admin_change_plan(plan_id)
@@ -3702,6 +3993,7 @@ def request_admin_policy_warning_status(
             admin_execution_capability_for(AdminChangeKind(plan.kind), approved_admin_adapter_enablement_kinds(store)),
             store.list_host_security_ids_review_packages_for_plan(plan.id),
             approved_admin_policy_warning_check_ids(store, plan.id),
+            profile,
         )
         warning_ids = {check.id for check in decision.checks if check.status == PolicyCheckStatus.WARN}
         if check_id not in warning_ids:
@@ -4455,7 +4747,9 @@ def _admin_execution_readiness_state(
         return "approval_required", "request explicit approval before execution"
     if not live_execution_supported:
         return "manual_execution_required", "specific live adapter approval and enablement is required before Overseer execution"
-    return "ready_for_overseer_execution", "execute approved plan through Overseer"
+    if plan.approved:
+        return "ready_for_overseer_execution", "execute approved plan through Overseer"
+    return "ready_for_overseer_execution", "execute no-approval plan through Overseer"
 
 
 def approve_admin_change_status(
@@ -4948,7 +5242,11 @@ def _dispatch_crew_message(
 def _dispatch_sisko_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
     if message.related_plan_id and message.related_plan_id != "all" and _message_mentions(message, "approve", "approval", "approved"):
         approval = approve_admin_change_status(store_path, message.related_plan_id, "sisko", dispatched_at)
-        return _crew_dispatch_result(message, "dispatched", f"Sisko approved plan {message.related_plan_id}", [approval])
+        actions: list[dict[str, object]] = [approval]
+        execution = _execute_obrien_package_plan_if_ready(store_path, message.related_plan_id)
+        if execution is not None:
+            actions.append(execution)
+        return _crew_dispatch_result(message, "dispatched", f"Sisko approved plan {message.related_plan_id}", actions)
     if message.related_plan_id == "all":
         return _crew_dispatch_result(message, "skipped", "Sisko dispatch requires exact plan IDs; broad all-plan approval is not executed", [])
     return _crew_dispatch_result(message, "skipped", "Sisko acknowledged command request; no exact approval target was provided", [])
@@ -4963,7 +5261,63 @@ def _dispatch_kira_message(store_path: str | Path, message, dispatched_by: str, 
 def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
     packages = (message.related_resource_id,) if message.related_resource_id else ()
     plan = plan_package_updates_status(store_path, captured_at=dispatched_at, packages=packages)
-    return _crew_dispatch_result(message, "dispatched", "O'Brien inspected packages and staged maintenance plans when upgrades were available", [plan])
+    actions: list[dict[str, object]] = [plan]
+    for item in plan.get("items", []):
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        advancement = _advance_obrien_package_plan(store_path, str(item["id"]), dispatched_at)
+        if advancement:
+            actions.append(advancement)
+    return _crew_dispatch_result(
+        message,
+        "dispatched",
+        "O'Brien inspected packages, staged update plans, and advanced package maintenance through allowed gates",
+        actions,
+    )
+
+
+def _advance_obrien_package_plan(store_path: str | Path, plan_id: str, advanced_at: str) -> dict[str, object] | None:
+    readiness = _admin_plan_readiness_item(store_path, plan_id)
+    if readiness.get("owner_domain") != OwnerDomain.OBRIEN.value:
+        return None
+    if readiness.get("kind") not in {AdminChangeKind.APT_UPDATE.value, AdminChangeKind.APT_UPGRADE.value}:
+        return None
+    if readiness.get("readiness_state") == "ready_for_overseer_execution":
+        return execute_admin_change_status(store_path, plan_id)
+    if readiness.get("readiness_state") == "approval_required":
+        if readiness.get("approval_level") == ApprovalLevel.SISKO.value:
+            approval = approve_admin_change_status(store_path, plan_id, "sisko", advanced_at)
+            execution = _execute_obrien_package_plan_if_ready(store_path, plan_id)
+            return {
+                "plan_id": plan_id,
+                "readiness_state": "sisko_approved",
+                "approval": approval,
+                "execution": execution,
+            }
+        return _ensure_sisko_plan_message(
+            store_path,
+            plan_id,
+            subject=f"Approve package maintenance {plan_id}",
+            message=(
+                f"O'Brien staged package maintenance plan {plan_id}. "
+                "Rollback and verification steps are recorded; approve this exact plan so Overseer can execute it."
+            ),
+            priority=str(readiness.get("risk_level") or RiskLevel.HIGH.value),
+            created_at=advanced_at,
+        )
+    return {"plan_id": plan_id, "readiness_state": readiness.get("readiness_state"), "next_step": readiness.get("next_step")}
+
+
+def _execute_obrien_package_plan_if_ready(store_path: str | Path, plan_id: str) -> dict[str, object] | None:
+    readiness = _admin_plan_readiness_item(store_path, plan_id)
+    if readiness.get("owner_domain") != OwnerDomain.OBRIEN.value:
+        return None
+    if readiness.get("kind") not in {AdminChangeKind.APT_UPDATE.value, AdminChangeKind.APT_UPGRADE.value}:
+        return None
+    refreshed = _admin_plan_readiness_item(store_path, plan_id)
+    if refreshed.get("readiness_state") != "ready_for_overseer_execution":
+        return None
+    return execute_admin_change_status(store_path, plan_id)
 
 
 def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
@@ -7156,6 +7510,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     documents_status_parser = subparsers.add_parser("documents-status", help="check Ezri's Obsidian Documents API readiness")
     documents_status_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
+    git_status_parser = subparsers.add_parser("git-status", help="summarize Ezri-managed git repository state")
+    git_status_parser.add_argument("--repo-path", default=None, help="repository path to inspect; defaults to the current directory")
     documents_notes_parser = subparsers.add_parser("documents-notes", help="list Obsidian vault notes through Ezri")
     documents_notes_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
     documents_notes_parser.add_argument("--folder", default="")
@@ -7867,6 +8223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "documents-status":
         print(json.dumps(documents_config_status(_documents_env_file_arg(args.env_file)), sort_keys=True))
+        return 0
+
+    if args.command == "git-status":
+        print(json.dumps(git_status_status(args.repo_path), sort_keys=True))
         return 0
 
     if args.command == "documents-notes":

@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 import overseer.api as overseer_api
 import overseer.admin as overseer_admin
+import overseer.cli as overseer_cli
 import overseer.documents as overseer_documents
 import overseer.knowledge as overseer_knowledge
 from overseer import (
@@ -53,6 +54,7 @@ from overseer import (
     decide_claim,
     classify_probe,
     recovery_evidence,
+    git_status_status,
     summarize_health_targets,
     HealthStatus,
     HealthEvidence,
@@ -130,9 +132,11 @@ from overseer import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
+    plan_npm_global_install,
     plan_user_service_restart,
     policy_customization_helper_status,
     policy_profile_from_answers_status,
@@ -1369,7 +1373,7 @@ class HealthSummaryTests(unittest.TestCase):
 
         self.assertIsNone(status["store"])
         self.assertEqual(status["enabled"], 1)
-        self.assertEqual(status["disabled"], 6)
+        self.assertEqual(status["disabled"], 8)
         self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
         self.assertFalse(restart["authorization_required_before_enable"])
         self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
@@ -1397,7 +1401,7 @@ class HealthSummaryTests(unittest.TestCase):
         package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
         self.assertEqual(status["store"], str(store_path))
         self.assertEqual(status["enabled"], 2)
-        self.assertEqual(status["disabled"], 5)
+        self.assertEqual(status["disabled"], 7)
         self.assertEqual(package["status"], AdminAdapterStatus.ENABLED.value)
         self.assertIn("approved live", package["summary"])
 
@@ -2411,6 +2415,7 @@ class HealthSummaryTests(unittest.TestCase):
             )
 
             status = operator_dashboard_status(store_path)
+            compact_status = operator_dashboard_status(store_path, include_summaries=False)
 
         self.assertEqual(status["overall_status"], "attention_required")
         self.assertEqual(status["attention"]["unhealthy_health_targets"], 1)
@@ -2432,6 +2437,8 @@ class HealthSummaryTests(unittest.TestCase):
         self.assertEqual(status["summaries"]["admin"]["restore_approvals"]["pending"], 1)
         self.assertIn("admin_history", status["summaries"])
         self.assertIn("health_efficiency", status["summaries"])
+        self.assertIn("role_focus", compact_status)
+        self.assertNotIn("summaries", compact_status)
 
 
 class OverseerApiTests(unittest.TestCase):
@@ -2739,6 +2746,43 @@ class OverseerApiTests(unittest.TestCase):
             self.assertEqual(notes["count"], 2)
             self.assertEqual(search["count"], 1)
 
+    def test_git_status_reports_branch_remote_links_and_working_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path = Path(directory) / "repo"
+            repo_path.mkdir()
+            subprocess.run(("git", "init", "-b", "main"), cwd=repo_path, check=True, capture_output=True, text=True)
+            subprocess.run(("git", "config", "user.email", "test@example.invalid"), cwd=repo_path, check=True)
+            subprocess.run(("git", "config", "user.name", "Overseer Test"), cwd=repo_path, check=True)
+            (repo_path / "README.md").write_text("# Test\n", encoding="utf-8")
+            subprocess.run(("git", "add", "README.md"), cwd=repo_path, check=True)
+            subprocess.run(("git", "commit", "-m", "Initialize test repo"), cwd=repo_path, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ("git", "remote", "add", "origin", "git@github.com:example/overseer-test.git"),
+                cwd=repo_path,
+                check=True,
+            )
+            (repo_path / "README.md").write_text("# Test\n\nChanged\n", encoding="utf-8")
+            (repo_path / "notes.md").write_text("draft\n", encoding="utf-8")
+
+            status = git_status_status(repo_path)
+
+        self.assertEqual(status["branch"], "main")
+        self.assertTrue(status["dirty"])
+        self.assertEqual(status["changed"], 2)
+        self.assertEqual(status["unstaged"], 1)
+        self.assertEqual(status["untracked"], 1)
+        self.assertEqual(status["remote"]["owner"], "example")
+        self.assertEqual(status["remote"]["repo"], "overseer-test")
+        self.assertEqual(status["links"]["repository"], "https://github.com/example/overseer-test")
+        self.assertIn("/tree/main", status["links"]["branch"])
+        self.assertIn("/commit/", status["links"]["commit"])
+        self.assertEqual(status["files"], status["status_lines"])
+        self.assertEqual(len(status["files"]), 2)
+        self.assertEqual(status["account"]["repository_count"], 1)
+        self.assertEqual(status["account"]["dirty_count"], 1)
+        self.assertEqual(status["account"]["repositories"][0]["relative_path"], "repo")
+        self.assertTrue(status["account"]["repositories"][0]["is_current"])
+
     def test_api_exposes_knowledge_capture_routes_behind_overseer_auth(self):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
             env_file = Path(directory) / "obsidian.env"
@@ -2772,6 +2816,28 @@ class OverseerApiTests(unittest.TestCase):
         self.assertTrue(plan["dry_run"])
         self.assertEqual(captured["captured"], 1)
         self.assertTrue(any(call[0] == "PUT" and call[1].startswith("/vault/Overseer/Knowledge/Crew/ezri/") for call in obsidian.calls))
+
+    def test_api_and_client_expose_git_status_for_ezri(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            payload = {
+                "branch": "main",
+                "short_head": "abc1234",
+                "dirty": False,
+                "changed": 0,
+                "remote": {"web_url": "https://github.com/example/overseer-test"},
+                "links": {"repository": "https://github.com/example/overseer-test"},
+                "status_lines": [],
+            }
+
+            with patch.object(overseer_api, "git_status_status", lambda repo_path=None: payload):
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    direct = server.get("/git/status")
+                    client = OverseerApiClient(server.url, auth_token="client-secret")
+                    via_client = client.git_status()
+
+        self.assertEqual(direct["branch"], "main")
+        self.assertEqual(via_client["remote"]["web_url"], "https://github.com/example/overseer-test")
 
     def test_loopback_api_serves_operator_console_without_token(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2844,6 +2910,21 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("<section id=\"ezri\"", html)
             self.assertIn("function renderEzri()", html)
             self.assertIn('stationIntro("Ezri", "Knowledge Base"', html)
+            self.assertIn('gitStatus: "/git/status"', html)
+            self.assertIn("Git Runtime", html)
+            self.assertIn("Account Repositories", html)
+            self.assertIn("Current Repo Links", html)
+            self.assertIn("Current Working Tree", html)
+            self.assertIn("Dirty Repos", html)
+            self.assertIn("Workflows", html)
+            self.assertIn("Approve a pending admin request", html)
+            self.assertIn("View VM leases and virtual claims", html)
+            self.assertIn("View logs from an unhealthy service", html)
+            self.assertIn("Check an exhausted limit refresh", html)
+            self.assertIn("Adjust service schedule", html)
+            self.assertIn("Overseer/Runbooks/operator-workflows.md", html)
+            self.assertIn("function ezriWorkflowRows()", html)
+            self.assertIn("function workflowFill(row)", html)
             self.assertIn("Search and List", html)
             self.assertIn("Current Folder", html)
             self.assertIn("Capture Queue", html)
@@ -3714,7 +3795,7 @@ class OverseerApiClientTests(unittest.TestCase):
 
             with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
                 client = OverseerApiClient(server.url, auth_token="client-secret")
-                status = client.operator_dashboard()
+                status = client.operator_dashboard(include_summaries=True)
 
             self.assertEqual(status["service_name"], "overseer")
             self.assertIn(status["overall_status"], {"nominal", "warning", "attention_required"})
@@ -4749,6 +4830,10 @@ class OverseerApiClientTests(unittest.TestCase):
     def test_client_requests_and_approves_admin_policy_warning(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
+            (Path(directory) / "policy-profile.json").write_text(
+                json.dumps({"profile": {"name": "api-warning-profile", "warn_on_apt_upgrade_rollback": True}}),
+                encoding="utf-8",
+            )
 
             with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
                 client = OverseerApiClient(server.url, auth_token="client-secret")
@@ -5293,12 +5378,20 @@ class HostInspectionTests(unittest.TestCase):
             ).inspect("2026-07-18T16:00:00+00:00")
             store = SQLiteStore(store_path)
             store.save_host_snapshot(snapshot)
+            newer_snapshot = replace(
+                snapshot,
+                id="host.host-a.2026-07-18t17-00-00-000000-00-00",
+                captured_at="2026-07-18T17:00:00+00:00",
+            )
+            store.save_host_snapshot(newer_snapshot)
             loaded = store.load_host_snapshot(snapshot.id)
+            latest = store.load_latest_host_snapshot()
             store.close()
 
             state = list_state_status(store_path)
 
         self.assertEqual(loaded.hostname, "host-a")
+        self.assertEqual(latest.id, newer_snapshot.id)
         self.assertEqual(state["host_snapshots"][0]["id"], snapshot.id)
         self.assertEqual(state["host_snapshots"][0]["observation_count"], 8)
 
@@ -6141,7 +6234,7 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "install", "-y", "nmap"))
         self.assertEqual(plan.rollback_steps[0].command, ("sudo", "apt-get", "remove", "-y", "nmap"))
 
-    def test_package_update_plan_uses_sisko_approval_and_consistency_check(self):
+    def test_package_update_plan_runs_without_explicit_approval_and_consistency_check(self):
         plan = plan_apt_update(
             "admin.apt.update",
             "refresh package metadata before maintenance",
@@ -6149,13 +6242,14 @@ class AdminChangePlanTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.kind, AdminChangeKind.APT_UPDATE)
-        self.assertEqual(plan.approval_level, ApprovalLevel.SISKO)
-        self.assertEqual(plan.risk_level, RiskLevel.MEDIUM)
-        self.assertTrue(plan.requires_explicit_approval())
+        self.assertEqual(plan.approval_level, ApprovalLevel.NONE)
+        self.assertEqual(plan.risk_level, RiskLevel.LOW)
+        self.assertFalse(plan.requires_explicit_approval())
+        self.assertTrue(plan.can_execute())
         self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "update"))
         self.assertEqual(plan.verification_steps[0].command, ("sudo", "apt-get", "check"))
 
-    def test_package_upgrade_plan_requires_human_approval_and_preview(self):
+    def test_package_upgrade_plan_uses_sisko_approval_and_preview(self):
         plan = plan_apt_upgrade(
             "admin.apt.upgrade.sqlite",
             ("sqlite3",),
@@ -6164,11 +6258,12 @@ class AdminChangePlanTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.kind, AdminChangeKind.APT_UPGRADE)
-        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.approval_level, ApprovalLevel.SISKO)
         self.assertEqual(plan.risk_level, RiskLevel.HIGH)
         self.assertEqual(plan.target, "sqlite3")
         self.assertEqual(plan.steps[0].command, ("sudo", "apt-get", "install", "--only-upgrade", "--dry-run", "sqlite3"))
         self.assertEqual(plan.steps[1].command, ("sudo", "apt-get", "install", "--only-upgrade", "-y", "sqlite3"))
+        self.assertEqual(plan.rollback_steps[1].command, ("sudo", "apt-get", "-f", "install", "-y"))
         self.assertEqual(plan.verification_steps[0].command, ("dpkg-query", "-W", "sqlite3"))
 
     def test_plan_admin_change_cli_accepts_package_argument(self):
@@ -6402,6 +6497,86 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(capability.status, AdminAdapterStatus.DISABLED)
         self.assertIn("live adapter unavailable for apt_install", result.summary)
 
+    def test_apt_install_rejects_provider_prefixed_packages(self):
+        with self.assertRaisesRegex(ValueError, "provider-specific admin adapter"):
+            plan_apt_install(
+                "admin.install.bad-provider",
+                ("npm:obsidian-mcp-server",),
+                "install documents bridge",
+            )
+
+    def test_stale_provider_prefixed_apt_plan_blocks_before_commands(self):
+        plan = approve_admin_change_plan(
+            replace(
+                plan_apt_install("admin.install.bad-provider", ("nmap",), "enable approved audit"),
+                target="npm:obsidian-mcp-server",
+                steps=(
+                    AdminCommandStep(
+                        "Install packages",
+                        ("sudo", "apt-get", "install", "-y", "npm:obsidian-mcp-server"),
+                        "invalid stale provider-prefixed package plan",
+                    ),
+                ),
+            ),
+            "operator",
+        )
+
+        result = execute_admin_change_plan(
+            plan,
+            enabled_adapter_kinds=(AdminChangeKind.APT_INSTALL,),
+            runner=lambda step: self.fail(f"runner should not be called for {step.command}"),
+        )
+
+        self.assertEqual(result.status, AdminExecutionStatus.BLOCKED)
+        self.assertIn("unsupported package provider 'npm'", result.summary)
+
+    def test_provider_specific_install_plans_use_provider_commands(self):
+        flatpak_plan = plan_flatpak_install(
+            "admin.flatpak.install.obsidian",
+            "md.obsidian.Obsidian",
+            "install documents editor",
+        )
+        npm_plan = plan_npm_global_install(
+            "admin.npm.install.documents",
+            "obsidian-mcp-server",
+            "install documents MCP bridge",
+        )
+
+        self.assertEqual(flatpak_plan.kind, AdminChangeKind.FLATPAK_INSTALL)
+        self.assertEqual(flatpak_plan.steps[0].command, ("flatpak", "install", "-y", "flathub", "md.obsidian.Obsidian"))
+        self.assertEqual(flatpak_plan.verification_steps[0].command, ("flatpak", "info", "md.obsidian.Obsidian"))
+        self.assertEqual(npm_plan.kind, AdminChangeKind.NPM_GLOBAL_INSTALL)
+        self.assertEqual(npm_plan.steps[0].command, ("npm", "install", "-g", "obsidian-mcp-server"))
+        self.assertEqual(npm_plan.rollback_steps[0].command, ("npm", "uninstall", "-g", "obsidian-mcp-server"))
+
+    def test_provider_specific_install_executes_only_with_enabled_adapter(self):
+        plan = approve_admin_change_plan(
+            plan_npm_global_install(
+                "admin.npm.install.documents",
+                "obsidian-mcp-server",
+                "install documents MCP bridge",
+            ),
+            "sisko",
+        )
+
+        blocked = execute_admin_change_plan(plan)
+        executed = execute_admin_change_plan(
+            plan,
+            enabled_adapter_kinds=(AdminChangeKind.NPM_GLOBAL_INSTALL,),
+            runner=lambda step: AdminCommandResult(
+                title=step.title,
+                command=step.command,
+                exit_code=0,
+                stdout="ok",
+            ),
+        )
+        capability = admin_execution_capability_for(plan.kind, (AdminChangeKind.NPM_GLOBAL_INSTALL,))
+
+        self.assertEqual(blocked.status, AdminExecutionStatus.BLOCKED)
+        self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
+        self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
+        self.assertEqual(executed.command_results[0].command, ("npm", "install", "-g", "obsidian-mcp-server"))
+
     def test_approved_package_update_executes_only_with_enabled_adapter(self):
         plan = approve_admin_change_plan(
             plan_apt_update("admin.apt.update.exec", "refresh approved package metadata"),
@@ -6479,11 +6654,16 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(item["status"], PolicyCheckStatus.BLOCK.value)
         self.assertEqual(checks["admin.plan.approval"]["status"], PolicyCheckStatus.BLOCK.value)
         self.assertEqual(checks["admin.adapter.enabled"]["status"], PolicyCheckStatus.BLOCK.value)
-        self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.WARN.value)
+        self.assertEqual(checks["admin.rollback"]["status"], PolicyCheckStatus.PASS.value)
 
     def test_admin_policy_status_warns_when_upgrade_is_approved_and_adapter_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
-            store_path = Path(directory) / "overseer.sqlite3"
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            (root / "policy-profile.json").write_text(
+                json.dumps({"profile": {"name": "warning-observing", "warn_on_apt_upgrade_rollback": True}}),
+                encoding="utf-8",
+            )
             plan_admin_change_status(
                 store_path,
                 "admin.apt.upgrade.ready",
@@ -6562,7 +6742,13 @@ class AdminChangePlanTests(unittest.TestCase):
             root = Path(directory)
             store_path = root / "overseer.sqlite3"
             (root / "policy-profile.json").write_text(
-                json.dumps({"name": "store-warning-observing", "block_warnings_until_accepted": False}),
+                json.dumps(
+                    {
+                        "name": "store-warning-observing",
+                        "warn_on_apt_upgrade_rollback": True,
+                        "block_warnings_until_accepted": False,
+                    }
+                ),
                 encoding="utf-8",
             )
             plan_admin_change_status(
@@ -6588,7 +6774,12 @@ class AdminChangePlanTests(unittest.TestCase):
 
     def test_execute_admin_change_status_blocks_policy_warnings(self):
         with tempfile.TemporaryDirectory() as directory:
-            store_path = Path(directory) / "overseer.sqlite3"
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            (root / "policy-profile.json").write_text(
+                json.dumps({"profile": {"name": "warning-blocking", "warn_on_apt_upgrade_rollback": True}}),
+                encoding="utf-8",
+            )
             plan_admin_change_status(
                 store_path,
                 "admin.apt.upgrade.warn-blocked",
@@ -6652,9 +6843,78 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(result["policy_profile"], "store-execution-profile")
         self.assertEqual(result["policy_profile_source"], "store_sibling_file")
 
+    def test_execute_admin_change_status_runs_rollback_when_upgrade_verification_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.rollback",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply package patch",
+                "sqlite3 upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
+            approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
+            approve_admin_change_status(store_path, "admin.apt.upgrade.rollback", "sisko")
+
+            def runner(step):
+                if step.title == "Verify package upgrade":
+                    return AdminCommandResult(step.title, step.command, 1, stderr="package query failed")
+                return AdminCommandResult(step.title, step.command, 0, stdout="ok")
+
+            result = execute_admin_change_status(store_path, "admin.apt.upgrade.rollback", runner=runner)
+            executions = admin_executions_status(store_path)
+
+        self.assertEqual(result["status"], AdminExecutionStatus.FAILED.value)
+        self.assertIn("rollback steps attempted", result["summary"])
+        self.assertEqual(result["rollback_results"][0]["command"], ["sudo", "apt-get", "check"])
+        self.assertEqual(result["rollback_results"][1]["command"], ["sudo", "apt-get", "-f", "install", "-y"])
+        self.assertEqual(executions["executions"][0]["rollback_results"][1]["title"], "Attempt package recovery")
+
+    def test_obrien_advancement_uses_sisko_approval_for_package_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.apt.upgrade.sisko-auto",
+                AdminChangeKind.APT_UPGRADE.value,
+                "sqlite3",
+                "apply package patch",
+                "sqlite3 upgrade available",
+                packages=("sqlite3",),
+            )
+            requested = request_admin_adapter_enablement_status(store_path, AdminChangeKind.APT_UPGRADE.value, "sisko")
+            approve_admin_adapter_enablement_status(store_path, requested["approval_id"], "sisko")
+
+            with patch("overseer.cli.execute_admin_change_status") as execute:
+                execute.return_value = {"status": AdminExecutionStatus.COMPLETED.value}
+                status = overseer_cli._advance_obrien_package_plan(
+                    store_path,
+                    "admin.apt.upgrade.sisko-auto",
+                    "2026-07-20T20:30:00+00:00",
+                )
+
+            store = SQLiteStore(store_path)
+            try:
+                plan = store.load_admin_change_plan("admin.apt.upgrade.sisko-auto")
+            finally:
+                store.close()
+
+        self.assertEqual(status["readiness_state"], "sisko_approved")
+        self.assertEqual(status["approval"]["approval_level"], ApprovalLevel.SISKO.value)
+        self.assertEqual(status["execution"]["status"], AdminExecutionStatus.COMPLETED.value)
+        self.assertTrue(plan.approved)
+        self.assertEqual(plan.approved_by, "sisko")
+
     def test_admin_policy_warning_approval_allows_residual_warning(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
+            (Path(directory) / "policy-profile.json").write_text(
+                json.dumps({"profile": {"name": "warning-observing", "warn_on_apt_upgrade_rollback": True}}),
+                encoding="utf-8",
+            )
             plan_admin_change_status(
                 store_path,
                 "admin.apt.upgrade.warning-accepted",

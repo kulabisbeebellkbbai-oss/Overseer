@@ -18,6 +18,8 @@ class AdminChangeKind(StrEnum):
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
     APT_UPGRADE = "apt_upgrade"
+    FLATPAK_INSTALL = "flatpak_install"
+    NPM_GLOBAL_INSTALL = "npm_global_install"
     FIREWALL_ALLOW_TCP = "firewall_allow_tcp"
     FIREWALL_DENY_TCP = "firewall_deny_tcp"
     BLOCK_IP = "block_ip"
@@ -59,6 +61,7 @@ class AdminExecutionResult:
     summary: str
     command_results: tuple[AdminCommandResult, ...]
     verification_results: tuple[AdminCommandResult, ...] = ()
+    rollback_results: tuple[AdminCommandResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,9 @@ APT_NONINTERACTIVE_ENVIRONMENT: dict[str, str] = {
 }
 
 
+UNSUPPORTED_APT_PACKAGE_PREFIXES: tuple[str, ...] = ("flatpak:", "npm:", "pip:", "pipx:", "snap:")
+
+
 @dataclass(frozen=True)
 class AdminChangePlan:
     id: str
@@ -127,7 +133,12 @@ class AdminChangePlan:
         return not self.canceled and (self.approval_level != ApprovalLevel.NONE or self.risk_level != RiskLevel.LOW)
 
     def can_execute(self) -> bool:
-        return not self.archived and not self.canceled and self.approved and not missing_admin_change_fields(self)
+        return (
+            not self.archived
+            and not self.canceled
+            and (self.approved or not self.requires_explicit_approval())
+            and not missing_admin_change_fields(self)
+        )
 
 
 DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapability] = {
@@ -171,6 +182,24 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
             ("sudo", "apt-get", "check"),
             ("apt", "list", "--upgradable"),
         ),
+    ),
+    AdminChangeKind.FLATPAK_INSTALL: AdminExecutionCapability(
+        kind=AdminChangeKind.FLATPAK_INSTALL,
+        adapter_name="flatpak-install",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live flatpak installs require a specific package-provider adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("flatpak", "install"), ("flatpak", "info"), ("flatpak", "uninstall")),
+    ),
+    AdminChangeKind.NPM_GLOBAL_INSTALL: AdminExecutionCapability(
+        kind=AdminChangeKind.NPM_GLOBAL_INSTALL,
+        adapter_name="npm-global-install",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live npm global installs require a specific package-provider adapter approval plan before enablement",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("npm", "install", "-g"), ("npm", "list", "-g"), ("npm", "uninstall", "-g")),
     ),
     AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
@@ -306,6 +335,7 @@ def plan_user_service_restart(plan_id: str, service_name: str, reason: str, curr
 def plan_apt_install(plan_id: str, packages: tuple[str, ...], reason: str, current_state: str = "unknown") -> AdminChangePlan:
     if not packages:
         raise ValueError("at least one package is required")
+    _validate_apt_package_identifiers(packages)
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.APT_INSTALL,
@@ -351,8 +381,8 @@ def plan_apt_update(plan_id: str, reason: str, current_state: str = "unknown") -
         id=plan_id,
         kind=AdminChangeKind.APT_UPDATE,
         owner_domain=OwnerDomain.OBRIEN,
-        risk_level=RiskLevel.MEDIUM,
-        approval_level=ApprovalLevel.SISKO,
+        risk_level=RiskLevel.LOW,
+        approval_level=ApprovalLevel.NONE,
         target="apt package index",
         reason=reason,
         current_state=current_state,
@@ -389,6 +419,7 @@ def plan_apt_upgrade(
     current_state: str = "unknown",
 ) -> AdminChangePlan:
     package_args = packages or ()
+    _validate_apt_package_identifiers(package_args)
     target = " ".join(package_args) if package_args else "all upgradeable packages"
     if package_args:
         preview_command = ("sudo", "apt-get", "install", "--only-upgrade", "--dry-run", *package_args)
@@ -402,7 +433,7 @@ def plan_apt_upgrade(
         kind=AdminChangeKind.APT_UPGRADE,
         owner_domain=OwnerDomain.OBRIEN,
         risk_level=RiskLevel.HIGH,
-        approval_level=ApprovalLevel.HUMAN,
+        approval_level=ApprovalLevel.SISKO,
         target=target,
         reason=reason,
         current_state=current_state,
@@ -423,7 +454,12 @@ def plan_apt_upgrade(
             AdminCommandStep(
                 "Check package manager state before rollback decision",
                 ("sudo", "apt-get", "check"),
-                "apt upgrades may not be safely reversible automatically; verify state before operator-selected rollback",
+                "verify dependency state before trying rollback or the next available package version",
+            ),
+            AdminCommandStep(
+                "Attempt package recovery",
+                ("sudo", "apt-get", "-f", "install", "-y"),
+                "repair interrupted package configuration before retrying the next available version",
             ),
         ),
         risks=(
@@ -436,6 +472,95 @@ def plan_apt_upgrade(
                 "Verify package upgrade",
                 verification_command,
                 "confirm upgraded packages or package manager state are queryable",
+            ),
+        ),
+    )
+
+
+def plan_flatpak_install(
+    plan_id: str,
+    app_id: str,
+    reason: str,
+    current_state: str = "unknown",
+    remote: str = "flathub",
+) -> AdminChangePlan:
+    if not app_id.strip():
+        raise ValueError("app_id is required")
+    if not remote.strip():
+        raise ValueError("remote is required")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.FLATPAK_INSTALL,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.SISKO,
+        target=app_id,
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"install Flatpak app {app_id} from {remote}",
+        steps=(
+            AdminCommandStep(
+                "Install Flatpak app",
+                ("flatpak", "install", "-y", remote, app_id),
+                "apply the approved Flatpak installation",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Remove Flatpak app",
+                ("flatpak", "uninstall", "-y", app_id),
+                "undo Flatpak installation if verification fails",
+            ),
+        ),
+        risks=("user application changes", "provider repository metadata may change", "application permissions may affect local files"),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify Flatpak app",
+                ("flatpak", "info", app_id),
+                "confirm the Flatpak app is installed and queryable",
+            ),
+        ),
+    )
+
+
+def plan_npm_global_install(
+    plan_id: str,
+    package: str,
+    reason: str,
+    current_state: str = "unknown",
+) -> AdminChangePlan:
+    if not package.strip():
+        raise ValueError("package is required")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.NPM_GLOBAL_INSTALL,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.SISKO,
+        target=package,
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"install global npm package {package}",
+        steps=(
+            AdminCommandStep(
+                "Install global npm package",
+                ("npm", "install", "-g", package),
+                "apply the approved global npm installation",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Remove global npm package",
+                ("npm", "uninstall", "-g", package),
+                "undo global npm installation if verification fails",
+            ),
+        ),
+        risks=("global developer tooling changes", "provider package scripts may run", "package version drift may affect MCP behavior"),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify global npm package",
+                ("npm", "list", "-g", package, "--depth=0"),
+                "confirm the global npm package is installed and queryable",
             ),
         ),
     )
@@ -697,29 +822,45 @@ def execute_admin_change_plan(
             summary="admin change plan is not approved or is incomplete",
             command_results=(),
         )
+    unsupported_provider = _unsupported_apt_provider_for_plan(plan)
+    if unsupported_provider is not None:
+        return AdminExecutionResult(
+            id=f"admin.exec.{plan.id}.blocked",
+            plan_id=plan.id,
+            status=AdminExecutionStatus.BLOCKED,
+            summary=(
+                f"unsupported package provider {unsupported_provider!r} for {AdminChangeKind(plan.kind).value}; "
+                "stage a provider-specific admin adapter instead of apt"
+            ),
+            command_results=(),
+        )
 
     command_runner = runner or run_admin_command_step
     command_results = tuple(command_runner(step) for step in plan.steps)
     failed = next((result for result in command_results if result.exit_code != 0), None)
     if failed is not None:
+        rollback_results = tuple(command_runner(step) for step in plan.rollback_steps)
         return AdminExecutionResult(
             id=f"admin.exec.{plan.id}.failed",
             plan_id=plan.id,
             status=AdminExecutionStatus.FAILED,
-            summary=f"admin change failed during step: {failed.title}",
+            summary=f"admin change failed during step: {failed.title}; rollback steps attempted",
             command_results=command_results,
+            rollback_results=rollback_results,
         )
 
     verification_results = tuple(command_runner(step) for step in plan.verification_steps)
     verification_failed = next((result for result in verification_results if result.exit_code != 0), None)
     if verification_failed is not None:
+        rollback_results = tuple(command_runner(step) for step in plan.rollback_steps)
         return AdminExecutionResult(
             id=f"admin.exec.{plan.id}.failed",
             plan_id=plan.id,
             status=AdminExecutionStatus.FAILED,
-            summary=f"admin change verification failed during step: {verification_failed.title}",
+            summary=f"admin change verification failed during step: {verification_failed.title}; rollback steps attempted",
             command_results=command_results,
             verification_results=verification_results,
+            rollback_results=rollback_results,
         )
 
     return AdminExecutionResult(
@@ -774,6 +915,31 @@ def _is_apt_command(command: tuple[str, ...]) -> bool:
     if len(command) >= 2 and command[0] == "sudo" and command[1] == "apt-get":
         return True
     return bool(command and command[0] == "apt-get")
+
+
+def _validate_apt_package_identifiers(packages: Iterable[str]) -> None:
+    unsupported = _unsupported_package_provider(packages)
+    if unsupported is not None:
+        raise ValueError(f"unsupported package provider {unsupported!r}; use a provider-specific admin adapter")
+
+
+def _unsupported_apt_provider_for_plan(plan: AdminChangePlan) -> str | None:
+    if AdminChangeKind(plan.kind) not in {AdminChangeKind.APT_INSTALL, AdminChangeKind.APT_UPGRADE}:
+        return None
+    return _unsupported_package_provider(
+        part
+        for step in (*plan.steps, *plan.rollback_steps, *plan.verification_steps)
+        for part in step.command
+    )
+
+
+def _unsupported_package_provider(parts: Iterable[str]) -> str | None:
+    for part in parts:
+        lowered = part.lower()
+        for prefix in UNSUPPORTED_APT_PACKAGE_PREFIXES:
+            if lowered.startswith(prefix):
+                return prefix[:-1]
+    return None
 
 
 def authorization_required_status(plan: AdminChangePlan) -> dict[str, object]:

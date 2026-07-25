@@ -122,3 +122,28 @@ Discovered listener assets include:
 - `process_hint`: the source evidence line from `ss`.
 
 Risk routing is conservative: loopback listeners are low risk, non-loopback listeners are medium risk, and all-interface listeners are high risk.
+
+## Runtime Operations Registry
+
+Dax also maintains a local state registry for virtual runtime observations and
+staged lifecycle requests. The registry is stored under ignored project state
+and is safe to update from the UI because it records intent and evidence only.
+
+Protected gateway routes:
+
+- `GET /Overseer/virtual/operations`
+- `POST /Overseer/virtual/runtime-records`
+- `POST /Overseer/virtual/snapshot-requests`
+- `POST /Overseer/virtual/restore-requests`
+
+Operator controls live on the Claims page:
+
+- Virtual Runtime Record records observed state, adapter, ports, and snapshot
+  hints.
+- Virtual Snapshot Request stages a snapshot plan and waits for approval.
+- Virtual Restore Request stages a rollback plan and waits for approval.
+
+These routes do not start, stop, pause, snapshot, restore, destroy, reconfigure,
+or expose a VM, container, emulator, gateway, proxy, or tunnel. Live adapter
+execution remains approval-bound and must preserve checkout, security, health,
+and rollback evidence before mutation.

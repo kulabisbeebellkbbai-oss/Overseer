@@ -165,6 +165,26 @@ Supported log target forms:
 
 A log probe with a missing, unreadable, relative, or contradictory target is failed health evidence. The evidence records only summaries such as `expected log marker found` or `blocked log marker found`; it does not persist the sampled log content.
 
+## Journal Evidence
+
+Julian's Health page shows bounded, redacted `journalctl --user` excerpts for
+service units when they are available to the current user. It also reports
+whether `journalctl` is installed, whether the current user journal can be
+queried, and whether system journal access is currently available without
+privilege escalation.
+
+System journal content is approval-bound. The Health page can stage a System
+Journal Access Request through:
+
+```text
+POST /health/journal-access-requests
+```
+
+That request creates a `service_detail` operation record in `waiting_approval`
+state with the exact planned read-only `journalctl` commands and redaction
+guardrails. It does not invoke `sudo`, change group membership, read privileged
+system journal contents, or mutate the host.
+
 ## Manual Probes
 
 Manual probes let Julian record explicit operator health evidence without contacting a service:

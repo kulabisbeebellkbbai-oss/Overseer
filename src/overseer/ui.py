@@ -670,6 +670,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     const endpoints = {
       auth: "/auth-check",
       dashboard: "/operator-dashboard",
+      incidentLifecycle: "/incidents/lifecycle",
+      operations: "/operations/gap-coverage",
+      operationWorkflows: "/operations/workflows",
       runtime: "/runtime-status",
       authorizations: "/admin/authorizations-required",
       readiness: "/admin/execution-readiness",
@@ -677,15 +680,33 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       adminArchivePlan: "/admin/history-archive-plan",
       adminArchives: "/admin/history-archives",
       activePolicy: "/admin/active-policy-profile",
+      complianceEvidence: "/compliance/evidence",
       policyHelper: "/admin/policy-customization-helper",
       packageStatus: "/maintenance/package-status",
+      softwareEvidence: "/maintenance/software-evidence",
+      advisories: "/maintenance/advisories",
+      maintenanceSchedules: "/maintenance/schedules",
       physical: "/physical-summary",
+      storageEvidence: "/storage/evidence",
+      backupOperations: "/storage/backup-operations",
       virtual: "/virtual-summary",
+      virtualEvidence: "/virtual/evidence",
+      virtualOperations: "/virtual/operations",
       security: "/security-summary",
+      securityEvidence: "/security/evidence",
+      identityEvidence: "/identity/evidence",
+      identityRotationRequests: "/identity/rotation-requests",
       health: "/health-efficiency",
       healthSummary: "/health-summary",
+      serviceEvidence: "/health/service-evidence",
+      observabilityTrends: "/observability/trends",
+      metricHistory: "/observability/metric-history",
+      performanceHistory: "/observability/performance-history",
       usage: "/usage-summary",
+      usageEvidence: "/usage/evidence",
       documentsStatus: "/documents/status",
+      documentationEvidence: "/documents/evidence",
+      gitStatus: "/git/status",
       documentsNotes: "/documents/notes?folder=Overseer",
       knowledgeCapturePlan: "/documents/knowledge-capture-plan?limit=12",
       crewMessages: "/crew/messages",
@@ -704,6 +725,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       data: {},
       view: "overview",
       token: tokenStore.getItem("overseerToken") || "",
+      documentsFolder: "Overseer",
+      documentsQuery: "Overseer",
       loadErrors: [],
       lastAction: null
     };
@@ -726,7 +749,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         event.preventDefault();
         applyFill(fillTarget.dataset.fill);
         const targetView = fillTarget.dataset.viewTarget;
-        if (targetView && !fillTarget.dataset.action) selectView(targetView);
+        if (targetView && targetView !== state.view && !fillTarget.dataset.action) selectView(targetView);
         if (!fillTarget.dataset.action) return;
       }
       const viewTarget = event.target.closest("[data-view-target]");
@@ -766,8 +789,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       state.data = {...state.data, auth: authPayload};
       state.loadErrors = [];
       document.getElementById("updated").textContent = new Date().toLocaleString();
-      render();
-      const endpointEntries = Object.entries(endpoints).filter(([key]) => !requiredEndpointKeys.has(key));
+      const endpointEntries = Object.entries(endpoints)
+        .filter(([key]) => !requiredEndpointKeys.has(key))
+        .map(([key, path]) => [key, endpointPath(key, path)]);
       const results = await mapEndpointEntries(endpointEntries, 4);
       const nextData = {...state.data};
       const failures = [];
@@ -795,6 +819,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function formatEndpointError(failure) {
       return `${failure.path}: ${failure.message}`;
+    }
+    function endpointPath(key, path) {
+      if (key === "documentsNotes") return documentsNotesPath();
+      return path;
+    }
+    function documentsNotesPath() {
+      const folder = (state.documentsFolder || "Overseer").trim();
+      const suffix = folder ? `?folder=${encodeURIComponent(folder)}` : "";
+      return `/documents/notes${suffix}`;
     }
     async function mapEndpointEntries(entries, concurrency) {
       const results = new Array(entries.length);
@@ -842,6 +875,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       status.textContent = "Running action...";
       try {
         const result = await actionRequest(action, source);
+        applyActionResult(action, result);
         state.lastAction = {action, result, at: new Date().toLocaleString()};
         await refresh();
       } catch (err) {
@@ -849,10 +883,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         status.className = "panel action-status error";
       }
     }
+    function applyActionResult(action, result) {
+      if (action === "documents-list-notes") state.data.documentsNotes = result;
+      if (action === "documents-search") state.data.documentsSearch = result;
+      if (action === "documents-capture-knowledge") state.data.knowledgeCapturePlan = result;
+    }
     async function actionRequest(action, source) {
       if (action === "discover-physical") return await postJson("/physical/discover", {});
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
+      if (action === "record-virtual-runtime") return await recordVirtualRuntime();
+      if (action === "stage-virtual-snapshot-request") return await stageVirtualSnapshotRequest();
+      if (action === "stage-virtual-restore-request") return await stageVirtualRestoreRequest();
+      if (action === "record-backup-job") return await recordBackupJob();
+      if (action === "record-restore-test") return await recordRestoreTest();
+      if (action === "stage-backup-cleanup-request") return await stageBackupCleanupRequest();
       if (action === "register-resource") return await registerResource();
       if (action === "request-claim") return await requestClaim();
       if (action === "approve-claim") return await approveClaim();
@@ -873,6 +918,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
+      if (action === "refresh-advisories") return await refreshAdvisories();
+      if (action === "record-maintenance-schedule") return await recordMaintenanceSchedule();
       if (action === "plan-admin-change") return await planAdminChange();
       if (action === "approve-admin-change") return await approveAdminChange();
       if (action === "cancel-admin-change") return await cancelAdminChange();
@@ -890,11 +937,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "unarchive-admin-history") return await unarchiveAdminHistory();
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
+      if (action === "stage-journal-access-request") return await stageJournalAccessRequest();
+      if (action === "capture-metric-history") return await captureMetricHistory();
       if (action === "inspect-host") return await postJson("/host/inspect", {});
       if (action === "plan-listener-queue-remediations") return await postJson("/host/security/listener-review-queue/remediation-plans", {requested_by: "odo"});
       if (action === "plan-host-security-remediation") return await planHostSecurityRemediation();
       if (action === "record-source-review") return await recordSourceReview();
+      if (action === "stage-identity-rotation-request") return await stageIdentityRotationRequest();
+      if (action === "record-operation") return await recordOperation();
+      if (action === "transition-operation") return await transitionOperation();
+      if (action === "stage-operation-workflow") return await stageOperationWorkflow();
       if (action === "plan-source-block") return await planSourceBlock();
+      if (action === "stage-firewall-policy-enforcement") return await stageFirewallPolicyEnforcement();
       if (action === "prepare-ids-review-package") return await prepareIdsReviewPackage();
       if (action === "export-ids-review-prompt") return await exportIdsReviewPrompt();
       if (action === "dispatch-ids-review-package") return await dispatchIdsReviewPackage();
@@ -911,6 +965,67 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const payload = {resource_id: resourceId, name, resource_type: resourceType, owner_domain: ownerDomain, risk_level: riskLevel};
       if (identifiersText) payload.identifiers = JSON.parse(identifiersText);
       return await postJson("/resources", payload);
+    }
+    async function recordBackupJob() {
+      return await postJson("/storage/backup-jobs", {
+        job_id: value("backup-job-id"),
+        target: value("backup-target"),
+        schedule: value("backup-schedule") || "manual",
+        retention: value("backup-retention") || "operator-defined",
+        requested_by: value("backup-requested-by") || "kira",
+        risk_level: value("backup-risk") || "medium",
+        status: value("backup-status") || "staged",
+        notes: value("backup-notes")
+      });
+    }
+    async function recordRestoreTest() {
+      return await postJson("/storage/restore-tests", {
+        test_id: value("restore-test-id"),
+        job_id: value("restore-job-id"),
+        restore_point: value("restore-point"),
+        status: value("restore-status") || "planned",
+        validated_by: value("restore-validated-by") || "kira",
+        notes: value("restore-notes")
+      });
+    }
+    async function stageBackupCleanupRequest() {
+      return await postJson("/storage/cleanup-requests", {
+        path: value("backup-cleanup-path"),
+        requested_by: value("backup-cleanup-requested-by") || "kira",
+        reason: value("backup-cleanup-reason") || "review generated storage cleanup candidate"
+      });
+    }
+    async function recordVirtualRuntime() {
+      const ports = value("virtual-ports")
+        .split(/[,\n]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map(Number);
+      return await postJson("/virtual/runtime-records", {
+        resource_id: value("virtual-resource-id"),
+        kind: value("virtual-kind") || "vm",
+        state: value("virtual-state") || "observed",
+        adapter: value("virtual-adapter") || "manual",
+        ports,
+        snapshot_hint: value("virtual-snapshot-hint"),
+        notes: value("virtual-notes")
+      });
+    }
+    async function stageVirtualSnapshotRequest() {
+      return await postJson("/virtual/snapshot-requests", {
+        resource_id: value("snapshot-resource-id"),
+        requested_by: value("snapshot-requested-by") || "dax",
+        reason: value("snapshot-reason") || "stage virtual snapshot before maintenance",
+        snapshot_name: value("snapshot-name")
+      });
+    }
+    async function stageVirtualRestoreRequest() {
+      return await postJson("/virtual/restore-requests", {
+        resource_id: value("restore-virtual-resource-id"),
+        restore_point: value("restore-virtual-point"),
+        requested_by: value("restore-virtual-requested-by") || "dax",
+        reason: value("restore-virtual-reason") || "stage virtual restore after failed change"
+      });
     }
     async function requestClaim() {
       const payload = {
@@ -982,6 +1097,54 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const port = value("admin-port");
       if (port) payload.port = Number(port);
       return await postJson("/admin/plans", payload);
+    }
+    async function recordMaintenanceSchedule() {
+      const metadataText = value("maintenance-schedule-metadata");
+      const payload = {
+        schedule_id: value("maintenance-schedule-id"),
+        target: value("maintenance-schedule-target"),
+        recurrence: value("maintenance-schedule-recurrence"),
+        window: value("maintenance-schedule-window"),
+        timezone: value("maintenance-schedule-timezone") || "UTC",
+        blackout: value("maintenance-schedule-blackout"),
+        validation: value("maintenance-schedule-validation"),
+        rollback: value("maintenance-schedule-rollback"),
+        status: value("maintenance-schedule-status"),
+        owner_domain: value("maintenance-schedule-owner") || "obrien",
+        risk_level: value("maintenance-schedule-risk") || "medium",
+        notes: value("maintenance-schedule-notes")
+      };
+      if (metadataText) payload.metadata = JSON.parse(metadataText);
+      return await postJson("/maintenance/schedules", payload);
+    }
+    async function stageJournalAccessRequest() {
+      return await postJson("/health/journal-access-requests", {
+        resource_id: value("journal-resource-id"),
+        unit: value("journal-unit"),
+        requested_by: value("journal-requested-by") || "julian",
+        reason: value("journal-reason") || "system journal access needed for service diagnosis"
+      });
+    }
+    async function captureMetricHistory() {
+      return await postJson("/observability/metric-history/capture", {
+        snapshot_id: value("metric-history-id"),
+        requested_by: value("metric-history-requested-by") || "julian",
+        notes: value("metric-history-notes"),
+        max_snapshots: Number(value("metric-history-retention") || 250)
+      });
+    }
+    async function refreshAdvisories() {
+      const packages = value("advisory-packages")
+        .split(/[,\n]/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      return await postJson("/maintenance/advisories/refresh", {
+        packages,
+        source: value("advisory-source") || "nvd",
+        max_results_per_package: Number(value("advisory-max-results") || 5),
+        requested_by: value("advisory-requested-by") || "obrien",
+        dry_run: document.getElementById("advisory-dry-run")?.checked || false
+      });
     }
     async function approveAdminChange() {
       return await postJson("/admin/approve", {
@@ -1122,19 +1285,61 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (limitId) payload.related_limit_id = limitId;
       return await postJson("/crew/messages", payload);
     }
+    async function recordOperation() {
+      const metadataText = value("op-metadata");
+      const payload = {
+        record_id: value("op-record-id"),
+        kind: value("op-kind"),
+        owner_domain: value("op-owner"),
+        status: value("op-status"),
+        subject: value("op-subject"),
+        summary: value("op-summary"),
+        severity: value("op-severity"),
+        next_step: value("op-next-step")
+      };
+      const resourceId = value("op-resource-id");
+      const evidenceIds = value("op-evidence-ids");
+      if (resourceId) payload.resource_id = resourceId;
+      if (evidenceIds) payload.evidence_ids = evidenceIds.split(",").map((item) => item.trim()).filter(Boolean);
+      if (metadataText) payload.metadata = JSON.parse(metadataText);
+      return await postJson("/operations/records", payload);
+    }
+    async function transitionOperation() {
+      const payload = {
+        record_id: value("op-transition-record-id"),
+        status: value("op-transition-status"),
+        updated_by: value("op-transition-by") || "sisko"
+      };
+      const nextStep = value("op-transition-next-step");
+      const note = value("op-transition-note");
+      if (nextStep) payload.next_step = nextStep;
+      if (note) payload.summary_note = note;
+      return await postJson("/operations/records/transition", payload);
+    }
+    async function stageOperationWorkflow() {
+      const payload = {
+        template_id: value("op-workflow-template-id"),
+        requested_by: value("op-workflow-requested-by") || "sisko"
+      };
+      const recordId = value("op-workflow-record-id");
+      const resourceId = value("op-workflow-resource-id");
+      if (recordId) payload.record_id = recordId;
+      if (resourceId) payload.resource_id = resourceId;
+      return await postJson("/operations/workflows/stage", payload);
+    }
     async function dispatchCrewMessages(role) {
       const payload = {dispatched_by: "sisko"};
       if (role) payload.owner_domain = role;
       return await postJson("/crew/dispatch", payload);
     }
     async function listDocumentsNotes() {
-      const folder = value("documents-folder");
-      const suffix = folder ? `?folder=${encodeURIComponent(folder)}` : "";
-      return await getJson(`/documents/notes${suffix}`);
+      state.documentsFolder = value("documents-folder") || "Overseer";
+      return await getJson(documentsNotesPath());
     }
     async function searchDocuments() {
+      state.documentsQuery = value("documents-query") || "Overseer";
       return await postJson("/documents/search", {
-        query: value("documents-query"),
+        query: state.documentsQuery,
         context_length: Number(value("documents-context-length") || "100")
       });
     }
@@ -1211,6 +1416,25 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (planId) payload.plan_id = planId;
       return await postJson("/host/security/source-reviews/block-plans", payload);
     }
+    async function stageFirewallPolicyEnforcement() {
+      const payload = {
+        rule_index: Number(value("firewall-rule-index") || 0),
+        requested_by: value("firewall-requested-by") || "odo",
+        reason: value("firewall-enforcement-reason") || undefined
+      };
+      const planId = value("firewall-plan-id");
+      if (planId) payload.plan_id = planId;
+      return await postJson("/host/security/firewall-policy/enforcement-plans", payload);
+    }
+    async function stageIdentityRotationRequest() {
+      return await postJson("/identity/rotation-requests", {
+        subject: value("identity-rotation-subject"),
+        subject_type: value("identity-rotation-subject-type") || "secret",
+        requested_by: value("identity-rotation-requested-by") || "odo",
+        reason: value("identity-rotation-reason") || "stage identity or secret rotation review",
+        urgency: value("identity-rotation-urgency") || "medium"
+      });
+    }
     async function prepareIdsReviewPackage() {
       const payload = {
         plan_id: value("ids-plan-id"),
@@ -1274,6 +1498,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const focus = (state.data.dashboard || {}).role_focus || {};
       const attention = (state.data.dashboard || {}).attention || {};
       const runtime = state.data.runtime || {};
+      const operations = state.data.operations || {};
+      const incidentLifecycle = state.data.incidentLifecycle || {};
+      const operationWorkflows = state.data.operationWorkflows || {};
+      const templates = operationWorkflows.templates || [];
       const crewSummary = (state.data.crewMessages || {}).summary || {};
       const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
       document.getElementById("overview").innerHTML = `
@@ -1295,6 +1523,49 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${crew("Dax", focus.dax)}
           ${crew("Julian", focus.julian)}
           <div class="panel span-12">${table("Recent Crew Dispatches", dispatches, ["occurred_at", "owner_domain", "event_type", "message_id", "reason"], {links: {owner_domain: (row) => domainView(row.owner_domain)}})}</div>
+          <div class="panel span-6">${table("Incident Board", operations.incidents || [], ["id", "severity", "owner", "status", "next_step"], {links: {owner: (row) => domainView(row.owner)}})}</div>
+          <div class="panel span-6">${table("Risk Register", operations.risk_register || [], ["id", "domain", "risk", "state", "next_review"], {links: {domain: (row) => domainView(row.domain)}})}</div>
+          <div class="panel span-12">${table("Incident Lifecycle", incidentLifecycle.items || [], ["id", "kind", "owner_domain", "status", "severity", "next_step"], {links: {owner_domain: (row) => domainView(row.owner_domain)}, fills: {id: (row) => operationFill(row)}, fillView: "overview"})}</div>
+          <div class="panel span-6">${table("Incident Sources", incidentLifecycle.health_items || [], ["id", "resource_id", "status", "owner_domain", "next_step"], {links: {owner_domain: (row) => domainView(row.owner_domain)}})}</div>
+          <div class="panel span-6">${table("Post Incident Checklist", incidentLifecycle.post_incident_checklist || [], ["step", "owner", "status"], {links: {owner: (row) => domainView(row.owner)}})}</div>
+          <div class="panel span-12">${table("Operations Coverage", operations.coverage || [], ["area", "status", "available", "next_gap"])}</div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Stage Operations Workflow</h3><button class="action-btn" data-action="stage-operation-workflow">Stage Workflow</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="op-workflow-template-id">Template</label><select id="op-workflow-template-id">${operationWorkflowOptions(templates)}</select></div>
+              <div class="field span-3"><label for="op-workflow-record-id">Record ID</label><input id="op-workflow-record-id" placeholder="optional"></div>
+              <div class="field span-3"><label for="op-workflow-resource-id">Resource</label><input id="op-workflow-resource-id" placeholder="optional"></div>
+              <div class="field span-3"><label for="op-workflow-requested-by">Requested By</label><input id="op-workflow-requested-by" value="sisko"></div>
+            </div>
+            ${table("Workflow Templates", templates, ["id", "kind", "owner_domain", "severity", "next_step"], {links: {owner_domain: (row) => domainView(row.owner_domain)}, fills: {id: (row) => operationWorkflowFill(row)}, fillView: "overview"})}
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Record Operation</h3><button class="action-btn" data-action="record-operation">Record</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="op-record-id">Record ID</label><input id="op-record-id" value="ops.incident.local"></div>
+              <div class="field span-2"><label for="op-kind">Kind</label><select id="op-kind">${operationKindOptions()}</select></div>
+              <div class="field span-2"><label for="op-owner">Owner</label><select id="op-owner">${ownerOptions()}</select></div>
+              <div class="field span-2"><label for="op-status">Status</label><select id="op-status">${operationStatusOptions()}</select></div>
+              <div class="field span-2"><label for="op-severity">Severity</label><select id="op-severity">${riskOptions()}</select></div>
+              <div class="field span-2"><label for="op-resource-id">Resource</label><input id="op-resource-id"></div>
+              <div class="field span-4"><label for="op-subject">Subject</label><input id="op-subject" value="Track operations workflow"></div>
+              <div class="field span-4"><label for="op-evidence-ids">Evidence IDs</label><input id="op-evidence-ids"></div>
+              <div class="field span-4"><label for="op-next-step">Next Step</label><input id="op-next-step" value="review and assign"></div>
+              <div class="field span-6"><label for="op-summary">Summary</label><textarea id="op-summary">Record the operational workflow and evidence needed.</textarea></div>
+              <div class="field span-6"><label for="op-metadata">Metadata</label><textarea id="op-metadata">{}</textarea></div>
+            </div>
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Transition Operation</h3><button class="action-btn" data-action="transition-operation">Transition</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="op-transition-record-id">Record ID</label><input id="op-transition-record-id" value="ops.incident.local"></div>
+              <div class="field span-3"><label for="op-transition-status">Status</label><select id="op-transition-status">${operationStatusOptions()}</select></div>
+              <div class="field span-3"><label for="op-transition-by">Updated By</label><input id="op-transition-by" value="sisko"></div>
+              <div class="field span-3"><label for="op-transition-next-step">Next Step</label><input id="op-transition-next-step" value="verify evidence and continue"></div>
+              <div class="field span-12"><label for="op-transition-note">Note</label><input id="op-transition-note" value="Lifecycle state updated from operator review."></div>
+            </div>
+          </div>
+          <div class="panel span-12">${table("Operation Records", (operations.operation_records || {}).items || [], ["id", "kind", "owner_domain", "status", "severity", "next_step"], {links: {owner_domain: (row) => domainView(row.owner_domain)}, fills: {id: (row) => operationFill(row)}, fillView: "overview"})}</div>
           ${officerPanel("sisko", "Command routing", "Coordinate this issue across the crew.")}
         </div>`;
     }
@@ -1303,10 +1574,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const auth = state.data.authorizations || {};
       const readiness = state.data.readiness || {};
       const activePolicy = state.data.activePolicy || {};
+      const complianceEvidence = state.data.complianceEvidence || {};
       const policyHelper = state.data.policyHelper || {};
       const packageStatus = state.data.packageStatus || {};
+      const softwareEvidence = state.data.softwareEvidence || {};
+      const advisories = state.data.advisories || softwareEvidence.advisories || {};
+      const maintenanceSchedules = state.data.maintenanceSchedules || {};
       const archivePlan = state.data.adminArchivePlan || {};
       const archives = state.data.adminArchives || {};
+      const operations = state.data.operations || {};
       const profile = activePolicy.profile || {};
       document.getElementById("admin").innerHTML = `
         <div class="grid">
@@ -1326,6 +1602,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-2"><label for="admin-package">Package</label><input id="admin-package"></div>
               <div class="field span-2"><label for="admin-port">Port</label><input id="admin-port" type="number" min="1" max="65535"></div>
               <div class="field span-6"><label for="admin-reason">Reason</label><input id="admin-reason" value="operator requested maintenance"></div>
+            </div>
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Maintenance Schedule</h3><button class="action-btn" data-action="record-maintenance-schedule">Record Schedule</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="maintenance-schedule-id">Schedule ID</label><input id="maintenance-schedule-id" value="schedule.weekly.updates"></div>
+              <div class="field span-3"><label for="maintenance-schedule-target">Target</label><input id="maintenance-schedule-target" value="local packages"></div>
+              <div class="field span-2"><label for="maintenance-schedule-recurrence">Recurrence</label><input id="maintenance-schedule-recurrence" value="weekly"></div>
+              <div class="field span-3"><label for="maintenance-schedule-window">Window</label><input id="maintenance-schedule-window" value="Sunday 02:00-04:00"></div>
+              <div class="field span-2"><label for="maintenance-schedule-timezone">Timezone</label><input id="maintenance-schedule-timezone" value="UTC"></div>
+              <div class="field span-3"><label for="maintenance-schedule-owner">Owner</label><select id="maintenance-schedule-owner">${ownerOptions()}</select></div>
+              <div class="field span-3"><label for="maintenance-schedule-risk">Risk</label><select id="maintenance-schedule-risk">${riskOptions()}</select></div>
+              <div class="field span-3"><label for="maintenance-schedule-status">Status</label><select id="maintenance-schedule-status">${maintenanceScheduleStatusOptions()}</select></div>
+              <div class="field span-3"><label for="maintenance-schedule-blackout">Blackout</label><input id="maintenance-schedule-blackout" value="none"></div>
+              <div class="field span-4"><label for="maintenance-schedule-validation">Validation</label><input id="maintenance-schedule-validation" value="run health probes and service evidence"></div>
+              <div class="field span-4"><label for="maintenance-schedule-rollback">Rollback</label><input id="maintenance-schedule-rollback" value="use related admin plan rollback steps"></div>
+              <div class="field span-4"><label for="maintenance-schedule-notes">Notes</label><input id="maintenance-schedule-notes"></div>
+              <div class="field span-12"><label for="maintenance-schedule-metadata">Metadata</label><textarea id="maintenance-schedule-metadata">{}</textarea></div>
             </div>
           </div>
           <div class="panel span-4">
@@ -1420,6 +1714,40 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Execution Readiness", readiness.items || [], ["id", "kind", "readiness_state", "next_step"], {fills: {id: (row) => adminPlanFill(row.id)}, fillView: "admin"})}</div>
           <div class="panel span-6">${table("Archive Candidates", archivePlan.items || [], ["plan_id", "disposition", "next_step"])}</div>
           <div class="panel span-6">${table("Archived Plans", archives.items || [], ["plan_id", "disposition", "archived_by", "archived_at"])}</div>
+          <div class="panel span-6">${table("Change Calendar", operations.change_calendar || [], ["id", "kind", "target", "status", "window", "rollback"], {fills: {id: (row) => adminPlanFill(row.id)}, fillView: "admin"})}</div>
+          <div class="panel span-6">${table("Maintenance Schedules", maintenanceSchedules.items || [], ["id", "target", "recurrence", "window", "timezone", "status"], {fills: {id: (row) => maintenanceScheduleFill(row)}, fillView: "admin"})}</div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Advisory Refresh</h3><button class="action-btn" data-action="refresh-advisories">Refresh Advisories</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="advisory-packages">Packages</label><textarea id="advisory-packages">${safe((advisories.requested_packages || []).join(", ") || "openssl, openssh, sudo, curl, apt, dpkg, systemd, python3")}</textarea></div>
+              <div class="field span-2"><label for="advisory-source">Source</label><select id="advisory-source">${advisorySourceOptions()}</select></div>
+              <div class="field span-2"><label for="advisory-max-results">Max Results</label><input id="advisory-max-results" type="number" min="1" max="20" value="5"></div>
+              <div class="field span-2"><label for="advisory-requested-by">Requested By</label><input id="advisory-requested-by" value="obrien"></div>
+              <div class="field span-3 inline-check"><label for="advisory-dry-run"><input id="advisory-dry-run" type="checkbox"> Dry Run</label></div>
+            </div>
+          </div>
+          <div class="panel span-6">${kv("Advisory Feed Status", {
+            status: advisories.status,
+            cached_records: advisories.cached_records,
+            finding_count: advisories.finding_count,
+            oldest_cache_age_seconds: advisories.oldest_cache_age_seconds,
+            next_step: advisories.next_step
+          })}</div>
+          <div class="panel span-6">${table("Advisory Sources", advisories.sources || [], ["source", "name", "status", "url"], {links: {url: (row) => row.url}})}</div>
+          <div class="panel span-6">${table("Advisory Package Summary", advisories.package_summary || [], ["package", "findings", "critical", "high", "medium", "low", "next_step"])}</div>
+          <div class="panel span-6">${kv("Advisory Severity", advisories.by_severity || {})}</div>
+          <div class="panel span-12">${table("Advisory Findings", advisories.findings || [], ["package", "source", "cve_id", "severity", "published", "last_modified", "summary", "url"], {links: {url: (row) => row.url}})}</div>
+          <div class="panel span-6">${table("Patch And Software Inventory", [operations.software_inventory || {}], ["dpkg_packages", "held_packages", "pip_packages", "flatpak_apps", "next_step"])}</div>
+          <div class="panel span-6">${table("Package Manager Evidence", softwareEvidence.package_managers || [], ["manager", "available"])}</div>
+          <div class="panel span-6">${table("Package Provenance", softwareEvidence.provenance || [], ["source", "present", "status"])}</div>
+          <div class="panel span-6">${table("Release Note References", softwareEvidence.release_notes || [], ["path", "present", "status"])}</div>
+          <div class="panel span-12">${table("Patch Readiness", softwareEvidence.patch_readiness || [], ["check", "status", "next_step"])}</div>
+          <div class="panel span-12">${table("Compliance And Drift", operations.compliance || [], ["area", "status", "evidence", "next_step"])}</div>
+          <div class="panel span-6">${table("Policy Exceptions", complianceEvidence.policy_exceptions || [], ["approval_id", "subject_id", "status", "level", "owner_domain"], {fills: {approval_id: (row) => ({ "admin-approval-plan-id": row.subject_id || "" })}, fillView: "admin"})}</div>
+          <div class="panel span-6">${table("Desired State Baselines", complianceEvidence.desired_state || [], ["area", "path", "present", "status"])}</div>
+          <div class="panel span-6">${table("Desired State Drift", complianceEvidence.desired_state_drift || [], ["area", "expected", "status", "next_step"])}</div>
+          <div class="panel span-6">${table("Local Secret Guards", complianceEvidence.local_secret_guards || [], ["pattern", "present", "status"])}</div>
+          <div class="panel span-6">${table("Compliance Evidence Matrix", complianceEvidence.evidence_matrix || [], ["area", "records", "status"])}</div>
           ${officerPanel("sisko", "Administrative decision", "Plan, approve, or coordinate a protected administrative change.")}
           ${officerPanel("obrien", "Maintenance deployment", "Schedule updates, patches, or service maintenance.")}
         </div>`;
@@ -1427,6 +1755,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderAssets() {
       const physical = state.data.physical || {};
       const virtual = state.data.virtual || {};
+      const operations = state.data.operations || {};
+      const storageEvidence = state.data.storageEvidence || {};
+      const backupOperations = state.data.backupOperations || {};
       document.getElementById("assets").innerHTML = `
         <div class="grid">
           ${stationIntro("Kira / Dax", "Asset Control", "Physical inventory and virtual checkout surfaces.", ["USB and storage", "listeners", "virtual assets"])}
@@ -1436,7 +1767,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Virtual", virtual.assets, "assets", "span-3", "", "assets")}
           ${metric("Active Claims", virtual.active_claims, "virtual", "span-3", virtual.active_claims ? "warn" : "good", "claims")}
           <div class="panel span-12">
-            <div class="toolbar"><h3>Register Resource</h3><button class="action-btn" data-action="register-resource">Record Resource</button></div>
+            <div class="toolbar"><h3>Resource Registry</h3><button class="action-btn" data-action="register-resource">Record Resource</button></div>
             <div class="form-grid">
               <div class="field span-2"><label for="resource-id">Resource ID</label><input id="resource-id" value="svc.local.service"></div>
               <div class="field span-2"><label for="resource-name">Name</label><input id="resource-name" value="Local Service"></div>
@@ -1448,6 +1779,48 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-6">${table("Physical Assets", physical.items || [], ["id", "kind", "stable_id", "checkout_ready"], {fills: {id: (row) => resourceClaimFill(row.id, "kira")}, fillView: "claims"})}</div>
           <div class="panel span-6">${table("Virtual Assets", virtual.items || [], ["id", "name", "state", "current_claim_id"], {fills: {id: (row) => resourceClaimFill(row.id, "dax"), current_claim_id: (row) => claimFill(row.current_claim_id)}, fillView: "claims"})}</div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Backup Job Registry</h3><button class="action-btn" data-action="record-backup-job">Record Job</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="backup-job-id">Job ID</label><input id="backup-job-id" value="backup.local.state"></div>
+              <div class="field span-3"><label for="backup-target">Target</label><input id="backup-target" value="state/"></div>
+              <div class="field span-2"><label for="backup-schedule">Schedule</label><input id="backup-schedule" value="manual"></div>
+              <div class="field span-2"><label for="backup-retention">Retention</label><input id="backup-retention" value="operator-defined"></div>
+              <div class="field span-1"><label for="backup-risk">Risk</label><select id="backup-risk">${riskOptions()}</select></div>
+              <div class="field span-1"><label for="backup-status">Status</label><input id="backup-status" value="staged"></div>
+              <div class="field span-1"><label for="backup-requested-by">By</label><input id="backup-requested-by" value="kira"></div>
+              <div class="field span-12"><label for="backup-notes">Notes</label><input id="backup-notes"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Restore Test Record</h3><button class="action-btn" data-action="record-restore-test">Record Test</button></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="restore-test-id">Test ID</label><input id="restore-test-id" value="restore.local.state"></div>
+              <div class="field span-4"><label for="restore-job-id">Job ID</label><input id="restore-job-id" value="backup.local.state"></div>
+              <div class="field span-4"><label for="restore-point">Restore Point</label><input id="restore-point" value="backups/restore-test.md"></div>
+              <div class="field span-4"><label for="restore-status">Status</label><input id="restore-status" value="planned"></div>
+              <div class="field span-4"><label for="restore-validated-by">Validated By</label><input id="restore-validated-by" value="kira"></div>
+              <div class="field span-12"><label for="restore-notes">Notes</label><input id="restore-notes"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Backup Cleanup Request</h3><button class="action-btn" data-action="stage-backup-cleanup-request">Stage Request</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="backup-cleanup-path">Path</label><input id="backup-cleanup-path" value="artifacts"></div>
+              <div class="field span-3"><label for="backup-cleanup-requested-by">Requested By</label><input id="backup-cleanup-requested-by" value="kira"></div>
+              <div class="field span-12"><label for="backup-cleanup-reason">Reason</label><input id="backup-cleanup-reason" value="review generated storage cleanup candidate"></div>
+            </div>
+          </div>
+          <div class="panel span-6">${table("Storage And Backup", [operations.storage_backup || {}], ["mount_rows", "backup_markers", "restore_tests", "next_step"])}</div>
+          <div class="panel span-6">${table("Mount Health", storageEvidence.mounts || [], ["source", "type", "available", "use_percent", "mount", "status"])}</div>
+          <div class="panel span-6">${table("SMART Health", storageEvidence.smart_health || [], ["device", "available", "status", "exit_code"])}</div>
+          <div class="panel span-6">${table("Backup Markers", storageEvidence.backup_markers || [], ["path", "kind", "status"])}</div>
+          <div class="panel span-12">${table("Backup Jobs", backupOperations.jobs || storageEvidence.backup_jobs || [], ["id", "target", "schedule", "retention", "status", "next_step"], {fills: {id: (row) => backupJobFill(row)}, fillView: "assets"})}</div>
+          <div class="panel span-12">${table("Restore Tests", backupOperations.restore_tests || storageEvidence.restore_tests || [], ["id", "job_id", "restore_point", "status", "validated_by", "next_step"], {fills: {id: (row) => restoreTestFill(row), job_id: (row) => backupJobFill({id: row.job_id})}, fillView: "assets"})}</div>
+          <div class="panel span-12">${table("Backup Cleanup Requests", backupOperations.cleanup_requests || storageEvidence.cleanup_requests || [], ["id", "path", "status", "approval_required", "next_step"], {fills: {path: (row) => backupCleanupFill(row)}, fillView: "assets"})}</div>
+          <div class="panel span-6">${table("Storage Cleanup Candidates", storageEvidence.cleanup_candidates || [], ["path", "kind", "status"])}</div>
+          <div class="panel span-6">${kv("Capacity Summary", storageEvidence.capacity_summary || {})}</div>
+          <div class="panel span-6">${table("Physical Lifecycle", operations.physical_lifecycle || [], ["stable_id", "kind", "checkout_ready", "power_risk", "storage_risk", "next_step"], {fills: {stable_id: (row) => resourceClaimFill(row.stable_id, "kira")}, fillView: "claims"})}</div>
           ${officerPanel("kira", "Physical asset issue", "Handle a USB, serial, power, storage, or connected-device issue.")}
           ${officerPanel("dax", "Virtual asset checkout", "Handle an emulator, VM, gateway, proxy, listener, or virtual checkout issue.")}
         </div>`;
@@ -1455,6 +1828,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function renderClaims() {
       const claims = state.data.claims || {};
       const cleanup = state.data.claimCleanup || {};
+      const operations = state.data.operations || {};
+      const virtualEvidence = state.data.virtualEvidence || {};
+      const virtualOperations = state.data.virtualOperations || {};
       document.getElementById("claims").innerHTML = `
         <div class="grid">
           ${stationIntro("Dax", "Deconfliction Matrix", "Claims, leases, locks, and cleanup handoffs.", ["active claims", "approvals", "cleanup"])}
@@ -1511,8 +1887,46 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-2"><label for="cleanup-executed-by">Executed By</label><input id="cleanup-executed-by" value="sisko"></div>
             </div>
           </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Virtual Runtime Record</h3><button class="action-btn" data-action="record-virtual-runtime">Record Runtime</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="virtual-resource-id">Resource ID</label><input id="virtual-resource-id" value="vm.local.resource"></div>
+              <div class="field span-2"><label for="virtual-kind">Kind</label><input id="virtual-kind" value="vm"></div>
+              <div class="field span-2"><label for="virtual-state">State</label><input id="virtual-state" value="observed"></div>
+              <div class="field span-2"><label for="virtual-adapter">Adapter</label><input id="virtual-adapter" value="manual"></div>
+              <div class="field span-3"><label for="virtual-ports">Ports</label><input id="virtual-ports" placeholder="8000, 8443"></div>
+              <div class="field span-4"><label for="virtual-snapshot-hint">Snapshot Hint</label><input id="virtual-snapshot-hint"></div>
+              <div class="field span-8"><label for="virtual-notes">Notes</label><input id="virtual-notes" value="record observed virtual runtime state"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Virtual Snapshot Request</h3><button class="action-btn" data-action="stage-virtual-snapshot-request">Stage Snapshot</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="snapshot-resource-id">Resource ID</label><input id="snapshot-resource-id" value="vm.local.resource"></div>
+              <div class="field span-6"><label for="snapshot-name">Snapshot Name</label><input id="snapshot-name" value="before-maintenance"></div>
+              <div class="field span-4"><label for="snapshot-requested-by">Requested By</label><input id="snapshot-requested-by" value="dax"></div>
+              <div class="field span-8"><label for="snapshot-reason">Reason</label><input id="snapshot-reason" value="stage virtual snapshot before maintenance"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Virtual Restore Request</h3><button class="action-btn" data-action="stage-virtual-restore-request">Stage Restore</button></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="restore-virtual-resource-id">Resource ID</label><input id="restore-virtual-resource-id" value="vm.local.resource"></div>
+              <div class="field span-6"><label for="restore-virtual-point">Restore Point</label><input id="restore-virtual-point" value="before-maintenance"></div>
+              <div class="field span-4"><label for="restore-virtual-requested-by">Requested By</label><input id="restore-virtual-requested-by" value="dax"></div>
+              <div class="field span-8"><label for="restore-virtual-reason">Reason</label><input id="restore-virtual-reason" value="stage virtual restore after failed change"></div>
+            </div>
+          </div>
           <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"], {fills: {id: (row) => claimFill(row.id), resource_id: (row) => resourceClaimFill(row.resource_id, row.owner_role || "dax")}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"], {fills: {id: (row) => cleanupFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Virtual Runtime Evidence", virtualEvidence.items || [], ["resource_id", "kind", "state", "ports", "active_claims", "snapshot_status", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Virtual Runtime Records", virtualOperations.runtime_records || virtualEvidence.runtime_records || [], ["resource_id", "kind", "state", "adapter", "ports", "next_step"], {fills: {resource_id: (row) => virtualRuntimeFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Virtual Snapshot Requests", virtualOperations.snapshot_requests || virtualEvidence.snapshot_requests || [], ["id", "resource_id", "status", "approval_required", "next_step"], {fills: {resource_id: (row) => virtualSnapshotFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Virtual Restore Requests", virtualOperations.restore_requests || virtualEvidence.restore_requests || [], ["id", "resource_id", "restore_point", "status", "approval_required"], {fills: {resource_id: (row) => virtualRestoreFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Runtime Adapter Availability", virtualEvidence.runtime_adapters || [], ["adapter", "available", "status", "mutation_boundary"])}</div>
+          <div class="panel span-6">${table("Port Pool Evidence", virtualEvidence.port_pool || [], ["port", "owner_count", "status", "owners"])}</div>
+          <div class="panel span-6">${table("Virtual Cleanup Evidence", virtualEvidence.cleanup || [], ["claim_id", "resource_id", "status", "next_step"], {fills: {claim_id: (row) => cleanupFill({id: row.claim_id})}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Virtual Runtime Inventory", operations.virtual_runtime || [], ["resource_id", "kind", "state", "ports", "active_claims", "cleanup_candidates", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
           ${officerPanel("dax", "Checkout conflict", "Deconflict a claim, lease, lock, or cleanup request.")}
         </div>`;
     }
@@ -1522,6 +1936,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const plans = (security.protective_plans || {}).items || [];
       const listenerQueue = state.data.listenerReviewQueue || {};
       const sourceQueue = state.data.sourceReviewQueue || {};
+      const securityEvidence = state.data.securityEvidence || {};
+      const identityEvidence = state.data.identityEvidence || {};
+      const identityRotationRequests = state.data.identityRotationRequests || {};
+      const operations = state.data.operations || {};
       document.getElementById("security").innerHTML = `
         <div class="grid">
           ${stationIntro("Odo", "Security Board", "Host inspection, source review, and protective action staging.", ["listeners", "source review", "IDS package"])}
@@ -1562,6 +1980,25 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
+            <div class="toolbar"><h3>Firewall Policy Enforcement</h3><button class="action-btn" data-action="stage-firewall-policy-enforcement">Stage Enforcement</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="firewall-rule-index">Rule Index</label><input id="firewall-rule-index" type="number" min="0" value="0"></div>
+              <div class="field span-5"><label for="firewall-plan-id">Plan ID</label><input id="firewall-plan-id"></div>
+              <div class="field span-4"><label for="firewall-requested-by">Requested By</label><input id="firewall-requested-by" value="odo"></div>
+              <div class="field span-12"><label for="firewall-enforcement-reason">Reason</label><input id="firewall-enforcement-reason" value="stage desired firewall policy enforcement for IDS review"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Identity Rotation Request</h3><button class="action-btn" data-action="stage-identity-rotation-request">Stage Request</button></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="identity-rotation-subject">Subject</label><input id="identity-rotation-subject" value="local secret"></div>
+              <div class="field span-3"><label for="identity-rotation-subject-type">Type</label><select id="identity-rotation-subject-type">${identitySubjectTypeOptions()}</select></div>
+              <div class="field span-2"><label for="identity-rotation-urgency">Urgency</label><select id="identity-rotation-urgency">${riskOptions()}</select></div>
+              <div class="field span-3"><label for="identity-rotation-requested-by">Requested By</label><input id="identity-rotation-requested-by" value="odo"></div>
+              <div class="field span-12"><label for="identity-rotation-reason">Reason</label><input id="identity-rotation-reason" value="stage identity or secret rotation review"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
             <div class="toolbar"><h3>IDS Review</h3><div class="actions"><button class="action-btn" data-action="prepare-ids-review-package">Prepare</button><button class="action-btn" data-action="export-ids-review-prompt">Export</button><button class="action-btn" data-action="dispatch-ids-review-package">Dispatch</button><button class="action-btn" data-action="record-ids-review-result">Record</button></div></div>
             <div class="form-grid">
               <div class="field span-4"><label for="ids-plan-id">Plan ID</label><input id="ids-plan-id"></div>
@@ -1582,13 +2019,32 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-4">${kv("IDS Review", security.ids_review || {})}</div>
           <div class="panel span-12">${table("Listener Review Queue", listenerQueue.items || [], ["listener", "bind_scope", "severity", "queue_status", "plan_id", "next_step"], {fills: {listener: (row) => listenerFill(row), plan_id: (row) => adminPlanFill(row.plan_id)}, fillView: "security"})}</div>
           <div class="panel span-12">${table("Source Review Queue", sourceQueue.items || [], ["remote_address", "listener", "source_scope", "disposition", "queue_status", "next_step"], {fills: {remote_address: (row) => sourceReviewFill(row), listener: (row) => sourceReviewFill(row)}, fillView: "security"})}</div>
+          <div class="panel span-6">${table("Security Baseline Checks", securityEvidence.baseline_checks || [], ["check", "status", "evidence", "next_step"])}</div>
+          <div class="panel span-6">${table("Firewall Provenance", securityEvidence.firewall_provenance || [], ["name", "status", "exit_code", "summary"])}</div>
+          <div class="panel span-12">${table("Firewall Policy Diff", securityEvidence.firewall_policy_diff || [], ["index", "action", "port", "status", "next_step", "rule"], {fills: {index: (row) => firewallPolicyFill(row), rule: (row) => firewallPolicyFill(row)}, fillView: "security"})}</div>
+          <div class="panel span-12">${table("Listener Exposure Evidence", securityEvidence.listener_exposure || [], ["id", "severity", "summary", "recommended_action"], {fills: {id: (row) => ({ "op-record-id": `ops.security.${row.id || "finding"}`, "op-kind": "security_baseline", "op-owner": "odo", "op-status": "staged", "op-severity": row.severity === "high" ? "high" : "medium", "op-subject": row.summary || "Security exposure review", "op-summary": row.evidence || "", "op-next-step": row.recommended_action || "stage security review" })}, fillView: "overview"})}</div>
+          <div class="panel span-12">${table("Protective Plan Provenance", securityEvidence.protective_plan_provenance || [], ["id", "kind", "target", "approved", "canceled", "rollback"], {fills: {id: (row) => adminPlanFill(row.id)}, fillView: "admin"})}</div>
+          <div class="panel span-6">${table("Security Baseline Drift", operations.security_drift || [], ["check", "status", "evidence", "next_step"])}</div>
+          <div class="panel span-6">${table("Identity And Secrets", [operations.identity_access || {}], ["local_users", "local_groups", "service_accounts", "public_ssh_keys", "next_step"])}</div>
+          <div class="panel span-12">${table("Identity Access Review", identityEvidence.users || [], ["user", "uid", "account_type", "home", "login_shell"])}</div>
+          <div class="panel span-6">${table("SSH Key Custody", identityEvidence.ssh_keys || [], ["path", "kind", "fingerprint", "status"], {fills: {path: (row) => identityRotationFill({...row, subject_type: "ssh_key"})}, fillView: "security"})}</div>
+          <div class="panel span-6">${table("Secret File Custody", identityEvidence.secret_files || [], ["path", "status", "content"], {fills: {path: (row) => identityRotationFill({...row, subject_type: "secret"})}, fillView: "security"})}</div>
+          <div class="panel span-12">${table("Rotation Reminders", identityEvidence.rotation_reminders || [], ["area", "items", "next_step"], {fills: {area: (row) => identityRotationFill(row)}, fillView: "security"})}</div>
+          <div class="panel span-12">${table("Identity Rotation Requests", identityRotationRequests.requests || identityEvidence.rotation_requests || [], ["id", "subject_type", "subject", "urgency", "status", "approval_required", "next_step"], {fills: {subject: (row) => identityRotationFill(row), id: (row) => identityRotationFill(row)}, fillView: "security"})}</div>
+          <div class="panel span-12">${table("Network Gateway Analysis", [operations.network || {}], ["interfaces", "routes", "dns_servers", "listener_rows", "gateway_routes", "next_step"])}</div>
           ${officerPanel("odo", "Security investigation", "Investigate traffic, exposed listeners, intrusion signals, or protective actions.")}
         </div>`;
     }
     function renderHealth() {
       const health = state.data.health || {};
       const healthSummary = state.data.healthSummary || {};
+      const serviceEvidence = state.data.serviceEvidence || {};
+      const journalAccess = serviceEvidence.journal_access || {};
+      const observabilityTrends = state.data.observabilityTrends || {};
+      const metricHistory = state.data.metricHistory || {};
+      const performanceHistory = state.data.performanceHistory || {};
       const runtime = state.data.runtime || {};
+      const operations = state.data.operations || {};
       document.getElementById("health").innerHTML = `
         <div class="grid">
           ${stationIntro("Julian", "Diagnostics Lab", "Service health, probe failures, and runtime freshness.", ["probes", "MCP checks", "HTML and JSON"])}
@@ -1624,7 +2080,45 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="health-target">Target</label><input id="health-target" value="http://127.0.0.1:8766/health"></div>
             </div>
           </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>System Journal Access Request</h3><button class="action-btn" data-action="stage-journal-access-request">Stage Request</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="journal-resource-id">Resource ID</label><input id="journal-resource-id" value="svc.system.service"></div>
+              <div class="field span-3"><label for="journal-unit">Unit</label><input id="journal-unit" value="example.service"></div>
+              <div class="field span-2"><label for="journal-requested-by">Requested By</label><input id="journal-requested-by" value="julian"></div>
+              <div class="field span-4"><label for="journal-reason">Reason</label><input id="journal-reason" value="system journal access needed for service diagnosis"></div>
+            </div>
+          </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Metric History Capture</h3><button class="action-btn" data-action="capture-metric-history">Capture Metrics</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="metric-history-id">Snapshot ID</label><input id="metric-history-id" placeholder="optional"></div>
+              <div class="field span-2"><label for="metric-history-requested-by">Requested By</label><input id="metric-history-requested-by" value="julian"></div>
+              <div class="field span-2"><label for="metric-history-retention">Retention</label><input id="metric-history-retention" type="number" min="1" value="250"></div>
+              <div class="field span-5"><label for="metric-history-notes">Notes</label><input id="metric-history-notes" value="capture retained observability trends"></div>
+            </div>
+          </div>
           <div class="panel span-12">${table("Health Targets", healthSummary.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id, "health-name": row.name || "" })}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("Service Evidence", serviceEvidence.items || [], ["resource_id", "unit", "health", "health_error", "executions", "next_step"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-6">${kv("Journal Access Status", {
+            journalctl_available: journalAccess.journalctl_available,
+            user_journal_access: journalAccess.user_journal_access?.available,
+            system_journal_access: journalAccess.system_journal_access?.available,
+            next_step: journalAccess.next_step
+          })}</div>
+          <div class="panel span-6">${table("System Journal Requests", journalAccess.system_review_requests || [], ["resource_id", "unit", "scope", "approval_required", "status", "next_step"], {fills: {resource_id: (row) => journalAccessFill(row), unit: (row) => journalAccessFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-6">${table("Service Validation Checklist", serviceValidationRows(serviceEvidence.items || []), ["resource_id", "step", "status"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-6">${table("Redacted Service Logs", serviceLogRows(serviceEvidence.items || []), ["resource_id", "target_id", "path", "readable", "lines"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("Journal Excerpts", serviceJournalRows(serviceEvidence.items || []), ["resource_id", "unit", "available", "exit_code", "error"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-6">${table("Host Resources", [operations.host_resources || {}], ["load_1m", "memory_available_mb", "root_free_gb", "processes", "thermal_zones"])}</div>
+          <div class="panel span-6">${table("Log Evidence", operations.log_evidence || [], ["target_id", "resource_id", "kind", "status", "latest_evidence"])}</div>
+          <div class="panel span-12">${table("Service Details", operations.service_details || [], ["resource_id", "name", "state", "health", "targets", "dependencies", "admin_plans"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id, "health-name": row.name || "" })}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("Service Actions", operations.service_actions || [], ["resource_id", "action", "status", "approval", "existing_plans"], {fills: {resource_id: (row) => ({ "admin-target": row.resource_id, "admin-kind": "user_service_restart", "admin-reason": `stage ${row.action} for ${row.resource_id}` })}, fillView: "admin"})}</div>
+          <div class="panel span-12">${table("Observability And Performance", operations.observability || [], ["resource_id", "status", "recovery_required", "evidence", "history_records"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id })}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("Health Trend History", observabilityTrends.resource_trends || [], ["resource_id", "samples", "healthy", "unhealthy", "latest_status", "error_rate_status"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id })}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("Metric History Snapshots", metricHistory.snapshots || [], ["id", "captured_at", "requested_by", "resource_count", "attention_resources", "next_step"], {fills: {id: (row) => metricHistoryFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("Performance Regression History", performanceHistory.reports || [], ["report", "status", "operator_performance_status", "operator_performance_seconds", "operator_functional_seconds", "project_regression_seconds", "next_step"])}</div>
+          <div class="panel span-12">${table("Host Snapshot Trend", observabilityTrends.host_snapshot_trends || [], ["snapshot_id", "captured_at", "hostname", "observation_count"])}</div>
           ${officerPanel("julian", "Service health issue", "Diagnose MCP, HTTP, HTML, JSON, process, or probe failures.")}
         </div>`;
     }
@@ -1644,13 +2138,31 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function adminKindOptions() {
-      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "flatpak_install", "npm_global_install", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function sourceDispositionOptions() {
       return ["needs_review", "expected", "benign", "suspicious", "hostile"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
+    function identitySubjectTypeOptions() {
+      return ["secret", "ssh_key", "api_key", "service_account", "user", "group"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
     function idsReviewStatusOptions() {
       return ["accepted", "revision_required"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function operationKindOptions() {
+      return ["incident", "maintenance_window", "service_detail", "security_baseline", "network_route", "storage_backup", "physical_lifecycle", "virtual_runtime", "observability_trend", "usage_cost", "compliance_drift", "document_freshness", "identity_access"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function operationStatusOptions() {
+      return ["open", "triaged", "staged", "waiting_approval", "in_progress", "verified", "closed", "blocked"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function maintenanceScheduleStatusOptions() {
+      return ["active", "paused", "retired"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function advisorySourceOptions() {
+      return ["nvd", "debian", "both"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function operationWorkflowOptions(templates) {
+      return (templates || []).map((item) => `<option value="${safe(item.id)}">${safe(item.id)}</option>`).join("");
     }
     function policyQuestionControls(questions) {
       return (questions || []).map((question) => {
@@ -1680,6 +2192,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function renderUsage() {
       const usage = state.data.usage || {};
+      const operations = state.data.operations || {};
+      const usageEvidence = state.data.usageEvidence || {};
       document.getElementById("usage").innerHTML = `
         <div class="grid">
           ${stationIntro("Quark", "Quota Exchange", "Usage-limited services, renewal windows, and continuation dispatch.", ["API-keyed MCP", "renewals", "queued work"])}
@@ -1725,23 +2239,53 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"], {fills: {limit_id: (row) => usageLimitFill(row), resource_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
+          <div class="panel span-12">${table("Quota Evidence", usageEvidence.limit_evidence || [], ["limit_id", "resource_id", "remaining", "capacity", "usage_percent", "status", "next_step"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
+          <div class="panel span-6">${table("Continuation Queue Evidence", usageEvidence.continuation_queue || [], ["request_id", "limit_id", "owner_thread", "requested_units", "status"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
+          <div class="panel span-6">${table("Usage Allocation By Thread", usageEvidence.allocation_by_thread || [], ["owner_thread", "requests", "requested_units", "status"])}</div>
+          <div class="panel span-12">${table("Cost And Forecast Coverage", operations.usage_costs || [], ["limit_id", "remaining", "capacity", "queued_requests", "cost_tracking", "forecast"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           ${officerPanel("quark", "MCP API quota scheduling", "Track API-keyed MCP call limits and schedule continuation after the quota window resets.", "limit.mcp.api.calls.daily")}
         </div>`;
     }
     function renderEzri() {
       const status = state.data.documentsStatus || {};
+      const git = state.data.gitStatus || {};
+      const gitAccount = git.account || {};
       const notes = state.data.documentsNotes || {};
       const capture = state.data.knowledgeCapturePlan || {};
-      const files = (notes.files || []).map((file) => ({file}));
+      const documentationEvidence = state.data.documentationEvidence || {};
+      const currentFolder = notes.folder || state.documentsFolder || "Overseer";
+      state.documentsFolder = currentFolder;
+      const files = (notes.files || []).map((file) => ({
+        file,
+        kind: String(file).endsWith("/") ? "folder" : "note",
+        path: documentChildPath(currentFolder, file)
+      }));
+      const repos = gitAccount.repositories || [];
       const captureItems = capture.items || [];
       const captureTone = capture.failed ? "bad" : capture.candidate_count ? "pending" : "good";
+      const gitTone = git.conflicted ? "bad" : git.dirty ? "warn" : "good";
+      const gitRemote = git.remote || {};
+      const gitLinks = git.links || {};
+      const linkRows = [
+        {label: "Repository", url: gitLinks.repository},
+        {label: "Branch", url: gitLinks.branch},
+        {label: "Commit", url: gitLinks.commit},
+        {label: "Pull Requests", url: gitLinks.pulls},
+        {label: "Actions", url: gitLinks.actions}
+      ].filter((row) => row.url);
+      const workflows = ezriWorkflowRows();
+      const operations = state.data.operations || {};
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
-          ${stationIntro("Ezri", "Knowledge Base", "Operational notes, event capture, runbooks, and vault search.", ["documents", "capture", "runbooks"])}
+          ${stationIntro("Ezri", "Knowledge Base", "Operational notes, git state, event capture, runbooks, and vault search.", ["documents", "git", "runbooks"])}
           ${metric("REST API", status.available ? "online" : "offline", "Obsidian Local REST", "span-3", status.available ? "good" : "bad", "ezri")}
           ${metric("Auth", status.authenticated ? "valid" : "blocked", "stored bearer token", "span-3", status.authenticated ? "good" : "warn", "ezri")}
           ${metric("Vault Notes", notes.count, notes.folder || "Overseer", "span-3", "", "ezri")}
           ${metric("Capture Queue", capture.candidate_count, "crew and audit events", "span-3", captureTone, "ezri")}
+          ${metric("Repositories", gitAccount.repository_count ?? 0, gitAccount.root || "workspace", "span-3", repos.length ? "good" : "inactive", "ezri")}
+          ${metric("Dirty Repos", gitAccount.dirty_count ?? 0, "account working trees", "span-3", gitAccount.dirty_count ? "warn" : "good", "ezri")}
+          ${metric("Remote Repos", gitAccount.with_remote_count ?? 0, "linked to Git remotes", "span-3", gitAccount.with_remote_count ? "good" : "inactive", "ezri")}
+          ${metric("Current Repo", gitRemote.repo || git.branch || "none", gitRemote.owner || "local only", "span-3", gitRemote.web_url ? "good" : gitTone, "ezri")}
           <div class="panel span-6">${kv("Documents Runtime", {
             service: status.service || "unavailable",
             status: status.available ? "online" : "offline",
@@ -1750,13 +2294,33 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             plugin: status.manifest?.version,
             writes: (status.allowed_write_prefixes || []).join(", ")
           })}</div>
-          <div class="panel span-6">${table("Current Folder", files, ["file"], {fills: {file: (row) => ({ "documents-note-path": row.file || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${kv("Git Runtime", {
+            repository: git.repo_path,
+            account_root: gitAccount.root,
+            branch: git.branch,
+            head: git.short_head,
+            upstream: git.upstream,
+            dirty: git.dirty ? "yes" : "no",
+            conflicted: git.conflicted || 0,
+            remote: gitRemote.web_url
+          })}</div>
+          <div class="panel span-12">${table("Account Repositories", repos, ["relative_path", "branch", "dirty", "changed", "remote_owner", "remote_repo"], {external: {remote_repo: (row) => row.remote_url}, fills: {relative_path: (row) => ({ "documents-query": row.relative_path || row.name || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("Current Repo Links", linkRows, ["label", "url"], {external: {url: true}})}</div>
+          <div class="panel span-6">${table("Current Working Tree", git.status_lines || [], ["status", "path"])}</div>
+          <div class="panel span-12 workflow-panel">${table("Workflows", workflows, ["workflow", "page", "owner", "action", "source"], {limit: 80, fills: {workflow: (row) => workflowFill(row), source: (row) => workflowFill(row)}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("Documentation Coverage", [operations.documentation || {}], ["docs_count", "expected_runbooks", "present_runbooks", "missing_runbooks", "next_step"])}</div>
+          <div class="panel span-6">${table("Runbook Coverage", documentationEvidence.runbook_coverage || [], ["runbook", "present", "status"], {fills: {runbook: (row) => ({ "documents-note-path": row.path || "", "documents-query": row.runbook || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("Workflow Coverage", documentationEvidence.workflow_coverage || [], ["workflow", "source", "status"], {limit: 40, fills: {workflow: (row) => ({ "documents-query": row.workflow || "", "documents-note-path": row.source || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("Stale Document Candidates", documentationEvidence.stale_documents || [], ["path", "age_days", "status"], {fills: {path: (row) => ({ "documents-note-path": row.path || "", "documents-query": row.path || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("ADR Index", documentationEvidence.adr_index || [], ["path", "status"], {fills: {path: (row) => ({ "documents-note-path": row.path || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("Release Index", documentationEvidence.release_index || [], ["path", "status"], {fills: {path: (row) => ({ "documents-note-path": row.path || "" })}, fillView: "ezri"})}</div>
+          <div class="panel span-6">${table("Current Folder", files, ["kind", "file"], {fills: {file: (row) => documentFileFill(row)}, fillActions: {file: (row) => row.kind === "folder" ? "documents-list-notes" : ""}, fillView: "ezri"})}</div>
           <div class="panel span-6">
             <div class="toolbar"><h3>Search and List</h3><div class="actions"><button class="action-btn" data-action="documents-search">Search</button><button class="action-btn" data-action="documents-list-notes">List Folder</button></div></div>
             <div class="form-grid">
-              <div class="field span-6"><label for="documents-query">Query</label><input id="documents-query" value="Overseer"></div>
+              <div class="field span-6"><label for="documents-query">Query</label><input id="documents-query" value="${safe(state.documentsQuery || "Overseer")}"></div>
               <div class="field span-3"><label for="documents-context-length">Context</label><input id="documents-context-length" type="number" min="0" value="100"></div>
-              <div class="field span-3"><label for="documents-folder">Folder</label><input id="documents-folder" value="Overseer"></div>
+              <div class="field span-3"><label for="documents-folder">Folder</label><input id="documents-folder" value="${safe(currentFolder)}"></div>
             </div>
           </div>
           <div class="panel span-6">
@@ -1776,6 +2340,82 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           ${officerPanel("ezri", "Documentation support", "Capture, find, summarize, or update Overseer docs, runbooks, decisions, and troubleshooting notes.")}
         </div>`;
+    }
+    function ezriWorkflowRows() {
+      const source = "Overseer/Runbooks/operator-workflows.md";
+      return [
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "open drilldown", source, query: "Review command status"},
+        {workflow: "Record an operations workflow", page: "Overview", owner: "Sisko / Ezri", action: "record-operation", source, query: "Record an operations workflow"},
+        {workflow: "Stage a gap workflow from a template", page: "Overview", owner: "Sisko / Ezri", action: "stage-operation-workflow", source, query: "Stage a gap workflow from a template"},
+        {workflow: "Transition an operations record", page: "Overview", owner: "Sisko", action: "transition-operation", source, query: "Transition an operations record"},
+        {workflow: "Dispatch open crew requests", page: "Overview", owner: "Sisko", action: "dispatch-crew-messages", source, query: "Dispatch open crew requests"},
+        {workflow: "Send a crew request", page: "Any", owner: "Sisko", action: "send-crew-message", source, query: "Send a crew request"},
+        {workflow: "Approve a pending admin request", page: "Admin", owner: "Sisko", action: "approve-admin-change", source, query: "Approve a pending admin request"},
+        {workflow: "Request changes for a plan", page: "Admin", owner: "Sisko", action: "cancel-admin-change", source, query: "Request changes for a plan"},
+        {workflow: "Plan a service restart or admin change", page: "Admin", owner: "O'Brien", action: "plan-admin-change", source, query: "Plan a service restart or admin change"},
+        {workflow: "Execute an approved admin plan", page: "Admin", owner: "O'Brien", action: "execute-admin-change", source, query: "Execute an approved admin plan"},
+        {workflow: "Plan package updates", page: "Admin", owner: "O'Brien", action: "plan-package-updates", source, query: "Plan package updates"},
+        {workflow: "Refresh CVE advisory feeds", page: "Admin", owner: "O'Brien", action: "refresh-advisories", source, query: "Refresh CVE advisory feeds"},
+        {workflow: "Discover user services", page: "Admin", owner: "O'Brien / Julian", action: "discover-user-services", source, query: "Discover user services"},
+        {workflow: "Enable a live adapter", page: "Admin", owner: "Sisko / O'Brien", action: "request-admin-adapter-enablement", source, query: "Enable a live adapter"},
+        {workflow: "Approve adapter enablement", page: "Admin", owner: "Sisko", action: "approve-admin-adapter-enablement", source, query: "Approve adapter enablement"},
+        {workflow: "Archive inactive admin history", page: "Admin", owner: "Sisko", action: "request-admin-archive", source, query: "Archive inactive admin history"},
+        {workflow: "Approve admin history archive", page: "Admin", owner: "Sisko", action: "approve-admin-archive", source, query: "Approve admin history archive"},
+        {workflow: "Run approved admin archive", page: "Admin", owner: "Sisko", action: "archive-admin-history", source, query: "Run approved admin archive"},
+        {workflow: "Restore archived admin history", page: "Admin", owner: "Sisko", action: "request-admin-restore", source, query: "Restore archived admin history"},
+        {workflow: "Approve admin history restore", page: "Admin", owner: "Sisko", action: "approve-admin-restore", source, query: "Approve admin history restore"},
+        {workflow: "Unarchive an approved admin plan", page: "Admin", owner: "Sisko", action: "unarchive-admin-history", source, query: "Unarchive an approved admin plan"},
+        {workflow: "Customize policy defaults", page: "Admin", owner: "Sisko", action: "build-policy-profile", source, query: "Customize policy defaults"},
+        {workflow: "Accept a policy warning", page: "Admin", owner: "Sisko", action: "request-policy-warning", source, query: "Accept a policy warning"},
+        {workflow: "Approve a policy warning", page: "Admin", owner: "Sisko", action: "approve-policy-warning", source, query: "Approve a policy warning"},
+        {workflow: "Discover physical devices", page: "Assets", owner: "Kira", action: "discover-physical", source, query: "Discover physical devices"},
+        {workflow: "Discover storage arrays", page: "Assets", owner: "Kira", action: "discover-storage", source, query: "Discover storage arrays"},
+        {workflow: "Discover listeners as virtual assets", page: "Assets", owner: "Dax", action: "discover-listeners", source, query: "Discover listeners as virtual assets"},
+        {workflow: "Register a managed resource", page: "Assets", owner: "Kira / Dax", action: "register-resource", source, query: "Register a managed resource"},
+        {workflow: "Record a backup job", page: "Assets", owner: "Kira", action: "record-backup-job", source, query: "Record a backup job"},
+        {workflow: "Record a restore test", page: "Assets", owner: "Kira", action: "record-restore-test", source, query: "Record a restore test"},
+        {workflow: "Stage backup cleanup request", page: "Assets", owner: "Kira", action: "stage-backup-cleanup-request", source, query: "Stage backup cleanup request"},
+        {workflow: "View VM leases and virtual claims", page: "Claims", owner: "Dax", action: "open Claims", source, query: "View VM leases and virtual claims"},
+        {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
+        {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},
+        {workflow: "Stage virtual restore request", page: "Claims", owner: "Dax", action: "stage-virtual-restore-request", source, query: "Stage virtual restore request"},
+        {workflow: "Request a VM, port, gateway, or device claim", page: "Claims", owner: "Dax", action: "request-claim", source, query: "Request a VM port gateway or device claim"},
+        {workflow: "Approve a resource claim", page: "Claims", owner: "Sisko / Dax", action: "approve-claim", source, query: "Approve a resource claim"},
+        {workflow: "Activate an approved claim", page: "Claims", owner: "Dax", action: "activate-claim", source, query: "Activate an approved claim"},
+        {workflow: "Release a claim", page: "Claims", owner: "Dax", action: "release-claim", source, query: "Release a claim"},
+        {workflow: "Clean up stale or expired claims", page: "Claims", owner: "Dax", action: "request-claim-cleanup", source, query: "Clean up stale or expired claims"},
+        {workflow: "Approve claim cleanup", page: "Claims", owner: "Sisko / Dax", action: "approve-claim-cleanup", source, query: "Approve claim cleanup"},
+        {workflow: "Execute approved claim cleanup", page: "Claims", owner: "Dax", action: "execute-claim-cleanup", source, query: "Execute approved claim cleanup"},
+        {workflow: "Inspect host security posture", page: "Security", owner: "Odo", action: "inspect-host", source, query: "Inspect host security posture"},
+        {workflow: "Stage listener remediation plans", page: "Security", owner: "Odo", action: "plan-listener-queue-remediations", source, query: "Stage listener remediation plans"},
+        {workflow: "Plan one listener remediation", page: "Security", owner: "Odo", action: "plan-host-security-remediation", source, query: "Plan one listener remediation"},
+        {workflow: "Review a remote source", page: "Security", owner: "Odo", action: "record-source-review", source, query: "Review a remote source"},
+        {workflow: "Plan a source block", page: "Security", owner: "Odo", action: "plan-source-block", source, query: "Plan a source block"},
+        {workflow: "Stage firewall policy enforcement", page: "Security", owner: "Odo", action: "stage-firewall-policy-enforcement", source, query: "Stage firewall policy enforcement"},
+        {workflow: "Stage identity rotation request", page: "Security", owner: "Odo", action: "stage-identity-rotation-request", source, query: "Stage identity rotation request"},
+        {workflow: "Prepare an IDS review package", page: "Security", owner: "Odo", action: "prepare-ids-review-package", source, query: "Prepare an IDS review package"},
+        {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
+        {workflow: "Dispatch an IDS review package", page: "Security", owner: "Odo", action: "dispatch-ids-review-package", source, query: "Dispatch an IDS review package"},
+        {workflow: "Record an IDS review result", page: "Security", owner: "Odo", action: "record-ids-review-result", source, query: "Record an IDS review result"},
+        {workflow: "View logs from an unhealthy service", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "View logs from an unhealthy service"},
+        {workflow: "Stage system journal access request", page: "Health", owner: "Julian", action: "stage-journal-access-request", source, query: "Stage system journal access request"},
+        {workflow: "Capture metric history snapshot", page: "Health", owner: "Julian", action: "capture-metric-history", source, query: "Capture metric history snapshot"},
+        {workflow: "Run health probes", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "Run health probes"},
+        {workflow: "Register a health target", page: "Health", owner: "Julian", action: "register-health-target", source, query: "Register a health target"},
+        {workflow: "Check an exhausted limit refresh", page: "Usage", owner: "Quark", action: "open Usage", source, query: "Check an exhausted limit refresh"},
+        {workflow: "Record a usage limit", page: "Usage", owner: "Quark", action: "record-usage-limit", source, query: "Record a usage limit"},
+        {workflow: "Request continuation after quota refresh", page: "Usage", owner: "Quark", action: "request-usage-continuation", source, query: "Request continuation after quota refresh"},
+        {workflow: "Dispatch ready continuation work", page: "Usage", owner: "Quark", action: "dispatch-usage-continuations", source, query: "Dispatch ready continuation work"},
+        {workflow: "Discover Codex project threads", page: "Usage", owner: "Quark", action: "discover-codex-threads", source, query: "Discover Codex project threads"},
+        {workflow: "Search documentation", page: "Documents", owner: "Ezri", action: "documents-search", source, query: "Search documentation"},
+        {workflow: "List a documentation folder", page: "Documents", owner: "Ezri", action: "documents-list-notes", source, query: "List a documentation folder"},
+        {workflow: "Write an approved note", page: "Documents", owner: "Ezri", action: "documents-write-note", source, query: "Write an approved note"},
+        {workflow: "Capture crew and audit knowledge", page: "Documents", owner: "Ezri", action: "documents-capture-knowledge", source, query: "Capture crew and audit knowledge"},
+        {workflow: "View git account status", page: "Documents", owner: "Ezri", action: "open Documents", source, query: "View git account status"},
+        {workflow: "View audit log", page: "Audit", owner: "Sisko", action: "open Audit", source, query: "View audit log"},
+        {workflow: "Review approval history", page: "Audit", owner: "Sisko", action: "open Audit", source, query: "Review approval history"},
+        {workflow: "Adjust service schedule", page: "Admin", owner: "O'Brien", action: "record-maintenance-schedule", source, query: "Adjust service schedule"}
+      ];
     }
     function renderAudit() {
       const audit = state.data.audit || {};
@@ -1894,6 +2534,23 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "policy-warning-plan-id": planId || ""
       };
     }
+    function maintenanceScheduleFill(row) {
+      return {
+        "maintenance-schedule-id": row?.id || "",
+        "maintenance-schedule-target": row?.target || "",
+        "maintenance-schedule-recurrence": row?.recurrence || "weekly",
+        "maintenance-schedule-window": row?.window || "unscheduled",
+        "maintenance-schedule-timezone": row?.timezone || "UTC",
+        "maintenance-schedule-owner": row?.owner_domain || "obrien",
+        "maintenance-schedule-risk": row?.risk_level || "medium",
+        "maintenance-schedule-status": row?.status || "active",
+        "maintenance-schedule-blackout": row?.blackout || "",
+        "maintenance-schedule-validation": row?.validation || "",
+        "maintenance-schedule-rollback": row?.rollback || "",
+        "maintenance-schedule-notes": row?.notes || "",
+        "maintenance-schedule-metadata": JSON.stringify(row?.metadata || {})
+      };
+    }
     function approvalFill(approval) {
       const id = approval?.id || "";
       const subject = approval?.subject_id || "";
@@ -1917,12 +2574,103 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         [`${prefix}-limit-id`]: values.limit_id || ""
       };
     }
+    function operationFill(row) {
+      return {
+        "op-record-id": row.id || "",
+        "op-transition-record-id": row.id || "",
+        "op-kind": row.kind || "incident",
+        "op-owner": row.owner_domain || "sisko",
+        "op-status": row.status || "open",
+        "op-transition-status": row.status || "open",
+        "op-severity": row.severity || "low",
+        "op-resource-id": row.resource_id || "",
+        "op-subject": row.subject || "",
+        "op-summary": row.summary || "",
+        "op-next-step": row.next_step || "",
+        "op-transition-next-step": row.next_step || "",
+        "op-evidence-ids": (row.evidence_ids || []).join(", "),
+        "op-metadata": JSON.stringify(row.metadata || {})
+      };
+    }
+    function operationWorkflowFill(row) {
+      return {
+        "op-workflow-template-id": row.id || "",
+        "op-workflow-record-id": `ops.${row.id || "workflow"}`,
+        "op-workflow-resource-id": "",
+        "op-workflow-requested-by": "sisko",
+        "op-kind": row.kind || "incident",
+        "op-owner": row.owner_domain || "sisko",
+        "op-status": "staged",
+        "op-severity": row.severity || "low",
+        "op-subject": row.subject || "",
+        "op-summary": row.summary || "",
+        "op-next-step": row.next_step || "",
+        "op-metadata": JSON.stringify({template_id: row.id || ""})
+      };
+    }
     function resourceClaimFill(resourceId, role = "dax") {
       return {
         "claim-resource-id": resourceId || "",
         "claim-owner-role": role || "dax",
         "claim-intent": `coordinate work on ${resourceId || "resource"}`,
         "claim-action": "review and deconflict requested work"
+      };
+    }
+    function backupJobFill(row) {
+      return {
+        "backup-job-id": row?.id || "",
+        "restore-job-id": row?.id || "",
+        "backup-target": row?.target || "",
+        "backup-schedule": row?.schedule || "manual",
+        "backup-retention": row?.retention || "operator-defined",
+        "backup-status": row?.status || "staged",
+        "backup-risk": row?.risk_level || "medium",
+        "backup-notes": row?.notes || ""
+      };
+    }
+    function restoreTestFill(row) {
+      return {
+        "restore-test-id": row?.id || "",
+        "restore-job-id": row?.job_id || "",
+        "restore-point": row?.restore_point || "",
+        "restore-status": row?.status || "planned",
+        "restore-validated-by": row?.validated_by || "kira",
+        "restore-notes": row?.notes || ""
+      };
+    }
+    function backupCleanupFill(row) {
+      return {
+        "backup-cleanup-path": row?.path || "",
+        "backup-cleanup-reason": row?.next_step || "review generated storage cleanup candidate"
+      };
+    }
+    function virtualRuntimeFill(row) {
+      return {
+        "virtual-resource-id": row?.resource_id || "",
+        "virtual-kind": row?.kind || "vm",
+        "virtual-state": row?.state || "observed",
+        "virtual-adapter": row?.adapter || "manual",
+        "virtual-ports": Array.isArray(row?.ports) ? row.ports.join(", ") : "",
+        "virtual-snapshot-hint": row?.snapshot_hint || row?.snapshot_path || "",
+        "virtual-notes": row?.notes || row?.next_step || "",
+        "snapshot-resource-id": row?.resource_id || "",
+        "restore-virtual-resource-id": row?.resource_id || ""
+      };
+    }
+    function virtualSnapshotFill(row) {
+      return {
+        "snapshot-resource-id": row?.resource_id || "",
+        "snapshot-name": row?.snapshot_name || "",
+        "snapshot-reason": row?.reason || row?.next_step || "stage virtual snapshot before maintenance",
+        "restore-virtual-resource-id": row?.resource_id || "",
+        "restore-virtual-point": row?.snapshot_name || row?.id || ""
+      };
+    }
+    function virtualRestoreFill(row) {
+      return {
+        "restore-virtual-resource-id": row?.resource_id || "",
+        "restore-virtual-point": row?.restore_point || "",
+        "restore-virtual-reason": row?.reason || row?.next_step || "stage virtual restore after failed change"
       };
     }
     function claimFill(claimId) {
@@ -1955,6 +2703,23 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "source-rationale": row?.next_step || "review source activity"
       };
     }
+    function firewallPolicyFill(row) {
+      const index = row?.index ?? 0;
+      return {
+        "firewall-rule-index": index,
+        "firewall-plan-id": `admin.firewall-policy.rule-${index}.${row?.action || "rule"}.${row?.port || "port"}`,
+        "firewall-enforcement-reason": row?.next_step || "stage desired firewall policy enforcement for IDS review",
+        "ids-plan-id": `admin.firewall-policy.rule-${index}.${row?.action || "rule"}.${row?.port || "port"}`
+      };
+    }
+    function identityRotationFill(row) {
+      return {
+        "identity-rotation-subject": row?.subject || row?.path || row?.area || "",
+        "identity-rotation-subject-type": row?.subject_type || "secret",
+        "identity-rotation-urgency": row?.urgency || "medium",
+        "identity-rotation-reason": row?.next_step || row?.reason || "stage identity or secret rotation review"
+      };
+    }
     function usageLimitFill(row) {
       return {
         "usage-limit-id": row?.limit_id || "",
@@ -1964,6 +2729,88 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "usage-capacity": row?.capacity ?? "",
         "usage-remaining": row?.remaining ?? "",
         "usage-resets-at": row?.resets_at || ""
+      };
+    }
+    function serviceEvidenceFill(row) {
+      return {
+        "health-resource-id": row?.resource_id || "",
+        "health-name": row?.name || row?.unit || "",
+        "journal-resource-id": row?.resource_id || "",
+        "journal-unit": row?.unit || "",
+        "op-record-id": `ops.service.${row?.resource_id || "detail"}`,
+        "op-kind": "service_detail",
+        "op-owner": "julian",
+        "op-status": "staged",
+        "op-resource-id": row?.resource_id || "",
+        "op-subject": `Service detail review: ${row?.resource_id || "resource"}`,
+        "op-summary": row?.health_error || row?.next_step || "Review service evidence.",
+        "op-next-step": row?.next_step || "review service detail evidence"
+      };
+    }
+    function journalAccessFill(row) {
+      return {
+        "journal-resource-id": row?.resource_id || "",
+        "journal-unit": row?.unit || "",
+        "journal-reason": row?.next_step || "system journal access needed for service diagnosis",
+        "op-record-id": `ops.service.journal-access.${row?.resource_id || "service"}`,
+        "op-kind": "service_detail",
+        "op-owner": "julian",
+        "op-status": "waiting_approval",
+        "op-resource-id": row?.resource_id || "",
+        "op-subject": `System journal access review: ${row?.resource_id || "service"}`,
+        "op-summary": `Request read-only system journal evidence for ${row?.unit || row?.resource_id || "service"}.`,
+        "op-next-step": "human approval required before privileged or system journal contents are read"
+      };
+    }
+    function metricHistoryFill(row) {
+      return {
+        "metric-history-id": row?.id || "",
+        "metric-history-notes": row?.next_step || "capture retained observability trends"
+      };
+    }
+    function serviceValidationRows(items) {
+      return (items || []).flatMap((item) => (item.validation_checklist || []).map((check) => ({
+        resource_id: item.resource_id,
+        step: check.step,
+        status: check.status
+      })));
+    }
+    function serviceLogRows(items) {
+      return (items || []).flatMap((item) => (item.log_evidence || []).map((log) => ({
+        resource_id: item.resource_id,
+        target_id: log.target_id,
+        path: log.path,
+        readable: log.readable,
+        lines: log.lines
+      })));
+    }
+    function serviceJournalRows(items) {
+      return (items || []).map((item) => ({
+        resource_id: item.resource_id,
+        unit: item.unit,
+        available: item.journal_excerpt?.available,
+        exit_code: item.journal_excerpt?.exit_code,
+        error: item.journal_excerpt?.error || item.journal_excerpt?.reason || ""
+      }));
+    }
+    function documentChildPath(folder, file) {
+      const cleanFolder = String(folder || "").replace(/\\/+$/, "");
+      const cleanFile = String(file || "").replace(/^\\/+/, "").replace(/\\/+$/, "");
+      if (!cleanFolder) return cleanFile;
+      if (!cleanFile) return cleanFolder;
+      return `${cleanFolder}/${cleanFile}`;
+    }
+    function documentFileFill(row) {
+      if (row?.kind === "folder") return {"documents-folder": row.path || ""};
+      return {"documents-note-path": row?.path || row?.file || ""};
+    }
+    function workflowFill(row) {
+      const source = row?.source || "";
+      const folder = source.endsWith(".md") ? source.split("/").slice(0, -1).join("/") : source;
+      return {
+        "documents-note-path": source,
+        "documents-folder": folder || "Overseer",
+        "documents-query": row?.query || row?.workflow || source
       };
     }
     function domainView(domain) {
@@ -2065,7 +2912,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return stations[name] || "Operations";
     }
     function table(titleText, rows, keys, options = {}) {
-      const body = (rows || []).slice(0, 12).map((row) => `<tr>${keys.map((key) => `<td>${formatCell(row, key, options)}</td>`).join("")}</tr>`).join("");
+      const limit = options.limit ?? 12;
+      const body = (rows || []).slice(0, limit).map((row) => `<tr>${keys.map((key) => `<td>${formatCell(row, key, options)}</td>`).join("")}</tr>`).join("");
       return `<div class="toolbar"><h3>${safe(titleText)}</h3><span class="pill">${(rows || []).length}</span></div><div class="table-scroll"><table><thead><tr>${keys.map((key) => `<th>${safe(labelize(key))}</th>`).join("")}</tr></thead><tbody>${body || `<tr><td colspan="${keys.length}" class="muted">No rows</td></tr>`}</tbody></table></div>`;
     }
     function formatCell(row, key, options = {}) {
@@ -2075,10 +2923,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         const target = typeof link === "function" ? link(row, key, value) : link;
         if (target) return `<button type="button" class="cell-link" data-view-target="${safe(target)}">${format(value)}</button>`;
       }
+      if (options.external?.[key]) {
+        const external = options.external[key];
+        const href = typeof external === "function" ? external(row, key, value) : value;
+        if (href) return `<a class="cell-link" href="${safe(href)}" target="_blank" rel="noreferrer">${format(value)}</a>`;
+      }
       const fill = options.fills?.[key];
       if (fill) {
         const fields = fill(row, key, value);
-        if (fields) return `<button type="button" class="cell-link" data-fill="${safe(JSON.stringify(fields))}" data-view-target="${safe(options.fillView || state.view)}">${format(value)}</button>`;
+        const fillAction = options.fillActions?.[key];
+        const action = typeof fillAction === "function" ? fillAction(row, key, value) : fillAction;
+        if (fields) return `<button type="button" class="cell-link" data-fill="${safe(JSON.stringify(fields))}" data-view-target="${safe(options.fillView || state.view)}"${action ? ` data-action="${safe(action)}"` : ""}>${format(value)}</button>`;
       }
       return format(value);
     }

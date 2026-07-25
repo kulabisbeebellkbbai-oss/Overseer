@@ -72,7 +72,7 @@ class PolicyProfile:
     )
     require_live_adapter_enabled: bool = True
     require_rollback_steps: bool = True
-    warn_on_apt_upgrade_rollback: bool = True
+    warn_on_apt_upgrade_rollback: bool = False
     require_verification_steps: bool = True
     require_ids_review_for_firewall: bool = True
     block_warnings_until_accepted: bool = True
@@ -307,7 +307,11 @@ def policy_profile_from_mapping(mapping: Mapping[str, object]) -> PolicyProfile:
         },
         require_live_adapter_enabled=_bool_setting(mapping, "require_live_adapter_enabled", True),
         require_rollback_steps=_bool_setting(mapping, "require_rollback_steps", True),
-        warn_on_apt_upgrade_rollback=_bool_setting(mapping, "warn_on_apt_upgrade_rollback", True),
+        warn_on_apt_upgrade_rollback=_bool_setting(
+            mapping,
+            "warn_on_apt_upgrade_rollback",
+            BEST_PRACTICE_POLICY_PROFILE.warn_on_apt_upgrade_rollback,
+        ),
         require_verification_steps=_bool_setting(mapping, "require_verification_steps", True),
         require_ids_review_for_firewall=_bool_setting(mapping, "require_ids_review_for_firewall", True),
         block_warnings_until_accepted=_bool_setting(mapping, "block_warnings_until_accepted", True),
@@ -398,7 +402,7 @@ def policy_customization_questions() -> tuple[PolicyQuestion, ...]:
             id="apt-upgrade-warning",
             prompt="Should package upgrades keep a residual rollback warning until explicitly accepted?",
             profile_key="warn_on_apt_upgrade_rollback",
-            default=True,
+            default=False,
             options=(True, False),
             rationale="Package downgrades are not always available or safe.",
         ),

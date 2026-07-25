@@ -19,6 +19,8 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 - `apt_install`
 - `apt_update`
 - `apt_upgrade`
+- `flatpak_install`
+- `npm_global_install`
 - `firewall_allow_tcp`
 - `firewall_deny_tcp`
 - `block_ip`
@@ -30,6 +32,8 @@ PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.install.nmap --kind apt_install --target nmap --reason "enable approved local audit"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.update --kind apt_update --target apt --reason "refresh package metadata"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.upgrade.sqlite --kind apt_upgrade --target sqlite3 --package sqlite3 --reason "apply approved patch"
+PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.flatpak.obsidian --kind flatpak_install --target md.obsidian.Obsidian --reason "install approved local documentation editor"
+PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.npm.obsidian-mcp --kind npm_global_install --target obsidian-mcp-server --reason "install approved Documents MCP bridge"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.firewall.8443 --kind firewall_allow_tcp --target tcp/8443 --port 8443 --reason "publish approved local service"
 PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko
@@ -54,6 +58,12 @@ Canceling a plan keeps the record visible but removes it from the pending author
 Live execution support is controlled by the effective adapter table. User-service restart is enabled by default; package install, package index refresh, package upgrade, firewall allow/deny, and source-block execution require approved adapter enablement for the store plus the specific admin plan approval and any IDS review gate.
 
 Approved apt-family execution uses a noninteractive apt/debconf environment with standard input closed. This keeps package operations from opening terminal dialogs after the command list has already been approved. Package defaults still apply unless the approved plan explicitly includes a different package configuration step.
+
+Apt-family plans accept apt package names only. Overseer rejects
+provider-prefixed install targets such as `npm:obsidian-mcp-server` or
+`flatpak:md.obsidian.Obsidian` before execution. Use `npm_global_install` and
+`flatpak_install` instead so those software sources get their own command,
+rollback, and verification steps.
 
 Execution results are persisted and can be reviewed with `admin-executions` or the loopback API. Blocked execution attempts are also persisted so O'Brien and Sisko can see why a plan did not run.
 

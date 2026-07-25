@@ -55,10 +55,12 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli usage-summary --store state/overseer.sqlite3` - summarize persisted usage limits, capacity state, reset timing, and confidence.
 - `curl -H "Authorization: Bearer $(tr -d '\n' < state/api-token)" http://127.0.0.1:8766/documents/status` - check Ezri's Obsidian Local REST API readiness without exposing the Obsidian token.
 - `curl -H "Authorization: Bearer $(tr -d '\n' < state/api-token)" 'http://127.0.0.1:8766/documents/notes?folder=Overseer'` - list Ezri-managed vault notes through Overseer.
+- `curl -H "Authorization: Bearer $(tr -d '\n' < state/api-token)" http://127.0.0.1:8766/git/status` - read Ezri's repository status summary and GitHub links.
 - `PYTHONPATH=src python3 -m overseer.cli documents-status` - check Ezri's Obsidian Local REST API readiness through the ignored local env file.
 - `PYTHONPATH=src python3 -m overseer.cli documents-search --query Overseer` - search the local Obsidian vault through Ezri without exposing the Obsidian token.
 - `PYTHONPATH=src python3 -m overseer.cli documents-write-note --path Overseer/Inbox/operator-note.md --content-file /path/to/note.md` - append markdown to an approved Documents vault path.
 - `PYTHONPATH=src python3 -m overseer.cli capture-knowledge-events --store state/overseer.sqlite3 --dry-run` - preview crew-message and audit-event notes Ezri can capture under `Overseer/Knowledge/`.
+- `PYTHONPATH=src python3 -m overseer.cli git-status` - show read-only branch, upstream, dirty-state, file summary, and repository links for Ezri.
 - `PYTHONPATH=src python3 -m overseer.cli discover-codex-project-threads --store state/overseer.sqlite3` - import local `codex-projects` registry rows as Quark-owned thread resources without starting sessions.
 - `PYTHONPATH=src python3 -m overseer.cli record-usage-limit --store state/overseer.sqlite3 --limit-id limit.service.requests --resource-id svc.service --kind requests --capacity 100 --remaining 25 --window hourly` - record or update Quark usage-limit evidence.
 - `PYTHONPATH=src python3 -m overseer.cli usage-continuation-plan --store state/overseer.sqlite3` - summarize Quark continuation requests and dispatch handoffs.
@@ -86,6 +88,8 @@ The first release should include a working initial slice for every major domain:
 - `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --kind user_service_restart --target overseer-api.service --reason "reload approved code"` - prepare an approval-gated admin change plan without executing it.
 - `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.update --kind apt_update --target apt --reason "refresh package metadata"` - prepare an approval-gated package index refresh plan without executing it.
 - `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.upgrade.sqlite --kind apt_upgrade --target sqlite3 --package sqlite3 --reason "apply approved patch"` - prepare an approval-gated package upgrade plan without executing it.
+- `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.flatpak.obsidian --kind flatpak_install --target md.obsidian.Obsidian --reason "install approved local documentation editor"` - prepare a provider-specific Flatpak install plan.
+- `PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.npm.obsidian-mcp --kind npm_global_install --target obsidian-mcp-server --reason "install approved Documents MCP bridge"` - prepare a provider-specific global npm install plan.
 - `PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3` - list stored admin change plans and restore requests waiting for explicit approval.
 - `PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko` - record approval metadata for an exact admin plan without executing it.
 - `PYTHONPATH=src python3 -m overseer.cli cancel-admin-change --store state/overseer.sqlite3 --plan-id admin.block.example --canceled-by odo --reason "reserved documentation address; no observed hostile traffic"` - cancel a placeholder or superseded admin plan without deleting history.
@@ -150,6 +154,8 @@ GitHub Actions runs the unit suite and CLI smoke test on pushes to `main` and pu
 - Physical discovery: `docs/physical-discovery.md`
 - Foreground runtime and local API service: `docs/runtime.md`
 - Documents MCP setup: `docs/documents-mcp.md`
+- Ezri git and documentation workflows: `docs/ezri-workflows.md`
+- Protected gateway UI regression testing: `docs/ui-regression-testing.md`
 
 The current runtime is a Python package with CLI entrypoints, an optional localhost-only HTTP API, SQLite persistence, and CI-backed unit coverage. Live host mutation is intentionally limited to user-service restart plans by default. Package installs, package index refreshes, package upgrades, firewall changes, and source blocks become eligible for Overseer execution only when the same store contains an approved adapter enablement request for that exact kind, and each admin change plan still requires its own approval, IDS review when applicable, execution evidence, and verification results.
 

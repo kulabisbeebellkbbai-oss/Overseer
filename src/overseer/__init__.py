@@ -28,9 +28,11 @@ from .admin import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
+    plan_npm_global_install,
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
@@ -66,6 +68,7 @@ from .core import (
     decide_claim,
 )
 from .crew import CrewMessage, CrewMessageStatus, build_crew_message, crew_message_status
+from .git import git_status_status
 from .health import (
     HealthEvidence,
     HealthStatus,
@@ -205,8 +208,10 @@ __all__ = [
     "plan_apt_update",
     "plan_apt_upgrade",
     "plan_block_ip",
+    "plan_flatpak_install",
     "plan_firewall_allow_tcp",
     "plan_firewall_deny_tcp",
+    "plan_npm_global_install",
     "plan_user_service_restart",
     "ApprovalRequest",
     "ApprovalStatus",

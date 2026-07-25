@@ -105,8 +105,9 @@ class OverseerApiClient:
             payload["last_verified_at"] = last_verified_at
         return self._post("/resources", payload)
 
-    def operator_dashboard(self) -> dict[str, Any]:
-        return self._get("/operator-dashboard")
+    def operator_dashboard(self, include_summaries: bool = False) -> dict[str, Any]:
+        suffix = "?include_summaries=true" if include_summaries else ""
+        return self._get(f"/operator-dashboard{suffix}")
 
     def maintenance_summary(self) -> dict[str, Any]:
         return self._get("/maintenance-summary")
@@ -310,6 +311,9 @@ class OverseerApiClient:
 
     def documents_status(self) -> dict[str, Any]:
         return self._get("/documents/status")
+
+    def git_status(self) -> dict[str, Any]:
+        return self._get("/git/status")
 
     def documents_notes(self, folder: str | None = None) -> dict[str, Any]:
         query = f"?{urlencode({'folder': folder})}" if folder else ""

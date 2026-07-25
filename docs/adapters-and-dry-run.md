@@ -6,6 +6,8 @@ Adapters are the boundary between Overseer's coordination model and the local ma
 
 - health probes
 - maintenance runners, including package install, package index refresh, package upgrade, and user-service restart adapters
+- provider-specific installers for non-apt software such as Flatpak, npm, pipx,
+  or snap packages
 - physical asset discovery
 - security action runners
 - usage-limit probes
@@ -17,6 +19,8 @@ Adapters are the boundary between Overseer's coordination model and the local ma
 - Live adapters must be explicit dependencies.
 - Live adapters must be wrapped by approval and audit gates before use.
 - Security, package-manager, firewall, device, and daemon operations remain authorization-bound.
+- Apt adapters must reject provider-prefixed package identifiers instead of
+  passing them to `apt-get`; those requests need a provider-specific adapter.
 
 ## Execution Result
 

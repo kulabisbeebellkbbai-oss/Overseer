@@ -17,6 +17,8 @@ from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
 from .host import HostInspectionSnapshot
 from .ids_review import HostSecurityIDSReviewPackage
+from .maintenance_schedule import MaintenanceSchedule
+from .ops_records import OperationRecord
 from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
@@ -151,6 +153,18 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS crew_messages (
                 id TEXT PRIMARY KEY,
                 owner_domain TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS operation_records (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                owner_domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS maintenance_schedules (
+                id TEXT PRIMARY KEY,
+                target TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             """
@@ -363,6 +377,12 @@ class SQLiteStore:
     def list_host_snapshots(self) -> tuple[HostInspectionSnapshot, ...]:
         return tuple(_load_dataclass(HostInspectionSnapshot, payload) for payload in self._list_payloads("host_snapshots"))
 
+    def load_latest_host_snapshot(self) -> HostInspectionSnapshot | None:
+        row = self._connection.execute("SELECT payload FROM host_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        return _load_dataclass(HostInspectionSnapshot, str(row["payload"]))
+
     def save_admin_change_plan(self, plan: AdminChangePlan) -> None:
         self._upsert("admin_change_plans", plan.id, _dump(plan))
 
@@ -443,6 +463,56 @@ class SQLiteStore:
 
     def list_crew_messages(self) -> tuple[CrewMessage, ...]:
         return tuple(_load_dataclass(CrewMessage, payload) for payload in self._list_payloads("crew_messages"))
+
+    def save_operation_record(self, record: OperationRecord) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO operation_records (id, kind, owner_domain, status, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (record.id, record.kind.value, record.owner_domain.value, record.status.value, _dump(record)),
+        )
+        self._connection.commit()
+
+    def load_operation_record(self, record_id: str) -> OperationRecord:
+        return _load_dataclass(OperationRecord, self._get_payload("operation_records", record_id))
+
+    def list_operation_records(
+        self,
+        kind: str | None = None,
+        owner_domain: str | None = None,
+        status: str | None = None,
+    ) -> tuple[OperationRecord, ...]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if owner_domain:
+            clauses.append("owner_domain = ?")
+            params.append(owner_domain)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT payload FROM operation_records{where} ORDER BY id",
+            tuple(params),
+        ).fetchall()
+        return tuple(_load_dataclass(OperationRecord, str(row["payload"])) for row in rows)
+
+    def save_maintenance_schedule(self, schedule: MaintenanceSchedule) -> None:
+        self._connection.execute(
+            "INSERT OR REPLACE INTO maintenance_schedules (id, target, payload) VALUES (?, ?, ?)",
+            (schedule.id, schedule.target, _dump(schedule)),
+        )
+        self._connection.commit()
+
+    def load_maintenance_schedule(self, schedule_id: str) -> MaintenanceSchedule:
+        return _load_dataclass(MaintenanceSchedule, self._get_payload("maintenance_schedules", schedule_id))
+
+    def list_maintenance_schedules(self) -> tuple[MaintenanceSchedule, ...]:
+        return tuple(_load_dataclass(MaintenanceSchedule, payload) for payload in self._list_payloads("maintenance_schedules"))
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

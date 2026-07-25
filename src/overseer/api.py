@@ -72,6 +72,7 @@ from .cli import (
     maintenance_summary_status,
     operator_dashboard_status,
     plan_host_security_listener_queue_remediations_status,
+    plan_firewall_policy_diff_enforcement_status,
     plan_host_security_source_block_status,
     plan_host_security_remediation_status,
     physical_summary_status,
@@ -110,10 +111,64 @@ from .documents import (
     documents_search_status,
     documents_write_note_status,
 )
+from .compliance_evidence import compliance_evidence_status
+from .advisories import advisory_status, refresh_advisories_status
+from .backup_ops import (
+    backup_operations_status,
+    record_backup_job_status,
+    record_restore_test_status,
+    stage_backup_cleanup_request_status,
+)
+from .documentation_evidence import documentation_evidence_status
+from .git import git_status_status
+from .identity_evidence import identity_evidence_status
+from .identity_ops import identity_rotation_requests_status, stage_identity_rotation_request_status
+from .incident_lifecycle import incident_lifecycle_status
 from .knowledge import knowledge_capture_status
+from .maintenance_schedule import maintenance_schedules_status, record_maintenance_schedule_status
+from .metric_history import capture_metric_history_status, metric_history_status
+from .observability_trends import observability_trends_status
+from .ops import (
+    list_operation_records_status,
+    operation_workflow_catalog_status,
+    operations_gap_coverage_status,
+    record_operation_status,
+    stage_operation_workflow_status,
+    transition_operation_record_status,
+)
+from .performance_history import performance_history_status
+from .service_evidence import service_evidence_status, stage_journal_access_request_status
+from .security_evidence import security_evidence_status
+from .software_evidence import software_evidence_status
+from .storage_evidence import storage_evidence_status
+from .usage_evidence import usage_evidence_status
+from .virtual_evidence import virtual_evidence_status
+from .virtual_ops import (
+    record_virtual_runtime_status,
+    stage_virtual_restore_request_status,
+    stage_virtual_snapshot_request_status,
+    virtual_operations_status,
+)
 from .ui import OPERATOR_CONSOLE_HTML
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+PROTECTED_GATEWAY_PREFIX = "/Overseer"
+
+
+def _strip_protected_gateway_prefix(path: str) -> str:
+    if path == PROTECTED_GATEWAY_PREFIX:
+        return "/"
+    if path.startswith(f"{PROTECTED_GATEWAY_PREFIX}/"):
+        stripped = path.removeprefix(PROTECTED_GATEWAY_PREFIX)
+        return stripped or "/"
+    return path
+
+
+def _project_path_for_store(store_path: str) -> Path:
+    store_parent = Path(store_path).resolve().parent
+    if store_parent.name == "state":
+        return store_parent.parent
+    return Path.cwd()
 
 
 def make_api_handler(store_path: str, auth_token: str | None = None):
@@ -122,7 +177,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
 
         def do_GET(self) -> None:
             route = urlsplit(self.path)
-            path = route.path
+            path = _strip_protected_gateway_prefix(route.path)
             query = parse_qs(route.query)
             if path == "/health":
                 self._write_json({"ok": True, "service": "overseer-api"})
@@ -155,7 +210,27 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 self._handle(lambda: command_summary_status(store_path))
                 return
             if path == "/operator-dashboard":
-                self._handle(lambda: operator_dashboard_status(store_path))
+                include_summaries = _query_first(query, "include_summaries") in {"1", "true", "yes"}
+                self._handle(lambda: operator_dashboard_status(store_path, include_summaries=include_summaries))
+                return
+            if path == "/incidents/lifecycle":
+                self._handle(lambda: incident_lifecycle_status(store_path))
+                return
+            if path == "/operations/gap-coverage":
+                self._handle(lambda: operations_gap_coverage_status(store_path))
+                return
+            if path == "/operations/records":
+                self._handle(
+                    lambda: list_operation_records_status(
+                        store_path,
+                        _query_first(query, "kind"),
+                        _query_first(query, "owner_domain"),
+                        _query_first(query, "status"),
+                    )
+                )
+                return
+            if path == "/operations/workflows":
+                self._handle(lambda: operation_workflow_catalog_status(store_path))
                 return
             if path == "/maintenance-summary":
                 self._handle(lambda: maintenance_summary_status(store_path))
@@ -163,8 +238,29 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/maintenance/package-status":
                 self._handle(lambda: inspect_packages_status())
                 return
+            if path == "/maintenance/software-evidence":
+                self._handle(lambda: software_evidence_status(store_path))
+                return
+            if path == "/maintenance/advisories":
+                self._handle(lambda: advisory_status(store_path))
+                return
+            if path == "/maintenance/schedules":
+                self._handle(lambda: maintenance_schedules_status(store_path))
+                return
             if path == "/health-summary":
                 self._handle(lambda: health_summary_status(store_path))
+                return
+            if path == "/health/service-evidence":
+                self._handle(lambda: service_evidence_status(store_path, _query_first(query, "resource_id")))
+                return
+            if path == "/observability/trends":
+                self._handle(lambda: observability_trends_status(store_path))
+                return
+            if path == "/observability/metric-history":
+                self._handle(lambda: metric_history_status(_project_path_for_store(store_path)))
+                return
+            if path == "/observability/performance-history":
+                self._handle(lambda: performance_history_status(_project_path_for_store(store_path), limit=int(_query_first(query, "limit") or "50")))
                 return
             if path == "/health-efficiency":
                 self._handle(lambda: health_efficiency_summary_status(store_path))
@@ -172,11 +268,20 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/usage-summary":
                 self._handle(lambda: usage_summary_status(store_path))
                 return
+            if path == "/usage/evidence":
+                self._handle(lambda: usage_evidence_status(store_path))
+                return
             if path == "/crew/messages":
                 self._handle(lambda: crew_messages_status(store_path, _query_first(query, "owner_domain"), _query_first(query, "status")))
                 return
             if path == "/documents/status":
                 self._handle(lambda: documents_config_status())
+                return
+            if path == "/documents/evidence":
+                self._handle(lambda: documentation_evidence_status(_project_path_for_store(store_path)))
+                return
+            if path == "/git/status":
+                self._handle(lambda: git_status_status(_project_path_for_store(store_path)))
                 return
             if path == "/documents/notes":
                 self._handle(lambda: documents_list_notes_status(folder=_query_first(query, "folder") or ""))
@@ -197,8 +302,20 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/physical-summary":
                 self._handle(lambda: physical_summary_status(store_path))
                 return
+            if path == "/storage/evidence":
+                self._handle(lambda: storage_evidence_status(_project_path_for_store(store_path)))
+                return
+            if path == "/storage/backup-operations":
+                self._handle(lambda: backup_operations_status(_project_path_for_store(store_path)))
+                return
             if path == "/virtual-summary":
                 self._handle(lambda: virtual_summary_status(store_path))
+                return
+            if path == "/virtual/evidence":
+                self._handle(lambda: virtual_evidence_status(store_path))
+                return
+            if path == "/virtual/operations":
+                self._handle(lambda: virtual_operations_status(_project_path_for_store(store_path)))
                 return
             if path == "/alerts-summary":
                 self._handle(lambda: alerts_summary_status(store_path))
@@ -219,6 +336,15 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/security-summary":
                 self._handle(lambda: security_summary_status(store_path))
+                return
+            if path == "/security/evidence":
+                self._handle(lambda: security_evidence_status(store_path))
+                return
+            if path == "/identity/evidence":
+                self._handle(lambda: identity_evidence_status(_project_path_for_store(store_path)))
+                return
+            if path == "/identity/rotation-requests":
+                self._handle(lambda: identity_rotation_requests_status(_project_path_for_store(store_path)))
                 return
             if path == "/host/security":
                 self._handle(lambda: assess_host_security_status(store_path))
@@ -265,6 +391,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/admin/policies":
                 self._handle(lambda: admin_policy_status(store_path, _query_first(query, "plan_id")))
                 return
+            if path == "/compliance/evidence":
+                self._handle(lambda: compliance_evidence_status(store_path, _project_path_for_store(store_path)))
+                return
             if path == "/admin/active-policy-profile":
                 self._handle(lambda: active_policy_profile_status(store_path))
                 return
@@ -301,160 +430,207 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
+            route = urlsplit(self.path)
+            path = _strip_protected_gateway_prefix(route.path)
             if not self._is_authorized():
                 self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
                 return
-            if self.path == "/claims/request":
+            if path == "/claims/request":
                 self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
                 return
-            if self.path == "/resources":
+            if path == "/resources":
                 self._handle_json(lambda payload: record_resource_status(store_path, **_resource_args(payload)))
                 return
-            if self.path == "/claims/approve":
+            if path == "/claims/approve":
                 self._handle_json(lambda payload: approve_claim_status(store_path, **_approve_claim_args(payload)))
                 return
-            if self.path == "/claims/activate":
+            if path == "/claims/activate":
                 self._handle_json(lambda payload: activate_claim_status(store_path, **_activate_claim_args(payload)))
                 return
-            if self.path == "/claims/release":
+            if path == "/claims/release":
                 self._handle_json(lambda payload: release_claim_status(store_path, **_release_claim_args(payload)))
                 return
-            if self.path == "/claims/cleanup-requests":
+            if path == "/claims/cleanup-requests":
                 self._handle_json(lambda payload: request_claim_cleanup_status(store_path, **_claim_cleanup_request_args(payload)))
                 return
-            if self.path == "/claims/cleanup-requests/approve":
+            if path == "/claims/cleanup-requests/approve":
                 self._handle_json(lambda payload: approve_claim_cleanup_status(store_path, **_approve_claim_cleanup_args(payload)))
                 return
-            if self.path == "/claims/cleanup-requests/execute":
+            if path == "/claims/cleanup-requests/execute":
                 self._handle_json(lambda payload: execute_claim_cleanup_status(store_path, **_execute_claim_cleanup_args(payload)))
                 return
-            if self.path == "/host/inspect":
+            if path == "/host/inspect":
                 self._handle(lambda: inspect_host_status(store_path))
                 return
-            if self.path == "/services/discover-user":
+            if path == "/operations/records":
+                self._handle_json(lambda payload: record_operation_status(store_path, **_operation_record_args(payload)))
+                return
+            if path == "/operations/records/transition":
+                self._handle_json(lambda payload: transition_operation_record_status(store_path, **_operation_transition_args(payload)))
+                return
+            if path == "/operations/workflows/stage":
+                self._handle_json(lambda payload: stage_operation_workflow_status(store_path, **_operation_workflow_stage_args(payload)))
+                return
+            if path == "/services/discover-user":
                 self._handle(lambda: discover_user_services_status(store_path))
                 return
-            if self.path == "/physical/discover":
+            if path == "/physical/discover":
                 self._handle_json(lambda payload: discover_physical_status(**_physical_discovery_args(store_path, payload)))
                 return
-            if self.path == "/health/probes/run":
+            if path == "/health/probes/run":
                 self._handle_json(lambda payload: probe_stored_health_status(store_path, **_stored_health_probe_args(payload)))
                 return
-            if self.path == "/health-targets":
+            if path == "/health-targets":
                 self._handle_json(lambda payload: record_health_target_status(store_path, **_health_target_args(payload)))
                 return
-            if self.path == "/physical/discover-storage":
+            if path == "/health/journal-access-requests":
+                self._handle_json(lambda payload: stage_journal_access_request_status(store_path, **_journal_access_request_args(payload)))
+                return
+            if path == "/observability/metric-history/capture":
+                self._handle_json(lambda payload: capture_metric_history_status(store_path, _project_path_for_store(store_path), **_metric_history_capture_args(payload)))
+                return
+            if path == "/physical/discover-storage":
                 self._handle_json(lambda payload: discover_storage_status(**_physical_storage_discovery_args(store_path, payload)))
                 return
-            if self.path == "/virtual/discover-listeners":
+            if path == "/storage/backup-jobs":
+                self._handle_json(lambda payload: record_backup_job_status(_project_path_for_store(store_path), **_backup_job_args(payload)))
+                return
+            if path == "/storage/restore-tests":
+                self._handle_json(lambda payload: record_restore_test_status(_project_path_for_store(store_path), **_restore_test_args(payload)))
+                return
+            if path == "/storage/cleanup-requests":
+                self._handle_json(lambda payload: stage_backup_cleanup_request_status(_project_path_for_store(store_path), **_backup_cleanup_request_args(payload)))
+                return
+            if path == "/virtual/discover-listeners":
                 self._handle(lambda: discover_virtual_listeners_status(store_path))
                 return
-            if self.path == "/host/security/remediations/plans":
+            if path == "/virtual/runtime-records":
+                self._handle_json(lambda payload: record_virtual_runtime_status(_project_path_for_store(store_path), **_virtual_runtime_record_args(payload)))
+                return
+            if path == "/virtual/snapshot-requests":
+                self._handle_json(lambda payload: stage_virtual_snapshot_request_status(_project_path_for_store(store_path), **_virtual_snapshot_request_args(payload)))
+                return
+            if path == "/virtual/restore-requests":
+                self._handle_json(lambda payload: stage_virtual_restore_request_status(_project_path_for_store(store_path), **_virtual_restore_request_args(payload)))
+                return
+            if path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
                 return
-            if self.path == "/host/security/listener-review-queue/remediation-plans":
+            if path == "/host/security/listener-review-queue/remediation-plans":
                 self._handle_json(lambda payload: plan_host_security_listener_queue_remediations_status(store_path, **_host_security_listener_queue_remediations_args(payload)))
                 return
-            if self.path == "/host/security/source-reviews/block-plans":
+            if path == "/host/security/source-reviews/block-plans":
                 self._handle_json(lambda payload: plan_host_security_source_block_status(store_path, **_host_security_source_block_args(payload)))
                 return
-            if self.path == "/host/security/source-reviews":
+            if path == "/host/security/firewall-policy/enforcement-plans":
+                self._handle_json(lambda payload: plan_firewall_policy_diff_enforcement_status(store_path, **_firewall_policy_enforcement_args(payload)))
+                return
+            if path == "/identity/rotation-requests":
+                self._handle_json(lambda payload: stage_identity_rotation_request_status(_project_path_for_store(store_path), **_identity_rotation_request_args(payload)))
+                return
+            if path == "/host/security/source-reviews":
                 self._handle_json(lambda payload: create_host_security_source_review_status(store_path, **_host_security_source_review_args(payload)))
                 return
-            if self.path == "/host/security/ids-review-packages":
+            if path == "/host/security/ids-review-packages":
                 self._handle_json(lambda payload: prepare_host_security_ids_review_package_status(store_path, **_host_security_ids_review_package_args(payload)))
                 return
-            if self.path == "/host/security/ids-review-packages/submit":
+            if path == "/host/security/ids-review-packages/submit":
                 self._handle_json(lambda payload: submit_host_security_ids_review_package_status(store_path, **_submit_host_security_ids_review_package_args(payload)))
                 return
-            if self.path == "/host/security/ids-review-packages/prompts":
+            if path == "/host/security/ids-review-packages/prompts":
                 self._handle_json(lambda payload: export_host_security_ids_review_prompt_status(store_path, **_export_host_security_ids_review_prompt_args(payload)))
                 return
-            if self.path == "/host/security/ids-review-packages/dispatch":
+            if path == "/host/security/ids-review-packages/dispatch":
                 self._handle_json(lambda payload: dispatch_host_security_ids_review_package_status(store_path, **_dispatch_host_security_ids_review_package_args(payload)))
                 return
-            if self.path == "/host/security/ids-review-packages/results":
+            if path == "/host/security/ids-review-packages/results":
                 self._handle_json(lambda payload: record_host_security_ids_review_result_status(store_path, **_host_security_ids_review_result_args(payload)))
                 return
-            if self.path == "/admin/plans":
+            if path == "/admin/plans":
                 self._handle_json(lambda payload: plan_admin_change_status(store_path, **_admin_plan_args(payload)))
                 return
-            if self.path == "/maintenance/package-update-plans":
+            if path == "/maintenance/package-update-plans":
                 self._handle_json(lambda payload: plan_package_updates_status(store_path, **_package_update_plan_args(payload)))
                 return
-            if self.path == "/admin/approve":
+            if path == "/maintenance/advisories/refresh":
+                self._handle_json(lambda payload: refresh_advisories_status(store_path, **_advisory_refresh_args(payload)))
+                return
+            if path == "/maintenance/schedules":
+                self._handle_json(lambda payload: record_maintenance_schedule_status(store_path, **_maintenance_schedule_args(payload)))
+                return
+            if path == "/admin/approve":
                 self._handle_json(lambda payload: approve_admin_change_status(store_path, **_approve_admin_plan_args(payload)))
                 return
-            if self.path == "/admin/cancel":
+            if path == "/admin/cancel":
                 self._handle_json(lambda payload: cancel_admin_change_status(store_path, **_cancel_admin_plan_args(payload)))
                 return
-            if self.path == "/admin/execute":
+            if path == "/admin/execute":
                 self._handle_admin_execute()
                 return
-            if self.path == "/admin/history-archive":
+            if path == "/admin/history-archive":
                 self._handle_json(lambda payload: archive_admin_history_status(store_path, **_archive_admin_history_args(payload)))
                 return
-            if self.path == "/admin/history-archive-requests":
+            if path == "/admin/history-archive-requests":
                 self._handle_json(lambda payload: request_admin_history_archive_status(store_path, **_admin_history_archive_request_args(payload)))
                 return
-            if self.path == "/admin/history-archive-requests/approve":
+            if path == "/admin/history-archive-requests/approve":
                 self._handle_json(lambda payload: approve_admin_history_archive_status(store_path, **_approve_admin_history_archive_args(payload)))
                 return
-            if self.path == "/admin/history-restore-requests":
+            if path == "/admin/history-restore-requests":
                 self._handle_json(lambda payload: request_admin_history_restore_status(store_path, **_admin_history_restore_request_args(payload)))
                 return
-            if self.path == "/admin/history-restore-requests/approve":
+            if path == "/admin/history-restore-requests/approve":
                 self._handle_json(lambda payload: approve_admin_history_restore_status(store_path, **_approve_admin_history_restore_args(payload)))
                 return
-            if self.path == "/admin/adapter-enablement-requests":
+            if path == "/admin/adapter-enablement-requests":
                 self._handle_json(lambda payload: request_admin_adapter_enablement_status(store_path, **_admin_adapter_enablement_request_args(payload)))
                 return
-            if self.path == "/admin/adapter-enablement-requests/approve":
+            if path == "/admin/adapter-enablement-requests/approve":
                 self._handle_json(lambda payload: approve_admin_adapter_enablement_status(store_path, **_approve_admin_adapter_enablement_args(payload)))
                 return
-            if self.path == "/admin/policy-warning-requests":
+            if path == "/admin/policy-warning-requests":
                 self._handle_json(lambda payload: request_admin_policy_warning_status(store_path, **_admin_policy_warning_request_args(payload)))
                 return
-            if self.path == "/admin/policy-warning-requests/approve":
+            if path == "/admin/policy-warning-requests/approve":
                 self._handle_json(lambda payload: approve_admin_policy_warning_status(store_path, **_approve_admin_policy_warning_args(payload)))
                 return
-            if self.path == "/admin/policy-customization-helper/profile":
+            if path == "/admin/policy-customization-helper/profile":
                 self._handle_json(lambda payload: _build_policy_profile_api_status(payload))
                 return
-            if self.path == "/runtime/daemon-migration-requests":
+            if path == "/runtime/daemon-migration-requests":
                 self._handle_json(lambda payload: request_daemon_migration_status(store_path, **_daemon_migration_request_args(payload)))
                 return
-            if self.path == "/runtime/daemon-migration-requests/approve":
+            if path == "/runtime/daemon-migration-requests/approve":
                 self._handle_json(lambda payload: approve_daemon_migration_status(store_path, **_approve_daemon_migration_args(payload)))
                 return
-            if self.path == "/usage/continuation-requests":
+            if path == "/usage/continuation-requests":
                 self._handle_json(lambda payload: request_usage_continuation_status(store_path, **_usage_continuation_request_args(payload)))
                 return
-            if self.path == "/usage-limits":
+            if path == "/usage-limits":
                 self._handle_json(lambda payload: record_usage_limit_status(store_path, **_usage_limit_args(payload)))
                 return
-            if self.path == "/crew/messages":
+            if path == "/crew/messages":
                 self._handle_json(lambda payload: record_crew_message_status(store_path, **_crew_message_args(payload)))
                 return
-            if self.path == "/crew/dispatch":
+            if path == "/crew/dispatch":
                 self._handle_json(lambda payload: dispatch_crew_messages_status(store_path, **_crew_dispatch_args(payload)))
                 return
-            if self.path == "/documents/search":
+            if path == "/documents/search":
                 self._handle_json(lambda payload: documents_search_status(**_documents_search_args(payload)))
                 return
-            if self.path == "/documents/notes":
+            if path == "/documents/notes":
                 self._handle_json(lambda payload: documents_write_note_status(**_documents_write_args(payload)))
                 return
-            if self.path == "/documents/knowledge-capture":
+            if path == "/documents/knowledge-capture":
                 self._handle_json(lambda payload: knowledge_capture_status(store_path, **_knowledge_capture_args(payload)))
                 return
-            if self.path == "/usage/continuation-dispatches":
+            if path == "/usage/continuation-dispatches":
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
-            if self.path == "/codex-projects/discover-threads":
+            if path == "/codex-projects/discover-threads":
                 self._handle_json(lambda payload: discover_codex_project_threads_status(store_path, **_codex_project_discovery_args(payload)))
                 return
-            if self.path == "/admin/history-unarchive":
+            if path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -663,6 +839,80 @@ def _documents_write_args(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _operation_record_args(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a JSON object")
+    return {
+        "record_id": str(payload["record_id"]),
+        "kind": str(payload["kind"]),
+        "owner_domain": str(payload["owner_domain"]),
+        "status": str(payload.get("status") or "open"),
+        "subject": str(payload["subject"]),
+        "summary": str(payload["summary"]),
+        "severity": str(payload.get("severity") or "low"),
+        "resource_id": str(payload["resource_id"]) if payload.get("resource_id") else None,
+        "evidence_ids": tuple(str(item) for item in payload.get("evidence_ids", ())),
+        "next_step": str(payload.get("next_step") or ""),
+        "metadata": metadata,
+    }
+
+
+def _operation_transition_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "record_id": str(payload["record_id"]),
+        "status": str(payload["status"]),
+        "updated_by": str(payload.get("updated_by") or "sisko"),
+        "next_step": str(payload["next_step"]) if payload.get("next_step") else None,
+        "summary_note": str(payload["summary_note"]) if payload.get("summary_note") else None,
+    }
+
+
+def _operation_workflow_stage_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "template_id": str(payload["template_id"]),
+        "record_id": str(payload["record_id"]) if payload.get("record_id") else None,
+        "resource_id": str(payload["resource_id"]) if payload.get("resource_id") else None,
+        "requested_by": str(payload.get("requested_by") or "sisko"),
+    }
+
+
+def _maintenance_schedule_args(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a JSON object")
+    return {
+        "schedule_id": str(payload["schedule_id"]),
+        "target": str(payload["target"]),
+        "recurrence": str(payload.get("recurrence") or "weekly"),
+        "window": str(payload.get("window") or "unscheduled"),
+        "timezone": str(payload.get("timezone") or "UTC"),
+        "blackout": str(payload.get("blackout") or ""),
+        "validation": str(payload.get("validation") or "run health probes and service evidence after maintenance"),
+        "rollback": str(payload.get("rollback") or "use related admin plan rollback steps"),
+        "status": str(payload.get("status") or "active"),
+        "owner_domain": str(payload.get("owner_domain") or "obrien"),
+        "risk_level": str(payload.get("risk_level") or "medium"),
+        "notes": str(payload.get("notes") or ""),
+        "metadata": metadata,
+    }
+
+
+def _advisory_refresh_args(payload: dict[str, Any]) -> dict[str, Any]:
+    packages = payload.get("packages")
+    if isinstance(packages, str):
+        packages = [part.strip() for part in packages.replace("\n", ",").split(",") if part.strip()]
+    if packages is not None and not isinstance(packages, list):
+        raise ValueError("packages must be a list or comma-separated string")
+    return {
+        "package_names": [str(item) for item in packages] if packages else None,
+        "source": str(payload.get("source") or "nvd"),
+        "max_results_per_package": int(payload.get("max_results_per_package") or 5),
+        "requested_by": str(payload.get("requested_by") or "obrien"),
+        "dry_run": bool(payload.get("dry_run", False)),
+    }
+
+
 def _knowledge_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
     kinds = payload.get("kinds", ())
     if isinstance(kinds, str):
@@ -742,6 +992,71 @@ def _physical_discovery_args(store_path: str, payload: dict[str, Any]) -> dict[s
     }
 
 
+def _backup_job_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": str(payload["job_id"]),
+        "target": str(payload["target"]),
+        "schedule": str(payload.get("schedule") or "manual"),
+        "retention": str(payload.get("retention") or "operator-defined"),
+        "requested_by": str(payload.get("requested_by") or "kira"),
+        "risk_level": str(payload.get("risk_level") or "medium"),
+        "status": str(payload.get("status") or "staged"),
+        "notes": str(payload.get("notes") or ""),
+    }
+
+
+def _restore_test_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "test_id": str(payload["test_id"]),
+        "job_id": str(payload["job_id"]),
+        "restore_point": str(payload["restore_point"]),
+        "status": str(payload.get("status") or "planned"),
+        "validated_by": str(payload.get("validated_by") or "kira"),
+        "notes": str(payload.get("notes") or ""),
+    }
+
+
+def _backup_cleanup_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": str(payload["path"]),
+        "requested_by": str(payload.get("requested_by") or "kira"),
+        "reason": str(payload.get("reason") or "review generated storage cleanup candidate"),
+    }
+
+
+def _virtual_runtime_record_args(payload: dict[str, Any]) -> dict[str, Any]:
+    ports = payload.get("ports") or ()
+    if isinstance(ports, str):
+        ports = [item.strip() for item in ports.split(",") if item.strip()]
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "kind": str(payload.get("kind") or "vm"),
+        "state": str(payload.get("state") or "observed"),
+        "adapter": str(payload.get("adapter") or "manual"),
+        "ports": tuple(int(port) for port in ports),
+        "snapshot_hint": str(payload.get("snapshot_hint") or ""),
+        "notes": str(payload.get("notes") or ""),
+    }
+
+
+def _virtual_snapshot_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "requested_by": str(payload.get("requested_by") or "dax"),
+        "reason": str(payload.get("reason") or "stage virtual snapshot before maintenance"),
+        "snapshot_name": str(payload.get("snapshot_name") or ""),
+    }
+
+
+def _virtual_restore_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "restore_point": str(payload["restore_point"]),
+        "requested_by": str(payload.get("requested_by") or "dax"),
+        "reason": str(payload.get("reason") or "stage virtual restore after failed change"),
+    }
+
+
 def _stored_health_probe_args(payload: dict[str, Any]) -> dict[str, Any]:
     args: dict[str, Any] = {}
     if "timeout_seconds" in payload:
@@ -762,6 +1077,24 @@ def _health_target_args(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_status": int(payload["expected_status"]) if payload.get("expected_status") is not None else None,
         "expected_content_type": str(payload["expected_content_type"]) if payload.get("expected_content_type") else None,
         "latency_warn_ms": int(payload["latency_warn_ms"]) if payload.get("latency_warn_ms") is not None else None,
+    }
+
+
+def _journal_access_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "unit": str(payload.get("unit") or ""),
+        "requested_by": str(payload.get("requested_by") or "julian"),
+        "reason": str(payload.get("reason") or "system journal access needed for service diagnosis"),
+    }
+
+
+def _metric_history_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_id": str(payload.get("snapshot_id") or ""),
+        "requested_by": str(payload.get("requested_by") or "julian"),
+        "notes": str(payload.get("notes") or ""),
+        "max_snapshots": int(payload.get("max_snapshots") or 250),
     }
 
 
@@ -941,6 +1274,25 @@ def _host_security_source_block_args(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
         "action": str(payload.get("action", "block_ip")),
         "reason": str(payload["reason"]) if payload.get("reason") else None,
+    }
+
+
+def _firewall_policy_enforcement_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "rule_index": int(payload["rule_index"]),
+        "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
+        "requested_by": str(payload.get("requested_by") or "odo"),
+        "reason": str(payload["reason"]) if payload.get("reason") else None,
+    }
+
+
+def _identity_rotation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "subject": str(payload["subject"]),
+        "subject_type": str(payload.get("subject_type") or "secret"),
+        "requested_by": str(payload.get("requested_by") or "odo"),
+        "reason": str(payload.get("reason") or "stage identity or secret rotation review"),
+        "urgency": str(payload.get("urgency") or "medium"),
     }
 
 

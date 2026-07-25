@@ -43,6 +43,9 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /usage/continuation-plan`
 - `GET /physical-summary`
 - `GET /virtual-summary`
+- `GET /virtual/operations`
+- `GET /observability/metric-history`
+- `GET /observability/performance-history`
 - `GET /health-summary`
 - `GET /health-efficiency`
 - `GET /host/security`
@@ -54,6 +57,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security/source-reviews`
 - `GET /host/security/ids-review-packages`
 - `GET /host/security/ids-review-summary`
+- `GET /identity/rotation-requests`
 - `GET /admin/authorizations-required`
 - `GET /admin/adapter-capabilities`
 - `GET /admin/adapter-enablement-plan`
@@ -86,12 +90,17 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /physical/discover`
 - `POST /physical/discover-storage`
 - `POST /virtual/discover-listeners`
+- `POST /virtual/runtime-records`
+- `POST /virtual/snapshot-requests`
+- `POST /virtual/restore-requests`
 - `POST /health-targets`
 - `POST /health/probes/run`
+- `POST /observability/metric-history/capture`
 - `POST /host/inspect`
 - `POST /host/security/listener-review-queue/remediation-plans`
 - `POST /host/security/source-reviews`
 - `POST /host/security/source-reviews/block-plans`
+- `POST /identity/rotation-requests`
 - `POST /host/security/ids-review-packages`
 - `POST /host/security/ids-review-packages/submit`
 - `POST /host/security/ids-review-packages/prompts`
@@ -174,6 +183,10 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /physical/discover` reads configured physical path roots, persists discovered serial/USB identities for Kira, and creates checkout-ready physical resources. Optional field: `roots`, either a string or list of strings. When omitted it checks `/dev/serial/by-id` and `/dev/serial/by-path`. It does not open devices, change permissions, mount storage, or write to hardware.
 `POST /physical/discover-storage` reads sysfs block-device metadata and persists discovered storage identities for Kira. Optional field: `sysfs_block_root`. It does not mount, unmount, format, partition, or write to devices.
 `POST /virtual/discover-listeners` reads local TCP listener evidence and persists discovered listener resources for Dax. It does not change firewall rules, routes, processes, service definitions, proxies, or network bindings.
+`GET /virtual/operations` returns Dax's local virtual runtime records plus staged snapshot and restore requests from ignored state.
+`POST /virtual/runtime-records` records observed virtual runtime state for a VM, container, emulator, gateway, or proxy. It does not start, stop, snapshot, restore, destroy, or reconfigure the runtime.
+`POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. It does not invoke any live virtual adapter.
+`POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. It does not invoke any live virtual adapter.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership, permissions, sidecar files, and schema migration metadata without creating a missing database or changing file modes.
@@ -191,6 +204,8 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `GET /host/security/source-reviews` lists persisted Odo source reviews, dispositions, and whether a reviewed source is eligible for a later block-plan staging step.
 `POST /host/security/source-reviews` records Odo's review of a correlated source. It does not stage a block plan or change firewall policy.
 `POST /host/security/source-reviews/block-plans` stages an Odo-owned, human-approval source block plan from a reviewed hostile source. It records the plan only; firewall and IDS enforcement remain blocked until separate approval and Intrusion Detection advisory review.
+`GET /identity/rotation-requests` returns Odo's staged identity, SSH key, API key, service-account, user, group, and secret rotation requests from ignored local state.
+`POST /identity/rotation-requests` stages an approval-bound identity or secret rotation request. It redacts local paths and does not disclose, copy, rotate, delete, replace, or modify credentials, users, groups, SSH keys, API keys, service accounts, or token files.
 `GET /host/security/ids-review-packages` lists prepared Intrusion Detection advisory packages and prompts tied to security admin plans.
 `GET /host/security/ids-review-summary` returns compact IDS/firewall review gate counters, package next steps, and latest Odo audit events without full prompts or advisory text.
 `POST /host/security/ids-review-packages` prepares the review package required before firewall or source-block plans can be approved. It does not run the advisor or apply policy.
@@ -216,6 +231,9 @@ The CLI equivalents are `documents-status`, `documents-notes`, `documents-search
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, counts by kind and source, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
 `GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.
+`GET /observability/metric-history` returns Julian's durable metric history snapshots from ignored local state.
+`POST /observability/metric-history/capture` captures a state-only snapshot of retained health and host trend summaries. It does not probe services, inspect the host, or read privileged logs.
+`GET /observability/performance-history` returns read-only regression and operator-performance timing history from local JSON artifacts. It does not run tests or mutate project state.
 
 ## Python Client
 

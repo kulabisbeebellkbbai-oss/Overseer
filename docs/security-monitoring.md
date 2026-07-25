@@ -52,3 +52,18 @@ PYTHONPATH=src python3 -m overseer.cli dispatch-host-security-ids-review-package
 ```
 
 Dispatch resumes the registered thread when needed, then delivers the advisory prompt into the tmux-backed Codex session. It records prompt path, thread id, conversation id, resume status, and prompt-delivery status. It does not accept the advisory, approve the admin plan, or execute firewall changes; `record-host-security-ids-review-result --status accepted` remains the separate review gate.
+
+## Desired Firewall Policy Enforcement
+
+Odo can turn a reviewed `config/desired-firewall.json` rule into a staged
+firewall admin plan through the protected API:
+
+```text
+POST /host/security/firewall-policy/enforcement-plans
+```
+
+Supported desired rules are objects with `action` set to `allow_tcp` or
+`deny_tcp` and a numeric `port`. Staging writes an admin plan and prepares an
+IDS review prompt under ignored state. It does not apply firewall rules, reload
+firewall services, change routes, alter service bind addresses, or approve the
+plan. Human approval remains required after IDS review before enforcement.

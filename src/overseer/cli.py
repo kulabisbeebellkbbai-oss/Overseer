@@ -7296,8 +7296,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_resource_parser.add_argument("--risk-level", required=True, choices=[item.value for item in RiskLevel])
     record_resource_parser.add_argument("--state", default=ResourceState.AVAILABLE.value, choices=[item.value for item in ResourceState])
     record_resource_parser.add_argument("--identifier-json", default="{}", help="JSON object with structured resource identifiers")
-    record_resource_parser.add_argument("--dependency", action="append", default=())
-    record_resource_parser.add_argument("--exclusive-group", action="append", default=())
+    record_resource_parser.add_argument("--dependency", action="append", default=[])
+    record_resource_parser.add_argument("--exclusive-group", action="append", default=[])
     record_resource_parser.add_argument("--current-claim-id")
     record_resource_parser.add_argument("--last-verified-at")
     record_resource_parser.add_argument("--notes", default="")
@@ -7372,14 +7372,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     plan_package_updates_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     plan_package_updates_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
-    plan_package_updates_parser.add_argument("--package", action="append", default=(), help="limit upgrade plan to a detected package")
+    plan_package_updates_parser.add_argument("--package", action="append", default=[], help="limit upgrade plan to a detected package")
     run_package_maintenance_parser = subparsers.add_parser(
         "run-package-maintenance-cycle",
         help="refresh apt metadata, stage detected upgrades, and execute through O'Brien gates",
     )
     run_package_maintenance_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     run_package_maintenance_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
-    run_package_maintenance_parser.add_argument("--package", action="append", default=(), help="limit upgrade plan to a detected package")
+    run_package_maintenance_parser.add_argument("--package", action="append", default=[], help="limit upgrade plan to a detected package")
     run_package_maintenance_parser.add_argument(
         "--no-auto-enable-adapters",
         action="store_true",
@@ -7831,7 +7831,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_parser.add_argument("--intent", required=True)
     claim_parser.add_argument("--requested-action", required=True)
     claim_parser.add_argument("--risk-level", required=True, choices=[item.value for item in RiskLevel])
-    claim_parser.add_argument("--port", action="append", type=int, default=(), help="port reservation for conflict checks")
+    claim_parser.add_argument("--port", action="append", type=int, default=[], help="port reservation for conflict checks")
     claim_parser.add_argument("--starts-at")
     claim_parser.add_argument("--expires-at")
     claim_parser.add_argument("--release-condition")
@@ -7876,7 +7876,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_parser.add_argument("--claim-id", required=True)
     release_parser.add_argument("--released-by")
     release_parser.add_argument("--reason")
-    release_parser.add_argument("--evidence-id", action="append", default=())
+    release_parser.add_argument("--evidence-id", action="append", default=[])
     release_parser.add_argument("--released-at")
     args = parser.parse_args(argv)
 

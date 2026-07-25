@@ -8577,6 +8577,69 @@ class CliDemoTests(unittest.TestCase):
         self.assertEqual(resource.owner_domain, OwnerDomain.DAX)
         self.assertEqual(resource.exclusive_groups, frozenset({"android-emulator"}))
 
+    def test_cli_records_bsbbs_port_resource_and_claim_with_append_options(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            resource_stdout = io.StringIO()
+            claim_stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(resource_stdout):
+                resource_exit = cli_main(
+                    [
+                        "record-resource",
+                        "--store",
+                        str(store_path),
+                        "--resource-id",
+                        "port.bsbbs.8796",
+                        "--name",
+                        "BSBBS localhost port 8796",
+                        "--resource-type",
+                        ResourceType.VIRTUAL_ASSET.value,
+                        "--owner-domain",
+                        OwnerDomain.DAX.value,
+                        "--risk-level",
+                        RiskLevel.MEDIUM.value,
+                        "--identifier-json",
+                        '{"host":"127.0.0.1","port":8796,"service":"bsbbs"}',
+                        "--exclusive-group",
+                        "protected-gateway-ports",
+                    ]
+                )
+            with contextlib.redirect_stdout(claim_stdout):
+                claim_exit = cli_main(
+                    [
+                        "request-claim",
+                        "--store",
+                        str(store_path),
+                        "--claim-id",
+                        "claim.bsbbs.port.8796",
+                        "--resource-id",
+                        "port.bsbbs.8796",
+                        "--claim-type",
+                        ClaimType.LEASE.value,
+                        "--owner-thread",
+                        "BSBBS",
+                        "--owner-role",
+                        OwnerDomain.DAX.value,
+                        "--intent",
+                        "reserve BSBBS localhost backend port",
+                        "--requested-action",
+                        "bind 127.0.0.1:8796 for BSBBS protected gateway rollout",
+                        "--risk-level",
+                        RiskLevel.MEDIUM.value,
+                        "--port",
+                        "8796",
+                    ]
+                )
+            resource_status = json.loads(resource_stdout.getvalue())
+            claim_status = json.loads(claim_stdout.getvalue())
+
+        self.assertEqual(resource_exit, 0)
+        self.assertEqual(claim_exit, 0)
+        self.assertEqual(resource_status["resource"]["exclusive_groups"], ["protected-gateway-ports"])
+        self.assertEqual(resource_status["resource"]["identifiers"]["port"], 8796)
+        self.assertEqual(claim_status["claim"], "claim.bsbbs.port.8796")
+
     def test_seed_config_status_uses_explicit_config_and_store_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "overseer.json"

@@ -152,7 +152,8 @@ environment-specific policy wiring:
   inventory enrichment. Dax now supports approved disposable lifecycle actions
   plus provider snapshot/restore for local fixtures, stopped qcow2 images,
   stopped qemu/libvirt image targets, containers, file-backed Renode/proxy
-  targets, and approved disposable Android AVD directories.
+  targets, and approved disposable Android AVD directories, with read-only
+  provider-depth, capacity, and image provenance evidence.
 - secret rotation execution and service-account change execution.
 
 ## Tests

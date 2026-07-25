@@ -35,7 +35,7 @@ from overseer.storage_evidence import storage_evidence_status
 from overseer.store import SQLiteStore
 from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
-from overseer.virtual_evidence import parse_docker_ps_json_lines, virtual_evidence_status
+from overseer.virtual_evidence import parse_docker_ps_json_lines, parse_podman_ps_json, virtual_evidence_status
 from overseer.virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
@@ -798,6 +798,9 @@ exit 0
         self.assertTrue(payload["runtime_adapters"])
         self.assertIn("runtime_inventory", payload)
         self.assertIn("execution_records", payload)
+        self.assertIn("capacity_summary", payload)
+        self.assertIn("provider_depth", payload)
+        self.assertIn("image_provenance", payload)
         self.assertEqual(payload["cleanup"][0]["claim_id"], "claim.expired")
         self.assertFalse(payload["host_mutation_performed"])
 
@@ -811,6 +814,19 @@ exit 0
         self.assertEqual(rows[0]["kind"], "container")
         self.assertEqual(rows[0]["state"], "running")
         self.assertEqual(rows[0]["image"], "nginx:latest")
+        self.assertIn("request Dax claim", rows[0]["next_step"])
+
+    def test_podman_provider_inventory_parser_returns_claimable_runtime_rows(self):
+        rows = parse_podman_ps_json(
+            '[{"Id":"def456","Image":"alpine:latest","Names":["overseer-dax-disposable-podman"],"State":"exited","Labels":{"overseer.owner":"dax"},"PortMappings":[]}]'
+        )
+
+        self.assertEqual(rows[0]["provider"], "podman")
+        self.assertEqual(rows[0]["resource_id"], "podman.overseer-dax-disposable-podman")
+        self.assertEqual(rows[0]["kind"], "container")
+        self.assertEqual(rows[0]["state"], "exited")
+        self.assertEqual(rows[0]["image"], "alpine:latest")
+        self.assertEqual(rows[0]["owner"], "dax")
         self.assertIn("request Dax claim", rows[0]["next_step"])
 
     @unittest.skipIf(shutil.which("qemu-img") is None, "qemu-img is required")
@@ -865,6 +881,39 @@ exit 0
         self.assertEqual(api_status["runtime_record_count"], 1)
         self.assertEqual(api_snapshot["snapshot_request"]["status"], "waiting_approval")
         self.assertFalse(restore["host_mutation_performed"])
+
+    def test_virtual_evidence_reports_registered_provider_depth_and_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir(parents=True)
+            proxy_config = root / "local-secrets" / "virtual-runtime-configs" / "overseer-dax-disposable-proxy.py"
+            proxy_config.parent.mkdir(parents=True)
+            proxy_config.write_text("print('proxy')\n", encoding="utf-8")
+            record_virtual_runtime_status(
+                root,
+                "overseer-dax-disposable-proxy",
+                kind="proxy",
+                state="running",
+                adapter="gateway_proxy",
+                ports=(8769,),
+                snapshot_hint="local-secrets/virtual-runtime-configs/overseer-dax-disposable-proxy.py",
+                notes="approved disposable proxy target",
+            )
+            payload = virtual_evidence_status(store_path)
+            with LocalApiHarness(store_path) as server:
+                api_payload = server.get_json("/Overseer/virtual/evidence")
+
+        provider_rows = {row["provider"]: row for row in payload["provider_depth"]}
+        inventory_rows = [row for row in payload["runtime_inventory"] if row["provider"] == "gateway_proxy"]
+        self.assertIn("gateway_proxy", provider_rows)
+        self.assertEqual(provider_rows["gateway_proxy"]["registered_records"], 1)
+        self.assertEqual(payload["capacity_summary"]["registered_ports"], 1)
+        self.assertTrue(inventory_rows)
+        self.assertEqual(inventory_rows[0]["state"], "running")
+        self.assertIn("Image Provenance Review", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Provider Depth Coverage", OPERATOR_CONSOLE_HTML)
+        self.assertEqual(api_payload["capacity_summary"]["registered_ports"], 1)
 
     def test_virtual_target_setup_batch_stages_approval_requests_without_host_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -25,6 +25,8 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         store.close()
     rows = [_virtual_row(resource, claims) for resource in resources]
     port_rows = _port_pool_rows(resources, claims)
+    runtime_records = list(virtual_ops["runtime_records"])
+    runtime_inventory = _runtime_inventory_rows(project_root, runtime_records)
     return {
         "store": str(Path(store_path)),
         "runtime_assets": len(rows),
@@ -32,12 +34,15 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         "port_conflicts": sum(1 for row in port_rows if row["status"] == "conflict"),
         "snapshot_ready": sum(1 for row in rows if row["snapshot_status"] == "ready"),
         "items": rows,
-        "runtime_records": virtual_ops["runtime_records"],
+        "runtime_records": runtime_records,
         "snapshot_requests": virtual_ops["snapshot_requests"],
         "restore_requests": virtual_ops["restore_requests"],
         "execution_records": virtual_ops["execution_records"],
         "runtime_adapters": _runtime_adapter_rows(),
-        "runtime_inventory": _runtime_inventory_rows(project_root),
+        "runtime_inventory": runtime_inventory,
+        "capacity_summary": _capacity_summary(resources, claims, runtime_records, runtime_inventory, port_rows),
+        "image_provenance": _image_provenance_rows(runtime_inventory),
+        "provider_depth": _provider_depth_rows(runtime_records, runtime_inventory),
         "port_pool": port_rows,
         "cleanup": _cleanup_rows(claims),
         "mutation_performed": False,
@@ -99,7 +104,7 @@ def _cleanup_rows(claims: tuple[Claim, ...]) -> list[dict[str, object]]:
 
 
 def _runtime_adapter_rows() -> list[dict[str, object]]:
-    adapters = ("docker", "podman", "virsh", "qemu-img", "qemu-system-x86_64", "qemu-system-aarch64", "VBoxManage", "emulator", "renode")
+    adapters = ("docker", "podman", "virsh", "qemu-img", "qemu-system-x86_64", "qemu-system-aarch64", "emulator", "renode")
     return [
         {
             "adapter": adapter,
@@ -111,11 +116,13 @@ def _runtime_adapter_rows() -> list[dict[str, object]]:
     ]
 
 
-def _runtime_inventory_rows(project_root: Path) -> list[dict[str, object]]:
+def _runtime_inventory_rows(project_root: Path, runtime_records: list[dict[str, object]]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     rows.extend(_docker_inventory_rows())
+    rows.extend(_podman_inventory_rows())
     rows.extend(_virsh_inventory_rows())
     rows.extend(_qemu_image_inventory_rows(project_root))
+    rows.extend(_registered_runtime_depth_rows(project_root, runtime_records))
     return rows
 
 
@@ -159,8 +166,74 @@ def parse_docker_ps_json_lines(output: str) -> list[dict[str, object]]:
                 "kind": "container",
                 "state": state,
                 "image": _short_value(item.get("Image")),
+                "virtual_size": "",
+                "actual_size": "",
+                "snapshots": "",
                 "ports": str(item.get("Ports") or ""),
                 "owner": str(item.get("Labels") or ""),
+                "evidence": f"id={container_id}",
+                "next_step": "request Dax claim before changing container runtime state",
+            }
+        )
+    return rows
+
+
+def _podman_inventory_rows() -> list[dict[str, object]]:
+    if shutil.which("podman") is None:
+        return []
+    result = _run_inventory_command(("podman", "ps", "-a", "--format", "json"))
+    if result["exit_code"] != 0:
+        return [
+            {
+                "provider": "podman",
+                "resource_id": "podman.inventory",
+                "kind": "container_inventory",
+                "state": "unavailable",
+                "image": "",
+                "virtual_size": "",
+                "actual_size": "",
+                "ports": "",
+                "owner": "",
+                "evidence": result["stderr"],
+                "next_step": "verify Podman rootless runtime before container inventory can be trusted",
+            }
+        ]
+    return parse_podman_ps_json(str(result["stdout"]))
+
+
+def parse_podman_ps_json(output: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    try:
+        items = json.loads(output) if output.strip() else []
+    except json.JSONDecodeError:
+        items = []
+    if isinstance(items, dict):
+        items = [items]
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        container_id = str(item.get("Id") or item.get("ID") or "").strip()
+        names = item.get("Names") or item.get("Name") or container_id or "container"
+        if isinstance(names, list):
+            name = str(names[0] if names else container_id or "container")
+        else:
+            name = str(names)
+        state = str(item.get("State") or item.get("Status") or "unknown").strip()
+        ports = item.get("Ports") or item.get("PortMappings") or ""
+        labels = item.get("Labels") or {}
+        owner = labels.get("overseer.owner", "") if isinstance(labels, dict) else str(labels)
+        rows.append(
+            {
+                "provider": "podman",
+                "resource_id": f"podman.{_safe_id(name or container_id)}",
+                "kind": "container",
+                "state": state,
+                "image": _short_value(item.get("Image") or item.get("ImageName")),
+                "virtual_size": "",
+                "actual_size": item.get("Size") or "",
+                "snapshots": "",
+                "ports": _short_value(ports),
+                "owner": owner,
                 "evidence": f"id={container_id}",
                 "next_step": "request Dax claim before changing container runtime state",
             }
@@ -270,6 +343,164 @@ def _qemu_image_inventory_row(project_root: Path, image: Path) -> dict[str, obje
         "evidence": f"format={info.get('format', '')}",
         "next_step": "request Dax claim before snapshot, restore, start, or image mutation",
     }
+
+
+def _registered_runtime_depth_rows(project_root: Path, runtime_records: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for record in runtime_records:
+        adapter = str(record.get("adapter") or "manual")
+        if adapter in {"manual", "local_fixture", "qemu_img", "docker", "podman", "libvirt"}:
+            continue
+        rows.append(_registered_runtime_depth_row(project_root, record, adapter))
+    return rows
+
+
+def _registered_runtime_depth_row(project_root: Path, record: dict[str, object], adapter: str) -> dict[str, object]:
+    resource_id = str(record.get("resource_id") or "runtime")
+    hint = str(record.get("snapshot_hint") or "")
+    target = _registered_target_path(project_root, record, adapter)
+    target_exists = target.exists() if target else False
+    state = str(record.get("state") or "observed")
+    actual_size = _path_size(target) if target and target_exists else ""
+    return {
+        "provider": adapter,
+        "resource_id": f"{adapter}.{_safe_id(resource_id)}",
+        "kind": str(record.get("kind") or "runtime"),
+        "state": state if target_exists or adapter == "android_emulator" else "target_missing",
+        "image": _redact_path(hint) if hint else _relative_or_name(project_root, target) if target else "",
+        "virtual_size": "",
+        "actual_size": actual_size,
+        "snapshots": "",
+        "ports": ",".join(str(port) for port in record.get("ports") or []),
+        "owner": _owner_from_notes(str(record.get("notes") or "")),
+        "evidence": _runtime_depth_evidence(project_root, target, target_exists, adapter),
+        "next_step": "request Dax claim before changing registered runtime state",
+    }
+
+
+def _registered_target_path(project_root: Path, record: dict[str, object], adapter: str) -> Path | None:
+    resource_id = str(record.get("resource_id") or "")
+    if adapter == "android_emulator":
+        return Path.home() / ".android" / "avd" / f"{resource_id}.avd"
+    hint = str(record.get("snapshot_hint") or "")
+    if not hint or hint.startswith("/") or "~" in Path(hint).parts or ".." in Path(hint).parts:
+        return None
+    return project_root / hint
+
+
+def _runtime_depth_evidence(project_root: Path, target: Path | None, target_exists: bool, adapter: str) -> str:
+    if target is None:
+        return "no safe project-relative snapshot_hint"
+    if not target_exists:
+        return "registered target path is missing"
+    if adapter == "android_emulator":
+        return f"avd={target.name}"
+    return f"path={_relative_or_name(project_root, target)}"
+
+
+def _path_size(path: Path) -> int:
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for child in path.rglob("*") if path.is_dir() else []:
+        if not child.is_file():
+            continue
+        try:
+            total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _numeric_value(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else 0
+
+
+def _owner_from_notes(notes: str) -> str:
+    lowered = notes.lower()
+    if "dax" in lowered or "disposable" in lowered:
+        return "dax"
+    return ""
+
+
+def _capacity_summary(
+    resources: list[Resource],
+    claims: tuple[Claim, ...],
+    runtime_records: list[dict[str, object]],
+    runtime_inventory: list[dict[str, object]],
+    port_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    images = [_numeric_value(row.get("actual_size")) for row in runtime_inventory]
+    return {
+        "virtual_resources": len(resources),
+        "registered_runtimes": len(runtime_records),
+        "inventory_rows": len(runtime_inventory),
+        "claimed_ports": len({port for claim in claims for port in claim.port_reservations}),
+        "registered_ports": len({port for record in runtime_records for port in record.get("ports") or []}),
+        "port_conflicts": sum(1 for row in port_rows if row["status"] == "conflict"),
+        "image_actual_bytes": sum(images),
+        "container_rows": sum(1 for row in runtime_inventory if row.get("kind") == "container"),
+        "image_rows": sum(1 for row in runtime_inventory if row.get("kind") in {"qcow2_image", "vm"}),
+        "next_step": "review conflicts, stale claims, and large images before scheduling new Dax work",
+    }
+
+
+def _image_provenance_rows(runtime_inventory: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows = []
+    for item in runtime_inventory:
+        image = str(item.get("image") or "")
+        if not image:
+            continue
+        provider = str(item.get("provider") or "")
+        risk = "local" if image.startswith("local-secrets") or image.endswith(".qcow2") else "external_or_registry"
+        rows.append(
+            {
+                "provider": provider,
+                "resource_id": item.get("resource_id", ""),
+                "image": image,
+                "state": item.get("state", ""),
+                "provenance": risk,
+                "evidence": item.get("evidence", ""),
+                "next_step": "review image source and vulnerability scan before production use"
+                if risk != "local"
+                else "retain local manifest and snapshot evidence",
+            }
+        )
+    return rows
+
+
+def _provider_depth_rows(runtime_records: list[dict[str, object]], runtime_inventory: list[dict[str, object]]) -> list[dict[str, object]]:
+    providers = ["docker", "podman", "libvirt", "qemu_process", "renode", "android_emulator", "gateway_proxy", "qemu_img"]
+    inventory_by_provider: dict[str, int] = {}
+    for row in runtime_inventory:
+        provider = str(row.get("provider") or "")
+        normalized = "libvirt" if provider == "virsh" else provider
+        inventory_by_provider[normalized] = inventory_by_provider.get(normalized, 0) + 1
+    records_by_provider: dict[str, int] = {}
+    for record in runtime_records:
+        provider = str(record.get("adapter") or "")
+        records_by_provider[provider] = records_by_provider.get(provider, 0) + 1
+    return [
+        {
+            "provider": provider,
+            "registered_records": records_by_provider.get(provider, 0),
+            "inventory_rows": inventory_by_provider.get(provider, 0),
+            "snapshot_restore": "implemented" if provider in {"docker", "podman", "libvirt", "qemu_process", "renode", "android_emulator", "gateway_proxy", "qemu_img"} else "not_implemented",
+            "mutation_boundary": "approved disposable targets only",
+            "next_step": "add richer CPU, memory, disk, and network telemetry where provider exposes it read-only",
+        }
+        for provider in providers
+    ]
 
 
 def _run_inventory_command(command: tuple[str, ...], timeout_seconds: float = 2.0) -> dict[str, object]:

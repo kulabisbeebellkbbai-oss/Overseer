@@ -255,16 +255,19 @@ the supplied evidence as the next resolution target.
 
 ## Read-Only Provider Inventory
 
-The Claims page also includes Runtime Provider Inventory. Dax currently gathers
+The Claims page also includes Runtime Provider Inventory, Provider Depth
+Coverage, Virtual Capacity Summary, and Image Provenance Review. Dax gathers
 read-only Docker container rows from `docker ps -a --format '{{json .}}'`,
-libvirt VM rows from `virsh list --all --name` plus `virsh domstate`, and qemu
-qcow2 image rows from staged files under `local-secrets/virtual-runtime-targets`.
-Qemu image inventory includes the project-relative image path, format status,
-virtual size, actual size, and internal snapshot names. Dax also reports
-`qemu-img` availability in Runtime Adapter Availability. Commands use short
-timeouts and return unavailable inventory rows when the CLI exists but the daemon
-or libvirt session is not accessible.
+Podman rows from `podman ps -a --format json`, libvirt VM rows from
+`virsh list --all --name` plus `virsh domstate`, qemu qcow2 image rows from
+staged files under `local-secrets/virtual-runtime-targets`, and registered
+runtime depth rows for qemu process, Renode, Android Emulator, and
+gateway/proxy records. Qemu image inventory includes the project-relative image
+path, format status, virtual size, actual size, and internal snapshot names.
+Dax also reports CLI availability in Runtime Adapter Availability. Commands use
+short timeouts and return unavailable inventory rows when a CLI exists but the
+daemon, rootless runtime, or libvirt session is not accessible.
 
-Inventory rows are evidence only. They do not start, stop, snapshot, restore, or
-destroy runtimes. Any mutation still requires a Dax claim plus the staged
-snapshot/restore or future provider-specific execution workflow.
+Inventory, capacity, and provenance rows are evidence only. They do not start,
+stop, snapshot, restore, or destroy runtimes. Any mutation still requires a Dax
+claim plus the staged lifecycle or snapshot/restore execution workflow.

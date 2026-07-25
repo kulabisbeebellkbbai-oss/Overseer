@@ -238,6 +238,7 @@ The CLI equivalents are `documents-status`, `documents-notes`, `documents-search
 `POST /usage/continuation-dispatches` persists idempotent dispatch records for ready continuation requests; optional fields are `dispatched_by`, `dispatched_at`, `resume_codex_projects`, and `codex_projects_registry`. When `resume_codex_projects` is true, matched `owner_thread` values are resumed through the local `codex-projects` tmux registry. It does not mutate host schedulers.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, counts by kind and source, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
+`GET /virtual/evidence` returns Dax read-only provider inventory, registered runtime records, port-pool conflicts, cleanup candidates, provider-depth coverage, virtual capacity summary, and image provenance review rows. It does not mutate runtime state.
 `GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.
 `GET /observability/metric-history` returns Julian's durable metric history snapshots from ignored local state.
 `POST /observability/metric-history/capture` captures a state-only snapshot of retained health and host trend summaries. It does not probe services, inspect the host, or read privileged logs.

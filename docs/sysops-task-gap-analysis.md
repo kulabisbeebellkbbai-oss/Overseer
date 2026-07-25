@@ -234,18 +234,18 @@ disposable Android AVD directory snapshot/restore with manifests under
 
 Gaps:
 
-- No approved live adapter inventory with state, image, CPU, memory, disk,
-  network, and owner gathered directly from every backend. Dax now surfaces
-  read-only Docker and virsh provider inventory when those CLIs are available,
-  plus qemu qcow2 image format, size, and internal snapshot metadata for staged
-  images under `local-secrets/virtual-runtime-targets`. CPU, memory, running
-  disk usage, network topology, Podman, QEMU process, emulator, Renode, and
-  gateway/proxy depth still need provider-specific collectors.
+- Richer CPU, memory, running disk, and network-topology telemetry still needs
+  provider-specific collectors where each backend exposes safe read-only data.
+  Dax now surfaces read-only Docker, Podman, virsh, qemu image, qemu process,
+  Android Emulator, Renode, and gateway/proxy depth rows, plus capacity and
+  image provenance review summaries.
 - No approved running-domain libvirt snapshot policy, VirtualBox provider,
   destroy action, or generalized snapshot/restore for non-disposable targets.
   Provider snapshot/restore is intentionally limited to approved disposable
   targets and stopped image-backed runtime state.
-- No container image vulnerability/provenance panel.
+- Container image vulnerability scanning still needs a scanner/policy choice.
+  Dax now surfaces image provenance review rows that identify local versus
+  registry/external image sources for operator triage.
 - No resource-capacity planning for CPU, memory, disk, and port pools.
 
 ### Observability, Health, And Performance

@@ -827,6 +827,7 @@ def plan_package_updates_status(
     captured_at: str | None = None,
     packages: Sequence[str] = (),
     adapter: AptPackageInspectionAdapter | None = None,
+    include_index_refresh_plan: bool = True,
 ) -> dict[str, object]:
     snapshot = (adapter or AptPackageInspectionAdapter()).inspect(captured_at)
     inspection = package_inspection_snapshot_status(snapshot)
@@ -859,11 +860,11 @@ def plan_package_updates_status(
     suffix = _status_id(snapshot.id)
     current_state = _package_update_current_state(snapshot, selected_names)
     plans = (
-        plan_apt_update(
+        *((plan_apt_update(
             f"admin.apt.update.{suffix}",
             "refresh package metadata before detected package upgrades",
             current_state,
-        ),
+        ),) if include_index_refresh_plan else ()),
         plan_apt_upgrade(
             f"admin.apt.upgrade.{suffix}",
             selected_names,
@@ -882,12 +883,97 @@ def plan_package_updates_status(
             "items": [admin_change_plan_status(plan) for plan in plans],
             "selected_packages": selected_names,
             "missing_packages": missing_names,
+            "include_index_refresh_plan": include_index_refresh_plan,
             "mutation_performed": True,
             "host_mutation_performed": False,
             "next_step": "dispatch O'Brien to advance staged package maintenance through allowed gates",
         }
     finally:
         store.close()
+
+
+def run_obrien_package_maintenance_cycle_status(
+    store_path: str | Path,
+    captured_at: str | None = None,
+    packages: Sequence[str] = (),
+    adapter: AptPackageInspectionAdapter | None = None,
+    runner=None,
+    policy_profile_path: str | Path | None = None,
+    auto_enable_adapters: bool = True,
+) -> dict[str, object]:
+    now = captured_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    suffix = _status_id(now)
+    actions: list[dict[str, object]] = []
+    enabled_actions: list[dict[str, object]] = []
+
+    refresh_plan = plan_apt_update(
+        f"admin.apt.update.maintenance.{suffix}",
+        "refresh package metadata for O'Brien maintenance cycle",
+        "maintenance cycle requested",
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_admin_change_plan(refresh_plan)
+    finally:
+        store.close()
+    actions.append({"stage_index_refresh": admin_change_plan_status(refresh_plan)})
+
+    if auto_enable_adapters:
+        enabled_actions.append(_ensure_admin_adapter_enabled(store_path, AdminChangeKind.APT_UPDATE, "human", now))
+    refresh_execution = execute_admin_change_status(
+        store_path,
+        refresh_plan.id,
+        runner=runner,
+        policy_profile_path=policy_profile_path,
+    )
+    actions.append({"execute_index_refresh": refresh_execution})
+
+    inspection_and_plans = plan_package_updates_status(
+        store_path,
+        captured_at=now,
+        packages=packages,
+        adapter=adapter,
+        include_index_refresh_plan=False,
+    )
+    actions.append({"plan_upgrades": inspection_and_plans})
+
+    upgrade_advancements: list[dict[str, object]] = []
+    if inspection_and_plans.get("plans"):
+        if auto_enable_adapters:
+            enabled_actions.append(_ensure_admin_adapter_enabled(store_path, AdminChangeKind.APT_UPGRADE, "human", now))
+        for item in inspection_and_plans.get("items", []):
+            if isinstance(item, dict) and item.get("id"):
+                advancement = _advance_obrien_package_plan(
+                    store_path,
+                    str(item["id"]),
+                    now,
+                    runner=runner,
+                    policy_profile_path=policy_profile_path,
+                )
+                if advancement is not None:
+                    upgrade_advancements.append(advancement)
+    actions.extend({"advance_upgrade": item} for item in upgrade_advancements)
+
+    executions = tuple(
+        action
+        for action in (refresh_execution, *(item.get("execution") or item for item in upgrade_advancements))
+        if isinstance(action, dict) and action.get("status")
+    )
+    return {
+        "store": str(Path(store_path)),
+        "captured_at": now,
+        "packages": tuple(packages),
+        "auto_enable_adapters": auto_enable_adapters,
+        "adapter_enablement": enabled_actions,
+        "actions": actions,
+        "executions": len(executions),
+        "completed_executions": sum(1 for item in executions if item.get("status") == AdminExecutionStatus.COMPLETED.value),
+        "failed_executions": sum(1 for item in executions if item.get("status") == AdminExecutionStatus.FAILED.value),
+        "blocked_executions": sum(1 for item in executions if item.get("status") == AdminExecutionStatus.BLOCKED.value),
+        "mutation_performed": True,
+        "host_mutation_performed": any(item.get("status") == AdminExecutionStatus.COMPLETED.value for item in executions),
+        "next_step": _obrien_package_maintenance_cycle_next_step(executions, inspection_and_plans),
+    }
 
 
 def package_inspection_snapshot_status(snapshot: PackageInspectionSnapshot) -> dict[str, object]:
@@ -5276,18 +5362,24 @@ def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str
     )
 
 
-def _advance_obrien_package_plan(store_path: str | Path, plan_id: str, advanced_at: str) -> dict[str, object] | None:
+def _advance_obrien_package_plan(
+    store_path: str | Path,
+    plan_id: str,
+    advanced_at: str,
+    runner=None,
+    policy_profile_path: str | Path | None = None,
+) -> dict[str, object] | None:
     readiness = _admin_plan_readiness_item(store_path, plan_id)
     if readiness.get("owner_domain") != OwnerDomain.OBRIEN.value:
         return None
     if readiness.get("kind") not in {AdminChangeKind.APT_UPDATE.value, AdminChangeKind.APT_UPGRADE.value}:
         return None
     if readiness.get("readiness_state") == "ready_for_overseer_execution":
-        return execute_admin_change_status(store_path, plan_id)
+        return execute_admin_change_status(store_path, plan_id, runner=runner, policy_profile_path=policy_profile_path)
     if readiness.get("readiness_state") == "approval_required":
         if readiness.get("approval_level") == ApprovalLevel.SISKO.value:
             approval = approve_admin_change_status(store_path, plan_id, "sisko", advanced_at)
-            execution = _execute_obrien_package_plan_if_ready(store_path, plan_id)
+            execution = _execute_obrien_package_plan_if_ready(store_path, plan_id, runner=runner, policy_profile_path=policy_profile_path)
             return {
                 "plan_id": plan_id,
                 "readiness_state": "sisko_approved",
@@ -5308,7 +5400,12 @@ def _advance_obrien_package_plan(store_path: str | Path, plan_id: str, advanced_
     return {"plan_id": plan_id, "readiness_state": readiness.get("readiness_state"), "next_step": readiness.get("next_step")}
 
 
-def _execute_obrien_package_plan_if_ready(store_path: str | Path, plan_id: str) -> dict[str, object] | None:
+def _execute_obrien_package_plan_if_ready(
+    store_path: str | Path,
+    plan_id: str,
+    runner=None,
+    policy_profile_path: str | Path | None = None,
+) -> dict[str, object] | None:
     readiness = _admin_plan_readiness_item(store_path, plan_id)
     if readiness.get("owner_domain") != OwnerDomain.OBRIEN.value:
         return None
@@ -5317,7 +5414,57 @@ def _execute_obrien_package_plan_if_ready(store_path: str | Path, plan_id: str) 
     refreshed = _admin_plan_readiness_item(store_path, plan_id)
     if refreshed.get("readiness_state") != "ready_for_overseer_execution":
         return None
-    return execute_admin_change_status(store_path, plan_id)
+    return execute_admin_change_status(store_path, plan_id, runner=runner, policy_profile_path=policy_profile_path)
+
+
+def _ensure_admin_adapter_enabled(
+    store_path: str | Path,
+    kind: AdminChangeKind,
+    approved_by: str,
+    approved_at: str,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        enabled = set(approved_admin_adapter_enablement_kinds(store))
+        existing = [
+            approval
+            for approval in store.list_approvals()
+            if approval.id == f"approval.admin.adapter.enable.{kind.value}"
+        ]
+    finally:
+        store.close()
+    if kind in enabled:
+        return {"kind": kind.value, "already_enabled": True, "mutation_performed": False}
+    if existing:
+        approval = approve_admin_adapter_enablement_status(
+            store_path,
+            f"approval.admin.adapter.enable.{kind.value}",
+            approved_by,
+            approved_at,
+        )
+        return {"kind": kind.value, "already_enabled": False, "approval": approval, "mutation_performed": True}
+    requested = request_admin_adapter_enablement_status(store_path, kind.value, "obrien", approved_at)
+    approval = approve_admin_adapter_enablement_status(store_path, requested["approval_id"], approved_by, approved_at)
+    return {
+        "kind": kind.value,
+        "already_enabled": False,
+        "request": requested,
+        "approval": approval,
+        "mutation_performed": True,
+    }
+
+
+def _obrien_package_maintenance_cycle_next_step(
+    executions: Sequence[dict[str, object]],
+    inspection_and_plans: dict[str, object],
+) -> str:
+    if any(item.get("status") == AdminExecutionStatus.FAILED.value for item in executions):
+        return "inspect failed execution evidence and rollback results before retrying package maintenance"
+    if any(item.get("status") == AdminExecutionStatus.BLOCKED.value for item in executions):
+        return "resolve blocked adapter, approval, or policy gate before retrying package maintenance"
+    if not inspection_and_plans.get("plans"):
+        return str(inspection_and_plans.get("next_step") or "package metadata refreshed; no package upgrades are currently staged")
+    return "package maintenance cycle completed through available O'Brien gates; continue monitoring post-change health evidence"
 
 
 def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
@@ -7210,6 +7357,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan_package_updates_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     plan_package_updates_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
     plan_package_updates_parser.add_argument("--package", action="append", default=(), help="limit upgrade plan to a detected package")
+    run_package_maintenance_parser = subparsers.add_parser(
+        "run-package-maintenance-cycle",
+        help="refresh apt metadata, stage detected upgrades, and execute through O'Brien gates",
+    )
+    run_package_maintenance_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    run_package_maintenance_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
+    run_package_maintenance_parser.add_argument("--package", action="append", default=(), help="limit upgrade plan to a detected package")
+    run_package_maintenance_parser.add_argument(
+        "--no-auto-enable-adapters",
+        action="store_true",
+        help="do not auto-record approved apt adapter enablement for this maintenance cycle",
+    )
+    run_package_maintenance_parser.add_argument("--policy-profile", help="optional JSON policy profile generated by policy-customization-helper")
     security_summary_parser = subparsers.add_parser("security-summary", help="summarize security surfaces and alerts")
     security_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_efficiency_parser = subparsers.add_parser("health-efficiency", help="summarize service health efficiency")
@@ -7820,6 +7980,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "plan-package-updates":
         print(json.dumps(plan_package_updates_status(args.store, args.captured_at, tuple(args.package)), sort_keys=True))
+        return 0
+
+    if args.command == "run-package-maintenance-cycle":
+        print(
+            json.dumps(
+                run_obrien_package_maintenance_cycle_status(
+                    args.store,
+                    args.captured_at,
+                    tuple(args.package),
+                    policy_profile_path=args.policy_profile,
+                    auto_enable_adapters=not args.no_auto_enable_adapters,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "security-summary":

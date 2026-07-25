@@ -188,6 +188,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. It does not invoke any live virtual adapter.
 `POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. It does not invoke any live virtual adapter.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.
+`POST /maintenance/package-maintenance-cycle` runs the approved O'Brien apt maintenance cycle: stage and execute package metadata refresh, inspect refreshed package updates, stage upgrades, advance Sisko-level approvals, execute plans that pass policy, and persist command, verification, rollback, audit, blocked, or failed evidence.
 `GET /runtime-status` returns service heartbeat freshness and host inspection freshness in a compact monitoring payload. Freshness states are `ok`, `warning`, `high`, or `missing`. Non-OK freshness states persist stable `alert` audit events in the same store.
 `GET /persistence/security` inspects SQLite store file ownership, permissions, sidecar files, and schema migration metadata without creating a missing database or changing file modes.
 `GET /state` includes schema migrations, persisted resources, claims, approvals, audit events, usage limits, usage continuation requests, usage continuation dispatches, health records, runtime records, admin plans, and security review records.

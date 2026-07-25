@@ -936,6 +936,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
+      if (action === "run-package-maintenance-cycle") return await postJson("/maintenance/package-maintenance-cycle", {});
       if (action === "refresh-advisories") return await refreshAdvisories();
       if (action === "record-maintenance-schedule") return await recordMaintenanceSchedule();
       if (action === "plan-admin-change") return await planAdminChange();
@@ -1605,7 +1606,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("admin").innerHTML = `
         <div class="grid">
           ${stationIntro("O'Brien", "Maintenance Operations", "Protected changes, package work, and service restart gates.", ["admin plans", "policy profile", "maintenance"])}
-          <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button><button class="action-btn" data-action="plan-package-updates">Plan Updates</button></div></div>
+          <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button><button class="action-btn" data-action="plan-package-updates">Plan Updates</button><button class="action-btn" data-action="run-package-maintenance-cycle">Run Package Cycle</button></div></div>
           ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good", "admin")}
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good", "admin")}
           ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3", "", "admin")}
@@ -2376,6 +2377,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Plan a service restart or admin change", page: "Admin", owner: "O'Brien", action: "plan-admin-change", source, query: "Plan a service restart or admin change"},
         {workflow: "Execute an approved admin plan", page: "Admin", owner: "O'Brien", action: "execute-admin-change", source, query: "Execute an approved admin plan"},
         {workflow: "Plan package updates", page: "Admin", owner: "O'Brien", action: "plan-package-updates", source, query: "Plan package updates"},
+        {workflow: "Run package maintenance cycle", page: "Admin", owner: "O'Brien", action: "run-package-maintenance-cycle", source, query: "Run package maintenance cycle"},
         {workflow: "Refresh CVE advisory feeds", page: "Admin", owner: "O'Brien", action: "refresh-advisories", source, query: "Refresh CVE advisory feeds"},
         {workflow: "Discover user services", page: "Admin", owner: "O'Brien / Julian", action: "discover-user-services", source, query: "Discover user services"},
         {workflow: "Enable a live adapter", page: "Admin", owner: "Sisko / O'Brien", action: "request-admin-adapter-enablement", source, query: "Enable a live adapter"},

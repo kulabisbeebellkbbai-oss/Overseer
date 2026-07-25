@@ -19,6 +19,7 @@ EXPECTED_VIEWS = {
         "actions": {
             "discover-user-services",
             "plan-package-updates",
+            "run-package-maintenance-cycle",
             "record-maintenance-schedule",
             "refresh-advisories",
             "plan-admin-change",
@@ -186,6 +187,7 @@ ACTION_ROUTES = {
     "request-claim-cleanup": ("POST", "/claims/cleanup-requests"),
     "request-policy-warning": ("POST", "/admin/policy-warning-requests"),
     "request-usage-continuation": ("POST", "/usage/continuation-requests"),
+    "run-package-maintenance-cycle": ("POST", "/maintenance/package-maintenance-cycle"),
     "run-health-probes": ("POST", "/health/probes/run"),
     "send-crew-message": ("POST", "/crew/messages"),
     "stage-backup-cleanup-request": ("POST", "/storage/cleanup-requests"),

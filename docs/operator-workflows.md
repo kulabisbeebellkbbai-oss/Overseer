@@ -146,9 +146,25 @@ Use this to keep packages up to date without applying changes blindly.
 
 1. Open Admin.
 2. Review Upgradable Packages.
-3. Click Plan Updates.
+3. Click Plan Updates when you want to stage plans for review without running
+   live package commands.
 4. Review generated plans, rollback notes, and readiness.
-5. Approve and execute only plans that satisfy policy.
+
+### Run Package Maintenance Cycle
+
+Use this when O'Brien should keep apt-managed system packages current through
+the approved live maintenance path.
+
+1. Open Admin.
+2. Review Upgradable Packages, Advisory Feed Status, and Admin Readiness.
+3. Click Run Package Cycle.
+4. O'Brien refreshes apt metadata, inspects refreshed package state, stages
+   detected upgrades, records approved apt adapter enablement for the store,
+   advances Sisko-level approvals, and executes only plans that pass policy.
+5. Open Admin Executions and Audit to confirm completed, blocked, or failed
+   evidence.
+6. If the cycle blocks or fails, review readiness, policy, rollback, and
+   execution evidence before retrying.
 
 ### Refresh CVE Advisory Feeds
 

@@ -96,6 +96,7 @@ from .cli import (
     record_usage_limit_status,
     request_claim_status,
     request_claim_cleanup_status,
+    run_obrien_package_maintenance_cycle_status,
     service_status,
     runtime_status,
     security_summary_status,
@@ -551,6 +552,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/maintenance/package-update-plans":
                 self._handle_json(lambda payload: plan_package_updates_status(store_path, **_package_update_plan_args(payload)))
+                return
+            if path == "/maintenance/package-maintenance-cycle":
+                self._handle_json(lambda payload: run_obrien_package_maintenance_cycle_status(store_path, **_package_maintenance_cycle_args(payload)))
                 return
             if path == "/maintenance/advisories/refresh":
                 self._handle_json(lambda payload: refresh_advisories_status(store_path, **_advisory_refresh_args(payload)))
@@ -1360,6 +1364,14 @@ def _package_update_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "captured_at": str(payload["captured_at"]) if payload.get("captured_at") else None,
         "packages": tuple(str(package) for package in payload.get("packages", ())),
+    }
+
+
+def _package_maintenance_cycle_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "captured_at": str(payload["captured_at"]) if payload.get("captured_at") else None,
+        "packages": tuple(str(package) for package in payload.get("packages", ())),
+        "auto_enable_adapters": bool(payload.get("auto_enable_adapters", True)),
     }
 
 

@@ -45,6 +45,7 @@ O'Brien's compact operator read model is available with:
 PYTHONPATH=src python3 -m overseer.cli maintenance-summary --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli inspect-packages
 PYTHONPATH=src python3 -m overseer.cli plan-package-updates --store state/overseer.sqlite3
+PYTHONPATH=src python3 -m overseer.cli run-package-maintenance-cycle --store state/overseer.sqlite3
 ```
 
 It summarizes persisted maintenance targets plus install, package index refresh, package upgrade, and restart admin plans, approval state, rollback and verification step coverage, execution status, and risk distribution.
@@ -52,6 +53,8 @@ It summarizes persisted maintenance targets plus install, package index refresh,
 `inspect-packages` is read-only. It runs `apt list --upgradable`, parses package names, candidate versions, installed versions, repository labels, and architectures, and does not run `apt-get update`, install packages, upgrade packages, remove packages, or use sudo.
 
 `plan-package-updates` uses the same read-only inspection result to stage O'Brien-owned admin plans for package metadata refresh and package upgrades. It writes only Overseer plan records; the normal approval, policy, rollback, and execution gates still decide whether package commands may run.
+
+`run-package-maintenance-cycle` is the approved live O'Brien package-maintenance path. It stages and executes an apt metadata refresh, inspects the refreshed package state, stages detected apt upgrades, auto-records the approved apt update/upgrade adapter enablement records for the store, lets Sisko approve Sisko-level package upgrades, executes only plans that pass policy, and persists command, verification, rollback, audit, and blocked/failed evidence. If adapter auto-enablement is disabled, the same command stops at the adapter gate and records blocked execution evidence instead of running apt commands.
 
 Advisory feed integration is available through the Admin page and local API:
 

@@ -236,6 +236,7 @@ from overseer.cli import _advance_admin_plan_after_dispatch
 from overseer.cli import request_usage_continuation_status
 from overseer.cli import dispatch_host_security_ids_review_package_status
 from overseer.cli import dispatch_usage_continuations_status
+from overseer.cli import run_obrien_package_maintenance_cycle_status
 from overseer.cli import run_status
 from overseer.cli import runtime_status
 from overseer.cli import security_summary_status
@@ -1219,6 +1220,63 @@ class PackageInspectionTests(unittest.TestCase):
             self.assertFalse(status["mutation_performed"])
             self.assertEqual(status["plans"], 0)
             self.assertEqual(status["inspection"]["status"], "failed")
+
+    def test_obrien_package_maintenance_cycle_refreshes_stages_and_executes_with_enabled_adapters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            commands = []
+
+            def inspect_runner(command):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "Listing...\nopenssl/oldstable-security 3.0.15-1 amd64 [upgradable from: 3.0.14-1]\n",
+                    "",
+                )
+
+            def command_runner(step):
+                commands.append(step.command)
+                return AdminCommandResult(step.title, step.command, 0, stdout="ok")
+
+            status = run_obrien_package_maintenance_cycle_status(
+                store_path,
+                "2026-07-25T08:00:00+00:00",
+                adapter=AptPackageInspectionAdapter(command_runner=inspect_runner),
+                runner=command_runner,
+            )
+            summary = admin_executions_status(store_path)
+
+        self.assertEqual(status["completed_executions"], 2)
+        self.assertEqual(status["failed_executions"], 0)
+        self.assertTrue(status["host_mutation_performed"])
+        self.assertIn(("sudo", "apt-get", "update"), commands)
+        self.assertIn(("sudo", "apt-get", "install", "--only-upgrade", "-y", "openssl"), commands)
+        self.assertEqual({item["status"] for item in summary["executions"]}, {AdminExecutionStatus.COMPLETED.value})
+
+    def test_obrien_package_maintenance_cycle_can_leave_live_execution_blocked_without_adapter_auto_enable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def inspect_runner(command):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "Listing...\nopenssl/oldstable-security 3.0.15-1 amd64 [upgradable from: 3.0.14-1]\n",
+                    "",
+                )
+
+            status = run_obrien_package_maintenance_cycle_status(
+                store_path,
+                "2026-07-25T08:05:00+00:00",
+                adapter=AptPackageInspectionAdapter(command_runner=inspect_runner),
+                runner=lambda step: self.fail(f"commands should stay blocked without adapter enablement: {step.command}"),
+                auto_enable_adapters=False,
+            )
+
+        self.assertEqual(status["completed_executions"], 0)
+        self.assertGreaterEqual(status["blocked_executions"], 1)
+        self.assertFalse(status["host_mutation_performed"])
+        self.assertIn("blocked", status["next_step"])
 
 
 class HealthSummaryTests(unittest.TestCase):

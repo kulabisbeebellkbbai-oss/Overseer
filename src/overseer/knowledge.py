@@ -95,7 +95,8 @@ def knowledge_capture_candidates(
     if "crew" in normalized_kinds:
         candidates.extend(_crew_candidate(message) for message in store.list_crew_messages())
     if "audit" in normalized_kinds:
-        candidates.extend(_audit_candidate(event) for event in store.list_audit_events())
+        audit_limit = max(limit * 4, 100)
+        candidates.extend(_audit_candidate(event) for event in store.list_audit_events(limit=audit_limit))
     candidates.sort(key=lambda candidate: candidate.occurred_at or "", reverse=True)
     return tuple(candidates[:limit])
 

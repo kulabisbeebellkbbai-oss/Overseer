@@ -15,7 +15,7 @@ def compliance_evidence_status(store_path: str | Path, project_root: str | Path 
     try:
         approvals = store.list_approvals()
         plans = store.list_admin_change_plans()
-        audits = store.list_audit_events()
+        audit_count = store.count_audit_events()
     finally:
         store.close()
     return {
@@ -38,7 +38,7 @@ def compliance_evidence_status(store_path: str | Path, project_root: str | Path 
         "evidence_matrix": [
             {"area": "approvals", "records": len(approvals), "status": "attention" if any(item.status == ApprovalStatus.PENDING for item in approvals) else "ready"},
             {"area": "admin plans", "records": len(plans), "status": "ready"},
-            {"area": "audit events", "records": len(audits), "status": "ready"},
+            {"area": "audit events", "records": audit_count, "status": "ready"},
         ],
         "mutation_performed": False,
         "host_mutation_performed": False,

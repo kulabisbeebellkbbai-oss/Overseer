@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
-from .audit import ApprovalRequest, AuditEvent
-from .core import Claim, ConflictDecision, Resource
+from .audit import ApprovalRequest, AuditEvent, AuditEventType
+from .core import Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
 from .host import HostInspectionSnapshot
@@ -374,8 +374,18 @@ class SQLiteStore:
     def load_host_snapshot(self, snapshot_id: str) -> HostInspectionSnapshot:
         return _load_dataclass(HostInspectionSnapshot, self._get_payload("host_snapshots", snapshot_id))
 
-    def list_host_snapshots(self) -> tuple[HostInspectionSnapshot, ...]:
-        return tuple(_load_dataclass(HostInspectionSnapshot, payload) for payload in self._list_payloads("host_snapshots"))
+    def list_host_snapshots(self, *, limit: int | None = None) -> tuple[HostInspectionSnapshot, ...]:
+        sql = "SELECT payload FROM host_snapshots ORDER BY id"
+        params: tuple[object, ...] = ()
+        if limit is not None:
+            sql = "SELECT payload FROM host_snapshots ORDER BY id DESC LIMIT ?"
+            params = (max(0, int(limit)),)
+        rows = self._connection.execute(sql, params).fetchall()
+        return tuple(_load_dataclass(HostInspectionSnapshot, str(row["payload"])) for row in rows)
+
+    def count_host_snapshots(self) -> int:
+        row = self._connection.execute("SELECT COUNT(*) AS count FROM host_snapshots").fetchone()
+        return int(row["count"] if row is not None else 0)
 
     def load_latest_host_snapshot(self) -> HostInspectionSnapshot | None:
         row = self._connection.execute("SELECT payload FROM host_snapshots ORDER BY id DESC LIMIT 1").fetchone()
@@ -480,7 +490,7 @@ class SQLiteStore:
     def list_operation_records(
         self,
         kind: str | None = None,
-        owner_domain: str | None = None,
+        owner_domain: OwnerDomain | str | None = None,
         status: str | None = None,
     ) -> tuple[OperationRecord, ...]:
         clauses: list[str] = []
@@ -521,8 +531,65 @@ class SQLiteStore:
         )
         self._connection.commit()
 
-    def list_audit_events(self) -> tuple[AuditEvent, ...]:
-        return tuple(_load_dataclass(AuditEvent, payload) for payload in self._list_payloads("audit_events"))
+    def list_audit_events(
+        self,
+        *,
+        subject_prefix: str | None = None,
+        event_type: AuditEventType | str | None = None,
+        owner_domain: OwnerDomain | str | None = None,
+        limit: int | None = None,
+    ) -> tuple[AuditEvent, ...]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if subject_prefix:
+            clauses.append("subject_id LIKE ?")
+            params.append(f"{subject_prefix}%")
+        if event_type:
+            clauses.append("payload LIKE ?")
+            params.append(f'%"event_type":"{AuditEventType(event_type).value}"%')
+        if owner_domain:
+            owner_value = OwnerDomain(owner_domain).value
+            clauses.append("payload LIKE ?")
+            params.append(f'%"owner_domain":"{owner_value}"%')
+        sql = "SELECT payload FROM audit_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self._connection.execute(sql, tuple(params)).fetchall()
+        return tuple(_load_dataclass(AuditEvent, str(row["payload"])) for row in rows)
+
+    def count_audit_events(
+        self,
+        *,
+        subject_prefix: str | None = None,
+        event_type: AuditEventType | str | None = None,
+        owner_domain: OwnerDomain | str | None = None,
+        risk_level: RiskLevel | str | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[object] = []
+        if subject_prefix:
+            clauses.append("subject_id LIKE ?")
+            params.append(f"{subject_prefix}%")
+        if event_type:
+            clauses.append("payload LIKE ?")
+            params.append(f'%"event_type":"{AuditEventType(event_type).value}"%')
+        if owner_domain:
+            owner_value = OwnerDomain(owner_domain).value
+            clauses.append("payload LIKE ?")
+            params.append(f'%"owner_domain":"{owner_value}"%')
+        if risk_level:
+            risk_value = RiskLevel(risk_level).value
+            clauses.append("payload LIKE ?")
+            params.append(f'%"risk_level":"{risk_value}"%')
+        sql = "SELECT COUNT(*) AS count FROM audit_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        row = self._connection.execute(sql, tuple(params)).fetchone()
+        return int(row["count"] if row is not None else 0)
 
     def _upsert(self, table: str, row_id: str, payload: str) -> None:
         self._connection.execute(f"INSERT OR REPLACE INTO {table} (id, payload) VALUES (?, ?)", (row_id, payload))

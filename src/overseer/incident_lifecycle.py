@@ -15,7 +15,8 @@ def incident_lifecycle_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         incidents = [record for record in store.list_operation_records(kind=OperationRecordKind.INCIDENT.value)]
-        alerts = [event for event in store.list_audit_events() if event.event_type == AuditEventType.ALERT]
+        alerts = list(store.list_audit_events(event_type=AuditEventType.ALERT, limit=500))
+        alert_count = store.count_audit_events(event_type=AuditEventType.ALERT)
         health = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
     finally:
         store.close()
@@ -34,7 +35,9 @@ def incident_lifecycle_status(store_path: str | Path) -> dict[str, object]:
     return {
         "store": str(Path(store_path)),
         "records": len(incidents),
-        "alerts": len(alerts),
+        "alerts": alert_count,
+        "alert_sample_limit": 500,
+        "alert_sampled": alert_count > len(alerts),
         "health_incidents": len(health_incidents),
         "open": sum(1 for record in incidents if record.status != OperationRecordStatus.CLOSED),
         "waiting_approval": sum(1 for record in incidents if record.status == OperationRecordStatus.WAITING_APPROVAL),

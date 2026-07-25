@@ -116,7 +116,7 @@ def operations_gap_coverage_status(store_path: str | Path) -> dict[str, object]:
         resources = store.list_resources()
         claims = store.list_claims()
         approvals = store.list_approvals()
-        audits = store.list_audit_events()
+        audits = store.list_audit_events(limit=2000)
         admin_plans = [plan for plan in store.list_admin_change_plans() if not plan.archived]
         executions = store.list_admin_executions()
         targets = store.list_health_targets()
@@ -126,8 +126,7 @@ def operations_gap_coverage_status(store_path: str | Path) -> dict[str, object]:
         usage_limits = store.list_usage_limits()
         usage_requests = store.list_usage_continuation_requests()
         operation_records = store.list_operation_records()
-        snapshots = store.list_host_snapshots()
-        latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        latest_snapshot = store.load_latest_host_snapshot()
     finally:
         store.close()
 

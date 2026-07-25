@@ -107,7 +107,7 @@ class OverseerRuntime:
             resources=len(self.store.list_resources()),
             usage_limits=len(self.store.list_usage_limits()),
             health_targets=len(self.store.list_health_targets()),
-            audit_events=len(self.store.list_audit_events()),
+            audit_events=self.store.count_audit_events(),
             health_evidence=len(self.store.list_health_evidence()),
             physical_identities=len(self.store.list_physical_identities()),
             runtime_heartbeats=len(self.store.list_runtime_heartbeats()),

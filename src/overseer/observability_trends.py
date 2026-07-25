@@ -14,7 +14,8 @@ def observability_trends_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         evidence = store.list_health_evidence()
-        snapshots = store.list_host_snapshots()
+        snapshot_count = store.count_host_snapshots()
+        snapshots = store.list_host_snapshots(limit=20)
     finally:
         store.close()
     by_resource: dict[str, list[object]] = {}
@@ -23,7 +24,9 @@ def observability_trends_status(store_path: str | Path) -> dict[str, object]:
     return {
         "store": str(Path(store_path)),
         "health_evidence": len(evidence),
-        "host_snapshots": len(snapshots),
+        "host_snapshots": snapshot_count,
+        "host_snapshot_sample_limit": 20,
+        "host_snapshot_sampled": snapshot_count > len(snapshots),
         "resource_trends": [_resource_trend(resource_id, items) for resource_id, items in sorted(by_resource.items())],
         "host_snapshot_trends": [
             {

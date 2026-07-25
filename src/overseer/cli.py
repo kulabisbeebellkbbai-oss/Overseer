@@ -622,7 +622,11 @@ def command_summary_status(
         resources = store.list_resources()
         claims = store.list_claims()
         approvals = store.list_approvals()
-        audit_events = store.list_audit_events()
+        alert_total = store.count_audit_events(event_type=AuditEventType.ALERT)
+        alert_high_or_critical = sum(
+            store.count_audit_events(event_type=AuditEventType.ALERT, risk_level=risk)
+            for risk in (RiskLevel.HIGH, RiskLevel.CRITICAL)
+        )
         usage_limits = store.list_usage_limits()
         physical_identities = store.list_physical_identities()
         health_summaries = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
@@ -635,7 +639,6 @@ def command_summary_status(
             policy=DEFAULT_RUNTIME_FRESHNESS_POLICY,
         )
         checked_at = _parse_optional_datetime(now) or datetime.now(UTC)
-        alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
         pending_approvals = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
         pending_admin_plans = [
             plan
@@ -719,10 +722,8 @@ def command_summary_status(
                 "pending_authorizations": len(pending_admin_plans),
             },
             "alerts": {
-                "total": len(alerts),
-                "high_or_critical": sum(
-                    1 for event in alerts if event.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}
-                ),
+                "total": alert_total,
+                "high_or_critical": alert_high_or_critical,
             },
         }
     finally:
@@ -929,10 +930,10 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
         resources = [resource for resource in store.list_resources() if resource.type == ResourceType.SECURITY_SURFACE]
-        audit_events = store.list_audit_events()
-        alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
-        snapshots = store.list_host_snapshots()
-        latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        alert_total = store.count_audit_events(event_type=AuditEventType.ALERT)
+        alerts = store.list_audit_events(event_type=AuditEventType.ALERT, limit=500)
+        ids_audit_events = store.list_audit_events(subject_prefix="ids-review.", limit=2000)
+        latest_snapshot = store.load_latest_host_snapshot()
         host_security = host_security_status(latest_snapshot) if latest_snapshot else None
         plans = [
             plan
@@ -950,13 +951,13 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
         return {
             "store": str(store.path),
             "security_surfaces": len(resources),
-            "alerts": len(alerts),
+            "alerts": alert_total,
             "alerts_by_risk": {
-                risk.value: sum(1 for event in alerts if event.risk_level == risk)
+                risk.value: store.count_audit_events(event_type=AuditEventType.ALERT, risk_level=risk)
                 for risk in RiskLevel
             },
             "alerts_by_owner": {
-                owner.value: sum(1 for event in alerts if event.owner_domain == owner)
+                owner.value: store.count_audit_events(event_type=AuditEventType.ALERT, owner_domain=owner)
                 for owner in OwnerDomain
             },
             "host_security": {
@@ -980,7 +981,7 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
             "ids_review": _host_security_ids_review_summary_payload(
                 store.path,
                 store.list_host_security_ids_review_packages(),
-                audit_events,
+                ids_audit_events,
                 plans,
             ),
             "surfaces": [security_surface_status(resource) for resource in resources],
@@ -1185,7 +1186,8 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
         resources = store.list_resources()
         claims = store.list_claims()
         approvals = store.list_approvals()
-        audit_events = store.list_audit_events()
+        audit_events = store.list_audit_events(limit=2000)
+        alert_total = store.count_audit_events(event_type=AuditEventType.ALERT)
         usage_limits = store.list_usage_limits()
         physical_identities = store.list_physical_identities()
         health_summaries = summarize_health_targets(store.list_health_targets(), store.list_health_evidence())
@@ -1198,7 +1200,6 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
         host_security = host_security_status(latest_snapshot) if latest_snapshot else {"high_findings": 0, "warning_findings": 0}
         heartbeat = next((item for item in heartbeats if item.service_name == service_name), None)
         freshness = assess_freshness(heartbeat.last_tick_at if heartbeat else None, policy=DEFAULT_RUNTIME_FRESHNESS_POLICY)
-        alerts = [event for event in audit_events if event.event_type == AuditEventType.ALERT]
         pending_approvals = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
         pending_admin_plans = [
             plan
@@ -1266,7 +1267,7 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
             "virtual_active_claims": len(virtual_claims),
             "virtual_queued_claims": sum(1 for claim in claims if claim.status == ClaimStatus.QUEUED),
             "maintenance_pending_authorizations": sum(1 for plan in maintenance_plans if plan.requires_explicit_approval() and not plan.approved and not plan.canceled),
-            "security_alerts": len(alerts),
+            "security_alerts": alert_total,
             "security_pending_authorizations": sum(1 for plan in protective_plans if plan.requires_explicit_approval() and not plan.approved and not plan.canceled),
             "security_ids_review_gate_blocked": ids_summary["gate_blocked"],
             "security_ids_review_revision_required": ids_summary["revision_required"],
@@ -2710,7 +2711,7 @@ def host_security_ids_review_summary_status(store_path: str | Path) -> dict[str,
         return _host_security_ids_review_summary_payload(
             store.path,
             store.list_host_security_ids_review_packages(),
-            store.list_audit_events(),
+            store.list_audit_events(subject_prefix="ids-review.", limit=2000),
             store.list_admin_change_plans(),
         )
     finally:
@@ -3442,7 +3443,7 @@ def admin_summary_status(store_path: str | Path) -> dict[str, object]:
         approvals = store.list_approvals()
         audit_events = [
             event
-            for event in store.list_audit_events()
+            for event in store.list_audit_events(subject_prefix="admin.", limit=2000)
             if event.subject_id.startswith("admin.") or event.id.startswith("audit.admin.exec.")
         ]
         pending = [
@@ -4074,7 +4075,7 @@ def admin_history_archive_plan_status(store_path: str | Path) -> dict[str, objec
         plans = store.list_admin_change_plans()
         active_plans = active_admin_change_plans(plans)
         executions = store.list_admin_executions()
-        audit_events = store.list_audit_events()
+        audit_events = store.list_audit_events(subject_prefix="admin.", limit=2000)
         ids_packages = store.list_host_security_ids_review_packages()
         history = _admin_history_review_payload(
             store.path,
@@ -4137,7 +4138,7 @@ def admin_history_restore_readiness_status(store_path: str | Path, plan_id: str 
         archive_records = {record.id: record for record in store.list_admin_history_archives()}
         executions = store.list_admin_executions()
         ids_packages = store.list_host_security_ids_review_packages()
-        audit_events = store.list_audit_events()
+        audit_events = store.list_audit_events(subject_prefix="admin.", limit=2000)
         items = [
             admin_history_restore_readiness_item_status(
                 plan,
@@ -5011,7 +5012,7 @@ def crew_messages_status(
     store = SQLiteStore(store_path)
     try:
         all_messages = list(store.list_crew_messages())
-        audit_events = list(store.list_audit_events())
+        audit_events = list(store.list_audit_events(subject_prefix="crew.", limit=2000))
         messages = list(all_messages)
         if owner_domain:
             selected_owner = OwnerDomain(owner_domain)
@@ -6146,16 +6147,19 @@ def usage_limit_status(limit: UsageLimit) -> dict[str, object]:
 def alerts_summary_status(store_path: str | Path) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        alerts = [event for event in store.list_audit_events() if event.event_type == AuditEventType.ALERT]
+        alerts = list(store.list_audit_events(event_type=AuditEventType.ALERT, limit=500))
+        alert_count = store.count_audit_events(event_type=AuditEventType.ALERT)
         return {
             "store": str(store.path),
-            "alerts": len(alerts),
+            "alerts": alert_count,
+            "sample_limit": 500,
+            "sampled": alert_count > len(alerts),
             "by_risk": {
-                risk.value: sum(1 for event in alerts if event.risk_level == risk)
+                risk.value: store.count_audit_events(event_type=AuditEventType.ALERT, risk_level=risk)
                 for risk in RiskLevel
             },
             "by_owner": {
-                owner.value: sum(1 for event in alerts if event.owner_domain == owner)
+                owner.value: store.count_audit_events(event_type=AuditEventType.ALERT, owner_domain=owner)
                 for owner in OwnerDomain
             },
             "events": [audit_event_status(event) for event in alerts],
@@ -6172,29 +6176,56 @@ def audit_summary_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        events = list(store.list_audit_events())
+        selected_event_type = AuditEventType(event_type) if event_type else None
+        selected_owner = OwnerDomain(owner) if owner else None
+        events = list(
+            store.list_audit_events(
+                event_type=selected_event_type,
+                owner_domain=selected_owner,
+                subject_prefix=subject_prefix,
+                limit=500,
+            )
+        )
+        event_count = store.count_audit_events(
+            event_type=selected_event_type,
+            owner_domain=selected_owner,
+            subject_prefix=subject_prefix,
+        )
         if event_type:
-            selected_event_type = AuditEventType(event_type)
             events = [event for event in events if event.event_type == selected_event_type]
         if owner:
-            selected_owner = OwnerDomain(owner)
             events = [event for event in events if event.owner_domain == selected_owner]
         if subject_prefix:
             events = [event for event in events if event.subject_id.startswith(subject_prefix)]
         return {
             "store": str(store.path),
             "events": [audit_event_status(event) for event in events],
-            "event_count": len(events),
+            "event_count": event_count,
+            "sample_limit": 500,
+            "sampled": event_count > len(events),
             "by_event_type": {
-                item.value: sum(1 for event in events if event.event_type == item)
+                item.value: store.count_audit_events(
+                    event_type=item,
+                    owner_domain=selected_owner,
+                    subject_prefix=subject_prefix,
+                )
                 for item in AuditEventType
             },
             "by_owner": {
-                item.value: sum(1 for event in events if event.owner_domain == item)
+                item.value: store.count_audit_events(
+                    event_type=selected_event_type,
+                    owner_domain=item,
+                    subject_prefix=subject_prefix,
+                )
                 for item in OwnerDomain
             },
             "by_risk": {
-                item.value: sum(1 for event in events if event.risk_level == item)
+                item.value: store.count_audit_events(
+                    event_type=selected_event_type,
+                    owner_domain=selected_owner,
+                    subject_prefix=subject_prefix,
+                    risk_level=item,
+                )
                 for item in RiskLevel
             },
             "filters": {
@@ -6714,7 +6745,8 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
         health_evidence = store.list_health_evidence()
         claims = store.list_claims()
         approvals = store.list_approvals()
-        audit_events = store.list_audit_events()
+        audit_event_count = store.count_audit_events()
+        audit_events = store.list_audit_events(limit=500)
         crew_messages = store.list_crew_messages()
         heartbeats = store.list_runtime_heartbeats()
         host_snapshots = store.list_host_snapshots()
@@ -6792,6 +6824,9 @@ def list_state_status(store_path: str | Path) -> dict[str, object]:
                 audit_event_status(event)
                 for event in audit_events
             ],
+            "audit_event_count": audit_event_count,
+            "audit_event_sample_limit": 500,
+            "audit_event_sampled": audit_event_count > len(audit_events),
             "runtime_heartbeats": [
                 {
                     "id": heartbeat.id,

@@ -683,6 +683,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("formatCell", OPERATOR_CONSOLE_HTML)
         self.assertIn('target="_blank"', OPERATOR_CONSOLE_HTML)
 
+    def test_generated_javascript_does_not_split_regex_literals(self):
+        self.assertIn(".split(/[,\\n]/)", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn(".split(/[,\n", OPERATOR_CONSOLE_HTML)
+
     def test_documents_folder_navigation_preserves_selected_folder(self):
         self.assertIn('documentsFolder: "Overseer"', OPERATOR_CONSOLE_HTML)
         self.assertIn("documentsNotesPath()", OPERATOR_CONSOLE_HTML)

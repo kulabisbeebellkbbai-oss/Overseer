@@ -997,7 +997,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     async function recordVirtualRuntime() {
       const ports = value("virtual-ports")
-        .split(/[,\n]/)
+        .split(/[,\\n]/)
         .map((item) => item.trim())
         .filter(Boolean)
         .map(Number);
@@ -1135,7 +1135,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     async function refreshAdvisories() {
       const packages = value("advisory-packages")
-        .split(/[,\n]/)
+        .split(/[,\\n]/)
         .map((item) => item.trim())
         .filter(Boolean);
       return await postJson("/maintenance/advisories/refresh", {

@@ -37,6 +37,7 @@ dist/
 build/
 coverage/
 .cache/
+.playwright-mcp/
 __pycache__/
 *.py[cod]
 node_modules/

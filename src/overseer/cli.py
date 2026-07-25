@@ -1524,8 +1524,7 @@ def runtime_status(store_path: str | Path, service_name: str = "overseer", now: 
     store = SQLiteStore(store_path)
     try:
         heartbeat = store.load_runtime_heartbeat(service_name)
-        snapshots = store.list_host_snapshots()
-        latest_snapshot = sorted(snapshots, key=lambda item: item.captured_at)[-1] if snapshots else None
+        latest_snapshot = store.load_latest_host_snapshot()
         host_security = host_security_status(latest_snapshot) if latest_snapshot else None
         heartbeat_freshness = assess_freshness(
             heartbeat.last_tick_at,

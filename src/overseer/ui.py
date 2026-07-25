@@ -730,6 +730,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       loadErrors: [],
       lastAction: null
     };
+    document.body.dataset.loadState = "locked";
+    document.body.dataset.loadFailures = "0";
     const tokenInput = document.getElementById("token");
     tokenInput.value = state.token;
     document.getElementById("token-form").addEventListener("submit", (event) => {
@@ -777,12 +779,20 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     async function refresh() {
       const error = document.getElementById("error");
+      document.body.dataset.loadState = "loading";
+      document.body.dataset.loadFailures = "0";
+      error.dataset.loadState = "loading";
+      error.dataset.loadFailures = "0";
       error.hidden = true;
       let authPayload;
       try {
         authPayload = await getJson(endpoints.auth);
       } catch (err) {
         error.textContent = formatEndpointError({path: endpoints.auth, message: err.message});
+        document.body.dataset.loadState = "failed";
+        document.body.dataset.loadFailures = "1";
+        error.dataset.loadState = "failed";
+        error.dataset.loadFailures = "1";
         error.hidden = false;
         return;
       }
@@ -805,6 +815,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       });
       state.data = nextData;
       state.loadErrors = failures;
+      document.body.dataset.loadFailures = String(failures.length);
+      error.dataset.loadFailures = String(failures.length);
       if (failures.length) {
         error.textContent = `Loaded with panel errors: ${failures.map(formatEndpointError).join("; ")}`;
         error.hidden = false;
@@ -812,8 +824,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       try {
         document.getElementById("updated").textContent = new Date().toLocaleString();
         render();
+        document.body.dataset.loadState = failures.length ? "partial" : "ready";
+        error.dataset.loadState = document.body.dataset.loadState;
       } catch (err) {
         error.textContent = err.message;
+        document.body.dataset.loadState = "failed";
+        document.body.dataset.loadFailures = String(Math.max(1, failures.length));
+        error.dataset.loadState = "failed";
+        error.dataset.loadFailures = document.body.dataset.loadFailures;
         error.hidden = false;
       }
     }

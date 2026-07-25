@@ -687,6 +687,12 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn(".split(/[,\\n]/)", OPERATOR_CONSOLE_HTML)
         self.assertNotIn(".split(/[,\n", OPERATOR_CONSOLE_HTML)
 
+    def test_console_exposes_load_state_marker_for_regression_runner(self):
+        self.assertIn('document.body.dataset.loadState = "locked";', OPERATOR_CONSOLE_HTML)
+        self.assertIn('document.body.dataset.loadState = "loading";', OPERATOR_CONSOLE_HTML)
+        self.assertIn('document.body.dataset.loadState = failures.length ? "partial" : "ready";', OPERATOR_CONSOLE_HTML)
+        self.assertIn('document.body.dataset.loadFailures = String(failures.length);', OPERATOR_CONSOLE_HTML)
+
     def test_documents_folder_navigation_preserves_selected_folder(self):
         self.assertIn('documentsFolder: "Overseer"', OPERATOR_CONSOLE_HTML)
         self.assertIn("documentsNotesPath()", OPERATOR_CONSOLE_HTML)

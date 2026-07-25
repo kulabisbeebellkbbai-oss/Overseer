@@ -218,6 +218,17 @@ Current Tank results:
   ping `job-20260725T063633Z-ping-251e786363`; the pending remote-testing queue
   was clear after the run. Tank returned only redacted status, counts, hashes,
   endpoint names, and findings.
+- `job-20260725T070700Z-overseer-performance-regression-load-marker-v5-diagnostic`:
+  passed at `performance-regression` after Tank runner v5 honored
+  `body[data-load-state='ready']` as the panel completion marker. Initial load
+  was `245ms`; all panels loaded in `4950ms`; final load state was `ready`;
+  `failure_selector_matched=false`; view switching was `p95=61ms`; endpoint
+  round trips covered `33` samples with `p95=1428ms`; observed browser requests
+  were `49`; `console_error_count=0`; findings were empty.
+- Tank worker `overseer-msi-test-agent-v5` was restarted and verified with live
+  ping `job-20260725T070724Z-ping-3a9cf265c2`; the pending remote-testing queue
+  was clear after the run. Tank returned only redacted status, counts, hashes,
+  endpoint names, and findings.
 - `job-20260721T042300Z-overseer-full-ui-regression-all-workflows`: passed
   with `observed_request_count=29`, `console_error_count=0`, and no findings.
 - `job-20260721T042301Z-overseer-performance-regression-gateway`: failed at
@@ -231,11 +242,7 @@ Current Tank results:
 
 Current remote performance findings:
 
-- all panels did not complete before the `10000ms` budget.
-- `/Overseer/runtime-status` exceeded its `2500ms` budget on every iteration:
-  `3820ms`, `3681ms`, `3712ms`.
-- `/Overseer/security-summary` exceeded its `2500ms` budget on every iteration:
-  `5251ms`, `5026ms`, `5009ms`.
+- No current remote performance findings after the Tank v5 marker-aware run.
 
 Tank follow-up:
 

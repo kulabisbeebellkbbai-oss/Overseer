@@ -40,6 +40,7 @@ from overseer.virtual_ops import (
     approve_virtual_snapshot_request_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
+    record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
@@ -699,6 +700,39 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertGreaterEqual(status["target_setup_request_count"], len(staged["target_setup_requests"]))
         self.assertEqual(api_staged["target_setup_requests"][0]["provider"], "gateway_proxy")
         self.assertGreaterEqual(api_status["target_setup_request_count"], 1)
+
+    def test_virtual_target_setup_result_records_execution_evidence_without_host_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_virtual_target_setup_batch_status(root, requested_by="dax", scope="docker")
+            completed = record_virtual_target_setup_result_status(
+                root,
+                "docker",
+                "completed",
+                executed_by="dax",
+                evidence="container exists with network none",
+            )
+            status = virtual_operations_status(root)
+            store_path = root / "state" / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                api_blocked = server.post_json(
+                    "/Overseer/virtual/target-setup-requests/result",
+                    {
+                        "provider": "virtualbox",
+                        "status": "blocked",
+                        "executed_by": "dax",
+                        "evidence": "approved package source unavailable",
+                    },
+                )
+                api_status = server.get_json("/Overseer/virtual/operations")
+
+        self.assertEqual(completed["target_setup_request"]["status"], "completed")
+        self.assertFalse(completed["target_setup_request"]["approval_required"])
+        self.assertFalse(completed["host_mutation_performed"])
+        self.assertEqual(status["target_setup_requests"][0]["evidence"], "container exists with network none")
+        self.assertEqual(api_blocked["target_setup_request"]["status"], "blocked")
+        self.assertTrue(api_blocked["target_setup_request"]["approval_required"])
+        self.assertEqual(api_status["target_setup_request_count"], 2)
 
     def test_performance_history_reads_regression_artifacts_without_running_tests(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -164,6 +164,80 @@ def stage_virtual_target_setup_batch_status(
     }
 
 
+def record_virtual_target_setup_result_status(
+    project_root: str | Path,
+    provider: str,
+    status: str,
+    executed_by: str = "dax",
+    evidence: str = "",
+    next_step: str = "",
+    executed_at: str | None = None,
+) -> dict[str, object]:
+    """Record the outcome of an approved provider target setup.
+
+    This records evidence only. The caller is responsible for any already
+    approved host mutation and for supplying redacted evidence.
+    """
+    cleaned_provider = _safe_id(provider).replace("-", "_")
+    cleaned_status = _safe_id(status).replace("-", "_")
+    if cleaned_status not in {"completed", "blocked", "failed", "partial"}:
+        raise ValueError("virtual target setup status must be completed, blocked, failed, or partial")
+    root = Path(project_root)
+    data = _read_registry(root)
+    now = executed_at or _now()
+    request_id = f"virtual-target-setup.{cleaned_provider}"
+    row = next((item for item in data["target_setup_requests"] if item.get("id") == request_id), None)
+    if row is None:
+        templates = [item for item in _all_target_setup_templates() if item["provider"] == cleaned_provider]
+        if not templates:
+            raise ValueError(f"virtual target setup request does not exist: {provider}")
+        row = {
+            **templates[0],
+            "id": request_id,
+            "requested_by": executed_by,
+            "reason": "record externally approved provider target setup result",
+            "created_at": now,
+        }
+        data["target_setup_requests"].append(row)
+    row.update(
+        {
+            "status": cleaned_status,
+            "approval_required": False if cleaned_status == "completed" else True,
+            "executed_by": executed_by,
+            "executed_at": now,
+            "updated_at": now,
+            "evidence": evidence,
+            "next_step": next_step
+            or (
+                "target is ready for Dax checkout and provider lifecycle testing"
+                if cleaned_status == "completed"
+                else "resolve setup blocker before Dax uses this provider target"
+            ),
+        }
+    )
+    data["execution_records"].append(
+        {
+            "id": f"virtual-execution.{request_id}.{_safe_id(now)}",
+            "request_id": request_id,
+            "resource_id": str(row.get("target_name") or request_id),
+            "action": "target_setup",
+            "status": cleaned_status,
+            "provider": cleaned_provider,
+            "executed_by": executed_by,
+            "executed_at": now,
+            "manifest_path": "",
+            "error": "" if cleaned_status == "completed" else evidence,
+        }
+    )
+    _write_registry(root, data)
+    return {
+        "target_setup_request": row,
+        "status": cleaned_status,
+        "mutation_performed": True,
+        "host_mutation_performed": False,
+    }
+
+
 def approve_virtual_snapshot_request_status(
     project_root: str | Path,
     request_id: str,

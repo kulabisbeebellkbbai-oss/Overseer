@@ -911,6 +911,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
       if (action === "stage-virtual-target-setup-batch") return await stageVirtualTargetSetupBatch();
+      if (action === "record-virtual-target-setup-result") return await recordVirtualTargetSetupResult();
       if (action === "record-virtual-runtime") return await recordVirtualRuntime();
       if (action === "stage-virtual-snapshot-request") return await stageVirtualSnapshotRequest();
       if (action === "approve-virtual-snapshot-request") return await approveVirtualSnapshotRequest();
@@ -1038,6 +1039,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         requested_by: value("virtual-target-setup-requested-by") || "dax",
         scope: value("virtual-target-setup-scope") || "all",
         reason: value("virtual-target-setup-reason") || "prepare approved disposable real-provider targets for Dax lifecycle development"
+      });
+    }
+    async function recordVirtualTargetSetupResult() {
+      return await postJson("/virtual/target-setup-requests/result", {
+        provider: value("virtual-target-result-provider") || "docker",
+        status: value("virtual-target-result-status") || "completed",
+        executed_by: value("virtual-target-result-executed-by") || "dax",
+        evidence: value("virtual-target-result-evidence"),
+        next_step: value("virtual-target-result-next-step")
       });
     }
     async function recordVirtualRuntime() {
@@ -1981,6 +1991,16 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="virtual-target-setup-reason">Reason</label><input id="virtual-target-setup-reason" value="prepare approved disposable real-provider targets for Dax lifecycle development"></div>
             </div>
           </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Target Setup Result</h3><button class="action-btn" data-action="record-virtual-target-setup-result">Record Result</button></div>
+            <div class="form-grid">
+              <div class="field span-2"><label for="virtual-target-result-provider">Provider</label><input id="virtual-target-result-provider" value="docker"></div>
+              <div class="field span-2"><label for="virtual-target-result-status">Status</label><input id="virtual-target-result-status" value="completed"></div>
+              <div class="field span-2"><label for="virtual-target-result-executed-by">Executed By</label><input id="virtual-target-result-executed-by" value="dax"></div>
+              <div class="field span-3"><label for="virtual-target-result-evidence">Evidence</label><input id="virtual-target-result-evidence" value="target verified with constrained network"></div>
+              <div class="field span-3"><label for="virtual-target-result-next-step">Next Step</label><input id="virtual-target-result-next-step" value="run provider lifecycle smoke"></div>
+            </div>
+          </div>
           <div class="panel span-6">
             <div class="toolbar"><h3>Virtual Snapshot Request</h3><div class="actions"><button class="action-btn" data-action="stage-virtual-snapshot-request">Stage</button><button class="action-btn" data-action="approve-virtual-snapshot-request">Approve</button><button class="action-btn" data-action="execute-virtual-snapshot-request">Execute</button></div></div>
             <div class="form-grid">
@@ -2477,6 +2497,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "View VM leases and virtual claims", page: "Claims", owner: "Dax", action: "open Claims", source, query: "View VM leases and virtual claims"},
         {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
         {workflow: "Stage real provider target setup batch", page: "Claims", owner: "Dax", action: "stage-virtual-target-setup-batch", source, query: "Stage real provider target setup batch"},
+        {workflow: "Record real provider setup result", page: "Claims", owner: "Dax", action: "record-virtual-target-setup-result", source, query: "Record real provider setup result"},
         {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},
         {workflow: "Approve virtual snapshot request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-snapshot-request", source, query: "Approve virtual snapshot request"},
         {workflow: "Execute virtual snapshot request", page: "Claims", owner: "Dax", action: "execute-virtual-snapshot-request", source, query: "Execute virtual snapshot request"},

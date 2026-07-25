@@ -184,6 +184,7 @@ ACTION_ROUTES = {
     "record-operation": ("POST", "/operations/records"),
     "record-source-review": ("POST", "/host/security/source-reviews"),
     "record-usage-limit": ("POST", "/usage-limits"),
+    "record-virtual-target-setup-result": ("POST", "/virtual/target-setup-requests/result"),
     "record-virtual-runtime": ("POST", "/virtual/runtime-records"),
     "register-health-target": ("POST", "/health-targets"),
     "register-resource": ("POST", "/resources"),
@@ -303,6 +304,13 @@ SAFE_POST_PAYLOADS = {
         "requested_by": "dax",
         "scope": "docker",
         "reason": "exercise target setup planning without host mutation",
+    },
+    "/virtual/target-setup-requests/result": {
+        "provider": "docker",
+        "status": "completed",
+        "executed_by": "dax",
+        "evidence": "target verified with constrained network",
+        "next_step": "run provider lifecycle smoke",
     },
     "/virtual/snapshot-requests": {
         "resource_id": "vm.ui.full",
@@ -850,6 +858,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                     "/Overseer/virtual/target-setup-requests",
                     SAFE_POST_PAYLOADS["/virtual/target-setup-requests"],
                 )
+                virtual_target_result = server.post_json(
+                    "/Overseer/virtual/target-setup-requests/result",
+                    SAFE_POST_PAYLOADS["/virtual/target-setup-requests/result"],
+                )
                 virtual_snapshot = server.post_json(
                     "/Overseer/virtual/snapshot-requests",
                     SAFE_POST_PAYLOADS["/virtual/snapshot-requests"],
@@ -942,6 +954,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertEqual(virtual_target_setup["target_setup_requests"][0]["provider"], "docker")
         self.assertTrue(virtual_target_setup["approval_required"])
         self.assertFalse(virtual_target_setup["host_mutation_performed"])
+        self.assertEqual(virtual_target_result["target_setup_request"]["status"], "completed")
+        self.assertFalse(virtual_target_result["host_mutation_performed"])
         self.assertEqual(virtual_snapshot["snapshot_request"]["status"], "waiting_approval")
         self.assertEqual(virtual_snapshot_approval["snapshot_request"]["status"], "approved")
         self.assertEqual(virtual_snapshot_execution["status"], "completed")

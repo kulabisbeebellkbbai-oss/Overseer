@@ -133,6 +133,7 @@ Protected gateway routes:
 
 - `GET /Overseer/virtual/operations`
 - `POST /Overseer/virtual/target-setup-requests`
+- `POST /Overseer/virtual/target-setup-requests/result`
 - `POST /Overseer/virtual/runtime-records`
 - `POST /Overseer/virtual/snapshot-requests`
 - `POST /Overseer/virtual/snapshot-requests/approve`
@@ -148,6 +149,9 @@ Operator controls live on the Claims page:
 - Real Provider Target Setup stages approval-required target creation requests
   for Docker, Podman, libvirt, qemu process, Renode, Android Emulator,
   gateway/proxy, and VirtualBox targets.
+- Target Setup Result records Dax's evidence after an approved setup batch is
+  executed. It marks each provider target completed, blocked, failed, or
+  partial without performing host mutation itself.
 - Virtual Snapshot Request stages a snapshot plan and waits for approval.
 - Virtual Restore Request stages a rollback plan and waits for approval.
 
@@ -200,6 +204,17 @@ The staged records include current state, proposed state, exact proposed
 commands or actions, risks, and rollback plan. They are review artifacts only.
 They do not install packages, change groups, start processes, create VMs,
 create containers, bind ports, create networks, or write gateway configs.
+
+After Sisko or the human approves and Dax executes the setup outside the
+staging call, Dax records the evidence:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli record-virtual-target-setup-result --project-root . --provider docker --status completed --evidence "container exists with network none"
+```
+
+Completion records clear the target setup approval requirement for that
+provider. Blocked, failed, and partial records keep approval required and surface
+the supplied evidence as the next resolution target.
 
 ## Read-Only Provider Inventory
 

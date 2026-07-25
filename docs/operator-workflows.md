@@ -385,6 +385,22 @@ PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . -
    proposed commands, and rollback plan.
 6. Do not create targets until the full batch approval is granted.
 
+### Record Real Provider Setup Result
+
+Use this after an approved provider target setup has been executed and Dax needs
+the UI state to reflect the verified outcome.
+
+1. Open Claims.
+2. Review Target Setup Requests and Runtime Provider Inventory.
+3. Fill Provider, Status, Executed By, Evidence, and Next Step.
+4. Use `completed` only when the target exists and containment evidence is
+   available.
+5. Use `blocked`, `failed`, or `partial` when a trust decision, package source,
+   manual intervention, or repair is still needed.
+6. Click Record Result.
+7. Confirm Target Setup Requests and Virtual Execution Records show the new
+   setup evidence.
+
 ### Stage Virtual Snapshot Request
 
 1. Open Claims.

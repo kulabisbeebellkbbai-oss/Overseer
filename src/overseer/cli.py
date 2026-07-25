@@ -110,6 +110,7 @@ from .virtual_ops import (
     approve_virtual_snapshot_request_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
+    record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
     stage_virtual_target_setup_batch_status,
     stage_virtual_restore_request_status,
@@ -7357,6 +7358,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     stage_virtual_target_setup_parser.add_argument("--requested-by", default="dax")
     stage_virtual_target_setup_parser.add_argument("--scope", default="all")
     stage_virtual_target_setup_parser.add_argument("--reason", default="prepare approved disposable real-provider targets for Dax lifecycle development")
+    record_virtual_target_setup_result_parser = subparsers.add_parser(
+        "record-virtual-target-setup-result",
+        help="record the evidence outcome of an approved Dax real-provider target setup",
+    )
+    record_virtual_target_setup_result_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    record_virtual_target_setup_result_parser.add_argument("--provider", required=True)
+    record_virtual_target_setup_result_parser.add_argument("--status", required=True, choices=("completed", "blocked", "failed", "partial"))
+    record_virtual_target_setup_result_parser.add_argument("--executed-by", default="dax")
+    record_virtual_target_setup_result_parser.add_argument("--evidence", default="")
+    record_virtual_target_setup_result_parser.add_argument("--next-step", default="")
+    record_virtual_target_setup_result_parser.add_argument("--executed-at")
     discover_virtual_parser = subparsers.add_parser("discover-virtual-listeners", help="discover local TCP listeners as virtual assets")
     discover_virtual_parser.add_argument("--store", required=True, help="explicit SQLite store path for persisting discovered listener resources")
     record_virtual_runtime_parser = subparsers.add_parser("record-virtual-runtime", help="record Dax virtual runtime state")
@@ -8047,6 +8059,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     requested_by=args.requested_by,
                     scope=args.scope,
                     reason=args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "record-virtual-target-setup-result":
+        print(
+            json.dumps(
+                record_virtual_target_setup_result_status(
+                    args.project_root,
+                    args.provider,
+                    args.status,
+                    args.executed_by,
+                    args.evidence,
+                    args.next_step,
+                    args.executed_at,
                 ),
                 sort_keys=True,
             )

@@ -151,6 +151,7 @@ from .virtual_ops import (
     approve_virtual_snapshot_request_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
+    record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
@@ -520,6 +521,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/target-setup-requests":
                 self._handle_json(lambda payload: stage_virtual_target_setup_batch_status(_project_path_for_store(store_path), **_virtual_target_setup_args(payload)))
+                return
+            if path == "/virtual/target-setup-requests/result":
+                self._handle_json(lambda payload: record_virtual_target_setup_result_status(_project_path_for_store(store_path), **_virtual_target_setup_result_args(payload)))
                 return
             if path == "/virtual/runtime-records":
                 self._handle_json(lambda payload: record_virtual_runtime_status(_project_path_for_store(store_path), **_virtual_runtime_record_args(payload)))
@@ -1092,6 +1096,17 @@ def _virtual_target_setup_args(payload: dict[str, Any]) -> dict[str, Any]:
         "requested_by": str(payload.get("requested_by") or "dax"),
         "scope": str(payload.get("scope") or "all"),
         "reason": str(payload.get("reason") or "prepare approved disposable real-provider targets for Dax lifecycle development"),
+    }
+
+
+def _virtual_target_setup_result_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": str(payload["provider"]),
+        "status": str(payload["status"]),
+        "executed_by": str(payload.get("executed_by") or "dax"),
+        "evidence": str(payload.get("evidence") or ""),
+        "next_step": str(payload.get("next_step") or ""),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
     }
 
 

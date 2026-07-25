@@ -234,11 +234,12 @@ disposable Android AVD directory snapshot/restore with manifests under
 
 Gaps:
 
-- Richer CPU, memory, running disk, and network-topology telemetry still needs
-  provider-specific collectors where each backend exposes safe read-only data.
-  Dax now surfaces read-only Docker, Podman, virsh, qemu image, qemu process,
-  Android Emulator, Renode, and gateway/proxy depth rows, plus capacity and
-  image provenance review summaries.
+- Hypervisor-grade CPU, memory, running disk, and network-topology telemetry
+  still needs backend-specific policy and collector depth for non-container
+  providers. Dax now surfaces read-only Docker/Podman CPU, memory, network, and
+  block-I/O fields when stats are available, virsh domain state, qemu image
+  metadata, qemu process, Android Emulator, Renode, and gateway/proxy depth rows,
+  plus capacity and image provenance review summaries.
 - No approved running-domain libvirt snapshot policy, VirtualBox provider,
   destroy action, or generalized snapshot/restore for non-disposable targets.
   Provider snapshot/restore is intentionally limited to approved disposable
@@ -246,7 +247,10 @@ Gaps:
 - Container image vulnerability scanning still needs a scanner/policy choice.
   Dax now surfaces image provenance review rows that identify local versus
   registry/external image sources for operator triage.
-- No resource-capacity planning for CPU, memory, disk, and port pools.
+- Capacity planning is present as a Dax summary for virtual resources,
+  registered runtimes, inventory rows, ports, conflicts, containers, images, and
+  known image bytes. Forecasting and policy thresholds still need operational
+  tuning.
 
 ### Observability, Health, And Performance
 

@@ -806,7 +806,8 @@ exit 0
 
     def test_docker_provider_inventory_parser_returns_claimable_runtime_rows(self):
         rows = parse_docker_ps_json_lines(
-            '{"ID":"abc123","Image":"nginx:latest","Names":"web.1","State":"running","Ports":"0.0.0.0:8080->80/tcp"}\n'
+            '{"ID":"abc123","Image":"nginx:latest","Names":"web.1","State":"running","Ports":"0.0.0.0:8080->80/tcp"}\n',
+            {"web.1": {"cpu": "0.10%", "memory": "12MiB / 1GiB", "network": "1kB / 2kB", "block_io": "3kB / 4kB"}},
         )
 
         self.assertEqual(rows[0]["provider"], "docker")
@@ -814,11 +815,16 @@ exit 0
         self.assertEqual(rows[0]["kind"], "container")
         self.assertEqual(rows[0]["state"], "running")
         self.assertEqual(rows[0]["image"], "nginx:latest")
+        self.assertEqual(rows[0]["cpu"], "0.10%")
+        self.assertEqual(rows[0]["memory"], "12MiB / 1GiB")
+        self.assertEqual(rows[0]["network"], "1kB / 2kB")
+        self.assertEqual(rows[0]["actual_size"], "3kB / 4kB")
         self.assertIn("request Dax claim", rows[0]["next_step"])
 
     def test_podman_provider_inventory_parser_returns_claimable_runtime_rows(self):
         rows = parse_podman_ps_json(
-            '[{"Id":"def456","Image":"alpine:latest","Names":["overseer-dax-disposable-podman"],"State":"exited","Labels":{"overseer.owner":"dax"},"PortMappings":[]}]'
+            '[{"Id":"def456","Image":"alpine:latest","Names":["overseer-dax-disposable-podman"],"State":"exited","Labels":{"overseer.owner":"dax"},"PortMappings":[]}]',
+            {"overseer-dax-disposable-podman": {"cpu": "0.00%", "memory": "8MiB", "network": "0B"}},
         )
 
         self.assertEqual(rows[0]["provider"], "podman")
@@ -827,6 +833,9 @@ exit 0
         self.assertEqual(rows[0]["state"], "exited")
         self.assertEqual(rows[0]["image"], "alpine:latest")
         self.assertEqual(rows[0]["owner"], "dax")
+        self.assertEqual(rows[0]["cpu"], "0.00%")
+        self.assertEqual(rows[0]["memory"], "8MiB")
+        self.assertEqual(rows[0]["network"], "0B")
         self.assertIn("request Dax claim", rows[0]["next_step"])
 
     @unittest.skipIf(shutil.which("qemu-img") is None, "qemu-img is required")

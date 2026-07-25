@@ -140,15 +140,19 @@ def _docker_inventory_rows() -> list[dict[str, object]]:
                 "image": "",
                 "ports": "",
                 "owner": "",
+                "cpu": "",
+                "memory": "",
+                "network": "",
                 "evidence": result["stderr"],
                 "next_step": "verify Docker daemon access before container inventory can be trusted",
             }
         ]
-    return parse_docker_ps_json_lines(str(result["stdout"]))
+    return parse_docker_ps_json_lines(str(result["stdout"]), _docker_stats_map())
 
 
-def parse_docker_ps_json_lines(output: str) -> list[dict[str, object]]:
+def parse_docker_ps_json_lines(output: str, stats_by_name: dict[str, dict[str, object]] | None = None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
+    stats_by_name = stats_by_name or {}
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -159,6 +163,7 @@ def parse_docker_ps_json_lines(output: str) -> list[dict[str, object]]:
         container_id = str(item.get("ID") or item.get("ContainerID") or "").strip()
         name = str(item.get("Names") or item.get("Name") or container_id or "container").strip()
         state = str(item.get("State") or item.get("Status") or "unknown").strip()
+        stats = stats_by_name.get(name) or stats_by_name.get(container_id) or {}
         rows.append(
             {
                 "provider": "docker",
@@ -167,10 +172,13 @@ def parse_docker_ps_json_lines(output: str) -> list[dict[str, object]]:
                 "state": state,
                 "image": _short_value(item.get("Image")),
                 "virtual_size": "",
-                "actual_size": "",
+                "actual_size": _short_value(stats.get("block_io")),
                 "snapshots": "",
                 "ports": str(item.get("Ports") or ""),
                 "owner": str(item.get("Labels") or ""),
+                "cpu": _short_value(stats.get("cpu")),
+                "memory": _short_value(stats.get("memory")),
+                "network": _short_value(stats.get("network")),
                 "evidence": f"id={container_id}",
                 "next_step": "request Dax claim before changing container runtime state",
             }
@@ -194,15 +202,19 @@ def _podman_inventory_rows() -> list[dict[str, object]]:
                 "actual_size": "",
                 "ports": "",
                 "owner": "",
+                "cpu": "",
+                "memory": "",
+                "network": "",
                 "evidence": result["stderr"],
                 "next_step": "verify Podman rootless runtime before container inventory can be trusted",
             }
         ]
-    return parse_podman_ps_json(str(result["stdout"]))
+    return parse_podman_ps_json(str(result["stdout"]), _podman_stats_map())
 
 
-def parse_podman_ps_json(output: str) -> list[dict[str, object]]:
+def parse_podman_ps_json(output: str, stats_by_name: dict[str, dict[str, object]] | None = None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
+    stats_by_name = stats_by_name or {}
     try:
         items = json.loads(output) if output.strip() else []
     except json.JSONDecodeError:
@@ -222,6 +234,7 @@ def parse_podman_ps_json(output: str) -> list[dict[str, object]]:
         ports = item.get("Ports") or item.get("PortMappings") or ""
         labels = item.get("Labels") or {}
         owner = labels.get("overseer.owner", "") if isinstance(labels, dict) else str(labels)
+        stats = stats_by_name.get(name) or stats_by_name.get(container_id) or {}
         rows.append(
             {
                 "provider": "podman",
@@ -234,10 +247,67 @@ def parse_podman_ps_json(output: str) -> list[dict[str, object]]:
                 "snapshots": "",
                 "ports": _short_value(ports),
                 "owner": owner,
+                "cpu": _short_value(stats.get("cpu")),
+                "memory": _short_value(stats.get("memory")),
+                "network": _short_value(stats.get("network")),
                 "evidence": f"id={container_id}",
                 "next_step": "request Dax claim before changing container runtime state",
             }
         )
+    return rows
+
+
+def _docker_stats_map() -> dict[str, dict[str, object]]:
+    result = _run_inventory_command(("docker", "stats", "--no-stream", "--format", "{{json .}}"), timeout_seconds=4.0)
+    if result["exit_code"] != 0:
+        return {}
+    rows: dict[str, dict[str, object]] = {}
+    for line in str(result["stdout"]).splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        names = [str(item.get("Name") or "").strip(), str(item.get("Container") or "").strip(), str(item.get("ID") or "").strip()]
+        stats = {
+            "cpu": item.get("CPUPerc") or item.get("CPU %") or "",
+            "memory": item.get("MemUsage") or item.get("MemPerc") or item.get("Mem %") or "",
+            "network": item.get("NetIO") or item.get("Net I/O") or "",
+            "block_io": item.get("BlockIO") or item.get("Block I/O") or "",
+        }
+        for name in names:
+            if name:
+                rows[name] = stats
+    return rows
+
+
+def _podman_stats_map() -> dict[str, dict[str, object]]:
+    result = _run_inventory_command(("podman", "stats", "--no-stream", "--format", "json"), timeout_seconds=4.0)
+    if result["exit_code"] != 0:
+        return {}
+    try:
+        items = json.loads(str(result["stdout"])) if str(result["stdout"]).strip() else []
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(items, dict):
+        items = [items]
+    rows: dict[str, dict[str, object]] = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        names = [
+            str(item.get("name") or item.get("Name") or "").strip(),
+            str(item.get("id") or item.get("ID") or item.get("container_id") or "").strip(),
+        ]
+        stats = {
+            "cpu": item.get("cpu_percent") or item.get("CPUPerc") or item.get("cpu") or "",
+            "memory": item.get("mem_usage") or item.get("MemUsage") or item.get("mem_percent") or "",
+            "network": item.get("net_input") or item.get("NetIO") or item.get("network") or "",
+        }
+        for name in names:
+            if name:
+                rows[name] = stats
     return rows
 
 
@@ -255,6 +325,9 @@ def _virsh_inventory_rows() -> list[dict[str, object]]:
                 "image": "",
                 "ports": "",
                 "owner": "",
+                "cpu": "",
+                "memory": "",
+                "network": "",
                 "evidence": names["stderr"],
                 "next_step": "verify libvirt access before VM inventory can be trusted",
             }
@@ -271,6 +344,9 @@ def _virsh_inventory_rows() -> list[dict[str, object]]:
                 "image": "",
                 "ports": "",
                 "owner": "",
+                "cpu": "",
+                "memory": "",
+                "network": "",
                 "evidence": f"name={name}",
                 "next_step": "request Dax claim before changing VM runtime state",
             }
@@ -305,6 +381,9 @@ def _qemu_image_inventory_row(project_root: Path, image: Path) -> dict[str, obje
             "actual_size": "",
             "snapshots": "",
             "evidence": result["stderr"],
+            "cpu": "",
+            "memory": "",
+            "network": "",
             "next_step": "inspect qemu-img error before using this image as a Dax target",
         }
     try:
@@ -322,6 +401,9 @@ def _qemu_image_inventory_row(project_root: Path, image: Path) -> dict[str, obje
             "actual_size": "",
             "snapshots": "",
             "evidence": "qemu-img info returned invalid JSON",
+            "cpu": "",
+            "memory": "",
+            "network": "",
             "next_step": "inspect image metadata before using this image as a Dax target",
         }
     snapshots = [
@@ -341,6 +423,9 @@ def _qemu_image_inventory_row(project_root: Path, image: Path) -> dict[str, obje
         "actual_size": info.get("actual-size", ""),
         "snapshots": ", ".join(snapshots),
         "evidence": f"format={info.get('format', '')}",
+        "cpu": "",
+        "memory": "",
+        "network": "offline image",
         "next_step": "request Dax claim before snapshot, restore, start, or image mutation",
     }
 
@@ -373,6 +458,9 @@ def _registered_runtime_depth_row(project_root: Path, record: dict[str, object],
         "snapshots": "",
         "ports": ",".join(str(port) for port in record.get("ports") or []),
         "owner": _owner_from_notes(str(record.get("notes") or "")),
+        "cpu": "running-state unknown" if state == "running" else "",
+        "memory": "",
+        "network": _network_from_runtime(record, adapter),
         "evidence": _runtime_depth_evidence(project_root, target, target_exists, adapter),
         "next_step": "request Dax claim before changing registered runtime state",
     }
@@ -431,6 +519,18 @@ def _owner_from_notes(notes: str) -> str:
     if "dax" in lowered or "disposable" in lowered:
         return "dax"
     return ""
+
+
+def _network_from_runtime(record: dict[str, object], adapter: str) -> str:
+    ports = list(record.get("ports") or [])
+    notes = str(record.get("notes") or "").lower()
+    if adapter in {"qemu_process", "renode"} and ("-net none" in notes or "no network" in notes):
+        return "none"
+    if adapter == "gateway_proxy":
+        return "loopback" if "loopback" in notes or ports else "unknown"
+    if adapter == "android_emulator":
+        return "emulator default"
+    return "ports:" + ",".join(str(port) for port in ports) if ports else ""
 
 
 def _capacity_summary(

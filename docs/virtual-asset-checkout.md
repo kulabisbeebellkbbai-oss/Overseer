@@ -264,6 +264,10 @@ staged files under `local-secrets/virtual-runtime-targets`, and registered
 runtime depth rows for qemu process, Renode, Android Emulator, and
 gateway/proxy records. Qemu image inventory includes the project-relative image
 path, format status, virtual size, actual size, and internal snapshot names.
+Container inventory includes CPU, memory, network, and block-I/O fields when
+`docker stats` or `podman stats` can read them without mutating runtime state.
+Registered qemu process, Renode, Android Emulator, and gateway/proxy rows infer
+network posture from ports and local runtime notes.
 Dax also reports CLI availability in Runtime Adapter Availability. Commands use
 short timeouts and return unavailable inventory rows when a CLI exists but the
 daemon, rootless runtime, or libvirt session is not accessible.

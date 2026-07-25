@@ -376,6 +376,73 @@ def execute_virtual_restore_request_status(
     }
 
 
+def execute_virtual_lifecycle_status(
+    project_root: str | Path,
+    resource_id: str,
+    action: str,
+    executed_by: str = "dax",
+    provider: str = "",
+    executed_at: str | None = None,
+) -> dict[str, object]:
+    if not executed_by.strip():
+        raise ValueError("executed_by is required")
+    cleaned_action = _safe_id(action).replace("-", "_")
+    if cleaned_action not in {"inspect", "start", "stop"}:
+        raise ValueError("virtual lifecycle action must be inspect, start, or stop")
+    root = Path(project_root)
+    data = _read_registry(root)
+    runtime = _find_runtime_record(data, resource_id)
+    runtime_provider = provider or str(runtime.get("adapter") or "")
+    now = executed_at or _now()
+    request_id = f"virtual-lifecycle.{_safe_id(str(runtime['resource_id']))}.{cleaned_action}"
+    try:
+        _validate_lifecycle_runtime(root, runtime, runtime_provider)
+        result = _execute_lifecycle_provider(root, runtime, runtime_provider, cleaned_action)
+        runtime.update(
+            {
+                "state": result["state"],
+                "updated_at": now,
+                "last_lifecycle_action": cleaned_action,
+                "last_lifecycle_at": now,
+                "next_step": result["next_step"],
+            }
+        )
+        manifest = _write_lifecycle_manifest(root, runtime, cleaned_action, runtime_provider, result, now)
+    except ValueError as error:
+        row = {"id": request_id, "resource_id": _safe_id(resource_id)}
+        _append_execution(data, row, f"lifecycle_{cleaned_action}", request_id, executed_by, now, "blocked", runtime_provider, error=str(error))
+        _write_registry(root, data)
+        return {
+            "status": "blocked",
+            "summary": str(error),
+            "runtime_record": runtime,
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    except OSError as error:
+        row = {"id": request_id, "resource_id": _safe_id(resource_id)}
+        _append_execution(data, row, f"lifecycle_{cleaned_action}", request_id, executed_by, now, "failed", runtime_provider, error=str(error))
+        _write_registry(root, data)
+        return {
+            "status": "failed",
+            "summary": str(error),
+            "runtime_record": runtime,
+            "mutation_performed": True,
+            "host_mutation_performed": cleaned_action != "inspect",
+        }
+    row = {"id": request_id, "resource_id": runtime["resource_id"]}
+    _append_execution(data, row, f"lifecycle_{cleaned_action}", request_id, executed_by, now, "completed", runtime_provider, manifest=manifest)
+    _write_registry(root, data)
+    return {
+        "status": "completed",
+        "runtime_record": runtime,
+        "manifest": manifest,
+        "provider_result": result,
+        "mutation_performed": True,
+        "host_mutation_performed": cleaned_action != "inspect",
+    }
+
+
 def _registry_path(root: Path) -> Path:
     return root / "state" / "virtual-operations.json"
 
@@ -788,6 +855,211 @@ def _run_qemu_img(args: tuple[str, ...]) -> str:
     return completed.stdout.strip()
 
 
+def _validate_lifecycle_runtime(root: Path, runtime: dict[str, object], provider: str) -> None:
+    resource_id = str(runtime.get("resource_id") or "")
+    notes = str(runtime.get("notes") or "").lower()
+    if not resource_id:
+        raise ValueError("virtual lifecycle requires a runtime resource_id")
+    if "disposable" not in resource_id and "disposable" not in notes and not resource_id.startswith("vm."):
+        raise ValueError("virtual lifecycle is limited to registered disposable targets")
+    if provider not in {"docker", "podman", "libvirt", "qemu_process", "renode", "android_emulator", "gateway_proxy"}:
+        raise ValueError(f"virtual lifecycle provider is not implemented: {provider}")
+    hint = str(runtime.get("snapshot_hint") or "")
+    if provider in {"qemu_process", "renode", "gateway_proxy"}:
+        _project_relative_path(root, hint)
+    if provider == "android_emulator" and not hint:
+        raise ValueError("android_emulator lifecycle requires an AVD config snapshot_hint")
+
+
+def _execute_lifecycle_provider(root: Path, runtime: dict[str, object], provider: str, action: str) -> dict[str, object]:
+    if provider == "docker":
+        return _docker_lifecycle(runtime, action)
+    if provider == "podman":
+        return _container_lifecycle(("podman",), runtime, action)
+    if provider == "libvirt":
+        return _libvirt_lifecycle(runtime, action)
+    if provider == "qemu_process":
+        return _qemu_process_lifecycle(root, runtime, action)
+    if provider == "renode":
+        return _scripted_process_lifecycle(root, runtime, action, "renode")
+    if provider == "android_emulator":
+        return _android_emulator_lifecycle(runtime, action)
+    if provider == "gateway_proxy":
+        return _scripted_process_lifecycle(root, runtime, action, "proxy")
+    raise ValueError(f"virtual lifecycle provider is not implemented: {provider}")
+
+
+def _docker_lifecycle(runtime: dict[str, object], action: str) -> dict[str, object]:
+    try:
+        return _container_lifecycle(("docker",), runtime, action)
+    except ValueError as error:
+        if "permission denied" not in str(error).lower() or shutil.which("sudo") is None:
+            raise
+    return _container_lifecycle(("sudo", "docker"), runtime, action)
+
+
+def _container_lifecycle(base_command: tuple[str, ...], runtime: dict[str, object], action: str) -> dict[str, object]:
+    name = str(runtime["resource_id"])
+    if action == "start":
+        output = _run_provider_command((*base_command, "start", name), timeout=20.0)
+        state = _container_state(base_command, name)
+        return _provider_result(state, output, "container started; inspect health and claim ownership before workload use")
+    if action == "stop":
+        output = _run_provider_command((*base_command, "stop", name), timeout=20.0)
+        state = _container_state(base_command, name)
+        return _provider_result(state, output, "container stopped; release claim or keep reserved for next lifecycle smoke")
+    state = _container_state(base_command, name)
+    return _provider_result(state, "", "container inspected; start only when a Dax claim owns the target")
+
+
+def _container_state(base_command: tuple[str, ...], name: str) -> str:
+    output = _run_provider_command((*base_command, "inspect", name, "--format", "{{.State.Status}}"), timeout=10.0)
+    return _state_from_text(output.strip())
+
+
+def _libvirt_lifecycle(runtime: dict[str, object], action: str) -> dict[str, object]:
+    name = str(runtime["resource_id"])
+    if action == "start":
+        output = _run_provider_command(("virsh", "start", name), timeout=20.0)
+        return _provider_result(_libvirt_state(name), output, "domain started without changing network definition; run health checks before use")
+    if action == "stop":
+        output = _run_provider_command(("virsh", "destroy", name), timeout=20.0)
+        return _provider_result(_libvirt_state(name), output, "domain stopped; snapshot or release according to the active claim")
+    return _provider_result(_libvirt_state(name), "", "domain inspected; start only under Dax claim control")
+
+
+def _libvirt_state(name: str) -> str:
+    output = _run_provider_command(("virsh", "domstate", name), timeout=10.0)
+    text = output.strip().lower()
+    if "running" in text:
+        return "running"
+    if "shut off" in text or "shut" in text:
+        return "stopped"
+    return _state_from_text(text)
+
+
+def _qemu_process_lifecycle(root: Path, runtime: dict[str, object], action: str) -> dict[str, object]:
+    resource_id = str(runtime["resource_id"])
+    pidfile = root / "local-secrets" / "virtual-runtime-targets" / f"{_safe_id(resource_id)}.pid"
+    script = root / "local-secrets" / "virtual-runtime-configs" / f"{_safe_id(resource_id)}-start.sh"
+    if action == "start":
+        if _pid_running(pidfile):
+            return _provider_result("running", f"pid {pidfile.read_text(encoding='utf-8').strip()}", "qemu process already running; inspect before reuse")
+        if not script.exists():
+            raise ValueError("qemu_process lifecycle start script is missing")
+        subprocess.Popen((str(script),), cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return _provider_result("running" if _pid_running(pidfile) else "starting", _relative_or_name(root, pidfile), "qemu process launch requested with project-local pidfile")
+    if action == "stop":
+        stopped = _stop_pidfile(pidfile)
+        return _provider_result("stopped", stopped, "qemu process stopped or already absent")
+    return _provider_result("running" if _pid_running(pidfile) else "stopped", _relative_or_name(root, pidfile), "qemu process inspected; start only with -net none launch script")
+
+
+def _scripted_process_lifecycle(root: Path, runtime: dict[str, object], action: str, suffix: str) -> dict[str, object]:
+    resource_id = str(runtime["resource_id"])
+    pidfile = root / "local-secrets" / "virtual-runtime-targets" / f"{_safe_id(resource_id)}.pid"
+    if suffix == "proxy":
+        pidfile = root / "local-secrets" / "virtual-runtime-targets" / "overseer-dax-disposable-proxy.pid"
+    script = root / "local-secrets" / "virtual-runtime-configs" / f"{_safe_id(resource_id)}-start.sh"
+    if suffix == "proxy":
+        script = root / "local-secrets" / "virtual-runtime-configs" / "overseer-dax-disposable-proxy-start.sh"
+    if action == "start":
+        if _pid_running(pidfile):
+            return _provider_result("running", f"pid {pidfile.read_text(encoding='utf-8').strip()}", f"{suffix} process already running")
+        if not script.exists():
+            raise ValueError(f"{suffix} lifecycle start script is missing")
+        process = subprocess.Popen((str(script),), cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        pidfile.write_text(str(process.pid), encoding="utf-8")
+        return _provider_result("running" if _pid_running(pidfile) else "starting", _relative_or_name(root, pidfile), f"{suffix} process launch requested")
+    if action == "stop":
+        stopped = _stop_pidfile(pidfile)
+        return _provider_result("stopped", stopped, f"{suffix} process stopped or already absent")
+    return _provider_result("running" if _pid_running(pidfile) else "stopped", _relative_or_name(root, pidfile), f"{suffix} process inspected")
+
+
+def _android_emulator_lifecycle(runtime: dict[str, object], action: str) -> dict[str, object]:
+    avd = str(runtime["resource_id"])
+    emulator = _android_tool("emulator")
+    adb = _android_tool("adb")
+    if action == "start":
+        if emulator is None:
+            raise ValueError("Android emulator is not available")
+        subprocess.Popen((emulator, "-avd", avd, "-no-window", "-no-audio", "-no-boot-anim"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return _provider_result("starting", avd, "Android emulator launch requested; verify adb state before use")
+    if action == "stop":
+        if adb is None:
+            raise ValueError("adb is not available")
+        output = _run_provider_command((adb, "emu", "kill"), timeout=10.0, check=False)
+        return _provider_result("stopped", output, "Android emulator stop requested; inspect adb devices")
+    if emulator is None:
+        raise ValueError("Android emulator is not available")
+    output = _run_provider_command((emulator, "-list-avds"), timeout=10.0)
+    return _provider_result("available" if avd in output.splitlines() else "missing", avd, "AVD inspected; start only under Dax claim control")
+
+
+def _android_tool(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    home = Path.home() / "Android" / "Sdk"
+    candidates = {
+        "emulator": home / "emulator" / "emulator",
+        "adb": home / "platform-tools" / "adb",
+    }
+    candidate = candidates.get(name)
+    if candidate and candidate.exists():
+        return str(candidate)
+    return None
+
+
+def _run_provider_command(command: tuple[str, ...], timeout: float = 15.0, check: bool = True) -> str:
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"provider command timed out: {' '.join(command)}") from error
+    except OSError as error:
+        raise ValueError(f"provider command failed to start: {error}") from error
+    if check and completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+        raise ValueError(f"provider command failed: {command[0]} {command[1] if len(command) > 1 else ''}: {stderr}")
+    return (completed.stdout.strip() or completed.stderr.strip()).strip()
+
+
+def _provider_result(state: str, output: str, next_step: str) -> dict[str, object]:
+    return {"state": state, "output": output[-500:], "next_step": next_step}
+
+
+def _state_from_text(text: str) -> str:
+    cleaned = text.strip().lower()
+    if cleaned in {"created", "exited", "stopped", "shut off"}:
+        return "stopped"
+    if cleaned in {"running", "paused"}:
+        return cleaned
+    return cleaned or "observed"
+
+
+def _pid_running(pidfile: Path) -> bool:
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return Path(f"/proc/{pid}").exists()
+
+
+def _stop_pidfile(pidfile: Path) -> str:
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return "pidfile absent"
+    try:
+        Path(f"/proc/{pid}").exists()
+        subprocess.run(("kill", str(pid)), check=False, capture_output=True, text=True, timeout=5.0)
+    except OSError as error:
+        raise ValueError(f"failed to stop pid {pid}: {error}") from error
+    return f"stopped pid {pid}"
+
+
 def _project_relative_path(root: Path, raw_path: str) -> Path:
     path = Path(raw_path)
     if path.is_absolute() or "~" in path.parts or ".." in path.parts:
@@ -826,6 +1098,39 @@ def _write_manifest(
     }
     manifest["entry_count"] = len(manifest["entries"])
     manifest_path = manifest_dir / f"{_safe_id(str(row['id']))}-{_safe_id(executed_at)}.json"
+    manifest["manifest_path"] = _relative_or_name(root, manifest_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
+def _write_lifecycle_manifest(
+    root: Path,
+    runtime: dict[str, object],
+    action: str,
+    provider: str,
+    result: dict[str, object],
+    executed_at: str,
+) -> dict[str, object]:
+    manifest_dir = root / "local-secrets" / "virtual-runtime-manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "request_id": f"virtual-lifecycle.{runtime['resource_id']}.{action}",
+        "resource_id": runtime["resource_id"],
+        "action": f"lifecycle_{action}",
+        "provider": provider,
+        "executed_at": executed_at,
+        "source": str(runtime.get("snapshot_hint") or ""),
+        "target": str(runtime.get("resource_id") or ""),
+        "preserved": "",
+        "provider_metadata": {
+            "state": result.get("state"),
+            "next_step": result.get("next_step"),
+            "output": result.get("output"),
+        },
+        "entries": [],
+        "entry_count": 0,
+    }
+    manifest_path = manifest_dir / f"{_safe_id(str(manifest['request_id']))}-{_safe_id(executed_at)}.json"
     manifest["manifest_path"] = _relative_or_name(root, manifest_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest

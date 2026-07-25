@@ -38,6 +38,7 @@ from overseer.virtual_evidence import parse_docker_ps_json_lines, virtual_eviden
 from overseer.virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
+    execute_virtual_lifecycle_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
@@ -562,6 +563,61 @@ class OperationsGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(unapproved["status"], "blocked")
         self.assertFalse(unapproved["host_mutation_performed"])
+        self.assertEqual(unsupported["status"], "blocked")
+        self.assertIn("not implemented", unsupported["summary"])
+
+    def test_virtual_lifecycle_executes_disposable_inspect_and_records_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "overseer-dax-disposable-proxy.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("proxy fixture\n", encoding="utf-8")
+            record_virtual_runtime_status(
+                root,
+                "overseer-dax-disposable-proxy",
+                kind="proxy",
+                state="running",
+                adapter="gateway_proxy",
+                ports=(8769,),
+                snapshot_hint="local-secrets/virtual-runtime-targets/overseer-dax-disposable-proxy.py",
+                notes="approved disposable proxy target",
+            )
+            inspected = execute_virtual_lifecycle_status(root, "overseer-dax-disposable-proxy", "inspect")
+            status = virtual_operations_status(root)
+            manifest_exists = (root / inspected["manifest"]["manifest_path"]).exists()
+
+        self.assertEqual(inspected["status"], "completed")
+        self.assertFalse(inspected["host_mutation_performed"])
+        self.assertEqual(inspected["manifest"]["action"], "lifecycle_inspect")
+        self.assertTrue(manifest_exists)
+        self.assertEqual(status["runtime_records"][0]["last_lifecycle_action"], "inspect")
+        self.assertEqual(status["execution_records"][0]["action"], "lifecycle_inspect")
+
+    def test_virtual_lifecycle_blocks_non_disposable_or_unknown_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_virtual_runtime_status(
+                root,
+                "production-vm",
+                kind="vm",
+                state="running",
+                adapter="libvirt",
+                snapshot_hint="local-secrets/virtual-runtime-targets/production-vm.qcow2",
+            )
+            unsafe = execute_virtual_lifecycle_status(root, "production-vm", "inspect")
+            record_virtual_runtime_status(
+                root,
+                "overseer-dax-disposable-unknown",
+                kind="vm",
+                state="stopped",
+                adapter="unknown",
+                snapshot_hint="local-secrets/virtual-runtime-targets/unknown",
+                notes="approved disposable target",
+            )
+            unsupported = execute_virtual_lifecycle_status(root, "overseer-dax-disposable-unknown", "inspect")
+
+        self.assertEqual(unsafe["status"], "blocked")
+        self.assertIn("disposable", unsafe["summary"])
         self.assertEqual(unsupported["status"], "blocked")
         self.assertIn("not implemented", unsupported["summary"])
 

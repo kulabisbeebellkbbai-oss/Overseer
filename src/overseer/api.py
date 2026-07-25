@@ -149,6 +149,7 @@ from .virtual_evidence import virtual_evidence_status
 from .virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
+    execute_virtual_lifecycle_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
@@ -527,6 +528,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/runtime-records":
                 self._handle_json(lambda payload: record_virtual_runtime_status(_project_path_for_store(store_path), **_virtual_runtime_record_args(payload)))
+                return
+            if path == "/virtual/lifecycle/execute":
+                self._handle_json(lambda payload: execute_virtual_lifecycle_status(_project_path_for_store(store_path), **_virtual_lifecycle_execution_args(payload)))
                 return
             if path == "/virtual/snapshot-requests":
                 self._handle_json(lambda payload: stage_virtual_snapshot_request_status(_project_path_for_store(store_path), **_virtual_snapshot_request_args(payload)))
@@ -1125,6 +1129,16 @@ def _virtual_restore_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "restore_point": str(payload["restore_point"]),
         "requested_by": str(payload.get("requested_by") or "dax"),
         "reason": str(payload.get("reason") or "stage virtual restore after failed change"),
+    }
+
+
+def _virtual_lifecycle_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "action": str(payload["action"]),
+        "executed_by": str(payload.get("executed_by") or "dax"),
+        "provider": str(payload.get("provider") or ""),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
     }
 
 

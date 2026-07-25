@@ -401,6 +401,22 @@ the UI state to reflect the verified outcome.
 7. Confirm Target Setup Requests and Virtual Execution Records show the new
    setup evidence.
 
+### Execute Virtual Lifecycle Action
+
+Use this after a disposable provider target is registered and Dax owns the
+checkout for an inspect, start, or stop action.
+
+1. Open Claims.
+2. Review Virtual Runtime Records, Target Setup Requests, and Runtime Provider
+   Inventory.
+3. Click the runtime row or fill Resource ID.
+4. Choose `inspect`, `start`, or `stop`.
+5. Leave Provider blank to use the runtime adapter, or fill it only when Dax is
+   intentionally overriding the adapter for a disposable test target.
+6. Click Execute Lifecycle.
+7. Review Virtual Execution Records and the manifest path.
+8. Run Julian health checks before returning a started target to service.
+
 ### Stage Virtual Snapshot Request
 
 1. Open Claims.

@@ -913,6 +913,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "stage-virtual-target-setup-batch") return await stageVirtualTargetSetupBatch();
       if (action === "record-virtual-target-setup-result") return await recordVirtualTargetSetupResult();
       if (action === "record-virtual-runtime") return await recordVirtualRuntime();
+      if (action === "execute-virtual-lifecycle") return await executeVirtualLifecycle();
       if (action === "stage-virtual-snapshot-request") return await stageVirtualSnapshotRequest();
       if (action === "approve-virtual-snapshot-request") return await approveVirtualSnapshotRequest();
       if (action === "execute-virtual-snapshot-request") return await executeVirtualSnapshotRequest();
@@ -1064,6 +1065,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         ports,
         snapshot_hint: value("virtual-snapshot-hint"),
         notes: value("virtual-notes")
+      });
+    }
+    async function executeVirtualLifecycle() {
+      return await postJson("/virtual/lifecycle/execute", {
+        resource_id: value("virtual-lifecycle-resource-id"),
+        action: value("virtual-lifecycle-action") || "inspect",
+        executed_by: value("virtual-lifecycle-executed-by") || "dax",
+        provider: value("virtual-lifecycle-provider")
       });
     }
     async function stageVirtualSnapshotRequest() {
@@ -2001,6 +2010,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-3"><label for="virtual-target-result-next-step">Next Step</label><input id="virtual-target-result-next-step" value="run provider lifecycle smoke"></div>
             </div>
           </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Virtual Lifecycle</h3><button class="action-btn" data-action="execute-virtual-lifecycle">Execute Lifecycle</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="virtual-lifecycle-resource-id">Resource ID</label><input id="virtual-lifecycle-resource-id" value="overseer-dax-disposable-proxy"></div>
+              <div class="field span-2"><label for="virtual-lifecycle-action">Action</label><select id="virtual-lifecycle-action"><option value="inspect">inspect</option><option value="start">start</option><option value="stop">stop</option></select></div>
+              <div class="field span-2"><label for="virtual-lifecycle-provider">Provider</label><input id="virtual-lifecycle-provider" placeholder="runtime adapter"></div>
+              <div class="field span-2"><label for="virtual-lifecycle-executed-by">Executed By</label><input id="virtual-lifecycle-executed-by" value="dax"></div>
+            </div>
+          </div>
           <div class="panel span-6">
             <div class="toolbar"><h3>Virtual Snapshot Request</h3><div class="actions"><button class="action-btn" data-action="stage-virtual-snapshot-request">Stage</button><button class="action-btn" data-action="approve-virtual-snapshot-request">Approve</button><button class="action-btn" data-action="execute-virtual-snapshot-request">Execute</button></div></div>
             <div class="form-grid">
@@ -2498,6 +2516,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
         {workflow: "Stage real provider target setup batch", page: "Claims", owner: "Dax", action: "stage-virtual-target-setup-batch", source, query: "Stage real provider target setup batch"},
         {workflow: "Record real provider setup result", page: "Claims", owner: "Dax", action: "record-virtual-target-setup-result", source, query: "Record real provider setup result"},
+        {workflow: "Execute virtual lifecycle action", page: "Claims", owner: "Dax", action: "execute-virtual-lifecycle", source, query: "Execute virtual lifecycle action"},
         {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},
         {workflow: "Approve virtual snapshot request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-snapshot-request", source, query: "Approve virtual snapshot request"},
         {workflow: "Execute virtual snapshot request", page: "Claims", owner: "Dax", action: "execute-virtual-snapshot-request", source, query: "Execute virtual snapshot request"},

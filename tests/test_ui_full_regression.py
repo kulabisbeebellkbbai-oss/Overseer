@@ -164,6 +164,7 @@ ACTION_ROUTES = {
     "execute-admin-change": ("POST", "/admin/execute"),
     "execute-backup-cleanup-request": ("POST", "/storage/cleanup-requests/execute"),
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
+    "execute-virtual-lifecycle": ("POST", "/virtual/lifecycle/execute"),
     "execute-virtual-restore-request": ("POST", "/virtual/restore-requests/execute"),
     "execute-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/execute"),
     "export-ids-review-prompt": ("POST", "/host/security/ids-review-packages/prompts"),
@@ -311,6 +312,12 @@ SAFE_POST_PAYLOADS = {
         "executed_by": "dax",
         "evidence": "target verified with constrained network",
         "next_step": "run provider lifecycle smoke",
+    },
+    "/virtual/lifecycle/execute": {
+        "resource_id": "vm.ui.full",
+        "action": "inspect",
+        "executed_by": "dax",
+        "provider": "gateway_proxy",
     },
     "/virtual/snapshot-requests": {
         "resource_id": "vm.ui.full",
@@ -862,6 +869,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                     "/Overseer/virtual/target-setup-requests/result",
                     SAFE_POST_PAYLOADS["/virtual/target-setup-requests/result"],
                 )
+                virtual_lifecycle = server.post_json(
+                    "/Overseer/virtual/lifecycle/execute",
+                    SAFE_POST_PAYLOADS["/virtual/lifecycle/execute"],
+                )
                 virtual_snapshot = server.post_json(
                     "/Overseer/virtual/snapshot-requests",
                     SAFE_POST_PAYLOADS["/virtual/snapshot-requests"],
@@ -956,6 +967,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertFalse(virtual_target_setup["host_mutation_performed"])
         self.assertEqual(virtual_target_result["target_setup_request"]["status"], "completed")
         self.assertFalse(virtual_target_result["host_mutation_performed"])
+        self.assertEqual(virtual_lifecycle["status"], "completed")
+        self.assertFalse(virtual_lifecycle["host_mutation_performed"])
         self.assertEqual(virtual_snapshot["snapshot_request"]["status"], "waiting_approval")
         self.assertEqual(virtual_snapshot_approval["snapshot_request"]["status"], "approved")
         self.assertEqual(virtual_snapshot_execution["status"], "completed")

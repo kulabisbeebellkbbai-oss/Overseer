@@ -187,6 +187,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `GET /virtual/operations` returns Dax's local virtual runtime records plus staged snapshot and restore requests from ignored state.
 `POST /virtual/target-setup-requests` stages approval-required Dax target setup requests for disposable real-provider targets. It writes planning records only and does not install packages, change groups, create containers, define VMs, start processes, bind ports, or write gateway configs.
 `POST /virtual/runtime-records` records observed virtual runtime state for a VM, container, emulator, gateway, or proxy. It does not start, stop, snapshot, restore, destroy, or reconfigure the runtime.
+`POST /virtual/lifecycle/execute` executes an approved disposable Dax runtime lifecycle action. Required fields: `resource_id` and `action` (`inspect`, `start`, or `stop`). Optional fields: `provider`, `executed_by`, and `executed_at`. It blocks non-disposable records and unsupported providers, writes a lifecycle manifest, and limits mutation to the named disposable target.
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. It does not invoke any live virtual adapter.
 `POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. It does not invoke any live virtual adapter.
 `POST /storage/cleanup-requests/approve` approves a staged Kira backup cleanup request without deleting files.

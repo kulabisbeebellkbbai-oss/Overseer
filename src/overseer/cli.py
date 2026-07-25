@@ -108,6 +108,7 @@ from .virtual_discovery import ListenerVirtualDiscoveryAdapter
 from .virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
+    execute_virtual_lifecycle_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
@@ -7380,6 +7381,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_virtual_runtime_parser.add_argument("--port", action="append", default=[], type=int)
     record_virtual_runtime_parser.add_argument("--snapshot-hint", default="")
     record_virtual_runtime_parser.add_argument("--notes", default="")
+    execute_virtual_lifecycle_parser = subparsers.add_parser("execute-virtual-lifecycle", help="execute an approved Dax disposable runtime lifecycle action")
+    execute_virtual_lifecycle_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    execute_virtual_lifecycle_parser.add_argument("--resource-id", required=True)
+    execute_virtual_lifecycle_parser.add_argument("--action", required=True, choices=("inspect", "start", "stop"))
+    execute_virtual_lifecycle_parser.add_argument("--executed-by", default="dax")
+    execute_virtual_lifecycle_parser.add_argument("--provider", default="")
+    execute_virtual_lifecycle_parser.add_argument("--executed-at")
     stage_virtual_snapshot_parser = subparsers.add_parser("stage-virtual-snapshot", help="stage a Dax virtual runtime snapshot request")
     stage_virtual_snapshot_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
     stage_virtual_snapshot_parser.add_argument("--resource-id", required=True)
@@ -8098,6 +8106,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.port,
                     args.snapshot_hint,
                     args.notes,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-virtual-lifecycle":
+        print(
+            json.dumps(
+                execute_virtual_lifecycle_status(
+                    args.project_root,
+                    args.resource_id,
+                    args.action,
+                    args.executed_by,
+                    args.provider,
+                    args.executed_at,
                 ),
                 sort_keys=True,
             )

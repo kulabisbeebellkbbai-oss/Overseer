@@ -135,6 +135,7 @@ Protected gateway routes:
 - `POST /Overseer/virtual/target-setup-requests`
 - `POST /Overseer/virtual/target-setup-requests/result`
 - `POST /Overseer/virtual/runtime-records`
+- `POST /Overseer/virtual/lifecycle/execute`
 - `POST /Overseer/virtual/snapshot-requests`
 - `POST /Overseer/virtual/snapshot-requests/approve`
 - `POST /Overseer/virtual/snapshot-requests/execute`
@@ -152,6 +153,9 @@ Operator controls live on the Claims page:
 - Target Setup Result records Dax's evidence after an approved setup batch is
   executed. It marks each provider target completed, blocked, failed, or
   partial without performing host mutation itself.
+- Virtual Lifecycle executes `inspect`, `start`, or `stop` against approved
+  disposable Docker, Podman, libvirt, qemu process, Renode, Android Emulator, or
+  gateway/proxy runtime records and writes lifecycle manifests.
 - Virtual Snapshot Request stages a snapshot plan and waits for approval.
 - Virtual Restore Request stages a rollback plan and waits for approval.
 
@@ -195,6 +199,19 @@ stack decision are explicitly approved.
 
 Until another provider is implemented and selected for a declared disposable
 target, execution returns a blocked record rather than mutating the host.
+
+Lifecycle execution is available for approved disposable provider targets:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-lifecycle --project-root . --resource-id overseer-dax-disposable-proxy --action inspect
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-lifecycle --project-root . --resource-id overseer-dax-disposable-docker --action start
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-lifecycle --project-root . --resource-id overseer-dax-disposable-docker --action stop
+```
+
+The lifecycle path rejects non-disposable runtime records, unsupported providers,
+and unsafe project paths. `inspect` records evidence only. `start` and `stop`
+mutate only the named disposable provider target and write execution manifests
+under `local-secrets/virtual-runtime-manifests`.
 
 ## Target Setup Batch
 

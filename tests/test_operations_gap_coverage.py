@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -501,6 +503,39 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(restored_text, "before\n")
         self.assertTrue(snapshot_manifest_exists)
         self.assertTrue(restore_manifest_exists)
+        self.assertEqual(status["execution_record_count"], 2)
+
+    @unittest.skipIf(shutil.which("qemu-img") is None or shutil.which("qemu-io") is None, "qemu-img and qemu-io are required")
+    def test_virtual_snapshot_and_restore_execute_against_disposable_qemu_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "vm.qemu.qcow2"
+            target.parent.mkdir(parents=True)
+            subprocess.run(("qemu-img", "create", "-f", "qcow2", str(target), "1M"), check=True, capture_output=True, text=True)
+            subprocess.run(("qemu-io", "-f", "qcow2", "-c", "write -P 0x11 0 512", str(target)), check=True, capture_output=True, text=True)
+            record_virtual_runtime_status(
+                root,
+                "vm.qemu",
+                kind="vm",
+                state="stopped",
+                adapter="qemu_img",
+                snapshot_hint="local-secrets/virtual-runtime-targets/vm.qemu.qcow2",
+            )
+            staged_snapshot = stage_virtual_snapshot_request_status(root, "vm.qemu", snapshot_name="before-change")
+            approve_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "sisko")
+            snapshot = execute_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "dax", provider="qemu_img")
+            subprocess.run(("qemu-io", "-f", "qcow2", "-c", "write -P 0x22 0 512", str(target)), check=True, capture_output=True, text=True)
+            staged_restore = stage_virtual_restore_request_status(root, "vm.qemu", "before-change")
+            approve_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "sisko")
+            restore = execute_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "dax", provider="qemu_img")
+            verify = subprocess.run(("qemu-io", "-f", "qcow2", "-c", "read -P 0x11 0 512", str(target)), check=False, capture_output=True, text=True)
+            status = virtual_operations_status(root)
+
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["manifest"]["provider"], "qemu_img")
+        self.assertEqual(restore["status"], "completed")
+        self.assertEqual(verify.returncode, 0, verify.stderr + verify.stdout)
+        self.assertTrue(restore["host_mutation_performed"])
         self.assertEqual(status["execution_record_count"], 2)
 
     def test_virtual_execution_blocks_unapproved_unsupported_or_unsafe_targets(self):

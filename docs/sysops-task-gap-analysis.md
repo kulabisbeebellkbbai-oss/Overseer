@@ -224,8 +224,9 @@ Gaps:
 
 Coverage: strong for checkout, conflict prevention, and staged lifecycle
 planning. Dax covers virtual claims, listener discovery, leases, release,
-cleanup, runtime state records, staged snapshot/restore requests, and
-approval-gated `local_fixture` snapshot/restore execution with manifests under
+cleanup, runtime state records, staged snapshot/restore requests,
+approval-gated `local_fixture` snapshot/restore execution, and real
+`qemu_img` qcow2 snapshot/restore execution with manifests under
 `local-secrets`.
 
 Gaps:
@@ -236,7 +237,9 @@ Gaps:
   but CPU, memory, disk, network topology, Podman, QEMU process, emulator,
   Renode, and gateway/proxy depth still need provider-specific collectors.
 - No approved real-provider snapshot or restore runner for Docker, Podman,
-  libvirt/QEMU, VirtualBox, Android Emulator, Renode, or gateway/proxy backends.
+  running libvirt domains, VirtualBox, Android Emulator, Renode, or
+  gateway/proxy backends. Stopped disposable qcow2 image snapshot/restore is
+  covered by `qemu_img`.
 - No container image vulnerability/provenance panel.
 - No resource-capacity planning for CPU, memory, disk, and port pools.
 

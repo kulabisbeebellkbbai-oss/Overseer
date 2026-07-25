@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -324,6 +325,8 @@ def _validate_request_ready(row: dict[str, object], action: str) -> None:
 
 
 def _execute_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    if provider == "qemu_img":
+        return _execute_qemu_snapshot(root, row, runtime, executed_at)
     if provider != "local_fixture":
         raise ValueError(f"virtual provider is not implemented for live execution: {provider}")
     target = _fixture_target(root, runtime)
@@ -341,6 +344,8 @@ def _execute_snapshot(root: Path, row: dict[str, object], runtime: dict[str, obj
 
 
 def _execute_restore(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    if provider == "qemu_img":
+        return _execute_qemu_restore(root, row, runtime, executed_at)
     if provider != "local_fixture":
         raise ValueError(f"virtual provider is not implemented for live execution: {provider}")
     target = _fixture_target(root, runtime)
@@ -393,6 +398,111 @@ def _fixture_restore_point(root: Path, resource_id: str, restore_point: str) -> 
     return candidate
 
 
+def _execute_qemu_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], executed_at: str) -> dict[str, object]:
+    target = _qemu_image_target(root, runtime)
+    snapshot_name = _safe_id(str(row.get("snapshot_name") or row.get("id") or "snapshot"))
+    before = _qemu_image_info(target)
+    _run_qemu_img(("snapshot", "-c", snapshot_name, str(target)))
+    after = _qemu_image_info(target)
+    return _write_manifest(
+        root,
+        row,
+        "snapshot",
+        "qemu_img",
+        target,
+        target,
+        executed_at,
+        provider_metadata={"snapshot_name": snapshot_name, "before": before, "after": after},
+    )
+
+
+def _execute_qemu_restore(root: Path, row: dict[str, object], runtime: dict[str, object], executed_at: str) -> dict[str, object]:
+    target = _qemu_image_target(root, runtime)
+    restore_point = _safe_id(str(row.get("restore_point") or ""))
+    if not restore_point:
+        raise ValueError("restore_point is required")
+    preserved = _preserve_qemu_image(root, target, str(row["resource_id"]), executed_at)
+    before = _qemu_image_info(target)
+    _run_qemu_img(("snapshot", "-a", restore_point, str(target)))
+    after = _qemu_image_info(target)
+    return _write_manifest(
+        root,
+        row,
+        "restore",
+        "qemu_img",
+        target,
+        target,
+        executed_at,
+        preserved=preserved,
+        provider_metadata={"restore_point": restore_point, "before": before, "after": after},
+    )
+
+
+def _qemu_image_target(root: Path, runtime: dict[str, object]) -> Path:
+    if runtime.get("adapter") != "qemu_img":
+        raise ValueError("qemu_img execution requires a runtime record with adapter=qemu_img")
+    if shutil.which("qemu-img") is None:
+        raise ValueError("qemu-img is not available")
+    hint = str(runtime.get("snapshot_hint") or "")
+    if not hint.strip():
+        raise ValueError("qemu_img execution requires a project-relative snapshot_hint qcow2 image")
+    target = _project_relative_path(root, hint)
+    allowed = (root / "local-secrets" / "virtual-runtime-targets").resolve()
+    if target != allowed and allowed not in target.parents:
+        raise ValueError("qemu_img target must stay under local-secrets/virtual-runtime-targets")
+    if target.suffix != ".qcow2":
+        raise ValueError("qemu_img target must be a .qcow2 image")
+    if not target.exists():
+        raise ValueError("qemu_img target does not exist")
+    info = _qemu_image_info(target)
+    if info.get("format") != "qcow2":
+        raise ValueError("qemu_img target must report qcow2 format")
+    return target
+
+
+def _preserve_qemu_image(root: Path, target: Path, resource_id: str, executed_at: str) -> Path:
+    preserved = root / "local-secrets" / "virtual-runtime-preserved" / _safe_id(resource_id) / f"{_safe_id(executed_at)}.qcow2"
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(target, preserved)
+    return preserved
+
+
+def _qemu_image_info(target: Path) -> dict[str, object]:
+    output = _run_qemu_img(("info", "--output=json", str(target)))
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"qemu-img info returned invalid JSON: {error}") from error
+    return {
+        "format": data.get("format"),
+        "virtual_size": data.get("virtual-size"),
+        "actual_size": data.get("actual-size"),
+        "snapshots": [
+            {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "vm_state_size": item.get("vm-state-size"),
+            }
+            for item in data.get("snapshots", [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _run_qemu_img(args: tuple[str, ...]) -> str:
+    command = ("qemu-img", *args)
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=15.0)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"qemu-img timed out: {' '.join(command)}") from error
+    except OSError as error:
+        raise ValueError(f"qemu-img failed to start: {error}") from error
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+        raise ValueError(f"qemu-img {' '.join(args[:2])} failed: {stderr}")
+    return completed.stdout.strip()
+
+
 def _project_relative_path(root: Path, raw_path: str) -> Path:
     path = Path(raw_path)
     if path.is_absolute() or "~" in path.parts or ".." in path.parts:
@@ -413,6 +523,7 @@ def _write_manifest(
     target: Path,
     executed_at: str,
     preserved: Path | None = None,
+    provider_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     manifest_dir = root / "local-secrets" / "virtual-runtime-manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -425,6 +536,7 @@ def _write_manifest(
         "source": _relative_or_name(root, source),
         "target": _relative_or_name(root, target),
         "preserved": _relative_or_name(root, preserved) if preserved else "",
+        "provider_metadata": provider_metadata or {},
         "entries": _manifest_entries(root, target),
     }
     manifest["entry_count"] = len(manifest["entries"])

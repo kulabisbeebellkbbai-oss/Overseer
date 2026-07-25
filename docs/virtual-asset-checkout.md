@@ -167,17 +167,31 @@ PYTHONPATH=src python3 -m overseer.cli execute-virtual-restore --project-root . 
 ```
 
 Docker, Podman, libvirt/QEMU, VirtualBox, Android Emulator, Renode, and gateway
-provider adapters remain explicit live-provider work. Until one of those
-providers is implemented and selected for a declared disposable target,
-execution returns a blocked record rather than mutating the host.
+runtime provider adapters remain explicit live-provider work. The first real
+provider is `qemu_img`, which snapshots and restores stopped disposable qcow2
+images with `qemu-img snapshot -c` and `qemu-img snapshot -a`.
+
+`qemu_img` guardrails:
+
+- runtime record `adapter` must be `qemu_img`;
+- `snapshot_hint` must point to a project-relative `.qcow2` image under
+  `local-secrets/virtual-runtime-targets`;
+- `qemu-img info --output=json` must report `qcow2`;
+- restore preserves the pre-restore image under
+  `local-secrets/virtual-runtime-preserved`;
+- Dax writes execution manifests under `local-secrets/virtual-runtime-manifests`.
+
+Until another provider is implemented and selected for a declared disposable
+target, execution returns a blocked record rather than mutating the host.
 
 ## Read-Only Provider Inventory
 
 The Claims page also includes Runtime Provider Inventory. Dax currently gathers
 read-only Docker container rows from `docker ps -a --format '{{json .}}'` and
-libvirt VM rows from `virsh list --all --name` plus `virsh domstate`. Commands
-use short timeouts and return unavailable inventory rows when the CLI exists but
-the daemon or libvirt session is not accessible.
+libvirt VM rows from `virsh list --all --name` plus `virsh domstate`. Dax also
+reports `qemu-img` availability in Runtime Adapter Availability. Commands use
+short timeouts and return unavailable inventory rows when the CLI exists but the
+daemon or libvirt session is not accessible.
 
 Inventory rows are evidence only. They do not start, stop, snapshot, restore, or
 destroy runtimes. Any mutation still requires a Dax claim plus the staged

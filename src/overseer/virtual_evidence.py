@@ -99,7 +99,7 @@ def _cleanup_rows(claims: tuple[Claim, ...]) -> list[dict[str, object]]:
 
 
 def _runtime_adapter_rows() -> list[dict[str, object]]:
-    adapters = ("docker", "podman", "virsh", "qemu-system-x86_64", "qemu-system-aarch64", "VBoxManage", "emulator", "renode")
+    adapters = ("docker", "podman", "virsh", "qemu-img", "qemu-system-x86_64", "qemu-system-aarch64", "VBoxManage", "emulator", "renode")
     return [
         {
             "adapter": adapter,

@@ -44,6 +44,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /physical-summary`
 - `GET /virtual-summary`
 - `GET /virtual/operations`
+- `POST /virtual/target-setup-requests`
 - `GET /observability/metric-history`
 - `GET /observability/performance-history`
 - `GET /health-summary`
@@ -184,6 +185,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /physical/discover-storage` reads sysfs block-device metadata and persists discovered storage identities for Kira. Optional field: `sysfs_block_root`. It does not mount, unmount, format, partition, or write to devices.
 `POST /virtual/discover-listeners` reads local TCP listener evidence and persists discovered listener resources for Dax. It does not change firewall rules, routes, processes, service definitions, proxies, or network bindings.
 `GET /virtual/operations` returns Dax's local virtual runtime records plus staged snapshot and restore requests from ignored state.
+`POST /virtual/target-setup-requests` stages approval-required Dax target setup requests for disposable real-provider targets. It writes planning records only and does not install packages, change groups, create containers, define VMs, start processes, bind ports, or write gateway configs.
 `POST /virtual/runtime-records` records observed virtual runtime state for a VM, container, emulator, gateway, or proxy. It does not start, stop, snapshot, restore, destroy, or reconfigure the runtime.
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. It does not invoke any live virtual adapter.
 `POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. It does not invoke any live virtual adapter.

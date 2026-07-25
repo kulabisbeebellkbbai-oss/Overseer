@@ -201,6 +201,7 @@ ACTION_ROUTES = {
     "stage-backup-cleanup-request": ("POST", "/storage/cleanup-requests"),
     "stage-journal-access-request": ("POST", "/health/journal-access-requests"),
     "stage-operation-workflow": ("POST", "/operations/workflows/stage"),
+    "stage-virtual-target-setup-batch": ("POST", "/virtual/target-setup-requests"),
     "stage-virtual-restore-request": ("POST", "/virtual/restore-requests"),
     "stage-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests"),
     "transition-operation": ("POST", "/operations/records/transition"),
@@ -297,6 +298,11 @@ SAFE_POST_PAYLOADS = {
         "ports": [8080],
         "snapshot_hint": "local-secrets/virtual-runtime-targets/vm.ui.full",
         "notes": "exercise disposable virtual runtime workflow",
+    },
+    "/virtual/target-setup-requests": {
+        "requested_by": "dax",
+        "scope": "docker",
+        "reason": "exercise target setup planning without host mutation",
     },
     "/virtual/snapshot-requests": {
         "resource_id": "vm.ui.full",
@@ -701,6 +707,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "virtual-resource-id",
             "virtual-snapshot-hint",
             "virtual-state",
+            "virtual-target-setup-reason",
+            "virtual-target-setup-requested-by",
+            "virtual-target-setup-scope",
             "snapshot-name",
             "snapshot-reason",
             "snapshot-requested-by",
@@ -715,6 +724,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("crew-card", OPERATOR_CONSOLE_HTML)
         self.assertIn("Resource Registry", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Target Setup Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Runtime Provider Inventory", OPERATOR_CONSOLE_HTML)
         self.assertIn("Account Repositories", OPERATOR_CONSOLE_HTML)
         self.assertIn("Current Repo Links", OPERATOR_CONSOLE_HTML)
@@ -761,6 +771,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Stage backup cleanup request",
             "View logs from an unhealthy service",
             "Record virtual runtime state",
+            "Stage real provider target setup batch",
             "Stage virtual snapshot request",
             "Approve virtual snapshot request",
             "Execute virtual snapshot request",
@@ -834,6 +845,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 virtual_runtime = server.post_json(
                     "/Overseer/virtual/runtime-records",
                     SAFE_POST_PAYLOADS["/virtual/runtime-records"],
+                )
+                virtual_target_setup = server.post_json(
+                    "/Overseer/virtual/target-setup-requests",
+                    SAFE_POST_PAYLOADS["/virtual/target-setup-requests"],
                 )
                 virtual_snapshot = server.post_json(
                     "/Overseer/virtual/snapshot-requests",
@@ -924,6 +939,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertEqual(backup_cleanup_execution["status"], "completed")
         self.assertFalse(cleanup_target.exists())
         self.assertEqual(virtual_runtime["runtime_record"]["resource_id"], "vm.ui.full")
+        self.assertEqual(virtual_target_setup["target_setup_requests"][0]["provider"], "docker")
+        self.assertTrue(virtual_target_setup["approval_required"])
+        self.assertFalse(virtual_target_setup["host_mutation_performed"])
         self.assertEqual(virtual_snapshot["snapshot_request"]["status"], "waiting_approval")
         self.assertEqual(virtual_snapshot_approval["snapshot_request"]["status"], "approved")
         self.assertEqual(virtual_snapshot_execution["status"], "completed")

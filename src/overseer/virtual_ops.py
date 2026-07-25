@@ -23,6 +23,8 @@ def virtual_operations_status(project_root: str | Path) -> dict[str, object]:
         "restore_request_count": len(data["restore_requests"]),
         "execution_records": data["execution_records"],
         "execution_record_count": len(data["execution_records"]),
+        "target_setup_requests": data["target_setup_requests"],
+        "target_setup_request_count": len(data["target_setup_requests"]),
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
@@ -125,6 +127,41 @@ def stage_virtual_restore_request_status(
     _upsert(data["restore_requests"], row)
     _write_registry(root, data)
     return {"restore_request": row, "mutation_performed": True, "host_mutation_performed": False}
+
+
+def stage_virtual_target_setup_batch_status(
+    project_root: str | Path,
+    requested_by: str = "dax",
+    scope: str = "all",
+    reason: str = "prepare approved disposable real-provider targets for Dax lifecycle development",
+) -> dict[str, object]:
+    root = Path(project_root)
+    data = _read_registry(root)
+    now = _now()
+    selected = _target_setup_templates(scope)
+    rows = []
+    for template in selected:
+        row = {
+            **template,
+            "id": f"virtual-target-setup.{template['provider']}",
+            "requested_by": requested_by,
+            "reason": reason,
+            "status": "waiting_human_approval",
+            "approval_required": True,
+            "created_at": now,
+            "updated_at": now,
+            "next_step": "human approval required before creating or changing this live provider target",
+        }
+        _upsert(data["target_setup_requests"], row)
+        rows.append(row)
+    _write_registry(root, data)
+    return {
+        "target_setup_requests": rows,
+        "target_setup_request_count": len(rows),
+        "approval_required": True,
+        "mutation_performed": True,
+        "host_mutation_performed": False,
+    }
 
 
 def approve_virtual_snapshot_request_status(
@@ -272,16 +309,17 @@ def _registry_path(root: Path) -> Path:
 def _read_registry(root: Path) -> dict[str, list[dict[str, object]]]:
     path = _registry_path(root)
     if not path.exists():
-        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "execution_records": []}
+        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "execution_records": [], "target_setup_requests": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "execution_records": []}
+        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "execution_records": [], "target_setup_requests": []}
     return {
         "runtime_records": list(data.get("runtime_records") or []),
         "snapshot_requests": list(data.get("snapshot_requests") or []),
         "restore_requests": list(data.get("restore_requests") or []),
         "execution_records": list(data.get("execution_records") or []),
+        "target_setup_requests": list(data.get("target_setup_requests") or []),
     }
 
 
@@ -298,6 +336,201 @@ def _upsert(rows: list[dict[str, object]], row: dict[str, object]) -> None:
         return
     row["created_at"] = rows[existing].get("created_at") or row["created_at"]
     rows[existing] = row
+
+
+def _target_setup_templates(scope: str) -> list[dict[str, object]]:
+    templates = _all_target_setup_templates()
+    cleaned = _safe_id(scope).replace("-", "_")
+    if cleaned in {"all", "targets", "batch"}:
+        return templates
+    selected = [item for item in templates if item["provider"] == cleaned]
+    if not selected:
+        raise ValueError(f"unknown virtual target setup scope: {scope}")
+    return selected
+
+
+def _all_target_setup_templates() -> list[dict[str, object]]:
+    return [
+        {
+            "provider": "docker",
+            "target_name": "overseer-dax-disposable-docker",
+            "current_state": "docker CLI is present but the current user cannot access /var/run/docker.sock",
+            "proposed_state": "current user can run read-only and disposable-container Docker lifecycle commands; a disposable Overseer container exists",
+            "required_changes": [
+                "grant current user Docker daemon access or provide an approved sudo-wrapper path",
+                "create disposable container/image target named overseer-dax-disposable-docker",
+            ],
+            "proposed_commands": [
+                "sudo usermod -aG docker god",
+                "newgrp docker or restart the user session before Docker commands are expected to work",
+                "docker create --name overseer-dax-disposable-docker alpine:latest sleep 3600",
+            ],
+            "risks": [
+                "docker group membership is root-equivalent on this host",
+                "container networking and mounts can expose host resources if not constrained",
+            ],
+            "rollback_plan": [
+                "docker rm -f overseer-dax-disposable-docker",
+                "sudo gpasswd -d god docker if Docker group access should be removed",
+            ],
+        },
+        {
+            "provider": "podman",
+            "target_name": "overseer-dax-disposable-podman",
+            "current_state": "podman CLI is not available",
+            "proposed_state": "Podman is installed and a rootless disposable container target exists",
+            "required_changes": [
+                "install Podman packages",
+                "create rootless disposable container named overseer-dax-disposable-podman",
+            ],
+            "proposed_commands": [
+                "sudo apt-get install -y podman",
+                "podman create --name overseer-dax-disposable-podman docker.io/library/alpine:latest sleep 3600",
+            ],
+            "risks": [
+                "package installation changes host software state",
+                "rootless container storage consumes user disk space",
+            ],
+            "rollback_plan": [
+                "podman rm -f overseer-dax-disposable-podman",
+                "sudo apt-get remove -y podman if Podman is not wanted after testing",
+            ],
+        },
+        {
+            "provider": "libvirt",
+            "target_name": "overseer-dax-disposable-libvirt",
+            "current_state": "virsh is available and no disposable domain is currently declared",
+            "proposed_state": "a stopped disposable libvirt domain exists for Dax start/stop/snapshot/restore testing",
+            "required_changes": [
+                "create disposable qcow2 disk image",
+                "define a minimal libvirt domain named overseer-dax-disposable-libvirt",
+            ],
+            "proposed_commands": [
+                "qemu-img create -f qcow2 local-secrets/virtual-runtime-targets/overseer-dax-disposable-libvirt.qcow2 1G",
+                "virt-install or virsh define a minimal non-autostart domain using that image",
+            ],
+            "risks": [
+                "a running VM consumes CPU, memory, disk, and possible network resources",
+                "incorrect network selection can expose a test VM",
+            ],
+            "rollback_plan": [
+                "virsh destroy overseer-dax-disposable-libvirt if running",
+                "virsh undefine overseer-dax-disposable-libvirt --remove-all-storage where supported",
+                "remove local-secrets/virtual-runtime-targets/overseer-dax-disposable-libvirt.qcow2",
+            ],
+        },
+        {
+            "provider": "qemu_process",
+            "target_name": "overseer-dax-disposable-qemu-process",
+            "current_state": "qemu-system binaries are available and no disposable qemu process is currently running",
+            "proposed_state": "a Dax-owned qemu process target can be launched, monitored, and stopped",
+            "required_changes": [
+                "create disposable qcow2 image",
+                "launch qemu with no external networking and a pidfile under local-secrets",
+            ],
+            "proposed_commands": [
+                "qemu-img create -f qcow2 local-secrets/virtual-runtime-targets/overseer-dax-disposable-qemu-process.qcow2 64M",
+                "qemu-system-x86_64 -display none -no-reboot -net none -pidfile local-secrets/virtual-runtime-targets/overseer-dax-disposable-qemu-process.pid -drive file=local-secrets/virtual-runtime-targets/overseer-dax-disposable-qemu-process.qcow2,format=qcow2",
+            ],
+            "risks": [
+                "a qemu process consumes CPU and memory",
+                "incorrect networking flags can expose a virtual network path",
+            ],
+            "rollback_plan": [
+                "kill the pid in local-secrets/virtual-runtime-targets/overseer-dax-disposable-qemu-process.pid",
+                "remove the disposable qcow2 and pidfile",
+            ],
+        },
+        {
+            "provider": "renode",
+            "target_name": "overseer-dax-disposable-renode",
+            "current_state": "Renode CLI is available and no disposable platform target is declared",
+            "proposed_state": "a minimal Renode script exists and can be launched/stopped by Dax",
+            "required_changes": [
+                "create a minimal Renode platform/script under local-secrets",
+                "define launch and stop evidence for the Renode process",
+            ],
+            "proposed_commands": [
+                "write local-secrets/virtual-runtime-targets/overseer-dax-disposable-renode.resc",
+                "renode --disable-xwt --console local-secrets/virtual-runtime-targets/overseer-dax-disposable-renode.resc",
+            ],
+            "risks": [
+                "Renode process can hang if launched with an unsuitable console mode",
+                "emulated peripherals may consume CPU unexpectedly",
+            ],
+            "rollback_plan": [
+                "terminate the Renode process owned by the disposable target",
+                "remove the disposable Renode script",
+            ],
+        },
+        {
+            "provider": "android_emulator",
+            "target_name": "overseer-dax-disposable-avd",
+            "current_state": "Android emulator CLI is not available in the current PATH",
+            "proposed_state": "a disposable AVD exists for Dax emulator lifecycle testing",
+            "required_changes": [
+                "install or expose Android emulator tooling",
+                "create a disposable AVD named overseer-dax-disposable-avd",
+            ],
+            "proposed_commands": [
+                "sdkmanager 'emulator' 'platform-tools' '<approved system image>'",
+                "avdmanager create avd -n overseer-dax-disposable-avd -k '<approved system image>'",
+            ],
+            "risks": [
+                "Android system images are large downloads",
+                "emulator networking and adb exposure need explicit containment",
+            ],
+            "rollback_plan": [
+                "avdmanager delete avd -n overseer-dax-disposable-avd",
+                "remove any downloaded system image only if no other project uses it",
+            ],
+        },
+        {
+            "provider": "gateway_proxy",
+            "target_name": "overseer-dax-disposable-proxy",
+            "current_state": "no disposable gateway/proxy target is declared",
+            "proposed_state": "a loopback-only disposable proxy exists with a known port, upstream, config path, and health check",
+            "required_changes": [
+                "choose a loopback-only port",
+                "create disposable proxy config under local-secrets",
+                "define upstream and health check",
+            ],
+            "proposed_commands": [
+                "start a loopback-only disposable proxy bound to 127.0.0.1 on an approved unused port",
+                "record Dax resource, port claim, rollback, and Julian health check",
+            ],
+            "risks": [
+                "wrong bind address can expose the proxy beyond loopback",
+                "port conflicts can disrupt local services",
+            ],
+            "rollback_plan": [
+                "stop the disposable proxy process",
+                "remove disposable proxy config and release the Dax port claim",
+            ],
+        },
+        {
+            "provider": "virtualbox",
+            "target_name": "overseer-dax-disposable-virtualbox",
+            "current_state": "VBoxManage is not available",
+            "proposed_state": "VirtualBox is installed if desired and a disposable VM exists",
+            "required_changes": [
+                "install or expose VirtualBox tooling",
+                "create a disposable VM named overseer-dax-disposable-virtualbox",
+            ],
+            "proposed_commands": [
+                "install VirtualBox from the approved package source",
+                "VBoxManage createvm --name overseer-dax-disposable-virtualbox --register",
+            ],
+            "risks": [
+                "VirtualBox install changes kernel modules and host virtualization stack",
+                "may conflict with KVM/libvirt workflows",
+            ],
+            "rollback_plan": [
+                "VBoxManage unregistervm overseer-dax-disposable-virtualbox --delete",
+                "remove VirtualBox packages only if no other project depends on them",
+            ],
+        },
+    ]
 
 
 def _find_request(data: dict[str, list[dict[str, object]]], key: str, request_id: str, prefix: str) -> dict[str, object]:

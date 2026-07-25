@@ -111,6 +111,7 @@ from .virtual_ops import (
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_runtime_status,
+    stage_virtual_target_setup_batch_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
     virtual_operations_status,
@@ -7351,6 +7352,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     virtual_operations_parser = subparsers.add_parser("virtual-operations", help="summarize staged Dax virtual runtime operations")
     virtual_operations_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    stage_virtual_target_setup_parser = subparsers.add_parser("stage-virtual-target-setup-batch", help="stage approval-required Dax real-provider target setup requests")
+    stage_virtual_target_setup_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    stage_virtual_target_setup_parser.add_argument("--requested-by", default="dax")
+    stage_virtual_target_setup_parser.add_argument("--scope", default="all")
+    stage_virtual_target_setup_parser.add_argument("--reason", default="prepare approved disposable real-provider targets for Dax lifecycle development")
     discover_virtual_parser = subparsers.add_parser("discover-virtual-listeners", help="discover local TCP listeners as virtual assets")
     discover_virtual_parser.add_argument("--store", required=True, help="explicit SQLite store path for persisting discovered listener resources")
     record_virtual_runtime_parser = subparsers.add_parser("record-virtual-runtime", help="record Dax virtual runtime state")
@@ -8031,6 +8037,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "virtual-operations":
         print(json.dumps(virtual_operations_status(args.project_root), sort_keys=True))
+        return 0
+
+    if args.command == "stage-virtual-target-setup-batch":
+        print(
+            json.dumps(
+                stage_virtual_target_setup_batch_status(
+                    args.project_root,
+                    requested_by=args.requested_by,
+                    scope=args.scope,
+                    reason=args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "discover-virtual-listeners":

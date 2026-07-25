@@ -375,6 +375,16 @@ PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . -
 6. Use this for observed state only; it does not start, stop, snapshot,
    restore, or delete virtual assets.
 
+### Stage Real Provider Target Setup Batch
+
+1. Open Claims.
+2. Review Runtime Adapter Availability and Runtime Provider Inventory.
+3. Fill Scope, Requested By, and Reason.
+4. Click Stage Batch.
+5. Review Target Setup Requests for current state, proposed state, risks,
+   proposed commands, and rollback plan.
+6. Do not create targets until the full batch approval is granted.
+
 ### Stage Virtual Snapshot Request
 
 1. Open Claims.

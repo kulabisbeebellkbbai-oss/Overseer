@@ -154,6 +154,7 @@ from .virtual_ops import (
     record_virtual_runtime_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
+    stage_virtual_target_setup_batch_status,
     virtual_operations_status,
 )
 from .ui import OPERATOR_CONSOLE_HTML
@@ -516,6 +517,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/discover-listeners":
                 self._handle(lambda: discover_virtual_listeners_status(store_path))
+                return
+            if path == "/virtual/target-setup-requests":
+                self._handle_json(lambda payload: stage_virtual_target_setup_batch_status(_project_path_for_store(store_path), **_virtual_target_setup_args(payload)))
                 return
             if path == "/virtual/runtime-records":
                 self._handle_json(lambda payload: record_virtual_runtime_status(_project_path_for_store(store_path), **_virtual_runtime_record_args(payload)))
@@ -1080,6 +1084,14 @@ def _virtual_runtime_record_args(payload: dict[str, Any]) -> dict[str, Any]:
         "ports": tuple(int(port) for port in ports),
         "snapshot_hint": str(payload.get("snapshot_hint") or ""),
         "notes": str(payload.get("notes") or ""),
+    }
+
+
+def _virtual_target_setup_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "requested_by": str(payload.get("requested_by") or "dax"),
+        "scope": str(payload.get("scope") or "all"),
+        "reason": str(payload.get("reason") or "prepare approved disposable real-provider targets for Dax lifecycle development"),
     }
 
 

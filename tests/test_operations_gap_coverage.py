@@ -43,6 +43,7 @@ from overseer.virtual_ops import (
     record_virtual_runtime_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
+    stage_virtual_target_setup_batch_status,
     virtual_operations_status,
 )
 from overseer.ui import OPERATOR_CONSOLE_HTML
@@ -674,6 +675,30 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(api_status["runtime_record_count"], 1)
         self.assertEqual(api_snapshot["snapshot_request"]["status"], "waiting_approval")
         self.assertFalse(restore["host_mutation_performed"])
+
+    def test_virtual_target_setup_batch_stages_approval_requests_without_host_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged = stage_virtual_target_setup_batch_status(root, requested_by="dax", scope="all")
+            docker_only = stage_virtual_target_setup_batch_status(root, requested_by="dax", scope="docker")
+            status = virtual_operations_status(root)
+            store_path = root / "state" / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                api_staged = server.post_json("/Overseer/virtual/target-setup-requests", {"scope": "gateway_proxy"})
+                api_status = server.get_json("/Overseer/virtual/operations")
+
+        providers = {row["provider"] for row in staged["target_setup_requests"]}
+        self.assertIn("docker", providers)
+        self.assertIn("libvirt", providers)
+        self.assertIn("gateway_proxy", providers)
+        self.assertTrue(all(row["approval_required"] for row in staged["target_setup_requests"]))
+        self.assertTrue(all(row["status"] == "waiting_human_approval" for row in staged["target_setup_requests"]))
+        self.assertFalse(staged["host_mutation_performed"])
+        self.assertEqual(docker_only["target_setup_requests"][0]["provider"], "docker")
+        self.assertIn("docker group membership", " ".join(docker_only["target_setup_requests"][0]["risks"]))
+        self.assertGreaterEqual(status["target_setup_request_count"], len(staged["target_setup_requests"]))
+        self.assertEqual(api_staged["target_setup_requests"][0]["provider"], "gateway_proxy")
+        self.assertGreaterEqual(api_status["target_setup_request_count"], 1)
 
     def test_performance_history_reads_regression_artifacts_without_running_tests(self):
         with tempfile.TemporaryDirectory() as directory:

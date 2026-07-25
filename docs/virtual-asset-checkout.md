@@ -132,6 +132,7 @@ and is safe to update from the UI because it records intent and evidence only.
 Protected gateway routes:
 
 - `GET /Overseer/virtual/operations`
+- `POST /Overseer/virtual/target-setup-requests`
 - `POST /Overseer/virtual/runtime-records`
 - `POST /Overseer/virtual/snapshot-requests`
 - `POST /Overseer/virtual/snapshot-requests/approve`
@@ -144,6 +145,9 @@ Operator controls live on the Claims page:
 
 - Virtual Runtime Record records observed state, adapter, ports, and snapshot
   hints.
+- Real Provider Target Setup stages approval-required target creation requests
+  for Docker, Podman, libvirt, qemu process, Renode, Android Emulator,
+  gateway/proxy, and VirtualBox targets.
 - Virtual Snapshot Request stages a snapshot plan and waits for approval.
 - Virtual Restore Request stages a rollback plan and waits for approval.
 
@@ -183,6 +187,19 @@ images with `qemu-img snapshot -c` and `qemu-img snapshot -a`.
 
 Until another provider is implemented and selected for a declared disposable
 target, execution returns a blocked record rather than mutating the host.
+
+## Target Setup Batch
+
+Dax can stage the full provider-target approval batch without changing the host:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli stage-virtual-target-setup-batch --project-root . --scope all
+```
+
+The staged records include current state, proposed state, exact proposed
+commands or actions, risks, and rollback plan. They are review artifacts only.
+They do not install packages, change groups, start processes, create VMs,
+create containers, bind ports, create networks, or write gateway configs.
 
 ## Read-Only Provider Inventory
 

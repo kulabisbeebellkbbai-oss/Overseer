@@ -910,6 +910,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-physical") return await postJson("/physical/discover", {});
       if (action === "discover-storage") return await postJson("/physical/discover-storage", {});
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
+      if (action === "stage-virtual-target-setup-batch") return await stageVirtualTargetSetupBatch();
       if (action === "record-virtual-runtime") return await recordVirtualRuntime();
       if (action === "stage-virtual-snapshot-request") return await stageVirtualSnapshotRequest();
       if (action === "approve-virtual-snapshot-request") return await approveVirtualSnapshotRequest();
@@ -1030,6 +1031,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/storage/cleanup-requests/execute", {
         request_id: value("backup-cleanup-request-id"),
         executed_by: value("backup-cleanup-executed-by") || "kira"
+      });
+    }
+    async function stageVirtualTargetSetupBatch() {
+      return await postJson("/virtual/target-setup-requests", {
+        requested_by: value("virtual-target-setup-requested-by") || "dax",
+        scope: value("virtual-target-setup-scope") || "all",
+        reason: value("virtual-target-setup-reason") || "prepare approved disposable real-provider targets for Dax lifecycle development"
       });
     }
     async function recordVirtualRuntime() {
@@ -1965,6 +1973,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-8"><label for="virtual-notes">Notes</label><input id="virtual-notes" value="record observed virtual runtime state"></div>
             </div>
           </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Real Provider Target Setup</h3><button class="action-btn" data-action="stage-virtual-target-setup-batch">Stage Batch</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="virtual-target-setup-scope">Scope</label><input id="virtual-target-setup-scope" value="all"></div>
+              <div class="field span-3"><label for="virtual-target-setup-requested-by">Requested By</label><input id="virtual-target-setup-requested-by" value="dax"></div>
+              <div class="field span-6"><label for="virtual-target-setup-reason">Reason</label><input id="virtual-target-setup-reason" value="prepare approved disposable real-provider targets for Dax lifecycle development"></div>
+            </div>
+          </div>
           <div class="panel span-6">
             <div class="toolbar"><h3>Virtual Snapshot Request</h3><div class="actions"><button class="action-btn" data-action="stage-virtual-snapshot-request">Stage</button><button class="action-btn" data-action="approve-virtual-snapshot-request">Approve</button><button class="action-btn" data-action="execute-virtual-snapshot-request">Execute</button></div></div>
             <div class="form-grid">
@@ -1998,6 +2014,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Virtual Snapshot Requests", virtualOperations.snapshot_requests || virtualEvidence.snapshot_requests || [], ["id", "resource_id", "status", "approved_by", "next_step"], {fills: {id: (row) => virtualSnapshotFill(row), resource_id: (row) => virtualSnapshotFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-6">${table("Virtual Restore Requests", virtualOperations.restore_requests || virtualEvidence.restore_requests || [], ["id", "resource_id", "restore_point", "status", "approved_by"], {fills: {id: (row) => virtualRestoreFill(row), resource_id: (row) => virtualRestoreFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Execution Records", virtualOperations.execution_records || [], ["id", "request_id", "resource_id", "action", "status", "provider", "manifest_path"])}</div>
+          <div class="panel span-12">${table("Target Setup Requests", virtualOperations.target_setup_requests || [], ["id", "provider", "target_name", "status", "approval_required", "current_state", "proposed_state", "next_step"])}</div>
           <div class="panel span-12">${table("Runtime Adapter Availability", virtualEvidence.runtime_adapters || [], ["adapter", "available", "status", "mutation_boundary"])}</div>
           <div class="panel span-12">${table("Runtime Provider Inventory", virtualEvidence.runtime_inventory || [], ["provider", "resource_id", "kind", "state", "image", "virtual_size", "actual_size", "snapshots", "ports", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
           <div class="panel span-6">${table("Port Pool Evidence", virtualEvidence.port_pool || [], ["port", "owner_count", "status", "owners"])}</div>
@@ -2459,6 +2476,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Execute backup cleanup request", page: "Assets", owner: "Kira", action: "execute-backup-cleanup-request", source, query: "Execute backup cleanup request"},
         {workflow: "View VM leases and virtual claims", page: "Claims", owner: "Dax", action: "open Claims", source, query: "View VM leases and virtual claims"},
         {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
+        {workflow: "Stage real provider target setup batch", page: "Claims", owner: "Dax", action: "stage-virtual-target-setup-batch", source, query: "Stage real provider target setup batch"},
         {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},
         {workflow: "Approve virtual snapshot request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-snapshot-request", source, query: "Approve virtual snapshot request"},
         {workflow: "Execute virtual snapshot request", page: "Claims", owner: "Dax", action: "execute-virtual-snapshot-request", source, query: "Execute virtual snapshot request"},

@@ -440,12 +440,15 @@ checkout for an inspect, start, or stop action.
 
 1. Open Claims.
 2. Confirm the snapshot request is approved.
-3. Fill Request ID, Executed By, and Provider.
+3. Fill Request ID, Executed By, and Provider. Use `local_fixture`,
+   `qemu_img`, `qemu_process`, `libvirt`, `docker`, `podman`, `renode`,
+   `android_emulator`, or `gateway_proxy` only when the runtime record adapter
+   and disposable target match that provider.
 4. Click Execute.
 5. Review Virtual Execution Records and manifest path.
-6. Real Docker, Podman, libvirt/QEMU, emulator, gateway, or proxy providers
-   remain blocked until their live adapters and exact disposable targets are
-   declared.
+6. For QEMU/libvirt image-backed targets, confirm the target was stopped before
+   execution. For containers, confirm the snapshot archive was created under
+   `local-secrets/virtual-runtime-snapshots`.
 
 ### Stage Virtual Restore Request
 
@@ -471,13 +474,12 @@ checkout for an inspect, start, or stop action.
 
 1. Open Claims.
 2. Confirm the restore request is approved.
-3. Fill Request ID, Executed By, and Provider.
+3. Fill Request ID, Executed By, and Provider. Match the provider to the
+   runtime record adapter and approved disposable target.
 4. Click Execute.
 5. Review Virtual Execution Records and manifest path.
 6. Have Julian validate service health before returning the runtime to service.
-7. Real Docker, Podman, libvirt/QEMU, emulator, gateway, or proxy providers
-   remain blocked until their live adapters and exact disposable targets are
-   declared.
+7. Review the preserved path when present before deleting any rollback evidence.
 
 ### Request A VM, Port, Gateway, Or Device Claim
 

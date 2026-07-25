@@ -222,11 +222,14 @@ Gaps:
 - Track image provenance, versions, network exposure, and disk usage.
 - Detect stale or abandoned leases.
 
-Coverage: strong for checkout, conflict prevention, and staged lifecycle
-planning. Dax covers virtual claims, listener discovery, leases, release,
-cleanup, runtime state records, staged snapshot/restore requests,
-approval-gated `local_fixture` snapshot/restore execution, and real
-`qemu_img` qcow2 snapshot/restore execution with manifests under
+Coverage: strong for checkout, conflict prevention, staged lifecycle planning,
+and approved disposable execution. Dax covers virtual claims, listener
+discovery, leases, release, cleanup, runtime state records, staged
+snapshot/restore requests, approved `local_fixture` workflow execution,
+`qemu_img` qcow2 snapshot/restore, stopped `qemu_process` and `libvirt`
+image-backed snapshot/restore, Docker/Podman container export/import
+snapshot/restore, file-backed Renode/proxy snapshot/restore, and approved
+disposable Android AVD directory snapshot/restore with manifests under
 `local-secrets`.
 
 Gaps:
@@ -238,10 +241,10 @@ Gaps:
   images under `local-secrets/virtual-runtime-targets`. CPU, memory, running
   disk usage, network topology, Podman, QEMU process, emulator, Renode, and
   gateway/proxy depth still need provider-specific collectors.
-- No approved real-provider snapshot or restore runner for Docker, Podman,
-  running libvirt domains, VirtualBox, Android Emulator, Renode, or
-  gateway/proxy backends. Stopped disposable qcow2 image snapshot/restore is
-  covered by `qemu_img`.
+- No approved running-domain libvirt snapshot policy, VirtualBox provider,
+  destroy action, or generalized snapshot/restore for non-disposable targets.
+  Provider snapshot/restore is intentionally limited to approved disposable
+  targets and stopped image-backed runtime state.
 - No container image vulnerability/provenance panel.
 - No resource-capacity planning for CPU, memory, disk, and port pools.
 

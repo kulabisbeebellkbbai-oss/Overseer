@@ -159,12 +159,33 @@ Operator controls live on the Claims page:
 - Virtual Snapshot Request stages a snapshot plan and waits for approval.
 - Virtual Restore Request stages a rollback plan and waits for approval.
 
-Snapshot and restore execution is implemented first through the conservative
-`local_fixture` adapter. It only operates on project-relative targets under
-`local-secrets/virtual-runtime-targets` and writes manifests under
-`local-secrets/virtual-runtime-manifests`. This lets Dax exercise the full
-approval and rollback lifecycle in regression without touching real hypervisor,
-container, emulator, gateway, proxy, or tunnel state.
+Snapshot and restore execution is implemented through conservative approved
+provider adapters. Every path requires a staged and approved request, a runtime
+record with the selected adapter, and a declared disposable target before Dax
+mutates anything.
+
+Provider coverage:
+
+- `local_fixture`: copies project-local files or directories under
+  `local-secrets/virtual-runtime-targets` for regression-safe workflow tests.
+- `qemu_img`: uses `qemu-img snapshot -c` and `qemu-img snapshot -a` against
+  stopped disposable qcow2 images.
+- `qemu_process`: uses the qcow2 snapshot path after verifying the disposable
+  QEMU pidfile is not running.
+- `libvirt`: uses the qcow2 snapshot path after verifying the disposable domain
+  is stopped.
+- `docker` and `podman`: export disposable container filesystems to
+  `container.tar`, preserve the pre-restore container export when present, and
+  recreate the disposable container with `--network none`.
+- `renode` and `gateway_proxy`: copy file-backed disposable scripts or configs
+  under `local-secrets/virtual-runtime-targets` or
+  `local-secrets/virtual-runtime-configs`.
+- `android_emulator`: copies only an approved disposable AVD directory under
+  `~/.android/avd/<resource_id>.avd`.
+
+Execution writes manifests under `local-secrets/virtual-runtime-manifests` and
+preserves pre-restore state under `local-secrets/virtual-runtime-preserved`
+where the provider supports local preservation.
 
 CLI:
 
@@ -178,27 +199,22 @@ PYTHONPATH=src python3 -m overseer.cli approve-virtual-restore --project-root . 
 PYTHONPATH=src python3 -m overseer.cli execute-virtual-restore --project-root . --request-id virtual-restore.vm.fixture
 ```
 
-Docker, Podman, libvirt/QEMU, Android Emulator, Renode, and gateway
-runtime provider adapters remain explicit live-provider work. The first real
-provider is `qemu_img`, which snapshots and restores stopped disposable qcow2
-images with `qemu-img snapshot -c` and `qemu-img snapshot -a`.
-
 VirtualBox is not part of the required provider setup path. Dax can add it later
 as an optional provider only if a trusted package source and host virtualization
 stack decision are explicitly approved.
 
 `qemu_img` guardrails:
 
-- runtime record `adapter` must be `qemu_img`;
+- runtime record `adapter` must be `qemu_img`, or `qemu_process`/`libvirt` when
+  that provider is intentionally selected;
 - `snapshot_hint` must point to a project-relative `.qcow2` image under
   `local-secrets/virtual-runtime-targets`;
 - `qemu-img info --output=json` must report `qcow2`;
+- `qemu_process` must not be running;
+- `libvirt` domains must be stopped;
 - restore preserves the pre-restore image under
   `local-secrets/virtual-runtime-preserved`;
 - Dax writes execution manifests under `local-secrets/virtual-runtime-manifests`.
-
-Until another provider is implemented and selected for a declared disposable
-target, execution returns a blocked record rather than mutating the host.
 
 Lifecycle execution is available for approved disposable provider targets:
 

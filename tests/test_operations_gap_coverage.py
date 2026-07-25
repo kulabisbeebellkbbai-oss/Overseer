@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -541,6 +542,126 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertTrue(restore["host_mutation_performed"])
         self.assertEqual(status["execution_record_count"], 2)
 
+    def test_virtual_snapshot_and_restore_execute_against_qemu_process_image(self):
+        if shutil.which("qemu-img") is None or shutil.which("qemu-io") is None:
+            self.skipTest("qemu-img and qemu-io are required")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "overseer-dax-disposable-qemu-process.qcow2"
+            target.parent.mkdir(parents=True)
+            subprocess.run(("qemu-img", "create", "-f", "qcow2", str(target), "1M"), check=True, capture_output=True, text=True)
+            subprocess.run(("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 0 512", str(target)), check=True, capture_output=True, text=True)
+            record_virtual_runtime_status(
+                root,
+                "overseer-dax-disposable-qemu-process",
+                kind="vm",
+                state="stopped",
+                adapter="qemu_process",
+                snapshot_hint="local-secrets/virtual-runtime-targets/overseer-dax-disposable-qemu-process.qcow2",
+                notes="approved disposable qemu process target",
+            )
+            staged_snapshot = stage_virtual_snapshot_request_status(root, "overseer-dax-disposable-qemu-process", snapshot_name="before-change")
+            approve_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "sisko")
+            snapshot = execute_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "dax", provider="qemu_process")
+            subprocess.run(("qemu-io", "-f", "qcow2", "-c", "write -P 0x44 0 512", str(target)), check=True, capture_output=True, text=True)
+            staged_restore = stage_virtual_restore_request_status(root, "overseer-dax-disposable-qemu-process", "before-change")
+            approve_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "sisko")
+            restore = execute_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "dax", provider="qemu_process")
+            verify = subprocess.run(("qemu-io", "-f", "qcow2", "-c", "read -P 0x33 0 512", str(target)), check=False, capture_output=True, text=True)
+
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["manifest"]["provider"], "qemu_process")
+        self.assertEqual(restore["status"], "completed")
+        self.assertEqual(restore["manifest"]["provider"], "qemu_process")
+        self.assertEqual(verify.returncode, 0, verify.stderr + verify.stdout)
+
+    def test_virtual_snapshot_and_restore_execute_against_disposable_gateway_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "overseer-dax-disposable-proxy.json"
+            target.parent.mkdir(parents=True)
+            target.write_text('{"route": "before"}\n', encoding="utf-8")
+            record_virtual_runtime_status(
+                root,
+                "overseer-dax-disposable-proxy",
+                kind="proxy",
+                state="running",
+                adapter="gateway_proxy",
+                ports=(8769,),
+                snapshot_hint="local-secrets/virtual-runtime-targets/overseer-dax-disposable-proxy.json",
+                notes="approved disposable gateway proxy target",
+            )
+            staged_snapshot = stage_virtual_snapshot_request_status(root, "overseer-dax-disposable-proxy", snapshot_name="before-change")
+            approve_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "sisko")
+            snapshot = execute_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "dax", provider="gateway_proxy")
+            target.write_text('{"route": "after"}\n', encoding="utf-8")
+            staged_restore = stage_virtual_restore_request_status(root, "overseer-dax-disposable-proxy", "before-change")
+            approve_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "sisko")
+            restore = execute_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "dax", provider="gateway_proxy")
+            restored_text = target.read_text(encoding="utf-8")
+
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["manifest"]["provider"], "gateway_proxy")
+        self.assertEqual(restore["status"], "completed")
+        self.assertEqual(restored_text, '{"route": "before"}\n')
+        self.assertTrue(restore["host_mutation_performed"])
+
+    def test_virtual_container_snapshot_and_restore_use_disposable_provider_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            log_path = root / "commands.log"
+            bin_dir.mkdir()
+            docker = bin_dir / "docker"
+            docker.write_text(
+                f"""#!/bin/sh
+printf '%s\\n' "$*" >> {log_path}
+case "$1" in
+  export)
+    shift
+    while [ "$1" != "" ]; do
+      if [ "$1" = "-o" ]; then shift; printf 'container snapshot\\n' > "$1"; exit 0; fi
+      shift
+    done
+    exit 2
+    ;;
+  import)
+    printf '%s\\n' "$3"
+    exit 0
+    ;;
+  inspect|rm|create)
+    exit 0
+    ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                record_virtual_runtime_status(
+                    root,
+                    "overseer-dax-disposable-docker",
+                    kind="container",
+                    state="stopped",
+                    adapter="docker",
+                    notes="approved disposable docker target",
+                )
+                staged_snapshot = stage_virtual_snapshot_request_status(root, "overseer-dax-disposable-docker", snapshot_name="before-change")
+                approve_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "sisko")
+                snapshot = execute_virtual_snapshot_request_status(root, staged_snapshot["snapshot_request"]["id"], "dax", provider="docker")
+                staged_restore = stage_virtual_restore_request_status(root, "overseer-dax-disposable-docker", "before-change")
+                approve_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "sisko")
+                restore = execute_virtual_restore_request_status(root, staged_restore["restore_request"]["id"], "dax", provider="docker")
+            commands = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["manifest"]["provider"], "docker")
+        self.assertEqual(restore["status"], "completed")
+        self.assertIn("export -o", commands)
+        self.assertIn("import", commands)
+        self.assertIn("create --name overseer-dax-disposable-docker --network none", commands)
+
     def test_virtual_execution_blocks_unapproved_unsupported_or_unsafe_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -560,11 +681,23 @@ class OperationsGapCoverageTests(unittest.TestCase):
             staged_unsupported = stage_virtual_snapshot_request_status(root, "vm.fixture", snapshot_name="unsupported")
             approve_virtual_snapshot_request_status(root, staged_unsupported["snapshot_request"]["id"], "sisko")
             unsupported = execute_virtual_snapshot_request_status(root, staged_unsupported["snapshot_request"]["id"], "dax", provider="libvirt")
+            record_virtual_runtime_status(
+                root,
+                "production-container",
+                kind="container",
+                state="running",
+                adapter="docker",
+            )
+            staged_unsafe = stage_virtual_snapshot_request_status(root, "production-container", snapshot_name="unsafe")
+            approve_virtual_snapshot_request_status(root, staged_unsafe["snapshot_request"]["id"], "sisko")
+            unsafe = execute_virtual_snapshot_request_status(root, staged_unsafe["snapshot_request"]["id"], "dax", provider="docker")
 
         self.assertEqual(unapproved["status"], "blocked")
         self.assertFalse(unapproved["host_mutation_performed"])
         self.assertEqual(unsupported["status"], "blocked")
-        self.assertIn("not implemented", unsupported["summary"])
+        self.assertIn("adapter=libvirt", unsupported["summary"])
+        self.assertEqual(unsafe["status"], "blocked")
+        self.assertIn("disposable", unsafe["summary"])
 
     def test_virtual_lifecycle_executes_disposable_inspect_and_records_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

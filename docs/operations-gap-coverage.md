@@ -147,10 +147,12 @@ environment-specific policy wiring:
   requests.
 - firewall desired-policy execution after IDS review and human approval.
 - approved live backup execution and restore execution.
-- VM/container/emulator live adapter inventory plus real-provider snapshot,
-  restore, start, stop, and destroy actions after explicit approval. Dax local
-  fixture snapshot/restore execution is implemented for regression-safe
-  lifecycle validation.
+- VM/container/emulator live adapter depth beyond approved disposable targets:
+  running-domain snapshot policy, destroy actions, and broader host-specific
+  inventory enrichment. Dax now supports approved disposable lifecycle actions
+  plus provider snapshot/restore for local fixtures, stopped qcow2 images,
+  stopped qemu/libvirt image targets, containers, file-backed Renode/proxy
+  targets, and approved disposable Android AVD directories.
 - secret rotation execution and service-account change execution.
 
 ## Tests

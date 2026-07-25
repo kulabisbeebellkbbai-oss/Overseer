@@ -677,6 +677,12 @@ def _validate_request_ready(row: dict[str, object], action: str) -> None:
 
 
 def _execute_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    if provider in {"docker", "podman"}:
+        return _execute_container_snapshot(root, row, runtime, provider, executed_at)
+    if provider in {"libvirt", "qemu_process"}:
+        return _execute_qemu_snapshot(root, row, _qemu_backed_runtime(root, runtime, provider), executed_at, manifest_provider=provider)
+    if provider in {"renode", "android_emulator", "gateway_proxy"}:
+        return _execute_file_backed_snapshot(root, row, runtime, provider, executed_at)
     if provider == "qemu_img":
         return _execute_qemu_snapshot(root, row, runtime, executed_at)
     if provider != "local_fixture":
@@ -696,6 +702,12 @@ def _execute_snapshot(root: Path, row: dict[str, object], runtime: dict[str, obj
 
 
 def _execute_restore(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    if provider in {"docker", "podman"}:
+        return _execute_container_restore(root, row, runtime, provider, executed_at)
+    if provider in {"libvirt", "qemu_process"}:
+        return _execute_qemu_restore(root, row, _qemu_backed_runtime(root, runtime, provider), executed_at, manifest_provider=provider)
+    if provider in {"renode", "android_emulator", "gateway_proxy"}:
+        return _execute_file_backed_restore(root, row, runtime, provider, executed_at)
     if provider == "qemu_img":
         return _execute_qemu_restore(root, row, runtime, executed_at)
     if provider != "local_fixture":
@@ -718,6 +730,100 @@ def _execute_restore(root: Path, row: dict[str, object], runtime: dict[str, obje
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(restore_point, target)
     return _write_manifest(root, row, "restore", provider, restore_point, target, executed_at, preserved=preserved)
+
+
+def _execute_container_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    resource_id = str(runtime["resource_id"])
+    snapshot_name = _safe_id(str(row.get("snapshot_name") or row.get("id") or "snapshot"))
+    snapshot_dir = root / "local-secrets" / "virtual-runtime-snapshots" / _safe_id(resource_id) / snapshot_name
+    archive = snapshot_dir / "container.tar"
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    command = _container_provider_command(provider, ("export", "-o", str(archive), resource_id), timeout=60.0)
+    metadata = {
+        "snapshot_name": snapshot_name,
+        "archive": _relative_or_name(root, archive),
+        "command": command,
+        "runtime_state": runtime.get("state"),
+    }
+    (snapshot_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return _write_manifest(root, row, "snapshot", provider, Path(resource_id), snapshot_dir, executed_at, provider_metadata=metadata)
+
+
+def _execute_container_restore(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    resource_id = str(runtime["resource_id"])
+    restore_point = _provider_restore_point(root, str(row["resource_id"]), str(row.get("restore_point") or ""))
+    archive = restore_point / "container.tar" if restore_point.is_dir() else restore_point
+    if archive.name != "container.tar" or not archive.exists():
+        raise ValueError("container restore point must contain container.tar")
+    preserved = root / "local-secrets" / "virtual-runtime-preserved" / _safe_id(resource_id) / _safe_id(executed_at)
+    preserved.mkdir(parents=True, exist_ok=True)
+    preserved_archive = preserved / "container-before-restore.tar"
+    inspected = _container_provider_command(provider, ("inspect", resource_id), timeout=10.0, check=False)
+    if inspected:
+        _container_provider_command(provider, ("export", "-o", str(preserved_archive), resource_id), timeout=60.0, check=False)
+        _container_provider_command(provider, ("rm", "-f", resource_id), timeout=30.0, check=False)
+    image_tag = f"overseer-restore-{_safe_id(resource_id)}:{_safe_id(executed_at)}"
+    _container_provider_command(provider, ("import", str(archive), image_tag), timeout=60.0)
+    _container_provider_command(
+        provider,
+        (
+            "create",
+            "--name",
+            resource_id,
+            "--network",
+            "none",
+            "--label",
+            "overseer.owner=dax",
+            "--label",
+            "overseer.disposable=true",
+            image_tag,
+            "sleep",
+            "3600",
+        ),
+        timeout=30.0,
+    )
+    metadata = {
+        "restore_point": _relative_or_name(root, restore_point),
+        "archive": _relative_or_name(root, archive),
+        "image_tag": image_tag,
+        "preserved_archive": _relative_or_name(root, preserved_archive) if preserved_archive.exists() else "",
+    }
+    return _write_manifest(root, row, "restore", provider, archive, Path(resource_id), executed_at, preserved=preserved, provider_metadata=metadata)
+
+
+def _execute_file_backed_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    target = _file_backed_target(root, runtime, provider)
+    snapshot_name = _safe_id(str(row.get("snapshot_name") or row.get("id") or "snapshot"))
+    snapshot_dir = root / "local-secrets" / "virtual-runtime-snapshots" / _safe_id(str(row["resource_id"])) / snapshot_name
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    copied = _copy_into_snapshot(target, snapshot_dir)
+    metadata = {"snapshot_name": snapshot_name, "copied_path": _relative_or_name(root, copied), "provider": provider}
+    (snapshot_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return _write_manifest(root, row, "snapshot", provider, target, snapshot_dir, executed_at, provider_metadata=metadata)
+
+
+def _execute_file_backed_restore(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    target = _file_backed_target(root, runtime, provider)
+    restore_point = _provider_restore_point(root, str(row["resource_id"]), str(row.get("restore_point") or ""))
+    restored_source = _snapshot_payload_path(restore_point, target.name)
+    preserved = root / "local-secrets" / "virtual-runtime-preserved" / _safe_id(str(row["resource_id"])) / _safe_id(executed_at)
+    if target.exists():
+        _copy_path(target, preserved)
+        _remove_path(target)
+    _copy_path(restored_source, target)
+    return _write_manifest(root, row, "restore", provider, restored_source, target, executed_at, preserved=preserved)
 
 
 def _fixture_target(root: Path, runtime: dict[str, object]) -> Path:
@@ -750,7 +856,129 @@ def _fixture_restore_point(root: Path, resource_id: str, restore_point: str) -> 
     return candidate
 
 
-def _execute_qemu_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], executed_at: str) -> dict[str, object]:
+def _validate_runtime_adapter(runtime: dict[str, object], provider: str) -> None:
+    adapter = str(runtime.get("adapter") or "")
+    if adapter != provider:
+        raise ValueError(f"{provider} execution requires a runtime record with adapter={provider}")
+
+
+def _provider_restore_point(root: Path, resource_id: str, restore_point: str) -> Path:
+    if not restore_point.strip():
+        raise ValueError("restore_point is required")
+    snapshots_root = (root / "local-secrets" / "virtual-runtime-snapshots" / _safe_id(resource_id)).resolve()
+    try:
+        candidate = _project_relative_path(root, restore_point).resolve()
+    except ValueError:
+        candidate = snapshots_root / _safe_id(restore_point)
+    if not candidate.exists():
+        candidate = snapshots_root / _safe_id(restore_point)
+    candidate = candidate.resolve()
+    if candidate != snapshots_root and snapshots_root not in candidate.parents:
+        raise ValueError("provider restore point must stay under local-secrets/virtual-runtime-snapshots")
+    if not candidate.exists():
+        raise ValueError("provider restore point does not exist")
+    return candidate
+
+
+def _container_provider_command(
+    provider: str,
+    args: tuple[str, ...],
+    timeout: float = 15.0,
+    check: bool = True,
+) -> str:
+    if provider == "podman":
+        return _run_provider_command(("podman", *args), timeout=timeout, check=check)
+    if provider != "docker":
+        raise ValueError(f"container provider is not implemented: {provider}")
+    if not check:
+        output = _run_provider_command(("docker", *args), timeout=timeout, check=False)
+        if "permission denied" not in output.lower() or shutil.which("sudo") is None:
+            return output
+        return _run_provider_command(("sudo", "docker", *args), timeout=timeout, check=False)
+    try:
+        return _run_provider_command(("docker", *args), timeout=timeout, check=check)
+    except ValueError as error:
+        if "permission denied" not in str(error).lower() or shutil.which("sudo") is None:
+            raise
+    return _run_provider_command(("sudo", "docker", *args), timeout=timeout, check=check)
+
+
+def _file_backed_target(root: Path, runtime: dict[str, object], provider: str) -> Path:
+    resource_id = str(runtime.get("resource_id") or "")
+    if provider == "android_emulator":
+        target = (Path.home() / ".android" / "avd" / f"{resource_id}.avd").resolve()
+        allowed_parent = (Path.home() / ".android" / "avd").resolve()
+        if target.parent != allowed_parent or not resource_id.startswith("overseer-dax-disposable"):
+            raise ValueError("android_emulator file snapshot is limited to approved disposable AVD directories")
+    else:
+        target = _project_relative_path(root, str(runtime.get("snapshot_hint") or ""))
+        allowed_roots = [
+            (root / "local-secrets" / "virtual-runtime-targets").resolve(),
+            (root / "local-secrets" / "virtual-runtime-configs").resolve(),
+        ]
+        if not any(target == allowed or allowed in target.parents for allowed in allowed_roots):
+            raise ValueError(f"{provider} file-backed target must stay under local-secrets/virtual-runtime-targets or local-secrets/virtual-runtime-configs")
+    if not target.exists():
+        raise ValueError(f"{provider} file-backed target does not exist")
+    return target
+
+
+def _copy_into_snapshot(source: Path, snapshot_dir: Path) -> Path:
+    copied = snapshot_dir / source.name
+    _copy_path(source, copied)
+    return copied
+
+
+def _snapshot_payload_path(restore_point: Path, target_name: str) -> Path:
+    if restore_point.is_file():
+        return restore_point
+    candidate = restore_point / target_name
+    if candidate.exists():
+        return candidate
+    children = [item for item in restore_point.iterdir() if item.name != "metadata.json"]
+    if len(children) == 1:
+        return children[0]
+    raise ValueError("file-backed restore point payload could not be identified")
+
+
+def _copy_path(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
+        return
+    shutil.copy2(source, target)
+
+
+def _remove_path(target: Path) -> None:
+    if target.is_dir():
+        shutil.rmtree(target)
+    elif target.exists():
+        target.unlink()
+
+
+def _qemu_backed_runtime(root: Path, runtime: dict[str, object], provider: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    if provider == "libvirt":
+        state = _libvirt_state(str(runtime["resource_id"]))
+        if state == "running":
+            raise ValueError("libvirt snapshot/restore requires a stopped disposable domain")
+    if provider == "qemu_process":
+        pidfile = root / "local-secrets" / "virtual-runtime-targets" / f"{_safe_id(str(runtime['resource_id']))}.pid"
+        if _pid_running(pidfile):
+            raise ValueError("qemu_process snapshot/restore requires the disposable qemu process to be stopped")
+    return {**runtime, "adapter": "qemu_img"}
+
+
+def _execute_qemu_snapshot(
+    root: Path,
+    row: dict[str, object],
+    runtime: dict[str, object],
+    executed_at: str,
+    manifest_provider: str = "qemu_img",
+) -> dict[str, object]:
     target = _qemu_image_target(root, runtime)
     snapshot_name = _safe_id(str(row.get("snapshot_name") or row.get("id") or "snapshot"))
     before = _qemu_image_info(target)
@@ -760,7 +988,7 @@ def _execute_qemu_snapshot(root: Path, row: dict[str, object], runtime: dict[str
         root,
         row,
         "snapshot",
-        "qemu_img",
+        manifest_provider,
         target,
         target,
         executed_at,
@@ -768,7 +996,13 @@ def _execute_qemu_snapshot(root: Path, row: dict[str, object], runtime: dict[str
     )
 
 
-def _execute_qemu_restore(root: Path, row: dict[str, object], runtime: dict[str, object], executed_at: str) -> dict[str, object]:
+def _execute_qemu_restore(
+    root: Path,
+    row: dict[str, object],
+    runtime: dict[str, object],
+    executed_at: str,
+    manifest_provider: str = "qemu_img",
+) -> dict[str, object]:
     target = _qemu_image_target(root, runtime)
     restore_point = _safe_id(str(row.get("restore_point") or ""))
     if not restore_point:
@@ -781,7 +1015,7 @@ def _execute_qemu_restore(root: Path, row: dict[str, object], runtime: dict[str,
         root,
         row,
         "restore",
-        "qemu_img",
+        manifest_provider,
         target,
         target,
         executed_at,

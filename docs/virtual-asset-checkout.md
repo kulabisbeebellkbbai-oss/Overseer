@@ -148,7 +148,7 @@ Operator controls live on the Claims page:
   hints.
 - Real Provider Target Setup stages approval-required target creation requests
   for Docker, Podman, libvirt, qemu process, Renode, Android Emulator,
-  gateway/proxy, and VirtualBox targets.
+  and gateway/proxy targets.
 - Target Setup Result records Dax's evidence after an approved setup batch is
   executed. It marks each provider target completed, blocked, failed, or
   partial without performing host mutation itself.
@@ -174,10 +174,14 @@ PYTHONPATH=src python3 -m overseer.cli approve-virtual-restore --project-root . 
 PYTHONPATH=src python3 -m overseer.cli execute-virtual-restore --project-root . --request-id virtual-restore.vm.fixture
 ```
 
-Docker, Podman, libvirt/QEMU, VirtualBox, Android Emulator, Renode, and gateway
+Docker, Podman, libvirt/QEMU, Android Emulator, Renode, and gateway
 runtime provider adapters remain explicit live-provider work. The first real
 provider is `qemu_img`, which snapshots and restores stopped disposable qcow2
 images with `qemu-img snapshot -c` and `qemu-img snapshot -a`.
+
+VirtualBox is not part of the required provider setup path. Dax can add it later
+as an optional provider only if a trusted package source and host virtualization
+stack decision are explicitly approved.
 
 `qemu_img` guardrails:
 

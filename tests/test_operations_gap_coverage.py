@@ -718,10 +718,10 @@ class OperationsGapCoverageTests(unittest.TestCase):
                 api_blocked = server.post_json(
                     "/Overseer/virtual/target-setup-requests/result",
                     {
-                        "provider": "virtualbox",
+                        "provider": "renode",
                         "status": "blocked",
                         "executed_by": "dax",
-                        "evidence": "approved package source unavailable",
+                        "evidence": "emulator target requires repair",
                     },
                 )
                 api_status = server.get_json("/Overseer/virtual/operations")

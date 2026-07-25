@@ -582,28 +582,6 @@ def _all_target_setup_templates() -> list[dict[str, object]]:
                 "remove disposable proxy config and release the Dax port claim",
             ],
         },
-        {
-            "provider": "virtualbox",
-            "target_name": "overseer-dax-disposable-virtualbox",
-            "current_state": "VBoxManage is not available",
-            "proposed_state": "VirtualBox is installed if desired and a disposable VM exists",
-            "required_changes": [
-                "install or expose VirtualBox tooling",
-                "create a disposable VM named overseer-dax-disposable-virtualbox",
-            ],
-            "proposed_commands": [
-                "install VirtualBox from the approved package source",
-                "VBoxManage createvm --name overseer-dax-disposable-virtualbox --register",
-            ],
-            "risks": [
-                "VirtualBox install changes kernel modules and host virtualization stack",
-                "may conflict with KVM/libvirt workflows",
-            ],
-            "rollback_plan": [
-                "VBoxManage unregistervm overseer-dax-disposable-virtualbox --delete",
-                "remove VirtualBox packages only if no other project depends on them",
-            ],
-        },
     ]
 
 

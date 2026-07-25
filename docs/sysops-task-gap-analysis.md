@@ -231,8 +231,10 @@ approval-gated `local_fixture` snapshot/restore execution with manifests under
 Gaps:
 
 - No approved live adapter inventory with state, image, CPU, memory, disk,
-  network, and owner gathered directly from Docker, Podman, virsh, QEMU, or
-  emulator backends.
+  network, and owner gathered directly from every backend. Dax now surfaces
+  read-only Docker and virsh provider inventory when those CLIs are available,
+  but CPU, memory, disk, network topology, Podman, QEMU process, emulator,
+  Renode, and gateway/proxy depth still need provider-specific collectors.
 - No approved real-provider snapshot or restore runner for Docker, Podman,
   libvirt/QEMU, VirtualBox, Android Emulator, Renode, or gateway/proxy backends.
 - No container image vulnerability/provenance panel.

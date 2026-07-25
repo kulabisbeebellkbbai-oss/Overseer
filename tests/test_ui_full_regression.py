@@ -714,6 +714,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("data-view-target", OPERATOR_CONSOLE_HTML)
         self.assertIn("crew-card", OPERATOR_CONSOLE_HTML)
         self.assertIn("Resource Registry", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Runtime Provider Inventory", OPERATOR_CONSOLE_HTML)
         self.assertIn("Account Repositories", OPERATOR_CONSOLE_HTML)
         self.assertIn("Current Repo Links", OPERATOR_CONSOLE_HTML)
         self.assertIn("authorizationDecisionBoard", OPERATOR_CONSOLE_HTML)

@@ -170,3 +170,15 @@ Docker, Podman, libvirt/QEMU, VirtualBox, Android Emulator, Renode, and gateway
 provider adapters remain explicit live-provider work. Until one of those
 providers is implemented and selected for a declared disposable target,
 execution returns a blocked record rather than mutating the host.
+
+## Read-Only Provider Inventory
+
+The Claims page also includes Runtime Provider Inventory. Dax currently gathers
+read-only Docker container rows from `docker ps -a --format '{{json .}}'` and
+libvirt VM rows from `virsh list --all --name` plus `virsh domstate`. Commands
+use short timeouts and return unavailable inventory rows when the CLI exists but
+the daemon or libvirt session is not accessible.
+
+Inventory rows are evidence only. They do not start, stop, snapshot, restore, or
+destroy runtimes. Any mutation still requires a Dax claim plus the staged
+snapshot/restore or future provider-specific execution workflow.

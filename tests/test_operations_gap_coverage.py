@@ -32,7 +32,7 @@ from overseer.storage_evidence import storage_evidence_status
 from overseer.store import SQLiteStore
 from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
-from overseer.virtual_evidence import virtual_evidence_status
+from overseer.virtual_evidence import parse_docker_ps_json_lines, virtual_evidence_status
 from overseer.virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
@@ -570,8 +570,22 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(api_payload["runtime_assets"], 2)
         self.assertGreaterEqual(payload["port_conflicts"], 1)
         self.assertTrue(payload["runtime_adapters"])
+        self.assertIn("runtime_inventory", payload)
+        self.assertIn("execution_records", payload)
         self.assertEqual(payload["cleanup"][0]["claim_id"], "claim.expired")
         self.assertFalse(payload["host_mutation_performed"])
+
+    def test_docker_provider_inventory_parser_returns_claimable_runtime_rows(self):
+        rows = parse_docker_ps_json_lines(
+            '{"ID":"abc123","Image":"nginx:latest","Names":"web.1","State":"running","Ports":"0.0.0.0:8080->80/tcp"}\n'
+        )
+
+        self.assertEqual(rows[0]["provider"], "docker")
+        self.assertEqual(rows[0]["resource_id"], "docker.web-1")
+        self.assertEqual(rows[0]["kind"], "container")
+        self.assertEqual(rows[0]["state"], "running")
+        self.assertEqual(rows[0]["image"], "nginx:latest")
+        self.assertIn("request Dax claim", rows[0]["next_step"])
 
     def test_virtual_operations_registry_stages_runtime_snapshot_and_restore_without_host_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

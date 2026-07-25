@@ -234,8 +234,10 @@ Gaps:
 - No approved live adapter inventory with state, image, CPU, memory, disk,
   network, and owner gathered directly from every backend. Dax now surfaces
   read-only Docker and virsh provider inventory when those CLIs are available,
-  but CPU, memory, disk, network topology, Podman, QEMU process, emulator,
-  Renode, and gateway/proxy depth still need provider-specific collectors.
+  plus qemu qcow2 image format, size, and internal snapshot metadata for staged
+  images under `local-secrets/virtual-runtime-targets`. CPU, memory, running
+  disk usage, network topology, Podman, QEMU process, emulator, Renode, and
+  gateway/proxy depth still need provider-specific collectors.
 - No approved real-provider snapshot or restore runner for Docker, Podman,
   running libvirt domains, VirtualBox, Android Emulator, Renode, or
   gateway/proxy backends. Stopped disposable qcow2 image snapshot/restore is

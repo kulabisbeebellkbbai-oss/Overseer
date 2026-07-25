@@ -37,7 +37,7 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         "restore_requests": virtual_ops["restore_requests"],
         "execution_records": virtual_ops["execution_records"],
         "runtime_adapters": _runtime_adapter_rows(),
-        "runtime_inventory": _runtime_inventory_rows(),
+        "runtime_inventory": _runtime_inventory_rows(project_root),
         "port_pool": port_rows,
         "cleanup": _cleanup_rows(claims),
         "mutation_performed": False,
@@ -111,10 +111,11 @@ def _runtime_adapter_rows() -> list[dict[str, object]]:
     ]
 
 
-def _runtime_inventory_rows() -> list[dict[str, object]]:
+def _runtime_inventory_rows(project_root: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     rows.extend(_docker_inventory_rows())
     rows.extend(_virsh_inventory_rows())
+    rows.extend(_qemu_image_inventory_rows(project_root))
     return rows
 
 
@@ -204,9 +205,76 @@ def _virsh_inventory_rows() -> list[dict[str, object]]:
     return rows
 
 
-def _run_inventory_command(command: tuple[str, ...]) -> dict[str, object]:
+def _qemu_image_inventory_rows(project_root: Path) -> list[dict[str, object]]:
+    if shutil.which("qemu-img") is None:
+        return []
+    targets_root = project_root / "local-secrets" / "virtual-runtime-targets"
+    if not targets_root.exists():
+        return []
+    rows = []
+    for image in sorted(targets_root.rglob("*.qcow2")):
+        rows.append(_qemu_image_inventory_row(project_root, image))
+    return rows
+
+
+def _qemu_image_inventory_row(project_root: Path, image: Path) -> dict[str, object]:
+    result = _run_inventory_command(("qemu-img", "info", "--output=json", str(image)), timeout_seconds=5.0)
+    if result["exit_code"] != 0:
+        return {
+            "provider": "qemu_img",
+            "resource_id": f"qemu-img.{_safe_id(_relative_or_name(project_root, image))}",
+            "kind": "qcow2_image",
+            "state": "unavailable",
+            "image": _relative_or_name(project_root, image),
+            "ports": "",
+            "owner": "",
+            "virtual_size": "",
+            "actual_size": "",
+            "snapshots": "",
+            "evidence": result["stderr"],
+            "next_step": "inspect qemu-img error before using this image as a Dax target",
+        }
     try:
-        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=2.0)
+        info = json.loads(str(result["stdout"]))
+    except json.JSONDecodeError:
+        return {
+            "provider": "qemu_img",
+            "resource_id": f"qemu-img.{_safe_id(_relative_or_name(project_root, image))}",
+            "kind": "qcow2_image",
+            "state": "invalid_info",
+            "image": _relative_or_name(project_root, image),
+            "ports": "",
+            "owner": "",
+            "virtual_size": "",
+            "actual_size": "",
+            "snapshots": "",
+            "evidence": "qemu-img info returned invalid JSON",
+            "next_step": "inspect image metadata before using this image as a Dax target",
+        }
+    snapshots = [
+        str(item.get("name") or item.get("id") or "")
+        for item in info.get("snapshots", [])
+        if isinstance(item, dict) and (item.get("name") or item.get("id"))
+    ]
+    return {
+        "provider": "qemu_img",
+        "resource_id": f"qemu-img.{_safe_id(_relative_or_name(project_root, image))}",
+        "kind": "qcow2_image",
+        "state": "ready" if info.get("format") == "qcow2" else "unsupported_format",
+        "image": _relative_or_name(project_root, image),
+        "ports": "",
+        "owner": "",
+        "virtual_size": info.get("virtual-size", ""),
+        "actual_size": info.get("actual-size", ""),
+        "snapshots": ", ".join(snapshots),
+        "evidence": f"format={info.get('format', '')}",
+        "next_step": "request Dax claim before snapshot, restore, start, or image mutation",
+    }
+
+
+def _run_inventory_command(command: tuple[str, ...], timeout_seconds: float = 2.0) -> dict[str, object]:
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout_seconds)
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"exit_code": -1, "stdout": "", "stderr": str(error)}
     return {
@@ -214,6 +282,13 @@ def _run_inventory_command(command: tuple[str, ...]) -> dict[str, object]:
         "stdout": completed.stdout.strip(),
         "stderr": completed.stderr.strip(),
     }
+
+
+def _relative_or_name(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
 
 
 def _claim_row(claim: Claim) -> dict[str, object]:

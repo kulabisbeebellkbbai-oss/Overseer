@@ -622,6 +622,26 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(rows[0]["image"], "nginx:latest")
         self.assertIn("request Dax claim", rows[0]["next_step"])
 
+    @unittest.skipIf(shutil.which("qemu-img") is None, "qemu-img is required")
+    def test_qemu_image_inventory_reports_disposable_qcow2_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir(parents=True)
+            image = root / "local-secrets" / "virtual-runtime-targets" / "inventory.qcow2"
+            image.parent.mkdir(parents=True)
+            subprocess.run(("qemu-img", "create", "-f", "qcow2", str(image), "1M"), check=True, capture_output=True, text=True)
+            subprocess.run(("qemu-img", "snapshot", "-c", "inventory-point", str(image)), check=True, capture_output=True, text=True)
+
+            payload = virtual_evidence_status(store_path)
+
+        qemu_rows = [row for row in payload["runtime_inventory"] if row["provider"] == "qemu_img"]
+        self.assertTrue(qemu_rows)
+        self.assertEqual(qemu_rows[0]["kind"], "qcow2_image")
+        self.assertEqual(qemu_rows[0]["state"], "ready")
+        self.assertIn("inventory-point", qemu_rows[0]["snapshots"])
+        self.assertIn("request Dax claim", qemu_rows[0]["next_step"])
+
     def test_virtual_operations_registry_stages_runtime_snapshot_and_restore_without_host_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2118,6 +2118,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-12">${table("Health Targets", healthSummary.summaries || [], ["resource_id", "name", "status", "recovery_required", "error"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id, "health-name": row.name || "" })}, fillView: "health"})}</div>
           <div class="panel span-12">${table("Service Evidence", serviceEvidence.items || [], ["resource_id", "unit", "health", "health_error", "executions", "next_step"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-6">${table("Service Dependency Nodes", (serviceEvidence.dependency_graph || {}).nodes || [], ["resource_id", "known", "owner_domain", "risk", "health"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id })}, fillView: "health"})}</div>
+          <div class="panel span-6">${table("Service Dependency Edges", (serviceEvidence.dependency_graph || {}).edges || [], ["from", "to", "known", "owner_domain", "health", "risk"], {fills: {from: (row) => ({ "health-resource-id": row.from }), to: (row) => ({ "health-resource-id": row.to })}, fillView: "health"})}</div>
           <div class="panel span-6">${kv("Journal Access Status", {
             journalctl_available: journalAccess.journalctl_available,
             user_journal_access: journalAccess.user_journal_access?.available,
@@ -2258,9 +2260,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"], {fills: {limit_id: (row) => usageLimitFill(row), resource_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-12">${table("Quota Evidence", usageEvidence.limit_evidence || [], ["limit_id", "resource_id", "remaining", "capacity", "usage_percent", "status", "next_step"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
+          <div class="panel span-12">${table("Exhaustion Forecast", usageEvidence.exhaustion_forecast || [], ["limit_id", "remaining", "queued_units", "remaining_after_queue", "deficit_units", "status", "next_step"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-6">${table("Continuation Queue Evidence", usageEvidence.continuation_queue || [], ["request_id", "limit_id", "owner_thread", "requested_units", "status"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-6">${table("Usage Allocation By Thread", usageEvidence.allocation_by_thread || [], ["owner_thread", "requests", "requested_units", "status"])}</div>
-          <div class="panel span-12">${table("Cost And Forecast Coverage", operations.usage_costs || [], ["limit_id", "remaining", "capacity", "queued_requests", "cost_tracking", "forecast"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
+          <div class="panel span-12">${table("Cost And Forecast Coverage", operations.usage_costs || [], ["limit_id", "remaining", "capacity", "queued_requests", "queued_units", "deficit_units", "cost_tracking", "forecast"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           ${officerPanel("quark", "MCP API quota scheduling", "Track API-keyed MCP call limits and schedule continuation after the quota window resets.", "limit.mcp.api.calls.daily")}
         </div>`;
     }

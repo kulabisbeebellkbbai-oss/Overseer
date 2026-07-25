@@ -30,9 +30,10 @@ def service_evidence_status(
 
     store = SQLiteStore(store_path)
     try:
+        all_resources = store.list_resources()
         resources = [
             resource
-            for resource in store.list_resources()
+            for resource in all_resources
             if resource.type in {ResourceType.SERVICE, ResourceType.MAINTENANCE_TARGET, ResourceType.USAGE_LIMITED_SERVICE}
             and (resource_id is None or resource.id == resource_id)
         ]
@@ -47,12 +48,14 @@ def service_evidence_status(
         summary.resource_id: summary
         for summary in summarize_health_targets(targets, evidence)
     }
+    resources_by_id = {resource.id: resource for resource in all_resources}
     return {
         "store": str(Path(store_path)),
         "resource_id": resource_id,
         "services": len(resources),
+        "dependency_graph": _dependency_graph(resources, resources_by_id, health_by_resource),
         "items": [
-            _service_detail(resource, targets, evidence, plans, executions, health_by_resource, log_tail_lines)
+            _service_detail(resource, targets, evidence, plans, executions, health_by_resource, resources_by_id, log_tail_lines)
             for resource in resources
         ],
         "journal_access": _journal_access_status(resources),
@@ -109,6 +112,7 @@ def _service_detail(
     plans: Sequence[Any],
     executions: Sequence[Any],
     health_by_resource: Mapping[str, Any],
+    resources_by_id: Mapping[str, Resource],
     log_tail_lines: int,
 ) -> dict[str, object]:
     unit = _systemd_unit_for(resource)
@@ -130,6 +134,7 @@ def _service_detail(
         "journal_scope": _journal_scope(resource),
         "systemd": _systemd_show(unit) if unit else {"available": False, "reason": "no unit identifier"},
         "dependencies": sorted(resource.dependencies),
+        "dependency_health": _dependency_health_rows(resource, resources_by_id, health_by_resource),
         "config_paths": _redacted_paths(resource.identifiers.get("config_paths", ())),
         "environment_paths": _redacted_paths(resource.identifiers.get("environment_paths", ())),
         "health": health.latest_status.value if health else HealthStatus.UNKNOWN.value,
@@ -144,6 +149,86 @@ def _service_detail(
         "validation_checklist": _validation_checklist(resource, health, service_plans),
         "next_step": _next_step(health, service_plans),
     }
+
+
+def _dependency_graph(
+    resources: Sequence[Resource],
+    resources_by_id: Mapping[str, Resource],
+    health_by_resource: Mapping[str, Any],
+) -> dict[str, object]:
+    node_ids = set()
+    edges = []
+    for resource in resources:
+        node_ids.add(resource.id)
+        for dependency_id in sorted(resource.dependencies):
+            node_ids.add(dependency_id)
+            dependency = resources_by_id.get(dependency_id)
+            health = health_by_resource.get(dependency_id)
+            edges.append(
+                {
+                    "from": resource.id,
+                    "to": dependency_id,
+                    "known": dependency is not None,
+                    "owner_domain": dependency.owner_domain.value if dependency else "unknown",
+                    "health": health.latest_status.value if health else HealthStatus.UNKNOWN.value,
+                    "risk": dependency.risk_level.value if dependency else "unknown",
+                }
+            )
+    return {
+        "nodes": [_dependency_node(node_id, resources_by_id.get(node_id), health_by_resource.get(node_id)) for node_id in sorted(node_ids)],
+        "edges": edges,
+        "missing_dependencies": sorted(edge["to"] for edge in edges if not edge["known"]),
+        "unhealthy_dependencies": sorted(
+            edge["to"]
+            for edge in edges
+            if edge["health"] in {HealthStatus.DEGRADED.value, HealthStatus.FAILED.value, HealthStatus.UNKNOWN.value}
+        ),
+    }
+
+
+def _dependency_node(resource_id: str, resource: Resource | None, health: Any | None) -> dict[str, object]:
+    return {
+        "resource_id": resource_id,
+        "known": resource is not None,
+        "name": resource.name if resource else "",
+        "type": resource.type.value if resource else "unknown",
+        "owner_domain": resource.owner_domain.value if resource else "unknown",
+        "risk": resource.risk_level.value if resource else "unknown",
+        "health": health.latest_status.value if health else HealthStatus.UNKNOWN.value,
+    }
+
+
+def _dependency_health_rows(
+    resource: Resource,
+    resources_by_id: Mapping[str, Resource],
+    health_by_resource: Mapping[str, Any],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "resource_id": dependency_id,
+            "known": resources_by_id.get(dependency_id) is not None,
+            "owner_domain": resources_by_id[dependency_id].owner_domain.value if dependency_id in resources_by_id else "unknown",
+            "risk": resources_by_id[dependency_id].risk_level.value if dependency_id in resources_by_id else "unknown",
+            "health": health_by_resource[dependency_id].latest_status.value if dependency_id in health_by_resource else HealthStatus.UNKNOWN.value,
+            "next_step": _dependency_next_step(dependency_id, resources_by_id, health_by_resource),
+        }
+        for dependency_id in sorted(resource.dependencies)
+    ]
+
+
+def _dependency_next_step(
+    dependency_id: str,
+    resources_by_id: Mapping[str, Resource],
+    health_by_resource: Mapping[str, Any],
+) -> str:
+    if dependency_id not in resources_by_id:
+        return "register dependency resource before approving service changes"
+    health = health_by_resource.get(dependency_id)
+    if health is None or health.latest_status == HealthStatus.UNKNOWN:
+        return "add or run dependency health probe before approving service changes"
+    if health.latest_status in {HealthStatus.DEGRADED, HealthStatus.FAILED}:
+        return "stage dependency recovery before dependent service changes"
+    return "dependency ready for impact review"
 
 
 def _systemd_unit_for(resource: Resource) -> str:

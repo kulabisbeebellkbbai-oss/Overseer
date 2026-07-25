@@ -38,6 +38,7 @@ def usage_evidence_status(store_path: str | Path) -> dict[str, object]:
             for limit in limits
         ],
         "allocation_by_thread": _allocation_by_thread(requests),
+        "exhaustion_forecast": _exhaustion_forecast(limits, requests),
         "continuation_queue": [
             {
                 "request_id": request.id,
@@ -97,3 +98,72 @@ def _allocation_by_thread(requests: tuple[object, ...]) -> list[dict[str, object
         }
         for owner_thread, units in sorted(allocations.items())
     ]
+
+
+def _exhaustion_forecast(limits: tuple[object, ...], requests: tuple[object, ...]) -> list[dict[str, object]]:
+    requests_by_limit: dict[str, list[object]] = {}
+    for request in requests:
+        requests_by_limit.setdefault(request.limit_id, []).append(request)
+    rows = []
+    known_limit_ids = {limit.id for limit in limits}
+    for limit in limits:
+        queued = requests_by_limit.get(limit.id, [])
+        queued_units = sum(max(0, request.requested_units) for request in queued)
+        remaining_after_queue = limit.remaining - queued_units
+        deficit_units = max(0, queued_units - limit.remaining)
+        rows.append(
+            {
+                "limit_id": limit.id,
+                "resource_id": limit.resource_id,
+                "remaining": limit.remaining,
+                "queued_requests": len(queued),
+                "queued_units": queued_units,
+                "remaining_after_queue": remaining_after_queue,
+                "deficit_units": deficit_units,
+                "resets_at": limit.resets_at,
+                "status": _forecast_status(limit.remaining, queued_units, limit.resets_at, limit.confidence),
+                "next_step": _forecast_next_step(limit.remaining, queued_units, limit.resets_at, limit.confidence),
+            }
+        )
+    for limit_id, queued in sorted(requests_by_limit.items()):
+        if limit_id in known_limit_ids:
+            continue
+        rows.append(
+            {
+                "limit_id": limit_id,
+                "resource_id": queued[0].resource_id if queued else "",
+                "remaining": 0,
+                "queued_requests": len(queued),
+                "queued_units": sum(max(0, request.requested_units) for request in queued),
+                "remaining_after_queue": 0,
+                "deficit_units": sum(max(0, request.requested_units) for request in queued),
+                "resets_at": None,
+                "status": "missing_limit",
+                "next_step": "register usage limit before dispatch",
+            }
+        )
+    return rows
+
+
+def _forecast_status(remaining: int, queued_units: int, resets_at: str | None, confidence: float) -> str:
+    if confidence < 0.5:
+        return "low_confidence"
+    if queued_units <= 0:
+        return "no_queue"
+    if remaining >= queued_units:
+        return "fits_now"
+    if resets_at:
+        return "queue_until_reset"
+    return "blocked_no_reset"
+
+
+def _forecast_next_step(remaining: int, queued_units: int, resets_at: str | None, confidence: float) -> str:
+    if confidence < 0.5:
+        return "verify provider reset policy before dispatch"
+    if queued_units <= 0:
+        return "no queued continuation work"
+    if remaining >= queued_units:
+        return "dispatch queued work within remaining capacity"
+    if resets_at:
+        return "hold queued work until reset"
+    return "record reset time or reduce queued work"

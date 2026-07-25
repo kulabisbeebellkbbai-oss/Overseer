@@ -66,8 +66,9 @@ The third pass added read-only evidence depth for the remaining gap categories:
 
 - Julian: service metadata, health evidence, redacted log snippets, bounded
   `journalctl --user` excerpts, dependency IDs, recent admin plans, trend
-  history, post-change validation checklist, journal access status, and staged
-  system-journal access requests.
+  history, post-change validation checklist, dependency graph and dependency
+  health evidence, journal access status, and staged system-journal access
+  requests.
 - Odo: stored-snapshot firewall provenance, listener exposure evidence,
   firewall desired-policy diff, desired-policy enforcement staging with IDS
   review package preparation, protective plan provenance, identity/access review,
@@ -79,16 +80,16 @@ The third pass added read-only evidence depth for the remaining gap categories:
 - Dax: virtual runtime evidence, claim state, port-pool conflicts, snapshot
   readiness, runtime adapter availability, runtime state records, staged
   snapshot requests, staged restore requests, and cleanup evidence.
-- Quark: quota evidence, exhaustion status, continuation queue, and allocation
-  by owner thread.
+- Quark: quota evidence, exhaustion status, continuation queue, allocation by
+  owner thread, and queued-demand exhaustion forecast with reset guidance.
 - O'Brien: package-manager availability, apt provenance, held packages, and
   patch readiness checks, plus durable maintenance schedule records with
   blackout, rollback, validation fields, patch metadata age, local release
   note references, and cached CVE/advisory correlation from NVD and Debian
   Security Tracker feeds.
 - Sisko: policy exceptions, desired-state baselines, local-secret guard checks,
-  desired-state drift rows, compliance evidence matrix, incident lifecycle, and
-  post-incident checklist.
+  read-only desired-state drift comparison, compliance evidence matrix,
+  incident lifecycle, and post-incident checklist.
 - Ezri: runbook coverage, documented workflow index, stale-doc candidates, ADR
   index, and release/changelog index.
 
@@ -115,12 +116,13 @@ The third pass added read-only evidence depth for the remaining gap categories:
   Plan Provenance, Identity Access Review, SSH Key Custody, Secret File Custody,
   Rotation Reminders, and Identity Rotation Requests.
 - Health: Host Resources, Log Evidence, Service Details, Service Actions,
-  Service Evidence, Service Validation Checklist, Redacted Service Logs,
-  Journal Excerpts, Journal Access Status, System Journal Requests,
+  Service Evidence, Service Dependency Nodes, Service Dependency Edges, Service
+  Validation Checklist, Redacted Service Logs, Journal Excerpts, Journal Access
+  Status, System Journal Requests,
   Observability And Performance, Health Trend History, Metric History
   Snapshots, Performance Regression History, and Host Snapshot Trend.
-- Usage: Quota Evidence, Continuation Queue Evidence, Usage Allocation By
-  Thread, and Cost And Forecast Coverage.
+- Usage: Quota Evidence, Exhaustion Forecast, Continuation Queue Evidence, Usage
+  Allocation By Thread, and Cost And Forecast Coverage.
 - Documents: Documentation Coverage, Runbook Coverage, Workflow Coverage, Stale
   Document Candidates, ADR Index, and Release Index.
 

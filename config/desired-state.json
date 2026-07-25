@@ -1,0 +1,49 @@
+{
+  "checks": [
+    {
+      "area": "local secret boundary",
+      "kind": "file_exists",
+      "path": ".gitignore",
+      "expected": true
+    },
+    {
+      "area": "local secret boundary",
+      "kind": "gitignore_contains",
+      "path": ".gitignore",
+      "pattern": "local-secrets/",
+      "expected": true
+    },
+    {
+      "area": "local secret boundary",
+      "kind": "gitignore_contains",
+      "path": ".gitignore",
+      "pattern": "state/api-token",
+      "expected": true
+    },
+    {
+      "area": "local secret boundary",
+      "kind": "gitignore_contains",
+      "path": ".gitignore",
+      "pattern": "*.sqlite3",
+      "expected": true
+    },
+    {
+      "area": "operator runbooks",
+      "kind": "file_exists",
+      "path": "docs/operator-workflows.md",
+      "expected": true
+    },
+    {
+      "area": "operator runbooks",
+      "kind": "file_exists",
+      "path": "docs/ui-regression-testing.md",
+      "expected": true
+    },
+    {
+      "area": "local service inventory",
+      "kind": "json_valid",
+      "path": "config/local-mcp-services.json",
+      "expected": true
+    }
+  ]
+}

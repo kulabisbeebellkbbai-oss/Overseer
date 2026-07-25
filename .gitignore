@@ -21,6 +21,7 @@ local-secrets/
 *.backup
 exports/
 state/
+state/api-token
 runtime/
 
 # OS/editor noise

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -210,6 +211,16 @@ class OperationsGapCoverageTests(unittest.TestCase):
                         owner_domain=OwnerDomain.JULIAN,
                         risk_level=RiskLevel.MEDIUM,
                         identifiers={"unit": "missing-test.service", "config_paths": ["/etc/test/secret.conf"]},
+                        dependencies=frozenset({"svc.dependency", "svc.missing"}),
+                    )
+                )
+                store.save_resource(
+                    Resource(
+                        id="svc.dependency",
+                        name="Dependency Service",
+                        type=ResourceType.SERVICE,
+                        owner_domain=OwnerDomain.JULIAN,
+                        risk_level=RiskLevel.LOW,
                     )
                 )
                 store.save_resource(
@@ -244,6 +255,25 @@ class OperationsGapCoverageTests(unittest.TestCase):
                         captured_at="2026-07-21T05:20:00Z",
                     )
                 )
+                store.save_health_target(
+                    HealthTarget(
+                        id="health.dependency.manual",
+                        resource_id="svc.dependency",
+                        name="Dependency Health",
+                        probe_type=ProbeType.MANUAL,
+                        target="manual",
+                    )
+                )
+                store.save_health_evidence(
+                    HealthEvidence(
+                        id="evidence.dependency",
+                        resource_id="svc.dependency",
+                        target="manual",
+                        probe_type=ProbeType.MANUAL,
+                        observed_status=HealthStatus.DEGRADED,
+                        owner_domain=OwnerDomain.JULIAN,
+                    )
+                )
             finally:
                 store.close()
 
@@ -262,13 +292,17 @@ class OperationsGapCoverageTests(unittest.TestCase):
 
         item = next(row for row in payload["items"] if row["resource_id"] == "svc.test")
         log_sample = "\n".join(item["log_evidence"][0]["sample"])
-        self.assertEqual(payload["services"], 2)
-        self.assertEqual(api_payload["services"], 2)
+        self.assertEqual(payload["services"], 3)
+        self.assertEqual(api_payload["services"], 3)
         self.assertEqual(item["health"], "degraded")
         self.assertIn("[redacted]", log_sample)
         self.assertNotIn("secret-value", log_sample)
         self.assertNotIn("abc123", log_sample)
         self.assertIn("validation_checklist", item)
+        self.assertEqual(item["dependency_health"][0]["health"], "degraded")
+        self.assertEqual(item["dependency_health"][1]["known"], False)
+        self.assertIn("svc.missing", payload["dependency_graph"]["missing_dependencies"])
+        self.assertIn("svc.dependency", payload["dependency_graph"]["unhealthy_dependencies"])
         self.assertIn("journal_excerpt", item)
         self.assertIn("journal_access", payload)
         self.assertTrue(payload["journal_access"]["system_review_requests"])
@@ -545,6 +579,9 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(payload["limits"], 1)
         self.assertEqual(api_payload["limits"], 1)
         self.assertEqual(payload["limit_evidence"][0]["status"], "exhausted")
+        self.assertEqual(payload["exhaustion_forecast"][0]["queued_units"], 3)
+        self.assertEqual(payload["exhaustion_forecast"][0]["deficit_units"], 3)
+        self.assertEqual(payload["exhaustion_forecast"][0]["status"], "queue_until_reset")
         self.assertEqual(payload["allocation_by_thread"][0]["requested_units"], 3)
         self.assertFalse(payload["host_mutation_performed"])
 
@@ -682,6 +719,32 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertTrue(payload["evidence_matrix"])
         self.assertFalse(payload["host_mutation_performed"])
 
+    def test_compliance_evidence_compares_desired_state_without_host_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / ".gitignore").write_text("local-secrets/\n", encoding="utf-8")
+            (root / "config" / "desired-state.json").write_text(
+                json.dumps(
+                    {
+                        "checks": [
+                            {"area": "secret guard", "kind": "gitignore_contains", "path": ".gitignore", "pattern": "local-secrets/"},
+                            {"area": "runbook", "kind": "file_exists", "path": "docs/operator-workflows.md"},
+                            {"area": "bad path", "kind": "file_exists", "path": "../outside"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = compliance_evidence_status(root / "overseer.sqlite3", root)
+
+        rows = {row["area"]: row for row in payload["desired_state_drift"]}
+        self.assertEqual(rows["secret guard"]["status"], "ok")
+        self.assertEqual(rows["runbook"]["status"], "drift")
+        self.assertEqual(rows["bad path"]["status"], "invalid")
+        self.assertFalse(payload["host_mutation_performed"])
+
     def test_maintenance_schedules_can_be_recorded_without_host_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -756,6 +819,8 @@ class OperationsGapCoverageTests(unittest.TestCase):
             "Network Gateway Analysis",
             "Host Resources",
             "Service Evidence",
+            "Service Dependency Nodes",
+            "Service Dependency Edges",
             "Service Validation Checklist",
             "Redacted Service Logs",
             "Log Evidence",
@@ -767,6 +832,7 @@ class OperationsGapCoverageTests(unittest.TestCase):
             "Observability And Performance",
             "Cost And Forecast Coverage",
             "Quota Evidence",
+            "Exhaustion Forecast",
             "Continuation Queue Evidence",
             "Usage Allocation By Thread",
             "Documentation Coverage",

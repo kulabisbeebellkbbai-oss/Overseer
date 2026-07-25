@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 from collections.abc import Sequence
@@ -436,7 +437,7 @@ def _coverage_rows() -> list[dict[str, object]]:
         _coverage("virtual runtime", "partial", "Claims and listener discovery", "add VM/container/emulator state inventory"),
         _coverage("observability performance", "partial", "Health probes and regression tests", "add trend history and host metrics"),
         _coverage("usage cost forecasting", "partial", "Usage limits and continuations", "add cost and exhaustion forecasting"),
-        _coverage("compliance drift", "partial", "Policy profile and warning approvals", "add desired-state drift matrix"),
+        _coverage("compliance drift", "partial", "Policy profile, warning approvals, desired-state drift matrix", "review desired-state drift rows and stage corrections"),
         _coverage("documentation coverage", "partial", "Documents, workflows, git status", "add freshness and ADR/release indexes"),
         _coverage("identity secrets access", "gap", "Security routing only", "add identity and credential review panels"),
     ]
@@ -672,6 +673,9 @@ def _observability_rows(health: Sequence[Any], evidence: Sequence[Any]) -> list[
 
 
 def _usage_cost_rows(limits: Sequence[Any], requests: Sequence[Any]) -> list[dict[str, object]]:
+    requests_by_limit: dict[str, list[Any]] = {}
+    for request in requests:
+        requests_by_limit.setdefault(request.limit_id, []).append(request)
     return [
         {
             "limit_id": limit.id,
@@ -679,24 +683,62 @@ def _usage_cost_rows(limits: Sequence[Any], requests: Sequence[Any]) -> list[dic
             "remaining": limit.remaining,
             "capacity": limit.capacity,
             "resets_at": limit.resets_at,
-            "queued_requests": len([request for request in requests if request.limit_id == limit.id]),
+            "queued_requests": len(requests_by_limit.get(limit.id, [])),
+            "queued_units": sum(max(0, request.requested_units) for request in requests_by_limit.get(limit.id, [])),
+            "deficit_units": max(
+                0,
+                sum(max(0, request.requested_units) for request in requests_by_limit.get(limit.id, [])) - limit.remaining,
+            ),
             "cost_tracking": "not_configured",
-            "forecast": "add exhaustion forecast from history",
+            "forecast": _usage_forecast_label(limit, requests_by_limit.get(limit.id, [])),
         }
         for limit in limits
     ]
 
 
+def _usage_forecast_label(limit: Any, requests: Sequence[Any]) -> str:
+    queued_units = sum(max(0, request.requested_units) for request in requests)
+    if queued_units <= 0:
+        return "no queued continuation work"
+    if limit.confidence < 0.5:
+        return "verify provider reset policy before dispatch"
+    if limit.remaining >= queued_units:
+        return "queued work fits remaining capacity"
+    if limit.resets_at:
+        return f"queued work waits until reset at {limit.resets_at}"
+    return "queued work exceeds capacity and reset time is unknown"
+
+
 def _compliance_rows(approvals: Sequence[Any], plans: Sequence[Any], audits: Sequence[Any]) -> list[dict[str, object]]:
     pending = [approval for approval in approvals if approval.status == ApprovalStatus.PENDING]
     warnings = [approval for approval in approvals if "policy.warning" in approval.subject_id]
+    desired_state = _desired_state_summary(Path.cwd())
     return [
         {"area": "approval policy", "status": "attention" if pending else "ok", "evidence": len(pending), "next_step": "review pending approvals"},
         {"area": "policy warning exceptions", "status": "attention" if warnings else "ok", "evidence": len(warnings), "next_step": "review accepted-risk expiry"},
-        {"area": "desired state drift", "status": "gap", "evidence": 0, "next_step": "add desired-state baselines"},
+        {
+            "area": "desired state drift",
+            "status": desired_state["status"],
+            "evidence": desired_state["evidence"],
+            "next_step": desired_state["next_step"],
+        },
         {"area": "post-change validation", "status": "partial", "evidence": sum(1 for plan in plans if plan.verification_steps), "next_step": "link verification checklist to every execution"},
         {"area": "audit evidence", "status": "present", "evidence": len(audits), "next_step": "add compliance matrix"},
     ]
+
+
+def _desired_state_summary(root: Path) -> dict[str, object]:
+    path = root / "config" / "desired-state.json"
+    if not path.exists():
+        return {"status": "gap", "evidence": 0, "next_step": "add desired-state baselines"}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "attention", "evidence": 0, "next_step": "repair desired-state baseline"}
+    checks = data.get("checks", [])
+    if not isinstance(checks, list) or not checks:
+        return {"status": "gap", "evidence": 0, "next_step": "add desired-state checks"}
+    return {"status": "present", "evidence": len(checks), "next_step": "review desired-state drift rows"}
 
 
 def _run_read_only(command: Sequence[str], timeout_seconds: float) -> dict[str, object]:

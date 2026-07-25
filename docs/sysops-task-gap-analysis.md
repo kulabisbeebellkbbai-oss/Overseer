@@ -498,6 +498,19 @@ Odo identity/secret rotation request staging. These write or read ignored local
 state only and do not mutate live virtual assets, credentials, accounts, or
 privileged host resources.
 
+Implementation Pass 8 added Sisko desired-state drift comparison and Julian
+service dependency graph depth. Desired-state checks compare safe project-local
+baselines such as required files, required directories, `.gitignore` guards, and
+JSON validity without reading secrets or mutating host state. Service evidence
+now includes dependency graph nodes, edges, dependency ownership, risk, health,
+missing dependency rows, and next-step guidance before service changes.
+
+Implementation Pass 9 added Quark queued-demand exhaustion forecasting. Usage
+evidence now compares queued continuation demand against remaining capacity and
+reset times, reports deficit units, flags missing limit records, and gives
+dispatch, hold, or reset-recording guidance without spending quota or calling
+external providers.
+
 Remaining gaps now require either live adapters, elevated access, long-running
 persistence, or environment-specific policy wiring: approved privileged/system
 journal content capture after staged requests, approved firewall execution after

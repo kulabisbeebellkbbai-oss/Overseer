@@ -37,6 +37,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /approvals-summary`
 - `GET /security-summary`
 - `GET /usage-summary`
+- `GET /usage/remote-testing`
 - `GET /documents/status`
 - `GET /documents/notes`
 - `GET /documents/knowledge-capture-plan`
@@ -109,6 +110,10 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /host/security/ids-review-packages/results`
 - `POST /host/security/remediations/plans`
 - `POST /usage-limits`
+- `POST /usage/remote-testing/profiles`
+- `POST /usage/remote-testing/leases`
+- `POST /usage/remote-testing/jobs`
+- `POST /usage/remote-testing/results`
 - `POST /documents/search`
 - `POST /documents/notes`
 - `POST /documents/knowledge-capture`
@@ -236,6 +241,11 @@ The CLI equivalents are `documents-status`, `documents-notes`, `documents-search
 `GET /usage/continuation-plan` returns persisted usage-limited continuation requests, dispatch records, and their current ready, waiting, blocked, or escalated schedule without mutating host state.
 `POST /usage/continuation-requests` persists a Quark continuation request with `request_id`, `limit_id`, `resource_id`, `owner_thread`, `requested_units`, and `intent`; optional fields are `risk_level`, `earliest_start`, `deadline`, `requested_by`, and `requested_at`.
 `POST /usage/continuation-dispatches` persists idempotent dispatch records for ready continuation requests; optional fields are `dispatched_by`, `dispatched_at`, `resume_codex_projects`, and `codex_projects_registry`. When `resume_codex_projects` is true, matched `owner_thread` values are resumed through the local `codex-projects` tmux registry. It does not mutate host schedulers.
+`GET /usage/remote-testing` returns Quark's Tank/MSI remote testing connection profile, queue counts, active leases, pending jobs, claimed jobs, recent redacted results, and supported job types.
+`POST /usage/remote-testing/profiles` records the Tank/MSI queue connection profile. Optional fields are `profile_id`, `display_name`, `worker_hint`, `base_url`, `ui_path`, `gateway_path`, `token_source`, and `recorded_by`.
+`POST /usage/remote-testing/leases` creates a Quark-managed remote testing lease. Required fields are `lease_id` and `purpose`; optional fields are `project`, `requested_by`, `job_types`, `ttl_minutes`, `priority`, and `profile_id`.
+`POST /usage/remote-testing/jobs` enqueues a redacted-safe remote test job for Tank/MSI. Required fields are `lease_id` and `job_type`; optional fields are `requested_by`, `project`, `params`, `base_url`, `ui_path`, `gateway_path`, `token_source`, and `mutates`. Params that look like secrets are rejected. Mutating jobs require an explicit disposable fixture.
+`POST /usage/remote-testing/results` reads redacted remote testing results. Optional fields are `lease_id` and `job_id`.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, counts by kind and source, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
 `GET /virtual/evidence` returns Dax read-only provider inventory, registered runtime records, port-pool conflicts, cleanup candidates, provider-depth coverage, virtual capacity summary, and image provenance review rows. It does not mutate runtime state.

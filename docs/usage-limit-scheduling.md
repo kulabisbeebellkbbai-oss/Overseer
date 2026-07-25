@@ -85,3 +85,38 @@ PYTHONPATH=src python3 -m overseer.cli dispatch-usage-continuations --store stat
 With `--resume-codex-projects`, Quark resolves each ready request's `owner_thread` against `/home/god/.codex/codex-projects.csv`. The value may be a conversation id, launcher command, launcher path, or project path. Matched threads are resumed in the same durable tmux session shape that `codex-projects` uses, but detached so the scheduler command does not attach to the interactive Codex UI.
 
 This does not modify cron, systemd timers, service state, network policy, or any external scheduler. Codex project resume creates or reuses a tmux session for an already registered Codex conversation.
+
+## Tank/MSI Remote Testing Facility
+
+Quark also manages the Tank/MSI remote testing queue as a leased usage facility.
+The queue root is local-only at `local-secrets/remote-testing` and is excluded
+from git. Jobs must contain only redacted-safe metadata: endpoint names, status
+expectations, validation stages, and fixture identifiers. Raw bearer tokens,
+cookies, browser storage, API keys, local database exports, screenshots, HTML,
+and raw response bodies must not be queued or returned.
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli remote-testing-status --project-root .
+PYTHONPATH=src python3 -m overseer.cli record-remote-testing-profile --project-root .
+PYTHONPATH=src python3 -m overseer.cli request-remote-testing-lease \
+  --project-root . \
+  --lease-id lease.overseer.tank-regression \
+  --project Overseer \
+  --purpose "run protected-gateway regression without human relay" \
+  --job-type ping \
+  --job-type overseer.full_ui_regression
+PYTHONPATH=src python3 -m overseer.cli enqueue-remote-test-job \
+  --project-root . \
+  --lease-id lease.overseer.tank-regression \
+  --job-type ping \
+  --params-json '{"validation_stage":"queue-ping"}'
+PYTHONPATH=src python3 -m overseer.cli collect-remote-test-results \
+  --project-root . \
+  --lease-id lease.overseer.tank-regression
+```
+
+The profile describes Tank on MSI, the worker hint, protected gateway path,
+token source path, supported job types, and redaction rules. A lease authorizes
+a project batch to queue selected job types for a limited period. Quark rejects
+job parameters that appear to contain secret material and rejects mutating jobs
+unless the job contract includes an explicit disposable fixture.

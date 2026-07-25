@@ -90,6 +90,13 @@ from .policy import (
     policy_profile_status,
 )
 from .policy import PolicyCheckStatus
+from .remote_testing import (
+    collect_remote_test_results_status,
+    enqueue_remote_test_job_status,
+    record_remote_testing_profile_status,
+    remote_testing_status,
+    request_remote_testing_lease_status,
+)
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
 from .runtime_state import (
@@ -7799,6 +7806,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    remote_testing_status_parser = subparsers.add_parser("remote-testing-status", help="summarize Quark-managed remote testing queue profiles and leases")
+    remote_testing_status_parser.add_argument("--project-root", default=".", help="project root containing local-secrets/remote-testing")
+    remote_testing_profile_parser = subparsers.add_parser("record-remote-testing-profile", help="record or update the Tank/MSI remote testing connection profile")
+    remote_testing_profile_parser.add_argument("--project-root", default=".")
+    remote_testing_profile_parser.add_argument("--profile-id", default="remote-testing.tank-msi")
+    remote_testing_profile_parser.add_argument("--display-name", default="Tank on MSI remote testing queue")
+    remote_testing_profile_parser.add_argument("--worker-hint", default="overseer-msi-test-agent")
+    remote_testing_profile_parser.add_argument("--queue-root", default="local-secrets/remote-testing")
+    remote_testing_profile_parser.add_argument("--base-url", default="http://127.0.0.1:8766")
+    remote_testing_profile_parser.add_argument("--ui-path", default="/Overseer/ui")
+    remote_testing_profile_parser.add_argument("--gateway-path", default="/Overseer")
+    remote_testing_profile_parser.add_argument("--token-source", default="state/api-token")
+    remote_testing_profile_parser.add_argument("--recorded-by", default="quark")
+    remote_testing_lease_parser = subparsers.add_parser("request-remote-testing-lease", help="lease the Tank/MSI remote testing queue for a project batch")
+    remote_testing_lease_parser.add_argument("--project-root", default=".")
+    remote_testing_lease_parser.add_argument("--lease-id", required=True)
+    remote_testing_lease_parser.add_argument("--project", default="Overseer")
+    remote_testing_lease_parser.add_argument("--purpose", required=True)
+    remote_testing_lease_parser.add_argument("--requested-by", default="quark")
+    remote_testing_lease_parser.add_argument("--job-type", action="append", default=["ping"], help="allowed job type; repeat for multiple")
+    remote_testing_lease_parser.add_argument("--ttl-minutes", type=int, default=120)
+    remote_testing_lease_parser.add_argument("--priority", default="normal")
+    remote_testing_lease_parser.add_argument("--profile-id", default="remote-testing.tank-msi")
+    remote_testing_job_parser = subparsers.add_parser("enqueue-remote-test-job", help="enqueue a redacted-safe job for the Tank/MSI remote testing worker")
+    remote_testing_job_parser.add_argument("--project-root", default=".")
+    remote_testing_job_parser.add_argument("--lease-id", required=True)
+    remote_testing_job_parser.add_argument("--job-type", required=True)
+    remote_testing_job_parser.add_argument("--requested-by", default="quark")
+    remote_testing_job_parser.add_argument("--project", default="Overseer")
+    remote_testing_job_parser.add_argument("--params-json", default="{}")
+    remote_testing_job_parser.add_argument("--base-url", default="http://127.0.0.1:8766")
+    remote_testing_job_parser.add_argument("--ui-path", default="/Overseer/ui")
+    remote_testing_job_parser.add_argument("--gateway-path", default="/Overseer")
+    remote_testing_job_parser.add_argument("--token-source", default="state/api-token")
+    remote_testing_job_parser.add_argument("--mutates", action="store_true")
+    remote_testing_results_parser = subparsers.add_parser("collect-remote-test-results", help="read redacted Tank/MSI remote testing results")
+    remote_testing_results_parser.add_argument("--project-root", default=".")
+    remote_testing_results_parser.add_argument("--lease-id")
+    remote_testing_results_parser.add_argument("--job-id")
     documents_status_parser = subparsers.add_parser("documents-status", help="check Ezri's Obsidian Documents API readiness")
     documents_status_parser.add_argument("--env-file", default=None, help="local Obsidian MCP env file")
     git_status_parser = subparsers.add_parser("git-status", help="summarize Ezri-managed git repository state")
@@ -8687,6 +8733,74 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-summary":
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "remote-testing-status":
+        print(json.dumps(remote_testing_status(args.project_root), sort_keys=True))
+        return 0
+
+    if args.command == "record-remote-testing-profile":
+        print(
+            json.dumps(
+                record_remote_testing_profile_status(
+                    args.project_root,
+                    args.profile_id,
+                    args.display_name,
+                    args.worker_hint,
+                    args.queue_root,
+                    args.base_url,
+                    args.ui_path,
+                    args.gateway_path,
+                    args.token_source,
+                    args.recorded_by,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "request-remote-testing-lease":
+        print(
+            json.dumps(
+                request_remote_testing_lease_status(
+                    args.project_root,
+                    args.lease_id,
+                    args.project,
+                    args.purpose,
+                    args.requested_by,
+                    tuple(args.job_type),
+                    args.ttl_minutes,
+                    args.priority,
+                    args.profile_id,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "enqueue-remote-test-job":
+        print(
+            json.dumps(
+                enqueue_remote_test_job_status(
+                    args.project_root,
+                    args.lease_id,
+                    args.job_type,
+                    args.requested_by,
+                    args.project,
+                    _json_object_arg(args.params_json, "params-json"),
+                    args.base_url,
+                    args.ui_path,
+                    args.gateway_path,
+                    args.token_source,
+                    args.mutates,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "collect-remote-test-results":
+        print(json.dumps(collect_remote_test_results_status(args.project_root, args.lease_id, args.job_id), sort_keys=True))
         return 0
 
     if args.command == "documents-status":

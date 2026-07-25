@@ -697,6 +697,37 @@ available through the current user journal.
 4. Record limits for API-keyed MCP services that have daily, weekly, or monthly
    quotas.
 
+### Save Tank/MSI Remote Testing Profile
+
+1. Open Usage.
+2. Review Remote Queue, Pending Tests, Active Leases, Remote Testing Profiles,
+   Remote Testing Leases, Remote Pending Jobs, and Remote Test Results.
+3. Click Save Profile if the Tank/MSI queue connection profile needs to be
+   recorded or refreshed.
+
+### Manage Tank/MSI Remote Testing
+
+1. Open Usage.
+2. Fill Lease ID, Project, Purpose, Requested By, TTL Minutes, Priority, and
+   Allowed Job Types.
+3. Click Request Lease.
+
+### Queue A Tank/MSI Remote Test Job
+
+1. Open Usage.
+2. Fill Job Lease, Job Type, and Job Params with a redacted-safe JSON object.
+3. Click Queue Job.
+4. Do not include raw tokens, cookies, browser storage, API keys, local database
+   exports, screenshots, HTML, or raw response bodies.
+
+### Collect Tank/MSI Remote Test Results
+
+1. Open Usage.
+2. Fill Result Lease or Result Job when filtering is needed.
+3. Click Collect Results to refresh redacted job results from the queue.
+4. If a result reports failed findings, drill into the owning page or workflow
+   named by the result before approving remediation.
+
 ## Documents: Ezri
 
 ### Search Documentation

@@ -704,6 +704,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       performanceHistory: "/observability/performance-history",
       usage: "/usage-summary",
       usageEvidence: "/usage/evidence",
+      remoteTesting: "/usage/remote-testing",
       documentsStatus: "/documents/status",
       documentationEvidence: "/documents/evidence",
       gitStatus: "/git/status",
@@ -905,6 +906,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "documents-list-notes") state.data.documentsNotes = result;
       if (action === "documents-search") state.data.documentsSearch = result;
       if (action === "documents-capture-knowledge") state.data.knowledgeCapturePlan = result;
+      if (action === "record-remote-testing-profile" || action === "request-remote-testing-lease") state.data.remoteTesting = result.status || result;
+      if (action === "enqueue-remote-test-job" || action === "collect-remote-test-results") state.data.remoteTesting = result.status || state.data.remoteTesting;
     }
     async function actionRequest(action, source) {
       if (action === "discover-physical") return await postJson("/physical/discover", {});
@@ -944,6 +947,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "documents-capture-knowledge") return await captureKnowledge();
       if (action === "request-usage-continuation") return await requestUsageContinuation();
       if (action === "dispatch-usage-continuations") return await dispatchUsageContinuations();
+      if (action === "record-remote-testing-profile") return await recordRemoteTestingProfile();
+      if (action === "request-remote-testing-lease") return await requestRemoteTestingLease();
+      if (action === "enqueue-remote-test-job") return await enqueueRemoteTestJob();
+      if (action === "collect-remote-test-results") return await collectRemoteTestResults();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
       if (action === "run-package-maintenance-cycle") return await postJson("/maintenance/package-maintenance-cycle", {});
       if (action === "refresh-advisories") return await refreshAdvisories();
@@ -1468,6 +1475,49 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/usage/continuation-dispatches", {
         dispatched_by: value("usage-dispatched-by") || "quark",
         resume_codex_projects: document.getElementById("usage-resume-codex-projects").checked
+      });
+    }
+    async function recordRemoteTestingProfile() {
+      return await postJson("/usage/remote-testing/profiles", {
+        profile_id: value("remote-profile-id") || "remote-testing.tank-msi",
+        display_name: value("remote-display-name") || "Tank on MSI remote testing queue",
+        worker_hint: value("remote-worker-hint") || "overseer-msi-test-agent",
+        base_url: value("remote-base-url") || "http://127.0.0.1:8766",
+        ui_path: value("remote-ui-path") || "/Overseer/ui",
+        gateway_path: value("remote-gateway-path") || "/Overseer",
+        token_source: value("remote-token-source") || "state/api-token",
+        recorded_by: value("remote-recorded-by") || "quark"
+      });
+    }
+    async function requestRemoteTestingLease() {
+      return await postJson("/usage/remote-testing/leases", {
+        lease_id: value("remote-lease-id") || "lease.overseer.tank-smoke",
+        project: value("remote-project") || "Overseer",
+        purpose: value("remote-purpose") || "run protected-gateway regression without human relay",
+        requested_by: value("remote-requested-by") || "quark",
+        job_types: value("remote-job-types").split(",").map((item) => item.trim()).filter(Boolean),
+        ttl_minutes: Number(value("remote-ttl-minutes") || "120"),
+        priority: value("remote-priority") || "normal",
+        profile_id: value("remote-profile-id") || "remote-testing.tank-msi"
+      });
+    }
+    async function enqueueRemoteTestJob() {
+      return await postJson("/usage/remote-testing/jobs", {
+        lease_id: value("remote-job-lease-id") || value("remote-lease-id"),
+        job_type: value("remote-job-type") || "ping",
+        requested_by: value("remote-requested-by") || "quark",
+        project: value("remote-project") || "Overseer",
+        params: JSON.parse(value("remote-job-params") || "{}"),
+        base_url: value("remote-base-url") || "http://127.0.0.1:8766",
+        ui_path: value("remote-ui-path") || "/Overseer/ui",
+        gateway_path: value("remote-gateway-path") || "/Overseer",
+        token_source: value("remote-token-source") || "state/api-token"
+      });
+    }
+    async function collectRemoteTestResults() {
+      return await postJson("/usage/remote-testing/results", {
+        lease_id: value("remote-result-lease-id") || value("remote-lease-id"),
+        job_id: value("remote-result-job-id")
       });
     }
     async function planHostSecurityRemediation() {
@@ -2330,14 +2380,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const usage = state.data.usage || {};
       const operations = state.data.operations || {};
       const usageEvidence = state.data.usageEvidence || {};
+      const remoteTesting = state.data.remoteTesting || usageEvidence.remote_testing || {};
+      const adapterStatus = remoteTesting.adapter_status || {};
+      const queueCounts = remoteTesting.queue_counts || {};
       document.getElementById("usage").innerHTML = `
         <div class="grid">
-          ${stationIntro("Quark", "Quota Exchange", "Usage-limited services, renewal windows, and continuation dispatch.", ["API-keyed MCP", "renewals", "queued work"])}
-          <div class="section-head"><h3>Usage Actions</h3><div class="actions"><button class="action-btn" data-action="discover-codex-threads">Discover Codex Threads</button><button class="action-btn" data-action="dispatch-usage-continuations">Dispatch Ready</button></div></div>
+          ${stationIntro("Quark", "Quota Exchange", "Usage-limited services, renewal windows, continuation dispatch, and remote test leases.", ["API-keyed MCP", "renewals", "Tank/MSI"])}
+          <div class="section-head"><h3>Usage Actions</h3><div class="actions"><button class="action-btn" data-action="discover-codex-threads">Discover Codex Threads</button><button class="action-btn" data-action="dispatch-usage-continuations">Dispatch Ready</button><button class="action-btn" data-action="collect-remote-test-results">Collect Remote Results</button></div></div>
           ${metric("Limits", usage.limits, "tracked", "span-3", "", "usage")}
           ${metric("Available", usage.available, "limits", "span-3", "good", "usage")}
           ${metric("Exhausted", usage.exhausted, "limits", "span-3", usage.exhausted ? "warn" : "good", "usage")}
           ${metric("Low Confidence", usage.low_confidence, "limits", "span-3", usage.low_confidence ? "warn" : "good", "usage")}
+          ${metric("Remote Queue", adapterStatus.status || "unknown", "Tank/MSI", "span-3", adapterStatus.status === "configured" ? "good" : "warn", "usage")}
+          ${metric("Pending Tests", queueCounts.pending ?? 0, "queued", "span-3", queueCounts.pending ? "pending" : "good", "usage")}
+          ${metric("Active Leases", (remoteTesting.active_leases || []).length, "remote testing", "span-3", (remoteTesting.active_leases || []).length ? "good" : "inactive", "usage")}
+          ${metric("Results", (remoteTesting.recent_results || []).length, "redacted", "span-3", "", "usage")}
           <div class="panel span-6">
             <div class="toolbar"><h3>Record Limit</h3><button class="action-btn" data-action="record-usage-limit">Record Limit</button></div>
             <div class="form-grid">
@@ -2374,11 +2431,40 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6 check-field"><label><input id="usage-resume-codex-projects" type="checkbox"> Resume Codex Projects</label></div>
             </div>
           </div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Tank/MSI Remote Testing</h3><div class="actions"><button class="action-btn" data-action="record-remote-testing-profile">Save Profile</button><button class="action-btn" data-action="request-remote-testing-lease">Request Lease</button><button class="action-btn" data-action="enqueue-remote-test-job">Queue Job</button><button class="action-btn" data-action="collect-remote-test-results">Collect Results</button></div></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="remote-profile-id">Profile ID</label><input id="remote-profile-id" value="${safe(remoteTesting.default_profile_id || "remote-testing.tank-msi")}"></div>
+              <div class="field span-4"><label for="remote-display-name">Display Name</label><input id="remote-display-name" value="Tank on MSI remote testing queue"></div>
+              <div class="field span-4"><label for="remote-worker-hint">Worker</label><input id="remote-worker-hint" value="overseer-msi-test-agent"></div>
+              <div class="field span-3"><label for="remote-recorded-by">Recorded By</label><input id="remote-recorded-by" value="quark"></div>
+              <div class="field span-3"><label for="remote-base-url">Base URL</label><input id="remote-base-url" value="http://127.0.0.1:8766"></div>
+              <div class="field span-3"><label for="remote-ui-path">UI Path</label><input id="remote-ui-path" value="/Overseer/ui"></div>
+              <div class="field span-3"><label for="remote-gateway-path">Gateway Path</label><input id="remote-gateway-path" value="/Overseer"></div>
+              <div class="field span-3"><label for="remote-token-source">Token Source</label><input id="remote-token-source" value="state/api-token"></div>
+              <div class="field span-3"><label for="remote-lease-id">Lease ID</label><input id="remote-lease-id" value="lease.overseer.tank-regression"></div>
+              <div class="field span-3"><label for="remote-project">Project</label><input id="remote-project" value="Overseer"></div>
+              <div class="field span-3"><label for="remote-requested-by">Requested By</label><input id="remote-requested-by" value="quark"></div>
+              <div class="field span-3"><label for="remote-ttl-minutes">TTL Minutes</label><input id="remote-ttl-minutes" type="number" min="1" value="120"></div>
+              <div class="field span-9"><label for="remote-purpose">Purpose</label><input id="remote-purpose" value="run protected-gateway regression without human relay"></div>
+              <div class="field span-3"><label for="remote-priority">Priority</label><input id="remote-priority" value="normal"></div>
+              <div class="field span-6"><label for="remote-job-types">Allowed Job Types</label><input id="remote-job-types" value="ping,overseer.auth_panel_smoke,overseer.full_ui_regression,overseer.performance_regression"></div>
+              <div class="field span-3"><label for="remote-job-lease-id">Job Lease</label><input id="remote-job-lease-id" value="lease.overseer.tank-regression"></div>
+              <div class="field span-3"><label for="remote-job-type">Job Type</label><input id="remote-job-type" value="ping"></div>
+              <div class="field span-8"><label for="remote-job-params">Job Params</label><textarea id="remote-job-params">{}</textarea></div>
+              <div class="field span-2"><label for="remote-result-lease-id">Result Lease</label><input id="remote-result-lease-id" value="lease.overseer.tank-regression"></div>
+              <div class="field span-2"><label for="remote-result-job-id">Result Job</label><input id="remote-result-job-id" placeholder="optional"></div>
+            </div>
+          </div>
           <div class="panel span-12">${table("Usage Limits", usage.items || [], ["limit_id", "resource_id", "remaining", "capacity", "resets_at"], {fills: {limit_id: (row) => usageLimitFill(row), resource_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-12">${table("Quota Evidence", usageEvidence.limit_evidence || [], ["limit_id", "resource_id", "remaining", "capacity", "usage_percent", "status", "next_step"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-12">${table("Exhaustion Forecast", usageEvidence.exhaustion_forecast || [], ["limit_id", "remaining", "queued_units", "remaining_after_queue", "deficit_units", "status", "next_step"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-6">${table("Continuation Queue Evidence", usageEvidence.continuation_queue || [], ["request_id", "limit_id", "owner_thread", "requested_units", "status"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-6">${table("Usage Allocation By Thread", usageEvidence.allocation_by_thread || [], ["owner_thread", "requests", "requested_units", "status"])}</div>
+          <div class="panel span-6">${table("Remote Testing Profiles", remoteTesting.connection_profiles || [], ["profile_id", "remote_operator", "remote_host", "worker_hint"])}</div>
+          <div class="panel span-6">${table("Remote Testing Leases", remoteTesting.leases || [], ["lease_id", "project", "status", "expires_at"])}</div>
+          <div class="panel span-6">${table("Remote Pending Jobs", remoteTesting.pending_jobs || [], ["job_id", "job_type", "lease_id", "status"], {limit: 20})}</div>
+          <div class="panel span-6">${table("Remote Test Results", remoteTesting.recent_results || [], ["job_id", "job_type", "status", "stage"], {limit: 20})}</div>
           <div class="panel span-12">${table("Cost And Forecast Coverage", operations.usage_costs || [], ["limit_id", "remaining", "capacity", "queued_requests", "queued_units", "deficit_units", "cost_tracking", "forecast"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           ${officerPanel("quark", "MCP API quota scheduling", "Track API-keyed MCP call limits and schedule continuation after the quota window resets.", "limit.mcp.api.calls.daily")}
         </div>`;
@@ -2554,6 +2640,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Request continuation after quota refresh", page: "Usage", owner: "Quark", action: "request-usage-continuation", source, query: "Request continuation after quota refresh"},
         {workflow: "Dispatch ready continuation work", page: "Usage", owner: "Quark", action: "dispatch-usage-continuations", source, query: "Dispatch ready continuation work"},
         {workflow: "Discover Codex project threads", page: "Usage", owner: "Quark", action: "discover-codex-threads", source, query: "Discover Codex project threads"},
+        {workflow: "Save Tank/MSI remote testing profile", page: "Usage", owner: "Quark", action: "record-remote-testing-profile", source, query: "Save Tank MSI remote testing profile"},
+        {workflow: "Manage Tank/MSI remote testing", page: "Usage", owner: "Quark", action: "request-remote-testing-lease", source, query: "Manage Tank MSI remote testing"},
+        {workflow: "Queue a Tank/MSI remote test job", page: "Usage", owner: "Quark", action: "enqueue-remote-test-job", source, query: "Queue a Tank MSI remote test job"},
+        {workflow: "Collect Tank/MSI remote test results", page: "Usage", owner: "Quark", action: "collect-remote-test-results", source, query: "Collect Tank MSI remote test results"},
         {workflow: "Search documentation", page: "Documents", owner: "Ezri", action: "documents-search", source, query: "Search documentation"},
         {workflow: "List a documentation folder", page: "Documents", owner: "Ezri", action: "documents-list-notes", source, query: "List a documentation folder"},
         {workflow: "Write an approved note", page: "Documents", owner: "Ezri", action: "documents-write-note", source, query: "Write an approved note"},

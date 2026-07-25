@@ -28,6 +28,13 @@ from overseer.metric_history import capture_metric_history_status, metric_histor
 from overseer.observability_trends import observability_trends_status
 from overseer.ops import operations_gap_coverage_status
 from overseer.performance_history import performance_history_status
+from overseer.remote_testing import (
+    collect_remote_test_results_status,
+    enqueue_remote_test_job_status,
+    record_remote_testing_profile_status,
+    remote_testing_status,
+    request_remote_testing_lease_status,
+)
 from overseer.security_evidence import security_evidence_status
 from overseer.service_evidence import service_evidence_status
 from overseer.software_evidence import software_evidence_status
@@ -1065,6 +1072,86 @@ exit 0
         self.assertEqual(payload["exhaustion_forecast"][0]["status"], "queue_until_reset")
         self.assertEqual(payload["allocation_by_thread"][0]["requested_units"], 3)
         self.assertFalse(payload["host_mutation_performed"])
+
+    def test_remote_testing_profile_lease_job_and_results_are_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = root / "local-secrets" / "remote-testing"
+            (queue / "jobs" / "pending").mkdir(parents=True)
+            (queue / "jobs" / "claimed").mkdir(parents=True)
+            (queue / "jobs" / "done").mkdir(parents=True)
+            (queue / "jobs" / "failed").mkdir(parents=True)
+            (queue / "QUEUE_CONTRACT.md").write_text("# Queue Contract\n", encoding="utf-8")
+
+            profile = record_remote_testing_profile_status(root, recorded_by="quark")
+            lease = request_remote_testing_lease_status(
+                root,
+                "lease.test",
+                "Overseer",
+                "exercise remote test queue",
+                job_types=("ping", "overseer.full_ui_regression"),
+            )
+            job = enqueue_remote_test_job_status(
+                root,
+                "lease.test",
+                "ping",
+                params={"validation_stage": "queue-ping"},
+            )
+            result_path = queue / "jobs" / "done" / "result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "job_id": job["job"]["job_id"],
+                        "job_type": "ping",
+                        "status": "passed",
+                        "stage": "queue-ping",
+                        "worker": "overseer-msi-test-agent-test",
+                        "findings": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status = remote_testing_status(root)
+            results = collect_remote_test_results_status(root, lease_id="lease.test")
+
+        self.assertEqual(profile["profile"]["profile_id"], "remote-testing.tank-msi")
+        self.assertEqual(lease["lease"]["status"], "active")
+        self.assertEqual(job["job"]["job_type"], "ping")
+        self.assertEqual(status["adapter_status"]["status"], "configured")
+        self.assertEqual(results["results"][0]["status"], "passed")
+        self.assertFalse(status["host_mutation_performed"])
+
+    def test_remote_testing_rejects_secret_like_job_params(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_remote_testing_lease_status(root, "lease.secret", "Overseer", "redaction test", job_types=("ping",))
+            with self.assertRaises(ValueError):
+                enqueue_remote_test_job_status(root, "lease.secret", "ping", params={"api_key": "do-not-queue"})
+
+    def test_remote_testing_api_routes_manage_lease_and_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            with LocalApiHarness(store_path) as server:
+                status = server.get_json("/Overseer/usage/remote-testing")
+                lease = server.post_json(
+                    "/Overseer/usage/remote-testing/leases",
+                    {
+                        "lease_id": "lease.api",
+                        "project": "Overseer",
+                        "purpose": "api route test",
+                        "job_types": ["ping"],
+                    },
+                )
+                job = server.post_json(
+                    "/Overseer/usage/remote-testing/jobs",
+                    {"lease_id": "lease.api", "job_type": "ping", "params": {}},
+                )
+
+        self.assertEqual(status["default_profile_id"], "remote-testing.tank-msi")
+        self.assertEqual(lease["lease"]["lease_id"], "lease.api")
+        self.assertEqual(job["job"]["queue_status"], "pending")
 
     def test_identity_evidence_redacts_secret_files_and_hashes_ssh_keys(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .remote_testing import remote_testing_status
 from .store import SQLiteStore
 
 
@@ -52,9 +53,17 @@ def usage_evidence_status(store_path: str | Path) -> dict[str, object]:
             }
             for request in requests
         ],
+        "remote_testing": remote_testing_status(_project_root_for_store(store_path)),
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
+
+
+def _project_root_for_store(store_path: str | Path) -> Path:
+    parent = Path(store_path).resolve().parent
+    if parent.name == "state":
+        return parent.parent
+    return parent
 
 
 def _usage_percent(capacity: int, remaining: int) -> int:

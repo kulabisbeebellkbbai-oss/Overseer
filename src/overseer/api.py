@@ -140,6 +140,13 @@ from .ops import (
     transition_operation_record_status,
 )
 from .performance_history import performance_history_status
+from .remote_testing import (
+    collect_remote_test_results_status,
+    enqueue_remote_test_job_status,
+    record_remote_testing_profile_status,
+    remote_testing_status,
+    request_remote_testing_lease_status,
+)
 from .service_evidence import service_evidence_status, stage_journal_access_request_status
 from .security_evidence import security_evidence_status
 from .software_evidence import software_evidence_status
@@ -280,6 +287,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/usage/evidence":
                 self._handle(lambda: usage_evidence_status(store_path))
+                return
+            if path == "/usage/remote-testing":
+                self._handle(lambda: remote_testing_status(_project_path_for_store(store_path)))
                 return
             if path == "/crew/messages":
                 self._handle(lambda: crew_messages_status(store_path, _query_first(query, "owner_domain"), _query_first(query, "status")))
@@ -646,6 +656,18 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/usage/continuation-requests":
                 self._handle_json(lambda payload: request_usage_continuation_status(store_path, **_usage_continuation_request_args(payload)))
                 return
+            if path == "/usage/remote-testing/profiles":
+                self._handle_json(lambda payload: record_remote_testing_profile_status(_project_path_for_store(store_path), **_remote_testing_profile_args(payload)))
+                return
+            if path == "/usage/remote-testing/leases":
+                self._handle_json(lambda payload: request_remote_testing_lease_status(_project_path_for_store(store_path), **_remote_testing_lease_args(payload)))
+                return
+            if path == "/usage/remote-testing/jobs":
+                self._handle_json(lambda payload: enqueue_remote_test_job_status(_project_path_for_store(store_path), **_remote_testing_job_args(payload)))
+                return
+            if path == "/usage/remote-testing/results":
+                self._handle_json(lambda payload: collect_remote_test_results_status(_project_path_for_store(store_path), **_remote_testing_results_args(payload)))
+                return
             if path == "/usage-limits":
                 self._handle_json(lambda payload: record_usage_limit_status(store_path, **_usage_limit_args(payload)))
                 return
@@ -972,6 +994,65 @@ def _usage_continuation_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
         "resume_codex_projects": bool(payload.get("resume_codex_projects", False)),
         "codex_projects_registry": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
+    }
+
+
+def _remote_testing_profile_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "profile_id": str(payload.get("profile_id", "remote-testing.tank-msi")),
+        "display_name": str(payload.get("display_name", "Tank on MSI remote testing queue")),
+        "worker_hint": str(payload.get("worker_hint", "overseer-msi-test-agent")),
+        "queue_root": str(payload.get("queue_root", "local-secrets/remote-testing")),
+        "base_url": str(payload.get("base_url", "http://127.0.0.1:8766")),
+        "ui_path": str(payload.get("ui_path", "/Overseer/ui")),
+        "gateway_path": str(payload.get("gateway_path", "/Overseer")),
+        "token_source": str(payload.get("token_source", "state/api-token")),
+        "recorded_by": str(payload.get("recorded_by", "quark")),
+    }
+
+
+def _remote_testing_lease_args(payload: dict[str, Any]) -> dict[str, Any]:
+    job_types = payload.get("job_types", ["ping"])
+    if isinstance(job_types, str):
+        job_types = [item.strip() for item in job_types.split(",") if item.strip()]
+    if not isinstance(job_types, list):
+        raise ValueError("job_types must be a list or comma-separated string")
+    return {
+        "lease_id": str(payload["lease_id"]),
+        "project": str(payload.get("project", "Overseer")),
+        "purpose": str(payload["purpose"]),
+        "requested_by": str(payload.get("requested_by", "quark")),
+        "job_types": tuple(str(item) for item in job_types),
+        "ttl_minutes": int(payload.get("ttl_minutes", 120)),
+        "priority": str(payload.get("priority", "normal")),
+        "profile_id": str(payload.get("profile_id", "remote-testing.tank-msi")),
+    }
+
+
+def _remote_testing_job_args(payload: dict[str, Any]) -> dict[str, Any]:
+    params = payload.get("params", {})
+    if isinstance(params, str):
+        params = json.loads(params) if params.strip() else {}
+    if not isinstance(params, dict):
+        raise ValueError("params must be a JSON object")
+    return {
+        "lease_id": str(payload["lease_id"]),
+        "job_type": str(payload["job_type"]),
+        "requested_by": str(payload.get("requested_by", "quark")),
+        "project": str(payload.get("project", "Overseer")),
+        "params": params,
+        "base_url": str(payload.get("base_url", "http://127.0.0.1:8766")),
+        "ui_path": str(payload.get("ui_path", "/Overseer/ui")),
+        "gateway_path": str(payload.get("gateway_path", "/Overseer")),
+        "token_source": str(payload.get("token_source", "state/api-token")),
+        "mutates": bool(payload.get("mutates", False)),
+    }
+
+
+def _remote_testing_results_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lease_id": str(payload["lease_id"]) if payload.get("lease_id") else None,
+        "job_id": str(payload["job_id"]) if payload.get("job_id") else None,
     }
 
 

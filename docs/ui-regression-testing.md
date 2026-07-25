@@ -202,6 +202,22 @@ Current Tank jobs requested:
 
 Current Tank results:
 
+- `job-20260725T052139Z-overseer-auth-panel-smoke-display-check`: passed at
+  `authenticated-panel-fetch`. All expected `/Overseer` display/auth endpoints
+  returned `200`, `console_error_count=0`, and findings were empty.
+- `job-20260725T052140Z-overseer-full-ui-regression-display-check`: passed at
+  `full-ui-regression` with `observed_request_count=49`,
+  `console_error_count=0`, and no findings.
+- `job-20260725T054840Z-overseer-http-status-unlock-panels-postfix`: passed at
+  `api-status-matrix`. `/health` plus the reported `/Overseer` unlock and
+  panel paths returned `200`; findings were empty.
+- `job-20260725T054841Z-overseer-full-ui-regression-unlock-postfix`: passed at
+  `full-ui-regression` with `observed_request_count=49`,
+  `console_error_count=0`, and no findings.
+- Tank worker `overseer-msi-test-agent-v4` was restarted and verified with live
+  ping `job-20260725T063633Z-ping-251e786363`; the pending remote-testing queue
+  was clear after the run. Tank returned only redacted status, counts, hashes,
+  endpoint names, and findings.
 - `job-20260721T042300Z-overseer-full-ui-regression-all-workflows`: passed
   with `observed_request_count=29`, `console_error_count=0`, and no findings.
 - `job-20260721T042301Z-overseer-performance-regression-gateway`: failed at

@@ -20,6 +20,9 @@ SUPPORTED_JOB_TYPES = (
     "overseer.admin_approve_smoke",
     "overseer.full_ui_regression",
     "overseer.performance_regression",
+    "protected_gateway.request_sequence",
+    "tank.local_facility_request",
+    "roadex.project_creation_flow",
 )
 SENSITIVE_KEY_PARTS = (
     "token",
@@ -428,7 +431,12 @@ def _lease_status(lease: dict[str, Any]) -> dict[str, object]:
 
 
 def _fixture_allows_mutation(params: dict[str, object]) -> bool:
-    return bool(params.get("fixture_id") or params.get("disposable_fixture"))
+    if params.get("fixture_id") or params.get("disposable_fixture"):
+        return True
+    return (
+        params.get("allow_mutation") is True
+        and params.get("require_explicit_user_approval") is True
+    )
 
 
 def _assert_redacted_safe(value: object, path: str = "params") -> None:

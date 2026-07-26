@@ -148,6 +148,10 @@ from overseer import (
 from overseer.api import make_api_handler, run_api_server
 from overseer.client import OverseerApiClient
 from overseer.host import run_read_only_command
+from overseer.remote_testing import (
+    enqueue_remote_test_job_status,
+    request_remote_testing_lease_status,
+)
 from overseer.ui import OPERATOR_CONSOLE_HTML
 from overseer.cli import demo_status
 from overseer.cli import discover_codex_project_threads_status
@@ -8104,6 +8108,51 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertIn("quark dispatch", summary["recent_dispatches"][0]["reason"])
             self.assertEqual(plan["continuation_requests"], 1)
             self.assertEqual(plan["items"][0]["id"], "work.crew.quark.dispatch-quota")
+
+    def test_dispatches_quark_remote_testing_message_without_usage_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            request_remote_testing_lease_status(
+                root,
+                "lease.roadex",
+                "Roadex",
+                "coordinate Tank through Quark",
+                job_types=("roadex.project_creation_flow",),
+            )
+            enqueue_remote_test_job_status(
+                root,
+                "lease.roadex",
+                "roadex.project_creation_flow",
+                params={
+                    "allow_mutation": True,
+                    "require_explicit_user_approval": True,
+                },
+                mutates=True,
+            )
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.QUARK.value,
+                "Dispatch Tank Roadex job",
+                "Have Tank claim the approved leased job.",
+                RiskLevel.HIGH.value,
+                requested_by="Roadex",
+                message_id="crew.quark.remote-testing",
+                related_resource_id="remote-testing.tank-msi",
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                message_id="crew.quark.remote-testing",
+                dispatched_at="2026-07-26T18:00:00+00:00",
+            )
+
+            self.assertEqual(status["processed"], 1)
+            self.assertEqual(status["acknowledged"], 1)
+            self.assertEqual(status["blocked"], 0)
+            self.assertEqual(status["items"][0]["status"], "dispatched")
+            self.assertIn("Tank pickup", status["items"][0]["reason"])
 
     def test_crew_message_summary_reports_blocked_dispatch_history(self):
         with tempfile.TemporaryDirectory() as directory:

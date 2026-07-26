@@ -6106,6 +6106,28 @@ def _execute_no_approval_admin_plan(store_path: str | Path, plan_id: str, approv
 
 
 def _dispatch_quark_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_resource_id and message.related_resource_id.startswith("remote-testing."):
+        store_path = Path(store_path)
+        project_root = store_path.parent.parent if store_path.parent.name == "state" else store_path.parent
+        status = remote_testing_status(project_root)
+        pending = [
+            job
+            for job in status["pending_jobs"]
+            if job.get("lease_id") and job.get("requested_by") == "quark"
+        ]
+        if not pending:
+            return _crew_dispatch_result(
+                message,
+                "skipped",
+                "Quark found no leased pending remote-testing job to dispatch",
+                [],
+            )
+        return _crew_dispatch_result(
+            message,
+            "dispatched",
+            f"Quark dispatched {len(pending)} leased remote-testing job(s) for Tank pickup",
+            [{"remote_testing": {"pending_jobs": pending, "host_mutation_performed": False}}],
+        )
     if not message.related_limit_id:
         return _crew_dispatch_result(message, "skipped", "Quark needs a related usage limit before scheduling continuation work", [])
     store = SQLiteStore(store_path)

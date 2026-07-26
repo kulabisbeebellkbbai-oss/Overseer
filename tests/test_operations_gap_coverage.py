@@ -1482,6 +1482,55 @@ exit 0
             with self.assertRaises(ValueError):
                 enqueue_remote_test_job_status(root, "lease.secret", "ping", params={"api_key": "do-not-queue"})
 
+    def test_remote_testing_queues_approved_roadex_flow_through_quark_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease = request_remote_testing_lease_status(
+                root,
+                "lease.roadex",
+                "Roadex",
+                "run an approved protected gateway project creation flow",
+                job_types=("roadex.project_creation_flow",),
+            )
+            job = enqueue_remote_test_job_status(
+                root,
+                "lease.roadex",
+                "roadex.project_creation_flow",
+                project="Roadex",
+                params={
+                    "allow_mutation": True,
+                    "require_explicit_user_approval": True,
+                    "project_name": "Example",
+                },
+                base_url="https://roadex.home.arpa:9443",
+                ui_path="/Roadex",
+                gateway_path="/Roadex",
+                mutates=True,
+            )
+
+        self.assertEqual(lease["lease"]["job_types"], ["roadex.project_creation_flow"])
+        self.assertEqual(job["job"]["lease_id"], "lease.roadex")
+        self.assertTrue(job["job"]["mutates"])
+
+    def test_remote_testing_rejects_unapproved_roadex_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_remote_testing_lease_status(
+                root,
+                "lease.roadex",
+                "Roadex",
+                "reject an unapproved project creation flow",
+                job_types=("roadex.project_creation_flow",),
+            )
+            with self.assertRaises(ValueError):
+                enqueue_remote_test_job_status(
+                    root,
+                    "lease.roadex",
+                    "roadex.project_creation_flow",
+                    params={"allow_mutation": True},
+                    mutates=True,
+                )
+
     def test_remote_testing_api_routes_manage_lease_and_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

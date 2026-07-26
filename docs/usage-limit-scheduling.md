@@ -123,3 +123,26 @@ the `192.168.68.xxx` LAN path because MSI may not be on HulaHut. A lease
 authorizes a project batch to queue selected job types for a limited period.
 Quark rejects job parameters that appear to contain secret material and rejects
 mutating jobs unless the job contract includes an explicit disposable fixture.
+
+## Final Answer Remote Testing Hook
+
+The user-scope Codex Stop hook `overseer-quark-remote-testing-hook.py` lets
+Quark coordinate final-answer testing before an implementation answer is
+delivered. When a final answer describes completed UI, protected gateway,
+browser, panel, route, endpoint, API, workflow, performance, or auth work and
+does not already include Quark/Tank evidence, the hook uses the Quark remote
+testing queue to:
+
+- reuse or create a project lease for the current Codex project;
+- enqueue `overseer.full_ui_regression`, `overseer.performance_regression`, or
+  `protected_gateway.request_sequence` as appropriate;
+- record a Quark crew message for traceability when the Overseer store is
+  available;
+- block the final response with a hook prompt so the same thread continues;
+- collect redacted Tank/MSI results on the next stop check and ask the agent to
+  include those results before final delivery.
+
+The hook is intentionally conservative. It skips answers that already include
+Quark remote testing evidence, local-only work, explicit skip wording, or no
+completed UI/gateway/API/browser-facing change. It never queues raw secrets and
+relies on the existing remote testing redaction policy for result summaries.

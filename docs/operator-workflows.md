@@ -698,21 +698,24 @@ be turned into an approval-bound firewall plan.
 8. Do not apply, reload, or enforce firewall changes until human approval is
    present after IDS review.
 
-### Execute Approved Firewall Fixture
+### Execute Approved Firewall Change
 
-Use this when a firewall or source-block plan needs end-to-end execution
-evidence without changing the host firewall.
+Use this when a firewall or source-block plan is ready for fixture proof or
+approved live enforcement.
 
 1. Open Security.
 2. Confirm the plan has an accepted IDS review package, human approval, and an
    approved adapter enablement record.
-3. Fill Execute Firewall Fixture with the exact Plan ID, executor, and
-   `local_fixture` mode.
-4. Click Execute Fixture.
-5. Review Admin execution history and the ignored local manifest under
+3. Fill Execute Firewall with the exact Plan ID and executor.
+4. Select `local_fixture` when the goal is end-to-end evidence without host
+   mutation, or `live` only when approved host enforcement is intended.
+5. Click Execute.
+6. Review backend, command, verification, rollback, Admin execution history, and
+   the ignored local manifest under
    `local-secrets/firewall-executions`.
-6. `live` mode must remain blocked unless a future specific human approval and
-   live executor implementation are present.
+7. Live mode mutates the host firewall only after IDS review, exact plan
+   approval, adapter enablement, backend compatibility, command-boundary
+   validation, and admin policy gates pass.
 
 ### Stage Identity Rotation Request
 

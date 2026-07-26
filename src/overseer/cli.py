@@ -7,8 +7,10 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
+import subprocess
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -28,6 +30,7 @@ from .admin import (
     authorization_required_status,
     cancel_admin_change_plan,
     execute_admin_change_plan,
+    run_admin_command_step,
     missing_admin_change_fields,
     plan_apt_install,
     plan_apt_update,
@@ -3208,6 +3211,7 @@ def plan_admin_change_status(
     compose_residual_scan_finding: Sequence[str] = (),
     health_url: str | None = None,
     backup_label: str | None = None,
+    use_firewalld: bool = False,
 ) -> dict[str, object]:
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
@@ -3244,7 +3248,11 @@ def plan_admin_change_status(
     elif plan_kind == AdminChangeKind.FIREWALL_DENY_TCP:
         if port is None:
             raise ValueError("port is required for firewall_deny_tcp")
-        plan = plan_firewall_deny_tcp(plan_id, port, reason, current_state)
+        plan = (
+            plan_firewalld_deny_tcp(plan_id, port, reason, current_state)
+            if use_firewalld
+            else plan_firewall_deny_tcp(plan_id, port, reason, current_state)
+        )
     elif plan_kind == AdminChangeKind.BLOCK_IP:
         plan = plan_block_ip(plan_id, target, reason, current_state)
     else:
@@ -3323,8 +3331,10 @@ def execute_firewall_change_status(
     mode: str = "local_fixture",
     executed_at: str | None = None,
     policy_profile_path: str | Path | None = None,
+    live_runner=None,
+    backend_override: str | None = None,
 ) -> dict[str, object]:
-    """Execute an approved firewall plan through a non-live fixture adapter."""
+    """Execute an approved firewall plan through Odo's firewall adapter gates."""
 
     if not executed_by.strip():
         raise ValueError("executed_by is required")
@@ -3335,42 +3345,28 @@ def execute_firewall_change_status(
             raise ValueError("admin plan is not a firewall or source-block plan")
     finally:
         store.close()
-    if mode != "local_fixture":
-        result = AdminExecutionResult(
-            id=f"admin.exec.{plan.id}.blocked",
-            plan_id=plan.id,
-            status=AdminExecutionStatus.BLOCKED,
-            summary="live firewall execution is not implemented; use local_fixture until a specific live firewall mutation is approved",
-            command_results=(),
+    if mode not in {"local_fixture", "live"}:
+        raise ValueError("mode must be local_fixture or live")
+    if mode == "live":
+        backend = _detect_firewall_backend(backend_override)
+        compatible, reason = _firewall_backend_compatible(plan, backend)
+        if not compatible:
+            payload = _persist_blocked_firewall_execution(store_path, plan, reason)
+        else:
+            payload = execute_admin_change_status(
+                store_path,
+                plan_id,
+                runner=_live_firewall_runner(backend, live_runner),
+                policy_profile_path=policy_profile_path,
+            )
+    else:
+        backend = _firewall_backend_status("fixture", False, "local fixture does not inspect host firewall")
+        payload = execute_admin_change_status(
+            store_path,
+            plan_id,
+            runner=_local_firewall_fixture_runner(executed_by, executed_at),
+            policy_profile_path=policy_profile_path,
         )
-        store = SQLiteStore(store_path)
-        try:
-            store.save_admin_execution(result)
-            store.save_audit_event(audit_event_from_admin_execution(plan, result))
-        finally:
-            store.close()
-        manifest = _write_firewall_execution_manifest(
-            _project_root_for_store_path(store_path),
-            plan,
-            admin_execution_status(result),
-            mode,
-            executed_by,
-            executed_at,
-        )
-        return {
-            "store": str(Path(store_path)),
-            **admin_execution_status(result),
-            "mode": mode,
-            "manifest_path": manifest["manifest_path"],
-            "firewall_mutation_performed": False,
-            "host_mutation_performed": False,
-        }
-    payload = execute_admin_change_status(
-        store_path,
-        plan_id,
-        runner=_local_firewall_fixture_runner(executed_by, executed_at),
-        policy_profile_path=policy_profile_path,
-    )
     manifest = _write_firewall_execution_manifest(
         _project_root_for_store_path(store_path),
         plan,
@@ -3378,13 +3374,15 @@ def execute_firewall_change_status(
         mode,
         executed_by,
         executed_at,
+        backend,
     )
     return {
         **payload,
         "mode": mode,
+        "firewall_backend": backend,
         "manifest_path": manifest["manifest_path"],
-        "firewall_mutation_performed": False,
-        "host_mutation_performed": False,
+        "firewall_mutation_performed": manifest["firewall_mutation_performed"],
+        "host_mutation_performed": manifest["host_mutation_performed"],
     }
 
 
@@ -3432,6 +3430,111 @@ def _is_supported_firewall_command(command: Sequence[str]) -> bool:
     return False
 
 
+def _persist_blocked_firewall_execution(store_path: str | Path, plan: AdminChangePlan, summary: str) -> dict[str, object]:
+    result = AdminExecutionResult(
+        id=f"admin.exec.{plan.id}.blocked",
+        plan_id=plan.id,
+        status=AdminExecutionStatus.BLOCKED,
+        summary=summary,
+        command_results=(),
+    )
+    store = SQLiteStore(store_path)
+    try:
+        store.save_admin_execution(result)
+        store.save_audit_event(audit_event_from_admin_execution(plan, result))
+    finally:
+        store.close()
+    return {"store": str(Path(store_path)), **admin_execution_status(result)}
+
+
+def _firewall_backend_status(name: str, available: bool, summary: str) -> dict[str, object]:
+    return {"name": name, "available": available, "summary": summary}
+
+
+def _detect_firewall_backend(backend_override: str | None = None) -> dict[str, object]:
+    if backend_override:
+        name = backend_override.strip().lower()
+        if name not in {"ufw", "firewalld", "unsupported"}:
+            raise ValueError("backend_override must be ufw, firewalld, or unsupported")
+        return _firewall_backend_status(name, name != "unsupported", "backend supplied by approved test or operator override")
+    firewalld_unavailable_summary = None
+    if shutil.which("firewall-cmd"):
+        try:
+            completed = subprocess.run(
+                ("firewall-cmd", "--state"),
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            return _firewall_backend_status("firewalld", True, "firewalld is installed and reports a running state")
+        firewalld_unavailable_summary = "firewalld command is installed but not currently usable"
+    if shutil.which("ufw"):
+        summary = "ufw command is installed"
+        if firewalld_unavailable_summary:
+            summary = f"{summary}; {firewalld_unavailable_summary}"
+        return _firewall_backend_status("ufw", True, summary)
+    if firewalld_unavailable_summary:
+        return _firewall_backend_status("firewalld", False, firewalld_unavailable_summary)
+    return _firewall_backend_status("unsupported", False, "no supported live firewall backend detected")
+
+
+def _firewall_backend_compatible(plan: AdminChangePlan, backend: dict[str, object]) -> tuple[bool, str]:
+    if not backend.get("available"):
+        return False, f"live firewall backend unavailable: {backend.get('summary')}"
+    name = str(backend.get("name") or "")
+    commands = tuple(plan.steps) + tuple(plan.rollback_steps) + tuple(plan.verification_steps)
+    unsupported = [step.command for step in commands if not _is_supported_live_firewall_command(step.command, name)]
+    if unsupported:
+        return False, f"live firewall backend {name} is incompatible with approved command boundary"
+    return True, "backend compatible"
+
+
+def _is_supported_live_firewall_command(command: Sequence[str], backend: str) -> bool:
+    if len(command) < 3 or command[0] != "sudo":
+        return False
+    if backend == "ufw":
+        if command[1] != "ufw" or command[2] not in {"allow", "deny", "delete", "status"}:
+            return False
+        if any(part.startswith("-") and part not in {"--dry-run", "--force"} for part in command[3:]):
+            return False
+        return True
+    if backend == "firewalld":
+        if command[1] != "firewall-cmd":
+            return False
+        allowed_literals = {"--permanent", "--reload", "--list-all"}
+        return all(
+            part in allowed_literals
+            or part.startswith("--zone=")
+            or part.startswith("--add-rich-rule=")
+            or part.startswith("--remove-rich-rule=")
+            for part in command[2:]
+        )
+    return False
+
+
+def _live_firewall_runner(backend: dict[str, object], live_runner=None):
+    backend_name = str(backend.get("name") or "")
+
+    def runner(step: AdminCommandStep) -> AdminCommandResult:
+        if not _is_supported_live_firewall_command(step.command, backend_name):
+            return AdminCommandResult(
+                title=step.title,
+                command=step.command,
+                exit_code=2,
+                stderr=f"unsupported live firewall command for backend {backend_name}",
+            )
+        if live_runner is not None:
+            return live_runner(step)
+        return run_admin_command_step(step)
+
+    return runner
+
+
 def _write_firewall_execution_manifest(
     project_root: Path,
     plan: AdminChangePlan,
@@ -3439,16 +3542,20 @@ def _write_firewall_execution_manifest(
     mode: str,
     executed_by: str,
     executed_at: str | None,
+    backend: dict[str, object],
 ) -> dict[str, object]:
+    status = execution_payload.get("status")
+    live_completed = mode == "live" and status == AdminExecutionStatus.COMPLETED.value
     manifest = {
         "schema": "overseer.firewall-execution-manifest.v1",
         "plan_id": plan.id,
         "kind": AdminChangeKind(plan.kind).value,
         "target": plan.target,
         "mode": mode,
+        "backend": backend,
         "executed_by": executed_by,
         "executed_at": executed_at or datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "status": execution_payload.get("status"),
+        "status": status,
         "summary": execution_payload.get("summary"),
         "command_count": len(execution_payload.get("command_results") or []),
         "verification_count": len(execution_payload.get("verification_results") or []),
@@ -3477,9 +3584,9 @@ def _write_firewall_execution_manifest(
             }
             for step in plan.rollback_steps
         ],
-        "host_mutation_performed": False,
-        "firewall_mutation_performed": False,
-        "approval_boundary": "local fixture evidence only; live firewall mutation requires explicit human approval and accepted IDS review",
+        "host_mutation_performed": live_completed,
+        "firewall_mutation_performed": live_completed,
+        "approval_boundary": "live firewall mutation requires accepted IDS review, exact plan approval, live adapter enablement, backend compatibility, command-boundary validation, audit, and rollback evidence",
     }
     manifest_dir = project_root / "local-secrets" / "firewall-executions"
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -8043,6 +8150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--compose-residual-scan-finding", action="append")
     admin_plan_parser.add_argument("--health-url")
     admin_plan_parser.add_argument("--backup-label")
+    admin_plan_parser.add_argument("--use-firewalld", action="store_true", help="stage firewalld-specific firewall_deny_tcp commands")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     approve_admin_parser = subparsers.add_parser("approve-admin-change", help="record approval metadata for an admin change plan")
@@ -9128,6 +9236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.compose_residual_scan_finding or (),
                     args.health_url,
                     args.backup_label,
+                    args.use_firewalld,
                 ),
                 sort_keys=True,
             )

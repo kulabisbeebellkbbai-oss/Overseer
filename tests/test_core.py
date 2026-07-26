@@ -6774,10 +6774,87 @@ class AdminChangePlanTests(unittest.TestCase):
                 "exercise live firewall mode block",
                 "reviewed source",
             )
-            blocked = overseer_cli.execute_firewall_change_status(store_path, plan["id"], "odo", "live")
+            blocked = overseer_cli.execute_firewall_change_status(store_path, plan["id"], "odo", "live", backend_override="ufw")
 
         self.assertEqual(blocked["status"], AdminExecutionStatus.BLOCKED.value)
-        self.assertIn("live firewall execution is not implemented", blocked["summary"])
+        self.assertIn("admin policy", blocked["summary"])
+        self.assertEqual(blocked["firewall_backend"]["name"], "ufw")
+        self.assertFalse(blocked["host_mutation_performed"])
+        self.assertFalse(blocked["firewall_mutation_performed"])
+
+    def test_firewall_live_mode_uses_fake_runner_after_all_gates(self):
+        executed_commands = []
+
+        def fake_live_runner(step):
+            executed_commands.append(step.command)
+            return AdminCommandResult(step.title, step.command, 0, "fake live runner accepted command")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            store_path = state / "overseer.sqlite3"
+            plan = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.firewall.live.fake",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/9443",
+                "exercise approved live Odo firewall runner with fake command execution",
+                "listener exposed",
+                port=9443,
+            )
+            package = overseer_cli.prepare_host_security_ids_review_package_status(store_path, plan["id"])
+            overseer_cli.submit_host_security_ids_review_package_status(store_path, package["id"], "odo")
+            overseer_cli.record_host_security_ids_review_result_status(
+                store_path,
+                package["id"],
+                "accepted",
+                "accepted for fake live runner execution path only",
+                "odo",
+            )
+            enablement = overseer_cli.request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "odo",
+            )
+            overseer_cli.approve_admin_adapter_enablement_status(store_path, enablement["approval_id"], "human")
+            overseer_cli.approve_admin_change_status(store_path, plan["id"], "human")
+            executed = overseer_cli.execute_firewall_change_status(
+                store_path,
+                plan["id"],
+                "odo",
+                "live",
+                live_runner=fake_live_runner,
+                backend_override="ufw",
+            )
+            manifest_exists = (root / executed["manifest_path"]).exists()
+
+        self.assertEqual(executed["status"], AdminExecutionStatus.COMPLETED.value)
+        self.assertEqual(executed["mode"], "live")
+        self.assertEqual(executed["firewall_backend"]["name"], "ufw")
+        self.assertTrue(executed["host_mutation_performed"])
+        self.assertTrue(executed["firewall_mutation_performed"])
+        self.assertTrue(manifest_exists)
+        self.assertEqual(len(executed_commands), 2)
+        self.assertIn("fake live runner accepted command", executed["command_results"][0]["stdout"])
+
+    def test_firewall_live_mode_blocks_backend_incompatible_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.firewall.live.backend.blocked",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/9443",
+                "exercise incompatible backend gate",
+                "listener exposed",
+                port=9443,
+                use_firewalld=True,
+            )
+            blocked = overseer_cli.execute_firewall_change_status(store_path, plan["id"], "odo", "live", backend_override="ufw")
+
+        self.assertEqual(blocked["status"], AdminExecutionStatus.BLOCKED.value)
+        self.assertIn("incompatible", blocked["summary"])
         self.assertFalse(blocked["host_mutation_performed"])
         self.assertFalse(blocked["firewall_mutation_performed"])
 

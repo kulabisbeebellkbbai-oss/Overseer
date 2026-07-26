@@ -145,9 +145,10 @@ Gaps:
 - No file-integrity monitoring view.
 - No vulnerability/CVE finding registry with remediation status.
 - No secrets exposure scan result panel.
-- No live firewall execution runner after IDS review and human approval.
-  Fixture-only execution is available for end-to-end approval evidence without
-  host firewall mutation.
+- Live firewall execution is available through Odo's gated runner after IDS
+  review, human approval, adapter enablement, backend compatibility, and command
+  validation. Remaining work is host-specific enforcement policy tuning,
+  rule-level approvals, and post-enforcement monitoring for real mutations.
 - No containment timeline or recovery checklist.
 
 ### Networking, Gateway, And Proxy Operations

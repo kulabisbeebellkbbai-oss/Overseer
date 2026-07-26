@@ -659,6 +659,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "admin-restore-plan-id",
             "admin-restore-requested-by",
             "admin-target",
+            "admin-use-firewalld",
             "admin-unarchive-approval-id",
             "admin-unarchive-plan-id",
             "admin-unarchived-by",

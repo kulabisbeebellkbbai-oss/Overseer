@@ -74,10 +74,12 @@ The third pass added read-only evidence depth for the remaining gap categories:
   firewall desired-policy diff, desired-policy enforcement staging with IDS
   review package preparation, protective plan provenance, identity/access review,
   SSH key custody hashes, secret-file custody markers, rotation reminders, and
-  staged identity/secret rotation requests. Odo also has fixture-only firewall
+  staged identity/secret rotation requests. Odo also has fixture firewall
+  execution for approval-path evidence and disabled-by-default live firewall
   execution for approved firewall/source-block plans after IDS review, plan
-  approval, and adapter enablement; the fixture persists execution/audit records
-  and ignored local manifests without changing host firewall state.
+  approval, adapter enablement, backend detection, and command-boundary
+  validation; both paths persist execution/audit records and ignored local
+  manifests, and only live mode mutates host firewall state after all gates pass.
 - Kira: mount health, backup/restore markers, backup job registry, restore-test
   records, approved local backup execution, approved isolated restore execution,
   cleanup requests, capacity summary, and cleanup candidates, plus SMART health
@@ -151,9 +153,8 @@ environment-specific policy wiring:
 - deeper privileged/system journal capture policy for any future sudo, group,
   or daemon-privilege escalation. The current runner handles only approved
   bounded reads available to the running Overseer process.
-- live firewall desired-policy execution after IDS review and human approval.
-  Fixture-only execution now verifies the approval path without mutating host
-  firewall state.
+- host-specific live firewall enforcement policy tuning, final rule-level
+  approvals, and post-enforcement monitoring for each real firewall mutation.
 - broader backup provider policy beyond project-local filesystem backup and
   isolated restore execution.
 - VM/container/emulator live adapter depth beyond approved disposable targets:

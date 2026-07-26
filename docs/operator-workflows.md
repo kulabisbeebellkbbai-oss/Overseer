@@ -495,6 +495,38 @@ checkout for an inspect, start, or stop action.
 6. Have Julian validate service health before returning the runtime to service.
 7. Review the preserved path when present before deleting any rollback evidence.
 
+### Stage Virtual Destroy Request
+
+Use this when Dax no longer needs an approved disposable target and the target
+should be removed after evidence preservation.
+
+1. Open Claims.
+2. Review claims, runtime state, target setup evidence, and any active owner.
+3. Click a runtime record or fill Resource ID, Requested By, and Reason.
+4. Click Stage.
+5. Review the staged destroy row and confirm the next step.
+
+### Approve Virtual Destroy Request
+
+1. Open Claims.
+2. Review the staged destroy request, runtime record, provider, target setup
+   evidence, and expected preserved path.
+3. Click the staged destroy request row to fill Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request status changes to approved.
+
+### Execute Virtual Destroy Request
+
+1. Open Claims.
+2. Confirm the destroy request is approved.
+3. Fill Request ID, Executed By, and Provider. Match the provider to the
+   runtime record adapter and approved disposable target.
+4. Click Execute.
+5. Review Virtual Execution Records, manifest path, preserved evidence, and
+   runtime state.
+6. Release the Dax checkout claim after the target is gone.
+
 ### Request A VM, Port, Gateway, Or Device Claim
 
 1. Open Claims.

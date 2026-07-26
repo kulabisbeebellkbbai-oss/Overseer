@@ -113,14 +113,17 @@ from .scheduler import ScheduledWorkStatus, schedule_usage_limited_work
 from .usage_limits import LimitKind, UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 from .virtual_discovery import ListenerVirtualDiscoveryAdapter
 from .virtual_ops import (
+    approve_virtual_destroy_request_status,
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
+    execute_virtual_destroy_request_status,
     execute_virtual_lifecycle_status,
     execute_virtual_target_setup_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
+    stage_virtual_destroy_request_status,
     stage_virtual_target_setup_batch_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
@@ -7439,6 +7442,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_virtual_restore_parser.add_argument("--executed-by", default="dax")
     execute_virtual_restore_parser.add_argument("--provider", default="local_fixture")
     execute_virtual_restore_parser.add_argument("--executed-at")
+    stage_virtual_destroy_parser = subparsers.add_parser("stage-virtual-destroy", help="stage a Dax virtual runtime destroy request")
+    stage_virtual_destroy_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    stage_virtual_destroy_parser.add_argument("--resource-id", required=True)
+    stage_virtual_destroy_parser.add_argument("--requested-by", default="dax")
+    stage_virtual_destroy_parser.add_argument("--reason", default="stage virtual destroy after disposable target is no longer needed")
+    approve_virtual_destroy_parser = subparsers.add_parser("approve-virtual-destroy", help="approve a staged Dax virtual runtime destroy request")
+    approve_virtual_destroy_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    approve_virtual_destroy_parser.add_argument("--request-id", required=True)
+    approve_virtual_destroy_parser.add_argument("--approved-by", default="sisko")
+    approve_virtual_destroy_parser.add_argument("--approved-at")
+    execute_virtual_destroy_parser = subparsers.add_parser("execute-virtual-destroy", help="execute an approved Dax virtual runtime destroy request")
+    execute_virtual_destroy_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    execute_virtual_destroy_parser.add_argument("--request-id", required=True)
+    execute_virtual_destroy_parser.add_argument("--executed-by", default="dax")
+    execute_virtual_destroy_parser.add_argument("--provider", default="local_fixture")
+    execute_virtual_destroy_parser.add_argument("--executed-at")
     stage_backup_cleanup_parser = subparsers.add_parser("stage-backup-cleanup", help="stage a Kira backup cleanup request")
     stage_backup_cleanup_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
     stage_backup_cleanup_parser.add_argument("--path", required=True)
@@ -8260,6 +8279,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 execute_virtual_restore_request_status(args.project_root, args.request_id, args.executed_by, args.provider, args.executed_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "stage-virtual-destroy":
+        print(
+            json.dumps(
+                stage_virtual_destroy_request_status(
+                    args.project_root,
+                    args.resource_id,
+                    args.requested_by,
+                    args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-virtual-destroy":
+        print(
+            json.dumps(
+                approve_virtual_destroy_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-virtual-destroy":
+        print(
+            json.dumps(
+                execute_virtual_destroy_request_status(args.project_root, args.request_id, args.executed_by, args.provider, args.executed_at),
                 sort_keys=True,
             )
         )

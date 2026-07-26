@@ -228,9 +228,9 @@ discovery, leases, release, cleanup, runtime state records, staged
 snapshot/restore requests, approved `local_fixture` workflow execution,
 `qemu_img` qcow2 snapshot/restore, stopped `qemu_process` and `libvirt`
 image-backed snapshot/restore, Docker/Podman container export/import
-snapshot/restore, file-backed Renode/proxy snapshot/restore, and approved
-disposable Android AVD directory snapshot/restore with manifests under
-`local-secrets`.
+snapshot/restore, file-backed Renode/proxy snapshot/restore, approved
+disposable destroy, and approved disposable Android AVD directory
+snapshot/restore/destroy with manifests under `local-secrets`.
 
 Gaps:
 
@@ -240,9 +240,9 @@ Gaps:
   block-I/O fields when stats are available, virsh domain state, qemu image
   metadata, qemu process, Android Emulator, Renode, and gateway/proxy depth rows,
   plus capacity and image provenance review summaries.
-- No approved running-domain libvirt snapshot policy, VirtualBox provider,
-  destroy action, or generalized snapshot/restore for non-disposable targets.
-  Provider snapshot/restore is intentionally limited to approved disposable
+- No approved running-domain libvirt snapshot policy or generalized
+  snapshot/restore/destroy for non-disposable targets. Provider
+  snapshot/restore/destroy is intentionally limited to approved disposable
   targets and stopped image-backed runtime state.
 - Container image vulnerability scanning still needs a scanner/policy choice.
   Dax now surfaces image provenance review rows that identify local versus

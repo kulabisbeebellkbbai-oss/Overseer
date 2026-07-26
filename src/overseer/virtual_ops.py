@@ -1,4 +1,4 @@
-"""Staged virtual runtime, snapshot, and restore records for Dax."""
+"""Staged virtual runtime, snapshot, restore, and destroy records for Dax."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ def virtual_operations_status(project_root: str | Path) -> dict[str, object]:
         "snapshot_request_count": len(data["snapshot_requests"]),
         "restore_requests": data["restore_requests"],
         "restore_request_count": len(data["restore_requests"]),
+        "destroy_requests": data["destroy_requests"],
+        "destroy_request_count": len(data["destroy_requests"]),
         "execution_records": data["execution_records"],
         "execution_record_count": len(data["execution_records"]),
         "target_setup_requests": data["target_setup_requests"],
@@ -127,6 +129,36 @@ def stage_virtual_restore_request_status(
     _upsert(data["restore_requests"], row)
     _write_registry(root, data)
     return {"restore_request": row, "mutation_performed": True, "host_mutation_performed": False}
+
+
+def stage_virtual_destroy_request_status(
+    project_root: str | Path,
+    resource_id: str,
+    requested_by: str = "dax",
+    reason: str = "stage virtual destroy after disposable target is no longer needed",
+) -> dict[str, object]:
+    root = Path(project_root)
+    data = _read_registry(root)
+    now = _now()
+    row = {
+        "id": f"virtual-destroy.{_safe_id(resource_id)}",
+        "resource_id": _safe_id(resource_id),
+        "requested_by": requested_by,
+        "reason": reason,
+        "status": "waiting_approval",
+        "approval_required": True,
+        "created_at": now,
+        "updated_at": now,
+        "guardrails": [
+            "verify checkout claim and owner before deletion",
+            "preserve disposable target evidence before removing runtime state",
+            "destroy only Dax-registered disposable VM, container, emulator, gateway, or proxy targets",
+        ],
+        "next_step": "human approval required before invoking VM, container, emulator, gateway, or proxy destroy adapters",
+    }
+    _upsert(data["destroy_requests"], row)
+    _write_registry(root, data)
+    return {"destroy_request": row, "mutation_performed": True, "host_mutation_performed": False}
 
 
 def stage_virtual_target_setup_batch_status(
@@ -395,6 +427,33 @@ def approve_virtual_restore_request_status(
     return {"restore_request": row, "mutation_performed": True, "host_mutation_performed": False}
 
 
+def approve_virtual_destroy_request_status(
+    project_root: str | Path,
+    request_id: str,
+    approved_by: str = "sisko",
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    if not approved_by.strip():
+        raise ValueError("approved_by is required")
+    root = Path(project_root)
+    data = _read_registry(root)
+    row = _find_request(data, "destroy_requests", request_id, "virtual-destroy")
+    if row.get("status") not in {"waiting_approval", "blocked"}:
+        raise ValueError(f"destroy request is not approvable: {row.get('status')}")
+    now = approved_at or _now()
+    row.update(
+        {
+            "status": "approved",
+            "approved_by": approved_by,
+            "approved_at": now,
+            "updated_at": now,
+            "next_step": "execute approved virtual destroy after checkout, evidence-preservation, provider, and target validation",
+        }
+    )
+    _write_registry(root, data)
+    return {"destroy_request": row, "mutation_performed": True, "host_mutation_performed": False}
+
+
 def execute_virtual_snapshot_request_status(
     project_root: str | Path,
     request_id: str,
@@ -479,6 +538,57 @@ def execute_virtual_restore_request_status(
     }
 
 
+def execute_virtual_destroy_request_status(
+    project_root: str | Path,
+    request_id: str,
+    executed_by: str = "dax",
+    provider: str = "local_fixture",
+    executed_at: str | None = None,
+) -> dict[str, object]:
+    if not executed_by.strip():
+        raise ValueError("executed_by is required")
+    root = Path(project_root)
+    data = _read_registry(root)
+    row = _find_request(data, "destroy_requests", request_id, "virtual-destroy")
+    now = executed_at or _now()
+    try:
+        _validate_request_ready(row, "destroy")
+        runtime = _find_runtime_record(data, str(row.get("resource_id") or ""))
+        manifest = _execute_destroy(root, row, runtime, provider, now)
+        runtime.update(
+            {
+                "state": "destroyed",
+                "updated_at": now,
+                "last_lifecycle_action": "destroy",
+                "last_lifecycle_at": now,
+                "next_step": "destroy completed; release any remaining claim and remove stale documentation references",
+            }
+        )
+    except ValueError as error:
+        return _record_blocked_execution(root, data, row, "destroy", request_id, executed_by, now, str(error))
+    except OSError as error:
+        return _record_failed_execution(root, data, row, "destroy", request_id, executed_by, now, str(error))
+    row.update(
+        {
+            "status": "completed",
+            "executed_by": executed_by,
+            "executed_at": now,
+            "updated_at": now,
+            "manifest_path": manifest["manifest_path"],
+            "next_step": "destroy completed; verify cleanup evidence and release the Dax checkout claim",
+        }
+    )
+    _append_execution(data, row, "destroy", request_id, executed_by, now, "completed", provider, manifest=manifest)
+    _write_registry(root, data)
+    return {
+        "destroy_request": row,
+        "status": "completed",
+        "manifest": manifest,
+        "mutation_performed": True,
+        "host_mutation_performed": provider != "local_fixture",
+    }
+
+
 def execute_virtual_lifecycle_status(
     project_root: str | Path,
     resource_id: str,
@@ -553,15 +663,16 @@ def _registry_path(root: Path) -> Path:
 def _read_registry(root: Path) -> dict[str, list[dict[str, object]]]:
     path = _registry_path(root)
     if not path.exists():
-        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "execution_records": [], "target_setup_requests": []}
+        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "destroy_requests": [], "execution_records": [], "target_setup_requests": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "execution_records": [], "target_setup_requests": []}
+        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "destroy_requests": [], "execution_records": [], "target_setup_requests": []}
     return {
         "runtime_records": list(data.get("runtime_records") or []),
         "snapshot_requests": list(data.get("snapshot_requests") or []),
         "restore_requests": list(data.get("restore_requests") or []),
+        "destroy_requests": list(data.get("destroy_requests") or []),
         "execution_records": list(data.get("execution_records") or []),
         "target_setup_requests": list(data.get("target_setup_requests") or []),
     }
@@ -1068,6 +1179,99 @@ def _execute_restore(root: Path, row: dict[str, object], runtime: dict[str, obje
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(restore_point, target)
     return _write_manifest(root, row, "restore", provider, restore_point, target, executed_at, preserved=preserved)
+
+
+def _execute_destroy(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    if provider in {"docker", "podman"}:
+        return _execute_container_destroy(root, row, runtime, provider, executed_at)
+    if provider == "libvirt":
+        return _execute_libvirt_destroy(root, row, runtime, executed_at)
+    if provider == "qemu_process":
+        return _execute_process_backed_destroy(root, row, runtime, "qemu_process", executed_at)
+    if provider in {"renode", "gateway_proxy"}:
+        return _execute_process_backed_destroy(root, row, runtime, provider, executed_at)
+    if provider == "android_emulator":
+        return _execute_android_emulator_destroy(root, row, runtime, executed_at)
+    if provider == "qemu_img":
+        return _execute_file_destroy(root, row, runtime, provider, executed_at, _qemu_image_target(root, runtime))
+    if provider != "local_fixture":
+        raise ValueError(f"virtual provider is not implemented for live execution: {provider}")
+    return _execute_file_destroy(root, row, runtime, provider, executed_at, _fixture_target(root, runtime))
+
+
+def _execute_container_destroy(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    output = _container_provider_command(provider, ("rm", "-f", str(runtime["resource_id"])), timeout=20.0, check=False)
+    return _write_manifest(root, row, "destroy", provider, Path(str(runtime["resource_id"])), Path(str(runtime["resource_id"])), executed_at, provider_metadata={"output": output[-500:]})
+
+
+def _execute_libvirt_destroy(root: Path, row: dict[str, object], runtime: dict[str, object], executed_at: str) -> dict[str, object]:
+    provider = "libvirt"
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    name = str(runtime["resource_id"])
+    outputs: list[str] = []
+    state = _libvirt_state(name)
+    if state == "running":
+        outputs.append(_run_provider_command(("virsh", "destroy", name), timeout=20.0, check=False))
+    outputs.append(_run_provider_command(("virsh", "undefine", name), timeout=20.0, check=False))
+    hint = str(runtime.get("snapshot_hint") or "")
+    preserved = None
+    if hint:
+        target = _project_relative_path(root, hint)
+        allowed = (root / "local-secrets" / "virtual-runtime-targets").resolve()
+        if target.exists() and (target == allowed or allowed in target.parents):
+            preserved = _preserve_destroy_target(root, target, str(row["resource_id"]), executed_at)
+            _remove_path(target)
+    return _write_manifest(root, row, "destroy", provider, Path(name), Path(name), executed_at, preserved=preserved, provider_metadata={"output": "\n".join(outputs)[-500:]})
+
+
+def _execute_process_backed_destroy(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    result = _execute_lifecycle_provider(root, runtime, provider, "stop")
+    target = _file_backed_target(root, runtime, provider)
+    return _execute_file_destroy(root, row, runtime, provider, executed_at, target, provider_metadata={"stop_result": result})
+
+
+def _execute_android_emulator_destroy(root: Path, row: dict[str, object], runtime: dict[str, object], executed_at: str) -> dict[str, object]:
+    provider = "android_emulator"
+    _validate_lifecycle_runtime(root, runtime, provider)
+    _validate_runtime_adapter(runtime, provider)
+    avdmanager = _android_tool("avdmanager")
+    if avdmanager is None:
+        raise ValueError("avdmanager is not available")
+    target = _file_backed_target(root, runtime, provider)
+    preserved = _preserve_destroy_target(root, target, str(row["resource_id"]), executed_at)
+    output = _run_provider_command((avdmanager, "delete", "avd", "-n", str(runtime["resource_id"])), timeout=20.0, check=False)
+    return _write_manifest(root, row, "destroy", provider, target, target, executed_at, preserved=preserved, provider_metadata={"output": output[-500:]})
+
+
+def _execute_file_destroy(
+    root: Path,
+    row: dict[str, object],
+    runtime: dict[str, object],
+    provider: str,
+    executed_at: str,
+    target: Path,
+    provider_metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if provider != "local_fixture":
+        _validate_lifecycle_runtime(root, runtime, provider)
+        _validate_runtime_adapter(runtime, provider)
+    preserved = _preserve_destroy_target(root, target, str(row["resource_id"]), executed_at)
+    _remove_path(target)
+    return _write_manifest(root, row, "destroy", provider, target, target, executed_at, preserved=preserved, provider_metadata=provider_metadata)
+
+
+def _preserve_destroy_target(root: Path, target: Path, resource_id: str, executed_at: str) -> Path:
+    preserved = root / "local-secrets" / "virtual-runtime-preserved" / _safe_id(resource_id) / f"destroy-{_safe_id(executed_at)}"
+    if preserved.exists():
+        _remove_path(preserved)
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    _copy_path(target, preserved / target.name)
+    return preserved
 
 
 def _execute_container_snapshot(root: Path, row: dict[str, object], runtime: dict[str, object], provider: str, executed_at: str) -> dict[str, object]:
@@ -1578,6 +1782,7 @@ def _android_tool(name: str) -> str | None:
     candidates = {
         "emulator": home / "emulator" / "emulator",
         "adb": home / "platform-tools" / "adb",
+        "avdmanager": home / "cmdline-tools" / "latest" / "bin" / "avdmanager",
     }
     candidate = candidates.get(name)
     if candidate and candidate.exists():

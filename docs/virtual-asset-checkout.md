@@ -134,6 +134,7 @@ Protected gateway routes:
 - `GET /Overseer/virtual/operations`
 - `POST /Overseer/virtual/target-setup-requests`
 - `POST /Overseer/virtual/target-setup-requests/result`
+- `POST /Overseer/virtual/target-setup-requests/execute`
 - `POST /Overseer/virtual/runtime-records`
 - `POST /Overseer/virtual/lifecycle/execute`
 - `POST /Overseer/virtual/snapshot-requests`
@@ -142,6 +143,9 @@ Protected gateway routes:
 - `POST /Overseer/virtual/restore-requests`
 - `POST /Overseer/virtual/restore-requests/approve`
 - `POST /Overseer/virtual/restore-requests/execute`
+- `POST /Overseer/virtual/destroy-requests`
+- `POST /Overseer/virtual/destroy-requests/approve`
+- `POST /Overseer/virtual/destroy-requests/execute`
 
 Operator controls live on the Claims page:
 
@@ -259,6 +263,16 @@ PYTHONPATH=src python3 -m overseer.cli record-virtual-target-setup-result --proj
 Completion records clear the target setup approval requirement for that
 provider. Blocked, failed, and partial records keep approval required and surface
 the supplied evidence as the next resolution target.
+
+Approved destroy execution uses the same staged request model as snapshot and
+restore. Dax preserves local fixture and file-backed target evidence before
+removing disposable targets, and blocks non-disposable resources:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli stage-virtual-destroy --project-root . --resource-id overseer-dax-disposable-proxy
+PYTHONPATH=src python3 -m overseer.cli approve-virtual-destroy --project-root . --request-id virtual-destroy.overseer-dax-disposable-proxy --approved-by sisko
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-destroy --project-root . --request-id virtual-destroy.overseer-dax-disposable-proxy --provider gateway_proxy
+```
 
 ## Read-Only Provider Inventory
 

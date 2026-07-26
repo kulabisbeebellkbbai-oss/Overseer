@@ -47,6 +47,9 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /virtual/operations`
 - `POST /virtual/target-setup-requests`
 - `POST /virtual/target-setup-requests/execute`
+- `POST /virtual/destroy-requests`
+- `POST /virtual/destroy-requests/approve`
+- `POST /virtual/destroy-requests/execute`
 - `GET /observability/metric-history`
 - `GET /observability/performance-history`
 - `GET /health-summary`
@@ -190,15 +193,17 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /physical/discover` reads configured physical path roots, persists discovered serial/USB identities for Kira, and creates checkout-ready physical resources. Optional field: `roots`, either a string or list of strings. When omitted it checks `/dev/serial/by-id` and `/dev/serial/by-path`. It does not open devices, change permissions, mount storage, or write to hardware.
 `POST /physical/discover-storage` reads sysfs block-device metadata and persists discovered storage identities for Kira. Optional field: `sysfs_block_root`. It does not mount, unmount, format, partition, or write to devices.
 `POST /virtual/discover-listeners` reads local TCP listener evidence and persists discovered listener resources for Dax. It does not change firewall rules, routes, processes, service definitions, proxies, or network bindings.
-`GET /virtual/operations` returns Dax's local virtual runtime records plus staged snapshot and restore requests from ignored state.
+`GET /virtual/operations` returns Dax's local virtual runtime records plus staged snapshot, restore, destroy, execution, and target setup records from ignored state.
 `POST /virtual/target-setup-requests` stages approval-required Dax target setup requests for disposable real-provider targets. It writes planning records only and does not install packages, change groups, create containers, define VMs, start processes, bind ports, or write gateway configs.
 `POST /virtual/target-setup-requests/execute` executes one approved Dax provider target setup with `provider`, `approved_by`, and optional `executed_by` or `executed_at`. It creates only approved disposable targets, uses no-network or loopback-only containment where applicable, writes a local manifest, and records blocked evidence when a provider dependency is missing.
 `POST /virtual/runtime-records` records observed virtual runtime state for a VM, container, emulator, gateway, or proxy. It does not start, stop, snapshot, restore, destroy, or reconfigure the runtime.
 `POST /virtual/lifecycle/execute` executes an approved disposable Dax runtime lifecycle action. Required fields: `resource_id` and `action` (`inspect`, `start`, or `stop`). Optional fields: `provider`, `executed_by`, and `executed_at`. It blocks non-disposable records and unsupported providers, writes a lifecycle manifest, and limits mutation to the named disposable target.
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/snapshot-requests/execute`.
 `POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/restore-requests/execute`.
+`POST /virtual/destroy-requests` stages a Dax destroy request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/destroy-requests/execute`.
 `POST /virtual/snapshot-requests/execute` executes only an approved Dax snapshot request against `local_fixture`, `qemu_img`, `qemu_process`, stopped `libvirt`, `docker`, `podman`, `renode`, approved disposable `android_emulator`, or `gateway_proxy` provider targets and writes a manifest under ignored local state.
 `POST /virtual/restore-requests/execute` executes only an approved Dax restore request against the same provider set, preserving rollback evidence where supported and blocking non-disposable or unsafe targets.
+`POST /virtual/destroy-requests/execute` executes only an approved Dax destroy request against disposable `local_fixture`, `qemu_img`, `qemu_process`, `libvirt`, `docker`, `podman`, `renode`, approved disposable `android_emulator`, or `gateway_proxy` provider targets. It preserves local fixture and file-backed target evidence before removal and blocks non-disposable or unsafe targets.
 `POST /storage/cleanup-requests/approve` approves a staged Kira backup cleanup request without deleting files.
 `POST /storage/cleanup-requests/execute` executes only an approved Kira cleanup request for project-relative `artifacts/` or `backups/` paths, writes a local cleanup manifest, and blocks unsafe absolute, traversal, missing, or unapproved targets.
 `GET /maintenance-summary` returns O'Brien's compact view of maintenance targets, install/update/upgrade/restart plans, pending approvals, rollback and verification readiness, and execution results.

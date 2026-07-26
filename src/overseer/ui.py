@@ -924,6 +924,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "stage-virtual-restore-request") return await stageVirtualRestoreRequest();
       if (action === "approve-virtual-restore-request") return await approveVirtualRestoreRequest();
       if (action === "execute-virtual-restore-request") return await executeVirtualRestoreRequest();
+      if (action === "stage-virtual-destroy-request") return await stageVirtualDestroyRequest();
+      if (action === "approve-virtual-destroy-request") return await approveVirtualDestroyRequest();
+      if (action === "execute-virtual-destroy-request") return await executeVirtualDestroyRequest();
       if (action === "record-backup-job") return await recordBackupJob();
       if (action === "record-restore-test") return await recordRestoreTest();
       if (action === "stage-backup-cleanup-request") return await stageBackupCleanupRequest();
@@ -1130,6 +1133,26 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         request_id: value("restore-virtual-request-id"),
         executed_by: value("restore-virtual-executed-by") || "dax",
         provider: value("restore-virtual-provider") || "local_fixture"
+      });
+    }
+    async function stageVirtualDestroyRequest() {
+      return await postJson("/virtual/destroy-requests", {
+        resource_id: value("destroy-virtual-resource-id"),
+        requested_by: value("destroy-virtual-requested-by") || "dax",
+        reason: value("destroy-virtual-reason") || "stage virtual destroy after disposable target is no longer needed"
+      });
+    }
+    async function approveVirtualDestroyRequest() {
+      return await postJson("/virtual/destroy-requests/approve", {
+        request_id: value("destroy-virtual-request-id"),
+        approved_by: value("destroy-virtual-approved-by") || "sisko"
+      });
+    }
+    async function executeVirtualDestroyRequest() {
+      return await postJson("/virtual/destroy-requests/execute", {
+        request_id: value("destroy-virtual-request-id"),
+        executed_by: value("destroy-virtual-executed-by") || "dax",
+        provider: value("destroy-virtual-provider") || "local_fixture"
       });
     }
     async function requestClaim() {
@@ -2111,12 +2134,25 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-12"><label for="restore-virtual-reason">Reason</label><input id="restore-virtual-reason" value="stage virtual restore after failed change"></div>
             </div>
           </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Virtual Destroy Request</h3><div class="actions"><button class="action-btn" data-action="stage-virtual-destroy-request">Stage</button><button class="action-btn" data-action="approve-virtual-destroy-request">Approve</button><button class="action-btn" data-action="execute-virtual-destroy-request">Execute</button></div></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="destroy-virtual-request-id">Request ID</label><input id="destroy-virtual-request-id"></div>
+              <div class="field span-6"><label for="destroy-virtual-resource-id">Resource ID</label><input id="destroy-virtual-resource-id" value="vm.local.resource"></div>
+              <div class="field span-3"><label for="destroy-virtual-requested-by">Requested By</label><input id="destroy-virtual-requested-by" value="dax"></div>
+              <div class="field span-3"><label for="destroy-virtual-approved-by">Approved By</label><input id="destroy-virtual-approved-by" value="sisko"></div>
+              <div class="field span-3"><label for="destroy-virtual-executed-by">Executed By</label><input id="destroy-virtual-executed-by" value="dax"></div>
+              <div class="field span-3"><label for="destroy-virtual-provider">Provider</label><input id="destroy-virtual-provider" value="local_fixture"></div>
+              <div class="field span-12"><label for="destroy-virtual-reason">Reason</label><input id="destroy-virtual-reason" value="stage virtual destroy after disposable target is no longer needed"></div>
+            </div>
+          </div>
           <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"], {fills: {id: (row) => claimFill(row.id), resource_id: (row) => resourceClaimFill(row.resource_id, row.owner_role || "dax")}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"], {fills: {id: (row) => cleanupFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Runtime Evidence", virtualEvidence.items || [], ["resource_id", "kind", "state", "ports", "active_claims", "snapshot_status", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Runtime Records", virtualOperations.runtime_records || virtualEvidence.runtime_records || [], ["resource_id", "kind", "state", "adapter", "ports", "next_step"], {fills: {resource_id: (row) => virtualRuntimeFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-6">${table("Virtual Snapshot Requests", virtualOperations.snapshot_requests || virtualEvidence.snapshot_requests || [], ["id", "resource_id", "status", "approved_by", "next_step"], {fills: {id: (row) => virtualSnapshotFill(row), resource_id: (row) => virtualSnapshotFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-6">${table("Virtual Restore Requests", virtualOperations.restore_requests || virtualEvidence.restore_requests || [], ["id", "resource_id", "restore_point", "status", "approved_by"], {fills: {id: (row) => virtualRestoreFill(row), resource_id: (row) => virtualRestoreFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Virtual Destroy Requests", virtualOperations.destroy_requests || [], ["id", "resource_id", "status", "approved_by", "next_step"], {fills: {id: (row) => virtualDestroyFill(row), resource_id: (row) => virtualDestroyFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Execution Records", virtualOperations.execution_records || [], ["id", "request_id", "resource_id", "action", "status", "provider", "manifest_path"])}</div>
           <div class="panel span-12">${table("Target Setup Requests", virtualOperations.target_setup_requests || [], ["id", "provider", "target_name", "status", "approval_required", "current_state", "proposed_state", "next_step"])}</div>
           <div class="panel span-12">${table("Runtime Adapter Availability", virtualEvidence.runtime_adapters || [], ["adapter", "available", "status", "mutation_boundary"])}</div>
@@ -2629,6 +2665,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Stage virtual restore request", page: "Claims", owner: "Dax", action: "stage-virtual-restore-request", source, query: "Stage virtual restore request"},
         {workflow: "Approve virtual restore request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-restore-request", source, query: "Approve virtual restore request"},
         {workflow: "Execute virtual restore request", page: "Claims", owner: "Dax", action: "execute-virtual-restore-request", source, query: "Execute virtual restore request"},
+        {workflow: "Stage virtual destroy request", page: "Claims", owner: "Dax", action: "stage-virtual-destroy-request", source, query: "Stage virtual destroy request"},
+        {workflow: "Approve virtual destroy request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-destroy-request", source, query: "Approve virtual destroy request"},
+        {workflow: "Execute virtual destroy request", page: "Claims", owner: "Dax", action: "execute-virtual-destroy-request", source, query: "Execute virtual destroy request"},
         {workflow: "Request a VM, port, gateway, or device claim", page: "Claims", owner: "Dax", action: "request-claim", source, query: "Request a VM port gateway or device claim"},
         {workflow: "Approve a resource claim", page: "Claims", owner: "Sisko / Dax", action: "approve-claim", source, query: "Approve a resource claim"},
         {workflow: "Activate an approved claim", page: "Claims", owner: "Dax", action: "activate-claim", source, query: "Activate an approved claim"},
@@ -2911,7 +2950,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "virtual-snapshot-hint": row?.snapshot_hint || row?.snapshot_path || "",
         "virtual-notes": row?.notes || row?.next_step || "",
         "snapshot-resource-id": row?.resource_id || "",
-        "restore-virtual-resource-id": row?.resource_id || ""
+        "restore-virtual-resource-id": row?.resource_id || "",
+        "destroy-virtual-resource-id": row?.resource_id || ""
       };
     }
     function virtualSnapshotFill(row) {
@@ -2934,6 +2974,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "restore-virtual-reason": row?.reason || row?.next_step || "stage virtual restore after failed change",
         "restore-virtual-approved-by": row?.approved_by || "sisko",
         "restore-virtual-executed-by": row?.executed_by || "dax"
+      };
+    }
+    function virtualDestroyFill(row) {
+      return {
+        "destroy-virtual-request-id": row?.id || "",
+        "destroy-virtual-resource-id": row?.resource_id || "",
+        "destroy-virtual-reason": row?.reason || row?.next_step || "stage virtual destroy after disposable target is no longer needed",
+        "destroy-virtual-approved-by": row?.approved_by || "sisko",
+        "destroy-virtual-executed-by": row?.executed_by || "dax"
       };
     }
     function claimFill(claimId) {

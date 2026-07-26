@@ -44,14 +44,17 @@ from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
 from overseer.virtual_evidence import parse_docker_ps_json_lines, parse_podman_ps_json, virtual_evidence_status
 from overseer.virtual_ops import (
+    approve_virtual_destroy_request_status,
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
+    execute_virtual_destroy_request_status,
     execute_virtual_lifecycle_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     execute_virtual_target_setup_status,
     record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
+    stage_virtual_destroy_request_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
     stage_virtual_target_setup_batch_status,
@@ -517,6 +520,37 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertTrue(restore_manifest_exists)
         self.assertEqual(status["execution_record_count"], 2)
 
+    def test_virtual_destroy_executes_against_local_fixture_with_preserved_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "vm.fixture"
+            target.mkdir(parents=True)
+            (target / "state.txt").write_text("ready to remove\n", encoding="utf-8")
+            record_virtual_runtime_status(
+                root,
+                "vm.fixture",
+                kind="vm",
+                state="stopped",
+                adapter="local_fixture",
+                snapshot_hint="local-secrets/virtual-runtime-targets/vm.fixture",
+            )
+            staged = stage_virtual_destroy_request_status(root, "vm.fixture")
+            approved = approve_virtual_destroy_request_status(root, staged["destroy_request"]["id"], "sisko")
+            destroyed = execute_virtual_destroy_request_status(root, staged["destroy_request"]["id"], "dax")
+            status = virtual_operations_status(root)
+            preserved = root / destroyed["manifest"]["preserved"] / "vm.fixture" / "state.txt"
+            preserved_text = preserved.read_text(encoding="utf-8")
+
+        self.assertEqual(staged["destroy_request"]["status"], "waiting_approval")
+        self.assertEqual(approved["destroy_request"]["status"], "approved")
+        self.assertEqual(destroyed["status"], "completed")
+        self.assertFalse(destroyed["host_mutation_performed"])
+        self.assertEqual(destroyed["manifest"]["action"], "destroy")
+        self.assertFalse(target.exists())
+        self.assertEqual(preserved_text, "ready to remove\n")
+        self.assertEqual(status["destroy_requests"][0]["status"], "completed")
+        self.assertEqual(status["runtime_records"][0]["state"], "destroyed")
+
     @unittest.skipIf(shutil.which("qemu-img") is None or shutil.which("qemu-io") is None, "qemu-img and qemu-io are required")
     def test_virtual_snapshot_and_restore_execute_against_disposable_qemu_image(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -761,6 +795,45 @@ exit 0
         self.assertIn("disposable", unsafe["summary"])
         self.assertEqual(unsupported["status"], "blocked")
         self.assertIn("not implemented", unsupported["summary"])
+
+    def test_virtual_destroy_blocks_unapproved_non_disposable_or_unknown_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "local-secrets" / "virtual-runtime-targets" / "vm.fixture"
+            target.mkdir(parents=True)
+            record_virtual_runtime_status(
+                root,
+                "vm.fixture",
+                kind="vm",
+                state="stopped",
+                adapter="local_fixture",
+                snapshot_hint="local-secrets/virtual-runtime-targets/vm.fixture",
+            )
+            staged = stage_virtual_destroy_request_status(root, "vm.fixture")
+            unapproved = execute_virtual_destroy_request_status(root, staged["destroy_request"]["id"], "dax")
+            record_virtual_runtime_status(root, "production-vm", kind="vm", state="running", adapter="libvirt")
+            staged_unsafe = stage_virtual_destroy_request_status(root, "production-vm")
+            approve_virtual_destroy_request_status(root, staged_unsafe["destroy_request"]["id"], "sisko")
+            unsafe = execute_virtual_destroy_request_status(root, staged_unsafe["destroy_request"]["id"], "dax", provider="libvirt")
+            record_virtual_runtime_status(
+                root,
+                "overseer-dax-disposable-unknown",
+                kind="vm",
+                state="stopped",
+                adapter="unknown",
+                snapshot_hint="local-secrets/virtual-runtime-targets/unknown",
+                notes="approved disposable target",
+            )
+            staged_unknown = stage_virtual_destroy_request_status(root, "overseer-dax-disposable-unknown")
+            approve_virtual_destroy_request_status(root, staged_unknown["destroy_request"]["id"], "sisko")
+            unknown = execute_virtual_destroy_request_status(root, staged_unknown["destroy_request"]["id"], "dax", provider="unknown")
+
+        self.assertEqual(unapproved["status"], "blocked")
+        self.assertIn("must be approved", unapproved["summary"])
+        self.assertEqual(unsafe["status"], "blocked")
+        self.assertIn("disposable", unsafe["summary"])
+        self.assertEqual(unknown["status"], "blocked")
+        self.assertIn("not implemented", unknown["summary"])
 
     def test_virtual_evidence_detects_port_conflicts_and_cleanup_candidates(self):
         with tempfile.TemporaryDirectory() as directory:

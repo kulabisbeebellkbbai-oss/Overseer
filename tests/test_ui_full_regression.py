@@ -150,6 +150,7 @@ ACTION_ROUTES = {
     "approve-policy-warning": ("POST", "/admin/policy-warning-requests/approve"),
     "approve-virtual-restore-request": ("POST", "/virtual/restore-requests/approve"),
     "approve-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/approve"),
+    "approve-virtual-destroy-request": ("POST", "/virtual/destroy-requests/approve"),
     "archive-admin-history": ("POST", "/admin/history-archive"),
     "build-policy-profile": ("POST", "/admin/policy-customization-helper/profile"),
     "cancel-admin-change": ("POST", "/admin/cancel"),
@@ -171,6 +172,7 @@ ACTION_ROUTES = {
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
     "execute-virtual-lifecycle": ("POST", "/virtual/lifecycle/execute"),
     "execute-virtual-target-setup": ("POST", "/virtual/target-setup-requests/execute"),
+    "execute-virtual-destroy-request": ("POST", "/virtual/destroy-requests/execute"),
     "execute-virtual-restore-request": ("POST", "/virtual/restore-requests/execute"),
     "execute-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/execute"),
     "export-ids-review-prompt": ("POST", "/host/security/ids-review-packages/prompts"),
@@ -216,6 +218,7 @@ ACTION_ROUTES = {
     "stage-virtual-target-setup-batch": ("POST", "/virtual/target-setup-requests"),
     "stage-virtual-restore-request": ("POST", "/virtual/restore-requests"),
     "stage-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests"),
+    "stage-virtual-destroy-request": ("POST", "/virtual/destroy-requests"),
     "transition-operation": ("POST", "/operations/records/transition"),
     "unarchive-admin-history": ("POST", "/admin/history-unarchive"),
 }
@@ -377,6 +380,20 @@ SAFE_POST_PAYLOADS = {
     },
     "/virtual/restore-requests/execute": {
         "request_id": "virtual-restore.vm.ui.full",
+        "executed_by": "dax",
+        "provider": "local_fixture",
+    },
+    "/virtual/destroy-requests": {
+        "resource_id": "vm.ui.full",
+        "requested_by": "dax",
+        "reason": "exercise disposable virtual destroy staging workflow",
+    },
+    "/virtual/destroy-requests/approve": {
+        "request_id": "virtual-destroy.vm.ui.full",
+        "approved_by": "sisko",
+    },
+    "/virtual/destroy-requests/execute": {
+        "request_id": "virtual-destroy.vm.ui.full",
         "executed_by": "dax",
         "provider": "local_fixture",
     },
@@ -746,6 +763,13 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "usage-resume-codex-projects",
             "usage-risk",
             "usage-window",
+            "destroy-virtual-approved-by",
+            "destroy-virtual-executed-by",
+            "destroy-virtual-provider",
+            "destroy-virtual-reason",
+            "destroy-virtual-request-id",
+            "destroy-virtual-requested-by",
+            "destroy-virtual-resource-id",
             "virtual-adapter",
             "virtual-kind",
             "virtual-notes",
@@ -770,6 +794,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("crew-card", OPERATOR_CONSOLE_HTML)
         self.assertIn("Resource Registry", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Virtual Destroy Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Target Setup Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Runtime Provider Inventory", OPERATOR_CONSOLE_HTML)
         self.assertIn("Account Repositories", OPERATOR_CONSOLE_HTML)
@@ -824,6 +849,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Stage virtual restore request",
             "Approve virtual restore request",
             "Execute virtual restore request",
+            "Stage virtual destroy request",
+            "Approve virtual destroy request",
+            "Execute virtual destroy request",
             "Stage system journal access request",
             "Capture metric history snapshot",
             "Check an exhausted limit refresh",
@@ -929,6 +957,19 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                     "/Overseer/virtual/restore-requests/execute",
                     SAFE_POST_PAYLOADS["/virtual/restore-requests/execute"],
                 )
+                virtual_restored_text = (virtual_target / "state.txt").read_text(encoding="utf-8")
+                virtual_destroy = server.post_json(
+                    "/Overseer/virtual/destroy-requests",
+                    SAFE_POST_PAYLOADS["/virtual/destroy-requests"],
+                )
+                virtual_destroy_approval = server.post_json(
+                    "/Overseer/virtual/destroy-requests/approve",
+                    SAFE_POST_PAYLOADS["/virtual/destroy-requests/approve"],
+                )
+                virtual_destroy_execution = server.post_json(
+                    "/Overseer/virtual/destroy-requests/execute",
+                    SAFE_POST_PAYLOADS["/virtual/destroy-requests/execute"],
+                )
                 identity_rotation = server.post_json(
                     "/Overseer/identity/rotation-requests",
                     SAFE_POST_PAYLOADS["/identity/rotation-requests"],
@@ -974,7 +1015,6 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 approvals = server.get_json("/Overseer/approvals-summary")
                 root_notes = server.get_json("/Overseer/documents/notes?folder=Overseer")
                 runbook_notes = server.get_json("/Overseer/documents/notes?folder=Overseer%2FRunbooks")
-                virtual_restored_text = (virtual_target / "state.txt").read_text(encoding="utf-8")
 
         self.assertTrue(resource["mutation_performed"])
         self.assertEqual(claim["claim"], "claim.ui.full")
@@ -1008,6 +1048,11 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertEqual(virtual_restore_execution["status"], "completed")
         self.assertEqual(virtual_restored_text, "before\n")
         self.assertFalse(virtual_restore["host_mutation_performed"])
+        self.assertEqual(virtual_destroy["destroy_request"]["status"], "waiting_approval")
+        self.assertEqual(virtual_destroy_approval["destroy_request"]["status"], "approved")
+        self.assertEqual(virtual_destroy_execution["status"], "completed")
+        self.assertFalse(virtual_destroy_execution["host_mutation_performed"])
+        self.assertFalse(virtual_target.exists())
         self.assertEqual(identity_rotation["request"]["status"], "waiting_approval")
         self.assertFalse(identity_rotation["host_mutation_performed"])
         self.assertEqual(crew_message["message"]["owner_domain"], "julian")

@@ -154,14 +154,17 @@ from .storage_evidence import storage_evidence_status
 from .usage_evidence import usage_evidence_status
 from .virtual_evidence import virtual_evidence_status
 from .virtual_ops import (
+    approve_virtual_destroy_request_status,
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
+    execute_virtual_destroy_request_status,
     execute_virtual_lifecycle_status,
     execute_virtual_target_setup_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
+    stage_virtual_destroy_request_status,
     stage_virtual_restore_request_status,
     stage_virtual_snapshot_request_status,
     stage_virtual_target_setup_batch_status,
@@ -563,6 +566,15 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/restore-requests/execute":
                 self._handle_json(lambda payload: execute_virtual_restore_request_status(_project_path_for_store(store_path), **_virtual_execution_args(payload)))
+                return
+            if path == "/virtual/destroy-requests":
+                self._handle_json(lambda payload: stage_virtual_destroy_request_status(_project_path_for_store(store_path), **_virtual_destroy_request_args(payload)))
+                return
+            if path == "/virtual/destroy-requests/approve":
+                self._handle_json(lambda payload: approve_virtual_destroy_request_status(_project_path_for_store(store_path), **_virtual_approval_args(payload)))
+                return
+            if path == "/virtual/destroy-requests/execute":
+                self._handle_json(lambda payload: execute_virtual_destroy_request_status(_project_path_for_store(store_path), **_virtual_execution_args(payload)))
                 return
             if path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
@@ -1223,6 +1235,14 @@ def _virtual_restore_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "restore_point": str(payload["restore_point"]),
         "requested_by": str(payload.get("requested_by") or "dax"),
         "reason": str(payload.get("reason") or "stage virtual restore after failed change"),
+    }
+
+
+def _virtual_destroy_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_id": str(payload["resource_id"]),
+        "requested_by": str(payload.get("requested_by") or "dax"),
+        "reason": str(payload.get("reason") or "stage virtual destroy after disposable target is no longer needed"),
     }
 
 

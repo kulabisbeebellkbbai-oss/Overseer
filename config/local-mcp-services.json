@@ -15,6 +15,18 @@
       "risk_level": "low"
     },
     {
+      "id": "svc.mcp.markitdown",
+      "name": "MarkItDown MCP",
+      "type": "service",
+      "owner_domain": "julian",
+      "risk_level": "low",
+      "identifiers": {
+        "kind": "streamable_http_mcp",
+        "endpoint": "http://127.0.0.1:8792/mcp"
+      },
+      "notes": "MarkItDown exposes MCP over streamable HTTP; readiness is checked with a non-mutating MCP initialize request rather than a conventional /health route."
+    },
+    {
       "id": "svc.mcp.skiller",
       "name": "Skiller MCP",
       "type": "service",
@@ -51,6 +63,14 @@
       "name": "GitHub MCP Proxy Health",
       "probe_type": "json",
       "target": "http://127.0.0.1:8791/health",
+      "expected_content_type": "application/json"
+    },
+    {
+      "id": "health.mcp.markitdown",
+      "resource_id": "svc.mcp.markitdown",
+      "name": "MarkItDown MCP Initialize",
+      "probe_type": "mcp",
+      "target": "http://127.0.0.1:8792/mcp",
       "expected_content_type": "application/json"
     },
     {

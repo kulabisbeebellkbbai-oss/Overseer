@@ -67,6 +67,7 @@ from overseer import (
     LocalCommandHealthProbeAdapter,
     LocalLogHealthProbeAdapter,
     ManualHealthProbeAdapter,
+    McpHttpHealthProbeAdapter,
     LocalProcessHealthProbeAdapter,
     RoutedHealthProbeAdapter,
     InterruptionPolicy,
@@ -268,11 +269,42 @@ class _JsonHealthHandler(BaseHTTPRequestHandler):
         return
 
 
+class _McpHealthHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        if self.path != "/mcp/":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "test-mcp", "version": "0"},
+                },
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
 class _FakeObsidianHandler(BaseHTTPRequestHandler):
     calls = []
 
     def do_GET(self):
         self.__class__.calls.append(("GET", self.path, self.headers.get("authorization"), ""))
+        if self.path.startswith("/search?"):
+            self._json([{"path": "Overseer/Runbooks/REST.md", "score": 1, "matches": []}])
+            return
         if self.headers.get("authorization") != "Bearer test-token":
             self.send_response(401)
             self.end_headers()
@@ -359,6 +391,21 @@ class LocalHttpServer:
         self.thread.start()
         host, port = self.server.server_address
         self.url = f"http://{host}:{port}/health"
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+class LocalMcpHttpServer:
+    def __enter__(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _McpHealthHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.url = f"http://{host}:{port}/mcp"
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -823,6 +870,22 @@ class LiveHealthProbeTests(unittest.TestCase):
             )
 
             evidence = HttpHealthProbeAdapter(timeout_seconds=2).probe(target)
+
+            self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
+            self.assertFalse(evidence.recovery_required)
+
+    def test_mcp_http_health_probe_adapter_initializes_streamable_http_server(self):
+        with LocalMcpHttpServer() as server:
+            target = HealthTarget(
+                id="local-mcp",
+                resource_id="svc.local.mcp",
+                name="Local MCP",
+                probe_type=ProbeType.MCP,
+                target=server.url,
+                expected_content_type="application/json",
+            )
+
+            evidence = McpHttpHealthProbeAdapter(timeout_seconds=2).probe(target)
 
             self.assertEqual(evidence.observed_status, HealthStatus.HEALTHY)
             self.assertFalse(evidence.recovery_required)
@@ -2582,7 +2645,7 @@ class OverseerApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
             env_file = Path(directory) / "obsidian.env"
             env_file.write_text(
-                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\n",
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=test-token\nOBSIDIAN_OMNISEARCH_URL={obsidian.url}\n",
                 encoding="utf-8",
             )
 
@@ -2599,6 +2662,7 @@ class OverseerApiTests(unittest.TestCase):
         self.assertTrue(status["available"])
         self.assertTrue(status["authenticated"])
         self.assertEqual(notes["files"], ["Inbox/operator-note.md", "Runbooks/REST.md"])
+        self.assertTrue(status["omnisearch"]["available"])
         self.assertEqual(search["results"][0]["filename"], "Overseer/Runbooks/REST.md")
         self.assertTrue(write["mutation_performed"])
         self.assertNotIn("test-token", json.dumps(status))

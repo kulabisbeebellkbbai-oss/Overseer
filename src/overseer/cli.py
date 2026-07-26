@@ -7912,6 +7912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     remote_testing_profile_parser.add_argument("--gateway-path", default="/Overseer")
     remote_testing_profile_parser.add_argument("--token-source", default="state/api-token")
     remote_testing_profile_parser.add_argument("--recorded-by", default="quark")
+    remote_testing_profile_parser.add_argument("--remote-host", default="god@10.50.0.100")
     remote_testing_lease_parser = subparsers.add_parser("request-remote-testing-lease", help="lease the Tank/MSI remote testing queue for a project batch")
     remote_testing_lease_parser.add_argument("--project-root", default=".")
     remote_testing_lease_parser.add_argument("--lease-id", required=True)
@@ -8929,6 +8930,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.gateway_path,
                     args.token_source,
                     args.recorded_by,
+                    args.remote_host,
                 ),
                 sort_keys=True,
             )

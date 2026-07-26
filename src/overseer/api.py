@@ -1042,6 +1042,7 @@ def _remote_testing_profile_args(payload: dict[str, Any]) -> dict[str, Any]:
         "gateway_path": str(payload.get("gateway_path", "/Overseer")),
         "token_source": str(payload.get("token_source", "state/api-token")),
         "recorded_by": str(payload.get("recorded_by", "quark")),
+        "remote_host": str(payload.get("remote_host", "god@10.50.0.100")),
     }
 
 

@@ -11,6 +11,8 @@ from typing import Any
 DEFAULT_PROFILE_ID = "remote-testing.tank-msi"
 DEFAULT_QUEUE_ROOT = "local-secrets/remote-testing"
 CONTROL_FILENAME = "quark-control.json"
+DEFAULT_REMOTE_HOST = "god@10.50.0.100"
+FORBIDDEN_TRANSPORTS = ("god@192.168.68.xxx", "192.168.68.xxx")
 SUPPORTED_JOB_TYPES = (
     "ping",
     "overseer.http_status",
@@ -50,6 +52,8 @@ def remote_testing_status(project_root: str | Path) -> dict[str, object]:
             "owner": "quark",
             "manager": "Tank on MSI",
             "default_ttl_minutes": 120,
+            "protected_gateway_required": True,
+            "forbidden_transports": list(FORBIDDEN_TRANSPORTS),
             "mutating_jobs": "disabled unless a disposable fixture is supplied by the job contract",
             "secret_policy": "raw tokens, cookies, browser storage, and credentials are never accepted in queue jobs",
         },
@@ -82,6 +86,7 @@ def record_remote_testing_profile_status(
     gateway_path: str = "/Overseer",
     token_source: str = "state/api-token",
     recorded_by: str = "quark",
+    remote_host: str = DEFAULT_REMOTE_HOST,
 ) -> dict[str, object]:
     root = Path(project_root)
     state = _with_default_profile(_load_control_state(root), root)
@@ -90,7 +95,13 @@ def record_remote_testing_profile_status(
         "display_name": display_name,
         "owner": "quark",
         "remote_operator": "Tank",
-        "remote_host": "MSI",
+        "remote_host": remote_host,
+        "remote_node": "MSI",
+        "transport": "protected_gateway_or_vpn_reachable_ssh",
+        "protected_gateway_required": True,
+        "forbidden_transports": list(FORBIDDEN_TRANSPORTS),
+        "worker_status_path": "%LOCALAPPDATA%/OverseerMsiTestAgent/status.json",
+        "launcher": "Captures/overseer-msi-test-agent-start.ps1",
         "worker_hint": worker_hint,
         "queue_root": queue_root,
         "base_url": base_url,
@@ -290,7 +301,13 @@ def _with_default_profile(state: dict[str, Any], project_root: Path) -> dict[str
             "display_name": "Tank on MSI remote testing queue",
             "owner": "quark",
             "remote_operator": "Tank",
-            "remote_host": "MSI",
+            "remote_host": DEFAULT_REMOTE_HOST,
+            "remote_node": "MSI",
+            "transport": "protected_gateway_or_vpn_reachable_ssh",
+            "protected_gateway_required": True,
+            "forbidden_transports": list(FORBIDDEN_TRANSPORTS),
+            "worker_status_path": "%LOCALAPPDATA%/OverseerMsiTestAgent/status.json",
+            "launcher": "Captures/overseer-msi-test-agent-start.ps1",
             "worker_hint": "overseer-msi-test-agent",
             "queue_root": DEFAULT_QUEUE_ROOT,
             "base_url": "http://127.0.0.1:8766",

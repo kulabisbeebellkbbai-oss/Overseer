@@ -1558,6 +1558,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         ui_path: value("remote-ui-path") || "/Overseer/ui",
         gateway_path: value("remote-gateway-path") || "/Overseer",
         token_source: value("remote-token-source") || "state/api-token",
+        remote_host: value("remote-host") || "god@10.50.0.100",
         recorded_by: value("remote-recorded-by") || "quark"
       });
     }
@@ -2563,6 +2564,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-3"><label for="remote-ui-path">UI Path</label><input id="remote-ui-path" value="/Overseer/ui"></div>
               <div class="field span-3"><label for="remote-gateway-path">Gateway Path</label><input id="remote-gateway-path" value="/Overseer"></div>
               <div class="field span-3"><label for="remote-token-source">Token Source</label><input id="remote-token-source" value="state/api-token"></div>
+              <div class="field span-3"><label for="remote-host">Remote Host</label><input id="remote-host" value="god@10.50.0.100"></div>
               <div class="field span-3"><label for="remote-lease-id">Lease ID</label><input id="remote-lease-id" value="lease.overseer.tank-regression"></div>
               <div class="field span-3"><label for="remote-project">Project</label><input id="remote-project" value="Overseer"></div>
               <div class="field span-3"><label for="remote-requested-by">Requested By</label><input id="remote-requested-by" value="quark"></div>
@@ -2582,7 +2584,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-12">${table("Exhaustion Forecast", usageEvidence.exhaustion_forecast || [], ["limit_id", "remaining", "queued_units", "remaining_after_queue", "deficit_units", "status", "next_step"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-6">${table("Continuation Queue Evidence", usageEvidence.continuation_queue || [], ["request_id", "limit_id", "owner_thread", "requested_units", "status"], {fills: {limit_id: (row) => usageLimitFill(row)}, fillView: "usage"})}</div>
           <div class="panel span-6">${table("Usage Allocation By Thread", usageEvidence.allocation_by_thread || [], ["owner_thread", "requests", "requested_units", "status"])}</div>
-          <div class="panel span-6">${table("Remote Testing Profiles", remoteTesting.connection_profiles || [], ["profile_id", "remote_operator", "remote_host", "worker_hint"])}</div>
+          <div class="panel span-6">${table("Remote Testing Profiles", remoteTesting.connection_profiles || [], ["profile_id", "remote_operator", "remote_host", "protected_gateway_required", "forbidden_transports", "worker_hint"])}</div>
           <div class="panel span-6">${table("Remote Testing Leases", remoteTesting.leases || [], ["lease_id", "project", "status", "expires_at"])}</div>
           <div class="panel span-6">${table("Remote Pending Jobs", remoteTesting.pending_jobs || [], ["job_id", "job_type", "lease_id", "status"], {limit: 20})}</div>
           <div class="panel span-6">${table("Remote Test Results", remoteTesting.recent_results || [], ["job_id", "job_type", "status", "stage"], {limit: 20})}</div>

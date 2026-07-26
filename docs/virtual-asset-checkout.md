@@ -200,12 +200,18 @@ CLI:
 ```bash
 PYTHONPATH=src python3 -m overseer.cli record-virtual-runtime --project-root . --resource-id vm.fixture --adapter local_fixture --snapshot-hint local-secrets/virtual-runtime-targets/vm.fixture
 PYTHONPATH=src python3 -m overseer.cli stage-virtual-snapshot --project-root . --resource-id vm.fixture --snapshot-name before-change
-PYTHONPATH=src python3 -m overseer.cli approve-virtual-snapshot --project-root . --request-id virtual-snapshot.vm.fixture --approved-by sisko
-PYTHONPATH=src python3 -m overseer.cli execute-virtual-snapshot --project-root . --request-id virtual-snapshot.vm.fixture
+PYTHONPATH=src python3 -m overseer.cli approve-virtual-snapshot --project-root . --request-id virtual-snapshot.vm.fixture.before-change --approved-by sisko
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-snapshot --project-root . --request-id virtual-snapshot.vm.fixture.before-change
 PYTHONPATH=src python3 -m overseer.cli stage-virtual-restore --project-root . --resource-id vm.fixture --restore-point before-change
-PYTHONPATH=src python3 -m overseer.cli approve-virtual-restore --project-root . --request-id virtual-restore.vm.fixture --approved-by sisko
-PYTHONPATH=src python3 -m overseer.cli execute-virtual-restore --project-root . --request-id virtual-restore.vm.fixture
+PYTHONPATH=src python3 -m overseer.cli approve-virtual-restore --project-root . --request-id virtual-restore.vm.fixture.before-change --approved-by sisko
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-restore --project-root . --request-id virtual-restore.vm.fixture.before-change
 ```
+
+Named snapshot and restore requests include the snapshot or restore point in
+their request id so multiple rollback points can be staged for the same virtual
+resource without replacing each other. Completed snapshot execution also records
+a `snapshot_records` catalog row with the restore point that Dax can feed back
+into a restore request.
 
 VirtualBox is not part of the required provider setup path. Dax can add it later
 as an optional provider only if a trusted package source and host virtualization

@@ -116,7 +116,10 @@ PYTHONPATH=src python3 -m overseer.cli collect-remote-test-results \
 ```
 
 The profile describes Tank on MSI, the worker hint, protected gateway path,
-token source path, supported job types, and redaction rules. A lease authorizes
-a project batch to queue selected job types for a limited period. Quark rejects
-job parameters that appear to contain secret material and rejects mutating jobs
-unless the job contract includes an explicit disposable fixture.
+token source path, supported job types, and redaction rules. The default route
+is `god@10.50.0.100` through the protected gateway or VPN-reachable coordination
+surface. Quark and project threads must not depend on `god@192.168.68.xxx` or
+the `192.168.68.xxx` LAN path because MSI may not be on HulaHut. A lease
+authorizes a project batch to queue selected job types for a limited period.
+Quark rejects job parameters that appear to contain secret material and rejects
+mutating jobs unless the job contract includes an explicit disposable fixture.

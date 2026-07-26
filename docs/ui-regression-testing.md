@@ -87,7 +87,11 @@ Queue root:
 
 Queue jobs are local-only and must never include raw API tokens, cookies, browser storage values, or local database exports. Results should report only endpoint names, HTTP status summaries, validation stage, auth-header presence, token-hash match, storage-key hashes, and non-sensitive body hashes.
 
-Tank runner v2 supports:
+Quark coordinates Tank/MSI through the protected gateway or VPN-reachable route
+`god@10.50.0.100`. Do not configure project threads or Quark jobs to use
+`god@192.168.68.xxx` or depend on the `192.168.68.xxx` LAN path.
+
+Tank runner supports:
 
 - `ping`
 - `overseer.http_status`

@@ -59,6 +59,87 @@ class HttpHealthProbeAdapter(HealthProbeAdapter):
         return classify_probe(target, result)
 
 
+class McpHttpHealthProbeAdapter(HealthProbeAdapter):
+    """Probe streamable HTTP MCP servers with a non-mutating initialize request."""
+
+    def __init__(self, timeout_seconds: float = 5.0, max_body_bytes: int = 2048) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.max_body_bytes = max_body_bytes
+
+    def probe(self, target: HealthTarget) -> HealthEvidence:
+        started = time.monotonic()
+        captured_at = datetime.now(UTC).isoformat()
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "overseer-health-probe", "version": "0.1"},
+                },
+            }
+        ).encode("utf-8")
+        request = Request(
+            _mcp_endpoint(target.target),
+            data=payload,
+            headers={
+                "User-Agent": "overseer-health-probe/0.1",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                body = response.read(self.max_body_bytes)
+                result = ProbeResult(
+                    target=target.target,
+                    probe_type=target.probe_type,
+                    status_code=response.status,
+                    content_type=response.headers.get("content-type"),
+                    body_summary=_body_summary(target.probe_type, body),
+                    latency_ms=_elapsed_ms(started),
+                    captured_at=captured_at,
+                )
+        except HTTPError as error:
+            body = error.read(self.max_body_bytes)
+            result = ProbeResult(
+                target=target.target,
+                probe_type=target.probe_type,
+                status_code=error.code,
+                content_type=error.headers.get("content-type") if error.headers else None,
+                body_summary=_body_summary(target.probe_type, body),
+                latency_ms=_elapsed_ms(started),
+                captured_at=captured_at,
+            )
+        except (TimeoutError, URLError, OSError) as error:
+            result = ProbeResult(
+                target=target.target,
+                probe_type=target.probe_type,
+                error=str(error),
+                latency_ms=_elapsed_ms(started),
+                captured_at=captured_at,
+            )
+        evidence = classify_probe(target, result)
+        if evidence.observed_status == HealthStatus.HEALTHY and "jsonrpc" not in result.body_summary.lower():
+            return classify_probe(
+                target,
+                ProbeResult(
+                    target=target.target,
+                    probe_type=target.probe_type,
+                    status_code=result.status_code,
+                    content_type=result.content_type,
+                    body_summary=result.body_summary,
+                    error="MCP initialize response did not include jsonrpc",
+                    latency_ms=result.latency_ms,
+                    captured_at=result.captured_at,
+                ),
+            )
+        return evidence
+
+
 class LocalProcessHealthProbeAdapter(HealthProbeAdapter):
     """Read-only process and systemd health probes with injectable command I/O."""
 
@@ -179,6 +260,8 @@ class RoutedHealthProbeAdapter(HealthProbeAdapter):
 
 
 def health_probe_adapter_for(target: HealthTarget, timeout_seconds: float = 5.0) -> HealthProbeAdapter:
+    if target.probe_type == ProbeType.MCP:
+        return McpHttpHealthProbeAdapter(timeout_seconds=timeout_seconds)
     if target.probe_type == ProbeType.PROCESS:
         return LocalProcessHealthProbeAdapter(timeout_seconds=timeout_seconds)
     if target.probe_type == ProbeType.COMMAND:
@@ -192,6 +275,10 @@ def health_probe_adapter_for(target: HealthTarget, timeout_seconds: float = 5.0)
 
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _mcp_endpoint(target: str) -> str:
+    return target if target.endswith("/") else f"{target}/"
 
 
 def _body_summary(probe_type: ProbeType, body: bytes) -> str:

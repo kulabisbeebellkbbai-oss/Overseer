@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
 DEFAULT_OBSIDIAN_ENV_FILE = "/home/god/.local/share/overseer/secrets/obsidian-mcp.env"
 DEFAULT_ALLOWED_WRITE_PREFIXES = ("Overseer/", "Inbox/")
+DEFAULT_OMNISEARCH_URL = "http://127.0.0.1:51361"
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class ObsidianDocumentsConfig:
     api_key: str
     env_file: str = DEFAULT_OBSIDIAN_ENV_FILE
     allowed_write_prefixes: tuple[str, ...] = DEFAULT_ALLOWED_WRITE_PREFIXES
+    omnisearch_url: str = DEFAULT_OMNISEARCH_URL
 
 
 def documents_config_status(env_file: str = DEFAULT_OBSIDIAN_ENV_FILE) -> dict[str, Any]:
@@ -41,6 +43,7 @@ def documents_config_status(env_file: str = DEFAULT_OBSIDIAN_ENV_FILE) -> dict[s
         "env_file": env_file,
         "base_url": _redacted_base_url(config.base_url),
         "allowed_write_prefixes": list(config.allowed_write_prefixes),
+        "omnisearch": ObsidianDocumentsClient(config).omnisearch_status(),
     }
 
 
@@ -81,7 +84,10 @@ def load_obsidian_documents_config(env_file: str = DEFAULT_OBSIDIAN_ENV_FILE) ->
         raise ValueError("OBSIDIAN_API_KEY is not configured")
     if not (base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:") or base_url.startswith("https://127.0.0.1:") or base_url.startswith("https://localhost:")):
         raise ValueError("Obsidian Documents API must remain loopback-bound")
-    return ObsidianDocumentsConfig(base_url=base_url.rstrip("/"), api_key=api_key, env_file=env_file)
+    omnisearch_url = (values.get("OBSIDIAN_OMNISEARCH_URL") or os.environ.get("OBSIDIAN_OMNISEARCH_URL") or DEFAULT_OMNISEARCH_URL).strip().rstrip("/")
+    if not _is_loopback_url(omnisearch_url):
+        raise ValueError("Obsidian Omnisearch API must remain loopback-bound")
+    return ObsidianDocumentsConfig(base_url=base_url.rstrip("/"), api_key=api_key, env_file=env_file, omnisearch_url=omnisearch_url)
 
 
 class ObsidianDocumentsClient:
@@ -121,6 +127,25 @@ class ObsidianDocumentsClient:
             raise ValueError("unexpected Obsidian search response")
         return {"query": query, "count": len(results), "results": results}
 
+    def omnisearch_status(self) -> dict[str, Any]:
+        try:
+            results = self._request_omnisearch("overseer")
+        except ValueError as error:
+            return {
+                "configured": True,
+                "available": False,
+                "base_url": _redacted_base_url(self.config.omnisearch_url),
+                "error": str(error),
+                "next_step": "enable Omnisearch HTTP server in Obsidian or restart Obsidian after local plugin setup",
+            }
+        return {
+            "configured": True,
+            "available": True,
+            "base_url": _redacted_base_url(self.config.omnisearch_url),
+            "result_count": len(results),
+            "next_step": "Omnisearch HTTP API is ready for Ezri search workflows",
+        }
+
     def write_note(self, path: str, content: str, mode: str = "append") -> dict[str, Any]:
         normalized_path = _validate_note_path(path, self.config.allowed_write_prefixes)
         if mode not in {"append", "replace"}:
@@ -151,6 +176,24 @@ class ObsidianDocumentsClient:
             raise ValueError(f"Obsidian request failed: HTTP {error.code} {detail}".strip()) from error
         except URLError as error:
             raise ValueError(f"Obsidian is unavailable: {error.reason}") from error
+
+    def _request_omnisearch(self, query: str) -> list[Any]:
+        params = urlencode({"q": query})
+        request = Request(f"{self.config.omnisearch_url}/search?{params}", headers={"User-Agent": "overseer-documents/0.1"}, method="GET")
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                text = response.read().decode("utf-8")
+        except HTTPError as error:
+            raise ValueError(f"Omnisearch request failed: HTTP {error.code}") from error
+        except URLError as error:
+            raise ValueError(f"Omnisearch is unavailable: {error.reason}") from error
+        try:
+            payload = json.loads(text or "[]")
+        except json.JSONDecodeError as error:
+            raise ValueError("Omnisearch returned invalid JSON") from error
+        if not isinstance(payload, list):
+            raise ValueError("Omnisearch returned an unexpected response")
+        return payload
 
 
 def _read_env_file(path: str) -> dict[str, str]:
@@ -197,3 +240,8 @@ def _safe_manifest(manifest: object) -> dict[str, Any]:
 
 def _redacted_base_url(base_url: str) -> str:
     return base_url.replace("localhost", "127.0.0.1")
+
+
+def _is_loopback_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost"}

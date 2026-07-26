@@ -518,6 +518,8 @@ class OperationsGapCoverageTests(unittest.TestCase):
             restore_manifest_exists = (root / restore["manifest"]["manifest_path"]).exists()
 
         self.assertEqual(runtime["runtime_record"]["adapter"], "local_fixture")
+        self.assertEqual(staged_snapshot["snapshot_request"]["id"], "virtual-snapshot.vm.fixture.before-change")
+        self.assertEqual(staged_restore["restore_request"]["id"], "virtual-restore.vm.fixture.before-change")
         self.assertEqual(approved_snapshot["snapshot_request"]["status"], "approved")
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(approved_restore["restore_request"]["status"], "approved")
@@ -526,6 +528,19 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertTrue(snapshot_manifest_exists)
         self.assertTrue(restore_manifest_exists)
         self.assertEqual(status["execution_record_count"], 2)
+        self.assertEqual(status["snapshot_record_count"], 1)
+        self.assertEqual(status["snapshot_records"][0]["restore_point"], "local-secrets/virtual-runtime-snapshots/vm.fixture/before-change")
+
+    def test_virtual_snapshot_requests_are_distinct_by_snapshot_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = stage_virtual_snapshot_request_status(root, "vm.fixture", snapshot_name="before-change")
+            second = stage_virtual_snapshot_request_status(root, "vm.fixture", snapshot_name="after-change")
+            status = virtual_operations_status(root)
+
+        self.assertEqual(first["snapshot_request"]["id"], "virtual-snapshot.vm.fixture.before-change")
+        self.assertEqual(second["snapshot_request"]["id"], "virtual-snapshot.vm.fixture.after-change")
+        self.assertEqual(status["snapshot_request_count"], 2)
 
     def test_virtual_destroy_executes_against_local_fixture_with_preserved_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1293,9 +1308,13 @@ exit 0
             results = collect_remote_test_results_status(root, lease_id="lease.test")
 
         self.assertEqual(profile["profile"]["profile_id"], "remote-testing.tank-msi")
+        self.assertEqual(profile["profile"]["remote_host"], "god@10.50.0.100")
+        self.assertTrue(profile["profile"]["protected_gateway_required"])
+        self.assertIn("192.168.68.xxx", profile["profile"]["forbidden_transports"])
         self.assertEqual(lease["lease"]["status"], "active")
         self.assertEqual(job["job"]["job_type"], "ping")
         self.assertEqual(status["adapter_status"]["status"], "configured")
+        self.assertIn("192.168.68.xxx", status["lease_profile"]["forbidden_transports"])
         self.assertEqual(results["results"][0]["status"], "passed")
         self.assertFalse(status["host_mutation_performed"])
 

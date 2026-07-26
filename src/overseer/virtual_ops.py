@@ -17,6 +17,8 @@ def virtual_operations_status(project_root: str | Path) -> dict[str, object]:
         "root": str(root),
         "runtime_records": data["runtime_records"],
         "runtime_record_count": len(data["runtime_records"]),
+        "snapshot_records": data["snapshot_records"],
+        "snapshot_record_count": len(data["snapshot_records"]),
         "snapshot_requests": data["snapshot_requests"],
         "snapshot_request_count": len(data["snapshot_requests"]),
         "restore_requests": data["restore_requests"],
@@ -77,8 +79,9 @@ def stage_virtual_snapshot_request_status(
     root = Path(project_root)
     data = _read_registry(root)
     now = _now()
+    snapshot_suffix = f".{_safe_id(snapshot_name)}" if snapshot_name else ""
     row = {
-        "id": f"virtual-snapshot.{_safe_id(resource_id)}",
+        "id": f"virtual-snapshot.{_safe_id(resource_id)}{snapshot_suffix}",
         "resource_id": _safe_id(resource_id),
         "snapshot_name": _safe_id(snapshot_name) if snapshot_name else "",
         "requested_by": requested_by,
@@ -109,8 +112,9 @@ def stage_virtual_restore_request_status(
     root = Path(project_root)
     data = _read_registry(root)
     now = _now()
+    restore_suffix = f".{_safe_id(restore_point)}"
     row = {
-        "id": f"virtual-restore.{_safe_id(resource_id)}",
+        "id": f"virtual-restore.{_safe_id(resource_id)}{restore_suffix}",
         "resource_id": _safe_id(resource_id),
         "restore_point": _redact_path(restore_point),
         "requested_by": requested_by,
@@ -485,6 +489,7 @@ def execute_virtual_snapshot_request_status(
             "next_step": "snapshot completed; use this restore point for rollback if later runtime work fails",
         }
     )
+    _upsert(data["snapshot_records"], _snapshot_record(row, provider, manifest, now))
     _append_execution(data, row, "snapshot", request_id, executed_by, now, "completed", provider, manifest=manifest)
     _write_registry(root, data)
     return {
@@ -663,18 +668,31 @@ def _registry_path(root: Path) -> Path:
 def _read_registry(root: Path) -> dict[str, list[dict[str, object]]]:
     path = _registry_path(root)
     if not path.exists():
-        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "destroy_requests": [], "execution_records": [], "target_setup_requests": []}
+        return _empty_registry()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"runtime_records": [], "snapshot_requests": [], "restore_requests": [], "destroy_requests": [], "execution_records": [], "target_setup_requests": []}
+        return _empty_registry()
     return {
         "runtime_records": list(data.get("runtime_records") or []),
+        "snapshot_records": list(data.get("snapshot_records") or []),
         "snapshot_requests": list(data.get("snapshot_requests") or []),
         "restore_requests": list(data.get("restore_requests") or []),
         "destroy_requests": list(data.get("destroy_requests") or []),
         "execution_records": list(data.get("execution_records") or []),
         "target_setup_requests": list(data.get("target_setup_requests") or []),
+    }
+
+
+def _empty_registry() -> dict[str, list[dict[str, object]]]:
+    return {
+        "runtime_records": [],
+        "snapshot_records": [],
+        "snapshot_requests": [],
+        "restore_requests": [],
+        "destroy_requests": [],
+        "execution_records": [],
+        "target_setup_requests": [],
     }
 
 
@@ -1107,6 +1125,12 @@ def _find_request(data: dict[str, list[dict[str, object]]], key: str, request_id
     for row in data[key]:
         if row.get("id") in candidates:
             return row
+    prefix_match = f"{prefix}.{cleaned}."
+    matches = [row for row in data[key] if str(row.get("id") or "").startswith(prefix_match)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"{prefix} request is ambiguous: {request_id}")
     raise ValueError(f"{prefix} request does not exist: {request_id}")
 
 
@@ -1891,6 +1915,32 @@ def _write_manifest(
     manifest["manifest_path"] = _relative_or_name(root, manifest_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
+
+
+def _snapshot_record(
+    row: dict[str, object],
+    provider: str,
+    manifest: dict[str, object],
+    captured_at: str,
+) -> dict[str, object]:
+    snapshot_name = str(
+        manifest.get("provider_metadata", {}).get("snapshot_name")
+        if isinstance(manifest.get("provider_metadata"), dict)
+        else ""
+    ) or str(row.get("snapshot_name") or row.get("id") or "snapshot")
+    restore_point = snapshot_name if provider in {"qemu_img", "qemu_process", "libvirt"} else str(manifest.get("target") or snapshot_name)
+    return {
+        "id": f"virtual-snapshot-record.{_safe_id(str(row['resource_id']))}.{_safe_id(snapshot_name)}",
+        "request_id": row["id"],
+        "resource_id": row["resource_id"],
+        "snapshot_name": _safe_id(snapshot_name),
+        "provider": provider,
+        "restore_point": restore_point,
+        "manifest_path": manifest.get("manifest_path", ""),
+        "captured_at": captured_at,
+        "entry_count": manifest.get("entry_count", 0),
+        "next_step": "stage a restore request with this restore_point if rollback is needed",
+    }
 
 
 def _write_lifecycle_manifest(

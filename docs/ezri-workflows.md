@@ -12,6 +12,13 @@ PYTHONPATH=src python3 -m overseer.cli documents-status
 
 Allowed write paths are `Overseer/` and `Inbox/`. Do not write secrets, raw API tokens, cookies, browser local storage values, or local database exports into notes.
 
+`documents-status` also reports Omnisearch readiness. Omnisearch is installed in
+the local vault as the `omnisearch` community plugin and should expose its
+localhost-only HTTP API at `http://127.0.0.1:51361/search?q=...` after Obsidian
+loads the plugin. The vault config keeps that API loopback-bound; if the status
+reports connection refused, restart or unlock Obsidian in the trusted GUI
+session and re-run `documents-status`.
+
 ## Writing Runbooks
 
 Create or replace a runbook from a repo file:

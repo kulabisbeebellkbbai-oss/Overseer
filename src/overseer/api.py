@@ -1390,6 +1390,7 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "compose_rollback_env": tuple(str(item) for item in payload.get("compose_rollback_env", ())),
         "compose_extra_file": tuple(str(item) for item in payload.get("compose_extra_file", ())),
         "compose_scan_image": tuple(str(item) for item in payload.get("compose_scan_image", ())),
+        "compose_residual_scan_finding": tuple(str(item) for item in payload.get("compose_residual_scan_finding", ())),
         "health_url": str(payload["health_url"]) if payload.get("health_url") else None,
         "backup_label": str(payload["backup_label"]) if payload.get("backup_label") else None,
     }

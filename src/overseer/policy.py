@@ -95,6 +95,7 @@ def evaluate_admin_change_policy(
         _approval_check(plan),
         _adapter_check(plan, capability, profile),
         _ids_review_check(plan, ids_review_packages, profile),
+        _residual_scan_findings_check(plan),
         _rollback_check(plan, profile),
         _verification_check(plan, profile),
         _risk_approval_check(plan, profile),
@@ -246,6 +247,22 @@ def _ids_review_check(
         OwnerDomain.ODO,
         "accepted IDS/firewall advisory is present",
         tuple(package.id for package in accepted),
+    )
+
+
+def _residual_scan_findings_check(plan: AdminChangePlan) -> PolicyCheck:
+    if not plan.residual_scan_findings:
+        return PolicyCheck(
+            "admin.scan.residual-findings",
+            PolicyCheckStatus.PASS,
+            OwnerDomain.ODO,
+            "no residual critical/high image findings declared",
+        )
+    return PolicyCheck(
+        "admin.scan.residual-findings",
+        PolicyCheckStatus.WARN,
+        OwnerDomain.ODO,
+        "replacement images still have residual critical/high findings: " + "; ".join(plan.residual_scan_findings),
     )
 
 

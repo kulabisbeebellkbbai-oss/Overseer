@@ -3152,6 +3152,7 @@ def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
         "rollback_steps": [_admin_command_status(step) for step in plan.rollback_steps],
         "verification_steps": [_admin_command_status(step) for step in plan.verification_steps],
         "risks": list(plan.risks),
+        "residual_scan_findings": list(plan.residual_scan_findings),
     }
 
 
@@ -3193,6 +3194,7 @@ def plan_admin_change_status(
     compose_rollback_env: Sequence[str] = (),
     compose_extra_file: Sequence[str] = (),
     compose_scan_image: Sequence[str] = (),
+    compose_residual_scan_finding: Sequence[str] = (),
     health_url: str | None = None,
     backup_label: str | None = None,
 ) -> dict[str, object]:
@@ -3220,6 +3222,7 @@ def plan_admin_change_status(
             rollback_env=tuple(compose_rollback_env),
             extra_compose_files=tuple(compose_extra_file),
             scan_images=tuple(compose_scan_image),
+            residual_scan_findings=tuple(compose_residual_scan_finding),
             health_url=health_url,
             backup_label=backup_label,
         )
@@ -7763,6 +7766,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--compose-rollback-env", action="append")
     admin_plan_parser.add_argument("--compose-extra-file", action="append")
     admin_plan_parser.add_argument("--compose-scan-image", action="append")
+    admin_plan_parser.add_argument("--compose-residual-scan-finding", action="append")
     admin_plan_parser.add_argument("--health-url")
     admin_plan_parser.add_argument("--backup-label")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
@@ -8749,6 +8753,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.compose_rollback_env or (),
                     args.compose_extra_file or (),
                     args.compose_scan_image or (),
+                    args.compose_residual_scan_finding or (),
                     args.health_url,
                     args.backup_label,
                 ),

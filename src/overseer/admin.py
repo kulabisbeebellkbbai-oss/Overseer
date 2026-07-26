@@ -118,6 +118,7 @@ class AdminChangePlan:
     rollback_steps: tuple[AdminCommandStep, ...]
     risks: tuple[str, ...]
     verification_steps: tuple[AdminCommandStep, ...]
+    residual_scan_findings: tuple[str, ...] = ()
     approved: bool = False
     approved_by: str | None = None
     approved_at: str | None = None
@@ -592,6 +593,7 @@ def plan_docker_compose_update(
     rollback_env: tuple[str, ...] = (),
     extra_compose_files: tuple[str, ...] = (),
     scan_images: tuple[str, ...] = (),
+    residual_scan_findings: tuple[str, ...] = (),
     health_url: str | None = None,
     backup_label: str | None = None,
 ) -> AdminChangePlan:
@@ -625,11 +627,18 @@ def plan_docker_compose_update(
                 "confirm the updated service responds on its local health or UI endpoint",
             ),
         )
+    residual_findings = tuple(finding.strip() for finding in residual_scan_findings if finding.strip())
+    scan_exit_code = "0" if residual_findings else "1"
+    scan_reason = (
+        "record current replacement image critical/high findings after explicit residual-risk approval"
+        if residual_findings
+        else "block service recreation if the pulled replacement image still has critical or high vulnerabilities"
+    )
     scan_steps = tuple(
         AdminCommandStep(
             f"Scan updated image {image}",
-            ("trivy", "image", "--severity", "CRITICAL,HIGH", "--exit-code", "1", image),
-            "block service recreation if the pulled replacement image still has critical or high vulnerabilities",
+            ("trivy", "image", "--severity", "CRITICAL,HIGH", "--exit-code", scan_exit_code, image),
+            scan_reason,
         )
         for image in scan_images
     )
@@ -731,6 +740,7 @@ def plan_docker_compose_update(
             "dependent local integrations may fail while services restart",
         ),
         verification_steps=verification,
+        residual_scan_findings=residual_findings,
     )
 
 

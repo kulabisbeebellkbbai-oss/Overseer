@@ -591,6 +591,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "admin-compose-env",
             "admin-compose-extra-files",
             "admin-compose-project-directory",
+            "admin-compose-residual-scan-findings",
             "admin-compose-rollback-env",
             "admin-compose-scan-images",
             "admin-current-state",

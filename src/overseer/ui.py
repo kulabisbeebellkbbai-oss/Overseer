@@ -1259,6 +1259,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (composeExtraFiles.length) payload.compose_extra_file = composeExtraFiles;
       const composeScanImages = splitList(value("admin-compose-scan-images"));
       if (composeScanImages.length) payload.compose_scan_image = composeScanImages;
+      const composeResidualScanFindings = splitList(value("admin-compose-residual-scan-findings"));
+      if (composeResidualScanFindings.length) payload.compose_residual_scan_finding = composeResidualScanFindings;
       const healthUrl = value("admin-health-url");
       if (healthUrl) payload.health_url = healthUrl;
       const backupLabel = value("admin-backup-label");
@@ -1817,6 +1819,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="admin-compose-extra-files">Extra Compose Files</label><input id="admin-compose-extra-files" placeholder="/home/god/penpot/local-secrets/admin-overrides/override.yaml"></div>
               <div class="field span-3"><label for="admin-health-url">Health URL</label><input id="admin-health-url" placeholder="http://127.0.0.1:9001/"></div>
               <div class="field span-6"><label for="admin-compose-scan-images">Scan Images</label><input id="admin-compose-scan-images" placeholder="penpotapp/frontend:2.17.0, postgres:15"></div>
+              <div class="field span-6"><label for="admin-compose-residual-scan-findings">Residual Scan Findings</label><input id="admin-compose-residual-scan-findings" placeholder="penpotapp/exporter:2.17 retains critical findings after risk reduction"></div>
               <div class="field span-3"><label for="admin-backup-label">Backup Label</label><input id="admin-backup-label" placeholder="penpot-update"></div>
               <div class="field span-6"><label for="admin-reason">Reason</label><input id="admin-reason" value="operator requested maintenance"></div>
             </div>

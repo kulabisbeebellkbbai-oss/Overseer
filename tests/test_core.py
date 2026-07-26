@@ -7140,6 +7140,61 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertIn("accepted residual warning", checks["admin.rollback"]["summary"])
         self.assertEqual(after["pending_policy_warning_approval_count"], 0)
 
+    def test_admin_policy_status_warns_on_residual_compose_scan_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = plan_admin_change_status(
+                store_path,
+                "admin.compose.penpot.residual-scan",
+                AdminChangeKind.DOCKER_COMPOSE_UPDATE.value,
+                "/srv/penpot/docker-compose.yaml",
+                "reduce Penpot image vulnerability exposure",
+                "Penpot app images have higher current critical/high findings",
+                compose_project_directory="/srv/penpot",
+                compose_extra_file=("/srv/penpot/local-secrets/admin-overrides/app-2.17.yaml",),
+                compose_residual_scan_finding=("penpotapp/exporter:2.17 keeps critical findings after reducing total exposure",),
+                health_url="http://127.0.0.1:9001/",
+            )
+
+            approve_admin_change_status(store_path, plan["id"], "human")
+            requested_adapter = request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.DOCKER_COMPOSE_UPDATE.value,
+                "sisko",
+            )
+            approve_admin_adapter_enablement_status(store_path, requested_adapter["approval_id"], "sisko")
+            status = admin_policy_status(store_path, plan["id"])
+            checks = {check["id"]: check for check in status["items"][0]["checks"]}
+            warning_request = request_admin_policy_warning_status(
+                store_path,
+                plan["id"],
+                "admin.scan.residual-findings",
+                "sisko",
+            )
+
+        self.assertEqual(plan["residual_scan_findings"], ["penpotapp/exporter:2.17 keeps critical findings after reducing total exposure"])
+        self.assertEqual(status["warn"], 1)
+        self.assertEqual(checks["admin.scan.residual-findings"]["status"], PolicyCheckStatus.WARN.value)
+        self.assertEqual(warning_request["check_id"], "admin.scan.residual-findings")
+
+    def test_residual_compose_scan_findings_keep_non_failing_scan_evidence(self):
+        plan = plan_docker_compose_update(
+            "admin.compose.penpot.residual",
+            "/srv/penpot/docker-compose.yaml",
+            "reduce image findings while preserving residual evidence",
+            "current image family has more findings",
+            project_directory="/srv/penpot",
+            scan_images=("penpotapp/backend:2.17",),
+            residual_scan_findings=("penpotapp/backend:2.17 retains high findings",),
+            health_url="http://127.0.0.1:9001/",
+        )
+
+        self.assertIn(
+            ("trivy", "image", "--severity", "CRITICAL,HIGH", "--exit-code", "0", "penpotapp/backend:2.17"),
+            [step.command for step in plan.steps],
+        )
+        self.assertEqual(plan.residual_scan_findings, ("penpotapp/backend:2.17 retains high findings",))
+
     def test_policy_customization_helper_reports_best_practice_questions(self):
         status = policy_customization_helper_status()
         question_ids = {question["id"] for question in status["questions"]}

@@ -9,6 +9,7 @@ import subprocess
 from typing import Any
 
 from .core import Claim, ClaimStatus, Resource, ResourceType
+from .image_scanning import image_scan_status
 from .store import SQLiteStore
 from .virtual_ops import virtual_operations_status
 
@@ -17,6 +18,7 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
     store_path = Path(store_path)
     project_root = store_path.parent.parent if store_path.parent.name == "state" else store_path.parent
     virtual_ops = virtual_operations_status(project_root)
+    image_scans = image_scan_status(project_root)
     store = SQLiteStore(store_path)
     try:
         resources = [resource for resource in store.list_resources() if resource.type == ResourceType.VIRTUAL_ASSET]
@@ -42,6 +44,9 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         "runtime_inventory": runtime_inventory,
         "capacity_summary": _capacity_summary(resources, claims, runtime_records, runtime_inventory, port_rows),
         "image_provenance": _image_provenance_rows(runtime_inventory),
+        "image_scanner_adapters": image_scans["scanner_adapters"],
+        "image_scan_requests": image_scans["scan_requests"],
+        "image_scan_results": image_scans["scan_results"],
         "provider_depth": _provider_depth_rows(runtime_records, runtime_inventory),
         "port_pool": port_rows,
         "cleanup": _cleanup_rows(claims),

@@ -124,6 +124,12 @@ from .backup_ops import (
 )
 from .documentation_evidence import documentation_evidence_status
 from .git import git_status_status
+from .image_scanning import (
+    approve_image_scan_request_status,
+    execute_image_scan_request_status,
+    image_scan_status,
+    stage_image_scan_request_status,
+)
 from .identity_evidence import identity_evidence_status
 from .identity_ops import identity_rotation_requests_status, stage_identity_rotation_request_status
 from .incident_lifecycle import incident_lifecycle_status
@@ -340,6 +346,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/operations":
                 self._handle(lambda: virtual_operations_status(_project_path_for_store(store_path)))
+                return
+            if path == "/virtual/image-scans":
+                self._handle(lambda: image_scan_status(_project_path_for_store(store_path)))
                 return
             if path == "/alerts-summary":
                 self._handle(lambda: alerts_summary_status(store_path))
@@ -575,6 +584,15 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/destroy-requests/execute":
                 self._handle_json(lambda payload: execute_virtual_destroy_request_status(_project_path_for_store(store_path), **_virtual_execution_args(payload)))
+                return
+            if path == "/virtual/image-scans":
+                self._handle_json(lambda payload: stage_image_scan_request_status(_project_path_for_store(store_path), **_image_scan_request_args(payload)))
+                return
+            if path == "/virtual/image-scans/approve":
+                self._handle_json(lambda payload: approve_image_scan_request_status(_project_path_for_store(store_path), **_image_scan_approval_args(payload)))
+                return
+            if path == "/virtual/image-scans/execute":
+                self._handle_json(lambda payload: execute_image_scan_request_status(_project_path_for_store(store_path), **_image_scan_execution_args(payload)))
                 return
             if path == "/host/security/remediations/plans":
                 self._handle_json(lambda payload: plan_host_security_remediation_status(store_path, **_host_security_remediation_args(payload)))
@@ -1269,6 +1287,32 @@ def _virtual_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
         "request_id": str(payload["request_id"]),
         "executed_by": str(payload.get("executed_by") or "dax"),
         "provider": str(payload.get("provider") or "local_fixture"),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
+    }
+
+
+def _image_scan_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "image": str(payload["image"]),
+        "provider": str(payload.get("provider") or "docker"),
+        "scanner": str(payload.get("scanner") or "trivy"),
+        "requested_by": str(payload.get("requested_by") or "dax"),
+        "reason": str(payload.get("reason") or "scan container image before production use"),
+    }
+
+
+def _image_scan_approval_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "approved_by": str(payload.get("approved_by") or "sisko"),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+    }
+
+
+def _image_scan_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "executed_by": str(payload.get("executed_by") or "dax"),
         "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
     }
 

@@ -50,6 +50,10 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /virtual/destroy-requests`
 - `POST /virtual/destroy-requests/approve`
 - `POST /virtual/destroy-requests/execute`
+- `GET /virtual/image-scans`
+- `POST /virtual/image-scans`
+- `POST /virtual/image-scans/approve`
+- `POST /virtual/image-scans/execute`
 - `GET /observability/metric-history`
 - `GET /observability/performance-history`
 - `GET /health-summary`
@@ -201,6 +205,10 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/snapshot-requests/execute`.
 `POST /virtual/restore-requests` stages a Dax restore request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/restore-requests/execute`.
 `POST /virtual/destroy-requests` stages a Dax destroy request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/destroy-requests/execute`.
+`GET /virtual/image-scans` returns Dax scanner adapter availability plus staged image vulnerability scan requests and summarized results from ignored local state.
+`POST /virtual/image-scans` stages a Dax container image vulnerability scan request for a declared image reference. It does not pull, run, remove, or mutate containers.
+`POST /virtual/image-scans/approve` approves a staged image scan request without invoking a scanner.
+`POST /virtual/image-scans/execute` executes an approved read-only Trivy image scan when `trivy` is installed. It stores raw scanner JSON under ignored `local-secrets/image-scans`, surfaces only summarized findings and severity counts, and blocks cleanly when Trivy is missing.
 `POST /virtual/snapshot-requests/execute` executes only an approved Dax snapshot request against `local_fixture`, `qemu_img`, `qemu_process`, stopped `libvirt`, `docker`, `podman`, `renode`, approved disposable `android_emulator`, or `gateway_proxy` provider targets and writes a manifest under ignored local state.
 `POST /virtual/restore-requests/execute` executes only an approved Dax restore request against the same provider set, preserving rollback evidence where supported and blocking non-disposable or unsafe targets.
 `POST /virtual/destroy-requests/execute` executes only an approved Dax destroy request against disposable `local_fixture`, `qemu_img`, `qemu_process`, `libvirt`, `docker`, `podman`, `renode`, approved disposable `android_emulator`, or `gateway_proxy` provider targets. It preserves local fixture and file-backed target evidence before removal and blocks non-disposable or unsafe targets.
@@ -255,7 +263,7 @@ The CLI equivalents are `documents-status`, `documents-notes`, `documents-search
 `POST /usage/remote-testing/results` reads redacted remote testing results. Optional fields are `lease_id` and `job_id`.
 `GET /physical-summary` returns persisted physical identity counts, checkout readiness, power risk, storage risk, counts by kind and source, and per-asset detail for Kira review.
 `GET /virtual-summary` returns persisted virtual asset counts, checkout readiness, active claims, queued claims, reserved ports, and per-asset detail for Dax review.
-`GET /virtual/evidence` returns Dax read-only provider inventory, registered runtime records, port-pool conflicts, cleanup candidates, provider-depth coverage, virtual capacity summary, and image provenance review rows. It does not mutate runtime state.
+`GET /virtual/evidence` returns Dax read-only provider inventory, registered runtime records, port-pool conflicts, cleanup candidates, provider-depth coverage, virtual capacity summary, image provenance review rows, and image scanner evidence. It does not mutate runtime state.
 `GET /health-efficiency` returns Julian's compact service-health view of target status counts, probe-type coverage, owner routing, recovery requirements, and latest failures.
 `GET /observability/metric-history` returns Julian's durable metric history snapshots from ignored local state.
 `POST /observability/metric-history/capture` captures a state-only snapshot of retained health and host trend summaries. It does not probe services, inspect the host, or read privileged logs.

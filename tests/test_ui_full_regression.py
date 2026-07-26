@@ -151,6 +151,7 @@ ACTION_ROUTES = {
     "approve-virtual-restore-request": ("POST", "/virtual/restore-requests/approve"),
     "approve-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/approve"),
     "approve-virtual-destroy-request": ("POST", "/virtual/destroy-requests/approve"),
+    "approve-image-scan": ("POST", "/virtual/image-scans/approve"),
     "archive-admin-history": ("POST", "/admin/history-archive"),
     "build-policy-profile": ("POST", "/admin/policy-customization-helper/profile"),
     "cancel-admin-change": ("POST", "/admin/cancel"),
@@ -173,6 +174,7 @@ ACTION_ROUTES = {
     "execute-virtual-lifecycle": ("POST", "/virtual/lifecycle/execute"),
     "execute-virtual-target-setup": ("POST", "/virtual/target-setup-requests/execute"),
     "execute-virtual-destroy-request": ("POST", "/virtual/destroy-requests/execute"),
+    "execute-image-scan": ("POST", "/virtual/image-scans/execute"),
     "execute-virtual-restore-request": ("POST", "/virtual/restore-requests/execute"),
     "execute-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/execute"),
     "export-ids-review-prompt": ("POST", "/host/security/ids-review-packages/prompts"),
@@ -219,6 +221,7 @@ ACTION_ROUTES = {
     "stage-virtual-restore-request": ("POST", "/virtual/restore-requests"),
     "stage-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests"),
     "stage-virtual-destroy-request": ("POST", "/virtual/destroy-requests"),
+    "stage-image-scan": ("POST", "/virtual/image-scans"),
     "transition-operation": ("POST", "/operations/records/transition"),
     "unarchive-admin-history": ("POST", "/admin/history-unarchive"),
 }
@@ -396,6 +399,21 @@ SAFE_POST_PAYLOADS = {
         "request_id": "virtual-destroy.vm.ui.full",
         "executed_by": "dax",
         "provider": "local_fixture",
+    },
+    "/virtual/image-scans": {
+        "image": "alpine:latest",
+        "provider": "docker",
+        "scanner": "trivy",
+        "requested_by": "dax",
+        "reason": "exercise image vulnerability scan staging workflow",
+    },
+    "/virtual/image-scans/approve": {
+        "request_id": "image-scan.docker.alpine-latest",
+        "approved_by": "sisko",
+    },
+    "/virtual/image-scans/execute": {
+        "request_id": "image-scan.docker.alpine-latest",
+        "executed_by": "dax",
     },
     "/identity/rotation-requests": {
         "subject": "local-secrets/test-token",
@@ -770,6 +788,14 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "destroy-virtual-request-id",
             "destroy-virtual-requested-by",
             "destroy-virtual-resource-id",
+            "image-scan-approved-by",
+            "image-scan-executed-by",
+            "image-scan-image",
+            "image-scan-provider",
+            "image-scan-reason",
+            "image-scan-request-id",
+            "image-scan-requested-by",
+            "image-scan-scanner",
             "virtual-adapter",
             "virtual-kind",
             "virtual-notes",
@@ -795,6 +821,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("Resource Registry", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Destroy Requests", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Image Vulnerability Scan", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Image Scanner Adapters", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Image Scan Results", OPERATOR_CONSOLE_HTML)
         self.assertIn("Target Setup Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Runtime Provider Inventory", OPERATOR_CONSOLE_HTML)
         self.assertIn("Account Repositories", OPERATOR_CONSOLE_HTML)
@@ -852,6 +881,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Stage virtual destroy request",
             "Approve virtual destroy request",
             "Execute virtual destroy request",
+            "Stage image vulnerability scan",
+            "Approve image vulnerability scan",
+            "Execute image vulnerability scan",
             "Stage system journal access request",
             "Capture metric history snapshot",
             "Check an exhausted limit refresh",
@@ -970,6 +1002,18 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                     "/Overseer/virtual/destroy-requests/execute",
                     SAFE_POST_PAYLOADS["/virtual/destroy-requests/execute"],
                 )
+                image_scan = server.post_json(
+                    "/Overseer/virtual/image-scans",
+                    SAFE_POST_PAYLOADS["/virtual/image-scans"],
+                )
+                image_scan_approval = server.post_json(
+                    "/Overseer/virtual/image-scans/approve",
+                    SAFE_POST_PAYLOADS["/virtual/image-scans/approve"],
+                )
+                image_scan_execution = server.post_json(
+                    "/Overseer/virtual/image-scans/execute",
+                    SAFE_POST_PAYLOADS["/virtual/image-scans/execute"],
+                )
                 identity_rotation = server.post_json(
                     "/Overseer/identity/rotation-requests",
                     SAFE_POST_PAYLOADS["/identity/rotation-requests"],
@@ -1053,6 +1097,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertEqual(virtual_destroy_execution["status"], "completed")
         self.assertFalse(virtual_destroy_execution["host_mutation_performed"])
         self.assertFalse(virtual_target.exists())
+        self.assertEqual(image_scan["scan_request"]["status"], "waiting_approval")
+        self.assertEqual(image_scan_approval["scan_request"]["status"], "approved")
+        self.assertIn(image_scan_execution["status"], {"blocked", "completed"})
+        self.assertFalse(image_scan_execution["host_mutation_performed"])
         self.assertEqual(identity_rotation["request"]["status"], "waiting_approval")
         self.assertFalse(identity_rotation["host_mutation_performed"])
         self.assertEqual(crew_message["message"]["owner_domain"], "julian")

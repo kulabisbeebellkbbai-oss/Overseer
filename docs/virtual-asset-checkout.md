@@ -146,6 +146,10 @@ Protected gateway routes:
 - `POST /Overseer/virtual/destroy-requests`
 - `POST /Overseer/virtual/destroy-requests/approve`
 - `POST /Overseer/virtual/destroy-requests/execute`
+- `GET /Overseer/virtual/image-scans`
+- `POST /Overseer/virtual/image-scans`
+- `POST /Overseer/virtual/image-scans/approve`
+- `POST /Overseer/virtual/image-scans/execute`
 
 Operator controls live on the Claims page:
 
@@ -273,6 +277,21 @@ PYTHONPATH=src python3 -m overseer.cli stage-virtual-destroy --project-root . --
 PYTHONPATH=src python3 -m overseer.cli approve-virtual-destroy --project-root . --request-id virtual-destroy.overseer-dax-disposable-proxy --approved-by sisko
 PYTHONPATH=src python3 -m overseer.cli execute-virtual-destroy --project-root . --request-id virtual-destroy.overseer-dax-disposable-proxy --provider gateway_proxy
 ```
+
+Container image vulnerability scans are staged, approved, and executed through
+Dax. Trivy execution is read-only, stores raw JSON under ignored
+`local-secrets/image-scans`, and surfaces summarized severity counts:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli stage-image-scan --project-root . --image alpine:latest --provider docker
+PYTHONPATH=src python3 -m overseer.cli approve-image-scan --project-root . --request-id image-scan.docker.alpine-latest --approved-by sisko
+PYTHONPATH=src python3 -m overseer.cli execute-image-scan --project-root . --request-id image-scan.docker.alpine-latest
+```
+
+If Trivy is missing, execution records a blocked result and does not mutate host
+state. Installing Trivy through the official Aqua APT repository requires a
+separate O'Brien package-source change plan because it adds a trusted package
+source under `/etc/apt/sources.list.d`.
 
 ## Read-Only Provider Inventory
 

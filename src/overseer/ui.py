@@ -692,6 +692,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       virtual: "/virtual-summary",
       virtualEvidence: "/virtual/evidence",
       virtualOperations: "/virtual/operations",
+      imageScans: "/virtual/image-scans",
       security: "/security-summary",
       securityEvidence: "/security/evidence",
       identityEvidence: "/identity/evidence",
@@ -927,6 +928,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "stage-virtual-destroy-request") return await stageVirtualDestroyRequest();
       if (action === "approve-virtual-destroy-request") return await approveVirtualDestroyRequest();
       if (action === "execute-virtual-destroy-request") return await executeVirtualDestroyRequest();
+      if (action === "stage-image-scan") return await stageImageScanRequest();
+      if (action === "approve-image-scan") return await approveImageScanRequest();
+      if (action === "execute-image-scan") return await executeImageScanRequest();
       if (action === "record-backup-job") return await recordBackupJob();
       if (action === "record-restore-test") return await recordRestoreTest();
       if (action === "stage-backup-cleanup-request") return await stageBackupCleanupRequest();
@@ -1153,6 +1157,27 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         request_id: value("destroy-virtual-request-id"),
         executed_by: value("destroy-virtual-executed-by") || "dax",
         provider: value("destroy-virtual-provider") || "local_fixture"
+      });
+    }
+    async function stageImageScanRequest() {
+      return await postJson("/virtual/image-scans", {
+        image: value("image-scan-image"),
+        provider: value("image-scan-provider") || "docker",
+        scanner: value("image-scan-scanner") || "trivy",
+        requested_by: value("image-scan-requested-by") || "dax",
+        reason: value("image-scan-reason") || "scan container image before production use"
+      });
+    }
+    async function approveImageScanRequest() {
+      return await postJson("/virtual/image-scans/approve", {
+        request_id: value("image-scan-request-id"),
+        approved_by: value("image-scan-approved-by") || "sisko"
+      });
+    }
+    async function executeImageScanRequest() {
+      return await postJson("/virtual/image-scans/execute", {
+        request_id: value("image-scan-request-id"),
+        executed_by: value("image-scan-executed-by") || "dax"
       });
     }
     async function requestClaim() {
@@ -2005,6 +2030,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const operations = state.data.operations || {};
       const virtualEvidence = state.data.virtualEvidence || {};
       const virtualOperations = state.data.virtualOperations || {};
+      const imageScans = state.data.imageScans || {};
       document.getElementById("claims").innerHTML = `
         <div class="grid">
           ${stationIntro("Dax", "Deconfliction Matrix", "Claims, leases, locks, and cleanup handoffs.", ["active claims", "approvals", "cleanup"])}
@@ -2146,6 +2172,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-12"><label for="destroy-virtual-reason">Reason</label><input id="destroy-virtual-reason" value="stage virtual destroy after disposable target is no longer needed"></div>
             </div>
           </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Image Vulnerability Scan</h3><div class="actions"><button class="action-btn" data-action="stage-image-scan">Stage</button><button class="action-btn" data-action="approve-image-scan">Approve</button><button class="action-btn" data-action="execute-image-scan">Execute</button></div></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="image-scan-request-id">Request ID</label><input id="image-scan-request-id"></div>
+              <div class="field span-6"><label for="image-scan-image">Image</label><input id="image-scan-image" value="alpine:latest"></div>
+              <div class="field span-3"><label for="image-scan-provider">Provider</label><input id="image-scan-provider" value="docker"></div>
+              <div class="field span-3"><label for="image-scan-scanner">Scanner</label><input id="image-scan-scanner" value="trivy"></div>
+              <div class="field span-3"><label for="image-scan-requested-by">Requested By</label><input id="image-scan-requested-by" value="dax"></div>
+              <div class="field span-3"><label for="image-scan-approved-by">Approved By</label><input id="image-scan-approved-by" value="sisko"></div>
+              <div class="field span-3"><label for="image-scan-executed-by">Executed By</label><input id="image-scan-executed-by" value="dax"></div>
+              <div class="field span-9"><label for="image-scan-reason">Reason</label><input id="image-scan-reason" value="scan container image before production use"></div>
+            </div>
+          </div>
           <div class="panel span-12">${table("Claims", claims.items || [], ["id", "resource_id", "status", "claim_type", "next_step"], {fills: {id: (row) => claimFill(row.id), resource_id: (row) => resourceClaimFill(row.resource_id, row.owner_role || "dax")}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Cleanup Candidates", cleanup.items || [], ["id", "cleanup_action", "approval_required", "cleanup_next_step"], {fills: {id: (row) => cleanupFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Runtime Evidence", virtualEvidence.items || [], ["resource_id", "kind", "state", "ports", "active_claims", "snapshot_status", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
@@ -2159,7 +2198,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${kv("Virtual Capacity Summary", virtualEvidence.capacity_summary || {})}</div>
           <div class="panel span-6">${table("Provider Depth Coverage", virtualEvidence.provider_depth || [], ["provider", "registered_records", "inventory_rows", "snapshot_restore", "mutation_boundary", "next_step"])}</div>
           <div class="panel span-12">${table("Runtime Provider Inventory", virtualEvidence.runtime_inventory || [], ["provider", "resource_id", "kind", "state", "image", "cpu", "memory", "network", "virtual_size", "actual_size", "snapshots", "ports", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
-          <div class="panel span-12">${table("Image Provenance Review", virtualEvidence.image_provenance || [], ["provider", "resource_id", "image", "state", "provenance", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Image Provenance Review", virtualEvidence.image_provenance || [], ["provider", "resource_id", "image", "state", "provenance", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax"), image: (row) => imageScanFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-6">${table("Image Scanner Adapters", imageScans.scanner_adapters || virtualEvidence.image_scanner_adapters || [], ["scanner", "available", "status", "next_step"])}</div>
+          <div class="panel span-6">${table("Image Scan Requests", imageScans.scan_requests || virtualEvidence.image_scan_requests || [], ["id", "image", "scanner", "status", "approved_by", "next_step"], {fills: {id: (row) => imageScanFill(row), image: (row) => imageScanFill(row)}, fillView: "claims"})}</div>
+          <div class="panel span-12">${table("Image Scan Results", imageScans.scan_results || virtualEvidence.image_scan_results || [], ["id", "image", "status", "critical", "high", "medium", "low", "unknown", "next_step"], {fills: {id: (row) => imageScanFill(row), image: (row) => imageScanFill(row)}, fillView: "claims"})}</div>
           <div class="panel span-6">${table("Port Pool Evidence", virtualEvidence.port_pool || [], ["port", "owner_count", "status", "owners"])}</div>
           <div class="panel span-6">${table("Virtual Cleanup Evidence", virtualEvidence.cleanup || [], ["claim_id", "resource_id", "status", "next_step"], {fills: {claim_id: (row) => cleanupFill({id: row.claim_id})}, fillView: "claims"})}</div>
           <div class="panel span-12">${table("Virtual Runtime Inventory", operations.virtual_runtime || [], ["resource_id", "kind", "state", "ports", "active_claims", "cleanup_candidates", "next_step"], {fills: {resource_id: (row) => resourceClaimFill(row.resource_id, "dax")}, fillView: "claims"})}</div>
@@ -2668,6 +2710,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Stage virtual destroy request", page: "Claims", owner: "Dax", action: "stage-virtual-destroy-request", source, query: "Stage virtual destroy request"},
         {workflow: "Approve virtual destroy request", page: "Claims", owner: "Sisko / Dax", action: "approve-virtual-destroy-request", source, query: "Approve virtual destroy request"},
         {workflow: "Execute virtual destroy request", page: "Claims", owner: "Dax", action: "execute-virtual-destroy-request", source, query: "Execute virtual destroy request"},
+        {workflow: "Stage image vulnerability scan", page: "Claims", owner: "Dax", action: "stage-image-scan", source, query: "Stage image vulnerability scan"},
+        {workflow: "Approve image vulnerability scan", page: "Claims", owner: "Sisko / Dax", action: "approve-image-scan", source, query: "Approve image vulnerability scan"},
+        {workflow: "Execute image vulnerability scan", page: "Claims", owner: "Dax", action: "execute-image-scan", source, query: "Execute image vulnerability scan"},
         {workflow: "Request a VM, port, gateway, or device claim", page: "Claims", owner: "Dax", action: "request-claim", source, query: "Request a VM port gateway or device claim"},
         {workflow: "Approve a resource claim", page: "Claims", owner: "Sisko / Dax", action: "approve-claim", source, query: "Approve a resource claim"},
         {workflow: "Activate an approved claim", page: "Claims", owner: "Dax", action: "activate-claim", source, query: "Activate an approved claim"},
@@ -2983,6 +3028,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "destroy-virtual-reason": row?.reason || row?.next_step || "stage virtual destroy after disposable target is no longer needed",
         "destroy-virtual-approved-by": row?.approved_by || "sisko",
         "destroy-virtual-executed-by": row?.executed_by || "dax"
+      };
+    }
+    function imageScanFill(row) {
+      return {
+        "image-scan-request-id": row?.id || row?.request_id || "",
+        "image-scan-image": row?.image || "",
+        "image-scan-provider": row?.provider || "docker",
+        "image-scan-scanner": row?.scanner || "trivy",
+        "image-scan-requested-by": row?.requested_by || "dax",
+        "image-scan-approved-by": row?.approved_by || "sisko",
+        "image-scan-executed-by": row?.executed_by || "dax",
+        "image-scan-reason": row?.reason || row?.next_step || "scan container image before production use"
       };
     }
     function claimFill(claimId) {

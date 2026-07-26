@@ -22,6 +22,13 @@ from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeTyp
 from overseer.host import HostCommandObservation, HostInspectionSnapshot
 from overseer.identity_evidence import identity_evidence_status
 from overseer.identity_ops import identity_rotation_requests_status, stage_identity_rotation_request_status
+from overseer.image_scanning import (
+    approve_image_scan_request_status,
+    execute_image_scan_request_status,
+    image_scan_status,
+    parse_trivy_image_scan,
+    stage_image_scan_request_status,
+)
 from overseer.incident_lifecycle import incident_lifecycle_status
 from overseer.maintenance_schedule import maintenance_schedules_status, record_maintenance_schedule_status
 from overseer.metric_history import capture_metric_history_status, metric_history_status
@@ -834,6 +841,83 @@ exit 0
         self.assertIn("disposable", unsafe["summary"])
         self.assertEqual(unknown["status"], "blocked")
         self.assertIn("not implemented", unknown["summary"])
+
+    def test_image_scan_requests_block_without_approved_scanner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged = stage_image_scan_request_status(root, "alpine:latest", provider="docker")
+            unapproved = execute_image_scan_request_status(root, staged["scan_request"]["id"])
+            approve_image_scan_request_status(root, staged["scan_request"]["id"], "sisko")
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = ""
+            try:
+                blocked = execute_image_scan_request_status(root, staged["scan_request"]["id"])
+                status = image_scan_status(root)
+            finally:
+                os.environ["PATH"] = old_path
+
+        self.assertEqual(staged["scan_request"]["status"], "waiting_approval")
+        self.assertEqual(unapproved["status"], "blocked")
+        self.assertIn("must be approved", unapproved["summary"])
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("trivy scanner is not installed", blocked["summary"])
+        self.assertEqual(status["scan_results"][-1]["status"], "blocked")
+
+    def test_image_scan_executes_with_fake_trivy_and_summarizes_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            trivy = fake_bin / "trivy"
+            trivy.write_text(
+                "#!/bin/sh\n"
+                "cat <<'JSON'\n"
+                "{\"Results\":[{\"Target\":\"alpine:latest\",\"Vulnerabilities\":["
+                "{\"VulnerabilityID\":\"CVE-1\",\"PkgName\":\"openssl\",\"InstalledVersion\":\"1.0\",\"FixedVersion\":\"1.1\",\"Severity\":\"HIGH\",\"Title\":\"test high\",\"PrimaryURL\":\"https://example.test/CVE-1\"},"
+                "{\"VulnerabilityID\":\"CVE-2\",\"PkgName\":\"busybox\",\"InstalledVersion\":\"1.0\",\"FixedVersion\":\"\",\"Severity\":\"LOW\",\"Title\":\"test low\"}"
+                "]}]}\n"
+                "JSON\n",
+                encoding="utf-8",
+            )
+            trivy.chmod(0o755)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{fake_bin}:{old_path}"
+            try:
+                staged = stage_image_scan_request_status(root, "alpine:latest", provider="docker")
+                approve_image_scan_request_status(root, staged["scan_request"]["id"], "sisko")
+                executed = execute_image_scan_request_status(root, staged["scan_request"]["id"])
+            finally:
+                os.environ["PATH"] = old_path
+            result = executed["scan_result"]
+            raw_exists = (root / result["raw_result_path"]).exists()
+
+        self.assertEqual(executed["status"], "completed")
+        self.assertFalse(executed["host_mutation_performed"])
+        self.assertEqual(result["finding_count"], 2)
+        self.assertEqual(result["high"], 1)
+        self.assertEqual(result["low"], 1)
+        self.assertTrue(raw_exists)
+
+    def test_trivy_parser_counts_severities(self):
+        parsed = parse_trivy_image_scan(
+            json.dumps(
+                {
+                    "Results": [
+                        {
+                            "Target": "image",
+                            "Vulnerabilities": [
+                                {"VulnerabilityID": "CVE-high", "PkgName": "pkg", "Severity": "HIGH"},
+                                {"VulnerabilityID": "CVE-critical", "PkgName": "pkg", "Severity": "CRITICAL"},
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+
+        self.assertEqual(parsed["finding_count"], 2)
+        self.assertEqual(parsed["by_severity"]["CRITICAL"], 1)
+        self.assertEqual(parsed["by_severity"]["HIGH"], 1)
 
     def test_virtual_evidence_detects_port_conflicts_and_cleanup_candidates(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -244,8 +244,10 @@ Gaps:
   snapshot/restore/destroy for non-disposable targets. Provider
   snapshot/restore/destroy is intentionally limited to approved disposable
   targets and stopped image-backed runtime state.
-- Container image vulnerability scanning still needs a scanner/policy choice.
-  Dax now surfaces image provenance review rows that identify local versus
+- Container image vulnerability scanning now has a Trivy-backed staged,
+  approved, read-only scan workflow with summarized severity results. Trivy
+  installation is still a package-source setup gate when the scanner is absent.
+  Dax also surfaces image provenance review rows that identify local versus
   registry/external image sources for operator triage.
 - Capacity planning is present as a Dax summary for virtual resources,
   registered runtimes, inventory rows, ports, conflicts, containers, images, and

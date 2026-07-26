@@ -155,6 +155,9 @@ environment-specific policy wiring:
   file-backed Renode/proxy targets, and approved disposable Android AVD
   directories, with read-only provider-depth, capacity, and image provenance
   evidence.
+- container image vulnerability scanner installation is still a package-source
+  setup gate when Trivy is absent, but Dax now has staged, approved, read-only
+  scan requests and summarized scan results.
 - secret rotation execution and service-account change execution.
 
 ## Tests

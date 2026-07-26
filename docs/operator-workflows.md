@@ -527,6 +527,38 @@ should be removed after evidence preservation.
    runtime state.
 6. Release the Dax checkout claim after the target is gone.
 
+### Stage Image Vulnerability Scan
+
+Use this when an external or registry image appears in Dax's image provenance
+review and must be checked before production use.
+
+1. Open Claims.
+2. Review Image Provenance Review, Runtime Provider Inventory, and Image
+   Scanner Adapters.
+3. Click the image row or fill Image, Provider, Scanner, Requested By, and
+   Reason.
+4. Click Stage.
+5. Review Image Scan Requests and confirm the request is waiting for approval.
+
+### Approve Image Vulnerability Scan
+
+1. Open Claims.
+2. Review the image reference, provider, scanner, provenance, and reason.
+3. Click the scan request row to fill Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request status changes to approved.
+
+### Execute Image Vulnerability Scan
+
+1. Open Claims.
+2. Confirm the scan request is approved and the Trivy adapter is available.
+3. Fill Request ID and Executed By.
+4. Click Execute.
+5. Review Image Scan Results for critical, high, medium, low, and unknown
+   finding counts.
+6. Route critical or high findings to Odo and O'Brien before production use.
+
 ### Request A VM, Port, Gateway, Or Device Claim
 
 1. Open Claims.

@@ -74,6 +74,12 @@ from .ids_review import (
     record_ids_review_package_result,
     write_ids_review_prompt_file,
 )
+from .image_scanning import (
+    approve_image_scan_request_status,
+    execute_image_scan_request_status,
+    image_scan_status,
+    stage_image_scan_request_status,
+)
 from .knowledge import DEFAULT_KNOWLEDGE_LIMIT, knowledge_capture_status
 from .live_health import health_probe_adapter_for
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
@@ -7365,6 +7371,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     virtual_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     virtual_operations_parser = subparsers.add_parser("virtual-operations", help="summarize staged Dax virtual runtime operations")
     virtual_operations_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    image_scans_parser = subparsers.add_parser("image-scans", help="summarize Dax container image vulnerability scan requests and results")
+    image_scans_parser.add_argument("--project-root", default=".", help="project root containing state/image-scans.json")
+    stage_image_scan_parser = subparsers.add_parser("stage-image-scan", help="stage a Dax container image vulnerability scan request")
+    stage_image_scan_parser.add_argument("--project-root", default=".", help="project root containing state/image-scans.json")
+    stage_image_scan_parser.add_argument("--image", required=True)
+    stage_image_scan_parser.add_argument("--provider", default="docker")
+    stage_image_scan_parser.add_argument("--scanner", default="trivy")
+    stage_image_scan_parser.add_argument("--requested-by", default="dax")
+    stage_image_scan_parser.add_argument("--reason", default="scan container image before production use")
+    approve_image_scan_parser = subparsers.add_parser("approve-image-scan", help="approve a staged Dax container image vulnerability scan request")
+    approve_image_scan_parser.add_argument("--project-root", default=".", help="project root containing state/image-scans.json")
+    approve_image_scan_parser.add_argument("--request-id", required=True)
+    approve_image_scan_parser.add_argument("--approved-by", default="sisko")
+    approve_image_scan_parser.add_argument("--approved-at")
+    execute_image_scan_parser = subparsers.add_parser("execute-image-scan", help="execute an approved Dax container image vulnerability scan request")
+    execute_image_scan_parser.add_argument("--project-root", default=".", help="project root containing state/image-scans.json")
+    execute_image_scan_parser.add_argument("--request-id", required=True)
+    execute_image_scan_parser.add_argument("--executed-by", default="dax")
+    execute_image_scan_parser.add_argument("--executed-at")
     stage_virtual_target_setup_parser = subparsers.add_parser("stage-virtual-target-setup-batch", help="stage approval-required Dax real-provider target setup requests")
     stage_virtual_target_setup_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
     stage_virtual_target_setup_parser.add_argument("--requested-by", default="dax")
@@ -8132,6 +8157,34 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "virtual-operations":
         print(json.dumps(virtual_operations_status(args.project_root), sort_keys=True))
+        return 0
+
+    if args.command == "image-scans":
+        print(json.dumps(image_scan_status(args.project_root), sort_keys=True))
+        return 0
+
+    if args.command == "stage-image-scan":
+        print(
+            json.dumps(
+                stage_image_scan_request_status(
+                    args.project_root,
+                    args.image,
+                    args.provider,
+                    args.scanner,
+                    args.requested_by,
+                    args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-image-scan":
+        print(json.dumps(approve_image_scan_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at), sort_keys=True))
+        return 0
+
+    if args.command == "execute-image-scan":
+        print(json.dumps(execute_image_scan_request_status(args.project_root, args.request_id, args.executed_by, args.executed_at), sort_keys=True))
         return 0
 
     if args.command == "stage-virtual-target-setup-batch":

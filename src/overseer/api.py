@@ -1385,6 +1385,12 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "current_state": str(payload.get("current_state", "unknown")),
         "packages": tuple(str(package) for package in payload.get("packages", ())),
         "port": int(payload["port"]) if payload.get("port") is not None else None,
+        "compose_project_directory": str(payload["compose_project_directory"]) if payload.get("compose_project_directory") else None,
+        "compose_env": tuple(str(item) for item in payload.get("compose_env", ())),
+        "compose_rollback_env": tuple(str(item) for item in payload.get("compose_rollback_env", ())),
+        "compose_scan_image": tuple(str(item) for item in payload.get("compose_scan_image", ())),
+        "health_url": str(payload["health_url"]) if payload.get("health_url") else None,
+        "backup_label": str(payload["backup_label"]) if payload.get("backup_label") else None,
     }
 
 

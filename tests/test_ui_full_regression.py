@@ -587,8 +587,14 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "admin-cancel-plan-id",
             "admin-cancel-reason",
             "admin-canceled-by",
+            "admin-backup-label",
+            "admin-compose-env",
+            "admin-compose-project-directory",
+            "admin-compose-rollback-env",
+            "admin-compose-scan-images",
             "admin-current-state",
             "admin-execute-plan-id",
+            "admin-health-url",
             "admin-kind",
             "admin-package",
             "admin-plan-id",
@@ -831,6 +837,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("authorizationDecisionBoard", OPERATOR_CONSOLE_HTML)
         self.assertIn("Approval Decisions", OPERATOR_CONSOLE_HTML)
         self.assertIn("Request Changes", OPERATOR_CONSOLE_HTML)
+        self.assertIn("docker_compose_update", OPERATOR_CONSOLE_HTML)
+        self.assertIn("compose_scan_image", OPERATOR_CONSOLE_HTML)
         self.assertIn("formatCell", OPERATOR_CONSOLE_HTML)
         self.assertIn('target="_blank"', OPERATOR_CONSOLE_HTML)
 

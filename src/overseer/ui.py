@@ -1249,6 +1249,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (packageName) payload.packages = [packageName];
       const port = value("admin-port");
       if (port) payload.port = Number(port);
+      const composeProjectDirectory = value("admin-compose-project-directory");
+      if (composeProjectDirectory) payload.compose_project_directory = composeProjectDirectory;
+      const composeEnv = splitList(value("admin-compose-env"));
+      if (composeEnv.length) payload.compose_env = composeEnv;
+      const composeRollbackEnv = splitList(value("admin-compose-rollback-env"));
+      if (composeRollbackEnv.length) payload.compose_rollback_env = composeRollbackEnv;
+      const composeScanImages = splitList(value("admin-compose-scan-images"));
+      if (composeScanImages.length) payload.compose_scan_image = composeScanImages;
+      const healthUrl = value("admin-health-url");
+      if (healthUrl) payload.health_url = healthUrl;
+      const backupLabel = value("admin-backup-label");
+      if (backupLabel) payload.backup_label = backupLabel;
       return await postJson("/admin/plans", payload);
     }
     async function recordMaintenanceSchedule() {
@@ -1797,6 +1809,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-2"><label for="admin-current-state">Current State</label><input id="admin-current-state" value="active"></div>
               <div class="field span-2"><label for="admin-package">Package</label><input id="admin-package"></div>
               <div class="field span-2"><label for="admin-port">Port</label><input id="admin-port" type="number" min="1" max="65535"></div>
+              <div class="field span-3"><label for="admin-compose-project-directory">Compose Dir</label><input id="admin-compose-project-directory" placeholder="/home/god/penpot"></div>
+              <div class="field span-3"><label for="admin-compose-env">Compose Env</label><input id="admin-compose-env" placeholder="PENPOT_VERSION=2.17.0"></div>
+              <div class="field span-3"><label for="admin-compose-rollback-env">Rollback Env</label><input id="admin-compose-rollback-env" placeholder="PENPOT_VERSION=2.16"></div>
+              <div class="field span-3"><label for="admin-health-url">Health URL</label><input id="admin-health-url" placeholder="http://127.0.0.1:9001/"></div>
+              <div class="field span-6"><label for="admin-compose-scan-images">Scan Images</label><input id="admin-compose-scan-images" placeholder="penpotapp/frontend:2.17.0, postgres:15"></div>
+              <div class="field span-3"><label for="admin-backup-label">Backup Label</label><input id="admin-backup-label" placeholder="penpot-update"></div>
               <div class="field span-6"><label for="admin-reason">Reason</label><input id="admin-reason" value="operator requested maintenance"></div>
             </div>
           </div>
@@ -2418,7 +2436,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function adminKindOptions() {
-      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "flatpak_install", "npm_global_install", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "flatpak_install", "npm_global_install", "docker_compose_update", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function sourceDispositionOptions() {
       return ["needs_review", "expected", "benign", "suspicious", "hostile"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
@@ -2461,6 +2479,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function value(id) {
       const element = document.getElementById(id);
       return element ? element.value.trim() : "";
+    }
+    function splitList(raw) {
+      return (raw || "").split(/[,\\n]/).map((item) => item.trim()).filter(Boolean);
     }
     function applyFill(encoded) {
       if (!encoded) return;

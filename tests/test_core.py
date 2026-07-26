@@ -132,6 +132,7 @@ from overseer import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_docker_compose_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
@@ -1428,15 +1429,21 @@ class HealthSummaryTests(unittest.TestCase):
         restart = next(item for item in status["items"] if item["kind"] == AdminChangeKind.USER_SERVICE_RESTART.value)
         package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
         upgrade = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_UPGRADE.value)
+        compose = next(item for item in status["items"] if item["kind"] == AdminChangeKind.DOCKER_COMPOSE_UPDATE.value)
 
         self.assertIsNone(status["store"])
         self.assertEqual(status["enabled"], 1)
-        self.assertEqual(status["disabled"], 8)
+        self.assertEqual(
+            status["disabled"],
+            sum(1 for item in status["items"] if item["status"] == AdminAdapterStatus.DISABLED.value),
+        )
         self.assertEqual(restart["status"], AdminAdapterStatus.ENABLED.value)
         self.assertFalse(restart["authorization_required_before_enable"])
         self.assertEqual(package["status"], AdminAdapterStatus.DISABLED.value)
         self.assertTrue(package["approval_plan_required"])
         self.assertEqual(upgrade["adapter_name"], "apt-package-upgrade")
+        self.assertEqual(compose["status"], AdminAdapterStatus.DISABLED.value)
+        self.assertTrue(compose["authorization_required_before_enable"])
 
     def test_admin_adapter_capabilities_use_approved_store_enablement(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1459,7 +1466,10 @@ class HealthSummaryTests(unittest.TestCase):
         package = next(item for item in status["items"] if item["kind"] == AdminChangeKind.APT_INSTALL.value)
         self.assertEqual(status["store"], str(store_path))
         self.assertEqual(status["enabled"], 2)
-        self.assertEqual(status["disabled"], 7)
+        self.assertEqual(
+            status["disabled"],
+            sum(1 for item in status["items"] if item["status"] == AdminAdapterStatus.DISABLED.value),
+        )
         self.assertEqual(package["status"], AdminAdapterStatus.ENABLED.value)
         self.assertIn("approved live", package["summary"])
 
@@ -6634,6 +6644,71 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
         self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(executed.command_results[0].command, ("npm", "install", "-g", "obsidian-mcp-server"))
+
+    def test_docker_compose_update_plan_is_human_gated_with_backups(self):
+        plan = plan_docker_compose_update(
+            "admin.compose.penpot.update",
+            "/srv/penpot/docker-compose.yaml",
+            "remediate vulnerable active container images",
+            "penpot 2.16 images running",
+            project_directory="/srv/penpot",
+            env=("PENPOT_VERSION=2.17.0",),
+            rollback_env=("PENPOT_VERSION=2.16",),
+            scan_images=("penpotapp/frontend:2.17.0",),
+            health_url="http://127.0.0.1:9001/",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.DOCKER_COMPOSE_UPDATE)
+        self.assertEqual(plan.owner_domain, OwnerDomain.OBRIEN)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.risk_level, RiskLevel.HIGH)
+        self.assertIn("Backup Postgres volume", [step.title for step in plan.steps])
+        self.assertIn("Backup asset volume", [step.title for step in plan.steps])
+        self.assertIn(("sudo", "env", "PENPOT_VERSION=2.17.0", "docker", "compose", "-f", "/srv/penpot/docker-compose.yaml", "pull"), [step.command for step in plan.steps])
+        self.assertIn(
+            ("trivy", "image", "--severity", "CRITICAL,HIGH", "--exit-code", "1", "penpotapp/frontend:2.17.0"),
+            [step.command for step in plan.steps],
+        )
+        self.assertLess(
+            [step.title for step in plan.steps].index("Scan updated image penpotapp/frontend:2.17.0"),
+            [step.title for step in plan.steps].index("Recreate Compose services"),
+        )
+        self.assertEqual(
+            plan.rollback_steps[0].command,
+            ("sudo", "env", "PENPOT_VERSION=2.16", "docker", "compose", "-f", "/srv/penpot/docker-compose.yaml", "up", "-d"),
+        )
+        self.assertEqual(plan.verification_steps[-1].command, ("curl", "-fsS", "http://127.0.0.1:9001/"))
+
+    def test_docker_compose_update_executes_only_with_enabled_adapter(self):
+        plan = approve_admin_change_plan(
+            plan_docker_compose_update(
+                "admin.compose.penpot.exec",
+                "/srv/penpot/docker-compose.yaml",
+                "apply approved image update",
+                "staged",
+                project_directory="/srv/penpot",
+            ),
+            "human",
+        )
+
+        blocked = execute_admin_change_plan(plan)
+        executed = execute_admin_change_plan(
+            plan,
+            enabled_adapter_kinds=(AdminChangeKind.DOCKER_COMPOSE_UPDATE,),
+            runner=lambda step: AdminCommandResult(
+                title=step.title,
+                command=step.command,
+                exit_code=0,
+                stdout="ok",
+            ),
+        )
+        capability = admin_execution_capability_for(plan.kind, (AdminChangeKind.DOCKER_COMPOSE_UPDATE,))
+
+        self.assertEqual(blocked.status, AdminExecutionStatus.BLOCKED)
+        self.assertIn("live adapter unavailable for docker_compose_update", blocked.summary)
+        self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
+        self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
+        self.assertEqual(executed.command_results[-1].command, ("sudo", "docker", "compose", "-f", "/srv/penpot/docker-compose.yaml", "up", "-d"))
 
     def test_approved_package_update_executes_only_with_enabled_adapter(self):
         plan = approve_admin_change_plan(

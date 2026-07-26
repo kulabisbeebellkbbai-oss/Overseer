@@ -33,6 +33,7 @@ from .admin import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_docker_compose_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,
@@ -3187,6 +3188,12 @@ def plan_admin_change_status(
     current_state: str,
     packages: Sequence[str] = (),
     port: int | None = None,
+    compose_project_directory: str | None = None,
+    compose_env: Sequence[str] = (),
+    compose_rollback_env: Sequence[str] = (),
+    compose_scan_image: Sequence[str] = (),
+    health_url: str | None = None,
+    backup_label: str | None = None,
 ) -> dict[str, object]:
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
@@ -3201,6 +3208,19 @@ def plan_admin_change_status(
         plan = plan_flatpak_install(plan_id, target, reason, current_state)
     elif plan_kind == AdminChangeKind.NPM_GLOBAL_INSTALL:
         plan = plan_npm_global_install(plan_id, target, reason, current_state)
+    elif plan_kind == AdminChangeKind.DOCKER_COMPOSE_UPDATE:
+        plan = plan_docker_compose_update(
+            plan_id,
+            target,
+            reason,
+            current_state,
+            project_directory=compose_project_directory,
+            env=tuple(compose_env),
+            rollback_env=tuple(compose_rollback_env),
+            scan_images=tuple(compose_scan_image),
+            health_url=health_url,
+            backup_label=backup_label,
+        )
     elif plan_kind == AdminChangeKind.FIREWALL_ALLOW_TCP:
         if port is None:
             raise ValueError("port is required for firewall_allow_tcp")
@@ -3540,6 +3560,12 @@ def _admin_adapter_enablement_risks(kind: AdminChangeKind) -> list[str]:
             "package-provider changes may alter shared host dependencies or developer tooling",
             "package installation or upgrade may restart, add, or change local services",
             "rollback may not fully restore transitive package state",
+        ]
+    if kind == AdminChangeKind.DOCKER_COMPOSE_UPDATE:
+        return [
+            "Docker Compose updates can restart shared local services",
+            "application image changes can run data migrations against mounted volumes",
+            "rollback may require restoring local-only volume backups if application migrations are not reversible",
         ]
     if kind in {AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP, AdminChangeKind.BLOCK_IP}:
         return [
@@ -7730,6 +7756,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--current-state", default="unknown")
     admin_plan_parser.add_argument("--package", action="append")
     admin_plan_parser.add_argument("--port", type=int)
+    admin_plan_parser.add_argument("--compose-project-directory")
+    admin_plan_parser.add_argument("--compose-env", action="append")
+    admin_plan_parser.add_argument("--compose-rollback-env", action="append")
+    admin_plan_parser.add_argument("--compose-scan-image", action="append")
+    admin_plan_parser.add_argument("--health-url")
+    admin_plan_parser.add_argument("--backup-label")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     approve_admin_parser = subparsers.add_parser("approve-admin-change", help="record approval metadata for an admin change plan")
@@ -8709,6 +8741,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.current_state,
                     args.package or (),
                     args.port,
+                    args.compose_project_directory,
+                    args.compose_env or (),
+                    args.compose_rollback_env or (),
+                    args.compose_scan_image or (),
+                    args.health_url,
+                    args.backup_label,
                 ),
                 sort_keys=True,
             )

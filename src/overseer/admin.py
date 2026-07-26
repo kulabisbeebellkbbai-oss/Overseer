@@ -20,6 +20,7 @@ class AdminChangeKind(StrEnum):
     APT_UPGRADE = "apt_upgrade"
     FLATPAK_INSTALL = "flatpak_install"
     NPM_GLOBAL_INSTALL = "npm_global_install"
+    DOCKER_COMPOSE_UPDATE = "docker_compose_update"
     FIREWALL_ALLOW_TCP = "firewall_allow_tcp"
     FIREWALL_DENY_TCP = "firewall_deny_tcp"
     BLOCK_IP = "block_ip"
@@ -200,6 +201,21 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         authorization_required_before_enable=True,
         approval_plan_required=True,
         supported_commands=(("npm", "install", "-g"), ("npm", "list", "-g"), ("npm", "uninstall", "-g")),
+    ),
+    AdminChangeKind.DOCKER_COMPOSE_UPDATE: AdminExecutionCapability(
+        kind=AdminChangeKind.DOCKER_COMPOSE_UPDATE,
+        adapter_name="docker-compose-update",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live Docker Compose updates require explicit adapter enablement because they can restart services and mutate volumes",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(
+            ("sudo", "docker", "compose"),
+            ("sudo", "docker", "run"),
+            ("sudo", "docker", "image", "inspect"),
+            ("trivy", "image"),
+            ("curl", "-fsS"),
+        ),
     ),
     AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
@@ -563,6 +579,144 @@ def plan_npm_global_install(
                 "confirm the global npm package is installed and queryable",
             ),
         ),
+    )
+
+
+def plan_docker_compose_update(
+    plan_id: str,
+    compose_file: str,
+    reason: str,
+    current_state: str = "unknown",
+    project_directory: str | None = None,
+    env: tuple[str, ...] = (),
+    rollback_env: tuple[str, ...] = (),
+    scan_images: tuple[str, ...] = (),
+    health_url: str | None = None,
+    backup_label: str | None = None,
+) -> AdminChangePlan:
+    if not compose_file.strip():
+        raise ValueError("compose_file is required")
+    compose_path = compose_file.strip()
+    project_dir = (project_directory or os.path.dirname(compose_path) or ".").strip()
+    compose_command = ("sudo", "docker", "compose", "-f", compose_path)
+    env_prefix = ("sudo", "env", *env) if env else ("sudo",)
+    rollback_env_prefix = ("sudo", "env", *rollback_env) if rollback_env else ("sudo",)
+    safe_label = (backup_label or plan_id).replace("/", "_").replace(" ", "_")
+    backup_dir = f"local-secrets/admin-backups/{safe_label}"
+    backup_path = f"{project_dir}/{backup_dir}"
+    verification = (
+        AdminCommandStep(
+            "Verify Compose services",
+            (*compose_command, "ps"),
+            "confirm the Compose project reports service state after the update",
+        ),
+    )
+    if health_url:
+        verification = (
+            *verification,
+            AdminCommandStep(
+                "Verify service health endpoint",
+                ("curl", "-fsS", health_url),
+                "confirm the updated service responds on its local health or UI endpoint",
+            ),
+        )
+    scan_steps = tuple(
+        AdminCommandStep(
+            f"Scan updated image {image}",
+            ("trivy", "image", "--severity", "CRITICAL,HIGH", "--exit-code", "1", image),
+            "block service recreation if the pulled replacement image still has critical or high vulnerabilities",
+        )
+        for image in scan_images
+    )
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.DOCKER_COMPOSE_UPDATE,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.HUMAN,
+        target=compose_path,
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"update Docker Compose project at {compose_path} and verify dependent services",
+        steps=(
+            AdminCommandStep(
+                "Create backup directory",
+                ("mkdir", "-p", backup_path),
+                "prepare local-only backup storage before changing Compose services",
+            ),
+            AdminCommandStep(
+                "Backup Compose file",
+                ("cp", compose_path, f"{backup_path}/docker-compose.yaml"),
+                "preserve the current Compose declaration for rollback",
+            ),
+            AdminCommandStep(
+                "Backup Postgres volume",
+                (
+                    "sudo",
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    "penpot_penpot_postgres_v15:/volume:ro",
+                    "-v",
+                    f"{backup_path}:/backup",
+                    "alpine:latest",
+                    "tar",
+                    "czf",
+                    "/backup/postgres-volume.tgz",
+                    "-C",
+                    "/volume",
+                    ".",
+                ),
+                "preserve database volume data before an application or image update",
+            ),
+            AdminCommandStep(
+                "Backup asset volume",
+                (
+                    "sudo",
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    "penpot_penpot_assets:/volume:ro",
+                    "-v",
+                    f"{backup_path}:/backup",
+                    "alpine:latest",
+                    "tar",
+                    "czf",
+                    "/backup/assets-volume.tgz",
+                    "-C",
+                    "/volume",
+                    ".",
+                ),
+                "preserve application assets before the update",
+            ),
+            AdminCommandStep(
+                "Pull Compose images",
+                (*env_prefix, "docker", "compose", "-f", compose_path, "pull"),
+                "download the approved image versions before recreating services",
+            ),
+            *scan_steps,
+            AdminCommandStep(
+                "Recreate Compose services",
+                (*env_prefix, "docker", "compose", "-f", compose_path, "up", "-d"),
+                "apply the approved image update to the Compose project",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Rollback Compose services",
+                (*rollback_env_prefix, "docker", "compose", "-f", compose_path, "up", "-d"),
+                "return the Compose project to the previous approved image set if verification fails",
+            ),
+        ),
+        risks=(
+            "Docker Compose services will restart",
+            "application image updates may run irreversible migrations",
+            "database and asset volumes must be backed up before service recreation",
+            "dependent local integrations may fail while services restart",
+        ),
+        verification_steps=verification,
     )
 
 

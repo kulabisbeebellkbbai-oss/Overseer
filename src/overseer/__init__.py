@@ -28,6 +28,7 @@ from .admin import (
     plan_apt_update,
     plan_apt_upgrade,
     plan_block_ip,
+    plan_docker_compose_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewall_allow_tcp,

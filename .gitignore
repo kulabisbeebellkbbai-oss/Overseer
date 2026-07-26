@@ -23,6 +23,7 @@ exports/
 state/
 state/api-token
 runtime/
+backups/
 
 # OS/editor noise
 .DS_Store

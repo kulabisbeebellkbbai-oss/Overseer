@@ -186,14 +186,16 @@ Gaps:
   local state.
 
 Coverage: strong for storage discovery, resource registration, mount-health
-dashboard, SMART availability, backup job records, restore-test records, cleanup
-request staging, marker discovery, and capacity summaries. Claims can protect
-shared storage before changes. Live backup, restore, and cleanup execution
-remain approval-bound.
+dashboard, SMART availability, backup job records, restore-test records,
+approved project-local backup execution, approved isolated restore execution,
+cleanup request staging and execution, marker discovery, and capacity summaries.
+Claims can protect shared storage before changes. Backup and restore execution
+write ignored local manifests and block unsafe paths.
 
 Gaps:
 
-- No approved live backup or restore execution runner.
+- No backup provider policy beyond project-local filesystem backup and isolated
+  restore execution.
 - No filesystem growth trend panel.
 - No storage risk alerts for local databases, WAL files, or ignored exports.
 - No encryption status or removable-media trust workflow.

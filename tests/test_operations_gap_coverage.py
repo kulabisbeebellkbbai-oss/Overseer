@@ -9,11 +9,17 @@ from pathlib import Path
 from overseer.advisories import advisory_status, refresh_advisories_status
 from overseer.backup_ops import (
     approve_backup_cleanup_request_status,
+    approve_backup_execution_request_status,
+    approve_restore_execution_request_status,
     backup_operations_status,
     execute_backup_cleanup_request_status,
+    execute_backup_execution_request_status,
+    execute_restore_execution_request_status,
     record_backup_job_status,
     record_restore_test_status,
     stage_backup_cleanup_request_status,
+    stage_backup_execution_request_status,
+    stage_restore_execution_request_status,
 )
 from overseer.compliance_evidence import compliance_evidence_status
 from overseer.core import Claim, ClaimStatus, ClaimType, OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
@@ -588,6 +594,59 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertFalse(unapproved["host_mutation_performed"])
         self.assertEqual(blocked["status"], "blocked")
         self.assertIn("project-relative", blocked["summary"])
+
+    def test_backup_and_restore_execution_copy_project_local_data_with_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "state" / "operator"
+            source.mkdir(parents=True)
+            (source / "snapshot.json").write_text('{"ok": true}\n', encoding="utf-8")
+            backup_staged = stage_backup_execution_request_status(root, "state/operator", backup_name="operator-state")
+            backup_approved = approve_backup_execution_request_status(root, backup_staged["backup_request"]["id"], "kira")
+            backup_executed = execute_backup_execution_request_status(root, backup_staged["backup_request"]["id"], "kira")
+            backup_path = backup_executed["backup_request"]["backup_path"]
+            restore_staged = stage_restore_execution_request_status(root, backup_path, "artifacts/restored/operator")
+            restore_approved = approve_restore_execution_request_status(root, restore_staged["restore_request"]["id"], "kira")
+            restore_executed = execute_restore_execution_request_status(root, restore_staged["restore_request"]["id"], "kira")
+            status = backup_operations_status(root)
+            backup_manifest_exists = (root / backup_executed["manifest"]["manifest_path"]).exists()
+            restore_manifest_exists = (root / restore_executed["manifest"]["manifest_path"]).exists()
+            restored_file_exists = (root / "artifacts" / "restored" / "operator" / "snapshot.json").exists()
+
+            self.assertEqual(backup_approved["backup_request"]["status"], "approved")
+            self.assertEqual(backup_executed["status"], "completed")
+            self.assertTrue(backup_executed["host_mutation_performed"])
+            self.assertEqual(restore_approved["restore_request"]["status"], "approved")
+            self.assertEqual(restore_executed["status"], "completed")
+            self.assertTrue(restore_executed["host_mutation_performed"])
+            self.assertEqual(status["backup_requests"][0]["status"], "completed")
+            self.assertEqual(status["restore_requests"][0]["status"], "completed")
+            self.assertTrue(backup_manifest_exists)
+            self.assertTrue(restore_manifest_exists)
+            self.assertTrue(restored_file_exists)
+
+    def test_backup_and_restore_execution_block_unapproved_or_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state").mkdir()
+            (root / "state" / "snapshot.json").write_text("{}", encoding="utf-8")
+            unapproved = stage_backup_execution_request_status(root, "state/snapshot.json")
+            blocked_unapproved = execute_backup_execution_request_status(root, unapproved["backup_request"]["id"], "kira")
+            unsafe = stage_backup_execution_request_status(root, "../outside")
+            approve_backup_execution_request_status(root, unsafe["backup_request"]["id"], "kira")
+            blocked_unsafe = execute_backup_execution_request_status(root, unsafe["backup_request"]["id"], "kira")
+            (root / "backups").mkdir()
+            (root / "backups" / "missing").write_text("backup", encoding="utf-8")
+            restore_unsafe = stage_restore_execution_request_status(root, "backups/missing", "../outside")
+            approve_restore_execution_request_status(root, restore_unsafe["restore_request"]["id"], "kira")
+            blocked_restore = execute_restore_execution_request_status(root, restore_unsafe["restore_request"]["id"], "kira")
+
+        self.assertEqual(blocked_unapproved["status"], "blocked")
+        self.assertFalse(blocked_unapproved["host_mutation_performed"])
+        self.assertEqual(blocked_unsafe["status"], "blocked")
+        self.assertIn("project-relative", blocked_unsafe["summary"])
+        self.assertEqual(blocked_restore["status"], "blocked")
+        self.assertIn("project-relative", blocked_restore["summary"])
 
     def test_virtual_snapshot_and_restore_execute_against_local_fixture_with_manifests(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -79,8 +79,9 @@ The third pass added read-only evidence depth for the remaining gap categories:
   approval, and adapter enablement; the fixture persists execution/audit records
   and ignored local manifests without changing host firewall state.
 - Kira: mount health, backup/restore markers, backup job registry, restore-test
-  records, cleanup requests, capacity summary, and cleanup candidates, plus
-  SMART health when `smartctl` is available without extra privileges.
+  records, approved local backup execution, approved isolated restore execution,
+  cleanup requests, capacity summary, and cleanup candidates, plus SMART health
+  when `smartctl` is available without extra privileges.
 - Dax: virtual runtime evidence, claim state, port-pool conflicts, snapshot
   readiness, runtime adapter availability, runtime state records, staged
   snapshot requests, staged restore requests, and cleanup evidence.
@@ -153,7 +154,8 @@ environment-specific policy wiring:
 - live firewall desired-policy execution after IDS review and human approval.
   Fixture-only execution now verifies the approval path without mutating host
   firewall state.
-- approved live backup execution and restore execution.
+- broader backup provider policy beyond project-local filesystem backup and
+  isolated restore execution.
 - VM/container/emulator live adapter depth beyond approved disposable targets:
   running-domain snapshot policy, non-disposable destroy policy, and broader
   host-specific inventory enrichment. Dax now supports approved disposable

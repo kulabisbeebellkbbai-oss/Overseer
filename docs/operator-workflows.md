@@ -304,8 +304,26 @@ blackouts, rollback expectations, and validation requirements.
    optional Notes.
 4. Click Record Job.
 5. Verify the job appears in Backup Jobs.
-6. Use Admin for any live backup execution plan; this registry does not copy or
-   delete files.
+6. Use Backup Execution Request when the approved job should produce a local
+   restore point.
+
+### Execute A Local Backup
+
+Use this when Kira has approval to copy a safe project-local source into an
+ignored Overseer backup restore point.
+
+1. Open Assets.
+2. Review Backup Jobs, Storage And Backup, and Capacity Summary.
+3. Fill Source Path with a project-relative path under `state/`, `docs/`,
+   `assets/`, `src/`, `tests/`, `artifacts/`, or `backups/`.
+4. Fill Backup Name, Requested By, and Reason.
+5. Click Stage.
+6. Review Backup Execution Requests.
+7. Click the request row to fill Request ID.
+8. Fill Approved By and click Approve.
+9. Fill Executed By and click Execute.
+10. Review Backup Execution Requests for completed, blocked, or failed status,
+    plus the ignored backup path and manifest path.
 
 ### Record A Restore Test
 
@@ -316,6 +334,24 @@ blackouts, rollback expectations, and validation requirements.
 4. Click Record Test.
 5. Verify the result appears in Restore Tests.
 6. Run actual restore verification only in an approved isolated target.
+
+### Execute A Local Restore
+
+Use this when Kira has approval to restore a local Overseer backup into an
+isolated project-local target for validation.
+
+1. Open Assets.
+2. Review Backup Execution Requests and choose a completed backup path.
+3. Fill Backup Path with the `backups/overseer-managed/...` restore point.
+4. Fill Restore Target with a new path under `artifacts/` or `backups/`.
+5. Fill Requested By and Reason.
+6. Click Stage.
+7. Review Restore Execution Requests.
+8. Click the request row to fill Request ID.
+9. Fill Approved By and click Approve.
+10. Fill Executed By and click Execute.
+11. Review Restore Execution Requests and record a Restore Test result after
+    validation.
 
 ### Stage Backup Cleanup Request
 
@@ -351,6 +387,17 @@ CLI equivalent:
 PYTHONPATH=src python3 -m overseer.cli stage-backup-cleanup --project-root . --path artifacts/old-run --requested-by kira
 PYTHONPATH=src python3 -m overseer.cli approve-backup-cleanup --project-root . --request-id backup-cleanup.artifacts-old-run --approved-by kira
 PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . --request-id backup-cleanup.artifacts-old-run --executed-by kira
+```
+
+Backup/restore CLI equivalents:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli stage-backup-execution --project-root . --source-path state --backup-name local-state --requested-by kira
+PYTHONPATH=src python3 -m overseer.cli approve-backup-execution --project-root . --request-id backup-exec.local-state --approved-by kira
+PYTHONPATH=src python3 -m overseer.cli execute-backup-execution --project-root . --request-id backup-exec.local-state --executed-by kira
+PYTHONPATH=src python3 -m overseer.cli stage-restore-execution --project-root . --backup-path backups/overseer-managed/local-state-2026-07-21T00-00-00Z --restore-target artifacts/restore-test/local-state --requested-by kira
+PYTHONPATH=src python3 -m overseer.cli approve-restore-execution --project-root . --request-id restore-exec.backups-overseer-managed-local-state-2026-07-21T00-00-00Z.artifacts-restore-test-local-state --approved-by kira
+PYTHONPATH=src python3 -m overseer.cli execute-restore-execution --project-root . --request-id restore-exec.backups-overseer-managed-local-state-2026-07-21T00-00-00Z.artifacts-restore-test-local-state --executed-by kira
 ```
 
 ## Claims: Dax

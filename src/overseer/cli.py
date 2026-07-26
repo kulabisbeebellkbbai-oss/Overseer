@@ -56,7 +56,17 @@ from .documents import (
 )
 from .git import git_status_status
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
-from .backup_ops import approve_backup_cleanup_request_status, execute_backup_cleanup_request_status, stage_backup_cleanup_request_status
+from .backup_ops import (
+    approve_backup_cleanup_request_status,
+    approve_backup_execution_request_status,
+    approve_restore_execution_request_status,
+    execute_backup_cleanup_request_status,
+    execute_backup_execution_request_status,
+    execute_restore_execution_request_status,
+    stage_backup_cleanup_request_status,
+    stage_backup_execution_request_status,
+    stage_restore_execution_request_status,
+)
 from .health import HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .host import (
     HostFindingSeverity,
@@ -7724,6 +7734,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_virtual_destroy_parser.add_argument("--executed-by", default="dax")
     execute_virtual_destroy_parser.add_argument("--provider", default="local_fixture")
     execute_virtual_destroy_parser.add_argument("--executed-at")
+    stage_backup_execution_parser = subparsers.add_parser("stage-backup-execution", help="stage a Kira backup execution request")
+    stage_backup_execution_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    stage_backup_execution_parser.add_argument("--source-path", required=True)
+    stage_backup_execution_parser.add_argument("--backup-name")
+    stage_backup_execution_parser.add_argument("--requested-by", default="kira")
+    stage_backup_execution_parser.add_argument("--reason", default="stage approved local backup execution")
+    approve_backup_execution_parser = subparsers.add_parser("approve-backup-execution", help="approve a staged Kira backup execution request")
+    approve_backup_execution_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    approve_backup_execution_parser.add_argument("--request-id", required=True)
+    approve_backup_execution_parser.add_argument("--approved-by", default="kira")
+    approve_backup_execution_parser.add_argument("--approved-at")
+    execute_backup_execution_parser = subparsers.add_parser("execute-backup-execution", help="execute an approved Kira backup execution request")
+    execute_backup_execution_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    execute_backup_execution_parser.add_argument("--request-id", required=True)
+    execute_backup_execution_parser.add_argument("--executed-by", default="kira")
+    execute_backup_execution_parser.add_argument("--executed-at")
+    stage_restore_execution_parser = subparsers.add_parser("stage-restore-execution", help="stage a Kira restore execution request")
+    stage_restore_execution_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    stage_restore_execution_parser.add_argument("--backup-path", required=True)
+    stage_restore_execution_parser.add_argument("--restore-target", required=True)
+    stage_restore_execution_parser.add_argument("--requested-by", default="kira")
+    stage_restore_execution_parser.add_argument("--reason", default="stage approved local restore execution")
+    approve_restore_execution_parser = subparsers.add_parser("approve-restore-execution", help="approve a staged Kira restore execution request")
+    approve_restore_execution_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    approve_restore_execution_parser.add_argument("--request-id", required=True)
+    approve_restore_execution_parser.add_argument("--approved-by", default="kira")
+    approve_restore_execution_parser.add_argument("--approved-at")
+    execute_restore_execution_parser = subparsers.add_parser("execute-restore-execution", help="execute an approved Kira restore execution request")
+    execute_restore_execution_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
+    execute_restore_execution_parser.add_argument("--request-id", required=True)
+    execute_restore_execution_parser.add_argument("--executed-by", default="kira")
+    execute_restore_execution_parser.add_argument("--executed-at")
     stage_backup_cleanup_parser = subparsers.add_parser("stage-backup-cleanup", help="stage a Kira backup cleanup request")
     stage_backup_cleanup_parser.add_argument("--project-root", default=".", help="project root containing state/backup-operations.json")
     stage_backup_cleanup_parser.add_argument("--path", required=True)
@@ -8684,6 +8726,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 execute_backup_cleanup_request_status(args.project_root, args.request_id, args.executed_by, args.executed_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "stage-backup-execution":
+        print(
+            json.dumps(
+                stage_backup_execution_request_status(args.project_root, args.source_path, args.requested_by, args.reason, args.backup_name),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-backup-execution":
+        print(
+            json.dumps(
+                approve_backup_execution_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-backup-execution":
+        print(
+            json.dumps(
+                execute_backup_execution_request_status(args.project_root, args.request_id, args.executed_by, args.executed_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "stage-restore-execution":
+        print(
+            json.dumps(
+                stage_restore_execution_request_status(args.project_root, args.backup_path, args.restore_target, args.requested_by, args.reason),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-restore-execution":
+        print(
+            json.dumps(
+                approve_restore_execution_request_status(args.project_root, args.request_id, args.approved_by, args.approved_at),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-restore-execution":
+        print(
+            json.dumps(
+                execute_restore_execution_request_status(args.project_root, args.request_id, args.executed_by, args.executed_at),
                 sort_keys=True,
             )
         )

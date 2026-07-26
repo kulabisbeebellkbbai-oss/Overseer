@@ -933,6 +933,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "execute-image-scan") return await executeImageScanRequest();
       if (action === "record-backup-job") return await recordBackupJob();
       if (action === "record-restore-test") return await recordRestoreTest();
+      if (action === "stage-backup-execution-request") return await stageBackupExecutionRequest();
+      if (action === "approve-backup-execution-request") return await approveBackupExecutionRequest();
+      if (action === "execute-backup-execution-request") return await executeBackupExecutionRequest();
+      if (action === "stage-restore-execution-request") return await stageRestoreExecutionRequest();
+      if (action === "approve-restore-execution-request") return await approveRestoreExecutionRequest();
+      if (action === "execute-restore-execution-request") return await executeRestoreExecutionRequest();
       if (action === "stage-backup-cleanup-request") return await stageBackupCleanupRequest();
       if (action === "approve-backup-cleanup-request") return await approveBackupCleanupRequest();
       if (action === "execute-backup-cleanup-request") return await executeBackupCleanupRequest();
@@ -1031,6 +1037,46 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         status: value("restore-status") || "planned",
         validated_by: value("restore-validated-by") || "kira",
         notes: value("restore-notes")
+      });
+    }
+    async function stageBackupExecutionRequest() {
+      return await postJson("/storage/backup-execution-requests", {
+        source_path: value("backup-exec-source-path"),
+        backup_name: value("backup-exec-backup-name"),
+        requested_by: value("backup-exec-requested-by") || "kira",
+        reason: value("backup-exec-reason") || "stage approved local backup execution"
+      });
+    }
+    async function approveBackupExecutionRequest() {
+      return await postJson("/storage/backup-execution-requests/approve", {
+        request_id: value("backup-exec-request-id"),
+        approved_by: value("backup-exec-approved-by") || "kira"
+      });
+    }
+    async function executeBackupExecutionRequest() {
+      return await postJson("/storage/backup-execution-requests/execute", {
+        request_id: value("backup-exec-request-id"),
+        executed_by: value("backup-exec-executed-by") || "kira"
+      });
+    }
+    async function stageRestoreExecutionRequest() {
+      return await postJson("/storage/restore-execution-requests", {
+        backup_path: value("restore-exec-backup-path"),
+        restore_target: value("restore-exec-restore-target"),
+        requested_by: value("restore-exec-requested-by") || "kira",
+        reason: value("restore-exec-reason") || "stage approved local restore execution"
+      });
+    }
+    async function approveRestoreExecutionRequest() {
+      return await postJson("/storage/restore-execution-requests/approve", {
+        request_id: value("restore-exec-request-id"),
+        approved_by: value("restore-exec-approved-by") || "kira"
+      });
+    }
+    async function executeRestoreExecutionRequest() {
+      return await postJson("/storage/restore-execution-requests/execute", {
+        request_id: value("restore-exec-request-id"),
+        executed_by: value("restore-exec-executed-by") || "kira"
       });
     }
     async function stageBackupCleanupRequest() {
@@ -2042,6 +2088,30 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
+            <div class="toolbar"><h3>Backup Execution Request</h3><div class="actions"><button class="action-btn" data-action="stage-backup-execution-request">Stage</button><button class="action-btn" data-action="approve-backup-execution-request">Approve</button><button class="action-btn" data-action="execute-backup-execution-request">Execute</button></div></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="backup-exec-request-id">Request ID</label><input id="backup-exec-request-id"></div>
+              <div class="field span-6"><label for="backup-exec-source-path">Source Path</label><input id="backup-exec-source-path" value="state"></div>
+              <div class="field span-4"><label for="backup-exec-backup-name">Backup Name</label><input id="backup-exec-backup-name" value="local-state"></div>
+              <div class="field span-4"><label for="backup-exec-requested-by">Requested By</label><input id="backup-exec-requested-by" value="kira"></div>
+              <div class="field span-4"><label for="backup-exec-approved-by">Approved By</label><input id="backup-exec-approved-by" value="kira"></div>
+              <div class="field span-4"><label for="backup-exec-executed-by">Executed By</label><input id="backup-exec-executed-by" value="kira"></div>
+              <div class="field span-12"><label for="backup-exec-reason">Reason</label><input id="backup-exec-reason" value="stage approved local backup execution"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Restore Execution Request</h3><div class="actions"><button class="action-btn" data-action="stage-restore-execution-request">Stage</button><button class="action-btn" data-action="approve-restore-execution-request">Approve</button><button class="action-btn" data-action="execute-restore-execution-request">Execute</button></div></div>
+            <div class="form-grid">
+              <div class="field span-6"><label for="restore-exec-request-id">Request ID</label><input id="restore-exec-request-id"></div>
+              <div class="field span-6"><label for="restore-exec-backup-path">Backup Path</label><input id="restore-exec-backup-path" value="backups/overseer-managed/local-state"></div>
+              <div class="field span-6"><label for="restore-exec-restore-target">Restore Target</label><input id="restore-exec-restore-target" value="artifacts/restore-test/local-state"></div>
+              <div class="field span-3"><label for="restore-exec-requested-by">Requested By</label><input id="restore-exec-requested-by" value="kira"></div>
+              <div class="field span-3"><label for="restore-exec-approved-by">Approved By</label><input id="restore-exec-approved-by" value="kira"></div>
+              <div class="field span-3"><label for="restore-exec-executed-by">Executed By</label><input id="restore-exec-executed-by" value="kira"></div>
+              <div class="field span-12"><label for="restore-exec-reason">Reason</label><input id="restore-exec-reason" value="stage approved local restore execution"></div>
+            </div>
+          </div>
+          <div class="panel span-6">
             <div class="toolbar"><h3>Backup Cleanup Request</h3><div class="actions"><button class="action-btn" data-action="stage-backup-cleanup-request">Stage</button><button class="action-btn" data-action="approve-backup-cleanup-request">Approve</button><button class="action-btn" data-action="execute-backup-cleanup-request">Execute</button></div></div>
             <div class="form-grid">
               <div class="field span-6"><label for="backup-cleanup-request-id">Request ID</label><input id="backup-cleanup-request-id"></div>
@@ -2058,6 +2128,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Backup Markers", storageEvidence.backup_markers || [], ["path", "kind", "status"])}</div>
           <div class="panel span-12">${table("Backup Jobs", backupOperations.jobs || storageEvidence.backup_jobs || [], ["id", "target", "schedule", "retention", "status", "next_step"], {fills: {id: (row) => backupJobFill(row)}, fillView: "assets"})}</div>
           <div class="panel span-12">${table("Restore Tests", backupOperations.restore_tests || storageEvidence.restore_tests || [], ["id", "job_id", "restore_point", "status", "validated_by", "next_step"], {fills: {id: (row) => restoreTestFill(row), job_id: (row) => backupJobFill({id: row.job_id})}, fillView: "assets"})}</div>
+          <div class="panel span-12">${table("Backup Execution Requests", backupOperations.backup_requests || storageEvidence.backup_requests || [], ["id", "source_path", "backup_path", "status", "approval_required", "next_step"], {fills: {id: (row) => backupExecutionFill(row), backup_path: (row) => restoreExecutionFill({backup_path: row.backup_path})}, fillView: "assets"})}</div>
+          <div class="panel span-12">${table("Restore Execution Requests", backupOperations.restore_requests || storageEvidence.restore_requests || [], ["id", "backup_path", "restore_target", "restored_path", "status", "next_step"], {fills: {id: (row) => restoreExecutionFill(row), backup_path: (row) => restoreExecutionFill(row)}, fillView: "assets"})}</div>
           <div class="panel span-12">${table("Backup Cleanup Requests", backupOperations.cleanup_requests || storageEvidence.cleanup_requests || [], ["id", "path", "status", "approval_required", "next_step"], {fills: {path: (row) => backupCleanupFill(row)}, fillView: "assets"})}</div>
           <div class="panel span-6">${table("Storage Cleanup Candidates", storageEvidence.cleanup_candidates || [], ["path", "kind", "status"])}</div>
           <div class="panel span-6">${kv("Capacity Summary", storageEvidence.capacity_summary || {})}</div>
@@ -2756,6 +2828,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Register a managed resource", page: "Assets", owner: "Kira / Dax", action: "register-resource", source, query: "Register a managed resource"},
         {workflow: "Record a backup job", page: "Assets", owner: "Kira", action: "record-backup-job", source, query: "Record a backup job"},
         {workflow: "Record a restore test", page: "Assets", owner: "Kira", action: "record-restore-test", source, query: "Record a restore test"},
+        {workflow: "Stage backup execution request", page: "Assets", owner: "Kira", action: "stage-backup-execution-request", source, query: "Stage backup execution request"},
+        {workflow: "Approve backup execution request", page: "Assets", owner: "Sisko / Kira", action: "approve-backup-execution-request", source, query: "Approve backup execution request"},
+        {workflow: "Execute backup execution request", page: "Assets", owner: "Kira", action: "execute-backup-execution-request", source, query: "Execute backup execution request"},
+        {workflow: "Stage restore execution request", page: "Assets", owner: "Kira", action: "stage-restore-execution-request", source, query: "Stage restore execution request"},
+        {workflow: "Approve restore execution request", page: "Assets", owner: "Sisko / Kira", action: "approve-restore-execution-request", source, query: "Approve restore execution request"},
+        {workflow: "Execute restore execution request", page: "Assets", owner: "Kira", action: "execute-restore-execution-request", source, query: "Execute restore execution request"},
         {workflow: "Stage backup cleanup request", page: "Assets", owner: "Kira", action: "stage-backup-cleanup-request", source, query: "Stage backup cleanup request"},
         {workflow: "Approve backup cleanup request", page: "Assets", owner: "Kira", action: "approve-backup-cleanup-request", source, query: "Approve backup cleanup request"},
         {workflow: "Execute backup cleanup request", page: "Assets", owner: "Kira", action: "execute-backup-cleanup-request", source, query: "Execute backup cleanup request"},
@@ -3049,6 +3127,26 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "backup-cleanup-reason": row?.reason || row?.next_step || "review generated storage cleanup candidate",
         "backup-cleanup-approved-by": row?.approved_by || "kira",
         "backup-cleanup-executed-by": row?.executed_by || "kira"
+      };
+    }
+    function backupExecutionFill(row) {
+      return {
+        "backup-exec-request-id": row?.id || "",
+        "backup-exec-source-path": row?.source_path || "",
+        "backup-exec-backup-name": row?.backup_name || row?.id || "",
+        "backup-exec-reason": row?.reason || row?.next_step || "stage approved local backup execution",
+        "backup-exec-approved-by": row?.approved_by || "kira",
+        "backup-exec-executed-by": row?.executed_by || "kira"
+      };
+    }
+    function restoreExecutionFill(row) {
+      return {
+        "restore-exec-request-id": row?.id || "",
+        "restore-exec-backup-path": row?.backup_path || "",
+        "restore-exec-restore-target": row?.restore_target || "artifacts/restore-test/local-state",
+        "restore-exec-reason": row?.reason || row?.next_step || "stage approved local restore execution",
+        "restore-exec-approved-by": row?.approved_by || "kira",
+        "restore-exec-executed-by": row?.executed_by || "kira"
       };
     }
     function virtualRuntimeFill(row) {

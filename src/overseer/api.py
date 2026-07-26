@@ -116,12 +116,18 @@ from .documents import (
 from .compliance_evidence import compliance_evidence_status
 from .advisories import advisory_status, refresh_advisories_status
 from .backup_ops import (
+    approve_backup_execution_request_status,
     approve_backup_cleanup_request_status,
+    approve_restore_execution_request_status,
     backup_operations_status,
+    execute_backup_execution_request_status,
     execute_backup_cleanup_request_status,
+    execute_restore_execution_request_status,
     record_backup_job_status,
     record_restore_test_status,
+    stage_backup_execution_request_status,
     stage_backup_cleanup_request_status,
+    stage_restore_execution_request_status,
 )
 from .documentation_evidence import documentation_evidence_status
 from .git import git_status_status
@@ -534,6 +540,24 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/storage/restore-tests":
                 self._handle_json(lambda payload: record_restore_test_status(_project_path_for_store(store_path), **_restore_test_args(payload)))
+                return
+            if path == "/storage/backup-execution-requests":
+                self._handle_json(lambda payload: stage_backup_execution_request_status(_project_path_for_store(store_path), **_backup_execution_request_args(payload)))
+                return
+            if path == "/storage/backup-execution-requests/approve":
+                self._handle_json(lambda payload: approve_backup_execution_request_status(_project_path_for_store(store_path), **_backup_execution_approval_args(payload)))
+                return
+            if path == "/storage/backup-execution-requests/execute":
+                self._handle_json(lambda payload: execute_backup_execution_request_status(_project_path_for_store(store_path), **_backup_execution_execute_args(payload)))
+                return
+            if path == "/storage/restore-execution-requests":
+                self._handle_json(lambda payload: stage_restore_execution_request_status(_project_path_for_store(store_path), **_restore_execution_request_args(payload)))
+                return
+            if path == "/storage/restore-execution-requests/approve":
+                self._handle_json(lambda payload: approve_restore_execution_request_status(_project_path_for_store(store_path), **_restore_execution_approval_args(payload)))
+                return
+            if path == "/storage/restore-execution-requests/execute":
+                self._handle_json(lambda payload: execute_restore_execution_request_status(_project_path_for_store(store_path), **_restore_execution_execute_args(payload)))
                 return
             if path == "/storage/cleanup-requests":
                 self._handle_json(lambda payload: stage_backup_cleanup_request_status(_project_path_for_store(store_path), **_backup_cleanup_request_args(payload)))
@@ -1184,6 +1208,56 @@ def _backup_cleanup_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "path": str(payload["path"]),
         "requested_by": str(payload.get("requested_by") or "kira"),
         "reason": str(payload.get("reason") or "review generated storage cleanup candidate"),
+    }
+
+
+def _backup_execution_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_path": str(payload["source_path"]),
+        "requested_by": str(payload.get("requested_by") or "kira"),
+        "reason": str(payload.get("reason") or "stage approved local backup execution"),
+        "backup_name": str(payload["backup_name"]) if payload.get("backup_name") else None,
+    }
+
+
+def _backup_execution_approval_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "approved_by": str(payload.get("approved_by") or "kira"),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") else None,
+    }
+
+
+def _backup_execution_execute_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "executed_by": str(payload.get("executed_by") or "kira"),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") else None,
+    }
+
+
+def _restore_execution_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "backup_path": str(payload["backup_path"]),
+        "restore_target": str(payload["restore_target"]),
+        "requested_by": str(payload.get("requested_by") or "kira"),
+        "reason": str(payload.get("reason") or "stage approved local restore execution"),
+    }
+
+
+def _restore_execution_approval_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "approved_by": str(payload.get("approved_by") or "kira"),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") else None,
+    }
+
+
+def _restore_execution_execute_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "executed_by": str(payload.get("executed_by") or "kira"),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") else None,
     }
 
 

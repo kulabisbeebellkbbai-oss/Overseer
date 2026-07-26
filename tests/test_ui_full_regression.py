@@ -50,6 +50,12 @@ EXPECTED_VIEWS = {
             "register-resource",
             "record-backup-job",
             "record-restore-test",
+            "stage-backup-execution-request",
+            "approve-backup-execution-request",
+            "execute-backup-execution-request",
+            "stage-restore-execution-request",
+            "approve-restore-execution-request",
+            "execute-restore-execution-request",
             "stage-backup-cleanup-request",
             "approve-backup-cleanup-request",
             "execute-backup-cleanup-request",
@@ -146,7 +152,9 @@ ACTION_ROUTES = {
     "approve-admin-archive": ("POST", "/admin/history-archive-requests/approve"),
     "approve-admin-change": ("POST", "/admin/approve"),
     "approve-admin-restore": ("POST", "/admin/history-restore-requests/approve"),
+    "approve-backup-execution-request": ("POST", "/storage/backup-execution-requests/approve"),
     "approve-backup-cleanup-request": ("POST", "/storage/cleanup-requests/approve"),
+    "approve-restore-execution-request": ("POST", "/storage/restore-execution-requests/approve"),
     "approve-claim": ("POST", "/claims/approve"),
     "approve-claim-cleanup": ("POST", "/claims/cleanup-requests/approve"),
     "approve-policy-warning": ("POST", "/admin/policy-warning-requests/approve"),
@@ -171,7 +179,9 @@ ACTION_ROUTES = {
     "documents-search": ("POST", "/documents/search"),
     "documents-write-note": ("POST", "/documents/notes"),
     "execute-admin-change": ("POST", "/admin/execute"),
+    "execute-backup-execution-request": ("POST", "/storage/backup-execution-requests/execute"),
     "execute-backup-cleanup-request": ("POST", "/storage/cleanup-requests/execute"),
+    "execute-restore-execution-request": ("POST", "/storage/restore-execution-requests/execute"),
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
     "execute-journal-access-request": ("POST", "/health/journal-access-requests/execute"),
     "execute-firewall-change": ("POST", "/host/security/firewall-executions/execute"),
@@ -218,7 +228,9 @@ ACTION_ROUTES = {
     "run-package-maintenance-cycle": ("POST", "/maintenance/package-maintenance-cycle"),
     "run-health-probes": ("POST", "/health/probes/run"),
     "send-crew-message": ("POST", "/crew/messages"),
+    "stage-backup-execution-request": ("POST", "/storage/backup-execution-requests"),
     "stage-backup-cleanup-request": ("POST", "/storage/cleanup-requests"),
+    "stage-restore-execution-request": ("POST", "/storage/restore-execution-requests"),
     "stage-journal-access-request": ("POST", "/health/journal-access-requests"),
     "stage-operation-workflow": ("POST", "/operations/workflows/stage"),
     "stage-virtual-target-setup-batch": ("POST", "/virtual/target-setup-requests"),
@@ -320,6 +332,35 @@ SAFE_POST_PAYLOADS = {
         "restore_point": "backups/restore-test.md",
         "status": "planned",
         "validated_by": "kira",
+    },
+    "/storage/backup-execution-requests": {
+        "source_path": "state/ui-backup-source",
+        "backup_name": "ui-backup-source",
+        "requested_by": "kira",
+        "reason": "exercise disposable backup execution request workflow",
+    },
+    "/storage/backup-execution-requests/approve": {
+        "request_id": "backup-exec.ui-backup-source",
+        "approved_by": "kira",
+    },
+    "/storage/backup-execution-requests/execute": {
+        "request_id": "backup-exec.ui-backup-source",
+        "executed_by": "kira",
+        "executed_at": "2026-07-21T00:00:00Z",
+    },
+    "/storage/restore-execution-requests": {
+        "backup_path": "backups/overseer-managed/ui-backup-source-2026-07-21T00-00-00Z",
+        "restore_target": "artifacts/ui-restore",
+        "requested_by": "kira",
+        "reason": "exercise disposable restore execution request workflow",
+    },
+    "/storage/restore-execution-requests/approve": {
+        "request_id": "restore-exec.backups-overseer-managed-ui-backup-source-2026-07-21T00-00-00Z.artifacts-ui-restore",
+        "approved_by": "kira",
+    },
+    "/storage/restore-execution-requests/execute": {
+        "request_id": "restore-exec.backups-overseer-managed-ui-backup-source-2026-07-21T00-00-00Z.artifacts-ui-restore",
+        "executed_by": "kira",
     },
     "/storage/cleanup-requests": {
         "path": "artifacts/ui-cleanup",
@@ -626,6 +667,13 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "advisory-packages",
             "advisory-requested-by",
             "advisory-source",
+            "backup-exec-approved-by",
+            "backup-exec-backup-name",
+            "backup-exec-executed-by",
+            "backup-exec-reason",
+            "backup-exec-request-id",
+            "backup-exec-requested-by",
+            "backup-exec-source-path",
             "backup-cleanup-path",
             "backup-cleanup-reason",
             "backup-cleanup-request-id",
@@ -759,6 +807,13 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "restore-status",
             "restore-test-id",
             "restore-validated-by",
+            "restore-exec-approved-by",
+            "restore-exec-backup-path",
+            "restore-exec-executed-by",
+            "restore-exec-reason",
+            "restore-exec-request-id",
+            "restore-exec-requested-by",
+            "restore-exec-restore-target",
             "restore-virtual-point",
             "restore-virtual-reason",
             "restore-virtual-requested-by",
@@ -838,6 +893,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("data-view-target", OPERATOR_CONSOLE_HTML)
         self.assertIn("crew-card", OPERATOR_CONSOLE_HTML)
         self.assertIn("Resource Registry", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Execution Request", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Restore Execution Request", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Execution Requests", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Restore Execution Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Destroy Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Image Vulnerability Scan", OPERATOR_CONSOLE_HTML)
@@ -889,6 +948,12 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "View VM leases and virtual claims",
             "Record a backup job",
             "Record a restore test",
+            "Stage backup execution request",
+            "Approve backup execution request",
+            "Execute backup execution request",
+            "Stage restore execution request",
+            "Approve restore execution request",
+            "Execute restore execution request",
             "Stage backup cleanup request",
             "View logs from an unhealthy service",
             "Record virtual runtime state",
@@ -934,11 +999,14 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             cleanup_target = Path(directory) / "artifacts" / "ui-cleanup"
             cleanup_target.mkdir(parents=True)
             (cleanup_target / "old-result.txt").write_text("generated result", encoding="utf-8")
+            backup_source = Path(directory) / "state" / "ui-backup-source"
+            backup_source.mkdir(parents=True)
+            (backup_source / "snapshot.json").write_text('{"source": "ui"}\n', encoding="utf-8")
             virtual_target = Path(directory) / "local-secrets" / "virtual-runtime-targets" / "vm.ui.full"
             virtual_target.mkdir(parents=True)
             (virtual_target / "state.txt").write_text("before\n", encoding="utf-8")
             store_path = Path(directory) / "state" / "overseer.sqlite3"
-            store_path.parent.mkdir(parents=True)
+            store_path.parent.mkdir(parents=True, exist_ok=True)
             with LocalApiHarness(store_path) as server:
                 resource = server.post_json("/Overseer/resources", SAFE_POST_PAYLOADS["/resources"])
                 claim = server.post_json("/Overseer/claims/request", SAFE_POST_PAYLOADS["/claims/request"])
@@ -963,6 +1031,30 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 )
                 backup_job = server.post_json("/Overseer/storage/backup-jobs", SAFE_POST_PAYLOADS["/storage/backup-jobs"])
                 restore_test = server.post_json("/Overseer/storage/restore-tests", SAFE_POST_PAYLOADS["/storage/restore-tests"])
+                backup_execution = server.post_json(
+                    "/Overseer/storage/backup-execution-requests",
+                    SAFE_POST_PAYLOADS["/storage/backup-execution-requests"],
+                )
+                backup_execution_approval = server.post_json(
+                    "/Overseer/storage/backup-execution-requests/approve",
+                    SAFE_POST_PAYLOADS["/storage/backup-execution-requests/approve"],
+                )
+                backup_execution_result = server.post_json(
+                    "/Overseer/storage/backup-execution-requests/execute",
+                    SAFE_POST_PAYLOADS["/storage/backup-execution-requests/execute"],
+                )
+                restore_execution = server.post_json(
+                    "/Overseer/storage/restore-execution-requests",
+                    SAFE_POST_PAYLOADS["/storage/restore-execution-requests"],
+                )
+                restore_execution_approval = server.post_json(
+                    "/Overseer/storage/restore-execution-requests/approve",
+                    SAFE_POST_PAYLOADS["/storage/restore-execution-requests/approve"],
+                )
+                restore_execution_result = server.post_json(
+                    "/Overseer/storage/restore-execution-requests/execute",
+                    SAFE_POST_PAYLOADS["/storage/restore-execution-requests/execute"],
+                )
                 backup_cleanup = server.post_json(
                     "/Overseer/storage/cleanup-requests",
                     SAFE_POST_PAYLOADS["/storage/cleanup-requests"],
@@ -1086,6 +1178,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 approvals = server.get_json("/Overseer/approvals-summary")
                 root_notes = server.get_json("/Overseer/documents/notes?folder=Overseer")
                 runbook_notes = server.get_json("/Overseer/documents/notes?folder=Overseer%2FRunbooks")
+                restored_backup_file_exists = (Path(directory) / "artifacts" / "ui-restore" / "snapshot.json").exists()
 
         self.assertTrue(resource["mutation_performed"])
         self.assertEqual(claim["claim"], "claim.ui.full")
@@ -1100,6 +1193,13 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertFalse(journal_execution["host_mutation_performed"])
         self.assertEqual(backup_job["job"]["id"], "backup.ui.full")
         self.assertEqual(restore_test["restore_test"]["id"], "restore.ui.full")
+        self.assertEqual(backup_execution["backup_request"]["status"], "waiting_approval")
+        self.assertEqual(backup_execution_approval["backup_request"]["status"], "approved")
+        self.assertEqual(backup_execution_result["status"], "completed")
+        self.assertEqual(restore_execution["restore_request"]["status"], "waiting_approval")
+        self.assertEqual(restore_execution_approval["restore_request"]["status"], "approved")
+        self.assertEqual(restore_execution_result["status"], "completed")
+        self.assertTrue(restored_backup_file_exists)
         self.assertEqual(backup_cleanup["cleanup_request"]["status"], "waiting_approval")
         self.assertFalse(backup_cleanup["host_mutation_performed"])
         self.assertEqual(backup_cleanup_approval["cleanup_request"]["status"], "approved")

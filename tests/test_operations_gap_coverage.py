@@ -49,6 +49,7 @@ from overseer.virtual_ops import (
     execute_virtual_lifecycle_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
+    execute_virtual_target_setup_status,
     record_virtual_target_setup_result_status,
     record_virtual_runtime_status,
     stage_virtual_restore_request_status,
@@ -987,6 +988,26 @@ exit 0
         self.assertEqual(api_blocked["target_setup_request"]["status"], "blocked")
         self.assertTrue(api_blocked["target_setup_request"]["approval_required"])
         self.assertEqual(api_status["target_setup_request_count"], 2)
+
+    def test_virtual_target_setup_execute_requires_approval_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_virtual_target_setup_batch_status(root, requested_by="dax", scope="gateway_proxy")
+            with self.assertRaises(ValueError):
+                execute_virtual_target_setup_status(root, "gateway_proxy", approved_by="")
+
+
+    def test_virtual_target_setup_execute_creates_gateway_proxy_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_virtual_target_setup_batch_status(root, requested_by="dax", scope="gateway_proxy")
+            completed = execute_virtual_target_setup_status(root, "gateway_proxy", approved_by="sisko")
+            status = virtual_operations_status(root)
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertIn("loopback-only proxy config", completed["manifest"]["summary"])
+        self.assertEqual(status["runtime_records"][0]["adapter"], "gateway_proxy")
+        self.assertFalse(status["host_mutation_performed"])
 
     def test_performance_history_reads_regression_artifacts_without_running_tests(self):
         with tempfile.TemporaryDirectory() as directory:

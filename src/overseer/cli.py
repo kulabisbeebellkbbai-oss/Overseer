@@ -116,6 +116,7 @@ from .virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
     execute_virtual_lifecycle_status,
+    execute_virtual_target_setup_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
@@ -7377,6 +7378,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_virtual_target_setup_result_parser.add_argument("--evidence", default="")
     record_virtual_target_setup_result_parser.add_argument("--next-step", default="")
     record_virtual_target_setup_result_parser.add_argument("--executed-at")
+    execute_virtual_target_setup_parser = subparsers.add_parser(
+        "execute-virtual-target-setup",
+        help="execute an approved Dax disposable real-provider target setup request",
+    )
+    execute_virtual_target_setup_parser.add_argument("--project-root", default=".", help="project root containing state/virtual-operations.json")
+    execute_virtual_target_setup_parser.add_argument("--provider", required=True)
+    execute_virtual_target_setup_parser.add_argument("--executed-by", default="dax")
+    execute_virtual_target_setup_parser.add_argument("--approved-by", required=True)
+    execute_virtual_target_setup_parser.add_argument("--executed-at")
     discover_virtual_parser = subparsers.add_parser("discover-virtual-listeners", help="discover local TCP listeners as virtual assets")
     discover_virtual_parser.add_argument("--store", required=True, help="explicit SQLite store path for persisting discovered listener resources")
     record_virtual_runtime_parser = subparsers.add_parser("record-virtual-runtime", help="record Dax virtual runtime state")
@@ -8129,6 +8139,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.executed_by,
                     args.evidence,
                     args.next_step,
+                    args.executed_at,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-virtual-target-setup":
+        print(
+            json.dumps(
+                execute_virtual_target_setup_status(
+                    args.project_root,
+                    args.provider,
+                    args.executed_by,
+                    args.approved_by,
                     args.executed_at,
                 ),
                 sort_keys=True,

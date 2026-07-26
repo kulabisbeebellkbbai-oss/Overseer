@@ -915,6 +915,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "discover-listeners") return await postJson("/virtual/discover-listeners", {});
       if (action === "stage-virtual-target-setup-batch") return await stageVirtualTargetSetupBatch();
       if (action === "record-virtual-target-setup-result") return await recordVirtualTargetSetupResult();
+      if (action === "execute-virtual-target-setup") return await executeVirtualTargetSetup();
       if (action === "record-virtual-runtime") return await recordVirtualRuntime();
       if (action === "execute-virtual-lifecycle") return await executeVirtualLifecycle();
       if (action === "stage-virtual-snapshot-request") return await stageVirtualSnapshotRequest();
@@ -1056,6 +1057,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         executed_by: value("virtual-target-result-executed-by") || "dax",
         evidence: value("virtual-target-result-evidence"),
         next_step: value("virtual-target-result-next-step")
+      });
+    }
+    async function executeVirtualTargetSetup() {
+      return await postJson("/virtual/target-setup-requests/execute", {
+        provider: value("virtual-target-execute-provider") || "docker",
+        executed_by: value("virtual-target-execute-executed-by") || "dax",
+        approved_by: value("virtual-target-execute-approved-by") || "sisko"
       });
     }
     async function recordVirtualRuntime() {
@@ -2061,6 +2069,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-12">
+            <div class="toolbar"><h3>Execute Approved Target Setup</h3><button class="action-btn" data-action="execute-virtual-target-setup">Execute Setup</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="virtual-target-execute-provider">Provider</label><input id="virtual-target-execute-provider" value="docker"></div>
+              <div class="field span-3"><label for="virtual-target-execute-executed-by">Executed By</label><input id="virtual-target-execute-executed-by" value="dax"></div>
+              <div class="field span-3"><label for="virtual-target-execute-approved-by">Approved By</label><input id="virtual-target-execute-approved-by" value="sisko"></div>
+            </div>
+          </div>
+          <div class="panel span-12">
             <div class="toolbar"><h3>Virtual Lifecycle</h3><button class="action-btn" data-action="execute-virtual-lifecycle">Execute Lifecycle</button></div>
             <div class="form-grid">
               <div class="field span-3"><label for="virtual-lifecycle-resource-id">Resource ID</label><input id="virtual-lifecycle-resource-id" value="overseer-dax-disposable-proxy"></div>
@@ -2604,6 +2620,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "View VM leases and virtual claims", page: "Claims", owner: "Dax", action: "open Claims", source, query: "View VM leases and virtual claims"},
         {workflow: "Record virtual runtime state", page: "Claims", owner: "Dax", action: "record-virtual-runtime", source, query: "Record virtual runtime state"},
         {workflow: "Stage real provider target setup batch", page: "Claims", owner: "Dax", action: "stage-virtual-target-setup-batch", source, query: "Stage real provider target setup batch"},
+        {workflow: "Execute approved provider target setup", page: "Claims", owner: "Dax", action: "execute-virtual-target-setup", source, query: "Execute approved provider target setup"},
         {workflow: "Record real provider setup result", page: "Claims", owner: "Dax", action: "record-virtual-target-setup-result", source, query: "Record real provider setup result"},
         {workflow: "Execute virtual lifecycle action", page: "Claims", owner: "Dax", action: "execute-virtual-lifecycle", source, query: "Execute virtual lifecycle action"},
         {workflow: "Stage virtual snapshot request", page: "Claims", owner: "Dax", action: "stage-virtual-snapshot-request", source, query: "Stage virtual snapshot request"},

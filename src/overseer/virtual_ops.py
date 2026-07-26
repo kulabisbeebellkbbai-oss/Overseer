@@ -164,6 +164,109 @@ def stage_virtual_target_setup_batch_status(
     }
 
 
+def execute_virtual_target_setup_status(
+    project_root: str | Path,
+    provider: str,
+    executed_by: str = "dax",
+    approved_by: str = "sisko",
+    executed_at: str | None = None,
+) -> dict[str, object]:
+    if not executed_by.strip():
+        raise ValueError("executed_by is required")
+    if not approved_by.strip():
+        raise ValueError("approved_by is required before executing target setup")
+    cleaned_provider = _safe_id(provider).replace("-", "_")
+    root = Path(project_root)
+    data = _read_registry(root)
+    request_id = f"virtual-target-setup.{cleaned_provider}"
+    row = next((item for item in data["target_setup_requests"] if item.get("id") == request_id), None)
+    if row is None:
+        templates = [item for item in _all_target_setup_templates() if item["provider"] == cleaned_provider]
+        if not templates:
+            raise ValueError(f"virtual target setup request does not exist: {provider}")
+        now = executed_at or _now()
+        row = {
+            **templates[0],
+            "id": request_id,
+            "requested_by": executed_by,
+            "reason": "execute approved provider target setup",
+            "status": "waiting_human_approval",
+            "approval_required": True,
+            "created_at": now,
+            "updated_at": now,
+        }
+        data["target_setup_requests"].append(row)
+    now = executed_at or _now()
+    try:
+        manifest = _execute_target_setup_provider(root, data, cleaned_provider, now)
+    except ValueError as error:
+        row.update(
+            {
+                "status": "blocked",
+                "approval_required": True,
+                "approved_by": approved_by,
+                "executed_by": executed_by,
+                "executed_at": now,
+                "updated_at": now,
+                "evidence": str(error),
+                "next_step": "resolve target setup blocker before Dax uses this provider",
+            }
+        )
+        _append_execution(data, row, "target_setup", request_id, executed_by, now, "blocked", cleaned_provider, error=str(error))
+        _write_registry(root, data)
+        return {
+            "target_setup_request": row,
+            "status": "blocked",
+            "summary": str(error),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    except OSError as error:
+        row.update(
+            {
+                "status": "failed",
+                "approval_required": True,
+                "approved_by": approved_by,
+                "executed_by": executed_by,
+                "executed_at": now,
+                "updated_at": now,
+                "evidence": str(error),
+                "next_step": "inspect partial target setup state and retry only after Dax validates provider safety",
+            }
+        )
+        _append_execution(data, row, "target_setup", request_id, executed_by, now, "failed", cleaned_provider, error=str(error))
+        _write_registry(root, data)
+        return {
+            "target_setup_request": row,
+            "status": "failed",
+            "summary": str(error),
+            "mutation_performed": True,
+            "host_mutation_performed": True,
+        }
+    row.update(
+        {
+            "status": "completed",
+            "approval_required": False,
+            "approved_by": approved_by,
+            "executed_by": executed_by,
+            "executed_at": now,
+            "updated_at": now,
+            "evidence": manifest["summary"],
+            "manifest_path": manifest["manifest_path"],
+            "next_step": "target is ready for Dax checkout and provider lifecycle testing",
+        }
+    )
+    _append_execution(data, row, "target_setup", request_id, executed_by, now, "completed", cleaned_provider, manifest=manifest)
+    _write_registry(root, data)
+    return {
+        "target_setup_request": row,
+        "status": "completed",
+        "manifest": manifest,
+        "mutation_performed": True,
+        "host_mutation_performed": manifest.get("host_mutation_performed", True),
+    }
+
+
 def record_virtual_target_setup_result_status(
     project_root: str | Path,
     provider: str,
@@ -650,6 +753,241 @@ def _all_target_setup_templates() -> list[dict[str, object]]:
             ],
         },
     ]
+
+
+def _execute_target_setup_provider(root: Path, data: dict[str, list[dict[str, object]]], provider: str, executed_at: str) -> dict[str, object]:
+    targets = root / "local-secrets" / "virtual-runtime-targets"
+    configs = root / "local-secrets" / "virtual-runtime-configs"
+    targets.mkdir(parents=True, exist_ok=True)
+    configs.mkdir(parents=True, exist_ok=True)
+    if provider == "docker":
+        return _setup_docker_target(root, data, executed_at)
+    if provider == "podman":
+        return _setup_podman_target(root, data, executed_at)
+    if provider == "libvirt":
+        return _setup_libvirt_target(root, data, executed_at)
+    if provider == "qemu_process":
+        return _setup_qemu_process_target(root, data, executed_at)
+    if provider == "renode":
+        return _setup_renode_target(root, data, executed_at)
+    if provider == "android_emulator":
+        return _setup_android_emulator_target(root, data, executed_at)
+    if provider == "gateway_proxy":
+        return _setup_gateway_proxy_target(root, data, executed_at)
+    raise ValueError(f"target setup provider is not implemented: {provider}")
+
+
+def _setup_docker_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-docker"
+    output = []
+    output.append(_container_provider_command("docker", ("rm", "-f", name), timeout=20.0, check=False))
+    output.append(_container_provider_command("docker", ("pull", "alpine:latest"), timeout=120.0, check=False))
+    output.append(_container_provider_command("docker", ("create", "--network", "none", "--name", name, "alpine:latest", "sleep", "3600"), timeout=60.0))
+    _upsert_runtime(data, name, "container", "stopped", "docker", "", "approved disposable Docker target with network none")
+    return _write_target_setup_manifest(root, "docker", name, executed_at, "docker disposable container created with --network none", output)
+
+
+def _setup_podman_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-podman"
+    if shutil.which("podman") is None:
+        raise ValueError("podman CLI is not available")
+    output = []
+    output.append(_run_provider_command(("podman", "rm", "-f", name), timeout=20.0, check=False))
+    output.append(_run_provider_command(("podman", "pull", "docker.io/library/alpine:latest"), timeout=120.0, check=False))
+    output.append(_run_provider_command(("podman", "create", "--network", "none", "--name", name, "docker.io/library/alpine:latest", "sleep", "3600"), timeout=60.0))
+    _upsert_runtime(data, name, "container", "stopped", "podman", "", "approved rootless Podman target with network none")
+    return _write_target_setup_manifest(root, "podman", name, executed_at, "podman disposable container created with --network none", output)
+
+
+def _setup_libvirt_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-libvirt"
+    disk = root / "local-secrets" / "virtual-runtime-targets" / f"{name}.qcow2"
+    xml = root / "local-secrets" / "virtual-runtime-configs" / f"{name}.xml"
+    if not disk.exists():
+        _run_qemu_img(("create", "-f", "qcow2", str(disk), "1G"))
+    xml.write_text(_libvirt_domain_xml(name, disk), encoding="utf-8")
+    try:
+        output = _run_provider_command(("virsh", "define", str(xml)), timeout=20.0)
+    except ValueError as error:
+        if "already exists" not in str(error).lower():
+            raise
+        output = _run_provider_command(("virsh", "dominfo", name), timeout=10.0, check=False)
+    _upsert_runtime(data, name, "vm", "stopped", "libvirt", _relative_or_name(root, disk), "approved disposable libvirt domain with no network interface")
+    return _write_target_setup_manifest(root, "libvirt", name, executed_at, "libvirt disposable domain defined without network interfaces", [output], files=[disk, xml])
+
+
+def _setup_qemu_process_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-qemu-process"
+    disk = root / "local-secrets" / "virtual-runtime-targets" / f"{name}.qcow2"
+    script = root / "local-secrets" / "virtual-runtime-configs" / f"{name}-start.sh"
+    pidfile = root / "local-secrets" / "virtual-runtime-targets" / f"{name}.pid"
+    if not disk.exists():
+        _run_qemu_img(("create", "-f", "qcow2", str(disk), "64M"))
+    _write_executable(
+        script,
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"exec qemu-system-x86_64 -display none -no-reboot -net none -pidfile {pidfile!s} "
+        f"-drive file={disk!s},format=qcow2\n",
+    )
+    _upsert_runtime(data, name, "vm", "stopped", "qemu_process", _relative_or_name(root, disk), "approved disposable qemu process target; start script uses -net none")
+    return _write_target_setup_manifest(root, "qemu_process", name, executed_at, "qemu qcow2 and no-network start script created", [], files=[disk, script])
+
+
+def _setup_renode_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-renode"
+    if shutil.which("renode") is None:
+        raise ValueError("renode CLI is not available")
+    resc = root / "local-secrets" / "virtual-runtime-targets" / f"{name}.resc"
+    script = root / "local-secrets" / "virtual-runtime-configs" / f"{name}-start.sh"
+    resc.write_text('logLevel -1\nmach create "overseer-dax-disposable-renode"\n', encoding="utf-8")
+    _write_executable(script, f"#!/usr/bin/env bash\nset -euo pipefail\nexec renode --disable-xwt --console {resc!s}\n")
+    _upsert_runtime(data, name, "emulator", "stopped", "renode", _relative_or_name(root, resc), "approved disposable Renode script target")
+    return _write_target_setup_manifest(root, "renode", name, executed_at, "renode script and start wrapper created", [], files=[resc, script])
+
+
+def _setup_android_emulator_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-avd"
+    emulator = _android_tool("emulator")
+    avdmanager = shutil.which("avdmanager") or str(Path.home() / "Android" / "Sdk" / "cmdline-tools" / "latest" / "bin" / "avdmanager")
+    sdkmanager = shutil.which("sdkmanager") or str(Path.home() / "Android" / "Sdk" / "cmdline-tools" / "latest" / "bin" / "sdkmanager")
+    if emulator is None or not Path(avdmanager).exists() or not Path(sdkmanager).exists():
+        raise ValueError("Android emulator, sdkmanager, or avdmanager is not available; install Android SDK tooling before creating the disposable AVD")
+    system_image = "system-images;android-36.1;google_apis;x86_64"
+    image_dir = Path.home() / "Android" / "Sdk" / "system-images" / "android-36.1" / "google_apis" / "x86_64"
+    if not image_dir.exists():
+        raise ValueError(f"approved Android system image is not installed: {system_image}")
+    avd_dir = Path.home() / ".android" / "avd" / f"{name}.avd"
+    output = []
+    if not avd_dir.exists():
+        output.append(_run_provider_command_with_input((avdmanager, "create", "avd", "-n", name, "-k", system_image, "--device", "pixel_6"), "no\n", timeout=60.0))
+    output.append(_run_provider_command((emulator, "-list-avds"), timeout=10.0, check=False))
+    if name not in "\n".join(output):
+        raise ValueError("disposable Android AVD was not visible after setup")
+    _upsert_runtime(data, name, "emulator", "stopped", "android_emulator", f"{name}.avd", "approved disposable Android AVD using installed android-36.1 google_apis x86_64 image")
+    return _write_target_setup_manifest(root, "android_emulator", name, executed_at, f"Android disposable AVD available with {system_image}", output)
+
+
+def _setup_gateway_proxy_target(root: Path, data: dict[str, list[dict[str, object]]], executed_at: str) -> dict[str, object]:
+    name = "overseer-dax-disposable-proxy"
+    port = _choose_loopback_port()
+    config = root / "local-secrets" / "virtual-runtime-configs" / f"{name}.json"
+    script = root / "local-secrets" / "virtual-runtime-configs" / f"{name}-start.sh"
+    pidfile = root / "local-secrets" / "virtual-runtime-targets" / f"{name}.pid"
+    config.write_text(json.dumps({"bind": "127.0.0.1", "port": port, "upstream": "fixture://dax-disposable"}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_executable(
+        script,
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "python3 - <<'PY'\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        body=b'{\"ok\":true,\"service\":\"overseer-dax-disposable-proxy\"}\\n'\n"
+        "        self.send_response(200); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)\n"
+        "    def log_message(self, fmt, *args): return\n"
+        f"ThreadingHTTPServer(('127.0.0.1',{port}), Handler).serve_forever()\n"
+        "PY\n",
+    )
+    _upsert_runtime(data, name, "gateway_proxy", "stopped", "gateway_proxy", _relative_or_name(root, config), f"approved loopback-only disposable proxy target on 127.0.0.1:{port}")
+    return _write_target_setup_manifest(root, "gateway_proxy", name, executed_at, f"loopback-only proxy config created on 127.0.0.1:{port}", [], files=[config, script, pidfile])
+
+
+def _upsert_runtime(
+    data: dict[str, list[dict[str, object]]],
+    resource_id: str,
+    kind: str,
+    state: str,
+    adapter: str,
+    snapshot_hint: str,
+    notes: str,
+) -> None:
+    now = _now()
+    row = {
+        "resource_id": _safe_id(resource_id),
+        "kind": kind,
+        "state": state,
+        "adapter": adapter,
+        "ports": [],
+        "snapshot_hint": snapshot_hint,
+        "notes": notes,
+        "created_at": now,
+        "updated_at": now,
+        "next_step": "request checkout before lifecycle mutation",
+    }
+    existing = next((index for index, item in enumerate(data["runtime_records"]) if item.get("resource_id") == row["resource_id"]), None)
+    if existing is None:
+        data["runtime_records"].append(row)
+    else:
+        row["created_at"] = data["runtime_records"][existing].get("created_at") or now
+        data["runtime_records"][existing] = row
+
+
+def _write_target_setup_manifest(
+    root: Path,
+    provider: str,
+    target_name: str,
+    executed_at: str,
+    summary: str,
+    command_outputs: list[str],
+    files: list[Path] | None = None,
+) -> dict[str, object]:
+    manifest_dir = root / "local-secrets" / "virtual-runtime-manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "request_id": f"virtual-target-setup.{provider}",
+        "resource_id": target_name,
+        "action": "target_setup",
+        "provider": provider,
+        "executed_at": executed_at,
+        "summary": summary,
+        "command_outputs": [item[-500:] for item in command_outputs if item],
+        "files": [_relative_or_name(root, item) for item in (files or ()) if item.exists()],
+        "host_mutation_performed": True,
+    }
+    manifest_path = manifest_dir / f"virtual-target-setup.{provider}-{_safe_id(executed_at)}.json"
+    manifest["manifest_path"] = _relative_or_name(root, manifest_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o700)
+
+
+def _libvirt_domain_xml(name: str, disk: Path) -> str:
+    return f"""<domain type='kvm'>
+  <name>{name}</name>
+  <memory unit='MiB'>128</memory>
+  <currentMemory unit='MiB'>128</currentMemory>
+  <vcpu placement='static'>1</vcpu>
+  <os>
+    <type arch='x86_64'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features><acpi/></features>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{disk}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <serial type='pty'><target port='0'/></serial>
+    <console type='pty'><target type='serial' port='0'/></console>
+  </devices>
+</domain>
+"""
+
+
+def _choose_loopback_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _find_request(data: dict[str, list[dict[str, object]]], key: str, request_id: str, prefix: str) -> dict[str, object]:
@@ -1250,6 +1588,19 @@ def _android_tool(name: str) -> str | None:
 def _run_provider_command(command: tuple[str, ...], timeout: float = 15.0, check: bool = True) -> str:
     try:
         completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"provider command timed out: {' '.join(command)}") from error
+    except OSError as error:
+        raise ValueError(f"provider command failed to start: {error}") from error
+    if check and completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+        raise ValueError(f"provider command failed: {command[0]} {command[1] if len(command) > 1 else ''}: {stderr}")
+    return (completed.stdout.strip() or completed.stderr.strip()).strip()
+
+
+def _run_provider_command_with_input(command: tuple[str, ...], input_text: str, timeout: float = 15.0, check: bool = True) -> str:
+    try:
+        completed = subprocess.run(command, input=input_text, check=False, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise ValueError(f"provider command timed out: {' '.join(command)}") from error
     except OSError as error:

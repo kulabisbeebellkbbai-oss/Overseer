@@ -68,6 +68,7 @@ EXPECTED_VIEWS = {
             "approve-claim-cleanup",
             "execute-claim-cleanup",
             "record-virtual-runtime",
+            "execute-virtual-target-setup",
             "stage-virtual-snapshot-request",
             "stage-virtual-restore-request",
             "send-crew-message",
@@ -169,6 +170,7 @@ ACTION_ROUTES = {
     "execute-backup-cleanup-request": ("POST", "/storage/cleanup-requests/execute"),
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
     "execute-virtual-lifecycle": ("POST", "/virtual/lifecycle/execute"),
+    "execute-virtual-target-setup": ("POST", "/virtual/target-setup-requests/execute"),
     "execute-virtual-restore-request": ("POST", "/virtual/restore-requests/execute"),
     "execute-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/execute"),
     "export-ids-review-prompt": ("POST", "/host/security/ids-review-packages/prompts"),
@@ -336,6 +338,11 @@ SAFE_POST_PAYLOADS = {
         "executed_by": "dax",
         "evidence": "target verified with constrained network",
         "next_step": "run provider lifecycle smoke",
+    },
+    "/virtual/target-setup-requests/execute": {
+        "provider": "gateway_proxy",
+        "executed_by": "dax",
+        "approved_by": "sisko",
     },
     "/virtual/lifecycle/execute": {
         "resource_id": "vm.ui.full",

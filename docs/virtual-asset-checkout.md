@@ -243,7 +243,14 @@ They do not install packages, change groups, start processes, create VMs,
 create containers, bind ports, create networks, or write gateway configs.
 
 After Sisko or the human approves and Dax executes the setup outside the
-staging call, Dax records the evidence:
+staging call, Dax records the evidence. For providers with an implemented
+disposable setup executor, Dax can execute and record evidence in one step:
+
+```bash
+PYTHONPATH=src python3 -m overseer.cli execute-virtual-target-setup --project-root . --provider gateway_proxy --approved-by sisko
+```
+
+Dax can also record an externally completed setup:
 
 ```bash
 PYTHONPATH=src python3 -m overseer.cli record-virtual-target-setup-result --project-root . --provider docker --status completed --evidence "container exists with network none"

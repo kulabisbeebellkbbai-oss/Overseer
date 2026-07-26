@@ -385,6 +385,20 @@ PYTHONPATH=src python3 -m overseer.cli execute-backup-cleanup --project-root . -
    proposed commands, and rollback plan.
 6. Do not create targets until the full batch approval is granted.
 
+### Execute Approved Provider Target Setup
+
+Use this after Sisko or the human has approved a staged provider target setup
+request and Dax is ready to create or verify the disposable target.
+
+1. Open Claims.
+2. Review Target Setup Requests for the selected provider.
+3. Fill Provider, Executed By, and Approved By.
+4. Click Execute Setup.
+5. Review Target Setup Requests and Virtual Execution Records for completed,
+   blocked, failed, or partial evidence.
+6. If a provider is blocked, resolve the blocker before using that provider in
+   lifecycle, snapshot, or restore workflows.
+
 ### Record Real Provider Setup Result
 
 Use this after an approved provider target setup has been executed and Dax needs

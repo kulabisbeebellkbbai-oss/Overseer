@@ -157,6 +157,7 @@ from .virtual_ops import (
     approve_virtual_restore_request_status,
     approve_virtual_snapshot_request_status,
     execute_virtual_lifecycle_status,
+    execute_virtual_target_setup_status,
     execute_virtual_restore_request_status,
     execute_virtual_snapshot_request_status,
     record_virtual_target_setup_result_status,
@@ -535,6 +536,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/virtual/target-setup-requests/result":
                 self._handle_json(lambda payload: record_virtual_target_setup_result_status(_project_path_for_store(store_path), **_virtual_target_setup_result_args(payload)))
+                return
+            if path == "/virtual/target-setup-requests/execute":
+                self._handle_json(lambda payload: execute_virtual_target_setup_status(_project_path_for_store(store_path), **_virtual_target_setup_execute_args(payload)))
                 return
             if path == "/virtual/runtime-records":
                 self._handle_json(lambda payload: record_virtual_runtime_status(_project_path_for_store(store_path), **_virtual_runtime_record_args(payload)))
@@ -1191,6 +1195,15 @@ def _virtual_target_setup_result_args(payload: dict[str, Any]) -> dict[str, Any]
         "executed_by": str(payload.get("executed_by") or "dax"),
         "evidence": str(payload.get("evidence") or ""),
         "next_step": str(payload.get("next_step") or ""),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
+    }
+
+
+def _virtual_target_setup_execute_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": str(payload["provider"]),
+        "executed_by": str(payload.get("executed_by") or "dax"),
+        "approved_by": str(payload["approved_by"]),
         "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
     }
 

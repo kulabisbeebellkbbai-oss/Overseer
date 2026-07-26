@@ -46,6 +46,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /virtual-summary`
 - `GET /virtual/operations`
 - `POST /virtual/target-setup-requests`
+- `POST /virtual/target-setup-requests/execute`
 - `GET /observability/metric-history`
 - `GET /observability/performance-history`
 - `GET /health-summary`
@@ -191,6 +192,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /virtual/discover-listeners` reads local TCP listener evidence and persists discovered listener resources for Dax. It does not change firewall rules, routes, processes, service definitions, proxies, or network bindings.
 `GET /virtual/operations` returns Dax's local virtual runtime records plus staged snapshot and restore requests from ignored state.
 `POST /virtual/target-setup-requests` stages approval-required Dax target setup requests for disposable real-provider targets. It writes planning records only and does not install packages, change groups, create containers, define VMs, start processes, bind ports, or write gateway configs.
+`POST /virtual/target-setup-requests/execute` executes one approved Dax provider target setup with `provider`, `approved_by`, and optional `executed_by` or `executed_at`. It creates only approved disposable targets, uses no-network or loopback-only containment where applicable, writes a local manifest, and records blocked evidence when a provider dependency is missing.
 `POST /virtual/runtime-records` records observed virtual runtime state for a VM, container, emulator, gateway, or proxy. It does not start, stop, snapshot, restore, destroy, or reconfigure the runtime.
 `POST /virtual/lifecycle/execute` executes an approved disposable Dax runtime lifecycle action. Required fields: `resource_id` and `action` (`inspect`, `start`, or `stop`). Optional fields: `provider`, `executed_by`, and `executed_at`. It blocks non-disposable records and unsupported providers, writes a lifecycle manifest, and limits mutation to the named disposable target.
 `POST /virtual/snapshot-requests` stages a Dax snapshot request with approval guardrails. Execution is separate and requires the approved disposable provider adapter selected through `/virtual/snapshot-requests/execute`.

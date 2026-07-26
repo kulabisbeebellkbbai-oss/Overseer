@@ -53,6 +53,7 @@ from .cli import (
     discover_storage_status,
     discover_virtual_listeners_status,
     execute_admin_change_status,
+    execute_firewall_change_status,
     execute_claim_cleanup_status,
     export_host_security_ids_review_prompt_status,
     export_state_redacted_status,
@@ -153,7 +154,7 @@ from .remote_testing import (
     remote_testing_status,
     request_remote_testing_lease_status,
 )
-from .service_evidence import service_evidence_status, stage_journal_access_request_status
+from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from .security_evidence import security_evidence_status
 from .software_evidence import software_evidence_status
 from .storage_evidence import storage_evidence_status
@@ -519,6 +520,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/health/journal-access-requests":
                 self._handle_json(lambda payload: stage_journal_access_request_status(store_path, **_journal_access_request_args(payload)))
                 return
+            if path == "/health/journal-access-requests/execute":
+                self._handle_json(lambda payload: execute_journal_access_request_status(store_path, _project_path_for_store(store_path), **_journal_access_execution_args(payload)))
+                return
             if path == "/observability/metric-history/capture":
                 self._handle_json(lambda payload: capture_metric_history_status(store_path, _project_path_for_store(store_path), **_metric_history_capture_args(payload)))
                 return
@@ -605,6 +609,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/host/security/firewall-policy/enforcement-plans":
                 self._handle_json(lambda payload: plan_firewall_policy_diff_enforcement_status(store_path, **_firewall_policy_enforcement_args(payload)))
+                return
+            if path == "/host/security/firewall-executions/execute":
+                self._handle_json(lambda payload: execute_firewall_change_status(store_path, **_firewall_execution_args(payload)))
                 return
             if path == "/identity/rotation-requests":
                 self._handle_json(lambda payload: stage_identity_rotation_request_status(_project_path_for_store(store_path), **_identity_rotation_request_args(payload)))
@@ -1350,6 +1357,16 @@ def _journal_access_request_args(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _journal_access_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "record_id": str(payload["record_id"]),
+        "executed_by": str(payload.get("executed_by") or "julian"),
+        "line_limit": int(payload.get("line_limit") or 50),
+        "since": str(payload.get("since") or "24 hours ago"),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
+    }
+
+
 def _metric_history_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "snapshot_id": str(payload.get("snapshot_id") or ""),
@@ -1552,6 +1569,16 @@ def _firewall_policy_enforcement_args(payload: dict[str, Any]) -> dict[str, Any]
         "plan_id": str(payload["plan_id"]) if payload.get("plan_id") else None,
         "requested_by": str(payload.get("requested_by") or "odo"),
         "reason": str(payload["reason"]) if payload.get("reason") else None,
+    }
+
+
+def _firewall_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_id": str(payload["plan_id"]),
+        "executed_by": str(payload.get("executed_by") or "odo"),
+        "mode": str(payload.get("mode") or "local_fixture"),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
+        "policy_profile_path": str(payload["policy_profile"]) if payload.get("policy_profile") else None,
     }
 
 

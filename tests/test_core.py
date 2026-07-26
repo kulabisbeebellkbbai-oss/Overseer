@@ -6709,6 +6709,74 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(executed.command_results[0].command, ("npm", "install", "-g", "obsidian-mcp-server"))
 
+    def test_firewall_plan_executes_through_local_fixture_after_ids_and_approval_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            store_path = state / "overseer.sqlite3"
+            plan = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.firewall.fixture",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/9443",
+                "exercise approved Odo firewall fixture",
+                "listener exposed",
+                port=9443,
+            )
+            package = overseer_cli.prepare_host_security_ids_review_package_status(store_path, plan["id"])
+            submitted = overseer_cli.submit_host_security_ids_review_package_status(
+                store_path,
+                package["id"],
+                "odo",
+            )
+            accepted = overseer_cli.record_host_security_ids_review_result_status(
+                store_path,
+                package["id"],
+                "accepted",
+                "accepted for local fixture execution only",
+                "odo",
+            )
+            enablement = overseer_cli.request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "odo",
+            )
+            overseer_cli.approve_admin_adapter_enablement_status(store_path, enablement["approval_id"], "human")
+            approval = overseer_cli.approve_admin_change_status(store_path, plan["id"], "human")
+            executed = overseer_cli.execute_firewall_change_status(store_path, plan["id"], "odo", "local_fixture")
+            manifest_exists = (root / executed["manifest_path"]).exists()
+            state_payload = overseer_cli.list_state_status(store_path)
+
+        self.assertEqual(submitted["status"], IDSReviewPackageStatus.SUBMITTED.value)
+        self.assertTrue(accepted["satisfies_pre_execution_review_gate"])
+        self.assertTrue(approval["approved"])
+        self.assertEqual(executed["status"], AdminExecutionStatus.COMPLETED.value)
+        self.assertEqual(executed["mode"], "local_fixture")
+        self.assertFalse(executed["host_mutation_performed"])
+        self.assertFalse(executed["firewall_mutation_performed"])
+        self.assertTrue(manifest_exists)
+        self.assertIn("host firewall not modified", executed["command_results"][0]["stdout"])
+        self.assertEqual(state_payload["admin_executions"][0]["status"], AdminExecutionStatus.COMPLETED.value)
+
+    def test_firewall_live_mode_records_blocked_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.firewall.live.blocked",
+                AdminChangeKind.BLOCK_IP.value,
+                "192.0.2.10",
+                "exercise live firewall mode block",
+                "reviewed source",
+            )
+            blocked = overseer_cli.execute_firewall_change_status(store_path, plan["id"], "odo", "live")
+
+        self.assertEqual(blocked["status"], AdminExecutionStatus.BLOCKED.value)
+        self.assertIn("live firewall execution is not implemented", blocked["summary"])
+        self.assertFalse(blocked["host_mutation_performed"])
+        self.assertFalse(blocked["firewall_mutation_performed"])
+
     def test_docker_compose_update_plan_is_human_gated_with_backups(self):
         plan = plan_docker_compose_update(
             "admin.compose.penpot.update",

@@ -84,6 +84,7 @@ EXPECTED_VIEWS = {
             "record-source-review",
             "plan-source-block",
             "stage-firewall-policy-enforcement",
+            "execute-firewall-change",
             "stage-identity-rotation-request",
             "prepare-ids-review-package",
             "export-ids-review-prompt",
@@ -99,6 +100,7 @@ EXPECTED_VIEWS = {
             "run-health-probes",
             "register-health-target",
             "stage-journal-access-request",
+            "execute-journal-access-request",
             "capture-metric-history",
             "send-crew-message",
         },
@@ -171,6 +173,8 @@ ACTION_ROUTES = {
     "execute-admin-change": ("POST", "/admin/execute"),
     "execute-backup-cleanup-request": ("POST", "/storage/cleanup-requests/execute"),
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
+    "execute-journal-access-request": ("POST", "/health/journal-access-requests/execute"),
+    "execute-firewall-change": ("POST", "/host/security/firewall-executions/execute"),
     "execute-virtual-lifecycle": ("POST", "/virtual/lifecycle/execute"),
     "execute-virtual-target-setup": ("POST", "/virtual/target-setup-requests/execute"),
     "execute-virtual-destroy-request": ("POST", "/virtual/destroy-requests/execute"),
@@ -294,6 +298,12 @@ SAFE_POST_PAYLOADS = {
         "unit": "disposable-ui-test.service",
         "requested_by": "julian",
         "reason": "exercise disposable journal access staging workflow",
+    },
+    "/health/journal-access-requests/execute": {
+        "record_id": "ops.service.journal-access.resource.ui.full",
+        "executed_by": "julian",
+        "line_limit": 10,
+        "since": "1 hour ago",
     },
     "/storage/backup-jobs": {
         "job_id": "backup.ui.full",
@@ -510,6 +520,7 @@ ROUTES_EXPECTED_TO_REQUIRE_FIXTURES = {
     "/host/security/ids-review-packages/dispatch",
     "/host/security/ids-review-packages/prompts",
     "/host/security/ids-review-packages/results",
+    "/host/security/firewall-executions/execute",
     "/host/security/firewall-policy/enforcement-plans",
     "/host/security/remediations/plans",
     "/host/security/source-reviews",
@@ -895,12 +906,14 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Approve image vulnerability scan",
             "Execute image vulnerability scan",
             "Stage system journal access request",
+            "Execute approved system journal capture",
             "Capture metric history snapshot",
             "Check an exhausted limit refresh",
             "Adjust service schedule",
             "Refresh CVE advisory feeds",
             "Inspect host security posture",
             "Stage firewall policy enforcement",
+            "Execute approved firewall fixture",
             "Stage identity rotation request",
             "Capture crew and audit knowledge",
             "View audit log",
@@ -943,6 +956,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 journal_request = server.post_json(
                     "/Overseer/health/journal-access-requests",
                     SAFE_POST_PAYLOADS["/health/journal-access-requests"],
+                )
+                journal_execution = server.post_json(
+                    "/Overseer/health/journal-access-requests/execute",
+                    SAFE_POST_PAYLOADS["/health/journal-access-requests/execute"],
                 )
                 backup_job = server.post_json("/Overseer/storage/backup-jobs", SAFE_POST_PAYLOADS["/storage/backup-jobs"])
                 restore_test = server.post_json("/Overseer/storage/restore-tests", SAFE_POST_PAYLOADS["/storage/restore-tests"])
@@ -1079,6 +1096,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertEqual(len(health_probe["evidence"]), 1)
         self.assertEqual(journal_request["record"]["status"], "waiting_approval")
         self.assertFalse(journal_request["host_mutation_performed"])
+        self.assertEqual(journal_execution["status"], "blocked")
+        self.assertFalse(journal_execution["host_mutation_performed"])
         self.assertEqual(backup_job["job"]["id"], "backup.ui.full")
         self.assertEqual(restore_test["restore_test"]["id"], "restore.ui.full")
         self.assertEqual(backup_cleanup["cleanup_request"]["status"], "waiting_approval")

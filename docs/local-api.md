@@ -151,6 +151,8 @@ All request bodies are JSON objects. Claim operations use the same field names a
 Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through the HTTP adapter, and process targets through Julian's local read-only process adapter.
 `POST /health-targets` records or updates a Julian health target for an existing resource. Required fields are `target_id`, `resource_id`, `name`, `probe_type`, and `target`; optional fields are `owner_domain`, `expected_status`, `expected_content_type`, and `latency_warn_ms`. It does not run probes or mutate host state.
 `POST /health/probes/run` probes health targets already persisted in the API store and records Julian health evidence. Optional fields: `timeout_seconds`, `retention_per_target`.
+`POST /health/journal-access-requests` stages a Julian read-only system-journal access operation record without reading privileged logs.
+`POST /health/journal-access-requests/execute` executes only a staged journal access record that has been transitioned to `in_progress`. It runs bounded `journalctl` reads without `sudo`, writes redacted evidence under ignored `local-secrets/journal-captures`, and returns a persisted `blocked` result when approval or journal access is missing.
 `POST /admin/plans` creates and persists an approval-gated admin change plan without executing it.
 `POST /admin/approve` records approval metadata for a stored plan without executing it.
 `POST /admin/cancel` marks a stored plan canceled without deleting history or executing it.
@@ -243,6 +245,7 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /host/security/ids-review-packages/results` records a manual advisory result. Firewall-affecting admin plans require an accepted result before approval.
 `POST /host/security/listener-review-queue/remediation-plans` stages one approval-gated Odo firewall-deny plan per currently unplanned exposed TCP port in the listener review queue. It groups duplicate listeners by port and does not apply firewall rules.
 `POST /host/security/remediations/plans` stages an Odo-owned, human-approval firewall deny plan for a triaged listener. It records the plan only; live firewall execution remains blocked until a separate approval and supported executor exist.
+`POST /host/security/firewall-executions/execute` executes only approved firewall/source-block plans through Odo's `local_fixture` adapter. The fixture path still requires accepted IDS review, plan approval, and adapter enablement, persists normal admin execution/audit records plus an ignored local manifest, and never changes host firewall state. `mode=live` records a blocked result until a future specific live firewall mutation receives human approval and implementation.
 `GET /usage-summary` returns persisted usage-limit counts, available or exhausted capacity, unknown reset counts, low-confidence counts, next reset time, and per-limit detail for Quark review.
 `POST /usage-limits` records or updates a Quark usage-limit observation with `limit_id`, `resource_id`, `kind`, `capacity`, `remaining`, and `window`; optional fields are `resets_at`, `observed_at`, and `confidence`.
 `GET /documents/status` reports Ezri's Obsidian Local REST API readiness using the ignored local secret env file. It redacts secret material and rejects non-loopback Obsidian API URLs.

@@ -651,6 +651,22 @@ be turned into an approval-bound firewall plan.
 8. Do not apply, reload, or enforce firewall changes until human approval is
    present after IDS review.
 
+### Execute Approved Firewall Fixture
+
+Use this when a firewall or source-block plan needs end-to-end execution
+evidence without changing the host firewall.
+
+1. Open Security.
+2. Confirm the plan has an accepted IDS review package, human approval, and an
+   approved adapter enablement record.
+3. Fill Execute Firewall Fixture with the exact Plan ID, executor, and
+   `local_fixture` mode.
+4. Click Execute Fixture.
+5. Review Admin execution history and the ignored local manifest under
+   `local-secrets/firewall-executions`.
+6. `live` mode must remain blocked unless a future specific human approval and
+   live executor implementation are present.
+
 ### Stage Identity Rotation Request
 
 Use this when Odo finds a local secret, API key, SSH key, user, group, or
@@ -706,6 +722,19 @@ available through the current user journal.
 6. Review the resulting operation record on Overview.
 7. Do not read privileged system journal contents until human approval is
    present.
+
+### Execute Approved System Journal Capture
+
+1. Open Overview and transition the journal access operation record to
+   `in_progress` after Sisko or human approval is present.
+2. Open Health.
+3. Fill Execute Journal Capture with the approved record id, executor, line
+   limit, and time window.
+4. Click Execute Capture.
+5. Review System Journal Captures and the linked service evidence. A blocked
+   result means the current Overseer process lacks journal access or the record
+   was not approved; do not add privilege escalation outside a separate approval
+   plan.
 
 ### Capture Metric History Snapshot
 

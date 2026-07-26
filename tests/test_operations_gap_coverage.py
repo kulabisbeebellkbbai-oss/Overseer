@@ -33,7 +33,7 @@ from overseer.incident_lifecycle import incident_lifecycle_status
 from overseer.maintenance_schedule import maintenance_schedules_status, record_maintenance_schedule_status
 from overseer.metric_history import capture_metric_history_status, metric_history_status
 from overseer.observability_trends import observability_trends_status
-from overseer.ops import operations_gap_coverage_status
+from overseer.ops import operations_gap_coverage_status, transition_operation_record_status
 from overseer.performance_history import performance_history_status
 from overseer.remote_testing import (
     collect_remote_test_results_status,
@@ -43,7 +43,7 @@ from overseer.remote_testing import (
     request_remote_testing_lease_status,
 )
 from overseer.security_evidence import security_evidence_status
-from overseer.service_evidence import service_evidence_status
+from overseer.service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from overseer.software_evidence import software_evidence_status
 from overseer.storage_evidence import storage_evidence_status
 from overseer.store import SQLiteStore
@@ -344,6 +344,104 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(journal_request["record"]["status"], "waiting_approval")
         self.assertFalse(journal_request["host_mutation_performed"])
         self.assertFalse(payload["host_mutation_performed"])
+
+    def test_system_journal_capture_requires_approved_operation_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            store_path = state / "overseer.sqlite3"
+            staged = stage_journal_access_request_status(
+                store_path,
+                "svc.system.test",
+                "system-test.service",
+                "julian",
+                "diagnose failed service",
+            )
+            blocked = execute_journal_access_request_status(store_path, root, staged["record"]["id"], "julian")
+
+        self.assertEqual(staged["record"]["status"], "waiting_approval")
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("transitioning it to in_progress", blocked["summary"])
+        self.assertFalse(blocked["host_mutation_performed"])
+
+    def test_approved_system_journal_capture_stores_redacted_local_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            store_path = state / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            try:
+                store.save_resource(
+                    Resource(
+                        id="svc.system.test",
+                        name="System Test Service",
+                        type=ResourceType.SERVICE,
+                        owner_domain=OwnerDomain.JULIAN,
+                        risk_level=RiskLevel.MEDIUM,
+                        identifiers={"unit": "system-test.service", "journal_scope": "system"},
+                    )
+                )
+            finally:
+                store.close()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            journalctl = fake_bin / "journalctl"
+            journalctl.write_text(
+                "#!/bin/sh\n"
+                "echo '2026-07-26T00:00:00Z system-test.service started token=abc123'\n"
+                "echo '2026-07-26T00:00:01Z authorization: bearer very-secret-token'\n",
+                encoding="utf-8",
+            )
+            journalctl.chmod(0o755)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{fake_bin}{os.pathsep}{old_path}"
+            try:
+                staged = stage_journal_access_request_status(store_path, "svc.system.test", "system-test.service")
+                approved = transition_operation_record_status(
+                    store_path,
+                    staged["record"]["id"],
+                    "in_progress",
+                    "sisko",
+                    "approved for bounded read-only journal capture",
+                )
+                executed = execute_journal_access_request_status(store_path, root, staged["record"]["id"], "julian", line_limit=25)
+                payload = service_evidence_status(store_path)
+                capture_exists = (root / executed["capture"]["capture_path"]).exists()
+            finally:
+                os.environ["PATH"] = old_path
+
+        sample = "\n".join(executed["capture"]["sample"])
+        self.assertEqual(approved["record"]["status"], "in_progress")
+        self.assertEqual(executed["status"], "completed")
+        self.assertEqual(executed["record"]["status"], "verified")
+        self.assertIn("[redacted]", sample)
+        self.assertNotIn("abc123", sample)
+        self.assertNotIn("very-secret-token", sample)
+        self.assertTrue(capture_exists)
+        captures = next(item for item in payload["items"] if item["resource_id"] == "svc.system.test")["system_journal_captures"]
+        self.assertTrue(captures)
+        self.assertFalse(executed["host_mutation_performed"])
+
+    def test_system_journal_capture_api_route_blocks_without_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            store_path = state / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                staged = server.post_json(
+                    "/Overseer/health/journal-access-requests",
+                    {"resource_id": "svc.system.test", "unit": "system-test.service"},
+                )
+                blocked = server.post_json(
+                    "/Overseer/health/journal-access-requests/execute",
+                    {"record_id": staged["record"]["id"], "executed_by": "julian"},
+                )
+
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertFalse(blocked["host_mutation_performed"])
 
     def test_security_evidence_uses_stored_snapshot_for_firewall_provenance(self):
         with tempfile.TemporaryDirectory() as directory:

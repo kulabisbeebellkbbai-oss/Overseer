@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .core import Resource, ResourceType
 from .health import HealthEvidence, HealthStatus, HealthTarget, ProbeType, summarize_health_targets
 from .ops import record_operation_status
+from .ops_records import OperationRecordStatus
 from .store import SQLiteStore
 
 SECRET_PATTERNS = (
@@ -49,6 +52,7 @@ def service_evidence_status(
         for summary in summarize_health_targets(targets, evidence)
     }
     resources_by_id = {resource.id: resource for resource in all_resources}
+    project_root = _project_root_for_store(store_path)
     return {
         "store": str(Path(store_path)),
         "resource_id": resource_id,
@@ -56,6 +60,7 @@ def service_evidence_status(
         "dependency_graph": _dependency_graph(resources, resources_by_id, health_by_resource),
         "items": [
             _service_detail(resource, targets, evidence, plans, executions, health_by_resource, resources_by_id, log_tail_lines)
+            | {"system_journal_captures": _system_journal_capture_rows(project_root, resource.id)}
             for resource in resources
         ],
         "journal_access": _journal_access_status(resources),
@@ -103,6 +108,102 @@ def stage_journal_access_request_status(
             ],
         },
     )
+
+
+def execute_journal_access_request_status(
+    store_path: str | Path,
+    project_root: str | Path,
+    record_id: str,
+    executed_by: str = "julian",
+    line_limit: int = 50,
+    since: str = "24 hours ago",
+    executed_at: str | None = None,
+) -> dict[str, object]:
+    """Execute an approved, bounded, read-only system journal capture."""
+
+    if not executed_by.strip():
+        raise ValueError("executed_by is required")
+    now = executed_at or _now()
+    root = Path(project_root)
+    store = SQLiteStore(store_path)
+    try:
+        record = store.load_operation_record(record_id)
+    finally:
+        store.close()
+    metadata = dict(record.metadata)
+    unit = str(metadata.get("unit") or "")
+    try:
+        _validate_journal_capture_ready(record_id, record.status, metadata, unit)
+        bounded_line_limit = min(max(1, int(line_limit)), 200)
+        capture = _capture_system_journal(root, record_id, unit, bounded_line_limit, since, now)
+    except (ValueError, OSError) as error:
+        summary = _redact_text(str(error))
+        result = _journal_capture_result(record_id, unit, now, "blocked", executed_by, line_limit, since, [], "", summary)
+        _write_journal_capture(root, result)
+        metadata.update(
+            {
+                "execution_status": "blocked",
+                "execution_error": summary,
+                "executed_by": executed_by,
+                "executed_at": now,
+                "journal_capture_result_id": result["id"],
+                "journal_capture_path": result["capture_path"],
+            }
+        )
+        updated = record_operation_status(
+            store_path,
+            record_id=record.id,
+            kind=record.kind.value,
+            owner_domain=record.owner_domain.value,
+            status=OperationRecordStatus.BLOCKED.value,
+            subject=record.subject,
+            summary=record.summary,
+            severity=record.severity.value,
+            resource_id=record.resource_id,
+            evidence_ids=(*record.evidence_ids, str(result["id"])),
+            next_step="review blocked system journal capture and resolve access or request scope before retrying",
+            metadata=metadata,
+        )
+        return {
+            "record": updated["record"],
+            "capture": result,
+            "status": "blocked",
+            "summary": summary,
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+
+    metadata.update(
+        {
+            "execution_status": "completed",
+            "executed_by": executed_by,
+            "executed_at": now,
+            "journal_capture_result_id": capture["id"],
+            "journal_capture_path": capture["capture_path"],
+            "captured_lines": capture["captured_lines"],
+        }
+    )
+    updated = record_operation_status(
+        store_path,
+        record_id=record.id,
+        kind=record.kind.value,
+        owner_domain=record.owner_domain.value,
+        status=OperationRecordStatus.VERIFIED.value,
+        subject=record.subject,
+        summary=record.summary,
+        severity=record.severity.value,
+        resource_id=record.resource_id,
+        evidence_ids=(*record.evidence_ids, str(capture["id"])),
+        next_step="system journal evidence captured; review redacted excerpt and continue service diagnosis",
+        metadata=metadata,
+    )
+    return {
+        "record": updated["record"],
+        "capture": capture,
+        "status": "completed",
+        "mutation_performed": True,
+        "host_mutation_performed": False,
+    }
 
 
 def _service_detail(
@@ -373,6 +474,115 @@ def _journal_excerpt(unit: str, log_tail_lines: int) -> dict[str, object]:
     }
 
 
+def _validate_journal_capture_ready(record_id: str, status: OperationRecordStatus, metadata: Mapping[str, object], unit: str) -> None:
+    if not record_id.startswith("ops.service.journal-access."):
+        raise ValueError("record is not a system journal access request")
+    if metadata.get("requested_access") != "read-only system journal excerpt":
+        raise ValueError("record does not carry a system journal access scope")
+    if status not in {OperationRecordStatus.IN_PROGRESS, OperationRecordStatus.VERIFIED}:
+        raise ValueError("system journal access request must be approved by transitioning it to in_progress before execution")
+    if not unit.strip():
+        raise ValueError("system journal unit is required")
+    if not re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", unit.strip()):
+        raise ValueError("system journal unit must be a systemd service unit name")
+
+
+def _capture_system_journal(root: Path, record_id: str, unit: str, line_limit: int, since: str, captured_at: str) -> dict[str, object]:
+    journalctl = shutil.which("journalctl")
+    if journalctl is None:
+        raise ValueError("journalctl not found")
+    command = (
+        journalctl,
+        "-u",
+        unit,
+        "-n",
+        str(line_limit),
+        "--since",
+        since,
+        "--no-pager",
+        "--output=short-iso",
+    )
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=5.0)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("journalctl timed out") from error
+    except OSError as error:
+        raise ValueError(f"journalctl failed to start: {error}") from error
+    if completed.returncode != 0:
+        error_text = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+        raise ValueError(f"journalctl failed: {_redact_text(error_text[-500:])}")
+    lines = [_redact_text(line) for line in completed.stdout.splitlines() if line.strip()]
+    return _write_journal_capture(
+        root,
+        _journal_capture_result(record_id, unit, captured_at, "completed", "", line_limit, since, lines, "", ""),
+    )
+
+
+def _journal_capture_result(
+    record_id: str,
+    unit: str,
+    captured_at: str,
+    status: str,
+    executed_by: str,
+    line_limit: int,
+    since: str,
+    lines: Sequence[str],
+    capture_path: str,
+    error: str,
+) -> dict[str, object]:
+    bounded = list(lines)[-min(max(1, int(line_limit)), 200):]
+    return {
+        "id": f"journal-capture.{_record_id_part(record_id)}.{_record_id_part(captured_at)}",
+        "record_id": record_id,
+        "unit": unit,
+        "status": status,
+        "captured_at": captured_at,
+        "executed_by": executed_by,
+        "requested_lines": min(max(1, int(line_limit)), 200),
+        "since": since,
+        "captured_lines": len(bounded),
+        "sample": bounded,
+        "capture_path": capture_path,
+        "execution_error": _redact_text(error),
+        "next_step": "review redacted journal evidence" if status == "completed" else "resolve journal access before retrying",
+    }
+
+
+def _write_journal_capture(root: Path, result: dict[str, object]) -> dict[str, object]:
+    capture_dir = root / "local-secrets" / "journal-captures"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    path = capture_dir / f"{_record_id_part(str(result['id']))}.json"
+    result = dict(result)
+    result["capture_path"] = _relative_or_name(root, path)
+    path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return result
+
+
+def _system_journal_capture_rows(project_root: Path, resource_id: str) -> list[dict[str, object]]:
+    safe_resource_id = _record_id_part(resource_id)
+    capture_dir = project_root / "local-secrets" / "journal-captures"
+    if not capture_dir.exists():
+        return []
+    rows = []
+    for path in sorted(capture_dir.glob(f"journal-capture.ops.service.journal-access.{safe_resource_id}.*.json"))[-5:]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rows.append(
+            {
+                "id": str(payload.get("id") or path.stem),
+                "unit": str(payload.get("unit") or ""),
+                "status": str(payload.get("status") or ""),
+                "captured_at": str(payload.get("captured_at") or ""),
+                "captured_lines": int(payload.get("captured_lines") or 0),
+                "capture_path": str(payload.get("capture_path") or str(path)),
+                "next_step": str(payload.get("next_step") or "review redacted journal evidence"),
+            }
+        )
+    return rows
+
+
 def _validation_checklist(resource: Resource, health: Any | None, plans: Sequence[Any]) -> list[dict[str, object]]:
     latest_plan = sorted(plans, key=lambda item: item.created_at or item.id)[-1] if plans else None
     return [
@@ -456,3 +666,21 @@ def _redact_text(value: str) -> str:
 def _record_id_part(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-")
     return cleaned or "service"
+
+
+def _relative_or_name(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
+
+
+def _now() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _project_root_for_store(store_path: str | Path) -> Path:
+    path = Path(store_path)
+    if path.parent.name == "state":
+        return path.parent.parent
+    return path.parent

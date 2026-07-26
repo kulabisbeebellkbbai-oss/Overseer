@@ -981,6 +981,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "run-health-probes") return await postJson("/health/probes/run", {retention_per_target: 5});
       if (action === "register-health-target") return await registerHealthTarget();
       if (action === "stage-journal-access-request") return await stageJournalAccessRequest();
+      if (action === "execute-journal-access-request") return await executeJournalAccessRequest();
       if (action === "capture-metric-history") return await captureMetricHistory();
       if (action === "inspect-host") return await postJson("/host/inspect", {});
       if (action === "plan-listener-queue-remediations") return await postJson("/host/security/listener-review-queue/remediation-plans", {requested_by: "odo"});
@@ -992,6 +993,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "stage-operation-workflow") return await stageOperationWorkflow();
       if (action === "plan-source-block") return await planSourceBlock();
       if (action === "stage-firewall-policy-enforcement") return await stageFirewallPolicyEnforcement();
+      if (action === "execute-firewall-change") return await executeFirewallChange();
       if (action === "prepare-ids-review-package") return await prepareIdsReviewPackage();
       if (action === "export-ids-review-prompt") return await exportIdsReviewPrompt();
       if (action === "dispatch-ids-review-package") return await dispatchIdsReviewPackage();
@@ -1292,6 +1294,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         unit: value("journal-unit"),
         requested_by: value("journal-requested-by") || "julian",
         reason: value("journal-reason") || "system journal access needed for service diagnosis"
+      });
+    }
+    async function executeJournalAccessRequest() {
+      return await postJson("/health/journal-access-requests/execute", {
+        record_id: value("journal-execute-record-id"),
+        executed_by: value("journal-execute-by") || "julian",
+        line_limit: Number(value("journal-execute-lines") || 50),
+        since: value("journal-execute-since") || "24 hours ago"
       });
     }
     async function captureMetricHistory() {
@@ -1638,6 +1648,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const planId = value("firewall-plan-id");
       if (planId) payload.plan_id = planId;
       return await postJson("/host/security/firewall-policy/enforcement-plans", payload);
+    }
+    async function executeFirewallChange() {
+      return await postJson("/host/security/firewall-executions/execute", {
+        plan_id: value("firewall-execute-plan-id"),
+        executed_by: value("firewall-execute-by") || "odo",
+        mode: value("firewall-execute-mode") || "local_fixture"
+      });
     }
     async function stageIdentityRotationRequest() {
       return await postJson("/identity/rotation-requests", {
@@ -2292,6 +2309,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
+            <div class="toolbar"><h3>Execute Firewall Fixture</h3><button class="action-btn" data-action="execute-firewall-change">Execute Fixture</button></div>
+            <div class="form-grid">
+              <div class="field span-5"><label for="firewall-execute-plan-id">Plan ID</label><input id="firewall-execute-plan-id" value="admin.host-security.firewall"></div>
+              <div class="field span-3"><label for="firewall-execute-by">Executed By</label><input id="firewall-execute-by" value="odo"></div>
+              <div class="field span-4"><label for="firewall-execute-mode">Mode</label><select id="firewall-execute-mode"><option value="local_fixture">local_fixture</option><option value="live">live</option></select></div>
+            </div>
+          </div>
+          <div class="panel span-6">
             <div class="toolbar"><h3>Identity Rotation Request</h3><button class="action-btn" data-action="stage-identity-rotation-request">Stage Request</button></div>
             <div class="form-grid">
               <div class="field span-4"><label for="identity-rotation-subject">Subject</label><input id="identity-rotation-subject" value="local secret"></div>
@@ -2393,6 +2418,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-12">
+            <div class="toolbar"><h3>Execute Journal Capture</h3><button class="action-btn" data-action="execute-journal-access-request">Execute Capture</button></div>
+            <div class="form-grid">
+              <div class="field span-4"><label for="journal-execute-record-id">Record ID</label><input id="journal-execute-record-id" value="ops.service.journal-access.svc.system.service"></div>
+              <div class="field span-2"><label for="journal-execute-by">Executed By</label><input id="journal-execute-by" value="julian"></div>
+              <div class="field span-2"><label for="journal-execute-lines">Lines</label><input id="journal-execute-lines" type="number" min="1" max="200" value="50"></div>
+              <div class="field span-4"><label for="journal-execute-since">Since</label><input id="journal-execute-since" value="24 hours ago"></div>
+            </div>
+          </div>
+          <div class="panel span-12">
             <div class="toolbar"><h3>Metric History Capture</h3><button class="action-btn" data-action="capture-metric-history">Capture Metrics</button></div>
             <div class="form-grid">
               <div class="field span-3"><label for="metric-history-id">Snapshot ID</label><input id="metric-history-id" placeholder="optional"></div>
@@ -2415,6 +2449,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Service Validation Checklist", serviceValidationRows(serviceEvidence.items || []), ["resource_id", "step", "status"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
           <div class="panel span-6">${table("Redacted Service Logs", serviceLogRows(serviceEvidence.items || []), ["resource_id", "target_id", "path", "readable", "lines"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
           <div class="panel span-12">${table("Journal Excerpts", serviceJournalRows(serviceEvidence.items || []), ["resource_id", "unit", "available", "exit_code", "error"], {fills: {resource_id: (row) => serviceEvidenceFill(row)}, fillView: "health"})}</div>
+          <div class="panel span-12">${table("System Journal Captures", systemJournalCaptureRows(serviceEvidence.items || []), ["resource_id", "id", "unit", "status", "captured_at", "captured_lines", "capture_path"], {fills: {resource_id: (row) => serviceEvidenceFill(row), id: (row) => ({ "journal-execute-record-id": row.record_id || "" })}, fillView: "health"})}</div>
           <div class="panel span-6">${table("Host Resources", [operations.host_resources || {}], ["load_1m", "memory_available_mb", "root_free_gb", "processes", "thermal_zones"])}</div>
           <div class="panel span-6">${table("Log Evidence", operations.log_evidence || [], ["target_id", "resource_id", "kind", "status", "latest_evidence"])}</div>
           <div class="panel span-12">${table("Service Details", operations.service_details || [], ["resource_id", "name", "state", "health", "targets", "dependencies", "admin_plans"], {fills: {resource_id: (row) => ({ "health-resource-id": row.resource_id, "health-name": row.name || "" })}, fillView: "health"})}</div>
@@ -2755,6 +2790,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Review a remote source", page: "Security", owner: "Odo", action: "record-source-review", source, query: "Review a remote source"},
         {workflow: "Plan a source block", page: "Security", owner: "Odo", action: "plan-source-block", source, query: "Plan a source block"},
         {workflow: "Stage firewall policy enforcement", page: "Security", owner: "Odo", action: "stage-firewall-policy-enforcement", source, query: "Stage firewall policy enforcement"},
+        {workflow: "Execute approved firewall fixture", page: "Security", owner: "Odo", action: "execute-firewall-change", source, query: "Execute approved firewall fixture"},
         {workflow: "Stage identity rotation request", page: "Security", owner: "Odo", action: "stage-identity-rotation-request", source, query: "Stage identity rotation request"},
         {workflow: "Prepare an IDS review package", page: "Security", owner: "Odo", action: "prepare-ids-review-package", source, query: "Prepare an IDS review package"},
         {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
@@ -2762,6 +2798,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Record an IDS review result", page: "Security", owner: "Odo", action: "record-ids-review-result", source, query: "Record an IDS review result"},
         {workflow: "View logs from an unhealthy service", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "View logs from an unhealthy service"},
         {workflow: "Stage system journal access request", page: "Health", owner: "Julian", action: "stage-journal-access-request", source, query: "Stage system journal access request"},
+        {workflow: "Execute approved system journal capture", page: "Health", owner: "Julian", action: "execute-journal-access-request", source, query: "Execute approved system journal capture"},
         {workflow: "Capture metric history snapshot", page: "Health", owner: "Julian", action: "capture-metric-history", source, query: "Capture metric history snapshot"},
         {workflow: "Run health probes", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "Run health probes"},
         {workflow: "Register a health target", page: "Health", owner: "Julian", action: "register-health-target", source, query: "Register a health target"},
@@ -3150,6 +3187,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "journal-resource-id": row?.resource_id || "",
         "journal-unit": row?.unit || "",
         "journal-reason": row?.next_step || "system journal access needed for service diagnosis",
+        "journal-execute-record-id": `ops.service.journal-access.${row?.resource_id || "service"}`,
         "op-record-id": `ops.service.journal-access.${row?.resource_id || "service"}`,
         "op-kind": "service_detail",
         "op-owner": "julian",
@@ -3190,6 +3228,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         exit_code: item.journal_excerpt?.exit_code,
         error: item.journal_excerpt?.error || item.journal_excerpt?.reason || ""
       }));
+    }
+    function systemJournalCaptureRows(items) {
+      return (items || []).flatMap((item) => (item.system_journal_captures || []).map((capture) => ({
+        resource_id: item.resource_id,
+        record_id: capture.record_id || `ops.service.journal-access.${item.resource_id || "service"}`,
+        ...capture
+      })));
     }
     function documentChildPath(folder, file) {
       const cleanFolder = String(folder || "").replace(/\\/+$/, "");

@@ -68,18 +68,20 @@ Gaps:
 - Track config files, environment files, secrets references, and unit files.
 - Detect orphaned services or unexpected processes.
 
-Coverage: strong for non-privileged service evidence. Overseer can discover
-user services, stage admin changes, show service health summaries, register
-health targets, run probes, show redacted log evidence, show bounded user
-journal excerpts, detect journal access status, stage system-journal access
-requests, and route service issues through Julian or O'Brien.
+Coverage: strong for non-privileged service evidence and approved bounded
+journal capture. Overseer can discover user services, stage admin changes, show
+service health summaries, register health targets, run probes, show redacted log
+evidence, show bounded user journal excerpts, detect journal access status,
+stage system-journal access requests, execute approved bounded system-journal
+captures when the running process already has access, and route service issues
+through Julian or O'Brien.
 
 Gaps:
 
 - No first-class service detail page with unit metadata, dependencies, recent
   journal excerpts, restart history, config paths, and owning runbook.
-- No approved privileged system-journal capture runner after a staged request is
-  approved.
+- No privileged escalation policy for system-journal capture beyond access
+  already available to the running Overseer process.
 - No direct service action workflow for start, stop, restart, reload, enable, or
   disable with readiness evidence and rollback.
 - No process tree or per-process resource usage explorer.
@@ -130,7 +132,10 @@ Gaps:
 
 Coverage: strong for listener review, host inspection, source review, block
 planning, IDS package workflow, firewall provenance, desired-policy diffing, and
-desired-policy enforcement staging. Audit supports evidence retention.
+desired-policy enforcement staging. Odo can now execute approved firewall and
+source-block plans through a local fixture adapter after IDS review, plan
+approval, and adapter enablement; this records execution/audit evidence without
+changing host firewall state. Audit supports evidence retention.
 
 Gaps:
 
@@ -140,7 +145,9 @@ Gaps:
 - No file-integrity monitoring view.
 - No vulnerability/CVE finding registry with remediation status.
 - No secrets exposure scan result panel.
-- No approved firewall execution runner after IDS review and human approval.
+- No live firewall execution runner after IDS review and human approval.
+  Fixture-only execution is available for end-to-end approval evidence without
+  host firewall mutation.
 - No containment timeline or recovery checklist.
 
 ### Networking, Gateway, And Proxy Operations
@@ -530,8 +537,9 @@ dispatch, hold, or reset-recording guidance without spending quota or calling
 external providers.
 
 Remaining gaps now require either live adapters, elevated access, long-running
-persistence, or environment-specific policy wiring: approved privileged/system
-journal content capture after staged requests, approved firewall execution after
-IDS review and human approval, approved live backup execution, approved restore
-execution, VM/container live adapter inventory and snapshot/restore execution,
-deep performance charts, and secret/service-account rotation execution.
+persistence, or environment-specific policy wiring: privileged escalation policy
+for system-journal capture beyond the approved bounded runner, live firewall
+execution after IDS review and human approval beyond the fixture adapter,
+approved live backup execution, approved restore execution, VM/container live
+adapter inventory and snapshot/restore execution, deep performance charts, and
+secret/service-account rotation execution.

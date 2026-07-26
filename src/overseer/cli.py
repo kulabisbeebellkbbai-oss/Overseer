@@ -136,6 +136,7 @@ from .virtual_ops import (
     stage_virtual_snapshot_request_status,
     virtual_operations_status,
 )
+from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 
@@ -3303,6 +3304,198 @@ def execute_admin_change_status(
         }
     finally:
         store.close()
+
+
+def execute_firewall_change_status(
+    store_path: str | Path,
+    plan_id: str,
+    executed_by: str = "odo",
+    mode: str = "local_fixture",
+    executed_at: str | None = None,
+    policy_profile_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Execute an approved firewall plan through a non-live fixture adapter."""
+
+    if not executed_by.strip():
+        raise ValueError("executed_by is required")
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        if AdminChangeKind(plan.kind) not in _FIREWALL_EXECUTION_KINDS:
+            raise ValueError("admin plan is not a firewall or source-block plan")
+    finally:
+        store.close()
+    if mode != "local_fixture":
+        result = AdminExecutionResult(
+            id=f"admin.exec.{plan.id}.blocked",
+            plan_id=plan.id,
+            status=AdminExecutionStatus.BLOCKED,
+            summary="live firewall execution is not implemented; use local_fixture until a specific live firewall mutation is approved",
+            command_results=(),
+        )
+        store = SQLiteStore(store_path)
+        try:
+            store.save_admin_execution(result)
+            store.save_audit_event(audit_event_from_admin_execution(plan, result))
+        finally:
+            store.close()
+        manifest = _write_firewall_execution_manifest(
+            _project_root_for_store_path(store_path),
+            plan,
+            admin_execution_status(result),
+            mode,
+            executed_by,
+            executed_at,
+        )
+        return {
+            "store": str(Path(store_path)),
+            **admin_execution_status(result),
+            "mode": mode,
+            "manifest_path": manifest["manifest_path"],
+            "firewall_mutation_performed": False,
+            "host_mutation_performed": False,
+        }
+    payload = execute_admin_change_status(
+        store_path,
+        plan_id,
+        runner=_local_firewall_fixture_runner(executed_by, executed_at),
+        policy_profile_path=policy_profile_path,
+    )
+    manifest = _write_firewall_execution_manifest(
+        _project_root_for_store_path(store_path),
+        plan,
+        payload,
+        mode,
+        executed_by,
+        executed_at,
+    )
+    return {
+        **payload,
+        "mode": mode,
+        "manifest_path": manifest["manifest_path"],
+        "firewall_mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+_FIREWALL_EXECUTION_KINDS: frozenset[AdminChangeKind] = frozenset(
+    {
+        AdminChangeKind.FIREWALL_ALLOW_TCP,
+        AdminChangeKind.FIREWALL_DENY_TCP,
+        AdminChangeKind.BLOCK_IP,
+    }
+)
+
+
+def _local_firewall_fixture_runner(executed_by: str, executed_at: str | None):
+    def runner(step: AdminCommandStep) -> AdminCommandResult:
+        if not _is_supported_firewall_command(step.command):
+            return AdminCommandResult(
+                title=step.title,
+                command=step.command,
+                exit_code=2,
+                stderr="unsupported firewall command for local fixture adapter",
+            )
+        return AdminCommandResult(
+            title=step.title,
+            command=step.command,
+            exit_code=0,
+            stdout=f"local fixture accepted by {executed_by} at {executed_at or 'execution-time'}; host firewall not modified",
+        )
+
+    return runner
+
+
+def _is_supported_firewall_command(command: Sequence[str]) -> bool:
+    if len(command) < 3 or command[0] != "sudo":
+        return False
+    if command[1] == "ufw":
+        return tuple(command[:3]) in {
+            ("sudo", "ufw", "allow"),
+            ("sudo", "ufw", "deny"),
+            ("sudo", "ufw", "delete"),
+            ("sudo", "ufw", "status"),
+        }
+    if command[1] == "firewall-cmd":
+        allowed = {"--permanent", "--reload", "--zone=public", "--list-all"}
+        return all(part.startswith("--add-rich-rule=") or part.startswith("--remove-rich-rule=") or part in allowed for part in command[2:])
+    return False
+
+
+def _write_firewall_execution_manifest(
+    project_root: Path,
+    plan: AdminChangePlan,
+    execution_payload: dict[str, object],
+    mode: str,
+    executed_by: str,
+    executed_at: str | None,
+) -> dict[str, object]:
+    manifest = {
+        "schema": "overseer.firewall-execution-manifest.v1",
+        "plan_id": plan.id,
+        "kind": AdminChangeKind(plan.kind).value,
+        "target": plan.target,
+        "mode": mode,
+        "executed_by": executed_by,
+        "executed_at": executed_at or datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "status": execution_payload.get("status"),
+        "summary": execution_payload.get("summary"),
+        "command_count": len(execution_payload.get("command_results") or []),
+        "verification_count": len(execution_payload.get("verification_results") or []),
+        "rollback_count": len(execution_payload.get("rollback_results") or []),
+        "commands": [
+            {
+                "title": step.title,
+                "command": list(step.command),
+                "reason": step.reason,
+            }
+            for step in plan.steps
+        ],
+        "verification": [
+            {
+                "title": step.title,
+                "command": list(step.command),
+                "reason": step.reason,
+            }
+            for step in plan.verification_steps
+        ],
+        "rollback": [
+            {
+                "title": step.title,
+                "command": list(step.command),
+                "reason": step.reason,
+            }
+            for step in plan.rollback_steps
+        ],
+        "host_mutation_performed": False,
+        "firewall_mutation_performed": False,
+        "approval_boundary": "local fixture evidence only; live firewall mutation requires explicit human approval and accepted IDS review",
+    }
+    manifest_dir = project_root / "local-secrets" / "firewall-executions"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path = manifest_dir / f"{_safe_local_filename(plan.id)}-{_safe_local_filename(str(manifest['executed_at']))}.json"
+    manifest["manifest_path"] = _relative_or_name(project_root, path)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
+def _project_root_for_store_path(store_path: str | Path) -> Path:
+    path = Path(store_path)
+    if path.parent.name == "state":
+        return path.parent.parent
+    return path.parent
+
+
+def _relative_or_name(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
+
+
+def _safe_local_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value).strip()).strip("-")
+    return cleaned or "item"
 
 
 def admin_executions_status(store_path: str | Path) -> dict[str, object]:
@@ -7390,6 +7583,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_health_target_parser.add_argument("--expected-status", type=int)
     record_health_target_parser.add_argument("--expected-content-type")
     record_health_target_parser.add_argument("--latency-warn-ms", type=int)
+    service_evidence_parser = subparsers.add_parser("service-evidence", help="summarize Julian service detail evidence")
+    service_evidence_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    service_evidence_parser.add_argument("--resource-id")
+    stage_journal_access_parser = subparsers.add_parser("stage-journal-access", help="stage a Julian system journal access request")
+    stage_journal_access_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    stage_journal_access_parser.add_argument("--resource-id", required=True)
+    stage_journal_access_parser.add_argument("--unit", default="")
+    stage_journal_access_parser.add_argument("--requested-by", default="julian")
+    stage_journal_access_parser.add_argument("--reason", default="system journal access needed for service diagnosis")
+    execute_journal_access_parser = subparsers.add_parser("execute-journal-access", help="execute an approved Julian system journal capture request")
+    execute_journal_access_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    execute_journal_access_parser.add_argument("--project-root", default=".", help="project root containing local-secrets/journal-captures")
+    execute_journal_access_parser.add_argument("--record-id", required=True)
+    execute_journal_access_parser.add_argument("--executed-by", default="julian")
+    execute_journal_access_parser.add_argument("--line-limit", type=int, default=50)
+    execute_journal_access_parser.add_argument("--since", default="24 hours ago")
+    execute_journal_access_parser.add_argument("--executed-at")
     discover_parser = subparsers.add_parser("discover-physical", help="read directory entries for physical device paths")
     discover_parser.add_argument("--root", action="append", required=True, help="directory root to inspect")
     discover_parser.add_argument("--store", help="explicit SQLite store path for persisting discovered path identities")
@@ -7786,6 +7996,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_admin_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     execute_admin_parser.add_argument("--plan-id", required=True)
     execute_admin_parser.add_argument("--policy-profile", help="optional JSON policy profile generated by policy-customization-helper")
+    execute_firewall_parser = subparsers.add_parser("execute-firewall-change", help="execute an approved firewall plan through Odo's local fixture adapter")
+    execute_firewall_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    execute_firewall_parser.add_argument("--plan-id", required=True)
+    execute_firewall_parser.add_argument("--executed-by", default="odo")
+    execute_firewall_parser.add_argument("--mode", default="local_fixture", choices=("local_fixture", "live"))
+    execute_firewall_parser.add_argument("--executed-at")
+    execute_firewall_parser.add_argument("--policy-profile", help="optional JSON policy profile generated by policy-customization-helper")
     admin_executions_parser = subparsers.add_parser("admin-executions", help="list persisted admin change execution results")
     admin_executions_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     admin_adapter_capabilities_parser = subparsers.add_parser(
@@ -8173,6 +8390,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.expected_status,
                     args.expected_content_type,
                     args.latency_warn_ms,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "service-evidence":
+        print(json.dumps(service_evidence_status(args.store, args.resource_id), sort_keys=True))
+        return 0
+
+    if args.command == "stage-journal-access":
+        print(
+            json.dumps(
+                stage_journal_access_request_status(
+                    args.store,
+                    args.resource_id,
+                    args.unit,
+                    args.requested_by,
+                    args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "execute-journal-access":
+        print(
+            json.dumps(
+                execute_journal_access_request_status(
+                    args.store,
+                    args.project_root,
+                    args.record_id,
+                    args.executed_by,
+                    args.line_limit,
+                    args.since,
+                    args.executed_at,
                 ),
                 sort_keys=True,
             )
@@ -8782,6 +9035,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "execute-admin-change":
         print(json.dumps(execute_admin_change_status(args.store, args.plan_id, policy_profile_path=args.policy_profile), sort_keys=True))
+        return 0
+
+    if args.command == "execute-firewall-change":
+        print(
+            json.dumps(
+                execute_firewall_change_status(
+                    args.store,
+                    args.plan_id,
+                    args.executed_by,
+                    args.mode,
+                    args.executed_at,
+                    args.policy_profile,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "admin-executions":

@@ -185,6 +185,20 @@ state with the exact planned read-only `journalctl` commands and redaction
 guardrails. It does not invoke `sudo`, change group membership, read privileged
 system journal contents, or mutate the host.
 
+After approval, Sisko or the operator transitions the operation record to
+`in_progress`. Julian can then execute the bounded capture through:
+
+```text
+POST /health/journal-access-requests/execute
+```
+
+Execution runs `journalctl` only with the current Overseer process privileges,
+limits the line count and time window, redacts secret-like values, stores the
+redacted capture under ignored `local-secrets/journal-captures`, and links the
+capture back to the service evidence view. If the record is not approved or the
+process lacks journal access, Overseer records a `blocked` result rather than
+attempting privilege escalation.
+
 ## Manual Probes
 
 Manual probes let Julian record explicit operator health evidence without contacting a service:

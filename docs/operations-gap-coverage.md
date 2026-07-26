@@ -67,13 +67,17 @@ The third pass added read-only evidence depth for the remaining gap categories:
 - Julian: service metadata, health evidence, redacted log snippets, bounded
   `journalctl --user` excerpts, dependency IDs, recent admin plans, trend
   history, post-change validation checklist, dependency graph and dependency
-  health evidence, journal access status, and staged system-journal access
-  requests.
+  health evidence, journal access status, staged system-journal access
+  requests, and approved bounded system-journal capture with redacted local
+  evidence artifacts.
 - Odo: stored-snapshot firewall provenance, listener exposure evidence,
   firewall desired-policy diff, desired-policy enforcement staging with IDS
   review package preparation, protective plan provenance, identity/access review,
   SSH key custody hashes, secret-file custody markers, rotation reminders, and
-  staged identity/secret rotation requests.
+  staged identity/secret rotation requests. Odo also has fixture-only firewall
+  execution for approved firewall/source-block plans after IDS review, plan
+  approval, and adapter enablement; the fixture persists execution/audit records
+  and ignored local manifests without changing host firewall state.
 - Kira: mount health, backup/restore markers, backup job registry, restore-test
   records, cleanup requests, capacity summary, and cleanup candidates, plus
   SMART health when `smartctl` is available without extra privileges.
@@ -143,9 +147,12 @@ schedule editor, and advisory feed correlation. The remaining work requires
 live adapter execution, elevated access, long-running persistence, or
 environment-specific policy wiring:
 
-- approved privileged/system journal content capture after staged access
-  requests.
-- firewall desired-policy execution after IDS review and human approval.
+- deeper privileged/system journal capture policy for any future sudo, group,
+  or daemon-privilege escalation. The current runner handles only approved
+  bounded reads available to the running Overseer process.
+- live firewall desired-policy execution after IDS review and human approval.
+  Fixture-only execution now verifies the approval path without mutating host
+  firewall state.
 - approved live backup execution and restore execution.
 - VM/container/emulator live adapter depth beyond approved disposable targets:
   running-domain snapshot policy, non-disposable destroy policy, and broader

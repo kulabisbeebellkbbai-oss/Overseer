@@ -6710,6 +6710,41 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(executed.command_results[-1].command, ("sudo", "docker", "compose", "-f", "/srv/penpot/docker-compose.yaml", "up", "-d"))
 
+    def test_admin_execution_stops_before_later_mutations_after_failed_step(self):
+        plan = approve_admin_change_plan(
+            plan_docker_compose_update(
+                "admin.compose.penpot.scan-gate",
+                "/srv/penpot/docker-compose.yaml",
+                "block recreate when replacement image scan fails",
+                "staged",
+                project_directory="/srv/penpot",
+                scan_images=("penpotapp/frontend:2.17.0",),
+            ),
+            "human",
+        )
+        calls = []
+
+        def runner(step):
+            calls.append(step.title)
+            return AdminCommandResult(
+                title=step.title,
+                command=step.command,
+                exit_code=1 if step.title.startswith("Scan updated image") else 0,
+                stdout="",
+            )
+
+        result = execute_admin_change_plan(
+            plan,
+            enabled_adapter_kinds=(AdminChangeKind.DOCKER_COMPOSE_UPDATE,),
+            runner=runner,
+        )
+
+        self.assertEqual(result.status, AdminExecutionStatus.FAILED)
+        self.assertIn("Scan updated image penpotapp/frontend:2.17.0", result.summary)
+        self.assertNotIn("Recreate Compose services", calls)
+        self.assertEqual(calls[-1], "Rollback Compose services")
+        self.assertEqual([item.title for item in result.command_results][-1], "Scan updated image penpotapp/frontend:2.17.0")
+
     def test_approved_package_update_executes_only_with_enabled_adapter(self):
         plan = approve_admin_change_plan(
             plan_apt_update("admin.apt.update.exec", "refresh approved package metadata"),

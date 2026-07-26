@@ -990,7 +990,40 @@ def execute_admin_change_plan(
         )
 
     command_runner = runner or run_admin_command_step
-    command_results = tuple(command_runner(step) for step in plan.steps)
+    command_results_list: list[AdminCommandResult] = []
+    for step in plan.steps:
+        result = command_runner(step)
+        command_results_list.append(result)
+        if result.exit_code != 0:
+            rollback_results = tuple(command_runner(step) for step in plan.rollback_steps)
+            return AdminExecutionResult(
+                id=f"admin.exec.{plan.id}.failed",
+                plan_id=plan.id,
+                status=AdminExecutionStatus.FAILED,
+                summary=f"admin change failed during step: {result.title}; rollback steps attempted",
+                command_results=tuple(command_results_list),
+                rollback_results=rollback_results,
+            )
+    command_results = tuple(command_results_list)
+
+    verification_results_list: list[AdminCommandResult] = []
+    for step in plan.verification_steps:
+        result = command_runner(step)
+        verification_results_list.append(result)
+        if result.exit_code != 0:
+            verification_results = tuple(verification_results_list)
+            rollback_results = tuple(command_runner(step) for step in plan.rollback_steps)
+            return AdminExecutionResult(
+                id=f"admin.exec.{plan.id}.failed",
+                plan_id=plan.id,
+                status=AdminExecutionStatus.FAILED,
+                summary=f"admin change verification failed during step: {result.title}; rollback steps attempted",
+                command_results=command_results,
+                verification_results=verification_results,
+                rollback_results=rollback_results,
+            )
+
+    verification_results = tuple(verification_results_list)
     failed = next((result for result in command_results if result.exit_code != 0), None)
     if failed is not None:
         rollback_results = tuple(command_runner(step) for step in plan.rollback_steps)
@@ -1000,20 +1033,6 @@ def execute_admin_change_plan(
             status=AdminExecutionStatus.FAILED,
             summary=f"admin change failed during step: {failed.title}; rollback steps attempted",
             command_results=command_results,
-            rollback_results=rollback_results,
-        )
-
-    verification_results = tuple(command_runner(step) for step in plan.verification_steps)
-    verification_failed = next((result for result in verification_results if result.exit_code != 0), None)
-    if verification_failed is not None:
-        rollback_results = tuple(command_runner(step) for step in plan.rollback_steps)
-        return AdminExecutionResult(
-            id=f"admin.exec.{plan.id}.failed",
-            plan_id=plan.id,
-            status=AdminExecutionStatus.FAILED,
-            summary=f"admin change verification failed during step: {verification_failed.title}; rollback steps attempted",
-            command_results=command_results,
-            verification_results=verification_results,
             rollback_results=rollback_results,
         )
 

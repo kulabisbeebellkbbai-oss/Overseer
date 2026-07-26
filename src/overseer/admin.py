@@ -590,6 +590,7 @@ def plan_docker_compose_update(
     project_directory: str | None = None,
     env: tuple[str, ...] = (),
     rollback_env: tuple[str, ...] = (),
+    extra_compose_files: tuple[str, ...] = (),
     scan_images: tuple[str, ...] = (),
     health_url: str | None = None,
     backup_label: str | None = None,
@@ -597,8 +598,12 @@ def plan_docker_compose_update(
     if not compose_file.strip():
         raise ValueError("compose_file is required")
     compose_path = compose_file.strip()
+    extra_paths = tuple(path.strip() for path in extra_compose_files if path.strip())
     project_dir = (project_directory or os.path.dirname(compose_path) or ".").strip()
-    compose_command = ("sudo", "docker", "compose", "-f", compose_path)
+    compose_files: tuple[str, ...] = (compose_path, *extra_paths)
+    compose_file_args = tuple(arg for path in compose_files for arg in ("-f", path))
+    compose_command = ("sudo", "docker", "compose", *compose_file_args)
+    rollback_compose_command = ("sudo", "docker", "compose", "-f", compose_path)
     env_prefix = ("sudo", "env", *env) if env else ("sudo",)
     rollback_env_prefix = ("sudo", "env", *rollback_env) if rollback_env else ("sudo",)
     safe_label = (backup_label or plan_id).replace("/", "_").replace(" ", "_")
@@ -628,6 +633,14 @@ def plan_docker_compose_update(
         )
         for image in scan_images
     )
+    extra_backup_steps = tuple(
+        AdminCommandStep(
+            f"Backup Compose override {index}",
+            ("cp", path, f"{backup_path}/compose-override-{index}.yaml"),
+            "preserve the current Compose override declaration for rollback review",
+        )
+        for index, path in enumerate(extra_paths, start=1)
+    )
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.DOCKER_COMPOSE_UPDATE,
@@ -649,6 +662,7 @@ def plan_docker_compose_update(
                 ("cp", compose_path, f"{backup_path}/docker-compose.yaml"),
                 "preserve the current Compose declaration for rollback",
             ),
+            *extra_backup_steps,
             AdminCommandStep(
                 "Backup Postgres volume",
                 (
@@ -693,13 +707,13 @@ def plan_docker_compose_update(
             ),
             AdminCommandStep(
                 "Pull Compose images",
-                (*env_prefix, "docker", "compose", "-f", compose_path, "pull"),
+                (*env_prefix, "docker", "compose", *compose_file_args, "pull"),
                 "download the approved image versions before recreating services",
             ),
             *scan_steps,
             AdminCommandStep(
                 "Recreate Compose services",
-                (*env_prefix, "docker", "compose", "-f", compose_path, "up", "-d"),
+                (*env_prefix, "docker", "compose", *compose_file_args, "up", "-d"),
                 "apply the approved image update to the Compose project",
             ),
         ),
@@ -707,7 +721,7 @@ def plan_docker_compose_update(
             AdminCommandStep(
                 "Rollback Compose services",
                 (*rollback_env_prefix, "docker", "compose", "-f", compose_path, "up", "-d"),
-                "return the Compose project to the previous approved image set if verification fails",
+                "return the Compose project to the base Compose file if verification fails",
             ),
         ),
         risks=(

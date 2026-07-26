@@ -589,6 +589,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "admin-canceled-by",
             "admin-backup-label",
             "admin-compose-env",
+            "admin-compose-extra-files",
             "admin-compose-project-directory",
             "admin-compose-rollback-env",
             "admin-compose-scan-images",

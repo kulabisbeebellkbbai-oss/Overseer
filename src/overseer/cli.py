@@ -3191,6 +3191,7 @@ def plan_admin_change_status(
     compose_project_directory: str | None = None,
     compose_env: Sequence[str] = (),
     compose_rollback_env: Sequence[str] = (),
+    compose_extra_file: Sequence[str] = (),
     compose_scan_image: Sequence[str] = (),
     health_url: str | None = None,
     backup_label: str | None = None,
@@ -3217,6 +3218,7 @@ def plan_admin_change_status(
             project_directory=compose_project_directory,
             env=tuple(compose_env),
             rollback_env=tuple(compose_rollback_env),
+            extra_compose_files=tuple(compose_extra_file),
             scan_images=tuple(compose_scan_image),
             health_url=health_url,
             backup_label=backup_label,
@@ -7759,6 +7761,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--compose-project-directory")
     admin_plan_parser.add_argument("--compose-env", action="append")
     admin_plan_parser.add_argument("--compose-rollback-env", action="append")
+    admin_plan_parser.add_argument("--compose-extra-file", action="append")
     admin_plan_parser.add_argument("--compose-scan-image", action="append")
     admin_plan_parser.add_argument("--health-url")
     admin_plan_parser.add_argument("--backup-label")
@@ -8744,6 +8747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.compose_project_directory,
                     args.compose_env or (),
                     args.compose_rollback_env or (),
+                    args.compose_extra_file or (),
                     args.compose_scan_image or (),
                     args.health_url,
                     args.backup_label,

@@ -6654,6 +6654,7 @@ class AdminChangePlanTests(unittest.TestCase):
             project_directory="/srv/penpot",
             env=("PENPOT_VERSION=2.17.0",),
             rollback_env=("PENPOT_VERSION=2.16",),
+            extra_compose_files=("/srv/penpot/local-secrets/admin-overrides/support.yaml",),
             scan_images=("penpotapp/frontend:2.17.0",),
             health_url="http://127.0.0.1:9001/",
         )
@@ -6664,7 +6665,22 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(plan.risk_level, RiskLevel.HIGH)
         self.assertIn("Backup Postgres volume", [step.title for step in plan.steps])
         self.assertIn("Backup asset volume", [step.title for step in plan.steps])
-        self.assertIn(("sudo", "env", "PENPOT_VERSION=2.17.0", "docker", "compose", "-f", "/srv/penpot/docker-compose.yaml", "pull"), [step.command for step in plan.steps])
+        self.assertIn("Backup Compose override 1", [step.title for step in plan.steps])
+        self.assertIn(
+            (
+                "sudo",
+                "env",
+                "PENPOT_VERSION=2.17.0",
+                "docker",
+                "compose",
+                "-f",
+                "/srv/penpot/docker-compose.yaml",
+                "-f",
+                "/srv/penpot/local-secrets/admin-overrides/support.yaml",
+                "pull",
+            ),
+            [step.command for step in plan.steps],
+        )
         self.assertIn(
             ("trivy", "image", "--severity", "CRITICAL,HIGH", "--exit-code", "1", "penpotapp/frontend:2.17.0"),
             [step.command for step in plan.steps],

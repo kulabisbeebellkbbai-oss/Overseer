@@ -877,6 +877,30 @@ available through the current user journal.
 4. Do not include raw tokens, cookies, browser storage, API keys, local database
    exports, screenshots, HTML, or raw response bodies.
 
+### Run Mobile UI Emulator Regression
+
+Use this after mobile app, mobile web UI, responsive UI, Android, iOS, or other
+emulator-targeted UI work is complete.
+
+1. Confirm the originating project thread explicitly requested mobile or
+   emulator regression testing. The Quark Stop hook listens for explicit
+   requests; it must not infer a test from ordinary implementation text.
+2. Check Usage and confirm Quark has no active lease that would conflict with
+   another project's emulator run, such as Roadex testing already in progress.
+3. If a live emulator or AVD is required, open Claims and let Dax claim or
+   verify the emulator resource before queuing the job.
+4. Open Usage and request a Tank/MSI remote testing lease scoped to the current
+   project, thread, service path, and allowed job types.
+5. Queue the project-specific protected-gateway or UI regression job with
+   redacted-safe parameters only. Until a native mobile worker job type exists,
+   use the project's approved protected-gateway/browser contract or
+   `protected_gateway.request_sequence`.
+6. Collect the redacted results through Usage or the Quark hook continuation.
+7. Treat emulator failures as actionable only when the result identifies the
+   project, service path, validation stage, endpoint or view name, and
+   non-secret finding. Do not rely on screenshots, cookies, browser storage, raw
+   HTML, device identifiers, serials, or local database exports.
+
 ### Collect Tank/MSI Remote Test Results
 
 1. Open Usage.

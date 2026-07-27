@@ -95,6 +95,19 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             self.assertEqual(payload["action"], "would_queue")
             self.assertEqual(payload["job_type"], "overseer.full_ui_regression")
 
+    def test_hook_dry_run_accepts_explicit_mobile_emulator_regression_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            _write_transcript(transcript, "run a mobile UI emulator regression test through Quark", "Updated the responsive mobile page.")
+
+            result = self._run_hook(root, transcript, dry_run=True)
+
+            self.assertEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["action"], "would_queue")
+            self.assertEqual(payload["job_type"], "overseer.full_ui_regression")
+
     def test_hook_queues_quark_job_and_crew_message(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

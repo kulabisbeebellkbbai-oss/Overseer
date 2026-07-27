@@ -2966,6 +2966,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Save Tank/MSI remote testing profile", page: "Usage", owner: "Quark", action: "record-remote-testing-profile", source, query: "Save Tank MSI remote testing profile"},
         {workflow: "Manage Tank/MSI remote testing", page: "Usage", owner: "Quark", action: "request-remote-testing-lease", source, query: "Manage Tank MSI remote testing"},
         {workflow: "Queue a Tank/MSI remote test job", page: "Usage", owner: "Quark", action: "enqueue-remote-test-job", source, query: "Queue a Tank MSI remote test job"},
+        {workflow: "Run mobile UI emulator regression", page: "Usage", owner: "Quark", action: "request-remote-testing-lease", source, query: "Run Mobile UI Emulator Regression"},
         {workflow: "Collect Tank/MSI remote test results", page: "Usage", owner: "Quark", action: "collect-remote-test-results", source, query: "Collect Tank MSI remote test results"},
         {workflow: "Search documentation", page: "Documents", owner: "Ezri", action: "documents-search", source, query: "Search documentation"},
         {workflow: "List a documentation folder", page: "Documents", owner: "Ezri", action: "documents-list-notes", source, query: "List a documentation folder"},

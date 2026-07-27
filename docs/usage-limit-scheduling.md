@@ -130,10 +130,10 @@ The user-scope Codex Stop hook `overseer-quark-remote-testing-hook.py` lets
 Quark fulfill explicit remote testing requests from the current thread. It acts
 as a listener: ordinary implementation answers are allowed through, even when
 they mention UI, protected gateway, browser, panel, route, endpoint, API,
-workflow, performance, or auth work. When the latest user turn explicitly asks
-for Tank, MSI, Quark, remote, protected-gateway, regression, smoke,
-performance, browser, or UI testing, the hook uses the Quark remote testing
-queue to:
+workflow, performance, mobile layout, emulator, Android, iOS, or auth work.
+When the latest user turn explicitly asks for Tank, MSI, Quark, remote,
+protected-gateway, regression, smoke, performance, browser, UI, mobile, Android,
+iOS, AVD, or emulator testing, the hook uses the Quark remote testing queue to:
 
 - reuse or create a project lease for the current Codex project;
 - enqueue `overseer.full_ui_regression`, `overseer.performance_regression`, or
@@ -151,3 +151,28 @@ originating thread. Hook-continuation prompts may collect or wait on an existing
 requested job, but they do not create new jobs by themselves. The hook never
 queues raw secrets and relies on the existing remote testing redaction policy
 for result summaries.
+
+## Mobile UI Emulator Standard
+
+Whenever mobile app or mobile UI work is complete, the originating project
+thread should explicitly request Quark-coordinated mobile/emulator regression
+testing before the work is considered fully verified. This is a process
+standard, not a broad stop-hook inference rule: the thread should ask for the
+test directly, for example "run a mobile UI emulator regression test through
+Quark".
+
+Quark must avoid interfering with active emulator testing by other projects.
+If Roadex or another project is already running emulator tests, Quark should
+either use a separate leased facility or wait until the current lease clears.
+Dax owns emulator and AVD checkout, so any test that needs a live emulator
+resource should have a Dax claim or equivalent checkout evidence before the job
+is queued.
+
+Until the Tank/MSI worker or a future Android, iOS, or macOS testing agent
+advertises a native mobile job type, mobile UI regression should use the
+project's approved protected-gateway/browser contract or
+`protected_gateway.request_sequence` with redacted-safe parameters. Results must
+return only non-secret evidence such as project, service path, validation stage,
+view or endpoint name, HTTP status, timing summary, short hashes, and findings.
+Do not return raw screenshots, tokens, cookies, browser storage, device ids,
+serials, local databases, HTML, or response bodies.

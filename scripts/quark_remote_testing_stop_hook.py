@@ -20,9 +20,9 @@ DEFAULT_STORE = DEFAULT_PROJECT_ROOT / "state" / "overseer.sqlite3"
 HOOK_PROMPT_RE = re.compile(r"<hook_prompt\b[^>]*>.*?</hook_prompt>", re.IGNORECASE | re.DOTALL)
 EXPLICIT_REMOTE_TEST_RE = re.compile(
     r"("
-    r"\b(run|queue|schedule|perform|execute|request|have|use)\b.{0,80}\b(test|tests|testing|regression|smoke|performance|browser|ui)\b|"
-    r"\b(test|tests|testing|regression|smoke|performance)\b.{0,80}\b(tank|quark|msi|remote|protected\s+gateway|gateway)\b|"
-    r"\b(tank|quark|msi|remote[-\s]?testing)\b.{0,80}\b(test|tests|testing|regression|smoke|performance)\b|"
+    r"\b(run|queue|schedule|perform|execute|request|have|use)\b.{0,80}\b(test|tests|testing|regression|smoke|performance|browser|ui|mobile|emulator|avd|android|ios)\b|"
+    r"\b(test|tests|testing|regression|smoke|performance|mobile|emulator|avd|android|ios)\b.{0,80}\b(tank|quark|msi|remote|protected\s+gateway|gateway|emulator)\b|"
+    r"\b(tank|quark|msi|remote[-\s]?testing|emulator|avd)\b.{0,80}\b(test|tests|testing|regression|smoke|performance|mobile|android|ios)\b|"
     r"\boverseer\.(full_ui_regression|performance_regression)\b|"
     r"\bprotected_gateway\.request_sequence\b"
     r")",

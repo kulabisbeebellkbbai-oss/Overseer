@@ -19,6 +19,7 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
     backup_ops = backup_operations_status(root)
     growth_history = storage_growth_history_status(root)
     risk_alerts = _storage_risk_alert_rows(root)
+    encryption_trust = storage_encryption_trust_status(root)
     return {
         "root": str(root),
         "mounts": mounts,
@@ -38,11 +39,33 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
         "cleanup_candidates": _cleanup_candidates(root),
         "risk_alerts": risk_alerts,
         "risk_alert_count": sum(1 for row in risk_alerts if row.get("risk_level") != "ok"),
+        "encryption_trust": encryption_trust["devices"],
+        "encryption_trust_count": encryption_trust["device_count"],
+        "removable_media_review": encryption_trust["removable_media_review"],
+        "removable_media_review_count": encryption_trust["removable_media_review_count"],
         "capacity_summary": _capacity_summary(),
         "growth_samples": growth_history["snapshots"],
         "growth_sample_count": growth_history["snapshot_count"],
         "growth_trends": growth_history["trends"],
         "growth_retention": growth_history["retention"],
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def storage_encryption_trust_status(
+    project_root: str | Path,
+    sysfs_block_root: str | Path = "/sys/class/block",
+) -> dict[str, object]:
+    root = Path(project_root)
+    devices = _storage_encryption_trust_rows(Path(sysfs_block_root))
+    review = [row for row in devices if row.get("approval_required")]
+    return {
+        "root": str(root),
+        "devices": devices,
+        "device_count": len(devices),
+        "removable_media_review": review,
+        "removable_media_review_count": len(review),
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
@@ -175,6 +198,93 @@ def _storage_risk_alert_rows(root: Path) -> list[dict[str, object]]:
             }
         ]
     return alerts
+
+
+def _storage_encryption_trust_rows(sysfs_block_root: Path) -> list[dict[str, object]]:
+    if not sysfs_block_root.exists() or not sysfs_block_root.is_dir():
+        return [
+            {
+                "device": "sysfs",
+                "kind": "storage_encryption_trust_scan",
+                "removable": False,
+                "read_only": False,
+                "encrypted": "unknown",
+                "trust_status": "unavailable",
+                "risk_level": "warning",
+                "approval_required": True,
+                "next_step": "sysfs block metadata is unavailable; require manual storage trust review before removable-media use",
+            }
+        ]
+    rows = []
+    for path in sorted(sysfs_block_root.iterdir(), key=lambda item: item.name):
+        if path.name.startswith(".") or _is_virtual_block_device(path.name):
+            continue
+        row = _storage_encryption_trust_row(path)
+        if row:
+            rows.append(row)
+    if not rows:
+        rows.append(
+            {
+                "device": "storage",
+                "kind": "storage_encryption_trust_scan",
+                "removable": False,
+                "read_only": False,
+                "encrypted": "unknown",
+                "trust_status": "no_block_storage_rows",
+                "risk_level": "ok",
+                "approval_required": False,
+                "next_step": "continue periodic removable-media trust scans",
+            }
+        )
+    return rows
+
+
+def _storage_encryption_trust_row(path: Path) -> dict[str, object]:
+    removable = _read_first_line(path / "removable") == "1"
+    read_only = _read_first_line(path / "ro") == "1"
+    encrypted = _encrypted_status(path)
+    if removable and not read_only and encrypted is not True:
+        trust_status = "removable_media_needs_trust_decision"
+        risk_level = "warning"
+        approval_required = True
+        next_step = "verify owner, purpose, malware risk, encryption, and backup policy before using this removable writable device"
+    elif encrypted is True:
+        trust_status = "encrypted_or_mapped_storage"
+        risk_level = "ok"
+        approval_required = False
+        next_step = "confirm recovery key custody and restore-test coverage"
+    elif read_only:
+        trust_status = "read_only_media"
+        risk_level = "ok"
+        approval_required = False
+        next_step = "read-only media can be inspected, but require approval before copying sensitive data"
+    else:
+        trust_status = "fixed_storage_unencrypted_or_unknown"
+        risk_level = "medium"
+        approval_required = False
+        next_step = "include in encryption, backup, and restore-test planning"
+    return {
+        "device": f"/dev/{path.name}",
+        "kind": "storage_encryption_trust",
+        "model": _read_first_line(path / "device" / "model") or "unknown",
+        "removable": removable,
+        "read_only": read_only,
+        "encrypted": encrypted,
+        "trust_status": trust_status,
+        "risk_level": risk_level,
+        "approval_required": approval_required,
+        "next_step": next_step,
+    }
+
+
+def _encrypted_status(path: Path) -> bool | str:
+    dm_uuid = _read_first_line(path / "dm" / "uuid")
+    if dm_uuid:
+        return dm_uuid.upper().startswith("CRYPT-")
+    holder_names = [holder.name.lower() for holder in (path / "holders").glob("*")] if (path / "holders").exists() else []
+    if any(name.startswith(("dm-", "crypt", "luks")) for name in holder_names):
+        return True
+    return "unknown"
 
 
 def _storage_risk_alert(root: Path, path: Path) -> dict[str, object] | None:
@@ -412,11 +522,25 @@ def _usage_status(percent: str) -> str:
     return "ok"
 
 
+def _is_virtual_block_device(name: str) -> bool:
+    return name.startswith(("loop", "ram", "zram")) or name in {"fd0"}
+
+
 def _relative_or_name(root: Path, path: Path) -> str:
     try:
         return str(path.relative_to(root))
     except ValueError:
         return path.name
+
+
+def _read_first_line(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    return text.splitlines()[0].strip()
 
 
 def _redact_device(value: str) -> str:

@@ -64,7 +64,7 @@ from overseer.remote_testing import (
 from overseer.security_evidence import security_evidence_status
 from overseer.service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from overseer.software_evidence import software_evidence_status
-from overseer.storage_evidence import capture_storage_growth_snapshot_status, storage_evidence_status
+from overseer.storage_evidence import capture_storage_growth_snapshot_status, storage_encryption_trust_status, storage_evidence_status
 from overseer.store import SQLiteStore
 from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
@@ -556,7 +556,21 @@ class OperationsGapCoverageTests(unittest.TestCase):
             (root / "state" / "app.sqlite3-wal").write_text("wal placeholder\n", encoding="utf-8")
             (root / "exports").mkdir()
             (root / "exports" / "operator-export.json").write_text("{}\n", encoding="utf-8")
+            sysfs = root / "sys" / "block"
+            removable = sysfs / "sdb"
+            removable_device = removable / "device"
+            removable_device.mkdir(parents=True)
+            (removable / "removable").write_text("1\n", encoding="utf-8")
+            (removable / "ro").write_text("0\n", encoding="utf-8")
+            (removable_device / "model").write_text("USB Test Media\n", encoding="utf-8")
+            encrypted = sysfs / "dm-0"
+            encrypted_dm = encrypted / "dm"
+            encrypted_dm.mkdir(parents=True)
+            (encrypted / "removable").write_text("0\n", encoding="utf-8")
+            (encrypted / "ro").write_text("0\n", encoding="utf-8")
+            (encrypted_dm / "uuid").write_text("CRYPT-LUKS2-test\n", encoding="utf-8")
             payload = storage_evidence_status(root)
+            trust = storage_encryption_trust_status(root, sysfs)
             capture = capture_storage_growth_snapshot_status(root, "growth.test", requested_by="kira", notes="test growth capture")
             history = storage_evidence_status(root)
             store_path = root / "state" / "overseer.sqlite3"
@@ -577,6 +591,13 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertIn("ignored_export", alert_kinds)
         self.assertEqual(payload["risk_alert_count"], 3)
         self.assertTrue(all("next_step" in row for row in payload["risk_alerts"]))
+        removable_review = next(row for row in trust["devices"] if row["device"] == "/dev/sdb")
+        encrypted_review = next(row for row in trust["devices"] if row["device"] == "/dev/dm-0")
+        self.assertTrue(removable_review["approval_required"])
+        self.assertEqual(removable_review["trust_status"], "removable_media_needs_trust_decision")
+        self.assertFalse(encrypted_review["approval_required"])
+        self.assertTrue(encrypted_review["encrypted"])
+        self.assertEqual(trust["removable_media_review_count"], 1)
         self.assertEqual(payload["growth_trends"][0]["status"], "needs_history")
         self.assertEqual(capture["snapshot"]["id"], "growth.test")
         self.assertTrue(capture["mutation_performed"])

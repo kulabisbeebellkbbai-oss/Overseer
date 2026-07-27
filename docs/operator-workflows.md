@@ -343,6 +343,22 @@ exports, or any operation that could expose or lose local state.
 6. Use Storage Cleanup Candidates only after the risk alert next step is
    resolved.
 
+### Review Storage Encryption And Removable Media Trust
+
+Use this before copying to or from removable media, accepting attached storage
+as a backup target, or approving storage work that depends on encryption.
+
+1. Open Assets.
+2. Review Storage Encryption Trust.
+3. Review Removable Media Review for approval-required rows.
+4. Treat writable removable devices with unknown encryption as untrusted until
+   Kira verifies owner, purpose, malware risk, encryption state, and backup
+   policy.
+5. Treat encrypted rows as needing recovery-key custody and restore-test
+   coverage, not as automatically approved for sensitive data.
+6. Do not mount, format, copy to, copy from, or trust removable storage until
+   the review row next step is resolved.
+
 ### Record A Backup Job
 
 1. Open Assets.

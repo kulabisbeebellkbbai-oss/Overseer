@@ -165,9 +165,9 @@ environment-specific policy wiring:
   failover shells. Only local NAS is the planned first remote target; cloud,
   clone, and failover services are marked future work until testable providers
   exist.
-- encryption status and removable-media trust workflow beyond the current
-  capacity, cleanup, backup marker, filesystem growth trend, and metadata-only
-  storage risk alert panels.
+- live encryption enforcement, media mounting, and removable-device data
+  transfer actions beyond the current read-only encryption trust and
+  removable-media review panels.
 - VM/container/emulator live adapter depth beyond approved disposable targets:
   approved running-domain consistency/quiesce execution policy, approved
   non-disposable restore/destroy execution policy, and broader host-specific

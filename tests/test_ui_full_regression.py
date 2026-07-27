@@ -934,6 +934,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("Backup Provider Classes", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Growth Snapshot", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Risk Alerts", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Storage Encryption Trust", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Removable Media Review", OPERATOR_CONSOLE_HTML)
         self.assertIn("Filesystem Growth Trends", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Growth Samples", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
@@ -990,6 +992,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Record a backup job",
             "Capture filesystem growth snapshot",
             "Review storage risk alerts",
+            "Review storage encryption and removable media trust",
             "Record a restore test",
             "Stage backup execution request",
             "Approve backup execution request",

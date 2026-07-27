@@ -917,6 +917,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("Restore Execution Request", OPERATOR_CONSOLE_HTML)
         self.assertIn("Backup Execution Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Restore Execution Requests", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Provider Targets", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Provider Readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Provider Classes", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Destroy Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Image Vulnerability Scan", OPERATOR_CONSOLE_HTML)
@@ -1000,7 +1003,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Refresh CVE advisory feeds",
             "Inspect host security posture",
             "Stage firewall policy enforcement",
-            "Execute approved firewall fixture",
+            "Execute approved firewall change",
             "Stage identity rotation request",
             "Capture crew and audit knowledge",
             "View audit log",

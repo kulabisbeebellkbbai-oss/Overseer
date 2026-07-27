@@ -189,14 +189,18 @@ Gaps:
 Coverage: strong for storage discovery, resource registration, mount-health
 dashboard, SMART availability, backup job records, restore-test records,
 approved project-local backup execution, approved isolated restore execution,
-cleanup request staging and execution, marker discovery, and capacity summaries.
-Claims can protect shared storage before changes. Backup and restore execution
-write ignored local manifests and block unsafe paths.
+cleanup request staging and execution, marker discovery, capacity summaries, and
+provider planning. Kira now lists `//MediaStore/Overseer` as the first planned
+remote NAS target and exposes future shells for cloud object storage, full
+cloning, and hosted failover. Claims can protect shared storage before changes.
+Backup and restore execution write ignored local manifests and block unsafe
+paths.
 
 Gaps:
 
-- No backup provider policy beyond project-local filesystem backup and isolated
-  restore execution.
+- No live NAS/cloud/clone/failover backup execution beyond project-local
+  filesystem backup and isolated restore execution. Cloud, clone, and failover
+  are future work until services are available for testing.
 - No filesystem growth trend panel.
 - No storage risk alerts for local databases, WAL files, or ignored exports.
 - No encryption status or removable-media trust workflow.

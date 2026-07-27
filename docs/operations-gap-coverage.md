@@ -159,8 +159,12 @@ environment-specific policy wiring:
   bounded reads available to the running Overseer process.
 - host-specific live firewall enforcement policy tuning, final rule-level
   approvals, and post-enforcement monitoring for each real firewall mutation.
-- broader backup provider policy beyond project-local filesystem backup and
-  isolated restore execution.
+- backup provider execution beyond project-local filesystem backup and isolated
+  restore execution. Kira now exposes provider targets and readiness for
+  `//MediaStore` NAS backups, cloud object storage, full clone, and hosted
+  failover shells. Only local NAS is the planned first remote target; cloud,
+  clone, and failover services are marked future work until testable providers
+  exist.
 - VM/container/emulator live adapter depth beyond approved disposable targets:
   approved running-domain consistency/quiesce execution policy, approved
   non-disposable restore/destroy execution policy, and broader host-specific

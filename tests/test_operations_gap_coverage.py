@@ -568,6 +568,13 @@ class OperationsGapCoverageTests(unittest.TestCase):
             cleanup = stage_backup_cleanup_request_status(root, "artifacts", reason="review generated artifacts")
             status = backup_operations_status(root)
             evidence = storage_evidence_status(root)
+            media_target = next(row for row in status["provider_targets"] if row["name"] == "MediaStore")
+            cloud_target = next(row for row in status["provider_targets"] if row["provider_class"] == "cloud_object_storage")
+            media_readiness = next(row for row in status["provider_readiness"] if row["name"] == "MediaStore")
+            store_path = root / "state" / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                api_status = server.get_json("/Overseer/storage/backup-operations")
+                api_evidence = server.get_json("/Overseer/storage/evidence")
 
         self.assertEqual(job["job"]["id"], "backup.test")
         self.assertEqual(restore["restore_test"]["job_id"], "backup.test")
@@ -575,6 +582,16 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(status["job_count"], 1)
         self.assertEqual(status["restore_test_count"], 1)
         self.assertEqual(evidence["backup_jobs"][0]["id"], "backup.test")
+        self.assertEqual(media_target["target"], "//MediaStore/Overseer")
+        self.assertEqual(media_target["role"], "first remote backup target")
+        self.assertFalse(media_readiness["can_execute"])
+        self.assertIn("mount path", media_readiness["blockers"])
+        self.assertTrue(cloud_target["future_work"])
+        self.assertIn("Backup Provider Targets", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Provider Readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Provider Classes", OPERATOR_CONSOLE_HTML)
+        self.assertEqual(api_status["provider_targets"][0]["name"], "MediaStore")
+        self.assertEqual(api_evidence["backup_provider_targets"][0]["name"], "MediaStore")
         self.assertFalse(cleanup["host_mutation_performed"])
 
     def test_approved_backup_cleanup_deletes_project_artifact_with_manifest(self):

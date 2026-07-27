@@ -106,6 +106,20 @@ Use this when an admin plan is staged and waiting for approval.
 6. Click Approve.
 7. Do not click Execute until readiness shows the plan can execute.
 
+### Approve And Implement An Admin Request
+
+Use this when Sisko has reviewed an admin plan that already satisfies IDS,
+policy, and readiness gates, and the intended result is immediate execution
+after approval.
+
+1. Open Admin.
+2. Review Pending Approval Decisions.
+3. Click the item key to open the plain-English decision context.
+4. Confirm target, risk, reasoning, alternatives, service impact, rollback, and
+   next step.
+5. Click Approve & Implement.
+6. Confirm the approval and execution records appear in Admin history.
+
 ### Request Changes For A Plan
 
 Use this when a plan is wrong, incomplete, or lacks evidence.
@@ -299,7 +313,8 @@ blackouts, rollback expectations, and validation requirements.
 ### Record A Backup Job
 
 1. Open Assets.
-2. Review Storage And Backup, Capacity Summary, and Backup Markers.
+2. Review Storage And Backup, Backup Provider Targets, Backup Provider
+   Readiness, Capacity Summary, and Backup Markers.
 3. Fill Job ID, Target, Schedule, Retention, Risk, Status, Requested By, and
    optional Notes.
 4. Click Record Job.
@@ -307,10 +322,30 @@ blackouts, rollback expectations, and validation requirements.
 6. Use Backup Execution Request when the approved job should produce a local
    restore point.
 
-### Execute A Local Backup
+### Review Backup Provider Readiness
 
-Use this when Kira has approval to copy a safe project-local source into an
-ignored Overseer backup restore point.
+Use this before planning remote NAS backups, cloud backups, full cloning, or
+hosted failover.
+
+1. Open Assets.
+2. Review Backup Provider Targets. `//MediaStore/Overseer` is the first planned
+   remote NAS backup target.
+3. Review Backup Provider Readiness and do not execute a provider whose
+   `can_execute` field is false.
+4. Treat cloud object storage, full clone, and hosted failover rows as future
+   work until a real provider, credentials, network path, retention policy, and
+   restore-test target exist.
+5. Prefer industry-standard tools and protocols: SMB/CIFS or NFS for NAS,
+   restic, borg, rclone, rsync, S3-compatible object storage, Azure Blob, Google
+   Cloud Storage, ZFS/Btrfs send, LVM snapshots, image manifests, and
+   infrastructure-as-code for failover.
+6. Before enabling live NAS execution, define mount path, credentials,
+   encryption, retention, exclusions, monitoring, and an isolated restore test.
+
+### Stage Backup Execution Request
+
+Use this when Kira needs to prepare a safe project-local backup request before
+the final approval gate.
 
 1. Open Assets.
 2. Review Backup Jobs, Storage And Backup, and Capacity Summary.
@@ -319,10 +354,31 @@ ignored Overseer backup restore point.
 4. Fill Backup Name, Requested By, and Reason.
 5. Click Stage.
 6. Review Backup Execution Requests.
-7. Click the request row to fill Request ID.
-8. Fill Approved By and click Approve.
-9. Fill Executed By and click Execute.
-10. Review Backup Execution Requests for completed, blocked, or failed status,
+7. Confirm the staged request records the source path, backup name, risk,
+   approval state, and next step.
+
+### Approve Backup Execution Request
+
+Use this when Sisko or Kira has reviewed a staged backup request and the source
+path is within the approved project-local boundary.
+
+1. Open Assets.
+2. Review Backup Execution Requests.
+3. Click the request row to fill Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request is marked approved before execution.
+
+### Execute Backup Execution Request
+
+Use this when Kira has approval to copy a safe project-local source into an
+ignored Overseer backup restore point.
+
+1. Open Assets.
+2. Review Backup Execution Requests.
+3. Click the approved request row to fill Request ID.
+4. Fill Executed By and click Execute.
+5. Review Backup Execution Requests for completed, blocked, or failed status,
     plus the ignored backup path and manifest path.
 
 ### Record A Restore Test
@@ -335,10 +391,10 @@ ignored Overseer backup restore point.
 5. Verify the result appears in Restore Tests.
 6. Run actual restore verification only in an approved isolated target.
 
-### Execute A Local Restore
+### Stage Restore Execution Request
 
-Use this when Kira has approval to restore a local Overseer backup into an
-isolated project-local target for validation.
+Use this when Kira needs to prepare an isolated project-local restore request
+before the final approval gate.
 
 1. Open Assets.
 2. Review Backup Execution Requests and choose a completed backup path.
@@ -347,10 +403,30 @@ isolated project-local target for validation.
 5. Fill Requested By and Reason.
 6. Click Stage.
 7. Review Restore Execution Requests.
-8. Click the request row to fill Request ID.
-9. Fill Approved By and click Approve.
-10. Fill Executed By and click Execute.
-11. Review Restore Execution Requests and record a Restore Test result after
+8. Confirm the request records the restore point, isolated target, approval
+   state, and next step.
+
+### Approve Restore Execution Request
+
+Use this when Sisko or Kira has reviewed the restore point and target path.
+
+1. Open Assets.
+2. Review Restore Execution Requests.
+3. Click the request row to fill Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request is marked approved before execution.
+
+### Execute Restore Execution Request
+
+Use this when Kira has approval to restore a local Overseer backup into an
+isolated project-local target for validation.
+
+1. Open Assets.
+2. Review Restore Execution Requests.
+3. Click the approved request row to fill Request ID.
+4. Fill Executed By and click Execute.
+5. Review Restore Execution Requests and record a Restore Test result after
     validation.
 
 ### Stage Backup Cleanup Request
@@ -653,6 +729,20 @@ review and must be checked before production use.
 3. Review High, Warning, Listener Review Queue, Source Review Queue, and Plans.
 4. Unknown usage should be sent to Odo through the channel.
 
+### Advance Odo Security Review To Approval Or Execution
+
+Use this when Odo has pending listener, source, or firewall findings and should
+move each item as far as policy allows without another manual prompt.
+
+1. Open Security.
+2. Review Listener Review Queue, Source Review Queue, Firewall Policy Diff, and
+   Open Security Plans.
+3. Click Advance Odo Work.
+4. Review the generated admin plans, IDS packages, source decisions, and any
+   completed automatic actions.
+5. Items that still require human approval should appear in the approval panels
+   with plain-English context and approve or request-changes controls.
+
 ### Stage Listener Remediation Plans
 
 1. Open Security.
@@ -732,6 +822,31 @@ service account that needs rotation or access review.
 6. Review Identity Rotation Requests.
 7. Do not print, copy, rotate, delete, or replace any credential or account
    until human approval is present.
+
+### Approve Identity Rotation Request
+
+Use this when Sisko or Odo has verified that the staged identity rotation is
+needed and the principal impact is understood.
+
+1. Open Security.
+2. Review Identity Rotation Requests.
+3. Click the request row when available; it fills Request ID.
+4. Fill Approved By.
+5. Click Approve.
+6. Confirm the request is approved before execution.
+
+### Execute Identity Rotation Request
+
+Use this when Odo has approval to perform the identity rotation fixture or an
+approved live rotation path.
+
+1. Open Security.
+2. Review the approved identity rotation request.
+3. Click the request row when available; it fills Request ID.
+4. Fill Executed By.
+5. Click Execute Fixture.
+6. Review execution evidence, rollback notes, and any follow-up security
+   monitoring.
 
 ### Prepare, Export, Dispatch, And Record IDS Review
 

@@ -2192,6 +2192,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("SMART Health", storageEvidence.smart_health || [], ["device", "available", "status", "exit_code"])}</div>
           <div class="panel span-6">${table("Backup Markers", storageEvidence.backup_markers || [], ["path", "kind", "status"])}</div>
           <div class="panel span-12">${table("Backup Jobs", backupOperations.jobs || storageEvidence.backup_jobs || [], ["id", "target", "schedule", "retention", "status", "next_step"], {fills: {id: (row) => backupJobFill(row)}, fillView: "assets"})}</div>
+          <div class="panel span-12">${table("Backup Provider Targets", backupOperations.provider_targets || storageEvidence.backup_provider_targets || [], ["id", "name", "target", "provider_class", "protocols", "tooling", "role", "status", "next_step"])}</div>
+          <div class="panel span-12">${table("Backup Provider Readiness", backupOperations.provider_readiness || storageEvidence.backup_provider_readiness || [], ["id", "provider_class", "target", "role", "status", "can_stage", "can_execute", "blockers", "next_step"])}</div>
+          <div class="panel span-12">${table("Backup Provider Classes", backupOperations.provider_classes || storageEvidence.backup_provider_classes || [], ["provider_class", "standard_options", "current_target", "status", "test_status"])}</div>
           <div class="panel span-12">${table("Restore Tests", backupOperations.restore_tests || storageEvidence.restore_tests || [], ["id", "job_id", "restore_point", "status", "validated_by", "next_step"], {fills: {id: (row) => restoreTestFill(row), job_id: (row) => backupJobFill({id: row.job_id})}, fillView: "assets"})}</div>
           <div class="panel span-12">${table("Backup Execution Requests", backupOperations.backup_requests || storageEvidence.backup_requests || [], ["id", "source_path", "backup_path", "status", "approval_required", "next_step"], {fills: {id: (row) => backupExecutionFill(row), backup_path: (row) => restoreExecutionFill({backup_path: row.backup_path})}, fillView: "assets"})}</div>
           <div class="panel span-12">${table("Restore Execution Requests", backupOperations.restore_requests || storageEvidence.restore_requests || [], ["id", "backup_path", "restore_target", "restored_path", "status", "next_step"], {fills: {id: (row) => restoreExecutionFill(row), backup_path: (row) => restoreExecutionFill(row)}, fillView: "assets"})}</div>
@@ -2883,6 +2886,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Dispatch open crew requests", page: "Overview", owner: "Sisko", action: "dispatch-crew-messages", source, query: "Dispatch open crew requests"},
         {workflow: "Send a crew request", page: "Any", owner: "Sisko", action: "send-crew-message", source, query: "Send a crew request"},
         {workflow: "Approve a pending admin request", page: "Admin", owner: "Sisko", action: "approve-admin-change", source, query: "Approve a pending admin request"},
+        {workflow: "Approve and implement an admin request", page: "Admin", owner: "Sisko / O'Brien", action: "approve-and-execute-admin-change", source, query: "Approve and implement an admin request"},
         {workflow: "Request changes for a plan", page: "Admin", owner: "Sisko", action: "cancel-admin-change", source, query: "Request changes for a plan"},
         {workflow: "Plan a service restart or admin change", page: "Admin", owner: "O'Brien", action: "plan-admin-change", source, query: "Plan a service restart or admin change"},
         {workflow: "Execute an approved admin plan", page: "Admin", owner: "O'Brien", action: "execute-admin-change", source, query: "Execute an approved admin plan"},
@@ -2906,6 +2910,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Discover listeners as virtual assets", page: "Assets", owner: "Dax", action: "discover-listeners", source, query: "Discover listeners as virtual assets"},
         {workflow: "Register a managed resource", page: "Assets", owner: "Kira / Dax", action: "register-resource", source, query: "Register a managed resource"},
         {workflow: "Record a backup job", page: "Assets", owner: "Kira", action: "record-backup-job", source, query: "Record a backup job"},
+        {workflow: "Review backup provider readiness", page: "Assets", owner: "Kira", action: "open Assets", source, query: "Review Backup Provider Readiness"},
         {workflow: "Record a restore test", page: "Assets", owner: "Kira", action: "record-restore-test", source, query: "Record a restore test"},
         {workflow: "Stage backup execution request", page: "Assets", owner: "Kira", action: "stage-backup-execution-request", source, query: "Stage backup execution request"},
         {workflow: "Approve backup execution request", page: "Assets", owner: "Sisko / Kira", action: "approve-backup-execution-request", source, query: "Approve backup execution request"},
@@ -2948,8 +2953,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Review a remote source", page: "Security", owner: "Odo", action: "record-source-review", source, query: "Review a remote source"},
         {workflow: "Plan a source block", page: "Security", owner: "Odo", action: "plan-source-block", source, query: "Plan a source block"},
         {workflow: "Stage firewall policy enforcement", page: "Security", owner: "Odo Firewall", action: "stage-firewall-policy-enforcement", source, query: "Stage firewall policy enforcement"},
-        {workflow: "Execute approved firewall fixture", page: "Security", owner: "Odo Firewall", action: "execute-firewall-change", source, query: "Execute approved firewall fixture"},
+        {workflow: "Execute approved firewall change", page: "Security", owner: "Odo Firewall", action: "execute-firewall-change", source, query: "Execute approved firewall change"},
         {workflow: "Stage identity rotation request", page: "Security", owner: "Odo", action: "stage-identity-rotation-request", source, query: "Stage identity rotation request"},
+        {workflow: "Approve identity rotation request", page: "Security", owner: "Sisko / Odo", action: "approve-identity-rotation-request", source, query: "Approve identity rotation request"},
+        {workflow: "Execute identity rotation request", page: "Security", owner: "Odo", action: "execute-identity-rotation-request", source, query: "Execute identity rotation request"},
         {workflow: "Prepare an IDS review package", page: "Security", owner: "Odo IDS", action: "prepare-ids-review-package", source, query: "Prepare an IDS review package"},
         {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo IDS", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
         {workflow: "Dispatch an IDS review package", page: "Security", owner: "Odo IDS", action: "dispatch-ids-review-package", source, query: "Dispatch an IDS review package"},
@@ -3048,7 +3055,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         ${reviewBriefMarkup(reviewId, brief)}
         <div class="actions">
           ${fillButton("Review Source", fields, "admin")}
-          ${plan.ids_review_gate_satisfied === false ? `<button type="button" class="action-btn" disabled>Waiting On IDS</button>` : fillButton("Approve & Implement", fields, "admin", "approve-and-execute-admin-change")}
+          ${plan.ids_review_gate_satisfied === false ? `<button type="button" class="action-btn" disabled>Waiting On IDS</button>` : `<button type="button" class="action-btn" data-fill="${safe(JSON.stringify(fields))}" data-view-target="admin" data-action="approve-and-execute-admin-change">Approve & Implement</button>`}
           ${fillButton("Request Changes", requestChange, "admin", "cancel-admin-change")}
         </div>
       </div>`;

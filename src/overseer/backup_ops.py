@@ -13,6 +13,7 @@ from pathlib import Path
 def backup_operations_status(project_root: str | Path) -> dict[str, object]:
     root = Path(project_root)
     data = _read_registry(root)
+    provider_readiness = backup_provider_readiness_status(root)
     return {
         "root": str(root),
         "jobs": data["jobs"],
@@ -25,6 +26,26 @@ def backup_operations_status(project_root: str | Path) -> dict[str, object]:
         "restore_request_count": len(data["restore_requests"]),
         "cleanup_requests": data["cleanup_requests"],
         "cleanup_request_count": len(data["cleanup_requests"]),
+        "provider_targets": provider_readiness["targets"],
+        "provider_classes": provider_readiness["provider_classes"],
+        "provider_readiness": provider_readiness["readiness"],
+        "provider_standard": provider_readiness["standard"],
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def backup_provider_readiness_status(project_root: str | Path) -> dict[str, object]:
+    root = Path(project_root)
+    targets = _provider_target_rows()
+    classes = _provider_class_rows()
+    readiness = [_provider_readiness_row(row) for row in targets]
+    return {
+        "root": str(root),
+        "standard": "3-2-1 backups with restore testing, immutable retention where supported, encryption, and monitored offsite copies",
+        "targets": targets,
+        "provider_classes": classes,
+        "readiness": readiness,
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
@@ -455,6 +476,123 @@ def _read_registry(root: Path) -> dict[str, list[dict[str, object]]]:
 
 def _empty_registry() -> dict[str, list[dict[str, object]]]:
     return {"jobs": [], "restore_tests": [], "backup_requests": [], "restore_requests": [], "cleanup_requests": []}
+
+
+def _provider_target_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "backup-target.nas.mediastore",
+            "name": "MediaStore",
+            "target": "//MediaStore/Overseer",
+            "provider_class": "network_nas",
+            "protocols": "SMB/CIFS, NFS capable",
+            "tooling": "restic, borg, rclone, rsync",
+            "role": "first remote backup target",
+            "status": "planned_local_nas",
+            "connection_status": "not_checked",
+            "execution_available": False,
+            "future_work": False,
+            "next_step": "define mount path, credentials, encryption, retention, and restore-test target before enabling NAS backup execution",
+        },
+        {
+            "id": "backup-target.cloud.object-storage",
+            "name": "Object Storage",
+            "target": "s3-compatible://future-overseer-backups",
+            "provider_class": "cloud_object_storage",
+            "protocols": "S3 API, Backblaze B2, Azure Blob, Google Cloud Storage",
+            "tooling": "restic, rclone, cloud lifecycle policies, object lock where available",
+            "role": "future offsite cloud backup",
+            "status": "future_unavailable",
+            "connection_status": "not_configured",
+            "execution_available": False,
+            "future_work": True,
+            "next_step": "select provider, credentials, bucket policy, encryption, retention, and egress budget before implementation",
+        },
+        {
+            "id": "backup-target.clone.full-system",
+            "name": "Full Clone",
+            "target": "clone://future-full-system-image",
+            "provider_class": "full_clone",
+            "protocols": "ZFS/Btrfs snapshots, LVM snapshots, rsync, Clonezilla-style image export",
+            "tooling": "zfs send/receive, btrfs send/receive, rsync, qemu-img, disk image manifests",
+            "role": "future full cloning and bare-metal recovery",
+            "status": "future_unavailable",
+            "connection_status": "not_configured",
+            "execution_available": False,
+            "future_work": True,
+            "next_step": "inventory filesystems, boot mode, exclusion policy, quiesce plan, and restore host before implementation",
+        },
+        {
+            "id": "backup-target.failover.hosted-instance",
+            "name": "Hosted Failover",
+            "target": "failover://future-hosted-instance",
+            "provider_class": "hosted_failover",
+            "protocols": "cloud-init, Terraform/OpenTofu, Packer, container registry, DNS cutover",
+            "tooling": "infrastructure-as-code, image promotion, health probes, runbook automation",
+            "role": "future offsite hosted failover instance",
+            "status": "future_unavailable",
+            "connection_status": "not_configured",
+            "execution_available": False,
+            "future_work": True,
+            "next_step": "define provider, recovery point objective, recovery time objective, DNS, secrets bootstrap, and failover test window",
+        },
+    ]
+
+
+def _provider_class_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "provider_class": "network_nas",
+            "standard_options": "SMB/CIFS, NFS, restic repository, borg repository, rsync mirror",
+            "current_target": "//MediaStore/Overseer",
+            "status": "planned_first",
+            "test_status": "not_connected",
+        },
+        {
+            "provider_class": "cloud_object_storage",
+            "standard_options": "S3-compatible, Backblaze B2, Azure Blob, Google Cloud Storage",
+            "current_target": "future",
+            "status": "future_work",
+            "test_status": "no_service_available",
+        },
+        {
+            "provider_class": "full_clone",
+            "standard_options": "ZFS/Btrfs send, LVM snapshot, rsync image, qemu-img conversion",
+            "current_target": "future",
+            "status": "future_work",
+            "test_status": "no_service_available",
+        },
+        {
+            "provider_class": "hosted_failover",
+            "standard_options": "VM image promotion, IaC redeploy, containerized service restore, DNS cutover",
+            "current_target": "future",
+            "status": "future_work",
+            "test_status": "no_service_available",
+        },
+    ]
+
+
+def _provider_readiness_row(target: dict[str, object]) -> dict[str, object]:
+    blockers = []
+    if target.get("connection_status") != "ready":
+        blockers.append("connection not configured or tested")
+    if target.get("future_work"):
+        blockers.append("provider/service unavailable for testing")
+    if target.get("provider_class") == "network_nas":
+        blockers.append("mount path, credentials, encryption, retention, and restore test are not configured")
+    return {
+        "id": target["id"],
+        "name": target["name"],
+        "provider_class": target["provider_class"],
+        "target": target["target"],
+        "role": target["role"],
+        "status": target["status"],
+        "execution_available": False,
+        "can_stage": True,
+        "can_execute": False,
+        "blockers": "; ".join(blockers),
+        "next_step": target["next_step"],
+    }
 
 
 def _write_registry(root: Path, data: dict[str, object]) -> None:

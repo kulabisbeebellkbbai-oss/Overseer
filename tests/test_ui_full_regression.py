@@ -48,6 +48,7 @@ EXPECTED_VIEWS = {
             "discover-storage",
             "discover-listeners",
             "register-resource",
+            "capture-storage-growth-snapshot",
             "record-backup-job",
             "record-restore-test",
             "stage-backup-execution-request",
@@ -170,6 +171,7 @@ ACTION_ROUTES = {
     "build-policy-profile": ("POST", "/admin/policy-customization-helper/profile"),
     "cancel-admin-change": ("POST", "/admin/cancel"),
     "capture-metric-history": ("POST", "/observability/metric-history/capture"),
+    "capture-storage-growth-snapshot": ("POST", "/storage/growth-snapshots/capture"),
     "discover-codex-threads": ("POST", "/codex-projects/discover-threads"),
     "discover-listeners": ("POST", "/virtual/discover-listeners"),
     "discover-physical": ("POST", "/physical/discover"),
@@ -552,6 +554,12 @@ SAFE_POST_PAYLOADS = {
         "notes": "exercise disposable metric history workflow",
         "max_snapshots": 5,
     },
+    "/storage/growth-snapshots/capture": {
+        "snapshot_id": "storage.growth.ui.full",
+        "requested_by": "kira",
+        "notes": "exercise disposable storage growth workflow",
+        "max_snapshots": 5,
+    },
 }
 
 ROUTES_EXPECTED_TO_REQUIRE_FIXTURES = {
@@ -704,6 +712,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "backup-schedule",
             "backup-status",
             "backup-target",
+            "storage-growth-notes",
+            "storage-growth-requested-by",
+            "storage-growth-retention",
+            "storage-growth-snapshot-id",
             "claim-action",
             "claim-activate-approval-id",
             "claim-activate-id",
@@ -920,6 +932,9 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("Backup Provider Targets", OPERATOR_CONSOLE_HTML)
         self.assertIn("Backup Provider Readiness", OPERATOR_CONSOLE_HTML)
         self.assertIn("Backup Provider Classes", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Storage Growth Snapshot", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Filesystem Growth Trends", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Storage Growth Samples", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Execution Records", OPERATOR_CONSOLE_HTML)
         self.assertIn("Virtual Destroy Requests", OPERATOR_CONSOLE_HTML)
         self.assertIn("Image Vulnerability Scan", OPERATOR_CONSOLE_HTML)
@@ -972,6 +987,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "Approve a pending admin request",
             "View VM leases and virtual claims",
             "Record a backup job",
+            "Capture filesystem growth snapshot",
             "Record a restore test",
             "Stage backup execution request",
             "Approve backup execution request",

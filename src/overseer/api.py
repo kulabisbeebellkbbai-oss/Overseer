@@ -174,7 +174,7 @@ from .remote_testing import (
 from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from .security_evidence import security_evidence_status
 from .software_evidence import software_evidence_status
-from .storage_evidence import storage_evidence_status
+from .storage_evidence import capture_storage_growth_snapshot_status, storage_evidence_status
 from .usage_evidence import usage_evidence_status
 from .virtual_evidence import virtual_evidence_status
 from .virtual_ops import (
@@ -579,6 +579,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/storage/backup-execution-requests/execute":
                 self._handle_json(lambda payload: execute_backup_execution_request_status(_project_path_for_store(store_path), **_backup_execution_execute_args(payload)))
+                return
+            if path == "/storage/growth-snapshots/capture":
+                self._handle_json(lambda payload: capture_storage_growth_snapshot_status(_project_path_for_store(store_path), **_storage_growth_capture_args(payload)))
                 return
             if path == "/storage/restore-execution-requests":
                 self._handle_json(lambda payload: stage_restore_execution_request_status(_project_path_for_store(store_path), **_restore_execution_request_args(payload)))
@@ -1574,6 +1577,15 @@ def _metric_history_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "snapshot_id": str(payload.get("snapshot_id") or ""),
         "requested_by": str(payload.get("requested_by") or "julian"),
+        "notes": str(payload.get("notes") or ""),
+        "max_snapshots": int(payload.get("max_snapshots") or 250),
+    }
+
+
+def _storage_growth_capture_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_id": str(payload.get("snapshot_id") or ""),
+        "requested_by": str(payload.get("requested_by") or "kira"),
         "notes": str(payload.get("notes") or ""),
         "max_snapshots": int(payload.get("max_snapshots") or 250),
     }

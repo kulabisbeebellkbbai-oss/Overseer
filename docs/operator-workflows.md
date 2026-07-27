@@ -310,6 +310,22 @@ blackouts, rollback expectations, and validation requirements.
 3. Click Record Resource.
 4. Open Claims if the resource needs checkout or lock control.
 
+### Capture Filesystem Growth Snapshot
+
+Use this when Kira needs durable local evidence for filesystem growth trends
+without mounting disks, changing filesystems, or touching remote backup targets.
+
+1. Open Assets.
+2. Review Mount Health and Capacity Summary.
+3. Fill Snapshot ID when you need a stable named sample, otherwise leave it
+   blank for an automatic ID.
+4. Fill Requested By, Retention, and Notes.
+5. Click Capture Growth.
+6. Review Filesystem Growth Trends. A row with `needs_history` means at least
+   one more snapshot is required after normal workload activity.
+7. Investigate `attention`, `warning`, or `critical` rows before approving
+   backup, cleanup, package, database, or log-heavy work on the host.
+
 ### Record A Backup Job
 
 1. Open Assets.

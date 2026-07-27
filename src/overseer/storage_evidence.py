@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .backup_ops import backup_operations_status
@@ -14,6 +17,7 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
     mounts = _df_rows()
     backup_markers = _backup_markers(root)
     backup_ops = backup_operations_status(root)
+    growth_history = storage_growth_history_status(root)
     return {
         "root": str(root),
         "mounts": mounts,
@@ -32,9 +36,54 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
         "smart_health": _smart_health_rows(),
         "cleanup_candidates": _cleanup_candidates(root),
         "capacity_summary": _capacity_summary(),
+        "growth_samples": growth_history["snapshots"],
+        "growth_sample_count": growth_history["snapshot_count"],
+        "growth_trends": growth_history["trends"],
+        "growth_retention": growth_history["retention"],
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
+
+
+def storage_growth_history_status(project_root: str | Path) -> dict[str, object]:
+    root = Path(project_root)
+    data = _read_growth_registry(root)
+    snapshots = sorted(data["snapshots"], key=lambda item: str(item.get("captured_at") or item.get("id")), reverse=True)
+    return {
+        "root": str(root),
+        "snapshots": snapshots,
+        "snapshot_count": len(snapshots),
+        "trends": _growth_trend_rows(snapshots),
+        "retention": data.get("retention", {"max_snapshots": 250}),
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def capture_storage_growth_snapshot_status(
+    project_root: str | Path,
+    snapshot_id: str = "",
+    requested_by: str = "kira",
+    notes: str = "",
+    max_snapshots: int = 250,
+) -> dict[str, object]:
+    root = Path(project_root)
+    data = _read_growth_registry(root)
+    now = _now()
+    row = {
+        "id": _safe_id(snapshot_id) if snapshot_id else f"storage-growth.{now.replace(':', '').replace('-', '')}",
+        "captured_at": now,
+        "requested_by": requested_by,
+        "mounts": [_growth_mount_sample(mount) for mount in _df_rows()],
+        "root_capacity": _capacity_summary(),
+        "notes": notes,
+        "next_step": "compare against previous storage growth snapshots and investigate fast-growing filesystems before capacity becomes urgent",
+    }
+    _upsert_snapshot(data["snapshots"], row)
+    data["snapshots"] = sorted(data["snapshots"], key=lambda item: str(item.get("captured_at") or item.get("id")), reverse=True)[: max(1, int(max_snapshots))]
+    data["retention"] = {"max_snapshots": max(1, int(max_snapshots))}
+    _write_growth_registry(root, data)
+    return {"snapshot": row, "mutation_performed": True, "host_mutation_performed": False}
 
 
 def _df_rows() -> list[dict[str, object]]:
@@ -121,6 +170,150 @@ def _capacity_summary() -> dict[str, object]:
         "free_bytes": usage.free,
         "status": "attention" if usage.free < usage.total * 0.1 else "ok",
     }
+
+
+def _growth_trend_rows(snapshots: list[dict[str, object]]) -> list[dict[str, object]]:
+    by_mount: dict[str, list[dict[str, object]]] = {}
+    for snapshot in snapshots:
+        for mount in snapshot.get("mounts") or []:
+            key = str(mount.get("mount") or "unknown")
+            by_mount.setdefault(key, []).append({**mount, "captured_at": snapshot.get("captured_at")})
+    rows = []
+    for mount, samples in sorted(by_mount.items()):
+        ordered = sorted(samples, key=lambda item: str(item.get("captured_at") or ""))
+        latest = ordered[-1]
+        oldest = ordered[0]
+        latest_used = _int_or_none(latest.get("used_bytes"))
+        oldest_used = _int_or_none(oldest.get("used_bytes"))
+        elapsed_days = _elapsed_days(oldest.get("captured_at"), latest.get("captured_at"))
+        if len(ordered) < 2 or latest_used is None or oldest_used is None or not elapsed_days:
+            daily_growth = None
+            status = "needs_history"
+            next_step = "capture another storage growth snapshot after normal workload activity"
+        else:
+            daily_growth = round((latest_used - oldest_used) / elapsed_days)
+            status = _growth_status(daily_growth, latest.get("status"))
+            next_step = _growth_next_step(status)
+        rows.append(
+            {
+                "mount": mount,
+                "samples": len(ordered),
+                "oldest_captured_at": oldest.get("captured_at"),
+                "latest_captured_at": latest.get("captured_at"),
+                "latest_used_bytes": latest_used,
+                "latest_available_bytes": _int_or_none(latest.get("available_bytes")),
+                "latest_use_percent": latest.get("use_percent"),
+                "daily_growth_bytes": daily_growth,
+                "status": status,
+                "next_step": next_step,
+            }
+        )
+    if not rows:
+        rows.append(
+            {
+                "mount": "/",
+                "samples": 0,
+                "status": "needs_history",
+                "next_step": "capture the first storage growth snapshot from Assets",
+            }
+        )
+    return rows
+
+
+def _growth_mount_sample(mount: dict[str, object]) -> dict[str, object]:
+    return {
+        "source": mount.get("source"),
+        "type": mount.get("type"),
+        "mount": mount.get("mount"),
+        "size_bytes": _kilobytes_to_bytes(mount.get("size")),
+        "used_bytes": _kilobytes_to_bytes(mount.get("used")),
+        "available_bytes": _kilobytes_to_bytes(mount.get("available")),
+        "use_percent": mount.get("use_percent"),
+        "status": mount.get("status"),
+    }
+
+
+def _growth_status(daily_growth_bytes: int, latest_status: object) -> str:
+    if latest_status in {"critical", "warning"}:
+        return str(latest_status)
+    if daily_growth_bytes > 1024 * 1024 * 1024:
+        return "attention"
+    if daily_growth_bytes < 0:
+        return "shrinking"
+    return "ok"
+
+
+def _growth_next_step(status: str) -> str:
+    if status in {"critical", "warning", "attention"}:
+        return "review large-file, backup, database, cache, and log growth before the next maintenance window"
+    if status == "shrinking":
+        return "confirm cleanup or rotation was expected and no restore evidence was lost"
+    return "keep capturing storage growth snapshots during normal operations"
+
+
+def _growth_registry_path(root: Path) -> Path:
+    return root / "state" / "storage-growth-history.json"
+
+
+def _read_growth_registry(root: Path) -> dict[str, object]:
+    path = _growth_registry_path(root)
+    if not path.exists():
+        return {"snapshots": [], "retention": {"max_snapshots": 250}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"snapshots": [], "retention": {"max_snapshots": 250}}
+    return {
+        "snapshots": list(data.get("snapshots") or []),
+        "retention": dict(data.get("retention") or {"max_snapshots": 250}),
+    }
+
+
+def _write_growth_registry(root: Path, data: dict[str, object]) -> None:
+    path = _growth_registry_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _upsert_snapshot(rows: list[dict[str, object]], row: dict[str, object]) -> None:
+    existing = next((index for index, item in enumerate(rows) if item.get("id") == row["id"]), None)
+    if existing is None:
+        rows.append(row)
+    else:
+        rows[existing] = row
+
+
+def _kilobytes_to_bytes(value: object) -> int | None:
+    numeric = _int_or_none(value)
+    return None if numeric is None else numeric * 1024
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _elapsed_days(start: object, end: object) -> float | None:
+    try:
+        start_dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    seconds = (end_dt - start_dt).total_seconds()
+    if seconds <= 0:
+        return None
+    return seconds / 86400
+
+
+def _safe_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value).strip()).strip("-")
+    return cleaned or "storage-growth"
+
+
+def _now() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _usage_status(percent: str) -> str:

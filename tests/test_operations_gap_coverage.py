@@ -64,7 +64,7 @@ from overseer.remote_testing import (
 from overseer.security_evidence import security_evidence_status
 from overseer.service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from overseer.software_evidence import software_evidence_status
-from overseer.storage_evidence import storage_evidence_status
+from overseer.storage_evidence import capture_storage_growth_snapshot_status, storage_evidence_status
 from overseer.store import SQLiteStore
 from overseer.usage_evidence import usage_evidence_status
 from overseer.usage_limits import LimitKind, UsageContinuationRequest, UsageLimit
@@ -552,11 +552,29 @@ class OperationsGapCoverageTests(unittest.TestCase):
             (root / "backups").mkdir()
             (root / "backups" / "restore-test.md").write_text("restore evidence\n", encoding="utf-8")
             payload = storage_evidence_status(root)
+            capture = capture_storage_growth_snapshot_status(root, "growth.test", requested_by="kira", notes="test growth capture")
+            history = storage_evidence_status(root)
+            store_path = root / "state" / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                api_capture = server.post_json(
+                    "/Overseer/storage/growth-snapshots/capture",
+                    {"snapshot_id": "growth.api", "requested_by": "kira", "notes": "api growth capture", "max_snapshots": 5},
+                )
+                api_evidence = server.get_json("/Overseer/storage/evidence")
 
         self.assertGreaterEqual(payload["mount_count"], 1)
         self.assertEqual(payload["backup_marker_count"], 1)
         self.assertEqual(payload["backup_markers"][0]["path"], "backups/restore-test.md")
         self.assertIn("free_bytes", payload["capacity_summary"])
+        self.assertEqual(payload["growth_trends"][0]["status"], "needs_history")
+        self.assertEqual(capture["snapshot"]["id"], "growth.test")
+        self.assertTrue(capture["mutation_performed"])
+        self.assertFalse(capture["host_mutation_performed"])
+        self.assertEqual(history["growth_sample_count"], 1)
+        self.assertEqual(history["growth_samples"][0]["id"], "growth.test")
+        self.assertIn("daily_growth_bytes", history["growth_trends"][0])
+        self.assertEqual(api_capture["snapshot"]["id"], "growth.api")
+        self.assertGreaterEqual(api_evidence["growth_sample_count"], 1)
         self.assertTrue(payload["smart_health"])
         self.assertFalse(payload["host_mutation_performed"])
 

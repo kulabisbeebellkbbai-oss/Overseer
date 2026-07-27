@@ -964,6 +964,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "stage-backup-execution-request") return await stageBackupExecutionRequest();
       if (action === "approve-backup-execution-request") return await approveBackupExecutionRequest();
       if (action === "execute-backup-execution-request") return await executeBackupExecutionRequest();
+      if (action === "capture-storage-growth-snapshot") return await captureStorageGrowthSnapshot();
       if (action === "stage-restore-execution-request") return await stageRestoreExecutionRequest();
       if (action === "approve-restore-execution-request") return await approveRestoreExecutionRequest();
       if (action === "execute-restore-execution-request") return await executeRestoreExecutionRequest();
@@ -1089,6 +1090,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/storage/backup-execution-requests/execute", {
         request_id: value("backup-exec-request-id"),
         executed_by: value("backup-exec-executed-by") || "kira"
+      });
+    }
+    async function captureStorageGrowthSnapshot() {
+      return await postJson("/storage/growth-snapshots/capture", {
+        snapshot_id: value("storage-growth-snapshot-id"),
+        requested_by: value("storage-growth-requested-by") || "kira",
+        notes: value("storage-growth-notes"),
+        max_snapshots: Number(value("storage-growth-retention") || 250)
       });
     }
     async function stageRestoreExecutionRequest() {
@@ -2187,6 +2196,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-12"><label for="backup-cleanup-reason">Reason</label><input id="backup-cleanup-reason" value="review generated storage cleanup candidate"></div>
             </div>
           </div>
+          <div class="panel span-6">
+            <div class="toolbar"><h3>Storage Growth Snapshot</h3><button class="action-btn" data-action="capture-storage-growth-snapshot">Capture Growth</button></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="storage-growth-snapshot-id">Snapshot ID</label><input id="storage-growth-snapshot-id" placeholder="optional"></div>
+              <div class="field span-2"><label for="storage-growth-requested-by">Requested By</label><input id="storage-growth-requested-by" value="kira"></div>
+              <div class="field span-1"><label for="storage-growth-retention">Retention</label><input id="storage-growth-retention" type="number" min="1" value="250"></div>
+              <div class="field span-6"><label for="storage-growth-notes">Notes</label><input id="storage-growth-notes" value="capture filesystem growth evidence"></div>
+            </div>
+          </div>
           <div class="panel span-6">${table("Storage And Backup", [operations.storage_backup || {}], ["mount_rows", "backup_markers", "restore_tests", "next_step"])}</div>
           <div class="panel span-6">${table("Mount Health", storageEvidence.mounts || [], ["source", "type", "available", "use_percent", "mount", "status"])}</div>
           <div class="panel span-6">${table("SMART Health", storageEvidence.smart_health || [], ["device", "available", "status", "exit_code"])}</div>
@@ -2201,6 +2219,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-12">${table("Backup Cleanup Requests", backupOperations.cleanup_requests || storageEvidence.cleanup_requests || [], ["id", "path", "status", "approval_required", "next_step"], {fills: {path: (row) => backupCleanupFill(row)}, fillView: "assets"})}</div>
           <div class="panel span-6">${table("Storage Cleanup Candidates", storageEvidence.cleanup_candidates || [], ["path", "kind", "status"])}</div>
           <div class="panel span-6">${kv("Capacity Summary", storageEvidence.capacity_summary || {})}</div>
+          <div class="panel span-12">${table("Filesystem Growth Trends", storageEvidence.growth_trends || [], ["mount", "samples", "latest_use_percent", "daily_growth_bytes", "status", "next_step"])}</div>
+          <div class="panel span-12">${table("Storage Growth Samples", storageEvidence.growth_samples || [], ["id", "captured_at", "requested_by", "notes", "next_step"], {limit: 20})}</div>
           <div class="panel span-6">${table("Physical Lifecycle", operations.physical_lifecycle || [], ["stable_id", "kind", "checkout_ready", "power_risk", "storage_risk", "next_step"], {fills: {stable_id: (row) => resourceClaimFill(row.stable_id, "kira")}, fillView: "claims"})}</div>
           ${officerPanel("kira", "Physical asset issue", "Handle a USB, serial, power, storage, or connected-device issue.")}
           ${officerPanel("dax", "Virtual asset checkout", "Handle an emulator, VM, gateway, proxy, listener, or virtual checkout issue.")}
@@ -2909,6 +2929,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Discover storage arrays", page: "Assets", owner: "Kira", action: "discover-storage", source, query: "Discover storage arrays"},
         {workflow: "Discover listeners as virtual assets", page: "Assets", owner: "Dax", action: "discover-listeners", source, query: "Discover listeners as virtual assets"},
         {workflow: "Register a managed resource", page: "Assets", owner: "Kira / Dax", action: "register-resource", source, query: "Register a managed resource"},
+        {workflow: "Capture filesystem growth snapshot", page: "Assets", owner: "Kira", action: "capture-storage-growth-snapshot", source, query: "Capture filesystem growth snapshot"},
         {workflow: "Record a backup job", page: "Assets", owner: "Kira", action: "record-backup-job", source, query: "Record a backup job"},
         {workflow: "Review backup provider readiness", page: "Assets", owner: "Kira", action: "open Assets", source, query: "Review Backup Provider Readiness"},
         {workflow: "Record a restore test", page: "Assets", owner: "Kira", action: "record-restore-test", source, query: "Record a restore test"},

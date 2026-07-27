@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook that lets Quark coordinate remote testing before final delivery."""
+"""Stop hook that lets Quark fulfill explicit remote testing requests."""
 
 from __future__ import annotations
 
@@ -18,10 +18,14 @@ DEFAULT_PROJECT_ROOT = Path("/home/god/.local/share/overseer/project")
 DEFAULT_SOURCE_ROOT = DEFAULT_PROJECT_ROOT / "src"
 DEFAULT_STORE = DEFAULT_PROJECT_ROOT / "state" / "overseer.sqlite3"
 HOOK_PROMPT_RE = re.compile(r"<hook_prompt\b[^>]*>.*?</hook_prompt>", re.IGNORECASE | re.DOTALL)
-WORK_DONE_RE = re.compile(r"\b(implemented|added|created|built|changed|updated|fixed|repaired|completed|wired|exposed|served|deployed)\b", re.IGNORECASE)
-REMOTE_TEST_RE = re.compile(
-    r"\b(ui|dashboard|browser|page|panel|auth|unlock|protected\s+gateway|gateway|route|endpoint|api|"
-    r"regression|performance|latency|http\s+status|workflow|control)\b",
+EXPLICIT_REMOTE_TEST_RE = re.compile(
+    r"("
+    r"\b(run|queue|schedule|perform|execute|request|have|use)\b.{0,80}\b(test|tests|testing|regression|smoke|performance|browser|ui)\b|"
+    r"\b(test|tests|testing|regression|smoke|performance)\b.{0,80}\b(tank|quark|msi|remote|protected\s+gateway|gateway)\b|"
+    r"\b(tank|quark|msi|remote[-\s]?testing)\b.{0,80}\b(test|tests|testing|regression|smoke|performance)\b|"
+    r"\boverseer\.(full_ui_regression|performance_regression)\b|"
+    r"\bprotected_gateway\.request_sequence\b"
+    r")",
     re.IGNORECASE,
 )
 QUARK_EVIDENCE_RE = re.compile(
@@ -113,17 +117,23 @@ def job_type_for(text: str, name: str) -> str:
     return "protected_gateway.request_sequence"
 
 
+def has_explicit_remote_testing_request(user_text: str) -> bool:
+    cleaned = strip_hook_prompts(user_text)
+    if re.search(r"\b(no remote test|skip remote testing|local-only|not needed)\b", cleaned, re.IGNORECASE):
+        return False
+    return bool(EXPLICIT_REMOTE_TEST_RE.search(cleaned))
+
+
+def has_quark_hook_continuation(raw_user_text: str) -> bool:
+    return "Quark scheduled coordinated remote testing" in raw_user_text or "Quark remote testing is still pending" in raw_user_text
+
+
 def needs_quark_testing(user_text: str, assistant_text: str, cwd: str) -> bool:
-    combined = strip_hook_prompts("\n".join([user_text, assistant_text]))
-    if QUARK_EVIDENCE_RE.search(combined):
+    if not cwd:
         return False
-    if not WORK_DONE_RE.search(assistant_text):
+    if QUARK_EVIDENCE_RE.search(strip_hook_prompts(assistant_text)):
         return False
-    if not REMOTE_TEST_RE.search(combined):
-        return False
-    if re.search(r"\b(no remote test|skip remote testing|local-only|not needed)\b", combined, re.IGNORECASE):
-        return False
-    return bool(cwd)
+    return has_explicit_remote_testing_request(user_text)
 
 
 def import_overseer(project_root: Path, source_root: Path) -> None:
@@ -132,7 +142,15 @@ def import_overseer(project_root: Path, source_root: Path) -> None:
             sys.path.insert(0, path)
 
 
-def ensure_quark_job(project_root: Path, store_path: Path, session_id: str, cwd: str, assistant_text: str, dry_run: bool = False) -> dict[str, object]:
+def ensure_quark_job(
+    project_root: Path,
+    store_path: Path,
+    session_id: str,
+    cwd: str,
+    trigger_text: str,
+    dry_run: bool = False,
+    allow_queue: bool = True,
+) -> dict[str, object]:
     import_overseer(project_root, Path(os.environ.get("OVERSEER_SOURCE_ROOT", str(DEFAULT_SOURCE_ROOT))))
     from overseer.core import OwnerDomain, RiskLevel
     from overseer.remote_testing import (
@@ -148,7 +166,7 @@ def ensure_quark_job(project_root: Path, store_path: Path, session_id: str, cwd:
     suffix = stable_suffix(session_id or "session", cwd)
     lease_id = f"lease.codex-stop.{name.lower()}.{suffix}"
     gateway_path = project_gateway_path(name)
-    job_type = job_type_for(assistant_text, name)
+    job_type = job_type_for(trigger_text, name)
     status = remote_testing_status(project_root)
     existing_lease = next((item for item in status["leases"] if item.get("lease_id") == lease_id), None)
     if existing_lease and existing_lease.get("last_job_id"):
@@ -158,18 +176,20 @@ def ensure_quark_job(project_root: Path, store_path: Path, session_id: str, cwd:
         pending = [job for job in status["pending_jobs"] + status["claimed_jobs"] if job.get("lease_id") == lease_id]
         if pending:
             return {"action": "waiting", "lease_id": lease_id, "job_type": job_type, "pending": pending}
+    if not allow_queue:
+        return {"action": "noop", "lease_id": lease_id, "job_type": job_type, "reason": "no existing requested test job"}
     if dry_run:
         return {"action": "would_queue", "lease_id": lease_id, "job_type": job_type, "gateway_path": gateway_path}
     request_remote_testing_lease_status(
         project_root,
         lease_id,
         name,
-        "Quark coordinated final-answer regression check before Codex response delivery",
+        "Quark coordinated explicitly requested remote testing",
         requested_by="quark",
         job_types=(job_type,),
         priority="normal",
     )
-    params: dict[str, object] = {"scheduled_by": "quark-stop-hook", "validation_stage": "final-answer-coordination"}
+    params: dict[str, object] = {"scheduled_by": "quark-stop-hook", "validation_stage": "requested-remote-testing"}
     if job_type == "protected_gateway.request_sequence":
         params["requests"] = [{"label": "health", "method": "GET", "path": "/health"}]
     job = enqueue_remote_test_job_status(
@@ -200,8 +220,8 @@ def ensure_quark_job(project_root: Path, store_path: Path, session_id: str, cwd:
             record_crew_message_status(
                 store_path,
                 OwnerDomain.QUARK.value,
-                "Coordinate final-answer remote testing",
-                f"Queued {job_type} for {name} before final response delivery; collect redacted result and continue the thread.",
+                "Coordinate requested remote testing",
+                f"Queued {job_type} for {name} after explicit thread request; collect redacted result and continue the thread.",
                 RiskLevel.MEDIUM.value,
                 requested_by=name,
                 message_id=crew_id,
@@ -214,18 +234,20 @@ def system_message(result: dict[str, object]) -> str:
     action = result.get("action")
     if action == "collected":
         return (
-            "Quark remote testing evidence collected before final delivery. "
+            "Quark remote testing evidence collected for requested test. "
             f"Lease `{result.get('lease_id')}` results: {json.dumps(result.get('results'), sort_keys=True)}. "
             "Update the final answer with the redacted result summary and continue."
         )
     if action == "waiting":
         return (
-            "Quark remote testing is still pending before final delivery. "
+            "Quark remote testing is still pending for requested test. "
             f"Lease `{result.get('lease_id')}`, job type `{result.get('job_type')}`, pending: "
             f"{json.dumps(result.get('pending'), sort_keys=True)}. Continue by collecting results when available."
         )
+    if action == "noop":
+        return "Quark remote testing listener found no requested test job to collect."
     return (
-        "Quark scheduled coordinated remote testing before final delivery. "
+        "Quark scheduled requested coordinated remote testing. "
         f"Lease `{result.get('lease_id')}`, job type `{result.get('job_type')}`, "
         f"job `{(result.get('job') or {}).get('job_id') if isinstance(result.get('job'), dict) else ''}`. "
         "Continue this thread by collecting the redacted Tank/MSI result and include Quark remote testing evidence."
@@ -240,20 +262,33 @@ def stop_check(payload: dict[str, Any], dry_run: bool = False) -> int:
     if not path.exists():
         return 0
     entries = latest_turn(path)
-    user_text = strip_hook_prompts("\n".join(text for role, text in entries if role == "user" and text))
+    raw_user_text = "\n".join(text for role, text in entries if role == "user" and text)
+    user_text = strip_hook_prompts(raw_user_text)
     assistant_text = strip_hook_prompts("\n".join(text for role, text in entries if role == "assistant" and text))
     cwd = str(payload.get("cwd") or "")
-    if not needs_quark_testing(user_text, assistant_text, cwd):
+    explicit_request = needs_quark_testing(user_text, assistant_text, cwd)
+    hook_continuation = has_quark_hook_continuation(raw_user_text)
+    if not explicit_request and not hook_continuation:
         return 0
     project_root = Path(os.environ.get("OVERSEER_PROJECT_ROOT", str(DEFAULT_PROJECT_ROOT))).expanduser()
     store_path = Path(os.environ.get("OVERSEER_STORE", str(DEFAULT_STORE))).expanduser()
     try:
-        result = ensure_quark_job(project_root, store_path, str(payload.get("session_id") or ""), cwd, assistant_text, dry_run=dry_run)
+        result = ensure_quark_job(
+            project_root,
+            store_path,
+            str(payload.get("session_id") or ""),
+            cwd,
+            "\n".join([user_text, assistant_text]),
+            dry_run=dry_run,
+            allow_queue=explicit_request,
+        )
     except Exception as error:
         print(f"quark_remote_testing_stop_hook: unable to coordinate remote test: {error}", file=sys.stderr)
         return 0
     if dry_run:
         print(json.dumps(result, sort_keys=True))
+        return 0
+    if result.get("action") == "noop":
         return 0
     print(system_message(result), file=sys.stderr)
     return 2

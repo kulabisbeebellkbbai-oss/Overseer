@@ -54,11 +54,39 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertFalse((root / "local-secrets" / "remote-testing").exists())
 
-    def test_hook_dry_run_reports_would_queue_full_ui_regression(self):
+    def test_hook_noops_for_ui_work_without_explicit_testing_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             transcript = root / "transcript.jsonl"
             _write_transcript(transcript, "proceed", "Implemented the dashboard UI panel and endpoint wiring.")
+
+            result = self._run_hook(root, transcript, dry_run=True)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((root / "local-secrets" / "remote-testing").exists())
+
+    def test_hook_noops_for_meta_discussion_about_testing_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            _write_transcript(
+                transcript,
+                "the hook should act like a listener and should only test when the originating thread asks for a test",
+                "Updated the hook policy and tests.",
+            )
+
+            result = self._run_hook(root, transcript, dry_run=True)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((root / "local-secrets" / "remote-testing").exists())
+
+    def test_hook_dry_run_reports_would_queue_explicit_full_ui_regression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            _write_transcript(transcript, "run a remote UI regression test through Tank", "Implemented the dashboard UI panel and endpoint wiring.")
 
             result = self._run_hook(root, transcript, dry_run=True)
 
@@ -73,7 +101,7 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             (root / "state").mkdir()
             SQLiteStore(root / "state" / "overseer.sqlite3").close()
             transcript = root / "transcript.jsonl"
-            _write_transcript(transcript, "proceed", "Added the authenticated UI page and protected gateway panel.")
+            _write_transcript(transcript, "have Quark run a remote browser regression test", "Added the authenticated UI page and protected gateway panel.")
 
             result = self._run_hook(root, transcript)
             status = remote_testing_status(root)
@@ -84,7 +112,7 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
                 store.close()
 
             self.assertEqual(result.returncode, 2)
-            self.assertIn("Quark scheduled coordinated remote testing", result.stderr)
+            self.assertIn("Quark scheduled requested coordinated remote testing", result.stderr)
             self.assertEqual(len(status["pending_jobs"]), 1)
             self.assertEqual(status["pending_jobs"][0]["job_type"], "overseer.full_ui_regression")
             self.assertEqual(messages[0].owner_domain.value, "quark")
@@ -95,7 +123,7 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
             (root / "state").mkdir()
             SQLiteStore(root / "state" / "overseer.sqlite3").close()
             transcript = root / "transcript.jsonl"
-            _write_transcript(transcript, "proceed", "Fixed the protected gateway UI panel.")
+            _write_transcript(transcript, "run the remote UI regression test through Tank", "Fixed the protected gateway UI panel.")
             first = self._run_hook(root, transcript)
             status = remote_testing_status(root)
             job_id = status["pending_jobs"][0]["job_id"]
@@ -120,8 +148,23 @@ class QuarkRemoteTestingHookTests(unittest.TestCase):
 
             self.assertEqual(first.returncode, 2)
             self.assertEqual(second.returncode, 2)
-            self.assertIn("Quark remote testing evidence collected", second.stderr)
+            self.assertIn("Quark remote testing evidence collected for requested test", second.stderr)
             self.assertIn("passed", second.stderr)
+
+    def test_hook_continuation_does_not_queue_without_existing_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            _write_transcript(
+                transcript,
+                "<hook_prompt>Quark scheduled coordinated remote testing before final delivery.</hook_prompt>",
+                "Implemented the dashboard UI panel and endpoint wiring.",
+            )
+
+            result = self._run_hook(root, transcript)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse((root / "local-secrets" / "remote-testing").exists())
 
 
 if __name__ == "__main__":

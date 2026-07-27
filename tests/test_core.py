@@ -82,6 +82,7 @@ from overseer import (
     OperationPlanner,
     OverseerConfig,
     OverseerCoordinator,
+    HostSecuritySourceReview,
     PathPhysicalDiscoveryAdapter,
     AptPackageInspectionAdapter,
     StoragePhysicalDiscoveryAdapter,
@@ -136,6 +137,7 @@ from overseer import (
     plan_docker_compose_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
+    plan_firewalld_source_scoped_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_npm_global_install,
@@ -4392,7 +4394,7 @@ class OverseerApiClientTests(unittest.TestCase):
 
             self.assertEqual(status["kind"], AdminChangeKind.FIREWALL_DENY_TCP.value)
             self.assertEqual(status["target"], "tcp/22")
-            self.assertEqual(status["steps"][0]["command"], ["sudo", "ufw", "deny", "22/tcp"])
+            self.assertEqual(status["steps"][0]["command"][0:3], ["sudo", "firewall-cmd", "--permanent"])
             self.assertEqual(pending["pending_count"], 1)
 
     def test_client_reads_health_efficiency(self):
@@ -6304,6 +6306,32 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(status["firewall_backend"], "firewalld")
         self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
 
+    def test_firewalld_source_scoped_plan_preserves_sources_before_fallback_reject(self):
+        plan = plan_firewalld_source_scoped_deny_tcp(
+            "admin.firewalld.source-scoped.9443",
+            9443,
+            ("10.70.0.10/32", "10.70.0.11/32"),
+            "preserve protected gateway clients",
+            "gateway exposed",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.FIREWALL_DENY_TCP)
+        self.assertIn("10.70.0.10/32", plan.proposed_state)
+        self.assertIn("priority=\"-200\"", plan.steps[0].command[4])
+        self.assertIn("source address=\"10.70.0.10/32\"", plan.steps[0].command[4])
+        reject_rules = " ".join(
+            step.command[4]
+            for step in plan.steps
+            if len(step.command) > 4 and "--add-rich-rule" in step.command[4]
+        )
+        self.assertIn("family=\"ipv4\" priority=\"-100\"", reject_rules)
+        self.assertIn("family=\"ipv6\" priority=\"-100\"", reject_rules)
+        self.assertIn("overseer-deny6-9443", reject_rules)
+        self.assertEqual(plan.steps[-2].command, ("sudo", "firewall-cmd", "--check-config"))
+        self.assertEqual(plan.steps[-1].command, ("sudo", "firewall-cmd", "--reload"))
+        self.assertEqual(plan.rollback_steps[-2].command, ("sudo", "firewall-cmd", "--check-config"))
+        self.assertEqual(plan.rollback_steps[-1].command, ("sudo", "firewall-cmd", "--reload"))
+
     def test_odo_advance_collects_firewall_backend_before_ids_review(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -6357,6 +6385,54 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
         self.assertIn("firewall-cmd", package.firewall_rule_drafts[0])
         self.assertNotIn("ufw", package.prompt)
+
+    def test_odo_revision_restages_ssh_as_source_scoped_from_active_peer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.host-security.deny-tcp.22",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/22",
+                "stage approval-gated firewall deny for exposed listener queue tcp/22; requested_by=odo",
+                "listeners=0.0.0.0:22, [::]:22",
+                port=22,
+                use_firewalld=True,
+            )
+            package = overseer_cli.prepare_host_security_ids_review_package_status(store_path, plan["id"])
+            overseer_cli.submit_host_security_ids_review_package_status(store_path, package["id"], "odo")
+            overseer_cli.record_host_security_ids_review_result_status(
+                store_path,
+                package["id"],
+                "revision_required",
+                "Revision required: replace broad deny with source-scoped policy that preserves intended clients.",
+                "intrusion-detection-advisor",
+            )
+
+            completed = subprocess.CompletedProcess(
+                ("ss",),
+                0,
+                stdout="0 0 192.168.68.100:22 192.168.68.115:54939\n",
+                stderr="",
+            )
+            with patch("overseer.cli.subprocess.run", return_value=completed):
+                restaged = overseer_cli._restage_admin_plan_after_ids_revision(store_path, plan["id"])
+
+            loaded = SQLiteStore(store_path)
+            revised = loaded.load_admin_change_plan("admin.host-security.deny-tcp.22")
+            loaded.close()
+
+        self.assertEqual(restaged["firewall_backend"], "firewalld")
+        self.assertFalse(revised.approved)
+        self.assertIn("192.168.68.115/32", revised.proposed_state)
+        self.assertIn("source address=\"192.168.68.115/32\"", revised.steps[0].command[4])
+        reject_rules = " ".join(
+            step.command[4]
+            for step in revised.steps
+            if len(step.command) > 4 and "--add-rich-rule" in step.command[4]
+        )
+        self.assertIn("family=\"ipv4\" priority=\"-100\"", reject_rules)
+        self.assertIn("family=\"ipv6\" priority=\"-100\"", reject_rules)
 
     def test_odo_advance_restages_revision_required_firewall_plan_before_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6743,6 +6819,36 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertIn("'--add-rich-rule=rule port port=\"22\"", package.prompt)
         self.assertIn("'--remove-rich-rule=rule port port=\"22\"", package.prompt)
         self.assertIn("overseer-deny-22 ", package.prompt)
+
+    def test_ids_review_package_accepts_source_review_for_firewall_listener(self):
+        plan = plan_firewalld_source_scoped_deny_tcp(
+            "admin.firewalld.source-scoped.22",
+            22,
+            ("192.168.68.115/32",),
+            "preserve the current management client",
+            "listeners=0.0.0.0:22; intended_sources=192.168.68.115/32",
+        )
+        source_review = HostSecuritySourceReview(
+            id="source-review.ssh.management",
+            source_connection_id="admin.firewalld.source-scoped.22:192.168.68.115",
+            snapshot_id="snapshot.ssh",
+            listener="tcp/22",
+            remote_address="192.168.68.115",
+            remote_port="observed",
+            source_scope="lan",
+            evidence="observed established SSH peer during Odo source-scoped restage",
+            disposition=SourceReviewDisposition.EXPECTED,
+            rationale="current management peer preserved for lockout avoidance",
+            reviewed_by="odo",
+            reviewed_at="2026-07-27T03:45:00+00:00",
+            created_at="2026-07-27T03:45:00+00:00",
+        )
+
+        package = build_ids_review_package(plan, source_review)
+
+        self.assertEqual(package.source_review_id, "source-review.ssh.management")
+        self.assertIn("source_review=source-review.ssh.management", package.prompt)
+        self.assertIn("allow only intended sources 192.168.68.115/32", package.intended_traffic)
 
     def test_admin_change_plan_persists_without_execution(self):
         with tempfile.TemporaryDirectory() as directory:

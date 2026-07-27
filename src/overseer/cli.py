@@ -39,6 +39,7 @@ from .admin import (
     plan_docker_compose_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
+    plan_firewalld_source_scoped_deny_tcp,
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_npm_global_install,
@@ -153,6 +154,7 @@ from .service_evidence import execute_journal_access_request_status, service_evi
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
 ODO_SECURITY_DOMAINS = {OwnerDomain.ODO, OwnerDomain.ODO_IDS, OwnerDomain.ODO_FIREWALL}
+PROTECTED_GATEWAY_SOURCE_ALLOWLIST: tuple[str, ...] = ("10.70.0.10/32", "10.70.0.11/32", "10.70.0.12/32")
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -6336,6 +6338,7 @@ def _admin_plan_readiness_item(store_path: str | Path, plan_id: str) -> dict[str
 
 def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, created_at: str) -> dict[str, object]:
     _restage_admin_plan_after_ids_revision(store_path, plan_id)
+    source_review_id = _ensure_source_review_for_firewall_plan(store_path, plan_id, created_at)
     store = SQLiteStore(store_path)
     try:
         packages = [
@@ -6352,6 +6355,7 @@ def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, cr
         store_path,
         plan_id,
         package_id=package_id,
+        source_review_id=source_review_id,
         requested_by="odo",
         created_at=created_at,
     )
@@ -6372,11 +6376,81 @@ def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, cr
         return exported
 
 
+def _ensure_source_review_for_firewall_plan(store_path: str | Path, plan_id: str, created_at: str) -> str | None:
+    store = SQLiteStore(store_path)
+    try:
+        plan = store.load_admin_change_plan(plan_id)
+        if AdminChangeKind(plan.kind) != AdminChangeKind.FIREWALL_DENY_TCP:
+            return None
+        target = str(plan.target)
+        if not target.startswith("tcp/") or not target.removeprefix("tcp/").isdigit():
+            return None
+        match = re.search(r"intended_sources=([^;]+)", plan.current_state)
+        if not match:
+            return None
+        candidates: list[str] = []
+        for value in match.group(1).split(","):
+            value = value.strip()
+            if not value:
+                continue
+            try:
+                candidates.append(str(ipaddress.ip_network(value, strict=False).network_address))
+            except ValueError:
+                continue
+        if not candidates:
+            return None
+        existing_reviews = sorted(
+            store.list_host_security_source_reviews(),
+            key=lambda review: review.created_at or review.id,
+            reverse=True,
+        )
+        for review in existing_reviews:
+            listener = str(review.listener)
+            listener_port = listener.removeprefix("tcp/") if listener.startswith("tcp/") else listener.rsplit(":", maxsplit=1)[-1]
+            if listener_port == target.removeprefix("tcp/") and review.remote_address in candidates:
+                return review.id
+        source = candidates[0]
+        review = HostSecuritySourceReview(
+            id=f"source-review.{_status_id(plan_id)}.{_status_id(source)}",
+            source_connection_id=f"{plan_id}:{source}",
+            snapshot_id="odo-source-scoped-firewall-plan",
+            listener=target,
+            remote_address=source,
+            remote_port="observed",
+            source_scope=_source_scope_for_address(source),
+            evidence=f"{source} was captured from intended_sources while Odo restaged {plan_id}; confirm durable identity before enforcement",
+            disposition=SourceReviewDisposition.EXPECTED,
+            rationale="Odo preserved the observed intended source while staging a source-scoped firewall remediation plan; human approval still confirms durable identity and lockout recovery.",
+            reviewed_by="odo",
+            reviewed_at=created_at,
+            created_at=created_at,
+        )
+        store.save_host_security_source_review(review)
+        return review.id
+    finally:
+        store.close()
+
+
+def _source_scope_for_address(address: str) -> str:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return "unknown"
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_private:
+        return "lan"
+    return "external"
+
+
 def _restage_admin_plan_after_ids_revision(store_path: str | Path, plan_id: str) -> dict[str, object] | None:
     store = SQLiteStore(store_path)
     try:
         packages = store.list_host_security_ids_review_packages_for_plan(plan_id)
-        if not any(IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED for package in packages):
+        revision_packages = [
+            package for package in packages if IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED
+        ]
+        if not revision_packages:
             return None
         plan = store.load_admin_change_plan(plan_id)
         if AdminChangeKind(plan.kind) != AdminChangeKind.FIREWALL_DENY_TCP:
@@ -6384,19 +6458,110 @@ def _restage_admin_plan_after_ids_revision(store_path: str | Path, plan_id: str)
         target = str(plan.target)
         if not target.startswith("tcp/") or not target.removeprefix("tcp/").isdigit():
             return None
+        port = int(target.removeprefix("tcp/"))
         snapshot = store.load_latest_host_snapshot()
-        revised_plan, firewall_backend = _plan_firewall_deny_tcp_for_snapshot(
-            snapshot,
-            plan.id,
-            int(target.removeprefix("tcp/")),
-            plan.reason,
-            plan.current_state,
-        )
+        revision_text = "\n".join(package.advisory_result or "" for package in revision_packages)
+        source_scoped_sources = _source_scoped_sources_for_revised_firewall_plan(plan, revision_text)
+        if source_scoped_sources:
+            revised_plan = plan_firewalld_source_scoped_deny_tcp(
+                plan.id,
+                port,
+                source_scoped_sources,
+                _source_scoped_revision_reason(plan.reason),
+                _source_scoped_current_state(plan.current_state, source_scoped_sources),
+            )
+            firewall_backend = "firewalld"
+        else:
+            revised_plan, firewall_backend = _plan_firewall_deny_tcp_for_snapshot(
+                snapshot,
+                plan.id,
+                port,
+                plan.reason,
+                plan.current_state,
+            )
         revised_plan = replace(revised_plan, approved=False, approved_by=None, approved_at=None)
         store.save_admin_change_plan(revised_plan)
         return {"plan_id": plan_id, "firewall_backend": firewall_backend}
     finally:
         store.close()
+
+
+def _source_scoped_sources_for_revised_firewall_plan(plan: AdminChangePlan, revision_text: str) -> tuple[str, ...]:
+    target = str(plan.target)
+    if not target.startswith("tcp/") or not target.removeprefix("tcp/").isdigit():
+        return ()
+    port = int(target.removeprefix("tcp/"))
+    requires_source_scope = any(
+        phrase in revision_text.lower()
+        for phrase in ("source-scoped", "source scoped", "allowlist", "preserves intended clients", "preserve intended clients")
+    )
+    if not requires_source_scope and port not in {22, 9443}:
+        return ()
+    if port == 9443:
+        return PROTECTED_GATEWAY_SOURCE_ALLOWLIST
+    if port == 22:
+        return _active_tcp_peer_sources(port)
+    return ()
+
+
+def _active_tcp_peer_sources(port: int) -> tuple[str, ...]:
+    try:
+        completed = subprocess.run(
+            ("ss", "-H", "-tn", "state", "established", f"( sport = :{port} or dport = :{port} )"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    sources: set[str] = set()
+    for line in completed.stdout.splitlines():
+        columns = line.split()
+        if len(columns) < 4:
+            continue
+        source = _source_from_socket_token(columns[3])
+        if source:
+            sources.add(source)
+    return tuple(sorted(sources))
+
+
+def _source_from_socket_token(value: str) -> str | None:
+    if ":" not in value:
+        return None
+    address, _, port = value.rpartition(":")
+    if not port.isdigit():
+        return None
+    address = address.strip("[]")
+    if address in {"0.0.0.0", "::", "*", "127.0.0.1", "::1", "localhost"}:
+        return None
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    return f"{ip}/32" if ip.version == 4 else f"{ip}/128"
+
+
+def _source_scoped_revision_reason(reason: str) -> str:
+    suffix = "IDS revision requires source-scoped firewalld policy that preserves intended clients and rejects other sources with bounded logging"
+    return _semicolon_join_unique((*reason.split(";"), suffix))
+
+
+def _source_scoped_current_state(current_state: str, sources: Sequence[str]) -> str:
+    source_text = f"intended_sources={', '.join(sources)}"
+    return _semicolon_join_unique((*current_state.split(";"), source_text))
+
+
+def _semicolon_join_unique(parts: Sequence[str]) -> str:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for part in parts:
+        value = part.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return "; ".join(normalized)
 
 
 def _ensure_sisko_plan_message(

@@ -92,7 +92,7 @@ def build_ids_review_package(
         raise ValueError("admin plan does not require IDS/firewall review")
     if not requested_by.strip():
         raise ValueError("requested_by is required")
-    if source_review is not None and source_review.remote_address != plan.target:
+    if source_review is not None and not _source_review_matches_plan(source_review, plan):
         raise ValueError("source review target does not match admin plan target")
     source_context = _source_context(source_review)
     firewall_rule_drafts = _firewall_rule_drafts(plan)
@@ -225,12 +225,30 @@ def _source_context(source_review: HostSecuritySourceReview | None) -> str:
     )
 
 
+def _source_review_matches_plan(source_review: HostSecuritySourceReview, plan: AdminChangePlan) -> bool:
+    plan_kind = AdminChangeKind(plan.kind)
+    if plan_kind == AdminChangeKind.BLOCK_IP:
+        return source_review.remote_address == plan.target
+    if plan_kind == AdminChangeKind.FIREWALL_DENY_TCP:
+        target = str(plan.target)
+        if not target.startswith("tcp/") or not target.removeprefix("tcp/").isdigit():
+            return False
+        listener = str(source_review.listener)
+        listener_port = listener.removeprefix("tcp/") if listener.startswith("tcp/") else listener.rsplit(":", maxsplit=1)[-1]
+        return listener_port == target.removeprefix("tcp/")
+    return False
+
+
 def _intended_traffic(plan: AdminChangePlan) -> str:
     plan_kind = AdminChangeKind(plan.kind)
     if plan_kind == AdminChangeKind.BLOCK_IP:
         return f"deny traffic from source {plan.target}; direction inbound or routed as interpreted by host firewall"
     if plan_kind == AdminChangeKind.FIREWALL_DENY_TCP:
-        return f"deny inbound TCP service traffic for {plan.target}"
+        source_context = ""
+        match = re.search(r"intended_sources=([^;]+)", plan.current_state)
+        if match:
+            source_context = f"; allow only intended sources {match.group(1).strip()}"
+        return f"deny inbound TCP service traffic for {plan.target}{source_context}"
     return f"allow inbound TCP service traffic for {plan.target}"
 
 
@@ -255,6 +273,12 @@ def _ids_rule_drafts(
 
 
 def _logging_plan(plan: AdminChangePlan) -> str:
+    if AdminChangeKind(plan.kind) == AdminChangeKind.FIREWALL_DENY_TCP:
+        return (
+            f"Log allowed {plan.target} traffic during validation and log denied {plan.target} traffic with bounded rate limits. "
+            "Alert on deny bursts, first-seen source networks, sustained attempts, logging silence after a controlled denied test, "
+            "SSH authentication failures where applicable, unexpected usernames, root-login attempts, and source-address changes."
+        )
     return (
         f"Log filtered traffic for {plan.target} during validation; alert on repeated denied attempts, "
         "unexpected source networks, protocol anomalies, and authentication failures where service logs exist."
@@ -262,6 +286,13 @@ def _logging_plan(plan: AdminChangePlan) -> str:
 
 
 def _test_plan(plan: AdminChangePlan) -> str:
+    if AdminChangeKind(plan.kind) == AdminChangeKind.FIREWALL_DENY_TCP:
+        return (
+            f"Before enforcement, capture active zones, interfaces, policies, direct rules, runtime/permanent rich rules, "
+            f"effective nftables ordering, service binds, routes, and current sessions for {plan.target}. "
+            "Validate permanent configuration before reload. Keep the existing management session open, verify a second fresh "
+            "session from an intended source, test denial from a separate source and IPv6 path, verify alert delivery, and confirm rollback removes the exact rules."
+        )
     return (
         f"Before enforcement, confirm current reachability and policy state for {plan.target}. After approval, "
         "verify the exact rule exists, expected clients still work, denied traffic is logged, and rollback removes the rule."

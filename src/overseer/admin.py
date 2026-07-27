@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -884,6 +885,136 @@ def plan_firewalld_deny_tcp(
                 "Verify firewalld zone",
                 ("sudo", "firewall-cmd", f"--zone={zone}", "--list-all"),
                 "confirm the deny rule exists only as approved",
+            ),
+        ),
+    )
+
+
+def plan_firewalld_source_scoped_deny_tcp(
+    plan_id: str,
+    port: int,
+    allowed_sources: tuple[str, ...],
+    reason: str,
+    current_state: str = "unknown",
+    zone: str = "public",
+) -> AdminChangePlan:
+    if port < 1 or port > 65535:
+        raise ValueError("port must be between 1 and 65535")
+    if not allowed_sources:
+        raise ValueError("allowed_sources is required for source-scoped firewall plans")
+    if not zone.strip():
+        raise ValueError("zone is required")
+    normalized_sources = tuple(str(ipaddress.ip_network(source, strict=False)) for source in allowed_sources)
+
+    allow_steps: list[AdminCommandStep] = []
+    rollback_steps: list[AdminCommandStep] = []
+    for source in normalized_sources:
+        family = "ipv6" if ipaddress.ip_network(source, strict=False).version == 6 else "ipv4"
+        allow_rule = (
+            f'rule family="{family}" priority="-200" source address="{source}" '
+            f'port port="{port}" protocol="tcp" log prefix="overseer-allow-{port} " '
+            f'level="info" limit value="5/m" accept'
+        )
+        allow_steps.append(
+            AdminCommandStep(
+                f"Allow intended source {source}",
+                ("sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--add-rich-rule={allow_rule}"),
+                "preserve an intended client before applying the logged fallback reject",
+            )
+        )
+        rollback_steps.append(
+            AdminCommandStep(
+                f"Remove intended source {source}",
+                ("sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--remove-rich-rule={allow_rule}"),
+                "remove the source allow rule during rollback",
+            )
+        )
+
+    reject_rules = (
+        (
+            "ipv4",
+            f'rule family="ipv4" priority="-100" port port="{port}" protocol="tcp" '
+            f'log prefix="overseer-deny-{port} " level="warning" limit value="5/m" reject',
+        ),
+        (
+            "ipv6",
+            f'rule family="ipv6" priority="-100" port port="{port}" protocol="tcp" '
+            f'log prefix="overseer-deny6-{port} " level="warning" limit value="5/m" reject',
+        ),
+    )
+    reject_steps = tuple(
+        AdminCommandStep(
+            f"Add logged {family} fallback reject",
+            ("sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--add-rich-rule={rule}"),
+            "reject non-allowlisted inbound TCP traffic before broad zone service rules can accept it",
+        )
+        for family, rule in reject_rules
+    )
+    reject_rollback_steps = tuple(
+        AdminCommandStep(
+            f"Remove logged {family} fallback reject",
+            ("sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--remove-rich-rule={rule}"),
+            "remove the fallback reject rule during rollback",
+        )
+        for family, rule in reversed(reject_rules)
+    )
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.FIREWALL_DENY_TCP,
+        owner_domain=OwnerDomain.ODO_FIREWALL,
+        risk_level=RiskLevel.CRITICAL,
+        approval_level=ApprovalLevel.HUMAN,
+        target=f"tcp/{port}",
+        reason=reason,
+        current_state=current_state,
+        proposed_state=(
+            f"allow intended sources {', '.join(normalized_sources)} for TCP/{port} in firewalld zone {zone}; "
+            "reject and log other inbound sources"
+        ),
+        steps=(
+            *allow_steps,
+            *reject_steps,
+            AdminCommandStep(
+                "Validate firewalld permanent configuration",
+                ("sudo", "firewall-cmd", "--check-config"),
+                "confirm the staged permanent configuration parses before reload",
+            ),
+            AdminCommandStep(
+                "Reload firewalld",
+                ("sudo", "firewall-cmd", "--reload"),
+                "apply the approved permanent firewall rules",
+            ),
+        ),
+        rollback_steps=(
+            *reject_rollback_steps,
+            *rollback_steps,
+            AdminCommandStep(
+                "Validate firewalld rollback configuration",
+                ("sudo", "firewall-cmd", "--check-config"),
+                "confirm the rollback configuration parses before reload",
+            ),
+            AdminCommandStep(
+                "Reload firewalld after rollback",
+                ("sudo", "firewall-cmd", "--reload"),
+                "apply the rollback firewall state",
+            ),
+        ),
+        risks=(
+            "legitimate clients outside the allowlist may lose access",
+            "firewall policy changes require audit review",
+            "source attribution errors may preserve or block the wrong client",
+            "service may still listen until its bind configuration is changed",
+        ),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify firewalld zone",
+                ("sudo", "firewall-cmd", f"--zone={zone}", "--list-all"),
+                "confirm source allow rules and fallback reject exist only as approved",
+            ),
+            AdminCommandStep(
+                "Verify active firewalld zones",
+                ("sudo", "firewall-cmd", "--get-active-zones"),
+                "confirm the selected zone is active on the intended interfaces",
             ),
         ),
     )

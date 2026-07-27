@@ -456,7 +456,7 @@ SAFE_POST_PAYLOADS = {
     "/virtual/image-scans": {
         "image": "alpine:latest",
         "provider": "docker",
-        "scanner": "trivy",
+        "scanner": "ui-regression-fixture",
         "requested_by": "dax",
         "reason": "exercise image vulnerability scan staging workflow",
     },
@@ -995,7 +995,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn('"documents-query": row?.query || row?.workflow || source', OPERATOR_CONSOLE_HTML)
         for action in ACTION_ROUTES:
             with self.subTest(action=action):
-                self.assertIn(f'action: "{action}"', OPERATOR_CONSOLE_HTML)
+                self.assertIn(f'action === "{action}"', OPERATOR_CONSOLE_HTML)
 
     def test_safe_disposable_workflows_execute_through_gateway_routes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,7 +4,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from overseer.advisories import advisory_status, refresh_advisories_status
 from overseer.backup_ops import (
@@ -44,9 +47,13 @@ from overseer.performance_history import performance_history_status
 from overseer.remote_testing import (
     collect_remote_test_results_status,
     enqueue_remote_test_job_status,
+    issue_remote_testing_token_status,
+    record_remote_testing_account_status,
     record_remote_testing_profile_status,
     remote_testing_status,
     request_remote_testing_lease_status,
+    revoke_remote_testing_token_status,
+    validate_remote_testing_token,
 )
 from overseer.security_evidence import security_evidence_status
 from overseer.service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
@@ -1482,6 +1489,65 @@ exit 0
             with self.assertRaises(ValueError):
                 enqueue_remote_test_job_status(root, "lease.secret", "ping", params={"api_key": "do-not-queue"})
 
+    def test_remote_testing_issues_scoped_gateway_token_without_queueing_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_remote_testing_account_status(
+                root,
+                account_id="tank-msi-roadex",
+                agent_kind="windows",
+                agent_id="tank-msi",
+                allowed_projects=("Roadex",),
+                allowed_service_paths=("/Roadex", "/_gateway"),
+            )
+            lease = request_remote_testing_lease_status(
+                root,
+                "lease.roadex.auth",
+                "Roadex",
+                "issue scoped auth for Tank Roadex tests",
+                job_types=("protected_gateway.request_sequence",),
+            )
+            token = issue_remote_testing_token_status(
+                root,
+                account_id="tank-msi-roadex",
+                lease_id="lease.roadex.auth",
+                project="Roadex",
+                thread_id="thread.roadex.test",
+                service_paths=("/Roadex", "/_gateway"),
+                allowed_routes=("/api/bootstrap", "/"),
+            )
+            job = enqueue_remote_test_job_status(
+                root,
+                "lease.roadex.auth",
+                "protected_gateway.request_sequence",
+                project="Roadex",
+                gateway_path="/Roadex",
+                auth_token_id=str(token["token"]["token_id"]),
+            )
+            control = json.loads((root / "local-secrets" / "remote-testing" / "quark-control.json").read_text(encoding="utf-8"))
+            token_file = Path(str(token["token_path"]))
+            token_file_exists = token_file.exists()
+            raw_token = token_file.read_text(encoding="utf-8").strip()
+
+        self.assertEqual(lease["lease"]["project"], "Roadex")
+        self.assertEqual(token["token"]["allowed_methods"], ["GET", "HEAD", "OPTIONS"])
+        self.assertTrue(token_file_exists)
+        self.assertNotIn(raw_token, json.dumps(control))
+        self.assertEqual(job["job"]["auth_token_id"], token["token"]["token_id"])
+        self.assertEqual(job["job"]["token_source"], f"remote-testing-token:{token['token']['token_id']}")
+
+    def test_remote_testing_token_revocation_removes_local_token_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_remote_testing_lease_status(root, "lease.revoke", "Overseer", "revoke token", job_types=("ping",))
+            token = issue_remote_testing_token_status(root, lease_id="lease.revoke", service_paths=("/Overseer",))
+            token_path = Path(str(token["token_path"]))
+
+            revoked = revoke_remote_testing_token_status(root, str(token["token"]["token_id"]), reason="job finished")
+
+        self.assertFalse(token_path.exists())
+        self.assertEqual(revoked["token"]["status"], "revoked")
+
     def test_remote_testing_queues_approved_roadex_flow_through_quark_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1555,6 +1621,121 @@ exit 0
         self.assertEqual(status["default_profile_id"], "remote-testing.tank-msi")
         self.assertEqual(lease["lease"]["lease_id"], "lease.api")
         self.assertEqual(job["job"]["queue_status"], "pending")
+
+    def test_remote_testing_scoped_token_allows_read_and_denies_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            with LocalApiHarness(store_path) as server:
+                server.post_json(
+                    "/Overseer/usage/remote-testing/accounts",
+                    {
+                        "account_id": "tank-android-future",
+                        "agent_kind": "android",
+                        "agent_id": "tank-android",
+                        "allowed_projects": ["*"],
+                        "allowed_service_paths": ["/Overseer", "/Roadex", "/_gateway"],
+                    },
+                )
+                server.post_json(
+                    "/Overseer/usage/remote-testing/leases",
+                    {
+                        "lease_id": "lease.scoped.api",
+                        "project": "Roadex",
+                        "purpose": "scoped API token",
+                        "job_types": ["protected_gateway.request_sequence"],
+                    },
+                )
+                issued = server.post_json(
+                    "/Overseer/usage/remote-testing/auth-tokens",
+                    {
+                        "account_id": "tank-android-future",
+                        "lease_id": "lease.scoped.api",
+                        "project": "Roadex",
+                        "thread_id": "thread.roadex.limited",
+                        "service_paths": ["/Overseer"],
+                        "allowed_routes": ["/auth-check"],
+                    },
+                )
+                raw_token = Path(str(issued["token_path"])).read_text(encoding="utf-8").strip()
+                read_request = Request(f"{server.url}/Overseer/auth-check")
+                read_request.add_header("Authorization", f"Bearer {raw_token}")
+                with urlopen(read_request, timeout=5) as response:
+                    read_payload = json.loads(response.read().decode("utf-8"))
+                denied_request = Request(
+                    f"{server.url}/Overseer/crew/messages",
+                    data=json.dumps({"owner_domain": "quark", "subject": "bad", "message": "bad"}).encode("utf-8"),
+                    method="POST",
+                )
+                denied_request.add_header("Content-Type", "application/json")
+                denied_request.add_header("Authorization", f"Bearer {raw_token}")
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(denied_request, timeout=5)
+                status = server.get_json("/Overseer/usage/remote-testing")
+
+        account = next(item for item in status["test_accounts"] if item["account_id"] == "tank-android-future")
+        self.assertEqual(read_payload["auth_type"], "remote_testing_token")
+        self.assertEqual(read_payload["account_id"], "tank-android-future")
+        self.assertEqual(error.exception.code, 403)
+        self.assertFalse(account["enabled"])
+        self.assertTrue(any(item["event_type"] == "token_denied" for item in status["recent_test_auth_events"]))
+
+    def test_remote_testing_mutation_token_requires_exact_mutation_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_remote_testing_account_status(
+                root,
+                account_id="tank-ios-future",
+                agent_kind="ios",
+                agent_id="tank-ios",
+                allowed_projects=("Roadex",),
+                allowed_service_paths=("/Roadex", "/_gateway"),
+            )
+            request_remote_testing_lease_status(
+                root,
+                "lease.mutation.scope",
+                "Roadex",
+                "run scoped mutation test",
+                job_types=("protected_gateway.request_sequence",),
+            )
+            issued = issue_remote_testing_token_status(
+                root,
+                account_id="tank-ios-future",
+                lease_id="lease.mutation.scope",
+                project="Roadex",
+                service_paths=("/Roadex",),
+                allowed_methods=("GET", "POST"),
+                allowed_routes=("/api/tests/disposable-fixture", "/api/tests/other"),
+                mutates=True,
+                mutation_scope={
+                    "allowed_methods": ["POST"],
+                    "allowed_routes": ["/api/tests/disposable-fixture"],
+                    "service_paths": ["/Roadex"],
+                },
+            )
+            raw_token = Path(str(issued["token_path"])).read_text(encoding="utf-8").strip()
+            allowed = validate_remote_testing_token(
+                root,
+                raw_token,
+                "POST",
+                "/Roadex/api/tests/disposable-fixture",
+                "/api/tests/disposable-fixture",
+            )
+            denied = validate_remote_testing_token(
+                root,
+                raw_token,
+                "POST",
+                "/Roadex/api/tests/other",
+                "/api/tests/other",
+            )
+            status = remote_testing_status(root)
+
+        account = next(item for item in status["test_accounts"] if item["account_id"] == "tank-ios-future")
+        self.assertTrue(allowed["authorized"])
+        self.assertFalse(denied["authorized"])
+        self.assertEqual(denied["reason"], "mutation_scope_not_allowed")
+        self.assertFalse(account["enabled"])
 
     def test_identity_evidence_redacts_secret_files_and_hashes_ssh_keys(self):
         with tempfile.TemporaryDirectory() as directory:

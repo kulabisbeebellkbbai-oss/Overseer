@@ -114,9 +114,12 @@ from .policy import PolicyCheckStatus
 from .remote_testing import (
     collect_remote_test_results_status,
     enqueue_remote_test_job_status,
+    issue_remote_testing_token_status,
+    record_remote_testing_account_status,
     record_remote_testing_profile_status,
     remote_testing_status,
     request_remote_testing_lease_status,
+    revoke_remote_testing_token_status,
 )
 from .registry import ResourceRegistry
 from .runtime import OverseerRuntime
@@ -8703,6 +8706,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     remote_testing_profile_parser.add_argument("--token-source", default="state/api-token")
     remote_testing_profile_parser.add_argument("--recorded-by", default="quark")
     remote_testing_profile_parser.add_argument("--remote-host", default="god@10.50.0.100")
+    remote_testing_account_parser = subparsers.add_parser("record-remote-testing-account", help="record or update a scoped remote-testing service account")
+    remote_testing_account_parser.add_argument("--project-root", default=".")
+    remote_testing_account_parser.add_argument("--account-id", default="tank-msi-gateway-test")
+    remote_testing_account_parser.add_argument("--display-name", default="Tank/MSI gateway test account")
+    remote_testing_account_parser.add_argument("--agent-kind", default="windows")
+    remote_testing_account_parser.add_argument("--agent-id", default="tank-msi")
+    remote_testing_account_parser.add_argument("--allowed-project", action="append")
+    remote_testing_account_parser.add_argument("--allowed-service-path", action="append")
+    remote_testing_account_parser.add_argument("--allowed-gateway-origin", action="append")
+    remote_testing_account_parser.add_argument("--disabled", action="store_true")
+    remote_testing_account_parser.add_argument("--recorded-by", default="quark")
+    remote_testing_token_parser = subparsers.add_parser("issue-remote-testing-token", help="issue a scoped Quark remote-testing token grant")
+    remote_testing_token_parser.add_argument("--project-root", default=".")
+    remote_testing_token_parser.add_argument("--account-id", default="tank-msi-gateway-test")
+    remote_testing_token_parser.add_argument("--lease-id")
+    remote_testing_token_parser.add_argument("--job-id")
+    remote_testing_token_parser.add_argument("--project", default="Overseer")
+    remote_testing_token_parser.add_argument("--thread-id")
+    remote_testing_token_parser.add_argument("--service-path", action="append")
+    remote_testing_token_parser.add_argument("--gateway-origin", action="append")
+    remote_testing_token_parser.add_argument("--allowed-method", action="append")
+    remote_testing_token_parser.add_argument("--allowed-route", action="append")
+    remote_testing_token_parser.add_argument("--ttl-minutes", type=int, default=30)
+    remote_testing_token_parser.add_argument("--mutates", action="store_true")
+    remote_testing_token_parser.add_argument("--mutation-scope-json", default="{}")
+    remote_testing_token_parser.add_argument("--issued-by", default="quark")
+    remote_testing_revoke_parser = subparsers.add_parser("revoke-remote-testing-token", help="revoke a scoped Quark remote-testing token grant")
+    remote_testing_revoke_parser.add_argument("--project-root", default=".")
+    remote_testing_revoke_parser.add_argument("--token-id", required=True)
+    remote_testing_revoke_parser.add_argument("--revoked-by", default="quark")
+    remote_testing_revoke_parser.add_argument("--reason", default="test complete")
     remote_testing_lease_parser = subparsers.add_parser("request-remote-testing-lease", help="lease the Tank/MSI remote testing queue for a project batch")
     remote_testing_lease_parser.add_argument("--project-root", default=".")
     remote_testing_lease_parser.add_argument("--lease-id", required=True)
@@ -8724,6 +8758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     remote_testing_job_parser.add_argument("--ui-path", default="/Overseer/ui")
     remote_testing_job_parser.add_argument("--gateway-path", default="/Overseer")
     remote_testing_job_parser.add_argument("--token-source", default="state/api-token")
+    remote_testing_job_parser.add_argument("--auth-token-id")
     remote_testing_job_parser.add_argument("--mutates", action="store_true")
     remote_testing_results_parser = subparsers.add_parser("collect-remote-test-results", help="read redacted Tank/MSI remote testing results")
     remote_testing_results_parser.add_argument("--project-root", default=".")
@@ -9834,6 +9869,64 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "record-remote-testing-account":
+        print(
+            json.dumps(
+                record_remote_testing_account_status(
+                    args.project_root,
+                    args.account_id,
+                    args.display_name,
+                    args.agent_kind,
+                    args.agent_id,
+                    tuple(args.allowed_project or ["*"]),
+                    tuple(args.allowed_service_path or ["*"]),
+                    tuple(args.allowed_gateway_origin or ["*"]),
+                    not args.disabled,
+                    args.recorded_by,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "issue-remote-testing-token":
+        print(
+            json.dumps(
+                issue_remote_testing_token_status(
+                    args.project_root,
+                    args.account_id,
+                    args.lease_id,
+                    args.job_id,
+                    args.project,
+                    args.thread_id,
+                    tuple(args.service_path or ["/Overseer"]),
+                    tuple(args.gateway_origin or ["https://roadex.home.arpa:9443"]),
+                    tuple(args.allowed_method or ["GET", "HEAD", "OPTIONS"]),
+                    tuple(args.allowed_route or ["*"]),
+                    args.ttl_minutes,
+                    args.mutates,
+                    _json_object_arg(args.mutation_scope_json, "mutation-scope-json"),
+                    args.issued_by,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "revoke-remote-testing-token":
+        print(
+            json.dumps(
+                revoke_remote_testing_token_status(
+                    args.project_root,
+                    args.token_id,
+                    args.revoked_by,
+                    args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
     if args.command == "request-remote-testing-lease":
         print(
             json.dumps(
@@ -9867,6 +9960,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.ui_path,
                     args.gateway_path,
                     args.token_source,
+                    args.auth_token_id,
                     args.mutates,
                 ),
                 sort_keys=True,

@@ -157,9 +157,13 @@ from .performance_history import performance_history_status
 from .remote_testing import (
     collect_remote_test_results_status,
     enqueue_remote_test_job_status,
+    issue_remote_testing_token_status,
+    record_remote_testing_account_status,
     record_remote_testing_profile_status,
     remote_testing_status,
     request_remote_testing_lease_status,
+    revoke_remote_testing_token_status,
+    validate_remote_testing_token,
 )
 from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 from .security_evidence import security_evidence_status
@@ -212,6 +216,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
 
         def do_GET(self) -> None:
             route = urlsplit(self.path)
+            raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
             query = parse_qs(route.query)
             if path == "/health":
@@ -223,11 +228,21 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path in {"/", "/ui"}:
                 self._write_html(OPERATOR_CONSOLE_HTML)
                 return
-            if not self._is_authorized():
-                self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            auth_context = self._authorize_request("GET", raw_path, path)
+            if not auth_context.get("authorized"):
+                self._write_auth_error(auth_context)
                 return
             if path == "/auth-check":
-                self._write_json({"ok": True, "service": "overseer-api", "authorized": True})
+                self._write_json(
+                    {
+                        "ok": True,
+                        "service": "overseer-api",
+                        "authorized": True,
+                        "auth_type": auth_context.get("auth_type"),
+                        "account_id": auth_context.get("account_id"),
+                        "token_id": auth_context.get("token_id"),
+                    }
+                )
                 return
             if path == "/service-status":
                 self._handle(lambda: service_status(store_path))
@@ -472,9 +487,14 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
 
         def do_POST(self) -> None:
             route = urlsplit(self.path)
+            raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
-            if not self._is_authorized():
-                self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            auth_context = self._authorize_request("POST", raw_path, path)
+            if not auth_context.get("authorized"):
+                self._write_auth_error(auth_context)
+                return
+            if path.startswith("/usage/remote-testing/") and auth_context.get("auth_type") != "admin_token":
+                self._write_json({"error": "remote testing control routes require admin authorization"}, HTTPStatus.FORBIDDEN)
                 return
             if path == "/claims/request":
                 self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
@@ -728,6 +748,15 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/usage/remote-testing/profiles":
                 self._handle_json(lambda payload: record_remote_testing_profile_status(_project_path_for_store(store_path), **_remote_testing_profile_args(payload)))
                 return
+            if path == "/usage/remote-testing/accounts":
+                self._handle_json(lambda payload: record_remote_testing_account_status(_project_path_for_store(store_path), **_remote_testing_account_args(payload)))
+                return
+            if path == "/usage/remote-testing/auth-tokens":
+                self._handle_json(lambda payload: issue_remote_testing_token_status(_project_path_for_store(store_path), **_remote_testing_token_args(payload)))
+                return
+            if path == "/usage/remote-testing/auth-tokens/revoke":
+                self._handle_json(lambda payload: revoke_remote_testing_token_status(_project_path_for_store(store_path), **_remote_testing_revoke_args(payload)))
+                return
             if path == "/usage/remote-testing/leases":
                 self._handle_json(lambda payload: request_remote_testing_lease_status(_project_path_for_store(store_path), **_remote_testing_lease_args(payload)))
                 return
@@ -768,6 +797,31 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
 
         def log_message(self, format: str, *args: object) -> None:
             return
+
+        def _authorize_request(self, method: str, raw_path: str, normalized_path: str) -> dict[str, object]:
+            if auth_token is None:
+                return {"authorized": True, "auth_type": "none"}
+            header = self.headers.get("authorization", "")
+            prefix = "Bearer "
+            if not header.startswith(prefix):
+                return {"authorized": False, "auth_type": "missing", "reason": "missing_bearer"}
+            presented = header[len(prefix) :]
+            if secrets.compare_digest(presented, auth_token):
+                return {"authorized": True, "auth_type": "admin_token"}
+            context = validate_remote_testing_token(
+                _project_path_for_store(store_path),
+                presented,
+                method,
+                raw_path,
+                normalized_path,
+            )
+            if context is not None:
+                return context
+            return {"authorized": False, "auth_type": "unknown", "reason": "invalid_token"}
+
+        def _write_auth_error(self, auth_context: dict[str, object]) -> None:
+            status = HTTPStatus.FORBIDDEN if auth_context.get("auth_type") == "remote_testing_token" else HTTPStatus.UNAUTHORIZED
+            self._write_json({"error": "unauthorized", "reason": auth_context.get("reason")}, status)
 
         def _is_authorized(self) -> bool:
             if auth_token is None:
@@ -1081,6 +1135,61 @@ def _remote_testing_profile_args(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _list_payload(value: Any, default: list[str]) -> list[str]:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    raise ValueError("expected a list or comma-separated string")
+
+
+def _remote_testing_account_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "account_id": str(payload.get("account_id", "tank-msi-gateway-test")),
+        "display_name": str(payload.get("display_name", "Tank/MSI gateway test account")),
+        "agent_kind": str(payload.get("agent_kind", "windows")),
+        "agent_id": str(payload.get("agent_id", "tank-msi")),
+        "allowed_projects": tuple(_list_payload(payload.get("allowed_projects"), ["*"])),
+        "allowed_service_paths": tuple(_list_payload(payload.get("allowed_service_paths"), ["*"])),
+        "allowed_gateway_origins": tuple(_list_payload(payload.get("allowed_gateway_origins"), ["*"])),
+        "enabled": bool(payload.get("enabled", True)),
+        "recorded_by": str(payload.get("recorded_by", "quark")),
+    }
+
+
+def _remote_testing_token_args(payload: dict[str, Any]) -> dict[str, Any]:
+    mutation_scope = payload.get("mutation_scope", {})
+    if isinstance(mutation_scope, str):
+        mutation_scope = json.loads(mutation_scope) if mutation_scope.strip() else {}
+    if not isinstance(mutation_scope, dict):
+        raise ValueError("mutation_scope must be a JSON object")
+    return {
+        "account_id": str(payload.get("account_id", "tank-msi-gateway-test")),
+        "lease_id": str(payload["lease_id"]) if payload.get("lease_id") else None,
+        "job_id": str(payload["job_id"]) if payload.get("job_id") else None,
+        "project": str(payload.get("project", "Overseer")),
+        "thread_id": str(payload["thread_id"]) if payload.get("thread_id") else None,
+        "service_paths": tuple(_list_payload(payload.get("service_paths"), ["/Overseer"])),
+        "gateway_origins": tuple(_list_payload(payload.get("gateway_origins"), ["https://roadex.home.arpa:9443"])),
+        "allowed_methods": tuple(_list_payload(payload.get("allowed_methods"), ["GET", "HEAD", "OPTIONS"])),
+        "allowed_routes": tuple(_list_payload(payload.get("allowed_routes"), ["*"])),
+        "ttl_minutes": int(payload.get("ttl_minutes", 30)),
+        "mutates": bool(payload.get("mutates", False)),
+        "mutation_scope": mutation_scope,
+        "issued_by": str(payload.get("issued_by", "quark")),
+    }
+
+
+def _remote_testing_revoke_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "token_id": str(payload["token_id"]),
+        "revoked_by": str(payload.get("revoked_by", "quark")),
+        "reason": str(payload.get("reason", "test complete")),
+    }
+
+
 def _remote_testing_lease_args(payload: dict[str, Any]) -> dict[str, Any]:
     job_types = payload.get("job_types", ["ping"])
     if isinstance(job_types, str):
@@ -1115,6 +1224,7 @@ def _remote_testing_job_args(payload: dict[str, Any]) -> dict[str, Any]:
         "ui_path": str(payload.get("ui_path", "/Overseer/ui")),
         "gateway_path": str(payload.get("gateway_path", "/Overseer")),
         "token_source": str(payload.get("token_source", "state/api-token")),
+        "auth_token_id": str(payload["auth_token_id"]) if payload.get("auth_token_id") else None,
         "mutates": bool(payload.get("mutates", False)),
     }
 

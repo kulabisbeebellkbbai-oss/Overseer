@@ -2196,8 +2196,10 @@ def _load_host_snapshot_for_status(store: SQLiteStore, snapshot_id: str | None) 
 
 
 def _detected_firewall_backend(snapshot: HostInspectionSnapshot | None) -> str:
+    firewalld_available = bool(shutil.which("firewall-cmd"))
+    ufw_available = bool(shutil.which("ufw"))
     if snapshot is None:
-        return "ufw"
+        return "firewalld" if firewalld_available and not ufw_available else "ufw"
     try:
         firewalld_state = snapshot.observation("firewalld-state")
     except KeyError:
@@ -2209,6 +2211,8 @@ def _detected_firewall_backend(snapshot: HostInspectionSnapshot | None) -> str:
     except KeyError:
         active_zones = None
     if active_zones is not None and active_zones.exit_code == 0 and "interfaces:" in active_zones.stdout:
+        return "firewalld"
+    if firewalld_available and not ufw_available:
         return "firewalld"
     return "ufw"
 
@@ -5970,7 +5974,7 @@ def _obrien_package_maintenance_cycle_next_step(
 
 
 def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
-    inspection = inspect_host_status(store_path, collect_firewall_commands=False)
+    inspection = inspect_host_status(store_path, collect_firewall_commands=True)
     try:
         advancement = advance_odo_security_status(store_path, str(inspection["id"]), advanced_at=dispatched_at)
     except ValueError as error:
@@ -6032,9 +6036,13 @@ def advance_odo_security_status(
     advanced_at: str | None = None,
 ) -> dict[str, object]:
     now = advanced_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    selected_snapshot_id = snapshot_id
+    if selected_snapshot_id is None:
+        inspection = inspect_host_status(store_path, collect_firewall_commands=True)
+        selected_snapshot_id = str(inspection["id"])
     remediation = plan_host_security_listener_queue_remediations_status(
         store_path,
-        snapshot_id=snapshot_id,
+        snapshot_id=selected_snapshot_id,
         requested_by=requested_by,
     )
     advancement = _advance_odo_remediation_plans(store_path, remediation, now)
@@ -6294,6 +6302,25 @@ def _advance_admin_plan_after_dispatch(store_path: str | Path, plan_id: str, adv
         )
         return result
     if state == "ready_for_overseer_execution":
+        store = SQLiteStore(store_path)
+        try:
+            plan = store.load_admin_change_plan(plan_id)
+        finally:
+            store.close()
+        if plan.requires_explicit_approval():
+            result["sisko_message"] = _ensure_sisko_plan_message(
+                store_path,
+                plan_id,
+                subject=f"Execute approved plan {plan_id}",
+                message=(
+                    f"Odo advanced remediation plan {plan_id} through IDS review and approval readiness. "
+                    "Because this plan has an explicit approval gate, execution must remain a separate "
+                    "Sisko or human command decision for the exact recorded commands."
+                ),
+                priority=str(readiness["risk_level"]),
+                created_at=advanced_at,
+            )
+            return result
         result["execution"] = _execute_no_approval_admin_plan(store_path, plan_id, advanced_at)
         return result
     return result
@@ -6308,6 +6335,7 @@ def _admin_plan_readiness_item(store_path: str | Path, plan_id: str) -> dict[str
 
 
 def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, created_at: str) -> dict[str, object]:
+    _restage_admin_plan_after_ids_revision(store_path, plan_id)
     store = SQLiteStore(store_path)
     try:
         packages = [
@@ -6342,6 +6370,33 @@ def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, cr
     except ValueError as error:
         exported["dispatch_error"] = str(error)
         return exported
+
+
+def _restage_admin_plan_after_ids_revision(store_path: str | Path, plan_id: str) -> dict[str, object] | None:
+    store = SQLiteStore(store_path)
+    try:
+        packages = store.list_host_security_ids_review_packages_for_plan(plan_id)
+        if not any(IDSReviewPackageStatus(package.status) == IDSReviewPackageStatus.REVISION_REQUIRED for package in packages):
+            return None
+        plan = store.load_admin_change_plan(plan_id)
+        if AdminChangeKind(plan.kind) != AdminChangeKind.FIREWALL_DENY_TCP:
+            return None
+        target = str(plan.target)
+        if not target.startswith("tcp/") or not target.removeprefix("tcp/").isdigit():
+            return None
+        snapshot = store.load_latest_host_snapshot()
+        revised_plan, firewall_backend = _plan_firewall_deny_tcp_for_snapshot(
+            snapshot,
+            plan.id,
+            int(target.removeprefix("tcp/")),
+            plan.reason,
+            plan.current_state,
+        )
+        revised_plan = replace(revised_plan, approved=False, approved_by=None, approved_at=None)
+        store.save_admin_change_plan(revised_plan)
+        return {"plan_id": plan_id, "firewall_backend": firewall_backend}
+    finally:
+        store.close()
 
 
 def _ensure_sisko_plan_message(

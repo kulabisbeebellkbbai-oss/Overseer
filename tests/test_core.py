@@ -6252,6 +6252,247 @@ class HostInspectionTests(unittest.TestCase):
         self.assertIn("--add-rich-rule=", plan.steps[0].command[4])
         self.assertEqual(plan.steps[1].command, ("sudo", "firewall-cmd", "--reload"))
 
+    def test_host_security_remediation_uses_firewalld_when_probe_times_out_and_ufw_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command, timeout_seconds):
+                stdout = "ok"
+                stderr = ""
+                exit_code = 0
+                if tuple(command) == ("hostname",):
+                    stdout = "host-firewalld"
+                elif tuple(command) == ("ss", "-ltnp"):
+                    stdout = "LISTEN 0 128 0.0.0.0:9443 0.0.0.0:*"
+                elif tuple(command) in {
+                    ("firewall-cmd", "--state"),
+                    ("firewall-cmd", "--get-active-zones"),
+                    ("firewall-cmd", "--zone=public", "--list-all"),
+                }:
+                    stdout = ""
+                    stderr = "command timed out after 5.0 seconds"
+                    exit_code = 124
+                return HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+            snapshot = HostInspectionAdapter(
+                command_runner=runner,
+                file_reader=lambda path: "ID=debian\n",
+            ).inspect("2026-07-18T16:05:00+00:00")
+            store = SQLiteStore(store_path)
+            store.save_host_snapshot(snapshot)
+            store.close()
+
+            def fake_which(command):
+                if command == "firewall-cmd":
+                    return "/usr/bin/firewall-cmd"
+                if command == "ufw":
+                    return None
+                return None
+
+            with patch("overseer.cli.shutil.which", side_effect=fake_which):
+                status = plan_host_security_remediation_status(store_path, "0.0.0.0:9443")
+            loaded = SQLiteStore(store_path)
+            plan = loaded.load_admin_change_plan("admin.host-security.deny-tcp.9443")
+            loaded.close()
+
+        self.assertEqual(status["firewall_backend"], "firewalld")
+        self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
+
+    def test_odo_advance_collects_firewall_backend_before_ids_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command, timeout_seconds):
+                stdout = "ok"
+                if tuple(command) == ("hostname",):
+                    stdout = "host-firewalld"
+                elif tuple(command) == ("ss", "-ltnp"):
+                    stdout = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                elif tuple(command) == ("firewall-cmd", "--state"):
+                    stdout = "running"
+                elif tuple(command) == ("firewall-cmd", "--get-active-zones"):
+                    stdout = "public\n  interfaces: enp3s0"
+                return HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=stdout,
+                )
+
+            class FirewalldInspectionAdapter:
+                def __init__(self, collect_firewall_commands=True, **kwargs):
+                    self.collect_firewall_commands = collect_firewall_commands
+
+                def inspect(self, captured_at=None):
+                    return HostInspectionAdapter(
+                        command_runner=runner,
+                        file_reader=lambda path: "ID=debian\n",
+                        collect_firewall_commands=self.collect_firewall_commands,
+                    ).inspect(captured_at or "2026-07-18T16:05:00+00:00")
+
+            def fake_dispatch(store_path_arg, package_id, **kwargs):
+                store = SQLiteStore(store_path_arg)
+                try:
+                    package = store.load_host_security_ids_review_package(package_id)
+                    return overseer_cli.host_security_ids_review_package_status(package)
+                finally:
+                    store.close()
+
+            with patch("overseer.cli.HostInspectionAdapter", FirewalldInspectionAdapter):
+                with patch("overseer.cli.dispatch_host_security_ids_review_package_status", side_effect=fake_dispatch):
+                    status = overseer_cli.advance_odo_security_status(store_path)
+
+            loaded = SQLiteStore(store_path)
+            plan = loaded.load_admin_change_plan("admin.host-security.deny-tcp.22")
+            package = loaded.load_host_security_ids_review_package("ids-review.admin.host-security.deny-tcp.22")
+            loaded.close()
+
+        self.assertEqual(status["remediation"]["firewall_backend"], "firewalld")
+        self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
+        self.assertIn("firewall-cmd", package.firewall_rule_drafts[0])
+        self.assertNotIn("ufw", package.prompt)
+
+    def test_odo_advance_restages_revision_required_firewall_plan_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command, timeout_seconds):
+                stdout = "ok"
+                if tuple(command) == ("hostname",):
+                    stdout = "host-firewalld"
+                elif tuple(command) == ("ss", "-ltnp"):
+                    stdout = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                elif tuple(command) == ("firewall-cmd", "--state"):
+                    stdout = "running"
+                elif tuple(command) == ("firewall-cmd", "--get-active-zones"):
+                    stdout = "public\n  interfaces: enp3s0"
+                return HostCommandObservation(
+                    name=command[0],
+                    command=tuple(command),
+                    exit_code=0,
+                    stdout=stdout,
+                )
+
+            class FirewalldInspectionAdapter:
+                def __init__(self, collect_firewall_commands=True, **kwargs):
+                    self.collect_firewall_commands = collect_firewall_commands
+
+                def inspect(self, captured_at=None):
+                    return HostInspectionAdapter(
+                        command_runner=runner,
+                        file_reader=lambda path: "ID=debian\n",
+                        collect_firewall_commands=self.collect_firewall_commands,
+                    ).inspect(captured_at or "2026-07-18T16:05:00+00:00")
+
+            stale = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.host-security.deny-tcp.22",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/22",
+                "stage approval-gated firewall deny for exposed listener queue tcp/22; requested_by=odo",
+                "listener exposed",
+                port=22,
+            )
+            package = overseer_cli.prepare_host_security_ids_review_package_status(store_path, stale["id"])
+            overseer_cli.submit_host_security_ids_review_package_status(store_path, package["id"], "odo")
+            loaded = SQLiteStore(store_path)
+            loaded.save_admin_change_plan(
+                replace(
+                    loaded.load_admin_change_plan("admin.host-security.deny-tcp.22"),
+                    approved=True,
+                    approved_by="human",
+                    approved_at="2026-07-18T16:06:00+00:00",
+                )
+            )
+            loaded.close()
+            overseer_cli.record_host_security_ids_review_result_status(
+                store_path,
+                package["id"],
+                "revision_required",
+                "replace UFW draft with firewalld draft",
+                "intrusion-detection-advisor",
+            )
+
+            def fake_dispatch(store_path_arg, package_id, **kwargs):
+                store = SQLiteStore(store_path_arg)
+                try:
+                    package = store.load_host_security_ids_review_package(package_id)
+                    return overseer_cli.host_security_ids_review_package_status(package)
+                finally:
+                    store.close()
+
+            with patch("overseer.cli.HostInspectionAdapter", FirewalldInspectionAdapter):
+                with patch("overseer.cli.dispatch_host_security_ids_review_package_status", side_effect=fake_dispatch):
+                    status = overseer_cli.advance_odo_security_status(store_path)
+
+            loaded = SQLiteStore(store_path)
+            plan = loaded.load_admin_change_plan("admin.host-security.deny-tcp.22")
+            package = loaded.load_host_security_ids_review_package("ids-review.admin.host-security.deny-tcp.22")
+            loaded.close()
+
+        self.assertEqual(status["remediation"]["firewall_backend"], "firewalld")
+        self.assertFalse(plan.approved)
+        self.assertIsNone(plan.approved_by)
+        self.assertIsNone(plan.approved_at)
+        self.assertEqual(plan.steps[0].command[0:3], ("sudo", "firewall-cmd", "--permanent"))
+        self.assertIn("firewall-cmd", package.firewall_rule_drafts[0])
+        self.assertNotIn("ufw", package.prompt)
+
+    def test_odo_advance_does_not_auto_execute_explicit_firewall_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan = overseer_cli.plan_admin_change_status(
+                store_path,
+                "admin.host-security.deny-tcp.22",
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "tcp/22",
+                "stage approval-gated firewall deny for exposed listener queue tcp/22; requested_by=odo",
+                "listener exposed",
+                port=22,
+                use_firewalld=True,
+            )
+            package = overseer_cli.prepare_host_security_ids_review_package_status(store_path, plan["id"])
+            overseer_cli.submit_host_security_ids_review_package_status(store_path, package["id"], "odo")
+            overseer_cli.record_host_security_ids_review_result_status(
+                store_path,
+                package["id"],
+                "accepted",
+                "accepted firewalld review",
+                "intrusion-detection-advisor",
+            )
+            enablement = overseer_cli.request_admin_adapter_enablement_status(
+                store_path,
+                AdminChangeKind.FIREWALL_DENY_TCP.value,
+                "odo",
+            )
+            overseer_cli.approve_admin_adapter_enablement_status(store_path, enablement["approval_id"], "human")
+            loaded = SQLiteStore(store_path)
+            loaded.save_admin_change_plan(
+                replace(
+                    loaded.load_admin_change_plan("admin.host-security.deny-tcp.22"),
+                    approved=True,
+                    approved_by="human",
+                    approved_at="2026-07-18T16:06:00+00:00",
+                )
+            )
+            loaded.close()
+
+            status = overseer_cli._advance_admin_plan_after_dispatch(
+                store_path,
+                "admin.host-security.deny-tcp.22",
+                "2026-07-18T16:07:00+00:00",
+            )
+
+        self.assertEqual(status["readiness_state"], "ready_for_overseer_execution")
+        self.assertIn("sisko_message", status)
+        self.assertNotIn("execution", status)
+
     def test_runtime_status_reports_latest_host_security_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

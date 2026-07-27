@@ -750,7 +750,7 @@ def plan_firewall_allow_tcp(plan_id: str, port: int, reason: str, current_state:
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
-        owner_domain=OwnerDomain.ODO,
+        owner_domain=OwnerDomain.ODO_FIREWALL,
         risk_level=RiskLevel.CRITICAL,
         approval_level=ApprovalLevel.HUMAN,
         target=f"tcp/{port}",
@@ -788,7 +788,7 @@ def plan_firewall_deny_tcp(plan_id: str, port: int, reason: str, current_state: 
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.FIREWALL_DENY_TCP,
-        owner_domain=OwnerDomain.ODO,
+        owner_domain=OwnerDomain.ODO_FIREWALL,
         risk_level=RiskLevel.CRITICAL,
         approval_level=ApprovalLevel.HUMAN,
         target=f"tcp/{port}",
@@ -842,7 +842,7 @@ def plan_firewalld_deny_tcp(
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.FIREWALL_DENY_TCP,
-        owner_domain=OwnerDomain.ODO,
+        owner_domain=OwnerDomain.ODO_FIREWALL,
         risk_level=RiskLevel.CRITICAL,
         approval_level=ApprovalLevel.HUMAN,
         target=f"tcp/{port}",
@@ -895,7 +895,7 @@ def plan_block_ip(plan_id: str, address: str, reason: str, current_state: str = 
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.BLOCK_IP,
-        owner_domain=OwnerDomain.ODO,
+        owner_domain=OwnerDomain.ODO_FIREWALL,
         risk_level=RiskLevel.HIGH,
         approval_level=ApprovalLevel.HUMAN,
         target=address,

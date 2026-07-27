@@ -363,6 +363,33 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .decision-card .list {
       margin: 10px 0;
     }
+    .decision-card details {
+      margin: 10px 0;
+      padding: 10px;
+      border: 1px solid rgba(185, 166, 255, 0.18);
+      background: rgba(7, 6, 14, 0.46);
+    }
+    .decision-card summary {
+      cursor: pointer;
+      color: var(--lcars-peach);
+      font-weight: 800;
+    }
+    .review-brief {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .review-brief .row {
+      display: grid;
+      grid-template-columns: minmax(120px, 0.34fr) minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+    }
+    .decision-card .action-btn[disabled] {
+      cursor: not-allowed;
+      opacity: 0.62;
+      filter: grayscale(0.35);
+    }
     .form-grid {
       display: grid;
       grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -971,6 +998,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "record-maintenance-schedule") return await recordMaintenanceSchedule();
       if (action === "plan-admin-change") return await planAdminChange();
       if (action === "approve-admin-change") return await approveAdminChange();
+      if (action === "approve-and-execute-admin-change") return await approveAndExecuteAdminChange();
       if (action === "cancel-admin-change") return await cancelAdminChange();
       if (action === "execute-admin-change") return await executeAdminChange();
       if (action === "request-admin-adapter-enablement") return await requestAdminAdapterEnablement();
@@ -990,6 +1018,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "execute-journal-access-request") return await executeJournalAccessRequest();
       if (action === "capture-metric-history") return await captureMetricHistory();
       if (action === "inspect-host") return await postJson("/host/inspect", {});
+      if (action === "advance-odo-security") return await postJson("/host/security/advance", {requested_by: "odo"});
       if (action === "plan-listener-queue-remediations") return await postJson("/host/security/listener-review-queue/remediation-plans", {requested_by: "odo"});
       if (action === "plan-host-security-remediation") return await planHostSecurityRemediation();
       if (action === "record-source-review") return await recordSourceReview();
@@ -1378,6 +1407,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         approved_by: value("admin-approved-by")
       });
     }
+    async function approveAndExecuteAdminChange() {
+      const approval = await approveAdminChange();
+      try {
+        return {
+          status: "approved_and_execution_requested",
+          approval,
+          execution: await executeAdminChange()
+        };
+      } catch (error) {
+        return {
+          status: "approved_execution_blocked",
+          approval,
+          execution_error: error.message
+        };
+      }
+    }
     async function cancelAdminChange() {
       return await postJson("/admin/cancel", {
         plan_id: value("admin-cancel-plan-id"),
@@ -1689,7 +1734,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function stageFirewallPolicyEnforcement() {
       const payload = {
         rule_index: Number(value("firewall-rule-index") || 0),
-        requested_by: value("firewall-requested-by") || "odo",
+        requested_by: value("firewall-requested-by") || "odo_firewall",
         reason: value("firewall-enforcement-reason") || undefined
       };
       const planId = value("firewall-plan-id");
@@ -1699,7 +1744,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function executeFirewallChange() {
       return await postJson("/host/security/firewall-executions/execute", {
         plan_id: value("firewall-execute-plan-id"),
-        executed_by: value("firewall-execute-by") || "odo",
+        executed_by: value("firewall-execute-by") || "odo_firewall",
         mode: value("firewall-execute-mode") || "local_fixture"
       });
     }
@@ -1715,7 +1760,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function prepareIdsReviewPackage() {
       const payload = {
         plan_id: value("ids-plan-id"),
-        requested_by: value("ids-requested-by") || "odo"
+        requested_by: value("ids-requested-by") || "odo_ids"
       };
       const packageId = value("ids-package-id");
       const sourceReviewId = value("ids-source-review-id");
@@ -1731,7 +1776,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     async function dispatchIdsReviewPackage() {
       const payload = {
         package_id: value("ids-dispatch-package-id"),
-        dispatched_by: value("ids-dispatched-by") || "odo"
+        dispatched_by: value("ids-dispatched-by") || "odo_ids"
       };
       const ownerThread = value("ids-owner-thread");
       if (ownerThread) payload.owner_thread = ownerThread;
@@ -1742,7 +1787,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         package_id: value("ids-result-package-id"),
         status: value("ids-result-status"),
         advisory_result: value("ids-advisory-result"),
-        reviewed_by: value("ids-reviewed-by") || "odo"
+        reviewed_by: value("ids-reviewed-by") || "odo_ids"
       });
     }
     function render() {
@@ -1796,6 +1841,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${crew("Kira", focus.kira)}
           ${crew("O'Brien", focus.obrien)}
           ${crew("Odo", focus.odo)}
+          ${crew("Odo IDS", focus.odo_ids)}
+          ${crew("Odo Firewall", focus.odo_firewall)}
           ${crew("Quark", focus.quark)}
           ${crew("Dax", focus.dax)}
           ${crew("Julian", focus.julian)}
@@ -2334,14 +2381,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const identityEvidence = state.data.identityEvidence || {};
       const identityRotationRequests = state.data.identityRotationRequests || {};
       const operations = state.data.operations || {};
+      const auth = state.data.authorizations || {};
+      const readiness = state.data.readiness || {};
       document.getElementById("security").innerHTML = `
         <div class="grid">
           ${stationIntro("Odo", "Security Board", "Host inspection, source review, and protective action staging.", ["listeners", "source review", "IDS package"])}
-          <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button><button class="action-btn" data-action="plan-listener-queue-remediations">Plan Listener Queue</button></div></div>
+          <div class="section-head"><h3>Security Actions</h3><div class="actions"><button class="action-btn" data-action="inspect-host">Inspect Host</button><button class="action-btn" data-action="advance-odo-security">Advance Odo Review</button><button class="action-btn" data-action="plan-listener-queue-remediations">Plan Listener Queue</button></div></div>
           ${metric("Alerts", security.alerts, "security", "span-3", security.alerts ? "bad" : "good", "audit")}
           ${metric("High", host.high_findings, "findings", "span-3", host.high_findings ? "bad" : "good", "security")}
           ${metric("Warning", host.warning_findings, "findings", "span-3", host.warning_findings ? "warn" : "good", "security")}
           ${metric("Plans", (security.protective_plans || {}).total, "protective", "span-3", "", "admin")}
+          ${authorizationDecisionBoard(auth, readiness)}
           <div class="panel span-6">
             <div class="toolbar"><h3>Plan Remediation</h3><button class="action-btn" data-action="plan-host-security-remediation">Plan</button></div>
             <div class="form-grid">
@@ -2378,7 +2428,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <div class="form-grid">
               <div class="field span-3"><label for="firewall-rule-index">Rule Index</label><input id="firewall-rule-index" type="number" min="0" value="0"></div>
               <div class="field span-5"><label for="firewall-plan-id">Plan ID</label><input id="firewall-plan-id"></div>
-              <div class="field span-4"><label for="firewall-requested-by">Requested By</label><input id="firewall-requested-by" value="odo"></div>
+              <div class="field span-4"><label for="firewall-requested-by">Requested By</label><input id="firewall-requested-by" value="odo_firewall"></div>
               <div class="field span-12"><label for="firewall-enforcement-reason">Reason</label><input id="firewall-enforcement-reason" value="stage desired firewall policy enforcement for IDS review"></div>
             </div>
           </div>
@@ -2386,7 +2436,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <div class="toolbar"><h3>Execute Firewall Fixture</h3><button class="action-btn" data-action="execute-firewall-change">Execute Fixture</button></div>
             <div class="form-grid">
               <div class="field span-5"><label for="firewall-execute-plan-id">Plan ID</label><input id="firewall-execute-plan-id" value="admin.host-security.firewall"></div>
-              <div class="field span-3"><label for="firewall-execute-by">Executed By</label><input id="firewall-execute-by" value="odo"></div>
+              <div class="field span-3"><label for="firewall-execute-by">Executed By</label><input id="firewall-execute-by" value="odo_firewall"></div>
               <div class="field span-4"><label for="firewall-execute-mode">Mode</label><select id="firewall-execute-mode"><option value="local_fixture">local_fixture</option><option value="live">live</option></select></div>
             </div>
           </div>
@@ -2401,19 +2451,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>IDS Review</h3><div class="actions"><button class="action-btn" data-action="prepare-ids-review-package">Prepare</button><button class="action-btn" data-action="export-ids-review-prompt">Export</button><button class="action-btn" data-action="dispatch-ids-review-package">Dispatch</button><button class="action-btn" data-action="record-ids-review-result">Record</button></div></div>
+            <div class="toolbar"><h3>IDS Review Manual Override</h3><div class="actions"><button class="action-btn" data-action="prepare-ids-review-package">Prepare</button><button class="action-btn" data-action="export-ids-review-prompt">Export</button><button class="action-btn" data-action="dispatch-ids-review-package">Dispatch</button><button class="action-btn" data-action="record-ids-review-result">Record</button></div></div>
             <div class="form-grid">
               <div class="field span-4"><label for="ids-plan-id">Plan ID</label><input id="ids-plan-id"></div>
               <div class="field span-4"><label for="ids-package-id">Package ID</label><input id="ids-package-id"></div>
               <div class="field span-4"><label for="ids-source-review-id">Source Review</label><input id="ids-source-review-id"></div>
-              <div class="field span-3"><label for="ids-requested-by">Requested By</label><input id="ids-requested-by" value="odo"></div>
+              <div class="field span-3"><label for="ids-requested-by">Requested By</label><input id="ids-requested-by" value="odo_ids"></div>
               <div class="field span-3"><label for="ids-export-package-id">Export Package</label><input id="ids-export-package-id"></div>
               <div class="field span-3"><label for="ids-dispatch-package-id">Dispatch Package</label><input id="ids-dispatch-package-id"></div>
-              <div class="field span-3"><label for="ids-dispatched-by">Dispatched By</label><input id="ids-dispatched-by" value="odo"></div>
+              <div class="field span-3"><label for="ids-dispatched-by">Dispatched By</label><input id="ids-dispatched-by" value="odo_ids"></div>
               <div class="field span-4"><label for="ids-owner-thread">Owner Thread</label><input id="ids-owner-thread"></div>
               <div class="field span-4"><label for="ids-result-package-id">Result Package</label><input id="ids-result-package-id"></div>
               <div class="field span-4"><label for="ids-result-status">Result Status</label><select id="ids-result-status">${idsReviewStatusOptions()}</select></div>
-              <div class="field span-4"><label for="ids-reviewed-by">Reviewed By</label><input id="ids-reviewed-by" value="odo"></div>
+              <div class="field span-4"><label for="ids-reviewed-by">Reviewed By</label><input id="ids-reviewed-by" value="odo_ids"></div>
               <div class="field span-8"><label for="ids-advisory-result">Advisory Result</label><input id="ids-advisory-result" value="accepted staged package"></div>
             </div>
           </div>
@@ -2434,7 +2484,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-12">${table("Rotation Reminders", identityEvidence.rotation_reminders || [], ["area", "items", "next_step"], {fills: {area: (row) => identityRotationFill(row)}, fillView: "security"})}</div>
           <div class="panel span-12">${table("Identity Rotation Requests", identityRotationRequests.requests || identityEvidence.rotation_requests || [], ["id", "subject_type", "subject", "urgency", "status", "approval_required", "next_step"], {fills: {subject: (row) => identityRotationFill(row), id: (row) => identityRotationFill(row)}, fillView: "security"})}</div>
           <div class="panel span-12">${table("Network Gateway Analysis", [operations.network || {}], ["interfaces", "routes", "dns_servers", "listener_rows", "gateway_routes", "next_step"])}</div>
+          <div class="section-head"><h3>Odo Security Team</h3><div class="actions"><span class="pill">reports to Odo</span></div></div>
           ${officerPanel("odo", "Security investigation", "Investigate traffic, exposed listeners, intrusion signals, or protective actions.")}
+          ${officerPanel("odo_ids", "IDS advisory review", "Review IDS/firewall advisory packages, return accepted or revision results, and report blockers to Odo.")}
+          ${officerPanel("odo_firewall", "Firewall management", "Stage firewall remediation plans, prepare rollback and verification evidence, and hand IDS review work to Odo IDS.")}
         </div>`;
     }
     function renderHealth() {
@@ -2543,7 +2596,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return ["service", "virtual_asset", "physical_asset", "usage_limited_service", "maintenance_target", "security_surface", "composite"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function ownerOptions() {
-      return ["julian", "dax", "kira", "obrien", "odo", "quark", "sisko", "ezri"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["julian", "dax", "kira", "obrien", "odo", "odo_ids", "odo_firewall", "quark", "sisko", "ezri"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function riskOptions() {
       return ["low", "medium", "high", "critical"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
@@ -2865,17 +2918,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Approve claim cleanup", page: "Claims", owner: "Sisko / Dax", action: "approve-claim-cleanup", source, query: "Approve claim cleanup"},
         {workflow: "Execute approved claim cleanup", page: "Claims", owner: "Dax", action: "execute-claim-cleanup", source, query: "Execute approved claim cleanup"},
         {workflow: "Inspect host security posture", page: "Security", owner: "Odo", action: "inspect-host", source, query: "Inspect host security posture"},
+        {workflow: "Advance Odo security review to approval or execution", page: "Security", owner: "Odo", action: "advance-odo-security", source, query: "Advance Odo security review to approval or execution"},
         {workflow: "Stage listener remediation plans", page: "Security", owner: "Odo", action: "plan-listener-queue-remediations", source, query: "Stage listener remediation plans"},
         {workflow: "Plan one listener remediation", page: "Security", owner: "Odo", action: "plan-host-security-remediation", source, query: "Plan one listener remediation"},
         {workflow: "Review a remote source", page: "Security", owner: "Odo", action: "record-source-review", source, query: "Review a remote source"},
         {workflow: "Plan a source block", page: "Security", owner: "Odo", action: "plan-source-block", source, query: "Plan a source block"},
-        {workflow: "Stage firewall policy enforcement", page: "Security", owner: "Odo", action: "stage-firewall-policy-enforcement", source, query: "Stage firewall policy enforcement"},
-        {workflow: "Execute approved firewall fixture", page: "Security", owner: "Odo", action: "execute-firewall-change", source, query: "Execute approved firewall fixture"},
+        {workflow: "Stage firewall policy enforcement", page: "Security", owner: "Odo Firewall", action: "stage-firewall-policy-enforcement", source, query: "Stage firewall policy enforcement"},
+        {workflow: "Execute approved firewall fixture", page: "Security", owner: "Odo Firewall", action: "execute-firewall-change", source, query: "Execute approved firewall fixture"},
         {workflow: "Stage identity rotation request", page: "Security", owner: "Odo", action: "stage-identity-rotation-request", source, query: "Stage identity rotation request"},
-        {workflow: "Prepare an IDS review package", page: "Security", owner: "Odo", action: "prepare-ids-review-package", source, query: "Prepare an IDS review package"},
-        {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
-        {workflow: "Dispatch an IDS review package", page: "Security", owner: "Odo", action: "dispatch-ids-review-package", source, query: "Dispatch an IDS review package"},
-        {workflow: "Record an IDS review result", page: "Security", owner: "Odo", action: "record-ids-review-result", source, query: "Record an IDS review result"},
+        {workflow: "Prepare an IDS review package", page: "Security", owner: "Odo IDS", action: "prepare-ids-review-package", source, query: "Prepare an IDS review package"},
+        {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo IDS", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
+        {workflow: "Dispatch an IDS review package", page: "Security", owner: "Odo IDS", action: "dispatch-ids-review-package", source, query: "Dispatch an IDS review package"},
+        {workflow: "Record an IDS review result", page: "Security", owner: "Odo IDS", action: "record-ids-review-result", source, query: "Record an IDS review result"},
         {workflow: "View logs from an unhealthy service", page: "Health", owner: "Julian", action: "run-health-probes", source, query: "View logs from an unhealthy service"},
         {workflow: "Stage system journal access request", page: "Health", owner: "Julian", action: "stage-journal-access-request", source, query: "Stage system journal access request"},
         {workflow: "Execute approved system journal capture", page: "Health", owner: "Julian", action: "execute-journal-access-request", source, query: "Execute approved system journal capture"},
@@ -2952,9 +3006,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         ...fields,
         "admin-cancel-reason": `changes requested before approval: ${plan.next_step || readiness.next_step || plan.reason || ""}`
       };
+      const reviewId = `review-${slug(planId || plan.kind || "admin-plan")}`;
+      const brief = plan.review_brief || {};
       return `<div class="panel span-6 decision-card ${normalizeTone(stateTone(plan.risk_level))}">
         <div class="toolbar"><h3>${safe(plan.kind || "Admin Plan")}</h3><span class="pill ${stateTone(plan.risk_level)}">${safe(plan.approval_level || "approval")}</span></div>
-        ${kv("Decision Context", {
+        ${decisionContext("Decision Context", {
           plan_id: planId,
           owner: plan.owner_domain,
           target: plan.target,
@@ -2963,13 +3019,43 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           readiness: readiness.readiness_state,
           ids_review: plan.ids_review_gate_satisfied ? "satisfied" : "required",
           next_step: plan.next_step || readiness.next_step
-        })}
+        }, reviewId)}
+        ${reviewBriefMarkup(reviewId, brief)}
         <div class="actions">
           ${fillButton("Review Source", fields, "admin")}
-          ${fillButton("Approve", fields, "admin", "approve-admin-change")}
+          ${plan.ids_review_gate_satisfied === false ? `<button type="button" class="action-btn" disabled>Waiting On IDS</button>` : fillButton("Approve & Implement", fields, "admin", "approve-and-execute-admin-change")}
           ${fillButton("Request Changes", requestChange, "admin", "cancel-admin-change")}
         </div>
       </div>`;
+    }
+    function decisionContext(titleText, value, reviewId) {
+      const rows = Object.entries(value || {}).slice(0, 12).map(([key, val]) => {
+        const body = key === "plan_id" && val
+          ? `<a class="cell-link" href="#${safe(reviewId)}">${format(val)}</a>`
+          : format(val);
+        return `<div class="row"><span>${safe(labelize(key))}</span><strong>${body}</strong></div>`;
+      }).join("");
+      return `<h3>${safe(titleText)}</h3><div class="list">${rows || "<p class='muted'>No data</p>"}</div>`;
+    }
+    function reviewBriefMarkup(reviewId, brief) {
+      const items = {
+        change: brief.change,
+        remediation: brief.remediation,
+        reasoning: brief.reasoning,
+        approve_effect: brief.approve_effect,
+        deny_effect: brief.deny_effect,
+        service_impact: brief.service_impact,
+        alternatives: brief.alternatives,
+        commands: brief.commands,
+        rollback: brief.rollback,
+        verification: brief.verification,
+        risks: brief.risks
+      };
+      const rows = Object.entries(items)
+        .filter(([, val]) => val !== undefined && val !== null && String(Array.isArray(val) ? val.join(", ") : val).trim())
+        .map(([key, val]) => `<div class="row"><span>${safe(labelize(key))}</span><strong>${format(val)}</strong></div>`)
+        .join("");
+      return `<details id="${safe(reviewId)}"><summary>Plain-English Review</summary><div class="review-brief">${rows || "<p class='muted'>No review brief available.</p>"}</div></details>`;
     }
     function approvalDecisionCard(approval) {
       const fields = approvalFill(approval);
@@ -3362,6 +3448,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         kira: "assets",
         obrien: "admin",
         odo: "security",
+        odo_ids: "security",
+        odo_firewall: "security",
         quark: "usage",
         dax: "claims",
         julian: "health",
@@ -3415,6 +3503,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         kira: "Kira",
         obrien: "O'Brien",
         odo: "Odo",
+        odo_ids: "Odo IDS",
+        odo_firewall: "Odo Firewall",
         quark: "Quark",
         dax: "Dax",
         julian: "Julian",
@@ -3433,6 +3523,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "Kira": "assets",
         "O'Brien": "admin",
         "Odo": "security",
+        "Odo IDS": "security",
+        "Odo Firewall": "security",
         "Quark": "usage",
         "Dax": "claims",
         "Julian": "health",
@@ -3447,6 +3539,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         "Kira / Dax": "Asset control",
         "O'Brien": "Maintenance",
         "Odo": "Security",
+        "Odo IDS": "IDS and advisory review",
+        "Odo Firewall": "Firewall management",
         "Quark": "Service limits",
         "Dax": "Virtual assets",
         "Julian": "Health",
@@ -3507,6 +3601,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         if (char === '"') return "&quot;";
         return "&#39;";
       });
+    }
+    function slug(value) {
+      return String(value ?? "item").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "item";
     }
     function overallClass(value) {
       return stateTone(value) || "warn";

@@ -152,6 +152,7 @@ from .virtual_ops import (
 from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
+ODO_SECURITY_DOMAINS = {OwnerDomain.ODO, OwnerDomain.ODO_IDS, OwnerDomain.ODO_FIREWALL}
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -1071,8 +1072,8 @@ def security_summary_status(store_path: str | Path) -> dict[str, object]:
             plan
             for plan in store.list_admin_change_plans()
             if not plan.archived
-            and (plan.owner_domain == OwnerDomain.ODO
-            or plan.kind in {AdminChangeKind.BLOCK_IP, AdminChangeKind.FIREWALL_ALLOW_TCP}
+            and (plan.owner_domain in ODO_SECURITY_DOMAINS
+            or plan.kind in {AdminChangeKind.BLOCK_IP, AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP}
             )
         ]
         pending = [
@@ -1269,8 +1270,26 @@ def operator_dashboard_status(
                 "pending_protective_authorizations": attention["security_pending_authorizations"],
                 "ids_review_gate_blocked": attention["security_ids_review_gate_blocked"],
                 "ids_review_revision_required": attention["security_ids_review_revision_required"],
-                "open_messages": crew_by_owner["odo"]["open"],
-                "blocked_dispatches": crew_by_owner["odo"]["blocked_dispatches"],
+                "open_messages": crew_by_owner["odo"]["open"] + crew_by_owner["odo_ids"]["open"] + crew_by_owner["odo_firewall"]["open"],
+                "blocked_dispatches": crew_by_owner["odo"]["blocked_dispatches"] + crew_by_owner["odo_ids"]["blocked_dispatches"] + crew_by_owner["odo_firewall"]["blocked_dispatches"],
+                "ids_open_messages": crew_by_owner["odo_ids"]["open"],
+                "firewall_open_messages": crew_by_owner["odo_firewall"]["open"],
+            },
+            "odo_ids": {
+                "submitted_without_result": attention["security_ids_review_submitted_without_result"],
+                "gate_blocked": attention["security_ids_review_gate_blocked"],
+                "revision_required": attention["security_ids_review_revision_required"],
+                "open_messages": crew_by_owner["odo_ids"]["open"],
+                "blocked_dispatches": crew_by_owner["odo_ids"]["blocked_dispatches"],
+                "reports_to": "odo",
+            },
+            "odo_firewall": {
+                "pending_protective_authorizations": attention["security_pending_authorizations"],
+                "protective_plans": security["protective_plans"]["total"],
+                "high_findings": attention["high_security_findings"],
+                "open_messages": crew_by_owner["odo_firewall"]["open"],
+                "blocked_dispatches": crew_by_owner["odo_firewall"]["blocked_dispatches"],
+                "reports_to": "odo",
             },
             "quark": {
                 "limits": usage["limits"],
@@ -1355,7 +1374,7 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
         protective_plans = [
             plan
             for plan in admin_plans
-            if plan.owner_domain == OwnerDomain.ODO
+            if plan.owner_domain in ODO_SECURITY_DOMAINS
             or plan.kind in {AdminChangeKind.BLOCK_IP, AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP}
         ]
         admin_history = _compact_admin_history(admin_plans, admin_executions)
@@ -1438,8 +1457,26 @@ def operator_dashboard_compact_status(store_path: str | Path, service_name: str 
                 "pending_protective_authorizations": attention["security_pending_authorizations"],
                 "ids_review_gate_blocked": attention["security_ids_review_gate_blocked"],
                 "ids_review_revision_required": attention["security_ids_review_revision_required"],
-                "open_messages": crew_by_owner["odo"]["open"],
-                "blocked_dispatches": crew_by_owner["odo"]["blocked_dispatches"],
+                "open_messages": crew_by_owner["odo"]["open"] + crew_by_owner["odo_ids"]["open"] + crew_by_owner["odo_firewall"]["open"],
+                "blocked_dispatches": crew_by_owner["odo"]["blocked_dispatches"] + crew_by_owner["odo_ids"]["blocked_dispatches"] + crew_by_owner["odo_firewall"]["blocked_dispatches"],
+                "ids_open_messages": crew_by_owner["odo_ids"]["open"],
+                "firewall_open_messages": crew_by_owner["odo_firewall"]["open"],
+            },
+            "odo_ids": {
+                "submitted_without_result": attention["security_ids_review_submitted_without_result"],
+                "gate_blocked": attention["security_ids_review_gate_blocked"],
+                "revision_required": attention["security_ids_review_revision_required"],
+                "open_messages": crew_by_owner["odo_ids"]["open"],
+                "blocked_dispatches": crew_by_owner["odo_ids"]["blocked_dispatches"],
+                "reports_to": "odo",
+            },
+            "odo_firewall": {
+                "pending_protective_authorizations": attention["security_pending_authorizations"],
+                "protective_plans": len(protective_plans),
+                "high_findings": attention["high_security_findings"],
+                "open_messages": crew_by_owner["odo_firewall"]["open"],
+                "blocked_dispatches": crew_by_owner["odo_firewall"]["blocked_dispatches"],
+                "reports_to": "odo",
             },
             "quark": {
                 "limits": len(usage_limits),
@@ -2034,7 +2071,7 @@ def host_security_listener_review_queue_status(store_path: str | Path, snapshot_
         plans_by_target = {
             plan.target: plan
             for plan in store.list_admin_change_plans()
-            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived and not plan.canceled
+            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain in ODO_SECURITY_DOMAINS and not plan.archived and not plan.canceled
             and plan.id not in revision_required_plan_ids
         }
     finally:
@@ -2258,7 +2295,7 @@ def plan_host_security_listener_queue_remediations_status(
         existing_targets = {
             plan.target
             for plan in store.list_admin_change_plans()
-            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain == OwnerDomain.ODO and not plan.archived and not plan.canceled
+            if plan.kind == AdminChangeKind.FIREWALL_DENY_TCP and plan.owner_domain in ODO_SECURITY_DOMAINS and not plan.archived and not plan.canceled
             and plan.id not in revision_required_plan_ids
         }
         for port, items in sorted(candidates_by_port.items(), key=lambda entry: int(entry[0])):
@@ -3119,7 +3156,7 @@ def _ids_review_audit_event(
     return AuditEvent(
         id=f"audit.ids-review.{package.id}.{action}",
         event_type=event_type,
-        owner_domain=OwnerDomain.ODO,
+        owner_domain=OwnerDomain.ODO_IDS,
         subject_id=package.id,
         summary=f"IDS/firewall review package {action} for admin plan {package.plan_id}",
         risk_level=RiskLevel.CRITICAL,
@@ -5341,6 +5378,7 @@ def authorization_required_status_with_ids_review(
     ids_review_packages: Sequence[HostSecurityIDSReviewPackage] = (),
 ) -> dict[str, object]:
     status = authorization_required_status(plan)
+    status["review_brief"] = admin_plan_review_brief(plan, ids_review_packages)
     if not admin_plan_requires_ids_review(plan):
         status["ids_review_required_before_approval"] = False
         status["ids_review_gate_satisfied"] = True
@@ -5367,6 +5405,96 @@ def authorization_required_status_with_ids_review(
         status["authorization_required"] = False
         status["next_step"] = status["ids_review_next_step"]
     return status
+
+
+def admin_plan_review_brief(
+    plan: AdminChangePlan,
+    ids_review_packages: Sequence[HostSecurityIDSReviewPackage] = (),
+) -> dict[str, object]:
+    kind = AdminChangeKind(plan.kind)
+    command_titles = ", ".join(step.title for step in plan.steps) or "no command steps recorded"
+    rollback_titles = ", ".join(step.title for step in plan.rollback_steps) or "no rollback command recorded"
+    verification_titles = ", ".join(step.title for step in plan.verification_steps) or "no verification command recorded"
+    if kind == AdminChangeKind.FIREWALL_DENY_TCP:
+        change = f"Add a host firewall deny rule for TCP traffic matching {plan.target}."
+        remediation = "Reduce exposure from an unsafe or unexpected listener while preserving the exact plan for audit."
+        impact = "Approval may block clients that still depend on this inbound TCP path after execution."
+        alternatives = (
+            "leave the listener reachable while investigation continues",
+            "bind or stop the service instead of adding a firewall deny rule",
+            "restrict the rule to a narrower source once trusted source evidence is available",
+        )
+    elif kind == AdminChangeKind.FIREWALL_ALLOW_TCP:
+        change = f"Add a host firewall allow rule for TCP traffic matching {plan.target}."
+        remediation = "Expose an approved service path after command, rollback, and verification details are reviewed."
+        impact = "Approval may increase reachable network surface after execution."
+        alternatives = (
+            "keep the service private",
+            "publish only through the protected gateway",
+            "limit access by source network or VPN identity",
+        )
+    elif kind == AdminChangeKind.BLOCK_IP:
+        change = f"Block traffic from source {plan.target}."
+        remediation = "Contain a reviewed source without changing unrelated listener policy."
+        impact = "Approval may interrupt legitimate sessions from that source if the classification is wrong."
+        alternatives = (
+            "monitor without blocking",
+            "block only the affected service path",
+            "request more IDS evidence before deciding",
+        )
+    elif kind in {AdminChangeKind.APT_UPDATE, AdminChangeKind.APT_UPGRADE, AdminChangeKind.APT_INSTALL}:
+        change = f"Run package maintenance for {plan.target}."
+        remediation = "Apply required software maintenance with recorded rollback and verification steps."
+        impact = "Approval may restart or alter managed software depending on package maintainer scripts."
+        alternatives = (
+            "delay until a maintenance window",
+            "apply a narrower package set",
+            "hold the package and record the exception",
+        )
+    elif kind == AdminChangeKind.USER_SERVICE_RESTART:
+        change = f"Restart user service {plan.target}."
+        remediation = "Recover or refresh an unhealthy local service using the recorded command sequence."
+        impact = "Approval may briefly interrupt that service while it restarts."
+        alternatives = (
+            "leave the current service process running",
+            "inspect logs before restart",
+            "stage a broader maintenance plan",
+        )
+    else:
+        change = f"Apply admin change {kind.value} to {plan.target}."
+        remediation = plan.reason or "Apply the staged corrective action."
+        impact = "Approval allows the recorded execution steps to run after all gates pass."
+        alternatives = (
+            "deny this plan and leave current state unchanged",
+            "request a narrower plan",
+            "request more evidence before approving",
+        )
+    packages = [
+        {
+            "id": package.id,
+            "status": IDSReviewPackageStatus(package.status).value,
+            "dispatch_status": package.dispatch_status,
+            "satisfies_pre_execution_review_gate": package.satisfies_pre_execution_review_gate(),
+        }
+        for package in ids_review_packages
+    ]
+    return {
+        "title": f"Review {plan.id}",
+        "change": change,
+        "remediation": remediation,
+        "reasoning": plan.reason,
+        "current_state": plan.current_state,
+        "proposed_state": plan.proposed_state,
+        "approve_effect": "Approves this exact plan for Overseer execution when remaining gates are satisfied.",
+        "deny_effect": "Cancels this exact plan; no host change is made and Odo must stage a revised plan if needed.",
+        "service_impact": impact,
+        "alternatives": list(alternatives),
+        "commands": command_titles,
+        "rollback": rollback_titles,
+        "verification": verification_titles,
+        "risks": list(plan.risks),
+        "ids_review_packages": packages,
+    }
 
 
 def _ids_review_authorization_next_step(ids_review_packages: Sequence[HostSecurityIDSReviewPackage]) -> str:
@@ -5688,6 +5816,8 @@ def _dispatch_crew_message(
         OwnerDomain.KIRA: _dispatch_kira_message,
         OwnerDomain.OBRIEN: _dispatch_obrien_message,
         OwnerDomain.ODO: _dispatch_odo_message,
+        OwnerDomain.ODO_IDS: _dispatch_odo_ids_message,
+        OwnerDomain.ODO_FIREWALL: _dispatch_odo_firewall_message,
         OwnerDomain.QUARK: _dispatch_quark_message,
         OwnerDomain.DAX: _dispatch_dax_message,
         OwnerDomain.JULIAN: _dispatch_julian_message,
@@ -5850,6 +5980,48 @@ def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, d
         "dispatched",
         "Odo inspected host security, staged listener remediation plans, and advanced exact approval or execution gates",
         [inspection, advancement],
+    )
+
+
+def _dispatch_odo_ids_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_plan_id:
+        try:
+            package = _ensure_ids_review_package_for_plan(store_path, message.related_plan_id, dispatched_at)
+            return _crew_dispatch_result(
+                message,
+                "dispatched",
+                f"Odo IDS prepared and dispatched advisory review for {message.related_plan_id}",
+                [package],
+            )
+        except ValueError as error:
+            return _crew_dispatch_result(message, "skipped", str(error), [])
+    summary = host_security_ids_review_summary_status(store_path)
+    return _crew_dispatch_result(
+        message,
+        "dispatched",
+        "Odo IDS reviewed advisory package queue and reported current gate status",
+        [summary],
+    )
+
+
+def _dispatch_odo_firewall_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_plan_id:
+        try:
+            advancement = _advance_admin_plan_after_dispatch(store_path, message.related_plan_id, dispatched_at)
+            return _crew_dispatch_result(
+                message,
+                "dispatched",
+                f"Odo firewall manager advanced plan {message.related_plan_id} to its next gate",
+                [advancement],
+            )
+        except ValueError as error:
+            return _crew_dispatch_result(message, "skipped", str(error), [])
+    advancement = advance_odo_security_status(store_path, requested_by=OwnerDomain.ODO_FIREWALL.value, advanced_at=dispatched_at)
+    return _crew_dispatch_result(
+        message,
+        "dispatched",
+        "Odo firewall manager staged listener remediation and handed advisory work to Odo IDS",
+        [advancement],
     )
 
 
@@ -6046,7 +6218,7 @@ def _advance_odo_remediation_plans(
     try:
         candidate_ids = set(staged_plan_ids)
         for plan in store.list_admin_change_plans():
-            if plan.owner_domain == OwnerDomain.ODO and not plan.canceled and not plan.archived:
+            if plan.owner_domain in ODO_SECURITY_DOMAINS and not plan.canceled and not plan.archived:
                 candidate_ids.add(plan.id)
     finally:
         store.close()
@@ -6160,7 +6332,16 @@ def _ensure_ids_review_package_for_plan(store_path: str | Path, plan_id: str, cr
     except ValueError as error:
         prepared["prompt_export_error"] = str(error)
         return prepared
-    return exported
+    try:
+        return dispatch_host_security_ids_review_package_status(
+            store_path,
+            str(exported["id"]),
+            dispatched_by="odo",
+            dispatched_at=created_at,
+        )
+    except ValueError as error:
+        exported["dispatch_error"] = str(error)
+        return exported
 
 
 def _ensure_sisko_plan_message(

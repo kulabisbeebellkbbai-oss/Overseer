@@ -4466,14 +4466,23 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn('data-action="request-usage-continuation"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="dispatch-usage-continuations"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/host/inspect"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/host/security/advance"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/host/security/remediations/plans"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/host/security/source-reviews"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/host/security/source-reviews/block-plans"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/host/security/ids-review-packages"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/host/security/ids-review-packages/results"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="inspect-host"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="advance-odo-security"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="record-source-review"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="prepare-ids-review-package"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("approve-and-execute-admin-change", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Plain-English Review", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Odo Security Team", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Odo IDS", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Odo Firewall", OPERATOR_CONSOLE_HTML)
+        self.assertIn("odo_ids", OPERATOR_CONSOLE_HTML)
+        self.assertIn("odo_firewall", OPERATOR_CONSOLE_HTML)
         self.assertIn('adminArchivePlan: "/admin/history-archive-plan"', OPERATOR_CONSOLE_HTML)
         self.assertIn('adminArchives: "/admin/history-archives"', OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/admin/history-archive-requests"', OPERATOR_CONSOLE_HTML)
@@ -5922,6 +5931,9 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(block_plan["approval_level"], ApprovalLevel.HUMAN.value)
         self.assertFalse(block_plan["can_execute"])
         self.assertTrue(block_plan["ids_review_required_before_execution"])
+        self.assertIn("review_brief", auth_missing_package["pending"][0])
+        self.assertIn("Block traffic from source", auth_missing_package["pending"][0]["review_brief"]["change"])
+        self.assertIn("deny_effect", auth_missing_package["pending"][0]["review_brief"])
         self.assertEqual(auth_missing_package["pending"][0]["ids_review_next_step"], "prepare IDS/firewall review package before requesting approval")
         self.assertFalse(auth_missing_package["pending"][0]["authorization_required"])
         self.assertEqual(auth_prepared_package["pending"][0]["ids_review_next_step"], "export IDS/firewall review prompt and submit package before approval")
@@ -5954,7 +5966,7 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(ids_review_summary["packages"][0]["next_step"], "IDS/firewall advisory accepted; human approval may proceed")
         self.assertTrue(ids_review_summary["packages"][0]["advisory_result_present"])
         self.assertNotIn("prompt", ids_review_summary["packages"][0])
-        self.assertEqual(ids_review_summary["latest_audit_events"][0]["owner_domain"], OwnerDomain.ODO.value)
+        self.assertEqual(ids_review_summary["latest_audit_events"][0]["owner_domain"], OwnerDomain.ODO_IDS.value)
         self.assertTrue(approved["approved"])
         self.assertEqual(reviews["review_count"], 2)
         self.assertEqual(reviews["ready_for_block_plan"], 1)
@@ -6439,6 +6451,7 @@ class AdminChangePlanTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.risk_level, RiskLevel.CRITICAL)
+        self.assertEqual(plan.owner_domain, OwnerDomain.ODO_FIREWALL)
         self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
         self.assertEqual(plan.steps[0].command, ("sudo", "ufw", "allow", "8443/tcp"))
         self.assertEqual(plan.rollback_steps[0].command, ("sudo", "ufw", "delete", "allow", "8443/tcp"))
@@ -6452,6 +6465,7 @@ class AdminChangePlanTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.kind, AdminChangeKind.FIREWALL_DENY_TCP)
+        self.assertEqual(plan.owner_domain, OwnerDomain.ODO_FIREWALL)
         self.assertEqual(plan.risk_level, RiskLevel.CRITICAL)
         self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
         self.assertEqual(plan.steps[0].command, ("sudo", "ufw", "deny", "22/tcp"))
@@ -8088,6 +8102,74 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(summary["messages"], 1)
             self.assertEqual(summary["items"][0]["id"], "crew.odo.investigate-source")
 
+    def test_dispatches_odo_ids_subordinate_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.ODO_IDS.value,
+                "Review firewall advisory",
+                "Odo directed IDS to review the exact staged firewall package.",
+                RiskLevel.HIGH.value,
+                message_id="crew.odo-ids.review-firewall",
+                related_plan_id="admin.host-security.deny-tcp.22",
+            )
+
+            with patch(
+                "overseer.cli._ensure_ids_review_package_for_plan",
+                return_value={
+                    "id": "ids-review.admin.host-security.deny-tcp.22",
+                    "status": "submitted",
+                    "host_mutation_performed": False,
+                },
+            ) as ensure_package:
+                status = dispatch_crew_messages_status(
+                    store_path,
+                    owner_domain=OwnerDomain.ODO_IDS.value,
+                    dispatched_at="2026-07-27T02:30:00+00:00",
+                )
+            summary = crew_messages_status(store_path, owner_domain=OwnerDomain.ODO_IDS.value)
+
+        self.assertEqual(status["processed"], 1)
+        self.assertEqual(status["acknowledged"], 1)
+        self.assertFalse(status["host_mutation_performed"])
+        ensure_package.assert_called_once()
+        self.assertEqual(summary["by_owner_domain"][OwnerDomain.ODO_IDS.value]["dispatches"], 1)
+
+    def test_dispatches_odo_firewall_subordinate_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.ODO_FIREWALL.value,
+                "Advance firewall plan",
+                "Odo directed firewall management to advance this exact plan.",
+                RiskLevel.HIGH.value,
+                message_id="crew.odo-firewall.advance-plan",
+                related_plan_id="admin.host-security.deny-tcp.22",
+            )
+
+            with patch(
+                "overseer.cli._advance_admin_plan_after_dispatch",
+                return_value={
+                    "plan_id": "admin.host-security.deny-tcp.22",
+                    "readiness_state": "ids_review_blocked",
+                    "host_mutation_performed": False,
+                },
+            ) as advance_plan:
+                status = dispatch_crew_messages_status(
+                    store_path,
+                    owner_domain=OwnerDomain.ODO_FIREWALL.value,
+                    dispatched_at="2026-07-27T02:31:00+00:00",
+                )
+            summary = crew_messages_status(store_path, owner_domain=OwnerDomain.ODO_FIREWALL.value)
+
+        self.assertEqual(status["processed"], 1)
+        self.assertEqual(status["acknowledged"], 1)
+        self.assertFalse(status["host_mutation_performed"])
+        advance_plan.assert_called_once()
+        self.assertEqual(summary["by_owner_domain"][OwnerDomain.ODO_FIREWALL.value]["dispatches"], 1)
+
     def test_records_usage_limit_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -8341,7 +8423,8 @@ class UsageContinuationRequestTests(unittest.TestCase):
         self.assertEqual(staged["readiness_state"], "ids_review_blocked")
         self.assertEqual(ids_packages["package_count"], 1)
         self.assertEqual(ids_packages["packages"][0]["plan_id"], "admin.host-security.deny-tcp.22")
-        self.assertEqual(ids_packages["packages"][0]["status"], "prepared")
+        self.assertEqual(ids_packages["packages"][0]["status"], "submitted")
+        self.assertEqual(ids_packages["packages"][0]["dispatch_status"], "prompt_dispatched")
         self.assertTrue(ids_packages["packages"][0]["prompt_path"])
         self.assertEqual(messages["open"], 1)
         self.assertEqual(messages["items"][0]["related_plan_id"], "admin.host-security.deny-tcp.22")

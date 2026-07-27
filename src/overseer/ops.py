@@ -621,7 +621,12 @@ def _security_drift_rows(latest_snapshot: Any | None, plans: Sequence[Any], audi
     rows = [
         {"check": "host snapshot", "status": "present" if latest_snapshot else "missing", "evidence": latest_snapshot.id if latest_snapshot else "", "next_step": "inspect host security posture"},
         {"check": "firewall preview", "status": "partial" if latest_snapshot else "missing", "evidence": "host inspection observations", "next_step": "add ruleset diff and provenance"},
-        {"check": "protective plans", "status": "present" if any(plan.owner_domain == OwnerDomain.ODO for plan in plans) else "missing", "evidence": "admin plans", "next_step": "stage Odo remediation plans"},
+        {
+            "check": "protective plans",
+            "status": "present" if any(plan.owner_domain in {OwnerDomain.ODO, OwnerDomain.ODO_FIREWALL} for plan in plans) else "missing",
+            "evidence": "admin plans",
+            "next_step": "stage Odo firewall remediation plans",
+        },
         {"check": "security alerts", "status": "present" if any(event.event_type == AuditEventType.ALERT for event in audits) else "quiet", "evidence": "audit events", "next_step": "review incidents"},
     ]
     return rows

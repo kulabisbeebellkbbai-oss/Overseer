@@ -226,25 +226,25 @@ def _ids_review_check(
         return PolicyCheck(
             "admin.ids.review",
             PolicyCheckStatus.WARN,
-            OwnerDomain.ODO,
+            OwnerDomain.ODO_IDS,
             "policy profile does not block firewall-affecting plans on IDS advisory review",
             tuple(package.id for package in ids_review_packages),
         )
     if not admin_plan_requires_ids_review(plan):
-        return PolicyCheck("admin.ids.review", PolicyCheckStatus.PASS, OwnerDomain.ODO, "IDS review is not required")
+        return PolicyCheck("admin.ids.review", PolicyCheckStatus.PASS, OwnerDomain.ODO_IDS, "IDS review is not required")
     accepted = tuple(package for package in ids_review_packages if package.satisfies_pre_execution_review_gate())
     if not accepted:
         return PolicyCheck(
             "admin.ids.review",
             PolicyCheckStatus.BLOCK,
-            OwnerDomain.ODO,
+            OwnerDomain.ODO_IDS,
             "accepted IDS/firewall advisory is required before approval or execution",
             tuple(package.id for package in ids_review_packages),
         )
     return PolicyCheck(
         "admin.ids.review",
         PolicyCheckStatus.PASS,
-        OwnerDomain.ODO,
+        OwnerDomain.ODO_IDS,
         "accepted IDS/firewall advisory is present",
         tuple(package.id for package in accepted),
     )

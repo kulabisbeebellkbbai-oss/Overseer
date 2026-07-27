@@ -12,6 +12,8 @@ class OwnerDomain(StrEnum):
     KIRA = "kira"
     OBRIEN = "obrien"
     ODO = "odo"
+    ODO_IDS = "odo_ids"
+    ODO_FIREWALL = "odo_firewall"
     QUARK = "quark"
     DAX = "dax"
     JULIAN = "julian"

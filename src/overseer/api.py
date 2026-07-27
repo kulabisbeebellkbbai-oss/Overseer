@@ -25,6 +25,7 @@ from .cli import (
     admin_summary_status,
     archive_admin_history_status,
     assess_host_security_status,
+    advance_odo_security_status,
     approve_admin_change_status,
     approve_admin_adapter_enablement_status,
     approve_admin_history_archive_status,
@@ -627,6 +628,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/host/security/listener-review-queue/remediation-plans":
                 self._handle_json(lambda payload: plan_host_security_listener_queue_remediations_status(store_path, **_host_security_listener_queue_remediations_args(payload)))
+                return
+            if path == "/host/security/advance":
+                self._handle_json(lambda payload: advance_odo_security_status(store_path, **_advance_odo_security_args(payload)))
                 return
             if path == "/host/security/source-reviews/block-plans":
                 self._handle_json(lambda payload: plan_host_security_source_block_status(store_path, **_host_security_source_block_args(payload)))
@@ -1612,6 +1616,14 @@ def _host_security_listener_queue_remediations_args(payload: dict[str, Any]) -> 
         "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
         "requested_by": str(payload.get("requested_by", "odo")),
         "plan_prefix": str(payload.get("plan_prefix", "admin.host-security.deny-tcp")),
+    }
+
+
+def _advance_odo_security_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_id": str(payload["snapshot_id"]) if payload.get("snapshot_id") else None,
+        "requested_by": str(payload.get("requested_by", "odo")),
+        "advanced_at": str(payload["advanced_at"]) if payload.get("advanced_at") else None,
     }
 
 

@@ -18,6 +18,7 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
     backup_markers = _backup_markers(root)
     backup_ops = backup_operations_status(root)
     growth_history = storage_growth_history_status(root)
+    risk_alerts = _storage_risk_alert_rows(root)
     return {
         "root": str(root),
         "mounts": mounts,
@@ -35,6 +36,8 @@ def storage_evidence_status(project_root: str | Path | None = None) -> dict[str,
         "backup_provider_standard": backup_ops["provider_standard"],
         "smart_health": _smart_health_rows(),
         "cleanup_candidates": _cleanup_candidates(root),
+        "risk_alerts": risk_alerts,
+        "risk_alert_count": sum(1 for row in risk_alerts if row.get("risk_level") != "ok"),
         "capacity_summary": _capacity_summary(),
         "growth_samples": growth_history["snapshots"],
         "growth_sample_count": growth_history["snapshot_count"],
@@ -139,6 +142,87 @@ def _cleanup_candidates(root: Path) -> list[dict[str, object]]:
         if path.exists():
             candidates.append({"path": relative, "kind": "generated", "status": "review_before_delete"})
     return candidates
+
+
+def _storage_risk_alert_rows(root: Path) -> list[dict[str, object]]:
+    alerts: list[dict[str, object]] = []
+    seen: set[str] = set()
+    search_roots = [root / "state", root / "exports", root / "local-secrets", root / "backups"]
+    for search_root in search_roots:
+        if not search_root.exists():
+            continue
+        for path in sorted(search_root.rglob("*")):
+            if len(alerts) >= 80:
+                break
+            if not path.is_file():
+                continue
+            relative = _relative_or_name(root, path)
+            if relative in seen:
+                continue
+            alert = _storage_risk_alert(root, path)
+            if alert:
+                alerts.append(alert)
+                seen.add(relative)
+    if not alerts:
+        return [
+            {
+                "path": "state/, exports/, local-secrets/, backups/",
+                "kind": "storage_risk_scan",
+                "risk_level": "ok",
+                "status": "no_database_wal_or_export_alerts",
+                "size_bytes": 0,
+                "next_step": "continue periodic storage risk scans",
+            }
+        ]
+    return alerts
+
+
+def _storage_risk_alert(root: Path, path: Path) -> dict[str, object] | None:
+    relative = _relative_or_name(root, path)
+    name = path.name.lower()
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    if name.endswith((".sqlite-wal", ".sqlite3-wal", ".db-wal")) or name in {"wal", "sqlite-wal"} or "-wal" in name:
+        kind = "database_wal"
+        risk_level = "warning"
+        status = "review_checkpoint_and_backup_consistency"
+        next_step = "confirm the owning service can checkpoint safely before backup, cleanup, or restore work"
+    elif name.endswith((".sqlite-shm", ".sqlite3-shm", ".db-shm")) or "-shm" in name:
+        kind = "database_shared_memory"
+        risk_level = "medium"
+        status = "review_database_runtime_state"
+        next_step = "confirm the database owner and avoid copying live sidecar files without a consistent backup plan"
+    elif any(suffix in {".sqlite", ".sqlite3", ".db"} for suffix in suffixes):
+        kind = "local_database"
+        risk_level = "medium"
+        status = "protect_and_include_in_restore_tests"
+        next_step = "ensure backup, retention, and restore-test coverage before cleanup or migration"
+    elif relative.startswith("exports/"):
+        kind = "ignored_export"
+        risk_level = "medium"
+        status = "review_retention_and_sensitivity"
+        next_step = "decide retention, redaction, and backup handling before sharing or cleanup"
+    elif relative.startswith("local-secrets/") and any(token in name for token in ("export", "dump", "backup")):
+        kind = "local_secret_export"
+        risk_level = "warning"
+        status = "verify_secret_handling"
+        next_step = "keep ignored, review retention, and avoid exposing raw export contents"
+    else:
+        return None
+    return {
+        "path": relative,
+        "kind": kind,
+        "risk_level": risk_level,
+        "status": status,
+        "size_bytes": _file_size(path),
+        "next_step": next_step,
+    }
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _smart_health_rows() -> list[dict[str, object]]:

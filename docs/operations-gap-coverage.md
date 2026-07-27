@@ -165,9 +165,9 @@ environment-specific policy wiring:
   failover shells. Only local NAS is the planned first remote target; cloud,
   clone, and failover services are marked future work until testable providers
   exist.
-- storage risk alerts for local databases, WAL files, and ignored exports
-  beyond the current capacity, cleanup, backup marker, and filesystem growth
-  trend panels.
+- encryption status and removable-media trust workflow beyond the current
+  capacity, cleanup, backup marker, filesystem growth trend, and metadata-only
+  storage risk alert panels.
 - VM/container/emulator live adapter depth beyond approved disposable targets:
   approved running-domain consistency/quiesce execution policy, approved
   non-disposable restore/destroy execution policy, and broader host-specific

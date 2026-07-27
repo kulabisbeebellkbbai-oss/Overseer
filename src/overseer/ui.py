@@ -2219,6 +2219,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-12">${table("Backup Cleanup Requests", backupOperations.cleanup_requests || storageEvidence.cleanup_requests || [], ["id", "path", "status", "approval_required", "next_step"], {fills: {path: (row) => backupCleanupFill(row)}, fillView: "assets"})}</div>
           <div class="panel span-6">${table("Storage Cleanup Candidates", storageEvidence.cleanup_candidates || [], ["path", "kind", "status"])}</div>
           <div class="panel span-6">${kv("Capacity Summary", storageEvidence.capacity_summary || {})}</div>
+          <div class="panel span-12">${table("Storage Risk Alerts", storageEvidence.risk_alerts || [], ["path", "kind", "risk_level", "status", "size_bytes", "next_step"])}</div>
           <div class="panel span-12">${table("Filesystem Growth Trends", storageEvidence.growth_trends || [], ["mount", "samples", "latest_use_percent", "daily_growth_bytes", "status", "next_step"])}</div>
           <div class="panel span-12">${table("Storage Growth Samples", storageEvidence.growth_samples || [], ["id", "captured_at", "requested_by", "notes", "next_step"], {limit: 20})}</div>
           <div class="panel span-6">${table("Physical Lifecycle", operations.physical_lifecycle || [], ["stable_id", "kind", "checkout_ready", "power_risk", "storage_risk", "next_step"], {fills: {stable_id: (row) => resourceClaimFill(row.stable_id, "kira")}, fillView: "claims"})}</div>
@@ -2930,6 +2931,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Discover listeners as virtual assets", page: "Assets", owner: "Dax", action: "discover-listeners", source, query: "Discover listeners as virtual assets"},
         {workflow: "Register a managed resource", page: "Assets", owner: "Kira / Dax", action: "register-resource", source, query: "Register a managed resource"},
         {workflow: "Capture filesystem growth snapshot", page: "Assets", owner: "Kira", action: "capture-storage-growth-snapshot", source, query: "Capture filesystem growth snapshot"},
+        {workflow: "Review storage risk alerts", page: "Assets", owner: "Kira", action: "open Assets", source, query: "Review storage risk alerts"},
         {workflow: "Record a backup job", page: "Assets", owner: "Kira", action: "record-backup-job", source, query: "Record a backup job"},
         {workflow: "Review backup provider readiness", page: "Assets", owner: "Kira", action: "open Assets", source, query: "Review Backup Provider Readiness"},
         {workflow: "Record a restore test", page: "Assets", owner: "Kira", action: "record-restore-test", source, query: "Record a restore test"},

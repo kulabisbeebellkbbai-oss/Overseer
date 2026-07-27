@@ -326,6 +326,23 @@ without mounting disks, changing filesystems, or touching remote backup targets.
 7. Investigate `attention`, `warning`, or `critical` rows before approving
    backup, cleanup, package, database, or log-heavy work on the host.
 
+### Review Storage Risk Alerts
+
+Use this before approving storage cleanup, backup changes, database moves,
+exports, or any operation that could expose or lose local state.
+
+1. Open Assets.
+2. Review Storage Risk Alerts.
+3. Treat `database_wal` rows as consistency-sensitive; confirm the owning
+   service can checkpoint safely before backup, cleanup, or restore work.
+4. Treat `local_database` rows as restore-test candidates that need backup and
+   retention coverage.
+5. Treat `ignored_export` and `local_secret_export` rows as sensitivity risks;
+   decide retention, redaction, and sharing rules before moving or deleting
+   them.
+6. Use Storage Cleanup Candidates only after the risk alert next step is
+   resolved.
+
 ### Record A Backup Job
 
 1. Open Assets.

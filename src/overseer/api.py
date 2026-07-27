@@ -139,7 +139,13 @@ from .image_scanning import (
     stage_image_scan_request_status,
 )
 from .identity_evidence import identity_evidence_status
-from .identity_ops import identity_rotation_requests_status, stage_identity_rotation_request_status
+from .identity_ops import (
+    approve_identity_rotation_request_status,
+    execute_identity_rotation_request_status,
+    identity_rotation_execution_readiness_status,
+    identity_rotation_requests_status,
+    stage_identity_rotation_request_status,
+)
 from .incident_lifecycle import incident_lifecycle_status
 from .knowledge import knowledge_capture_status
 from .maintenance_schedule import maintenance_schedules_status, record_maintenance_schedule_status
@@ -402,6 +408,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/identity/rotation-requests":
                 self._handle(lambda: identity_rotation_requests_status(_project_path_for_store(store_path)))
                 return
+            if path == "/identity/rotation-readiness":
+                self._handle(lambda: identity_rotation_execution_readiness_status(_project_path_for_store(store_path), _query_first(query, "request_id")))
+                return
             if path == "/host/security":
                 self._handle(lambda: assess_host_security_status(store_path))
                 return
@@ -663,6 +672,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/identity/rotation-requests":
                 self._handle_json(lambda payload: stage_identity_rotation_request_status(_project_path_for_store(store_path), **_identity_rotation_request_args(payload)))
+                return
+            if path == "/identity/rotation-requests/approve":
+                self._handle_json(lambda payload: approve_identity_rotation_request_status(_project_path_for_store(store_path), **_identity_rotation_approval_args(payload)))
+                return
+            if path == "/identity/rotation-requests/execute":
+                self._handle_json(lambda payload: execute_identity_rotation_request_status(_project_path_for_store(store_path), **_identity_rotation_execution_args(payload)))
                 return
             if path == "/host/security/source-reviews":
                 self._handle_json(lambda payload: create_host_security_source_review_status(store_path, **_host_security_source_review_args(payload)))
@@ -1786,6 +1801,23 @@ def _identity_rotation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "requested_by": str(payload.get("requested_by") or "odo"),
         "reason": str(payload.get("reason") or "stage identity or secret rotation review"),
         "urgency": str(payload.get("urgency") or "medium"),
+    }
+
+
+def _identity_rotation_approval_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "approved_by": str(payload.get("approved_by") or "sisko"),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") is not None else None,
+    }
+
+
+def _identity_rotation_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "executed_by": str(payload.get("executed_by") or "odo"),
+        "mode": str(payload.get("mode") or "local_fixture"),
+        "executed_at": str(payload["executed_at"]) if payload.get("executed_at") is not None else None,
     }
 
 

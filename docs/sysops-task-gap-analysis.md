@@ -365,7 +365,8 @@ Gaps:
 Coverage: partial to strong for review and staging. Odo shows local
 user/group/service-account summaries, SSH public key custody hashes, secret-file
 custody markers, rotation reminders, and staged identity/secret rotation
-requests without exposing secret contents.
+requests with execution-readiness packets and local fixture execution manifests
+for approval-path review, without exposing secret contents.
 
 Gaps:
 
@@ -375,7 +376,7 @@ Gaps:
 - No service-account registry.
 - No secret scanning summary tied to remediation plans.
 - No approved live credential rotation, account modification, or revocation
-  executor.
+  executor beyond local fixture execution evidence.
 
 ## Highest Priority UI Gaps
 
@@ -522,9 +523,11 @@ records into ignored state without changing host packages.
 Implementation Pass 7 added Dax virtual runtime records, staged virtual
 snapshot requests, staged virtual restore requests, Julian metric history
 snapshots, read-only performance regression history from local artifacts, and
-Odo identity/secret rotation request staging. These write or read ignored local
-state only and do not mutate live virtual assets, credentials, accounts, or
-privileged host resources.
+Odo identity/secret rotation request staging. Implementation Pass 14 added
+Odo identity/secret rotation execution-readiness packets and approval-gated
+local fixture execution manifests. These write or read ignored local state only
+and do not mutate live virtual assets, credentials, accounts, or privileged host
+resources.
 
 Implementation Pass 8 added Sisko desired-state drift comparison and Julian
 service dependency graph depth. Desired-state checks compare safe project-local

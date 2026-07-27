@@ -23,6 +23,7 @@ Protected endpoint:
 /Overseer/usage/evidence
 /Overseer/identity/evidence
 /Overseer/identity/rotation-requests
+/Overseer/identity/rotation-readiness
 /Overseer/maintenance/software-evidence
 /Overseer/maintenance/advisories
 /Overseer/maintenance/schedules
@@ -74,10 +75,12 @@ The third pass added read-only evidence depth for the remaining gap categories:
   firewall desired-policy diff, desired-policy enforcement staging with IDS
   review package preparation, protective plan provenance, identity/access review,
   SSH key custody hashes, secret-file custody markers, rotation reminders, and
-  staged identity/secret rotation requests. Odo also has fixture firewall
-  execution for approval-path evidence and disabled-by-default live firewall
-  execution for approved firewall/source-block plans after IDS review, plan
-  approval, adapter enablement, backend detection, and command-boundary
+  staged identity/secret rotation requests, rotation execution-readiness
+  packets for Sisko approval, and local fixture execution manifests. Odo also
+  has fixture firewall execution for approval-path evidence and
+  disabled-by-default live firewall execution for approved firewall/source-block
+  plans after IDS review, plan approval, adapter enablement, backend detection,
+  and command-boundary
   validation; both paths persist execution/audit records and ignored local
   manifests, and only live mode mutates host firewall state after all gates pass.
 - Kira: mount health, backup/restore markers, backup job registry, restore-test
@@ -122,7 +125,8 @@ The third pass added read-only evidence depth for the remaining gap categories:
   Analysis, Security Baseline Checks, Firewall Provenance, Firewall Policy
   Diff, Firewall Policy Enforcement, Listener Exposure Evidence, Protective
   Plan Provenance, Identity Access Review, SSH Key Custody, Secret File Custody,
-  Rotation Reminders, and Identity Rotation Requests.
+  Rotation Reminders, Identity Rotation Requests, and Identity Rotation
+  Readiness.
 - Health: Host Resources, Log Evidence, Service Details, Service Actions,
   Service Evidence, Service Dependency Nodes, Service Dependency Edges, Service
   Validation Checklist, Redacted Service Logs, Journal Excerpts, Journal Access
@@ -168,7 +172,10 @@ environment-specific policy wiring:
 - container image vulnerability scanner installation is still a package-source
   setup gate when Trivy is absent, but Dax now has staged, approved, read-only
   scan requests and summarized scan results.
-- secret rotation execution and service-account change execution.
+- live secret rotation execution and service-account change execution. The
+  current readiness and local fixture execution surfaces identify approval
+  state, blockers, safeguards, and non-live execution evidence without reading
+  or changing credential material.
 
 ## Tests
 

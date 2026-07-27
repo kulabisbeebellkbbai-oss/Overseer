@@ -30,7 +30,13 @@ from overseer.documentation_evidence import documentation_evidence_status
 from overseer.health import HealthEvidence, HealthStatus, HealthTarget, ProbeType
 from overseer.host import HostCommandObservation, HostInspectionSnapshot
 from overseer.identity_evidence import identity_evidence_status
-from overseer.identity_ops import identity_rotation_requests_status, stage_identity_rotation_request_status
+from overseer.identity_ops import (
+    approve_identity_rotation_request_status,
+    execute_identity_rotation_request_status,
+    identity_rotation_execution_readiness_status,
+    identity_rotation_requests_status,
+    stage_identity_rotation_request_status,
+)
 from overseer.image_scanning import (
     approve_image_scan_request_status,
     execute_image_scan_request_status,
@@ -120,6 +126,9 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertIn("dns_servers", payload["network"])
         self.assertIn("local_users", payload["identity_access"])
         self.assertIn("docs_count", payload["documentation"])
+        identity_row = next(row for row in payload["coverage"] if row["area"] == "identity secrets access")
+        self.assertEqual(identity_row["status"], "partial")
+        self.assertIn("live rotation policy", identity_row["next_gap"])
 
     def test_gap_coverage_is_available_through_protected_gateway(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1772,6 +1781,69 @@ exit 0
         self.assertNotIn("do-not-return", str(payload))
         self.assertFalse(payload["host_mutation_performed"])
 
+    def test_identity_rotation_readiness_stays_approval_gated_and_non_mutating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged = stage_identity_rotation_request_status(
+                root,
+                "/home/god/Documents/Codex Workspace/Overseer/local-secrets/api-token",
+                subject_type="api_key",
+                requested_by="odo",
+            )
+            readiness = identity_rotation_execution_readiness_status(root)
+            filtered = identity_rotation_execution_readiness_status(root, staged["request"]["id"])
+            store_path = root / "state" / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                api_readiness = server.get_json("/Overseer/identity/rotation-readiness")
+
+        item = readiness["items"][0]
+        self.assertEqual(readiness["request_count"], 1)
+        self.assertEqual(filtered["items"][0]["request_id"], staged["request"]["id"])
+        self.assertEqual(item["readiness_state"], "waiting_approval")
+        self.assertFalse(item["can_execute"])
+        self.assertFalse(item["live_execution_available"])
+        self.assertIn("Sisko approval required before rotation or account change", item["blockers"])
+        self.assertEqual(api_readiness["items"][0]["subject"], ".../api-token")
+        self.assertNotIn("do-not-return", str(readiness))
+        self.assertFalse(readiness["host_mutation_performed"])
+
+    def test_identity_rotation_fixture_execution_requires_approval_and_avoids_host_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged = stage_identity_rotation_request_status(root, "local-secrets/test-token", subject_type="secret")
+            request_id = staged["request"]["id"]
+            blocked = execute_identity_rotation_request_status(root, request_id, mode="local_fixture")
+            approved = approve_identity_rotation_request_status(root, request_id, approved_by="sisko")
+            live_blocked = execute_identity_rotation_request_status(root, request_id, mode="live")
+            executed = execute_identity_rotation_request_status(root, request_id, mode="local_fixture")
+            status = identity_rotation_requests_status(root)
+            manifest_exists = (root / executed["execution"]["manifest_path"]).exists()
+            store_path = root / "state" / "overseer.sqlite3"
+            with LocalApiHarness(store_path) as server:
+                api_staged = server.post_json(
+                    "/Overseer/identity/rotation-requests",
+                    {"subject": "local-secrets/api-token", "subject_type": "api_key"},
+                )
+                api_approved = server.post_json(
+                    "/Overseer/identity/rotation-requests/approve",
+                    {"request_id": api_staged["request"]["id"], "approved_by": "sisko"},
+                )
+                api_executed = server.post_json(
+                    "/Overseer/identity/rotation-requests/execute",
+                    {"request_id": api_staged["request"]["id"], "mode": "local_fixture"},
+                )
+
+        self.assertEqual(blocked["execution"]["status"], "blocked")
+        self.assertEqual(approved["request"]["status"], "approved")
+        self.assertEqual(live_blocked["execution"]["status"], "blocked")
+        self.assertEqual(executed["execution"]["status"], "completed")
+        self.assertEqual(status["executions"][0]["status"], "completed")
+        self.assertTrue(manifest_exists)
+        self.assertEqual(executed["manifest"]["credential_material"], "[not-read]")
+        self.assertFalse(executed["host_mutation_performed"])
+        self.assertEqual(api_approved["request"]["status"], "approved")
+        self.assertEqual(api_executed["execution"]["status"], "completed")
+
     def test_software_evidence_reports_package_lifecycle_surfaces(self):
         payload = software_evidence_status()
 
@@ -1968,6 +2040,7 @@ exit 0
             "Rotation Reminders",
             "Identity Rotation Request",
             "Identity Rotation Requests",
+            "Identity Rotation Readiness",
             "Network Gateway Analysis",
             "Host Resources",
             "Service Evidence",
@@ -2012,6 +2085,7 @@ exit 0
             "Desired State Drift",
         )
         self.assertIn('operations: "/operations/gap-coverage"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('identityRotationReadiness: "/identity/rotation-readiness"', OPERATOR_CONSOLE_HTML)
         for text in expected_text:
             with self.subTest(text=text):
                 self.assertIn(text, OPERATOR_CONSOLE_HTML)

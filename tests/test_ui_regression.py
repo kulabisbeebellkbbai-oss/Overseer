@@ -126,6 +126,7 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
             "/Overseer/security/evidence",
             "/Overseer/identity/evidence",
             "/Overseer/identity/rotation-requests",
+            "/Overseer/identity/rotation-readiness",
             "/Overseer/git/status",
         )
         with tempfile.TemporaryDirectory() as directory:

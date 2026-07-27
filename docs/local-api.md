@@ -54,6 +54,8 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `POST /virtual/image-scans`
 - `POST /virtual/image-scans/approve`
 - `POST /virtual/image-scans/execute`
+- `POST /identity/rotation-requests/approve`
+- `POST /identity/rotation-requests/execute`
 - `GET /observability/metric-history`
 - `GET /observability/performance-history`
 - `GET /health-summary`
@@ -68,6 +70,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /host/security/ids-review-packages`
 - `GET /host/security/ids-review-summary`
 - `GET /identity/rotation-requests`
+- `GET /identity/rotation-readiness`
 - `GET /admin/authorizations-required`
 - `GET /admin/adapter-capabilities`
 - `GET /admin/adapter-enablement-plan`
@@ -242,6 +245,9 @@ Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through 
 `POST /host/security/source-reviews/block-plans` stages an Odo-owned, human-approval source block plan from a reviewed hostile source. It records the plan only; firewall and IDS enforcement remain blocked until separate approval and Intrusion Detection advisory review.
 `GET /identity/rotation-requests` returns Odo's staged identity, SSH key, API key, service-account, user, group, and secret rotation requests from ignored local state.
 `POST /identity/rotation-requests` stages an approval-bound identity or secret rotation request. It redacts local paths and does not disclose, copy, rotate, delete, replace, or modify credentials, users, groups, SSH keys, API keys, service accounts, or token files.
+`GET /identity/rotation-readiness` summarizes staged rotation requests for Sisko approval review with readiness state, blockers, safeguards, and non-live execution modes. It does not read or change credential contents, users, groups, SSH keys, API keys, service accounts, or token files.
+`POST /identity/rotation-requests/approve` records Sisko approval for a staged identity or secret rotation request without changing host identity or credential state.
+`POST /identity/rotation-requests/execute` executes the approved local fixture path and writes a redacted manifest under ignored state. Live identity mutation modes are blocked until a specific provider adapter and policy are approved.
 `GET /host/security/ids-review-packages` lists prepared Intrusion Detection advisory packages and prompts tied to security admin plans.
 `GET /host/security/ids-review-summary` returns compact IDS/firewall review gate counters, package next steps, and latest Odo audit events without full prompts or advisory text.
 `POST /host/security/ids-review-packages` prepares the review package required before firewall or source-block plans can be approved. It does not run the advisor or apply policy.

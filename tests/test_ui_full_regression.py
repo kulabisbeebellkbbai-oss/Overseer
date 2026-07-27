@@ -92,6 +92,8 @@ EXPECTED_VIEWS = {
             "stage-firewall-policy-enforcement",
             "execute-firewall-change",
             "stage-identity-rotation-request",
+            "approve-identity-rotation-request",
+            "execute-identity-rotation-request",
             "prepare-ids-review-package",
             "export-ids-review-prompt",
             "dispatch-ids-review-package",
@@ -163,6 +165,7 @@ ACTION_ROUTES = {
     "approve-virtual-snapshot-request": ("POST", "/virtual/snapshot-requests/approve"),
     "approve-virtual-destroy-request": ("POST", "/virtual/destroy-requests/approve"),
     "approve-image-scan": ("POST", "/virtual/image-scans/approve"),
+    "approve-identity-rotation-request": ("POST", "/identity/rotation-requests/approve"),
     "archive-admin-history": ("POST", "/admin/history-archive"),
     "build-policy-profile": ("POST", "/admin/policy-customization-helper/profile"),
     "cancel-admin-change": ("POST", "/admin/cancel"),
@@ -186,6 +189,7 @@ ACTION_ROUTES = {
     "execute-claim-cleanup": ("POST", "/claims/cleanup-requests/execute"),
     "execute-journal-access-request": ("POST", "/health/journal-access-requests/execute"),
     "execute-firewall-change": ("POST", "/host/security/firewall-executions/execute"),
+    "execute-identity-rotation-request": ("POST", "/identity/rotation-requests/execute"),
     "execute-virtual-lifecycle": ("POST", "/virtual/lifecycle/execute"),
     "execute-virtual-target-setup": ("POST", "/virtual/target-setup-requests/execute"),
     "execute-virtual-destroy-request": ("POST", "/virtual/destroy-requests/execute"),
@@ -475,6 +479,15 @@ SAFE_POST_PAYLOADS = {
         "reason": "exercise disposable identity rotation staging workflow",
         "urgency": "medium",
     },
+    "/identity/rotation-requests/approve": {
+        "request_id": "identity-rotation.secret.local-secrets-test-token",
+        "approved_by": "sisko",
+    },
+    "/identity/rotation-requests/execute": {
+        "request_id": "identity-rotation.secret.local-secrets-test-token",
+        "executed_by": "odo",
+        "mode": "local_fixture",
+    },
     "/crew/messages": {
         "owner_domain": "julian",
         "subject": "UI full regression",
@@ -733,6 +746,10 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
             "health-target",
             "health-target-id",
             "identity-rotation-reason",
+            "identity-rotation-request-id",
+            "identity-rotation-approved-by",
+            "identity-rotation-executed-by",
+            "identity-rotation-execute-mode",
             "identity-rotation-requested-by",
             "identity-rotation-subject",
             "identity-rotation-subject-type",
@@ -1139,6 +1156,14 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 identity_rotation = server.post_json(
                     "/Overseer/identity/rotation-requests",
                     SAFE_POST_PAYLOADS["/identity/rotation-requests"],
+                )
+                identity_rotation_approval = server.post_json(
+                    "/Overseer/identity/rotation-requests/approve",
+                    SAFE_POST_PAYLOADS["/identity/rotation-requests/approve"],
+                )
+                identity_rotation_execution = server.post_json(
+                    "/Overseer/identity/rotation-requests/execute",
+                    SAFE_POST_PAYLOADS["/identity/rotation-requests/execute"],
                 )
                 crew_message = server.post_json("/Overseer/crew/messages", SAFE_POST_PAYLOADS["/crew/messages"])
                 crew_dispatch = server.post_json("/Overseer/crew/dispatch", SAFE_POST_PAYLOADS["/crew/dispatch"])

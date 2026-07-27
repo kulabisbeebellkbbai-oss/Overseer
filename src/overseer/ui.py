@@ -724,6 +724,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       securityEvidence: "/security/evidence",
       identityEvidence: "/identity/evidence",
       identityRotationRequests: "/identity/rotation-requests",
+      identityRotationReadiness: "/identity/rotation-readiness",
       health: "/health-efficiency",
       healthSummary: "/health-summary",
       serviceEvidence: "/health/service-evidence",
@@ -1023,6 +1024,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "plan-host-security-remediation") return await planHostSecurityRemediation();
       if (action === "record-source-review") return await recordSourceReview();
       if (action === "stage-identity-rotation-request") return await stageIdentityRotationRequest();
+      if (action === "approve-identity-rotation-request") return await approveIdentityRotationRequest();
+      if (action === "execute-identity-rotation-request") return await executeIdentityRotationRequest();
       if (action === "record-operation") return await recordOperation();
       if (action === "transition-operation") return await transitionOperation();
       if (action === "stage-operation-workflow") return await stageOperationWorkflow();
@@ -1757,6 +1760,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         urgency: value("identity-rotation-urgency") || "medium"
       });
     }
+    async function approveIdentityRotationRequest() {
+      return await postJson("/identity/rotation-requests/approve", {
+        request_id: value("identity-rotation-request-id"),
+        approved_by: value("identity-rotation-approved-by") || "sisko"
+      });
+    }
+    async function executeIdentityRotationRequest() {
+      return await postJson("/identity/rotation-requests/execute", {
+        request_id: value("identity-rotation-request-id"),
+        executed_by: value("identity-rotation-executed-by") || "odo",
+        mode: value("identity-rotation-execute-mode") || "local_fixture"
+      });
+    }
     async function prepareIdsReviewPackage() {
       const payload = {
         plan_id: value("ids-plan-id"),
@@ -2380,6 +2396,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const securityEvidence = state.data.securityEvidence || {};
       const identityEvidence = state.data.identityEvidence || {};
       const identityRotationRequests = state.data.identityRotationRequests || {};
+      const identityRotationReadiness = state.data.identityRotationReadiness || {};
       const operations = state.data.operations || {};
       const auth = state.data.authorizations || {};
       const readiness = state.data.readiness || {};
@@ -2441,12 +2458,16 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             </div>
           </div>
           <div class="panel span-6">
-            <div class="toolbar"><h3>Identity Rotation Request</h3><button class="action-btn" data-action="stage-identity-rotation-request">Stage Request</button></div>
+            <div class="toolbar"><h3>Identity Rotation Request</h3><div class="actions"><button class="action-btn" data-action="stage-identity-rotation-request">Stage Request</button><button class="action-btn" data-action="approve-identity-rotation-request">Approve</button><button class="action-btn" data-action="execute-identity-rotation-request">Execute Fixture</button></div></div>
             <div class="form-grid">
               <div class="field span-4"><label for="identity-rotation-subject">Subject</label><input id="identity-rotation-subject" value="local secret"></div>
               <div class="field span-3"><label for="identity-rotation-subject-type">Type</label><select id="identity-rotation-subject-type">${identitySubjectTypeOptions()}</select></div>
               <div class="field span-2"><label for="identity-rotation-urgency">Urgency</label><select id="identity-rotation-urgency">${riskOptions()}</select></div>
               <div class="field span-3"><label for="identity-rotation-requested-by">Requested By</label><input id="identity-rotation-requested-by" value="odo"></div>
+              <div class="field span-5"><label for="identity-rotation-request-id">Request ID</label><input id="identity-rotation-request-id"></div>
+              <div class="field span-3"><label for="identity-rotation-approved-by">Approved By</label><input id="identity-rotation-approved-by" value="sisko"></div>
+              <div class="field span-2"><label for="identity-rotation-executed-by">Executed By</label><input id="identity-rotation-executed-by" value="odo"></div>
+              <div class="field span-2"><label for="identity-rotation-execute-mode">Mode</label><select id="identity-rotation-execute-mode"><option value="local_fixture">local_fixture</option><option value="live">live</option></select></div>
               <div class="field span-12"><label for="identity-rotation-reason">Reason</label><input id="identity-rotation-reason" value="stage identity or secret rotation review"></div>
             </div>
           </div>
@@ -2483,6 +2504,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("Secret File Custody", identityEvidence.secret_files || [], ["path", "status", "content"], {fills: {path: (row) => identityRotationFill({...row, subject_type: "secret"})}, fillView: "security"})}</div>
           <div class="panel span-12">${table("Rotation Reminders", identityEvidence.rotation_reminders || [], ["area", "items", "next_step"], {fills: {area: (row) => identityRotationFill(row)}, fillView: "security"})}</div>
           <div class="panel span-12">${table("Identity Rotation Requests", identityRotationRequests.requests || identityEvidence.rotation_requests || [], ["id", "subject_type", "subject", "urgency", "status", "approval_required", "next_step"], {fills: {subject: (row) => identityRotationFill(row), id: (row) => identityRotationFill(row)}, fillView: "security"})}</div>
+          <div class="panel span-12">${table("Identity Rotation Readiness", identityRotationReadiness.items || [], ["request_id", "subject_type", "status", "readiness_state", "can_execute", "live_execution_available", "blockers", "next_step"], {fills: {request_id: (row) => identityRotationFill({subject: row.subject, subject_type: row.subject_type})}, fillView: "security"})}</div>
           <div class="panel span-12">${table("Network Gateway Analysis", [operations.network || {}], ["interfaces", "routes", "dns_servers", "listener_rows", "gateway_routes", "next_step"])}</div>
           <div class="section-head"><h3>Odo Security Team</h3><div class="actions"><span class="pill">reports to Odo</span></div></div>
           ${officerPanel("odo", "Security investigation", "Investigate traffic, exposed listeners, intrusion signals, or protective actions.")}
@@ -3335,6 +3357,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function identityRotationFill(row) {
       return {
+        "identity-rotation-request-id": row?.id || row?.request_id || "",
         "identity-rotation-subject": row?.subject || row?.path || row?.area || "",
         "identity-rotation-subject-type": row?.subject_type || "secret",
         "identity-rotation-urgency": row?.urgency || "medium",

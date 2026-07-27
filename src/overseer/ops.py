@@ -439,7 +439,7 @@ def _coverage_rows() -> list[dict[str, object]]:
         _coverage("usage cost forecasting", "partial", "Usage limits and continuations", "add cost and exhaustion forecasting"),
         _coverage("compliance drift", "partial", "Policy profile, warning approvals, desired-state drift matrix", "review desired-state drift rows and stage corrections"),
         _coverage("documentation coverage", "partial", "Documents, workflows, git status", "add freshness and ADR/release indexes"),
-        _coverage("identity secrets access", "gap", "Security routing only", "add identity and credential review panels"),
+        _coverage("identity secrets access", "partial", "Identity evidence, custody review, rotation staging, readiness, approval, and fixture execution", "add approved live rotation policy and provider adapters"),
     ]
 
 

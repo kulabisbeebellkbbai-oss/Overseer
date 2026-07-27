@@ -302,7 +302,8 @@ source under `/etc/apt/sources.list.d`.
 ## Read-Only Provider Inventory
 
 The Claims page also includes Runtime Provider Inventory, Provider Depth
-Coverage, Virtual Capacity Summary, and Image Provenance Review. Dax gathers
+Coverage, Provider Policy Readiness, Runtime Mutation Readiness, Virtual
+Capacity Summary, and Image Provenance Review. Dax gathers
 read-only Docker container rows from `docker ps -a --format '{{json .}}'`,
 Podman rows from `podman ps -a --format json`, libvirt VM rows from
 `virsh list --all --name` plus `virsh domstate`, qemu qcow2 image rows from
@@ -318,6 +319,11 @@ Dax also reports CLI availability in Runtime Adapter Availability. Commands use
 short timeouts and return unavailable inventory rows when a CLI exists but the
 daemon, rootless runtime, or libvirt session is not accessible.
 
-Inventory, capacity, and provenance rows are evidence only. They do not start,
-stop, snapshot, restore, or destroy runtimes. Any mutation still requires a Dax
-claim plus the staged lifecycle or snapshot/restore execution workflow.
+Provider policy and runtime mutation readiness rows make blockers explicit:
+running-domain snapshots are blocked until a consistency or quiesce model is
+approved, non-disposable restore and destroy require owner impact review, and
+Android Emulator execution must not interfere with another project's active
+mobile testing lease. Inventory, capacity, policy, readiness, and provenance
+rows are evidence only. They do not start, stop, snapshot, restore, or destroy
+runtimes. Any mutation still requires a Dax claim plus the staged lifecycle or
+snapshot/restore execution workflow.

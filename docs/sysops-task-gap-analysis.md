@@ -251,8 +251,9 @@ Gaps:
   metadata, qemu process, Android Emulator, Renode, and gateway/proxy depth rows,
   plus capacity and image provenance review summaries.
 - No approved running-domain libvirt snapshot policy or generalized
-  snapshot/restore/destroy for non-disposable targets. Provider
-  snapshot/restore/destroy is intentionally limited to approved disposable
+  snapshot/restore/destroy execution for non-disposable targets. Dax now shows
+  provider policy and runtime mutation readiness blockers, but provider
+  snapshot/restore/destroy remains intentionally limited to approved disposable
   targets and stopped image-backed runtime state.
 - Container image vulnerability scanning now has a Trivy-backed staged,
   approved, read-only scan workflow with summarized severity results. Trivy

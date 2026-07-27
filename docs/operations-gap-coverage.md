@@ -162,13 +162,14 @@ environment-specific policy wiring:
 - broader backup provider policy beyond project-local filesystem backup and
   isolated restore execution.
 - VM/container/emulator live adapter depth beyond approved disposable targets:
-  running-domain snapshot policy, non-disposable destroy policy, and broader
-  host-specific inventory enrichment. Dax now supports approved disposable
+  approved running-domain consistency/quiesce execution policy, approved
+  non-disposable restore/destroy execution policy, and broader host-specific
+  inventory enrichment. Dax now supports approved disposable
   lifecycle actions plus provider snapshot/restore/destroy for local fixtures,
   stopped qcow2 images, stopped qemu/libvirt image targets, containers,
   file-backed Renode/proxy targets, and approved disposable Android AVD
-  directories, with read-only provider-depth, capacity, and image provenance
-  evidence.
+  directories, with read-only provider-depth, provider-policy, runtime-readiness,
+  capacity, and image provenance evidence.
 - container image vulnerability scanner installation is still a package-source
   setup gate when Trivy is absent, but Dax now has staged, approved, read-only
   scan requests and summarized scan results.

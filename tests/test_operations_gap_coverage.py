@@ -1267,15 +1267,26 @@ exit 0
                 api_payload = server.get_json("/Overseer/virtual/evidence")
 
         provider_rows = {row["provider"]: row for row in payload["provider_depth"]}
+        policy_rows = {row["provider"]: row for row in payload["provider_policy"]}
         inventory_rows = [row for row in payload["runtime_inventory"] if row["provider"] == "gateway_proxy"]
+        readiness_rows = [row for row in payload["runtime_readiness"] if row["provider"] == "gateway_proxy"]
         self.assertIn("gateway_proxy", provider_rows)
         self.assertEqual(provider_rows["gateway_proxy"]["registered_records"], 1)
+        self.assertIn("gateway_proxy", policy_rows)
+        self.assertEqual(policy_rows["gateway_proxy"]["blocked_rows"], 1)
         self.assertEqual(payload["capacity_summary"]["registered_ports"], 1)
         self.assertTrue(inventory_rows)
+        self.assertTrue(readiness_rows)
         self.assertEqual(inventory_rows[0]["state"], "running")
+        self.assertFalse(readiness_rows[0]["can_execute_live"])
+        self.assertIn("running-domain snapshot policy", readiness_rows[0]["blockers"])
         self.assertIn("Image Provenance Review", OPERATOR_CONSOLE_HTML)
         self.assertIn("Provider Depth Coverage", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Provider Policy Readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Runtime Mutation Readiness", OPERATOR_CONSOLE_HTML)
         self.assertEqual(api_payload["capacity_summary"]["registered_ports"], 1)
+        self.assertIn("provider_policy", api_payload)
+        self.assertIn("runtime_readiness", api_payload)
 
     def test_virtual_target_setup_batch_stages_approval_requests_without_host_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

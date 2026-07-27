@@ -923,6 +923,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("Image Scanner Adapters", OPERATOR_CONSOLE_HTML)
         self.assertIn("Image Scan Results", OPERATOR_CONSOLE_HTML)
         self.assertIn("Target Setup Requests", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Provider Policy Readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Runtime Mutation Readiness", OPERATOR_CONSOLE_HTML)
         self.assertIn("Runtime Provider Inventory", OPERATOR_CONSOLE_HTML)
         self.assertIn("Account Repositories", OPERATOR_CONSOLE_HTML)
         self.assertIn("Current Repo Links", OPERATOR_CONSOLE_HTML)

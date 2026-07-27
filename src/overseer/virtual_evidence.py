@@ -48,6 +48,8 @@ def virtual_evidence_status(store_path: str | Path) -> dict[str, object]:
         "image_scan_requests": image_scans["scan_requests"],
         "image_scan_results": image_scans["scan_results"],
         "provider_depth": _provider_depth_rows(runtime_records, runtime_inventory),
+        "provider_policy": _provider_policy_rows(runtime_records, runtime_inventory),
+        "runtime_readiness": _runtime_readiness_rows(runtime_inventory),
         "port_pool": port_rows,
         "cleanup": _cleanup_rows(claims),
         "mutation_performed": False,
@@ -606,6 +608,93 @@ def _provider_depth_rows(runtime_records: list[dict[str, object]], runtime_inven
         }
         for provider in providers
     ]
+
+
+def _provider_policy_rows(runtime_records: list[dict[str, object]], runtime_inventory: list[dict[str, object]]) -> list[dict[str, object]]:
+    providers = ["docker", "podman", "libvirt", "qemu_process", "renode", "android_emulator", "gateway_proxy", "qemu_img"]
+    readiness = _runtime_readiness_rows(runtime_inventory)
+    active_by_provider: dict[str, int] = {}
+    blocked_by_provider: dict[str, int] = {}
+    for row in readiness:
+        provider = str(row.get("provider") or "")
+        active_by_provider[provider] = active_by_provider.get(provider, 0) + 1
+        if row.get("can_execute_live") is False:
+            blocked_by_provider[provider] = blocked_by_provider.get(provider, 0) + 1
+    registered_by_provider: dict[str, int] = {}
+    for record in runtime_records:
+        provider = str(record.get("adapter") or "")
+        registered_by_provider[provider] = registered_by_provider.get(provider, 0) + 1
+    return [
+        {
+            "provider": provider,
+            "registered_records": registered_by_provider.get(provider, 0),
+            "runtime_rows": active_by_provider.get(provider, 0),
+            "blocked_rows": blocked_by_provider.get(provider, 0),
+            "running_snapshot_policy": _running_snapshot_policy(provider),
+            "non_disposable_policy": "block restore and destroy until owner impact, rollback, and explicit Sisko approval are present",
+            "required_evidence": _provider_required_evidence(provider),
+            "approval_gate": "Dax checkout plus Sisko approval before live mutation",
+            "next_step": "review runtime readiness rows before staging any live provider operation",
+        }
+        for provider in providers
+    ]
+
+
+def _runtime_readiness_rows(runtime_inventory: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [_runtime_readiness_row(row) for row in runtime_inventory]
+
+
+def _runtime_readiness_row(row: dict[str, object]) -> dict[str, object]:
+    provider = str(row.get("provider") or "")
+    state = str(row.get("state") or "")
+    notes = f"{row.get('evidence') or ''} {row.get('next_step') or ''} {row.get('owner') or ''}".lower()
+    disposable = "disposable" in notes or str(row.get("resource_id") or "").startswith(("local-fixture", "dax-disposable"))
+    running = state in {"running", "starting", "paused"}
+    blockers = []
+    if running:
+        blockers.append("running-domain snapshot policy is not approved for this provider")
+    if not disposable:
+        blockers.append("non-disposable restore and destroy require owner impact review")
+    if provider == "android_emulator":
+        blockers.append("avoid emulator execution while another project owns active mobile testing")
+    if not str(row.get("image") or row.get("evidence") or ""):
+        blockers.append("provider evidence is incomplete")
+    return {
+        "provider": provider,
+        "resource_id": row.get("resource_id") or "",
+        "state": state,
+        "disposable": disposable,
+        "running": running,
+        "can_stage": True,
+        "can_execute_live": not blockers,
+        "snapshot_policy": "blocked_running_domain" if running else "stopped_or_file_backed_only",
+        "restore_destroy_policy": "disposable_only" if disposable else "blocked_non_disposable",
+        "blockers": "; ".join(blockers) if blockers else "",
+        "required_evidence": _provider_required_evidence(provider),
+        "next_step": "stage request for approval only; do not execute live mutation" if blockers else "eligible for normal Dax approval-gated execution",
+    }
+
+
+def _running_snapshot_policy(provider: str) -> str:
+    if provider in {"libvirt", "qemu_process", "docker", "podman"}:
+        return "blocked until running-domain quiesce/suspend/consistency policy is approved"
+    if provider == "android_emulator":
+        return "blocked unless a disposable AVD is leased and no other project owns emulator testing"
+    return "file-backed stopped targets only"
+
+
+def _provider_required_evidence(provider: str) -> str:
+    evidence = {
+        "docker": "container id, image, mounts, ports, owner, disposable marker, rollback export",
+        "podman": "container id, image, mounts, ports, owner, disposable marker, rollback export",
+        "libvirt": "domain name, running state, backing images, snapshots, owner, maintenance window",
+        "qemu_process": "pid, image path, monitor/socket, ports, owner, quiesce plan",
+        "renode": "resc script path, target state, owner, disposable marker",
+        "android_emulator": "AVD name, adb serial, owner lease, disposable marker, active tester",
+        "gateway_proxy": "config path, bound ports, owner, rollback config",
+        "qemu_img": "image path, format, snapshot list, owner, backup path",
+    }
+    return evidence.get(provider, "provider identity, owner, state, rollback evidence")
 
 
 def _run_inventory_command(command: tuple[str, ...], timeout_seconds: float = 2.0) -> dict[str, object]:

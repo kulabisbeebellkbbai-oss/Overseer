@@ -141,6 +141,7 @@ from overseer import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_npm_global_install,
+    plan_storage_mount_test,
     plan_user_service_restart,
     policy_customization_helper_status,
     policy_profile_from_answers_status,
@@ -7299,6 +7300,38 @@ class AdminChangePlanTests(unittest.TestCase):
         self.assertEqual(capability.status, AdminAdapterStatus.ENABLED)
         self.assertEqual(executed.status, AdminExecutionStatus.COMPLETED)
         self.assertEqual(executed.command_results[-1].command, ("sudo", "docker", "compose", "-f", "/srv/penpot/docker-compose.yaml", "up", "-d"))
+
+    def test_storage_mount_test_plan_is_human_gated_and_secret_redacted(self):
+        plan = plan_storage_mount_test(
+            "admin.storage.mediastore.mount-test",
+            "//MediaStore/Overseer",
+            "/home/god/Documents/Codex Workspace/Overseer/local-secrets/mounts/mediastore",
+            "/home/god/Documents/Codex Workspace/Overseer/local-secrets/backup-providers/mediastore/credentials.conf",
+            "validate MediaStore NAS backup target",
+            "credentials configured but share is not mounted",
+        )
+        blocked = execute_admin_change_plan(approve_admin_change_plan(plan, "human"))
+        status = plan_admin_change_status(
+            None,
+            "admin.storage.mediastore.cli",
+            AdminChangeKind.STORAGE_MOUNT_TEST.value,
+            "//MediaStore/Overseer",
+            "stage MediaStore mount validation",
+            "not mounted",
+            mount_path="/mnt/mediastore",
+            credential_file="/secure/mediastore.credentials",
+        )
+
+        self.assertEqual(plan.kind, AdminChangeKind.STORAGE_MOUNT_TEST)
+        self.assertEqual(plan.owner_domain, OwnerDomain.KIRA)
+        self.assertEqual(plan.approval_level, ApprovalLevel.HUMAN)
+        self.assertEqual(plan.risk_level, RiskLevel.HIGH)
+        self.assertIn("Mount storage share", [step.title for step in plan.steps])
+        self.assertIn("Unmount storage share", [step.title for step in plan.rollback_steps])
+        self.assertEqual(blocked.status, AdminExecutionStatus.BLOCKED)
+        self.assertIn("live adapter unavailable for storage_mount_test", blocked.summary)
+        self.assertEqual(status["kind"], AdminChangeKind.STORAGE_MOUNT_TEST.value)
+        self.assertNotIn("password", json.dumps(status).lower())
 
     def test_admin_execution_stops_before_later_mutations_after_failed_step(self):
         plan = approve_admin_change_plan(

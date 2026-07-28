@@ -35,6 +35,7 @@ from .admin import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_npm_global_install,
+    plan_storage_mount_test,
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
@@ -217,6 +218,7 @@ __all__ = [
     "plan_firewall_allow_tcp",
     "plan_firewall_deny_tcp",
     "plan_npm_global_install",
+    "plan_storage_mount_test",
     "plan_user_service_restart",
     "ApprovalRequest",
     "ApprovalStatus",

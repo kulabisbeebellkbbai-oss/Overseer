@@ -22,6 +22,7 @@ class AdminChangeKind(StrEnum):
     FLATPAK_INSTALL = "flatpak_install"
     NPM_GLOBAL_INSTALL = "npm_global_install"
     DOCKER_COMPOSE_UPDATE = "docker_compose_update"
+    STORAGE_MOUNT_TEST = "storage_mount_test"
     FIREWALL_ALLOW_TCP = "firewall_allow_tcp"
     FIREWALL_DENY_TCP = "firewall_deny_tcp"
     BLOCK_IP = "block_ip"
@@ -218,6 +219,15 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
             ("trivy", "image"),
             ("curl", "-fsS"),
         ),
+    ),
+    AdminChangeKind.STORAGE_MOUNT_TEST: AdminExecutionCapability(
+        kind=AdminChangeKind.STORAGE_MOUNT_TEST,
+        adapter_name="storage-mount-test",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live storage mount tests require explicit adapter enablement because they mount network storage and can expose backup paths",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("mkdir", "-p"), ("sudo", "mount", "-t", "cifs"), ("findmnt", "--target"), ("sudo", "umount")),
     ),
     AdminChangeKind.FIREWALL_ALLOW_TCP: AdminExecutionCapability(
         kind=AdminChangeKind.FIREWALL_ALLOW_TCP,
@@ -742,6 +752,68 @@ def plan_docker_compose_update(
         ),
         verification_steps=verification,
         residual_scan_findings=residual_findings,
+    )
+
+
+def plan_storage_mount_test(
+    plan_id: str,
+    share: str,
+    mount_path: str,
+    credential_file: str,
+    reason: str,
+    current_state: str = "unknown",
+    filesystem_type: str = "cifs",
+) -> AdminChangePlan:
+    if not share.strip():
+        raise ValueError("share is required")
+    if not mount_path.strip():
+        raise ValueError("mount_path is required")
+    if not credential_file.strip():
+        raise ValueError("credential_file is required")
+    if filesystem_type != "cifs":
+        raise ValueError("only cifs storage mount tests are currently supported")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.STORAGE_MOUNT_TEST,
+        owner_domain=OwnerDomain.KIRA,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.HUMAN,
+        target=f"{share} -> {mount_path}",
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"temporarily mount {share} at {mount_path}, verify access, then unmount unless follow-up approval keeps it mounted",
+        steps=(
+            AdminCommandStep(
+                "Create local mount directory",
+                ("mkdir", "-p", mount_path),
+                "prepare the approved local mount point without touching the remote share",
+            ),
+            AdminCommandStep(
+                "Mount storage share",
+                ("sudo", "mount", "-t", filesystem_type, share, mount_path, "-o", f"credentials={credential_file},rw"),
+                "connect the approved network storage target using the ignored credential file",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Unmount storage share",
+                ("sudo", "umount", mount_path),
+                "disconnect the NAS share if validation fails or after the temporary test completes",
+            ),
+        ),
+        risks=(
+            "network storage credentials could be misused if local secret permissions are wrong",
+            "mounting the wrong share could expose or overwrite unintended backup data",
+            "a stale mount can cause backup jobs to write to local disk instead of NAS if not monitored",
+            "NAS outage or DNS failure can block backup execution until remediated",
+        ),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify mount target",
+                ("findmnt", "--target", mount_path),
+                "confirm the mounted path resolves to the approved NAS share",
+            ),
+        ),
     )
 
 

@@ -379,17 +379,22 @@ hosted failover.
 1. Open Assets.
 2. Review Backup Provider Targets. `//MediaStore/Overseer` is the first planned
    remote NAS backup target.
-3. Review Backup Provider Readiness and do not execute a provider whose
+3. Review Backup Provider Local Profiles. MediaStore credentials must show
+   `present`, but the password remains only in ignored `local-secrets`.
+4. Review Backup Provider Readiness and do not execute a provider whose
    `can_execute` field is false.
-4. Treat cloud object storage, full clone, and hosted failover rows as future
+5. Treat `credentials_configured_pending_mount` as staged, not ready. Live SMB
+   mount testing, retention/encryption policy, and an isolated restore test are
+   still required before scheduled NAS backup execution.
+6. Treat cloud object storage, full clone, and hosted failover rows as future
    work until a real provider, credentials, network path, retention policy, and
    restore-test target exist.
-5. Prefer industry-standard tools and protocols: SMB/CIFS or NFS for NAS,
+7. Prefer industry-standard tools and protocols: SMB/CIFS or NFS for NAS,
    restic, borg, rclone, rsync, S3-compatible object storage, Azure Blob, Google
    Cloud Storage, ZFS/Btrfs send, LVM snapshots, image manifests, and
    infrastructure-as-code for failover.
-6. Before enabling live NAS execution, define mount path, credentials,
-   encryption, retention, exclusions, monitoring, and an isolated restore test.
+8. Before enabling live NAS execution, define mount path, encryption, retention,
+   exclusions, monitoring, and an isolated restore test.
 
 ### Stage Backup Execution Request
 

@@ -621,6 +621,7 @@ class OperationsGapCoverageTests(unittest.TestCase):
             media_target = next(row for row in status["provider_targets"] if row["name"] == "MediaStore")
             cloud_target = next(row for row in status["provider_targets"] if row["provider_class"] == "cloud_object_storage")
             media_readiness = next(row for row in status["provider_readiness"] if row["name"] == "MediaStore")
+            media_profile = next(row for row in status["provider_local_profiles"] if row["name"] == "MediaStore")
             store_path = root / "state" / "overseer.sqlite3"
             with LocalApiHarness(store_path) as server:
                 api_status = server.get_json("/Overseer/storage/backup-operations")
@@ -635,14 +636,43 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(media_target["target"], "//MediaStore/Overseer")
         self.assertEqual(media_target["role"], "first remote backup target")
         self.assertFalse(media_readiness["can_execute"])
-        self.assertIn("mount path", media_readiness["blockers"])
+        self.assertEqual(media_readiness["credential_status"], "missing")
+        self.assertIn("credentials not configured", media_readiness["blockers"])
+        self.assertEqual(media_profile["credential_status"], "missing")
         self.assertTrue(cloud_target["future_work"])
         self.assertIn("Backup Provider Targets", OPERATOR_CONSOLE_HTML)
         self.assertIn("Backup Provider Readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Backup Provider Local Profiles", OPERATOR_CONSOLE_HTML)
         self.assertIn("Backup Provider Classes", OPERATOR_CONSOLE_HTML)
         self.assertEqual(api_status["provider_targets"][0]["name"], "MediaStore")
         self.assertEqual(api_evidence["backup_provider_targets"][0]["name"], "MediaStore")
         self.assertFalse(cleanup["host_mutation_performed"])
+
+    def test_mediastore_credentials_are_detected_without_secret_exposure_or_host_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credential_path = root / "local-secrets" / "backup-providers" / "mediastore" / "credentials.conf"
+            credential_path.parent.mkdir(parents=True)
+            credential_path.write_text("username=admin\npassword=redacted-test-secret\n", encoding="utf-8")
+            credential_path.chmod(0o600)
+
+            status = backup_operations_status(root)
+            evidence = storage_evidence_status(root)
+            media_target = next(row for row in status["provider_targets"] if row["name"] == "MediaStore")
+            media_readiness = next(row for row in status["provider_readiness"] if row["name"] == "MediaStore")
+            media_profile = next(row for row in status["provider_local_profiles"] if row["name"] == "MediaStore")
+
+        self.assertEqual(media_target["credential_status"], "present")
+        self.assertEqual(media_target["status"], "credentials_configured_pending_mount")
+        self.assertEqual(media_readiness["connection_status"], "credentials_configured")
+        self.assertEqual(media_readiness["credential_status"], "present")
+        self.assertIn("live mount approval", media_readiness["blockers"])
+        self.assertEqual(media_profile["credential_mode"], "owner_only")
+        self.assertEqual(media_profile["username_status"], "configured")
+        self.assertFalse(media_profile["mounted"])
+        self.assertFalse(status["host_mutation_performed"])
+        self.assertFalse(evidence["host_mutation_performed"])
+        self.assertNotIn("redacted-test-secret", json.dumps(status))
 
     def test_approved_backup_cleanup_deletes_project_artifact_with_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

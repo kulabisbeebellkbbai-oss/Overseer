@@ -10,6 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+MEDIASTORE_CREDENTIAL_PATH = Path("local-secrets/backup-providers/mediastore/credentials.conf")
+MEDIASTORE_MOUNT_PATH = Path("local-secrets/mounts/mediastore")
+MEDIASTORE_SHARE = "//MediaStore/Overseer"
+
+
 def backup_operations_status(project_root: str | Path) -> dict[str, object]:
     root = Path(project_root)
     data = _read_registry(root)
@@ -30,6 +35,7 @@ def backup_operations_status(project_root: str | Path) -> dict[str, object]:
         "provider_classes": provider_readiness["provider_classes"],
         "provider_readiness": provider_readiness["readiness"],
         "provider_standard": provider_readiness["standard"],
+        "provider_local_profiles": provider_readiness["local_profiles"],
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
@@ -37,7 +43,8 @@ def backup_operations_status(project_root: str | Path) -> dict[str, object]:
 
 def backup_provider_readiness_status(project_root: str | Path) -> dict[str, object]:
     root = Path(project_root)
-    targets = _provider_target_rows()
+    local_profiles = _local_provider_profiles(root)
+    targets = _provider_target_rows(root, local_profiles)
     classes = _provider_class_rows()
     readiness = [_provider_readiness_row(row) for row in targets]
     return {
@@ -46,6 +53,7 @@ def backup_provider_readiness_status(project_root: str | Path) -> dict[str, obje
         "targets": targets,
         "provider_classes": classes,
         "readiness": readiness,
+        "local_profiles": local_profiles,
         "mutation_performed": False,
         "host_mutation_performed": False,
     }
@@ -478,21 +486,30 @@ def _empty_registry() -> dict[str, list[dict[str, object]]]:
     return {"jobs": [], "restore_tests": [], "backup_requests": [], "restore_requests": [], "cleanup_requests": []}
 
 
-def _provider_target_rows() -> list[dict[str, object]]:
+def _provider_target_rows(root: Path, local_profiles: list[dict[str, object]]) -> list[dict[str, object]]:
+    mediastore_profile = next((row for row in local_profiles if row.get("id") == "backup-profile.nas.mediastore"), {})
+    mediastore_credential_ready = mediastore_profile.get("credential_status") == "present" and mediastore_profile.get("credential_mode") == "owner_only"
+    mediastore_mounted = bool(mediastore_profile.get("mounted"))
+    mediastore_status = "mounted_pending_restore_test" if mediastore_mounted else "credentials_configured_pending_mount"
+    if not mediastore_credential_ready:
+        mediastore_status = "planned_local_nas"
     return [
         {
             "id": "backup-target.nas.mediastore",
             "name": "MediaStore",
-            "target": "//MediaStore/Overseer",
+            "target": MEDIASTORE_SHARE,
             "provider_class": "network_nas",
             "protocols": "SMB/CIFS, NFS capable",
             "tooling": "restic, borg, rclone, rsync",
             "role": "first remote backup target",
-            "status": "planned_local_nas",
-            "connection_status": "not_checked",
+            "status": mediastore_status,
+            "connection_status": str(mediastore_profile.get("connection_status") or "not_checked"),
+            "credential_status": str(mediastore_profile.get("credential_status") or "missing"),
+            "credential_reference": str(MEDIASTORE_CREDENTIAL_PATH),
+            "mount_path": str(MEDIASTORE_MOUNT_PATH),
             "execution_available": False,
             "future_work": False,
-            "next_step": "define mount path, credentials, encryption, retention, and restore-test target before enabling NAS backup execution",
+            "next_step": _mediastore_target_next_step(mediastore_profile),
         },
         {
             "id": "backup-target.cloud.object-storage",
@@ -575,11 +592,15 @@ def _provider_class_rows() -> list[dict[str, object]]:
 def _provider_readiness_row(target: dict[str, object]) -> dict[str, object]:
     blockers = []
     if target.get("connection_status") != "ready":
-        blockers.append("connection not configured or tested")
+        blockers.append("connection not mounted and tested")
+    if target.get("credential_status") == "missing":
+        blockers.append("credentials not configured")
+    if target.get("credential_status") == "present" and target.get("provider_class") == "network_nas":
+        blockers.append("live mount approval and connectivity test pending")
     if target.get("future_work"):
         blockers.append("provider/service unavailable for testing")
     if target.get("provider_class") == "network_nas":
-        blockers.append("mount path, credentials, encryption, retention, and restore test are not configured")
+        blockers.append("retention, encryption, and restore test are not finalized")
     return {
         "id": target["id"],
         "name": target["name"],
@@ -587,12 +608,91 @@ def _provider_readiness_row(target: dict[str, object]) -> dict[str, object]:
         "target": target["target"],
         "role": target["role"],
         "status": target["status"],
+        "connection_status": target["connection_status"],
+        "credential_status": target.get("credential_status", "not_applicable"),
+        "credential_reference": target.get("credential_reference", ""),
+        "mount_path": target.get("mount_path", ""),
         "execution_available": False,
         "can_stage": True,
         "can_execute": False,
         "blockers": "; ".join(blockers),
         "next_step": target["next_step"],
     }
+
+
+def _local_provider_profiles(root: Path) -> list[dict[str, object]]:
+    return [_mediastore_local_profile(root)]
+
+
+def _mediastore_local_profile(root: Path) -> dict[str, object]:
+    credential_path = root / MEDIASTORE_CREDENTIAL_PATH
+    mount_path = root / MEDIASTORE_MOUNT_PATH
+    credential_status = "missing"
+    username_status = "missing"
+    credential_mode = "missing"
+    if credential_path.exists():
+        credential_status = "present"
+        username_status = "configured" if _credential_key_present(credential_path, "username") else "missing"
+        credential_mode = _credential_file_mode_status(credential_path)
+    mounted = mount_path.exists() and mount_path.is_mount()
+    connection_status = "ready" if mounted else "credentials_configured"
+    if credential_status == "missing" or username_status == "missing":
+        connection_status = "not_configured"
+    return {
+        "id": "backup-profile.nas.mediastore",
+        "name": "MediaStore",
+        "provider_class": "network_nas",
+        "share": MEDIASTORE_SHARE,
+        "credential_reference": str(MEDIASTORE_CREDENTIAL_PATH),
+        "credential_status": credential_status,
+        "credential_mode": credential_mode,
+        "username_status": username_status,
+        "mount_path": str(MEDIASTORE_MOUNT_PATH),
+        "mounted": mounted,
+        "connection_status": connection_status,
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+        "next_step": _mediastore_profile_next_step(credential_status, credential_mode, mounted),
+    }
+
+
+def _mediastore_target_next_step(profile: dict[str, object]) -> str:
+    if profile.get("credential_status") != "present":
+        return "create ignored MediaStore credential file before staging NAS mount approval"
+    if profile.get("credential_mode") != "owner_only":
+        return "restrict MediaStore credential file to owner-only permissions before use"
+    if not profile.get("mounted"):
+        return "stage Sisko/Kira approval for SMB/CIFS mount test at the configured local mount path"
+    return "stage disposable restore test and retention/encryption policy before enabling scheduled NAS backups"
+
+
+def _mediastore_profile_next_step(credential_status: str, credential_mode: str, mounted: bool) -> str:
+    if credential_status != "present":
+        return "store credentials only in ignored local-secrets before connection testing"
+    if credential_mode != "owner_only":
+        return "fix credential file permissions before any mount or backup attempt"
+    if not mounted:
+        return "mount/connectivity test requires explicit live system-change approval"
+    return "record restore-test evidence before marking MediaStore execution-ready"
+
+
+def _credential_key_present(path: Path, key: str) -> bool:
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == key and value.strip():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _credential_file_mode_status(path: Path) -> str:
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return "unreadable"
+    return "owner_only" if mode & 0o077 == 0 else "too_open"
 
 
 def _write_registry(root: Path, data: dict[str, object]) -> None:

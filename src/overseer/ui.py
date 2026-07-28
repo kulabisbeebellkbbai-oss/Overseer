@@ -1354,6 +1354,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (healthUrl) payload.health_url = healthUrl;
       const backupLabel = value("admin-backup-label");
       if (backupLabel) payload.backup_label = backupLabel;
+      const mountPath = value("admin-mount-path");
+      if (mountPath) payload.mount_path = mountPath;
+      const credentialFile = value("admin-credential-file");
+      if (credentialFile) payload.credential_file = credentialFile;
+      const filesystemType = value("admin-filesystem-type");
+      if (filesystemType) payload.filesystem_type = filesystemType;
       if (value("admin-use-firewalld") === "true") payload.use_firewalld = true;
       return await postJson("/admin/plans", payload);
     }
@@ -1958,6 +1964,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
               <div class="field span-6"><label for="admin-compose-scan-images">Scan Images</label><input id="admin-compose-scan-images" placeholder="penpotapp/frontend:2.17.0, postgres:15"></div>
               <div class="field span-6"><label for="admin-compose-residual-scan-findings">Residual Scan Findings</label><input id="admin-compose-residual-scan-findings" placeholder="penpotapp/exporter:2.17 retains critical findings after risk reduction"></div>
               <div class="field span-3"><label for="admin-backup-label">Backup Label</label><input id="admin-backup-label" placeholder="penpot-update"></div>
+              <div class="field span-4"><label for="admin-mount-path">Mount Path</label><input id="admin-mount-path" placeholder="/home/god/Documents/Codex Workspace/Overseer/local-secrets/mounts/mediastore"></div>
+              <div class="field span-5"><label for="admin-credential-file">Credential File</label><input id="admin-credential-file" placeholder="/home/god/Documents/Codex Workspace/Overseer/local-secrets/backup-providers/mediastore/credentials.conf"></div>
+              <div class="field span-3"><label for="admin-filesystem-type">Filesystem</label><input id="admin-filesystem-type" value="cifs"></div>
               <div class="field span-3"><label for="admin-use-firewalld">Firewall Backend</label><select id="admin-use-firewalld"><option value="false">ufw</option><option value="true">firewalld</option></select></div>
               <div class="field span-6"><label for="admin-reason">Reason</label><input id="admin-reason" value="operator requested maintenance"></div>
             </div>
@@ -2210,8 +2219,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">${table("SMART Health", storageEvidence.smart_health || [], ["device", "available", "status", "exit_code"])}</div>
           <div class="panel span-6">${table("Backup Markers", storageEvidence.backup_markers || [], ["path", "kind", "status"])}</div>
           <div class="panel span-12">${table("Backup Jobs", backupOperations.jobs || storageEvidence.backup_jobs || [], ["id", "target", "schedule", "retention", "status", "next_step"], {fills: {id: (row) => backupJobFill(row)}, fillView: "assets"})}</div>
-          <div class="panel span-12">${table("Backup Provider Targets", backupOperations.provider_targets || storageEvidence.backup_provider_targets || [], ["id", "name", "target", "provider_class", "protocols", "tooling", "role", "status", "next_step"])}</div>
-          <div class="panel span-12">${table("Backup Provider Readiness", backupOperations.provider_readiness || storageEvidence.backup_provider_readiness || [], ["id", "provider_class", "target", "role", "status", "can_stage", "can_execute", "blockers", "next_step"])}</div>
+          <div class="panel span-12">${table("Backup Provider Targets", backupOperations.provider_targets || storageEvidence.backup_provider_targets || [], ["id", "name", "target", "provider_class", "protocols", "tooling", "role", "status", "credential_status", "mount_path", "next_step"])}</div>
+          <div class="panel span-12">${table("Backup Provider Readiness", backupOperations.provider_readiness || storageEvidence.backup_provider_readiness || [], ["id", "provider_class", "target", "role", "status", "connection_status", "credential_status", "mount_path", "can_stage", "can_execute", "blockers", "next_step"])}</div>
+          <div class="panel span-12">${table("Backup Provider Local Profiles", backupOperations.provider_local_profiles || storageEvidence.backup_provider_local_profiles || [], ["id", "name", "share", "credential_status", "credential_mode", "username_status", "mount_path", "mounted", "connection_status", "next_step"])}</div>
           <div class="panel span-12">${table("Backup Provider Classes", backupOperations.provider_classes || storageEvidence.backup_provider_classes || [], ["provider_class", "standard_options", "current_target", "status", "test_status"])}</div>
           <div class="panel span-12">${table("Restore Tests", backupOperations.restore_tests || storageEvidence.restore_tests || [], ["id", "job_id", "restore_point", "status", "validated_by", "next_step"], {fills: {id: (row) => restoreTestFill(row), job_id: (row) => backupJobFill({id: row.job_id})}, fillView: "assets"})}</div>
           <div class="panel span-12">${table("Backup Execution Requests", backupOperations.backup_requests || storageEvidence.backup_requests || [], ["id", "source_path", "backup_path", "status", "approval_required", "next_step"], {fills: {id: (row) => backupExecutionFill(row), backup_path: (row) => restoreExecutionFill({backup_path: row.backup_path})}, fillView: "assets"})}</div>
@@ -2655,7 +2665,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function adminKindOptions() {
-      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "flatpak_install", "npm_global_install", "docker_compose_update", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function sourceDispositionOptions() {
       return ["needs_review", "expected", "benign", "suspicious", "hostile"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");

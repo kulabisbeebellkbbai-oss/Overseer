@@ -162,9 +162,11 @@ environment-specific policy wiring:
 - backup provider execution beyond project-local filesystem backup and isolated
   restore execution. Kira now exposes provider targets and readiness for
   `//MediaStore` NAS backups, cloud object storage, full clone, and hosted
-  failover shells. Only local NAS is the planned first remote target; cloud,
-  clone, and failover services are marked future work until testable providers
-  exist.
+  failover shells. MediaStore credentials can be configured in ignored local
+  secrets and surfaced as non-secret readiness evidence. Live mount testing,
+  retention/encryption policy, and isolated restore testing remain approval
+  gates. Cloud, clone, and failover services are marked future work until
+  testable providers exist.
 - live encryption enforcement, media mounting, and removable-device data
   transfer actions beyond the current read-only encryption trust and
   removable-media review panels.

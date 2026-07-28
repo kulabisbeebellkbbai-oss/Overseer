@@ -1627,6 +1627,9 @@ def _admin_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
         "health_url": str(payload["health_url"]) if payload.get("health_url") else None,
         "backup_label": str(payload["backup_label"]) if payload.get("backup_label") else None,
         "use_firewalld": bool(payload.get("use_firewalld", False)),
+        "mount_path": str(payload["mount_path"]) if payload.get("mount_path") else None,
+        "credential_file": str(payload["credential_file"]) if payload.get("credential_file") else None,
+        "filesystem_type": str(payload.get("filesystem_type", "cifs")),
     }
 
 

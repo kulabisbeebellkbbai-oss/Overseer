@@ -43,6 +43,7 @@ from .admin import (
     plan_firewall_allow_tcp,
     plan_firewall_deny_tcp,
     plan_npm_global_install,
+    plan_storage_mount_test,
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
@@ -3258,6 +3259,9 @@ def plan_admin_change_status(
     health_url: str | None = None,
     backup_label: str | None = None,
     use_firewalld: bool = False,
+    mount_path: str | None = None,
+    credential_file: str | None = None,
+    filesystem_type: str = "cifs",
 ) -> dict[str, object]:
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
@@ -3287,6 +3291,12 @@ def plan_admin_change_status(
             health_url=health_url,
             backup_label=backup_label,
         )
+    elif plan_kind == AdminChangeKind.STORAGE_MOUNT_TEST:
+        if not mount_path:
+            raise ValueError("mount_path is required for storage_mount_test")
+        if not credential_file:
+            raise ValueError("credential_file is required for storage_mount_test")
+        plan = plan_storage_mount_test(plan_id, target, mount_path, credential_file, reason, current_state, filesystem_type)
     elif plan_kind == AdminChangeKind.FIREWALL_ALLOW_TCP:
         if port is None:
             raise ValueError("port is required for firewall_allow_tcp")
@@ -3927,6 +3937,12 @@ def _admin_adapter_enablement_risks(kind: AdminChangeKind) -> list[str]:
             "Docker Compose updates can restart shared local services",
             "application image changes can run data migrations against mounted volumes",
             "rollback may require restoring local-only volume backups if application migrations are not reversible",
+        ]
+    if kind == AdminChangeKind.STORAGE_MOUNT_TEST:
+        return [
+            "storage mount tests can expose backup paths or write to the wrong target if the share is misidentified",
+            "network storage credentials must remain local-only and owner-readable",
+            "stale mounts can cause later backups to write to local disk instead of the NAS",
         ]
     if kind in {AdminChangeKind.FIREWALL_ALLOW_TCP, AdminChangeKind.FIREWALL_DENY_TCP, AdminChangeKind.BLOCK_IP}:
         return [
@@ -5459,6 +5475,15 @@ def admin_plan_review_brief(
             "delay until a maintenance window",
             "apply a narrower package set",
             "hold the package and record the exception",
+        )
+    elif kind == AdminChangeKind.STORAGE_MOUNT_TEST:
+        change = f"Temporarily mount storage target {plan.target} for connectivity validation."
+        remediation = "Validate the approved MediaStore backup path before any scheduled NAS backup execution is enabled."
+        impact = "Approval may create a temporary network filesystem mount and expose an empty or existing NAS backup path to the host."
+        alternatives = (
+            "delay NAS enablement and keep using project-local backups",
+            "run read-only name-resolution and SMB discovery checks first",
+            "choose a different backup provider or mount path",
         )
     elif kind == AdminChangeKind.USER_SERVICE_RESTART:
         change = f"Restart user service {plan.target}."
@@ -8554,6 +8579,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--compose-residual-scan-finding", action="append")
     admin_plan_parser.add_argument("--health-url")
     admin_plan_parser.add_argument("--backup-label")
+    admin_plan_parser.add_argument("--mount-path")
+    admin_plan_parser.add_argument("--credential-file")
+    admin_plan_parser.add_argument("--filesystem-type", default="cifs")
     admin_plan_parser.add_argument("--use-firewalld", action="store_true", help="stage firewalld-specific firewall_deny_tcp commands")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -9673,6 +9701,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.health_url,
                     args.backup_label,
                     args.use_firewalld,
+                    mount_path=args.mount_path,
+                    credential_file=args.credential_file,
+                    filesystem_type=args.filesystem_type,
                 ),
                 sort_keys=True,
             )

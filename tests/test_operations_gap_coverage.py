@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import shutil
 import subprocess
 import tempfile
@@ -616,8 +617,10 @@ class OperationsGapCoverageTests(unittest.TestCase):
             job = record_backup_job_status(root, "backup.test", "state/", schedule="daily", retention="7 days")
             restore = record_restore_test_status(root, "restore.test", "backup.test", "backups/restore-test.md")
             cleanup = stage_backup_cleanup_request_status(root, "artifacts", reason="review generated artifacts")
-            status = backup_operations_status(root)
-            evidence = storage_evidence_status(root)
+            with unittest.mock.patch("overseer.backup_ops._smb_helper_status", return_value="installed"):
+                with unittest.mock.patch("overseer.backup_ops.socket.getaddrinfo", return_value=[(0, 0, 0, "", ("192.0.2.50", 0))]):
+                    status = backup_operations_status(root)
+                    evidence = storage_evidence_status(root)
             media_target = next(row for row in status["provider_targets"] if row["name"] == "MediaStore")
             cloud_target = next(row for row in status["provider_targets"] if row["provider_class"] == "cloud_object_storage")
             media_readiness = next(row for row in status["provider_readiness"] if row["name"] == "MediaStore")
@@ -656,8 +659,10 @@ class OperationsGapCoverageTests(unittest.TestCase):
             credential_path.write_text("username=admin\npassword=redacted-test-secret\n", encoding="utf-8")
             credential_path.chmod(0o600)
 
-            status = backup_operations_status(root)
-            evidence = storage_evidence_status(root)
+            with unittest.mock.patch("overseer.backup_ops._smb_helper_status", return_value="installed"):
+                with unittest.mock.patch("overseer.backup_ops.socket.getaddrinfo", return_value=[(0, 0, 0, "", ("192.0.2.50", 0))]):
+                    status = backup_operations_status(root)
+                    evidence = storage_evidence_status(root)
             media_target = next(row for row in status["provider_targets"] if row["name"] == "MediaStore")
             media_readiness = next(row for row in status["provider_readiness"] if row["name"] == "MediaStore")
             media_profile = next(row for row in status["provider_local_profiles"] if row["name"] == "MediaStore")
@@ -666,13 +671,36 @@ class OperationsGapCoverageTests(unittest.TestCase):
         self.assertEqual(media_target["status"], "credentials_configured_pending_mount")
         self.assertEqual(media_readiness["connection_status"], "credentials_configured")
         self.assertEqual(media_readiness["credential_status"], "present")
+        self.assertEqual(media_readiness["smb_helper_status"], "installed")
+        self.assertEqual(media_readiness["name_resolution_status"], "resolved")
         self.assertIn("live mount approval", media_readiness["blockers"])
         self.assertEqual(media_profile["credential_mode"], "owner_only")
         self.assertEqual(media_profile["username_status"], "configured")
+        self.assertEqual(media_profile["resolved_addresses"], ["192.0.2.50"])
         self.assertFalse(media_profile["mounted"])
         self.assertFalse(status["host_mutation_performed"])
         self.assertFalse(evidence["host_mutation_performed"])
         self.assertNotIn("redacted-test-secret", json.dumps(status))
+
+    def test_mediastore_readiness_reports_missing_helper_and_unresolved_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credential_path = root / "local-secrets" / "backup-providers" / "mediastore" / "credentials.conf"
+            credential_path.parent.mkdir(parents=True)
+            credential_path.write_text("username=admin\npassword=redacted-test-secret\n", encoding="utf-8")
+            credential_path.chmod(0o600)
+
+            with unittest.mock.patch("overseer.backup_ops._smb_helper_status", return_value="missing"):
+                with unittest.mock.patch("overseer.backup_ops.socket.getaddrinfo", side_effect=socket.gaierror):
+                    status = backup_operations_status(root)
+            media_readiness = next(row for row in status["provider_readiness"] if row["name"] == "MediaStore")
+            media_profile = next(row for row in status["provider_local_profiles"] if row["name"] == "MediaStore")
+
+        self.assertEqual(media_readiness["smb_helper_status"], "missing")
+        self.assertEqual(media_readiness["name_resolution_status"], "unresolved")
+        self.assertIn("SMB/CIFS mount helper is not installed", media_readiness["blockers"])
+        self.assertIn("MediaStore name does not resolve", media_readiness["blockers"])
+        self.assertEqual(media_profile["next_step"], "install cifs-utils before retrying SMB/CIFS mount validation")
 
     def test_approved_backup_cleanup_deletes_project_artifact_with_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

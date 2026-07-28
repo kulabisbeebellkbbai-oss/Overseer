@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import hashlib
+import socket
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -506,6 +507,8 @@ def _provider_target_rows(root: Path, local_profiles: list[dict[str, object]]) -
             "connection_status": str(mediastore_profile.get("connection_status") or "not_checked"),
             "credential_status": str(mediastore_profile.get("credential_status") or "missing"),
             "credential_reference": str(MEDIASTORE_CREDENTIAL_PATH),
+            "smb_helper_status": str(mediastore_profile.get("smb_helper_status") or "not_checked"),
+            "name_resolution_status": str(mediastore_profile.get("name_resolution_status") or "not_checked"),
             "mount_path": str(MEDIASTORE_MOUNT_PATH),
             "execution_available": False,
             "future_work": False,
@@ -597,6 +600,10 @@ def _provider_readiness_row(target: dict[str, object]) -> dict[str, object]:
         blockers.append("credentials not configured")
     if target.get("credential_status") == "present" and target.get("provider_class") == "network_nas":
         blockers.append("live mount approval and connectivity test pending")
+    if target.get("smb_helper_status") == "missing":
+        blockers.append("SMB/CIFS mount helper is not installed")
+    if target.get("name_resolution_status") == "unresolved":
+        blockers.append("MediaStore name does not resolve")
     if target.get("future_work"):
         blockers.append("provider/service unavailable for testing")
     if target.get("provider_class") == "network_nas":
@@ -611,6 +618,8 @@ def _provider_readiness_row(target: dict[str, object]) -> dict[str, object]:
         "connection_status": target["connection_status"],
         "credential_status": target.get("credential_status", "not_applicable"),
         "credential_reference": target.get("credential_reference", ""),
+        "smb_helper_status": target.get("smb_helper_status", "not_checked"),
+        "name_resolution_status": target.get("name_resolution_status", "not_checked"),
         "mount_path": target.get("mount_path", ""),
         "execution_available": False,
         "can_stage": True,
@@ -627,6 +636,8 @@ def _local_provider_profiles(root: Path) -> list[dict[str, object]]:
 def _mediastore_local_profile(root: Path) -> dict[str, object]:
     credential_path = root / MEDIASTORE_CREDENTIAL_PATH
     mount_path = root / MEDIASTORE_MOUNT_PATH
+    helper_status = _smb_helper_status()
+    name_status = _host_resolution_status("MediaStore")
     credential_status = "missing"
     username_status = "missing"
     credential_mode = "missing"
@@ -647,12 +658,15 @@ def _mediastore_local_profile(root: Path) -> dict[str, object]:
         "credential_status": credential_status,
         "credential_mode": credential_mode,
         "username_status": username_status,
+        "smb_helper_status": helper_status,
+        "name_resolution_status": name_status["status"],
+        "resolved_addresses": name_status["addresses"],
         "mount_path": str(MEDIASTORE_MOUNT_PATH),
         "mounted": mounted,
         "connection_status": connection_status,
         "mutation_performed": False,
         "host_mutation_performed": False,
-        "next_step": _mediastore_profile_next_step(credential_status, credential_mode, mounted),
+        "next_step": _mediastore_profile_next_step(credential_status, credential_mode, helper_status, str(name_status["status"]), mounted),
     }
 
 
@@ -661,19 +675,45 @@ def _mediastore_target_next_step(profile: dict[str, object]) -> str:
         return "create ignored MediaStore credential file before staging NAS mount approval"
     if profile.get("credential_mode") != "owner_only":
         return "restrict MediaStore credential file to owner-only permissions before use"
+    if profile.get("smb_helper_status") != "installed":
+        return "install cifs-utils before retrying SMB/CIFS mount validation"
+    if profile.get("name_resolution_status") != "resolved":
+        return "configure MediaStore name resolution or use an approved NAS address before retrying mount validation"
     if not profile.get("mounted"):
         return "stage Sisko/Kira approval for SMB/CIFS mount test at the configured local mount path"
     return "stage disposable restore test and retention/encryption policy before enabling scheduled NAS backups"
 
 
-def _mediastore_profile_next_step(credential_status: str, credential_mode: str, mounted: bool) -> str:
+def _mediastore_profile_next_step(
+    credential_status: str,
+    credential_mode: str,
+    helper_status: str,
+    name_resolution_status: str,
+    mounted: bool,
+) -> str:
     if credential_status != "present":
         return "store credentials only in ignored local-secrets before connection testing"
     if credential_mode != "owner_only":
         return "fix credential file permissions before any mount or backup attempt"
+    if helper_status != "installed":
+        return "install cifs-utils before retrying SMB/CIFS mount validation"
+    if name_resolution_status != "resolved":
+        return "configure MediaStore name resolution or use an approved NAS address before retrying mount validation"
     if not mounted:
         return "mount/connectivity test requires explicit live system-change approval"
     return "record restore-test evidence before marking MediaStore execution-ready"
+
+
+def _smb_helper_status() -> str:
+    return "installed" if shutil.which("mount.cifs") else "missing"
+
+
+def _host_resolution_status(hostname: str) -> dict[str, object]:
+    try:
+        addresses = sorted({row[4][0] for row in socket.getaddrinfo(hostname, None)})
+    except socket.gaierror:
+        return {"status": "unresolved", "addresses": []}
+    return {"status": "resolved" if addresses else "unresolved", "addresses": addresses}
 
 
 def _credential_key_present(path: Path, key: str) -> bool:

@@ -343,6 +343,9 @@ def _smart_health_rows() -> list[dict[str, object]]:
     for device in sorted(Path("/dev").glob("sd?"))[:8]:
         try:
             completed = subprocess.run(("smartctl", "-H", str(device)), check=False, capture_output=True, text=True, timeout=2.0)
+        except FileNotFoundError:
+            rows.append({"device": device.name, "available": False, "status": "not_installed"})
+            continue
         except subprocess.TimeoutExpired:
             rows.append({"device": device.name, "available": True, "status": "timeout"})
             continue

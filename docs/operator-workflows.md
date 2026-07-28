@@ -383,17 +383,20 @@ hosted failover.
    `present`, but the password remains only in ignored `local-secrets`.
 4. Review Backup Provider Readiness and do not execute a provider whose
    `can_execute` field is false.
-5. Treat `credentials_configured_pending_mount` as staged, not ready. Live SMB
+5. Confirm `smb_helper_status` is `installed` and `name_resolution_status` is
+   `resolved` before retrying a MediaStore mount. Missing `cifs-utils` or an
+   unresolved `MediaStore` name blocks NAS validation before authentication.
+6. Treat `credentials_configured_pending_mount` as staged, not ready. Live SMB
    mount testing, retention/encryption policy, and an isolated restore test are
    still required before scheduled NAS backup execution.
-6. Treat cloud object storage, full clone, and hosted failover rows as future
+7. Treat cloud object storage, full clone, and hosted failover rows as future
    work until a real provider, credentials, network path, retention policy, and
    restore-test target exist.
-7. Prefer industry-standard tools and protocols: SMB/CIFS or NFS for NAS,
+8. Prefer industry-standard tools and protocols: SMB/CIFS or NFS for NAS,
    restic, borg, rclone, rsync, S3-compatible object storage, Azure Blob, Google
    Cloud Storage, ZFS/Btrfs send, LVM snapshots, image manifests, and
    infrastructure-as-code for failover.
-8. Before enabling live NAS execution, define mount path, encryption, retention,
+9. Before enabling live NAS execution, define mount path, encryption, retention,
    exclusions, monitoring, and an isolated restore test.
 
 ### Stage Backup Execution Request

@@ -163,10 +163,11 @@ environment-specific policy wiring:
   restore execution. Kira now exposes provider targets and readiness for
   `//MediaStore` NAS backups, cloud object storage, full clone, and hosted
   failover shells. MediaStore credentials can be configured in ignored local
-  secrets and surfaced as non-secret readiness evidence. Live mount testing,
-  retention/encryption policy, and isolated restore testing remain approval
-  gates. Cloud, clone, and failover services are marked future work until
-  testable providers exist.
+  secrets and surfaced as non-secret readiness evidence. Helper availability
+  and MediaStore name resolution are reported before mount retry. Live mount
+  testing, retention/encryption policy, and isolated restore testing remain
+  approval gates. Cloud, clone, and failover services are marked future work
+  until testable providers exist.
 - live encryption enforcement, media mounting, and removable-device data
   transfer actions beyond the current read-only encryption trust and
   removable-media review panels.

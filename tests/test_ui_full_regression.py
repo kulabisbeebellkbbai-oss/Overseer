@@ -934,6 +934,8 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
         self.assertIn("Backup Provider Local Profiles", OPERATOR_CONSOLE_HTML)
         self.assertIn("Backup Provider Classes", OPERATOR_CONSOLE_HTML)
         self.assertIn("credential_status", OPERATOR_CONSOLE_HTML)
+        self.assertIn("smb_helper_status", OPERATOR_CONSOLE_HTML)
+        self.assertIn("name_resolution_status", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Growth Snapshot", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Risk Alerts", OPERATOR_CONSOLE_HTML)
         self.assertIn("Storage Encryption Trust", OPERATOR_CONSOLE_HTML)

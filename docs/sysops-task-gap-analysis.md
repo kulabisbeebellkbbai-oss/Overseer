@@ -194,8 +194,9 @@ filesystem growth trend snapshots, metadata-only storage risk alerts for local
 databases, WAL/SHM sidecars, ignored exports, encryption trust evidence,
 removable-media approval review, and provider planning. Kira now lists
 `//MediaStore/Overseer` as the first planned remote NAS target, reports local
-credential readiness without exposing secrets, and exposes future shells for
-cloud object storage, full cloning, and hosted failover.
+credential, SMB helper, and name-resolution readiness without exposing secrets,
+and exposes future shells for cloud object storage, full cloning, and hosted
+failover.
 Claims can protect shared storage before changes. Backup and restore execution
 write ignored local manifests and block unsafe paths.
 
@@ -203,9 +204,10 @@ Gaps:
 
 - No live NAS/cloud/clone/failover backup execution beyond project-local
   filesystem backup and isolated restore execution. MediaStore still needs live
-  mount testing, retention/encryption policy, and isolated restore testing
-  before scheduled NAS backup execution. Cloud, clone, and failover are future
-  work until services are available for testing.
+  mount testing after `cifs-utils` and name resolution are ready, plus
+  retention/encryption policy and isolated restore testing before scheduled NAS
+  backup execution. Cloud, clone, and failover are future work until services
+  are available for testing.
 
 ### Physical Devices, Power, And Lab Assets
 

@@ -18,10 +18,12 @@ from .agent_contracts import (
     AgentDispatchRequest,
     AgentDispatchResult,
     AgentHandoffPackage,
+    AgentInstanceTransition,
     AgentInstanceProfile,
     AgentOperationState,
     AgentProvider,
     AgentSession,
+    AgentTransitionState,
     DriverEpoch,
 )
 from .audit import ApprovalRequest, AuditEvent, AuditEventType
@@ -44,6 +46,27 @@ CURRENT_SCHEMA_VERSION = 1
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
+AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
+_AGENT_TRANSITION_SUCCESSORS = {
+    AgentTransitionState.IMPORTING: {
+        AgentTransitionState.RECONCILING,
+        AgentTransitionState.FAILED,
+        AgentTransitionState.COMPLETED,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.RECONCILING: {
+        AgentTransitionState.RECONCILING,
+        AgentTransitionState.FAILED,
+        AgentTransitionState.COMPLETED,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.FAILED: {
+        AgentTransitionState.RECONCILING,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.COMPLETED: set(),
+    AgentTransitionState.ROLLED_BACK: set(),
+}
 _REDACTED_AGENT_TRANSCRIPT = "[redacted agent transcript]"
 _REDACTED_DISPATCH_PROMPT = "[redacted dispatch prompt]"
 _AGENT_CREDENTIAL_KEYS = frozenset(
@@ -115,6 +138,19 @@ class SchemaMigration:
     version: int | str
     description: str
     applied_at: str
+
+
+@dataclass(frozen=True)
+class AgentActivationReservation:
+    instance_id: str
+    reservation_id: str
+    owner_id: str
+    generation: int
+    state: str
+    started_at: str
+    lease_expires_at: str
+    epoch_id: str | None
+    reason: str | None
 
 
 class SQLiteStore:
@@ -371,10 +407,42 @@ class SQLiteStore:
                 CREATE TABLE IF NOT EXISTS agent_activation_reservations (
                     instance_id TEXT PRIMARY KEY,
                     reservation_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
+                    generation INTEGER NOT NULL DEFAULT 1,
                     state TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00',
+                    lease_expires_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00',
                     epoch_id TEXT,
                     reason TEXT
                 )
+                """
+            )
+            self._migrate_agent_activation_leases()
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_instance_transitions (
+                    instance_id TEXT PRIMARY KEY,
+                    handoff_id TEXT NOT NULL,
+                    outgoing_epoch_id TEXT NOT NULL,
+                    incoming_epoch_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS agent_dispatch_transition_fence
+                BEFORE INSERT ON agent_dispatches
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM agent_instance_transitions
+                    WHERE instance_id = NEW.instance_id
+                      AND state IN ('importing', 'reconciling', 'failed')
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'agent transition active');
+                END
                 """
             )
             self._record_agent_schema_migration(
@@ -389,6 +457,36 @@ class SQLiteStore:
                 AGENT_DRIVER_SCHEMA_V3,
                 "persist atomic agent activation reservations",
             )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V4,
+                "fence agent transitions and lease activation ownership",
+            )
+
+    def _migrate_agent_activation_leases(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(agent_activation_reservations)"
+            ).fetchall()
+        }
+        additions = (
+            ("owner_id", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("generation", "INTEGER NOT NULL DEFAULT 1"),
+            (
+                "started_at",
+                "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+            ),
+            (
+                "lease_expires_at",
+                "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+            ),
+        )
+        for name, declaration in additions:
+            if name not in columns:
+                self._connection.execute(
+                    f"ALTER TABLE agent_activation_reservations "
+                    f"ADD COLUMN {name} {declaration}"
+                )
 
     def _migrate_agent_dispatch_scope(self) -> None:
         columns = {
@@ -588,14 +686,47 @@ class SQLiteStore:
         self,
         instance_id: str,
         reservation_id: str,
+        *,
+        owner_id: str,
+        started_at: str,
+        lease_expires_at: str,
+        allow_blocked_retry: bool,
+        observed_at: str,
     ) -> bool:
         cursor = self._connection.execute(
             """
-            INSERT OR IGNORE INTO agent_activation_reservations
-                (instance_id, reservation_id, state)
-            VALUES (?, ?, 'starting')
+            INSERT INTO agent_activation_reservations
+                (
+                    instance_id, reservation_id, owner_id, generation, state,
+                    started_at, lease_expires_at, epoch_id, reason
+                )
+            VALUES (?, ?, ?, 1, 'starting', ?, ?, NULL, NULL)
+            ON CONFLICT(instance_id) DO UPDATE SET
+                reservation_id = excluded.reservation_id,
+                owner_id = excluded.owner_id,
+                generation = agent_activation_reservations.generation + 1,
+                state = 'starting',
+                started_at = excluded.started_at,
+                lease_expires_at = excluded.lease_expires_at,
+                epoch_id = NULL,
+                reason = NULL
+            WHERE (
+                agent_activation_reservations.state = 'blocked' AND ? = 1
+            ) OR (
+                agent_activation_reservations.state = 'starting'
+                AND julianday(agent_activation_reservations.lease_expires_at)
+                    <= julianday(?)
+            )
             """,
-            (instance_id, reservation_id),
+            (
+                instance_id,
+                reservation_id,
+                owner_id,
+                started_at,
+                lease_expires_at,
+                int(allow_blocked_retry),
+                observed_at,
+            ),
         )
         self._connection.commit()
         return cursor.rowcount == 1
@@ -603,25 +734,32 @@ class SQLiteStore:
     def load_agent_activation(
         self,
         instance_id: str,
-    ) -> tuple[str, str, str | None, str | None]:
+    ) -> AgentActivationReservation:
         row = self._connection.execute(
-            "SELECT reservation_id, state, epoch_id, reason "
+            "SELECT instance_id, reservation_id, owner_id, generation, state, "
+            "started_at, lease_expires_at, epoch_id, reason "
             "FROM agent_activation_reservations WHERE instance_id = ?",
             (instance_id,),
         ).fetchone()
         if row is None:
             raise KeyError(instance_id)
-        return (
-            str(row["reservation_id"]),
-            str(row["state"]),
-            str(row["epoch_id"]) if row["epoch_id"] is not None else None,
-            str(row["reason"]) if row["reason"] is not None else None,
+        return AgentActivationReservation(
+            instance_id=str(row["instance_id"]),
+            reservation_id=str(row["reservation_id"]),
+            owner_id=str(row["owner_id"]),
+            generation=int(row["generation"]),
+            state=str(row["state"]),
+            started_at=str(row["started_at"]),
+            lease_expires_at=str(row["lease_expires_at"]),
+            epoch_id=str(row["epoch_id"]) if row["epoch_id"] is not None else None,
+            reason=str(row["reason"]) if row["reason"] is not None else None,
         )
 
     def finish_agent_activation(
         self,
         instance_id: str,
         reservation_id: str,
+        owner_id: str,
         state: str,
         *,
         epoch_id: str | None = None,
@@ -631,13 +769,104 @@ class SQLiteStore:
             """
             UPDATE agent_activation_reservations
             SET state = ?, epoch_id = ?, reason = ?
-            WHERE instance_id = ? AND reservation_id = ?
+            WHERE instance_id = ? AND reservation_id = ? AND owner_id = ?
+                AND state = 'starting'
             """,
-            (state, epoch_id, reason, instance_id, reservation_id),
+            (state, epoch_id, reason, instance_id, reservation_id, owner_id),
         )
         if cursor.rowcount != 1:
             raise ValueError("activation reservation ownership changed")
         self._commit_agent_mutation()
+
+    def begin_agent_transition(self, transition: AgentInstanceTransition) -> bool:
+        if transition.state is not AgentTransitionState.IMPORTING:
+            raise ValueError("new agent transition must begin in importing state")
+        payload = json.dumps(
+            to_jsonable(transition),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        cursor = self._connection.execute(
+            """
+            INSERT INTO agent_instance_transitions
+                (
+                    instance_id, handoff_id, outgoing_epoch_id,
+                    incoming_epoch_id, state, payload
+                )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(instance_id) DO UPDATE SET
+                handoff_id = excluded.handoff_id,
+                outgoing_epoch_id = excluded.outgoing_epoch_id,
+                incoming_epoch_id = excluded.incoming_epoch_id,
+                state = excluded.state,
+                payload = excluded.payload
+            WHERE agent_instance_transitions.state IN ('completed', 'rolled_back')
+            """,
+            (
+                transition.instance_id,
+                transition.handoff_id,
+                transition.outgoing_epoch_id,
+                transition.incoming_epoch_id,
+                transition.state.value,
+                payload,
+            ),
+        )
+        self._commit_agent_mutation()
+        return cursor.rowcount == 1
+
+    def save_agent_transition(self, transition: AgentInstanceTransition) -> None:
+        current = self.load_agent_transition(transition.instance_id)
+        if (
+            current.handoff_id != transition.handoff_id
+            or current.outgoing_epoch_id != transition.outgoing_epoch_id
+            or current.incoming_epoch_id != transition.incoming_epoch_id
+        ):
+            raise ValueError("agent transition identity cannot change")
+        if transition.state not in _AGENT_TRANSITION_SUCCESSORS[current.state]:
+            raise ValueError(
+                f"invalid agent transition {current.state.value} "
+                f"to {transition.state.value}"
+            )
+        payload = json.dumps(
+            to_jsonable(transition),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        cursor = self._connection.execute(
+            """
+            UPDATE agent_instance_transitions
+            SET state = ?, payload = ?
+            WHERE instance_id = ? AND handoff_id = ? AND state = ?
+            """,
+            (
+                transition.state.value,
+                payload,
+                transition.instance_id,
+                transition.handoff_id,
+                current.state.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("agent transition state changed concurrently")
+        self._commit_agent_mutation()
+
+    def load_agent_transition(self, instance_id: str) -> AgentInstanceTransition:
+        row = self._connection.execute(
+            "SELECT payload FROM agent_instance_transitions WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(instance_id)
+        return _load_dataclass(AgentInstanceTransition, str(row["payload"]))
+
+    def list_agent_transitions(self) -> tuple[AgentInstanceTransition, ...]:
+        rows = self._connection.execute(
+            "SELECT payload FROM agent_instance_transitions ORDER BY instance_id"
+        ).fetchall()
+        return tuple(
+            _load_dataclass(AgentInstanceTransition, str(row["payload"]))
+            for row in rows
+        )
 
     def load_agent_session(self, session_id: str) -> AgentSession:
         return _load_dataclass(AgentSession, self._get_payload("agent_sessions", session_id))

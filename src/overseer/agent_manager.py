@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import time
 from typing import Callable, Protocol
@@ -15,8 +15,11 @@ from .agent_contracts import (
     AgentDispatchRequest,
     AgentDispatchResult,
     AgentErrorCategory,
+    AgentHandoffPackage,
+    AgentInstanceTransition,
     AgentOperationState,
     AgentSession,
+    AgentTransitionState,
     DriverEpoch,
 )
 from .agent_handoff import AgentHandoffService
@@ -49,6 +52,17 @@ class AgentHandoffError(AgentManagerError):
     """Raised after an incoming provider fails to acknowledge a handoff."""
 
 
+class AgentTransitionRequiredError(AgentManagerPausedError):
+    """Raised when explicit transition reconciliation or rollback is required."""
+
+    def __init__(self, transition: AgentInstanceTransition) -> None:
+        self.transition = transition
+        super().__init__(
+            f"agent instance {transition.instance_id} transition "
+            f"{transition.state.value} requires reconcile or rollback"
+        )
+
+
 _ACKNOWLEDGED_STATES = {
     AgentOperationState.ACKNOWLEDGED,
     AgentOperationState.RUNNING,
@@ -65,6 +79,11 @@ _TERMINAL_RESULT_STATES = {
     AgentOperationState.QUARANTINED,
 }
 MAX_CHECKPOINT_AGE_SECONDS = 300
+_BLOCKING_TRANSITION_STATES = {
+    AgentTransitionState.IMPORTING,
+    AgentTransitionState.RECONCILING,
+    AgentTransitionState.FAILED,
+}
 
 
 class AgentManager:
@@ -79,6 +98,8 @@ class AgentManager:
         handoffs: AgentHandoffService | None = None,
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        activation_lease_seconds: float = 30.0,
+        activation_wait_seconds: float = 5.0,
     ) -> None:
         if not callable(authorization_callback):
             raise TypeError("authorization_callback must be callable")
@@ -89,13 +110,24 @@ class AgentManager:
             lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
         )
         self._id_factory = id_factory or (lambda prefix: f"{prefix}.{uuid4().hex}")
+        if activation_lease_seconds <= 0 or activation_wait_seconds < 0:
+            raise ValueError("activation lease must be positive and wait non-negative")
+        self._activation_lease_seconds = activation_lease_seconds
+        self._activation_wait_seconds = activation_wait_seconds
+        self._activation_owner_id = self._id_factory("manager")
         self.handoffs = handoffs or AgentHandoffService(
             store,
             clock=self._clock,
             id_factory=lambda: self._id_factory("handoff"),
         )
 
-    def activate(self, instance_id: str, initiated_by: str) -> DriverEpoch:
+    def activate(
+        self,
+        instance_id: str,
+        initiated_by: str,
+        *,
+        retry_blocked: bool = False,
+    ) -> DriverEpoch:
         self._require_authorized(
             "activate",
             {
@@ -103,6 +135,7 @@ class AgentManager:
                 "initiated_by": initiated_by,
             },
         )
+        self._raise_transition_required(instance_id)
         open_epochs = self._authoritative_epochs(instance_id)
         if len(open_epochs) == 1:
             return open_epochs[0]
@@ -113,7 +146,20 @@ class AgentManager:
         profile = self.registry.profile(instance_id)
         driver = self.registry.driver(instance_id)
         reservation_id = self._id_factory("activation")
-        if not self.store.reserve_agent_activation(instance_id, reservation_id):
+        started_at = self._clock()
+        lease_expires_at = (
+            _aware_datetime(started_at)
+            + timedelta(seconds=self._activation_lease_seconds)
+        ).isoformat()
+        if not self.store.reserve_agent_activation(
+            instance_id,
+            reservation_id,
+            owner_id=self._activation_owner_id,
+            started_at=started_at,
+            lease_expires_at=lease_expires_at,
+            allow_blocked_retry=retry_blocked,
+            observed_at=started_at,
+        ):
             return self._await_activation_winner(instance_id)
         try:
             start_result = driver.start(profile)
@@ -121,6 +167,7 @@ class AgentManager:
             self.store.finish_agent_activation(
                 instance_id,
                 reservation_id,
+                self._activation_owner_id,
                 "blocked",
                 reason=AgentErrorCategory.PROVIDER_UNAVAILABLE.value,
             )
@@ -136,6 +183,7 @@ class AgentManager:
             self.store.finish_agent_activation(
                 instance_id,
                 reservation_id,
+                self._activation_owner_id,
                 "blocked",
                 reason=category.value,
             )
@@ -155,6 +203,7 @@ class AgentManager:
             self.store.finish_agent_activation(
                 instance_id,
                 reservation_id,
+                self._activation_owner_id,
                 "active",
                 epoch_id=epoch.id,
             )
@@ -173,6 +222,7 @@ class AgentManager:
                 "initiated_by": initiated_by,
             },
         )
+        self._raise_transition_required(session.instance_id)
         driver = self.registry.driver_for_provider(
             session.provider_id,
             instance_id=session.instance_id,
@@ -241,6 +291,10 @@ class AgentManager:
         idempotency_key: str,
         requested_by: str | None = None,
     ) -> AgentDispatchResult:
+        self._raise_transition_required(
+            instance_id,
+            error_type=AgentManagerPausedError,
+        )
         recorded = self._dispatch_for_idempotency_key(instance_id, idempotency_key)
         if recorded is not None:
             return self._result_from_dispatch(recorded)
@@ -276,6 +330,10 @@ class AgentManager:
                 instance_id, idempotency_key
             )
             if winner is None:
+                self._raise_transition_required(
+                    instance_id,
+                    error_type=AgentManagerPausedError,
+                )
                 raise
             return self._result_from_dispatch(winner)
         driver = self.registry.driver_for_provider(
@@ -298,6 +356,10 @@ class AgentManager:
         return self.record_provider_result(epoch.id, result)
 
     def checkpoint(self, instance_id: str) -> AgentCheckpoint:
+        self._raise_transition_required(
+            instance_id,
+            error_type=AgentManagerPausedError,
+        )
         checkpoint = self._collect_checkpoint(instance_id)
         self.store.save_agent_checkpoint(checkpoint)
         return checkpoint
@@ -344,6 +406,10 @@ class AgentManager:
         initiated_by: str,
         approval_id: str,
     ) -> DriverEpoch:
+        self._raise_transition_required(
+            instance_id,
+            error_type=AgentHandoffError,
+        )
         outgoing = self.active_epoch(instance_id)
         if outgoing.state not in _DISPATCHABLE_STATES:
             raise AgentManagerPausedError(
@@ -403,6 +469,18 @@ class AgentManager:
                     "status": "importing",
                 },
             )
+            transition = AgentInstanceTransition(
+                instance_id=instance_id,
+                handoff_id=package.id,
+                outgoing_epoch_id=outgoing.id,
+                incoming_epoch_id=incoming.id,
+                state=AgentTransitionState.IMPORTING,
+                updated_at=self._clock(),
+            )
+            if not self.store.begin_agent_transition(transition):
+                raise AgentHandoffError(
+                    f"agent instance {instance_id} transition is already active"
+                )
             self.store.save_agent_handoff(package)
             self.store.save_driver_epoch(incoming)
         try:
@@ -441,18 +519,98 @@ class AgentManager:
             },
         )
         package = self.store.load_agent_handoff(handoff_id)
-        if package.evidence.get("status") != "importing":
+        transition = self.store.load_agent_transition(package.instance_id)
+        if (
+            transition.handoff_id != package.id
+            or transition.state
+            not in {
+                AgentTransitionState.IMPORTING,
+                AgentTransitionState.RECONCILING,
+                AgentTransitionState.FAILED,
+            }
+        ):
             raise AgentHandoffError("handoff is not awaiting reconciliation")
         incoming = self.store.load_driver_epoch(
             str(package.evidence["incoming_epoch_id"])
         )
         outgoing = self.store.load_driver_epoch(package.outgoing_epoch_id)
+        if incoming.closed_at is not None:
+            raise AgentHandoffError("closed incoming transition requires rollback")
+        with self.store.agent_transaction():
+            transition = replace(
+                transition,
+                state=AgentTransitionState.RECONCILING,
+                updated_at=self._clock(),
+                reason=None,
+            )
+            self.store.save_agent_transition(transition)
+            package = replace(
+                package,
+                evidence={**package.evidence, "status": "reconciling"},
+            )
+            self.store.save_agent_handoff(package)
         incoming, failure = self._complete_handoff(
             package, outgoing, incoming, result, invalid_state="quarantined"
         )
         if failure is not None:
             raise AgentHandoffError(failure.value)
         return incoming
+
+    def rollback_handoff(
+        self,
+        handoff_id: str,
+        *,
+        initiated_by: str,
+    ) -> DriverEpoch:
+        self._require_authorized(
+            "rollback_handoff",
+            {
+                "handoff_id": handoff_id,
+                "initiated_by": initiated_by,
+            },
+        )
+        package = self.store.load_agent_handoff(handoff_id)
+        transition = self.store.load_agent_transition(package.instance_id)
+        if (
+            transition.handoff_id != handoff_id
+            or transition.state not in _BLOCKING_TRANSITION_STATES
+        ):
+            raise AgentHandoffError("handoff transition cannot be rolled back")
+        outgoing = self.store.load_driver_epoch(transition.outgoing_epoch_id)
+        incoming = self.store.load_driver_epoch(transition.incoming_epoch_id)
+        if outgoing.closed_at is not None:
+            raise AgentHandoffError("closed outgoing epoch cannot be resumed")
+        with self.store.agent_transaction():
+            if incoming.closed_at is None:
+                self.store.save_driver_epoch(
+                    replace(
+                        incoming,
+                        state=AgentOperationState.CANCELLED,
+                        closed_at=self._clock(),
+                        reason="handoff_rolled_back",
+                    )
+                )
+            outgoing = replace(
+                outgoing,
+                state=AgentOperationState.RUNNING,
+                reason="handoff_rolled_back",
+            )
+            self.store.save_driver_epoch(outgoing)
+            self.store.save_agent_handoff(
+                replace(
+                    package,
+                    evidence={**package.evidence, "status": "rolled_back"},
+                )
+            )
+            self.store.save_agent_transition(
+                replace(
+                    transition,
+                    state=AgentTransitionState.ROLLED_BACK,
+                    updated_at=self._clock(),
+                    reason="operator_rollback",
+                )
+            )
+        return outgoing
 
     def _complete_handoff(
         self,
@@ -514,6 +672,15 @@ class AgentManager:
                         },
                     )
                 )
+                transition = self.store.load_agent_transition(package.instance_id)
+                self.store.save_agent_transition(
+                    replace(
+                        transition,
+                        state=AgentTransitionState.FAILED,
+                        updated_at=self._clock(),
+                        reason=failure.value,
+                    )
+                )
             else:
                 session = self.store.load_agent_session(incoming.session_id)
                 self.store.save_agent_session(
@@ -532,6 +699,15 @@ class AgentManager:
                 )
                 self._close_epoch(outgoing, replacement_epoch_id=incoming.id)
                 self.store.save_driver_epoch(incoming)
+                transition = self.store.load_agent_transition(package.instance_id)
+                self.store.save_agent_transition(
+                    replace(
+                        transition,
+                        state=AgentTransitionState.COMPLETED,
+                        updated_at=self._clock(),
+                        reason=None,
+                    )
+                )
         return incoming, failure
 
     def record_provider_result(
@@ -727,15 +903,43 @@ class AgentManager:
             )
         )
 
+    def _blocking_transition(
+        self,
+        instance_id: str,
+    ) -> AgentInstanceTransition | None:
+        try:
+            transition = self.store.load_agent_transition(instance_id)
+        except KeyError:
+            return None
+        if transition.state in _BLOCKING_TRANSITION_STATES:
+            return transition
+        return None
+
+    def _raise_transition_required(
+        self,
+        instance_id: str,
+        *,
+        error_type: type[AgentManagerError] | None = None,
+    ) -> None:
+        transition = self._blocking_transition(instance_id)
+        if transition is None:
+            return
+        if error_type is None:
+            raise AgentTransitionRequiredError(transition)
+        raise error_type(
+            f"agent instance {instance_id} transition "
+            f"{transition.state.value} blocks this operation"
+        )
+
     def _await_activation_winner(self, instance_id: str) -> DriverEpoch:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + self._activation_wait_seconds
         while time.monotonic() < deadline:
-            _, state, epoch_id, reason = self.store.load_agent_activation(instance_id)
-            if state == "active" and epoch_id is not None:
-                return self.store.load_driver_epoch(epoch_id)
-            if state == "blocked":
+            reservation = self.store.load_agent_activation(instance_id)
+            if reservation.state == "active" and reservation.epoch_id is not None:
+                return self.store.load_driver_epoch(reservation.epoch_id)
+            if reservation.state == "blocked":
                 raise AgentManagerError(
-                    f"activation failed: {reason or 'blocked'}"
+                    f"activation blocked: {reservation.reason or 'unknown'}"
                 )
             time.sleep(0.01)
         raise AgentManagerError("activation reservation did not complete")

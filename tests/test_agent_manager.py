@@ -21,12 +21,15 @@ from overseer.agent_contracts import (
     AgentOperationState,
     AgentProvider,
     AgentSession,
+    AgentTransitionState,
 )
 from overseer.agent_manager import (
     AgentAuthorizationError,
     AgentHandoffError,
     AgentManager,
+    AgentManagerError,
     AgentManagerPausedError,
+    AgentTransitionRequiredError,
 )
 from overseer.agent_registry import AgentRegistry
 from overseer.core import OwnerDomain
@@ -56,6 +59,9 @@ class FakeDriver:
         self.last_import_result: AgentDispatchResult | None = None
         self.start_entered: Event | None = None
         self.start_release: Event | None = None
+        self.start_error_count = 0
+        self.import_entered: Event | None = None
+        self.import_release: Event | None = None
 
     def _result(
         self,
@@ -93,6 +99,9 @@ class FakeDriver:
             self.start_entered.set()
         if self.start_release is not None:
             self.start_release.wait(timeout=5)
+        if self.start_error_count:
+            self.start_error_count -= 1
+            raise RuntimeError("transient provider start failure")
         return self._result(
             request_id=f"activate.{self.provider.id}",
             session_id=f"external.{self.provider.id}.1",
@@ -157,6 +166,10 @@ class FakeDriver:
         package: AgentHandoffPackage,
     ) -> AgentDispatchResult:
         self.events.append(f"import:{self.provider.id}")
+        if self.import_entered is not None:
+            self.import_entered.set()
+        if self.import_release is not None:
+            self.import_release.wait(timeout=5)
         category = (
             AgentErrorCategory.HANDOFF_INCOMPATIBLE
             if self.import_state is AgentOperationState.FAILED
@@ -588,7 +601,7 @@ def test_handoff_rejects_acknowledgement_with_mismatched_binding(
     assert transition.state is AgentOperationState.BLOCKED
 
 
-def test_failed_import_leaves_auditable_transition_and_outgoing_authoritative(
+def test_failed_import_pauses_dispatch_until_explicit_rollback(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
     value, store, drivers, _ = manager
@@ -621,8 +634,69 @@ def test_failed_import_leaves_auditable_transition_and_outgoing_authoritative(
     assert handoff_evidence["incoming_session_id"]
     transition = store.load_driver_epoch(str(handoff_evidence["incoming_epoch_id"]))
     assert transition.state is AgentOperationState.BLOCKED
+    assert (
+        store.load_agent_transition(outgoing.instance_id).state
+        is AgentTransitionState.FAILED
+    )
+    with pytest.raises(AgentManagerPausedError, match="transition"):
+        value.dispatch("overseer.default", "must remain paused", "paused-key")
+
+    resumed = value.rollback_handoff(
+        store.list_agent_handoffs()[0].id,
+        initiated_by="operator",
+    )
+    assert resumed.id == outgoing.id
+    assert (
+        store.load_agent_transition(outgoing.instance_id).state
+        is AgentTransitionState.ROLLED_BACK
+    )
     result = value.dispatch("overseer.default", "continue safely", "outgoing-key")
     assert result.driver_epoch_id == outgoing.id
+
+
+def test_phase_a_fence_blocks_dispatch_and_competing_handoff(tmp_path: Path) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path) as store:
+        AgentManager(registry, store, authorization_callback=_allow).activate(
+            "overseer.default", initiated_by="operator"
+        )
+
+    driver = registry.driver_for_provider("claude", instance_id="overseer.default")
+    assert driver is drivers["claude"]
+    driver.import_entered = Event()
+    driver.import_release = Event()
+    errors: list[BaseException] = []
+
+    def handoff() -> None:
+        try:
+            with OverseerStore(path) as store:
+                AgentManager(
+                    registry, store, authorization_callback=_allow
+                ).manual_handoff(
+                    "overseer.default", "claude", "operator", "approval.fence"
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=handoff)
+    worker.start()
+    assert driver.import_entered.wait(timeout=5)
+
+    with OverseerStore(path) as store:
+        manager = AgentManager(registry, store, authorization_callback=_allow)
+        with pytest.raises(AgentManagerPausedError, match="transition"):
+            manager.dispatch("overseer.default", "must not dispatch", "fenced-key")
+        with pytest.raises(AgentHandoffError, match="transition"):
+            manager.manual_handoff(
+                "overseer.default", "claude", "operator", "approval.competing"
+            )
+        assert store.list_agent_dispatches() == ()
+
+    driver.import_release.set()
+    worker.join(timeout=5)
+    assert errors == []
 
 
 def test_manual_handoff_requires_callback_approval_before_any_mutation(
@@ -867,6 +941,10 @@ def test_handoff_phase_b_failure_preserves_durable_importing_state(
         assert incoming.state is AgentOperationState.QUEUED
         assert incoming.closed_at is None
         assert store.list_agent_dispatch_results() == ()
+        with pytest.raises(AgentTransitionRequiredError) as transition_required:
+            value.recover(outgoing.session_id, initiated_by="operator")
+        assert transition_required.value.transition.handoff_id == handoff.id
+        assert store.load_driver_epoch(outgoing.id) == outgoing
 
 
 def test_provider_checkpoint_created_at_controls_freshness(
@@ -896,6 +974,10 @@ def test_successful_handoff_persists_verified_external_session_identity(
     session = store.load_agent_session(incoming.session_id)
     assert session.external_session_id == "external.claude.handoff"
     assert not session.external_session_id.startswith("handoff.")
+    assert (
+        store.load_agent_transition(incoming.instance_id).state
+        is AgentTransitionState.COMPLETED
+    )
 
 
 def test_crash_after_external_success_keeps_importing_state_for_reconciliation(
@@ -972,6 +1054,140 @@ def test_concurrent_activation_reservation_starts_provider_once(tmp_path: Path) 
     assert len(results) == 2
     assert results[0] == results[1]
     assert driver.start_calls == 1
+
+
+def test_blocked_activation_requires_explicit_retry(tmp_path: Path) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    path = tmp_path / "state.sqlite3"
+    driver = registry.driver("overseer.default")
+    assert driver is drivers["codex"]
+    driver.start_error_count = 1
+
+    with OverseerStore(path) as store:
+        manager = AgentManager(
+            registry,
+            store,
+            authorization_callback=_allow,
+            activation_wait_seconds=0.05,
+        )
+        with pytest.raises(RuntimeError, match="transient"):
+            manager.activate("overseer.default", initiated_by="operator")
+        with pytest.raises(AgentManagerError, match="blocked"):
+            manager.activate("overseer.default", initiated_by="operator")
+        epoch = manager.activate(
+            "overseer.default",
+            initiated_by="operator",
+            retry_blocked=True,
+        )
+
+    assert epoch.state is AgentOperationState.RUNNING
+    assert driver.start_calls == 2
+
+
+def test_stale_activation_owner_can_be_replaced_but_live_owner_cannot(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    path = tmp_path / "state.sqlite3"
+    now = "2026-07-29T12:00:00+00:00"
+    with OverseerStore(path) as store:
+        assert store.reserve_agent_activation(
+            "overseer.default",
+            "activation.dead",
+            owner_id="manager.dead",
+            started_at="2026-07-29T11:00:00+00:00",
+            lease_expires_at="2026-07-29T11:01:00+00:00",
+            allow_blocked_retry=False,
+            observed_at=now,
+        )
+        manager = AgentManager(
+            registry,
+            store,
+            authorization_callback=_allow,
+            clock=lambda: now,
+            activation_wait_seconds=0.05,
+        )
+        epoch = manager.activate("overseer.default", initiated_by="operator")
+        reservation = store.load_agent_activation("overseer.default")
+
+    assert epoch.state is AgentOperationState.RUNNING
+    assert reservation.owner_id != "manager.dead"
+    assert reservation.generation == 2
+    assert drivers["codex"].start_calls == 1
+
+    live_path = tmp_path / "live.sqlite3"
+    with OverseerStore(live_path) as store:
+        assert store.reserve_agent_activation(
+            "overseer.default",
+            "activation.live",
+            owner_id="manager.live",
+            started_at=now,
+            lease_expires_at="2026-07-29T13:00:00+00:00",
+            allow_blocked_retry=False,
+            observed_at=now,
+        )
+        manager = AgentManager(
+            registry,
+            store,
+            authorization_callback=_allow,
+            clock=lambda: now,
+            activation_wait_seconds=0.05,
+        )
+        with pytest.raises(AgentManagerError, match="did not complete"):
+            manager.activate("overseer.default", initiated_by="operator")
+
+    assert drivers["codex"].start_calls == 1
+
+
+def test_concurrent_blocked_retry_starts_one_winning_generation(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    path = tmp_path / "state.sqlite3"
+    driver = registry.driver("overseer.default")
+    assert driver is drivers["codex"]
+    driver.start_error_count = 1
+    with OverseerStore(path) as store:
+        manager = AgentManager(registry, store, authorization_callback=_allow)
+        with pytest.raises(RuntimeError, match="transient"):
+            manager.activate("overseer.default", initiated_by="operator")
+
+    driver.start_entered = Event()
+    driver.start_release = Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def retry() -> None:
+        try:
+            with OverseerStore(path) as store:
+                manager = AgentManager(registry, store, authorization_callback=_allow)
+                results.append(
+                    manager.activate(
+                        "overseer.default",
+                        initiated_by="operator",
+                        retry_blocked=True,
+                    )
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    first = Thread(target=retry)
+    second = Thread(target=retry)
+    first.start()
+    assert driver.start_entered.wait(timeout=5)
+    second.start()
+    time.sleep(0.1)
+    driver.start_release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert driver.start_calls == 2
 
 
 def test_registry_provider_specific_resolution_is_typed_and_scoped(

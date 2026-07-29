@@ -27,6 +27,14 @@ class AgentOperationState(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class AgentTransitionState(StrEnum):
+    IMPORTING = "importing"
+    RECONCILING = "reconciling"
+    FAILED = "failed"
+    COMPLETED = "completed"
+    ROLLED_BACK = "rolled_back"
+
+
 class AgentErrorCategory(StrEnum):
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
     CONFIGURATION_ERROR = "configuration_error"
@@ -267,6 +275,24 @@ class DriverEpoch:
         if not isinstance(self.ordinal, int) or isinstance(self.ordinal, bool) or self.ordinal < 1:
             raise ValueError("driver epoch ordinal must be a positive integer")
         _validate_optional_identifier(self.replacement_epoch_id, "replacement epoch id")
+
+
+@dataclass(frozen=True)
+class AgentInstanceTransition:
+    instance_id: str
+    handoff_id: str
+    outgoing_epoch_id: str
+    incoming_epoch_id: str
+    state: AgentTransitionState
+    updated_at: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.instance_id, "instance id")
+        _require_identifier(self.handoff_id, "handoff id")
+        _require_identifier(self.outgoing_epoch_id, "outgoing epoch id")
+        _require_identifier(self.incoming_epoch_id, "incoming epoch id")
+        _require_identifier(self.updated_at, "transition timestamp")
 
 
 @dataclass(frozen=True)

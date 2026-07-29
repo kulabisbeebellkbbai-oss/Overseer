@@ -363,3 +363,52 @@ def test_profile_does_not_fall_open_to_sole_mismatched_legacy_session(
     assert result.state is AgentOperationState.FAILED
     assert result.error_category is AgentErrorCategory.SESSION_NOT_FOUND
     assert runner.commands == []
+
+
+def test_required_external_session_does_not_fall_through_to_workspace_match(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "codex-projects.csv"
+    registry.write_text(
+        "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+        "other-conversation,Other,/workspace/expected,other,/bin/other,"
+        "2026-07-28T10:00:00+00:00,2026-07-29T10:00:00+00:00,registry,\n",
+        encoding="utf-8",
+    )
+    runner = RecordingRunner()
+    capabilities = AgentCapabilities(
+        session_discovery=True,
+        session_resume=True,
+        interactive_dispatch=True,
+    )
+    provider = AgentProvider(
+        id="codex",
+        adapter_id="codex",
+        capabilities=capabilities,
+        transports=(AgentTransport.INTERACTIVE_CLI,),
+        executable_allowlist=("codex",),
+    )
+    profile = AgentInstanceProfile(
+        id="overseer.default",
+        primary_provider_id="codex",
+        primary_adapter_id="codex",
+        transport=AgentTransport.INTERACTIVE_CLI,
+        workspace="/workspace/expected",
+        external_session_id="required-conversation",
+        declared_capabilities=capabilities,
+    )
+    adapter = CodexDriver(
+        provider,
+        profile,
+        registry_path=registry,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+    )
+
+    result = adapter.start(profile)
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_category is AgentErrorCategory.SESSION_NOT_FOUND
+    assert result.external_session_id is None
+    assert runner.commands == []

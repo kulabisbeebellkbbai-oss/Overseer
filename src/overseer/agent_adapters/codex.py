@@ -473,6 +473,7 @@ class CodexDriver:
             for session in self.discover():
                 if session.external_session_id == profile.external_session_id:
                     return session
+            return None
         workspace_sessions = self.discover(profile.workspace)
         if len(workspace_sessions) == 1:
             return workspace_sessions[0]

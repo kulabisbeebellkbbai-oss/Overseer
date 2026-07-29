@@ -2074,16 +2074,21 @@ def _persistence_schema_status(path: Path) -> dict[str, object]:
         connection.close()
     migrations = [
         {
-            "version": int(row[0]),
+            "version": int(str(row[0])) if str(row[0]).isdigit() else str(row[0]),
             "description": str(row[1]),
             "applied_at": str(row[2]),
         }
         for row in rows
     ]
+    numeric_versions = [
+        migration["version"]
+        for migration in migrations
+        if isinstance(migration["version"], int)
+    ]
     return {
         "current_schema_version": CURRENT_SCHEMA_VERSION,
         "migration_ledger_present": True,
-        "applied_schema_version": migrations[-1]["version"] if migrations else None,
+        "applied_schema_version": max(numeric_versions) if numeric_versions else None,
         "migration_count": len(migrations),
         "migrations": migrations,
     }

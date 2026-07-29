@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, fields, is_dataclass
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import Any, TypeVar, get_args, get_origin, get_type_hints
 
@@ -18,10 +19,10 @@ def to_jsonable(value: Any) -> Any:
         return [to_jsonable(item) for item in value]
     if isinstance(value, list):
         return [to_jsonable(item) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): to_jsonable(item) for key, item in value.items()}
     if is_dataclass(value):
-        return to_jsonable(asdict(value))
+        return {field.name: to_jsonable(getattr(value, field.name)) for field in fields(value)}
     return value
 
 
@@ -49,6 +50,13 @@ def _coerce_value(target_type: Any, value: Any) -> Any:
     if origin is tuple:
         subtype = args[0] if args else Any
         return tuple(_coerce_value(subtype, item) for item in value)
+
+    if origin is Mapping:
+        key_type, value_type = args if len(args) == 2 else (Any, Any)
+        return {
+            _coerce_value(key_type, key): _coerce_value(value_type, item)
+            for key, item in value.items()
+        }
 
     if isinstance(target_type, type) and issubclass(target_type, Enum):
         return target_type(value)

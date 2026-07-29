@@ -10045,9 +10045,14 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(len(migrations), 1)
+        self.assertEqual(len(migrations), 2)
         self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
         self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
+        self.assertEqual(migrations[1].version, "agent_driver_v1")
+        self.assertEqual(
+            migrations[1].description,
+            "persist provider-neutral agent driver lifecycle records",
+        )
         self.assertEqual(reopened_migrations, migrations)
 
     def test_persists_resource_claim_and_decision_in_explicit_temp_database(self):

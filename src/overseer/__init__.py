@@ -6,6 +6,21 @@ from .adapters import (
     ExecutionResult,
     ExecutionStatus,
 )
+from .agent_contracts import (
+    AgentCapabilities,
+    AgentCheckpoint,
+    AgentDispatchRequest,
+    AgentDispatchResult,
+    AgentErrorCategory,
+    AgentHandoffPackage,
+    AgentInstanceProfile,
+    AgentOperationState,
+    AgentProvider,
+    AgentSession,
+    AgentTransport,
+    DriverEpoch,
+    PrimaryDriver,
+)
 from .admin import (
     AdminChangeKind,
     AdminChangePlan,
@@ -209,6 +224,19 @@ from .usage_limits import (
 from .virtual_discovery import ListenerVirtualDiscoveryAdapter, TcpListener, parse_tcp_listeners
 
 __all__ = [
+    "AgentCapabilities",
+    "AgentCheckpoint",
+    "AgentDispatchRequest",
+    "AgentDispatchResult",
+    "AgentErrorCategory",
+    "AgentHandoffPackage",
+    "AgentInstanceProfile",
+    "AgentOperationState",
+    "AgentProvider",
+    "AgentSession",
+    "AgentTransport",
+    "DriverEpoch",
+    "PrimaryDriver",
     "DryRunExecutor",
     "ExecutionMode",
     "ExecutionRequest",

@@ -130,6 +130,8 @@ class AgentHandoffService:
         package: AgentHandoffPackage,
         incoming_capabilities: AgentCapabilities,
     ) -> AgentHandoffPackage:
+        _validate_handoff_bounds(package.objective)
+        _validate_handoff_bounds(package.evidence)
         _reject_sensitive_material(package.objective, key="objective")
         _reject_sensitive_material(package.evidence)
         if not incoming_capabilities.handoff_import:

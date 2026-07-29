@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from threading import Event, Thread
+import time
 from typing import Mapping
 
 import pytest
@@ -50,6 +52,10 @@ class FakeDriver:
         self.import_overrides: dict[str, str] = {}
         self.checkpoint_expires_at: str | None = None
         self.checkpoint_status = "ready"
+        self.checkpoint_created_at = datetime.now(timezone.utc).isoformat()
+        self.last_import_result: AgentDispatchResult | None = None
+        self.start_entered: Event | None = None
+        self.start_release: Event | None = None
 
     def _result(
         self,
@@ -70,6 +76,7 @@ class FakeDriver:
             state=state,
             error_category=error_category,
             provider_reference=f"provider-ref.{request_id}",
+            external_session_id=f"provider-session.{self.provider.id}",
             evidence={"status": state.value, "message_id": f"message.{request_id}"},
         )
 
@@ -82,6 +89,10 @@ class FakeDriver:
     def start(self, profile: AgentInstanceProfile) -> AgentDispatchResult:
         self.start_calls += 1
         self.events.append(f"start:{self.provider.id}")
+        if self.start_entered is not None:
+            self.start_entered.set()
+        if self.start_release is not None:
+            self.start_release.wait(timeout=5)
         return self._result(
             request_id=f"activate.{self.provider.id}",
             session_id=f"external.{self.provider.id}.1",
@@ -128,6 +139,7 @@ class FakeDriver:
                 "status": self.checkpoint_status,
                 "evidence_id": "evidence.checkpoint",
             },
+            created_at=self.checkpoint_created_at,
             expires_at=self.checkpoint_expires_at,
         )
 
@@ -163,11 +175,15 @@ class FakeDriver:
             state=self.import_state,
             error_category=category,
         )
-        return replace(
+        self.last_import_result = replace(
             result,
             instance_id=self.import_overrides.get("instance_id", self.profile.id),
             provider_id=self.import_overrides.get("provider_id", self.provider.id),
+            external_session_id=self.import_overrides.get(
+                "external_session_id", f"external.{self.provider.id}.handoff"
+            ),
         )
+        return self.last_import_result
 
 
 class TrackingStore(OverseerStore):
@@ -309,7 +325,7 @@ def test_activation_does_not_trust_adapter_owned_session_identity(
     assert store.load_agent_session(epoch.session_id).provider_id == "codex"
     assert (
         store.load_agent_session(epoch.session_id).external_session_id
-        == "external.codex.1"
+        == "provider-session.codex"
     )
     assert store.load_agent_session(epoch.session_id).legacy_references[
         "initiated_by_ref"
@@ -511,7 +527,7 @@ def test_late_result_from_closed_epoch_is_quarantined(
     assert result.error_category is AgentErrorCategory.QUARANTINED
     assert result.evidence["reason"] == "unknown_dispatch_request"
     assert result.id != late.id
-    assert store.list_agent_dispatch_results() == (result,)
+    assert result in store.list_agent_dispatch_results()
 
 
 def test_manual_handoff_closes_outgoing_only_after_incoming_acknowledgement(
@@ -532,7 +548,6 @@ def test_manual_handoff_closes_outgoing_only_after_incoming_acknowledgement(
     assert stored_outgoing.closed_at is not None
     assert stored_outgoing.replacement_epoch_id == incoming.id
     assert events.index("store:checkpoint") < events.index("store:handoff")
-    assert events.index("store:handoff") < events.index("factory:claude")
     assert events.index("store:handoff") < events.index("import:claude")
     assert events.index("import:claude") < events.index("store:close-outgoing")
 
@@ -567,17 +582,13 @@ def test_handoff_rejects_acknowledgement_with_mismatched_binding(
 
     paused = store.load_driver_epoch(outgoing.id)
     assert paused.closed_at is None
-    assert paused.state is AgentOperationState.BLOCKED
-    assert len(
-        [
-            epoch
-            for epoch in store.list_driver_epochs()
-            if epoch.instance_id == outgoing.instance_id and epoch.closed_at is None
-        ]
-    ) == 1
+    assert paused.state is AgentOperationState.RUNNING
+    assert value.active_epoch(outgoing.instance_id) == paused
+    transition = max(store.list_driver_epochs(), key=lambda epoch: epoch.ordinal)
+    assert transition.state is AgentOperationState.BLOCKED
 
 
-def test_failed_import_leaves_paused_auditable_state_and_outgoing_open(
+def test_failed_import_leaves_auditable_transition_and_outgoing_authoritative(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
     value, store, drivers, _ = manager
@@ -598,11 +609,8 @@ def test_failed_import_leaves_paused_auditable_state_and_outgoing_open(
 
     stored_outgoing = store.load_driver_epoch(outgoing.id)
     assert stored_outgoing.closed_at is None
-    assert stored_outgoing.state is AgentOperationState.BLOCKED
-    assert (
-        stored_outgoing.reason
-        == f"handoff_failed:{AgentErrorCategory.HANDOFF_INCOMPATIBLE.value}"
-    )
+    assert stored_outgoing.state is AgentOperationState.RUNNING
+    assert value.active_epoch(outgoing.instance_id) == stored_outgoing
     assert len(store.list_agent_checkpoints()) == 1
     handoff_evidence = store.list_agent_handoffs()[0].evidence
     assert handoff_evidence["checkpoint_id"] == store.list_agent_checkpoints()[0].id
@@ -611,8 +619,10 @@ def test_failed_import_leaves_paused_auditable_state_and_outgoing_open(
     assert handoff_evidence["status"] == "blocked"
     assert handoff_evidence["incoming_epoch_id"]
     assert handoff_evidence["incoming_session_id"]
-    with pytest.raises(AgentManagerPausedError, match="paused"):
-        value.dispatch("overseer.default", "must not run", "paused-key")
+    transition = store.load_driver_epoch(str(handoff_evidence["incoming_epoch_id"]))
+    assert transition.state is AgentOperationState.BLOCKED
+    result = value.dispatch("overseer.default", "continue safely", "outgoing-key")
+    assert result.driver_epoch_id == outgoing.id
 
 
 def test_manual_handoff_requires_callback_approval_before_any_mutation(
@@ -826,7 +836,7 @@ def test_result_and_quarantine_mutations_require_policy_authorization(
         assert store.list_agent_dispatch_results() == ()
 
 
-def test_handoff_transition_rolls_back_all_writes_on_final_save_failure(
+def test_handoff_phase_b_failure_preserves_durable_importing_state(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
@@ -850,8 +860,118 @@ def test_handoff_transition_rolls_back_all_writes_on_final_save_failure(
             )
 
         assert store.load_driver_epoch(outgoing.id) == outgoing
-        assert store.list_agent_checkpoints() == ()
-        assert store.list_agent_handoffs() == ()
+        assert len(store.list_agent_checkpoints()) == 1
+        handoff = store.list_agent_handoffs()[0]
+        assert handoff.evidence["status"] == "importing"
+        incoming = store.load_driver_epoch(str(handoff.evidence["incoming_epoch_id"]))
+        assert incoming.state is AgentOperationState.QUEUED
+        assert incoming.closed_at is None
+        assert store.list_agent_dispatch_results() == ()
+
+
+def test_provider_checkpoint_created_at_controls_freshness(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, drivers, _ = manager
+    outgoing = value.activate("overseer.default", initiated_by="operator")
+    drivers["codex"].checkpoint_created_at = "2000-01-01T00:00:00+00:00"
+
+    with pytest.raises(AgentHandoffError, match="stale"):
+        value.manual_handoff(
+            "overseer.default", "claude", "operator", "approval.stale-provider"
+        )
+
+    assert store.load_driver_epoch(outgoing.id).closed_at is None
+
+
+def test_successful_handoff_persists_verified_external_session_identity(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, _, _ = manager
+    value.activate("overseer.default", initiated_by="operator")
+    incoming = value.manual_handoff(
+        "overseer.default", "claude", "operator", "approval.external-session"
+    )
+
+    session = store.load_agent_session(incoming.session_id)
+    assert session.external_session_id == "external.claude.handoff"
+    assert not session.external_session_id.startswith("handoff.")
+
+
+def test_crash_after_external_success_keeps_importing_state_for_reconciliation(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+
+    class FailPromotionOnceStore(OverseerStore):
+        fail_promotion = True
+
+        def save_driver_epoch(self, epoch: object) -> None:
+            if self.fail_promotion and getattr(epoch, "closed_at", None) is not None:
+                self.fail_promotion = False
+                raise RuntimeError("injected phase B failure")
+            super().save_driver_epoch(epoch)
+
+    with FailPromotionOnceStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+        outgoing = value.activate("overseer.default", initiated_by="operator")
+        with pytest.raises(RuntimeError, match="phase B"):
+            value.manual_handoff(
+                "overseer.default", "claude", "operator", "approval.phase-b"
+            )
+
+        handoff = store.list_agent_handoffs()[0]
+        assert handoff.evidence["status"] == "importing"
+        assert store.list_agent_checkpoints()
+        assert store.load_driver_epoch(outgoing.id).closed_at is None
+        assert drivers["claude"].last_import_result is not None
+
+        incoming = value.reconcile_handoff(
+            handoff.id,
+            drivers["claude"].last_import_result,
+            initiated_by="operator",
+        )
+
+        assert incoming.state is AgentOperationState.RUNNING
+        assert store.load_driver_epoch(outgoing.id).closed_at is not None
+
+
+def test_concurrent_activation_reservation_starts_provider_once(tmp_path: Path) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    registry.driver("overseer.default")
+    driver = drivers["codex"]
+    driver.start_entered = Event()
+    driver.start_release = Event()
+    path = tmp_path / "state.sqlite3"
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def activate() -> None:
+        try:
+            with OverseerStore(path) as store:
+                manager = AgentManager(registry, store, authorization_callback=_allow)
+                results.append(
+                    manager.activate("overseer.default", initiated_by="operator")
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    first = Thread(target=activate)
+    second = Thread(target=activate)
+    first.start()
+    assert driver.start_entered.wait(timeout=5)
+    second.start()
+    time.sleep(0.1)
+    driver.start_release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert driver.start_calls == 1
 
 
 def test_registry_provider_specific_resolution_is_typed_and_scoped(

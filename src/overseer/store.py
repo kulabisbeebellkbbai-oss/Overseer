@@ -43,6 +43,7 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 CURRENT_SCHEMA_VERSION = 1
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
+AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
 _REDACTED_AGENT_TRANSCRIPT = "[redacted agent transcript]"
 _REDACTED_DISPATCH_PROMPT = "[redacted dispatch prompt]"
 _AGENT_CREDENTIAL_KEYS = frozenset(
@@ -365,6 +366,17 @@ class SQLiteStore:
                 )
                 """
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_activation_reservations (
+                    instance_id TEXT PRIMARY KEY,
+                    reservation_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    epoch_id TEXT,
+                    reason TEXT
+                )
+                """
+            )
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_VERSION,
                 "persist provider-neutral agent driver lifecycle records",
@@ -372,6 +384,10 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V2,
                 "scope dispatch idempotency and persist distinct result attempts",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V3,
+                "persist atomic agent activation reservations",
             )
 
     def _migrate_agent_dispatch_scope(self) -> None:
@@ -540,6 +556,18 @@ class SQLiteStore:
         )
 
     def save_agent_session(self, session: AgentSession) -> None:
+        try:
+            existing = self.load_agent_session(session.id)
+        except KeyError:
+            existing = None
+        if (
+            existing is not None
+            and existing.external_session_id is not None
+            and session.external_session_id != existing.external_session_id
+        ):
+            raise ValueError(
+                "agent_sessions immutable identity field external_session_id cannot change"
+            )
         self._save_agent_record(
             "agent_sessions",
             session,
@@ -547,7 +575,6 @@ class SQLiteStore:
             (
                 "id",
                 "provider_id",
-                "external_session_id",
                 "workspace",
                 "transport",
                 "instance_id",
@@ -556,6 +583,61 @@ class SQLiteStore:
             ),
             {"provider_id": session.provider_id},
         )
+
+    def reserve_agent_activation(
+        self,
+        instance_id: str,
+        reservation_id: str,
+    ) -> bool:
+        cursor = self._connection.execute(
+            """
+            INSERT OR IGNORE INTO agent_activation_reservations
+                (instance_id, reservation_id, state)
+            VALUES (?, ?, 'starting')
+            """,
+            (instance_id, reservation_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount == 1
+
+    def load_agent_activation(
+        self,
+        instance_id: str,
+    ) -> tuple[str, str, str | None, str | None]:
+        row = self._connection.execute(
+            "SELECT reservation_id, state, epoch_id, reason "
+            "FROM agent_activation_reservations WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(instance_id)
+        return (
+            str(row["reservation_id"]),
+            str(row["state"]),
+            str(row["epoch_id"]) if row["epoch_id"] is not None else None,
+            str(row["reason"]) if row["reason"] is not None else None,
+        )
+
+    def finish_agent_activation(
+        self,
+        instance_id: str,
+        reservation_id: str,
+        state: str,
+        *,
+        epoch_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE agent_activation_reservations
+            SET state = ?, epoch_id = ?, reason = ?
+            WHERE instance_id = ? AND reservation_id = ?
+            """,
+            (state, epoch_id, reason, instance_id, reservation_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("activation reservation ownership changed")
+        self._commit_agent_mutation()
 
     def load_agent_session(self, session_id: str) -> AgentSession:
         return _load_dataclass(AgentSession, self._get_payload("agent_sessions", session_id))

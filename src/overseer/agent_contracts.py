@@ -225,7 +225,7 @@ class AgentInstanceProfile:
 class AgentSession:
     id: str
     provider_id: str
-    external_session_id: str
+    external_session_id: str | None
     workspace: str
     transport: AgentTransport
     capabilities: AgentCapabilities
@@ -238,7 +238,7 @@ class AgentSession:
     def __post_init__(self) -> None:
         _require_identifier(self.id, "session id")
         _require_identifier(self.provider_id, "provider id")
-        _require_identifier(self.external_session_id, "external session id")
+        _validate_optional_identifier(self.external_session_id, "external session id")
         if not isinstance(self.workspace, str) or not self.workspace.strip():
             raise ValueError("workspace must be non-empty")
         _validate_optional_identifier(self.instance_id, "instance id")
@@ -305,6 +305,7 @@ class AgentDispatchResult:
     error_category: AgentErrorCategory | None = None
     error_message: str | None = None
     provider_reference: str | None = None
+    external_session_id: str | None = None
     acknowledged_at: str | None = None
     completed_at: str | None = None
     evidence: Mapping[str, object] = field(default_factory=dict)
@@ -317,6 +318,7 @@ class AgentDispatchResult:
         _require_identifier(self.driver_epoch_id, "driver epoch id")
         _require_identifier(self.provider_id, "provider id")
         _validate_optional_identifier(self.provider_reference, "provider reference")
+        _validate_optional_identifier(self.external_session_id, "external session id")
         object.__setattr__(self, "evidence", _freeze_mapping(self.evidence))
 
     @classmethod

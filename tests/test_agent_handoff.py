@@ -227,3 +227,20 @@ def test_handoff_rejects_excessive_nesting_depth() -> None:
             evidence=evidence,
             required_capabilities=AgentCapabilities(handoff_import=True),
         )
+
+
+def test_validate_applies_bounds_to_directly_constructed_package() -> None:
+    package = AgentHandoffPackage(
+        id="handoff.direct",
+        instance_id="overseer.default",
+        outgoing_epoch_id="epoch.1",
+        incoming_provider_id="claude",
+        objective="x" * (MAX_HANDOFF_STRING_LENGTH + 1),
+        required_capabilities=AgentCapabilities(handoff_import=True),
+    )
+
+    with pytest.raises(ValueError, match="string size"):
+        AgentHandoffService().validate(
+            package,
+            AgentCapabilities(handoff_import=True),
+        )

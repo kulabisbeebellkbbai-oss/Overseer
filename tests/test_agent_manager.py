@@ -1048,12 +1048,74 @@ def test_crash_after_external_success_keeps_importing_state_for_reconciliation(
 
         incoming = value.reconcile_handoff(
             handoff.id,
-            drivers["claude"].last_import_result,
             initiated_by="operator",
         )
 
         assert incoming.state is AgentOperationState.RUNNING
         assert store.load_driver_epoch(outgoing.id).closed_at is not None
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    ("result_id", "failed_state", "blocked_state"),
+)
+def test_durable_ack_reconciliation_rejects_caller_result_contradiction(
+    tmp_path: Path,
+    contradiction: str,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+
+    class FailPromotionOnceStore(OverseerStore):
+        fail_promotion = True
+
+        def save_driver_epoch(self, epoch: object) -> None:
+            if self.fail_promotion and getattr(epoch, "closed_at", None) is not None:
+                self.fail_promotion = False
+                raise RuntimeError("injected phase B failure")
+            super().save_driver_epoch(epoch)
+
+    with FailPromotionOnceStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+        outgoing = value.activate("overseer.default", initiated_by="operator")
+        with pytest.raises(RuntimeError, match="phase B"):
+            value.manual_handoff(
+                "overseer.default",
+                "claude",
+                "operator",
+                "approval.contradictory-reconcile",
+            )
+        handoff = store.list_agent_handoffs()[0]
+        caller_result = drivers["claude"].last_import_result
+        assert caller_result is not None
+        if contradiction == "result_id":
+            caller_result = replace(caller_result, id="result.contradictory")
+        elif contradiction == "failed_state":
+            caller_result = replace(
+                caller_result,
+                state=AgentOperationState.FAILED,
+                error_category=AgentErrorCategory.PROVIDER_UNAVAILABLE,
+            )
+        else:
+            caller_result = replace(
+                caller_result,
+                state=AgentOperationState.BLOCKED,
+                error_category=AgentErrorCategory.POLICY_BLOCKED,
+            )
+
+        with pytest.raises(AgentHandoffError, match="contradicts durable"):
+            value.reconcile_handoff(
+                handoff.id,
+                caller_result,
+                initiated_by="operator",
+            )
+
+        assert store.load_driver_epoch(outgoing.id).closed_at is None
+        assert (
+            store.load_agent_transition(outgoing.instance_id).state
+            is AgentTransitionState.IMPORT_ACKNOWLEDGED
+        )
+        assert store.load_agent_operation(outgoing.instance_id).state == "fenced"
 
 
 def test_concurrent_activation_reservation_starts_provider_once(tmp_path: Path) -> None:

@@ -568,7 +568,7 @@ class AgentManager:
     def reconcile_handoff(
         self,
         handoff_id: str,
-        result: AgentDispatchResult,
+        result: AgentDispatchResult | None = None,
         *,
         initiated_by: str,
     ) -> DriverEpoch:
@@ -577,7 +577,9 @@ class AgentManager:
             {
                 "handoff_id": handoff_id,
                 "initiated_by": initiated_by,
-                "result_id": result.id,
+                "result_id": (
+                    result.id if result is not None else "durable_acknowledgement"
+                ),
             },
         )
         package = self.store.load_agent_handoff(handoff_id)
@@ -600,21 +602,38 @@ class AgentManager:
         if incoming.closed_at is not None:
             raise AgentHandoffError("closed incoming transition requires rollback")
         if transition.state is AgentTransitionState.IMPORT_ACKNOWLEDGED:
-            durable_external_id = package.evidence.get(
-                "incoming_external_session_id"
-            )
-            if (
-                result.request_id != f"handoff.{package.id}"
-                or result.instance_id != package.instance_id
-                or result.provider_id != package.incoming_provider_id
-                or result.external_session_id != durable_external_id
-                or result.session_id != incoming.session_id
-                or result.driver_epoch_id != incoming.id
-            ):
-                raise AgentHandoffError(
-                    "reconciliation contradicts durable import acknowledgement"
+            if result is not None:
+                durable_result_id = package.evidence.get("import_result_id")
+                try:
+                    durable_result = self.store.load_agent_dispatch_result(
+                        str(durable_result_id)
+                    )
+                except KeyError as error:
+                    raise AgentHandoffError(
+                        "durable import acknowledgement result is missing"
+                    ) from error
+                binding_fields = (
+                    "id",
+                    "request_id",
+                    "instance_id",
+                    "provider_id",
+                    "external_session_id",
+                    "session_id",
+                    "driver_epoch_id",
+                    "state",
                 )
+                if any(
+                    getattr(result, field) != getattr(durable_result, field)
+                    for field in binding_fields
+                ):
+                    raise AgentHandoffError(
+                        "reconciliation contradicts durable import acknowledgement"
+                    )
             return self._promote_acknowledged_handoff(package)
+        if result is None:
+            raise AgentHandoffError(
+                "handoff reconciliation requires a provider result"
+            )
         with self.store.agent_transaction():
             transition = replace(
                 transition,

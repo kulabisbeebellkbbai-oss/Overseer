@@ -53,6 +53,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     body[data-station="overview"] { --station-accent: var(--lcars-amber); --station-accent-2: var(--lcars-orange); --station-accent-3: var(--lcars-peach); }
+    body[data-station="driver"] { --station-accent: var(--lcars-cyan); --station-accent-2: var(--lcars-violet); --station-accent-3: var(--lcars-amber); }
     body[data-station="admin"] { --station-accent: var(--lcars-peach); --station-accent-2: var(--lcars-amber); --station-accent-3: var(--lcars-cyan); }
     body[data-station="assets"] { --station-accent: var(--lcars-orange); --station-accent-2: var(--lcars-violet); --station-accent-3: var(--lcars-peach); }
     body[data-station="claims"] { --station-accent: var(--lcars-violet); --station-accent-2: var(--lcars-lavender); --station-accent-3: var(--lcars-cyan); }
@@ -208,6 +209,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     .action-btn {
       padding: 7px 12px;
+    }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 2px;
+    }
+    button[disabled] {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    .layout-mode {
+      position: fixed;
+      top: 8px;
+      right: 8px;
+      z-index: 10;
+      min-width: 116px;
+      min-height: 44px;
     }
     .grid {
       display: grid;
@@ -641,9 +658,35 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       .token input { width: 100%; flex-basis: 100%; }
       .field.span-2, .field.span-3, .field.span-6 { grid-column: span 6; }
     }
+    body[data-layout-effective="tablet"] .shell,
+    body[data-layout-effective="mobile"] .shell { grid-template-columns: 1fr; }
+    body[data-layout-effective="tablet"] aside,
+    body[data-layout-effective="mobile"] aside {
+      position: static;
+      border-right: 0;
+      border-bottom: 4px solid var(--station-accent);
+      box-shadow: none;
+    }
+    body[data-layout-effective="tablet"] .nav { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    body[data-layout-effective="mobile"] .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    body[data-layout-effective="tablet"] .span-3,
+    body[data-layout-effective="tablet"] .span-4 { grid-column: span 6; }
+    body[data-layout-effective="mobile"] .span-3,
+    body[data-layout-effective="mobile"] .span-4,
+    body[data-layout-effective="mobile"] .span-6,
+    body[data-layout-effective="mobile"] .span-8 { grid-column: span 12; }
+    body[data-layout-effective="mobile"] main { padding: 12px; }
+    body[data-layout-effective="mobile"] .topbar { grid-template-columns: 1fr; }
+    body[data-layout-effective="mobile"] .token { flex-wrap: wrap; }
+    body[data-layout-effective="mobile"] .token input { width: 100%; flex-basis: 100%; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
   </style>
 </head>
 <body data-station="overview">
+  <button id="layout-mode" class="action-btn layout-mode" type="button" aria-live="polite"
+    aria-label="Layout preference auto; effective desktop">Layout: auto</button>
   <div class="shell">
     <aside>
       <div class="brand">
@@ -655,6 +698,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       </div>
       <nav class="nav" aria-label="Views">
         <button data-view="overview" aria-selected="true">Overview</button>
+        <button data-view="driver">AI Driver</button>
         <button data-view="admin">Admin</button>
         <button data-view="assets">Assets</button>
         <button data-view="claims">Claims</button>
@@ -683,6 +727,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       <div id="error" class="panel error" hidden></div>
       <div id="action-status" class="panel action-status" hidden></div>
       <section id="overview" class="section active"></section>
+      <section id="driver" class="section"></section>
       <section id="admin" class="section"></section>
       <section id="assets" class="section"></section>
       <section id="claims" class="section"></section>
@@ -750,6 +795,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       claimCleanup: "/claims/cleanup-plan",
       listenerReviewQueue: "/host/security/listener-review-queue",
       sourceReviewQueue: "/host/security/source-review-queue"
+      ,agentProviders: "/agent-providers"
+      ,agentInstances: "/agent-instances"
+      ,agentSessions: "/agent-sessions"
+      ,agentDispatches: "/agent-dispatches"
     };
     const requiredEndpointKeys = new Set(["auth"]);
     const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
@@ -764,6 +813,42 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       loadErrors: [],
       lastAction: null
     };
+    const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"];
+    function viewportLayout(width) {
+      if (width <= 700) return "mobile";
+      if (width <= 1024) return "tablet";
+      return "desktop";
+    }
+    function nextLayoutMode(mode) {
+      return LAYOUT_MODES[(LAYOUT_MODES.indexOf(mode) + 1) % LAYOUT_MODES.length] || "auto";
+    }
+    function readLayoutMode() {
+      try {
+        const mode = localStorage.getItem("overseerLayoutMode");
+        return LAYOUT_MODES.includes(mode) ? mode : "auto";
+      } catch (_) {
+        return "auto";
+      }
+    }
+    let layoutMode = readLayoutMode();
+    function applyLayoutMode() {
+      const effective = layoutMode === "auto" ? viewportLayout(window.innerWidth) : layoutMode;
+      document.body.dataset.layoutPreference = layoutMode;
+      document.body.dataset.layoutEffective = effective;
+      document.body.setAttribute("data-layout-effective", effective);
+      const control = document.getElementById("layout-mode");
+      control.textContent = `Layout: ${layoutMode}`;
+      control.setAttribute("aria-label", `Layout preference ${layoutMode}; effective ${effective}`);
+    }
+    document.getElementById("layout-mode").addEventListener("click", () => {
+      layoutMode = nextLayoutMode(layoutMode);
+      try { localStorage.setItem("overseerLayoutMode", layoutMode); } catch (_) {}
+      applyLayoutMode();
+    });
+    window.addEventListener("resize", () => {
+      if (layoutMode === "auto") applyLayoutMode();
+    });
+    applyLayoutMode();
     document.body.dataset.loadState = "locked";
     document.body.dataset.loadFailures = "0";
     const tokenInput = document.getElementById("token");
@@ -984,6 +1069,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "approve-claim-cleanup") return await approveClaimCleanup();
       if (action === "execute-claim-cleanup") return await executeClaimCleanup();
       if (action === "discover-user-services") return await postJson("/services/discover-user", {});
+      if (action === "discover-agent-sessions") return await discoverAgentSessions();
+      if (action === "resume-agent-sessions") return await resumeAgentSession();
+      if (action === "checkpoint-agent") return await checkpointAgent();
+      if (action === "handoff-agent") return await changePrimaryAgent("/agent-handoffs", "manual handoff");
+      if (action === "failover-agent") return await changePrimaryAgent("/agent-failover", "controlled failover");
+      if (action === "cancel-agent") throw new Error("Provider does not support cancellation");
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
@@ -1043,6 +1134,36 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "dispatch-ids-review-package") return await dispatchIdsReviewPackage();
       if (action === "record-ids-review-result") return await recordIdsReviewResult();
       throw new Error(`unsupported action: ${action}`);
+    }
+    async function discoverAgentSessions() {
+      return await postJson("/agent-sessions/discover", {
+        provider_id: value("agent-provider-id"),
+        instance_id: value("agent-instance-id")
+      });
+    }
+    async function resumeAgentSession() {
+      return await postJson("/agent-recovery", {
+        session_id: value("agent-session-id"),
+        initiated_by: value("agent-initiated-by") || "operator"
+      });
+    }
+    async function checkpointAgent() {
+      return await postJson("/agent-checkpoints", {
+        instance_id: value("agent-instance-id")
+      });
+    }
+    async function changePrimaryAgent(path, operation) {
+      const approval_id = value("agent-approval-id");
+      if (!approval_id) throw new Error("approval_id is required");
+      if (!window.confirm(`Confirm ${operation} using approval ${approval_id}?`)) {
+        throw new Error(`${operation} cancelled by operator`);
+      }
+      return await postJson(path, {
+        instance_id: value("agent-instance-id"),
+        incoming_provider_id: value("agent-incoming-provider-id"),
+        initiated_by: value("agent-initiated-by") || "operator",
+        approval_id
+      });
     }
     async function registerResource() {
       const resourceId = document.getElementById("resource-id").value.trim();
@@ -1833,6 +1954,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       overallEl.textContent = overall.replaceAll("_", " ");
       overallEl.className = `pill ${overallClass(overall)}`;
       renderOverview();
+      renderDriver();
       renderAdmin();
       renderAssets();
       renderClaims();
@@ -1927,6 +2049,76 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div>
           <div class="panel span-12">${table("Operation Records", (operations.operation_records || {}).items || [], ["id", "kind", "owner_domain", "status", "severity", "next_step"], {links: {owner_domain: (row) => domainView(row.owner_domain)}, fills: {id: (row) => operationFill(row)}, fillView: "overview"})}</div>
           ${officerPanel("sisko", "Command routing", "Coordinate this issue across the crew.")}
+        </div>`;
+    }
+    function renderDriver() {
+      const providers = state.data.agentProviders?.providers || [];
+      const instances = state.data.agentInstances?.instances || [];
+      const sessions = state.data.agentSessions?.sessions || [];
+      const dispatches = state.data.agentDispatches?.dispatches || [];
+      const results = state.data.agentDispatches?.results || [];
+      const primary = instances.find((row) => row.primary || row.is_primary) || instances[0] || {};
+      const providerId = primary.primary_provider_id || primary.provider_id || "codex";
+      const provider = providers.find((row) => row.id === providerId) || {};
+      const capabilities = provider.capabilities || primary.capabilities || {};
+      const cancellationSupported = capabilities.cancellation === true || capabilities.cancel === true;
+      const readinessBlocker = provider.unavailable_reason || primary.blocker || primary.policy_blocker || "";
+      const fallbackOrder = primary.fallback_order || primary.fallback_provider_ids || [];
+      const providerNativeUsage = providers.flatMap((row) =>
+        (row.usage || row.usage_values || []).map((entry) => ({
+          provider_id: row.id,
+          limit_id: entry.limit_id || entry.name,
+          value: entry.value ?? entry.remaining,
+          usage_unit: entry.usage_unit
+        }))
+      );
+      const blockerText = readinessBlocker ? JSON.stringify(readinessBlocker) : "";
+      const cancelTitle = cancellationSupported ? "Cancel active provider operation" : "Provider does not support cancellation";
+      document.getElementById("driver").innerHTML = `
+        <div class="grid">
+          ${stationIntro("Sisko", "Primary AI Driver", "One primary provider per Overseer instance with controlled recovery, manual handoff, and failover.", ["provider neutral", "epoch fenced", "approval gated"])}
+          <div class="section-head"><h3>Driver Actions</h3><div class="actions">
+            <button class="action-btn" data-action="discover-agent-sessions">Discover Agent Sessions</button>
+            <button class="action-btn" data-action="resume-agent-sessions">Resume Agent Sessions</button>
+            <button class="action-btn" data-action="checkpoint-agent">Checkpoint</button>
+            <button class="action-btn" data-action="handoff-agent">Manual Handoff</button>
+            <button class="action-btn" data-action="failover-agent">Controlled Failover</button>
+            <button class="action-btn" data-action="cancel-agent"${cancellationSupported ? "" : " disabled"} title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
+          </div></div>
+          <div id="agent-cancel-blocker" class="panel span-12 ${cancellationSupported ? "good" : "inactive"}">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
+          <div class="panel span-12">
+            <div class="toolbar"><h3>Operator Request</h3><span class="pill">${safe(providerId)}</span></div>
+            <div class="form-grid">
+              <div class="field span-3"><label for="agent-instance-id">Instance</label><input id="agent-instance-id" value="${safe(primary.id || "overseer.default")}"></div>
+              <div class="field span-3"><label for="agent-provider-id">Discovery Provider</label><input id="agent-provider-id" value="${safe(providerId)}"></div>
+              <div class="field span-3"><label for="agent-incoming-provider-id">Incoming Provider</label><input id="agent-incoming-provider-id" value="${safe(fallbackOrder[0] || "")}"></div>
+              <div class="field span-3"><label for="agent-session-id">Session</label><input id="agent-session-id" value="${safe(sessions[0]?.id || sessions[0]?.session_id || "")}"></div>
+              <div class="field span-6"><label for="agent-approval-id">Approval ID</label><input id="agent-approval-id" autocomplete="off" placeholder="required for handoff or failover"></div>
+              <div class="field span-6"><label for="agent-initiated-by">Initiated By</label><input id="agent-initiated-by" value="operator"></div>
+            </div>
+          </div>
+          ${metric("Primary Provider", providerId, provider.readiness || primary.lifecycle_state || "unknown", "span-3", provider.available === false ? "bad" : "good")}
+          ${metric("Lifecycle", primary.lifecycle_state || primary.state || "unknown", "instance", "span-3", "")}
+          ${metric("Driver Epoch", primary.current_epoch || primary.driver_epoch || "none", "generation fence", "span-3", "")}
+          ${metric("Sessions", sessions.length, "normalized", "span-3", "")}
+          <div class="panel span-6">${kv("Checkpoint and Recovery", {
+            checkpoint: primary.checkpoint_id || primary.last_checkpoint_id,
+            recovery: primary.recovery_state || primary.recovery_status,
+            blocker: readinessBlocker
+          })}</div>
+          <div class="panel span-6">${kv("Fallback Order", {providers: fallbackOrder})}</div>
+          <div class="panel span-12">${table("Provider Capabilities", providers.map((row) => ({
+            provider_id: row.id,
+            readiness: row.readiness,
+            available: row.available,
+            capabilities: row.capabilities,
+            blocker: row.unavailable_reason
+          })), ["provider_id", "readiness", "available", "capabilities", "blocker"])}</div>
+          <div class="panel span-12">${table("Provider Native Usage", providerNativeUsage, ["provider_id", "limit_id", "value", "usage_unit"])}</div>
+          <div class="panel span-6">${table("Agent Sessions", sessions, ["provider_id", "instance_id", "session_id", "state", "checkpoint_id"])}</div>
+          <div class="panel span-6">${table("Agent Dispatches", dispatches, ["dispatch_id", "provider_id", "instance_id", "status", "driver_epoch"])}</div>
+          <div class="panel span-12">${table("Dispatch Results", results, ["dispatch_id", "status", "provider_id", "session_id"])}</div>
+          ${officerPanel("sisko", "Primary AI driver review", "Review provider readiness, epoch, checkpoint, and approval evidence before changing the primary driver.")}
         </div>`;
     }
     function renderAdmin() {
@@ -2983,6 +3175,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function ezriWorkflowRows() {
       const source = "Overseer/Runbooks/operator-workflows.md";
       return [
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "discover-agent-sessions", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "resume-agent-sessions", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "checkpoint-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "handoff-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "failover-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "cancel-agent", source, query: "Review command status"},
         {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "open drilldown", source, query: "Review command status"},
         {workflow: "Record an operations workflow", page: "Overview", owner: "Sisko / Ezri", action: "record-operation", source, query: "Record an operations workflow"},
         {workflow: "Stage a gap workflow from a template", page: "Overview", owner: "Sisko / Ezri", action: "stage-operation-workflow", source, query: "Stage a gap workflow from a template"},
@@ -3721,6 +3919,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return `<h3>${safe(titleText)}</h3><div class="list">${rows || "<p class='muted'>No data</p>"}</div>`;
     }
     function title(view) {
+      if (view === "driver") return "Primary AI Driver";
       return view.charAt(0).toUpperCase() + view.slice(1);
     }
     function labelize(key) {

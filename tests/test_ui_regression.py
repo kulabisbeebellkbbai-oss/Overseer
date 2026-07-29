@@ -66,6 +66,38 @@ class LocalApiHarness:
 
 
 class ProtectedGatewayUiRegressionTests(unittest.TestCase):
+    def test_operator_console_contains_primary_driver_controls(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn("Primary AI Driver", OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentProviders: "/agent-providers"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentInstances: "/agent-instances"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentSessions: "/agent-sessions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentDispatches: "/agent-dispatches"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="discover-agent-sessions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="resume-agent-sessions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="checkpoint-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="handoff-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="failover-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="cancel-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Provider Capabilities", OPERATOR_CONSOLE_HTML)
+        self.assertIn("approval_id", OPERATOR_CONSOLE_HTML)
+        self.assertIn("window.confirm", OPERATOR_CONSOLE_HTML)
+
+    def test_operator_console_has_responsive_mode_contract(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('id="layout-mode"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('aria-live="polite"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn("width <= 700", OPERATOR_CONSOLE_HTML)
+        self.assertIn("width <= 1024", OPERATOR_CONSOLE_HTML)
+        self.assertIn('localStorage.getItem("overseerLayoutMode")', OPERATOR_CONSOLE_HTML)
+        self.assertIn('localStorage.setItem("overseerLayoutMode"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('window.addEventListener("resize"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("data-layout-effective", OPERATOR_CONSOLE_HTML)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", OPERATOR_CONSOLE_HTML)
+
     def test_gateway_prefix_serves_operator_console_with_token_form(self):
         with tempfile.TemporaryDirectory() as directory:
             with LocalApiHarness(Path(directory) / "overseer.sqlite3") as server:

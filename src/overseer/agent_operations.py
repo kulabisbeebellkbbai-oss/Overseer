@@ -91,6 +91,27 @@ class AgentOperationCoordinator:
             )
         return operation
 
+    def verify_owned(self, reservation: AgentOperationReservation) -> None:
+        try:
+            current = self.store.load_agent_operation(reservation.instance_id)
+        except KeyError as error:
+            raise AgentOperationBlockedError(
+                f"agent instance {reservation.instance_id} reservation was lost"
+            ) from error
+        if current != reservation:
+            raise AgentOperationBlockedError(
+                f"agent instance {reservation.instance_id} reservation ownership changed"
+            )
+
+    def release_if_owned(self, reservation: AgentOperationReservation) -> bool:
+        with self.store.agent_transaction():
+            try:
+                self.verify_owned(reservation)
+            except AgentOperationBlockedError:
+                return False
+            self.release(reservation)
+        return True
+
     def release(self, reservation: AgentOperationReservation) -> AgentOperationReservation:
         released = replace(
             reservation,

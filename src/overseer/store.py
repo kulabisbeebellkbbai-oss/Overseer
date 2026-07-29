@@ -1552,7 +1552,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO audit_events (id, subject_id, payload) VALUES (?, ?, ?)",
             (event.id, event.subject_id, _dump(event)),
         )
-        self._connection.commit()
+        self._commit_agent_mutation()
 
     def list_audit_events(
         self,
@@ -1616,7 +1616,7 @@ class SQLiteStore:
 
     def _upsert(self, table: str, row_id: str, payload: str) -> None:
         self._connection.execute(f"INSERT OR REPLACE INTO {table} (id, payload) VALUES (?, ?)", (row_id, payload))
-        self._connection.commit()
+        self._commit_agent_mutation()
 
     def _save_agent_record(
         self,

@@ -31,6 +31,10 @@ from overseer.agent_manager import (
     AgentManagerPausedError,
     AgentTransitionRequiredError,
 )
+from overseer.agent_operations import (
+    AgentOperationBlockedError,
+    AgentOperationCoordinator,
+)
 from overseer.agent_registry import AgentRegistry
 from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.policy import PolicyCheck, PolicyCheckStatus, PolicyDecision
@@ -433,6 +437,10 @@ def test_manager_discovery_normalizes_and_persists_one_authorized_boundary(
             "session.codex.private",
             "thread.codex.private",
         )
+        operation = store.load_agent_operation("overseer.default")
+        assert operation.state.value == "open"
+        assert operation.owner_token is None
+        assert operation.generation == 2
 
 
 def test_discovery_cannot_bypass_an_operation_coordinator_fence(
@@ -452,6 +460,159 @@ def test_discovery_cannot_bypass_an_operation_coordinator_fence(
 
         assert "factory:codex" not in events
         assert store.list_agent_sessions() == ()
+
+
+def test_discovery_losing_reserved_generation_cannot_persist_after_race(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    driver = registry.driver("overseer.default")
+    adapter_entered = Event()
+    adapter_release = Event()
+    discovered = AgentSession(
+        id="session.codex.race",
+        provider_id="codex",
+        external_session_id="external.codex.race",
+        workspace=str(tmp_path),
+        transport=registry.providers["codex"].transports[0],
+        capabilities=registry.providers["codex"].capabilities,
+    )
+
+    def blocking_discover(workspace=None):
+        adapter_entered.set()
+        adapter_release.wait(timeout=5)
+        return (discovered,)
+
+    driver.discover = blocking_discover
+    path = tmp_path / "state.sqlite3"
+    results: list[tuple[AgentSession, ...]] = []
+    errors: list[BaseException] = []
+
+    def resource_for_session(session: AgentSession) -> Resource:
+        return Resource(
+            id=f"resource.{session.id}",
+            name=session.id,
+            type=ResourceType.USAGE_LIMITED_SERVICE,
+            owner_domain=OwnerDomain.QUARK,
+            risk_level=RiskLevel.LOW,
+        )
+
+    def run_discovery() -> None:
+        try:
+            with OverseerStore(path) as store:
+                results.append(
+                    AgentManager(
+                        registry,
+                        store,
+                        authorization_callback=_allow,
+                        session_resource_factory=resource_for_session,
+                    ).discover("overseer.default", "codex")
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=run_discovery)
+    worker.start()
+    assert adapter_entered.wait(timeout=5)
+
+    with OverseerStore(path) as store:
+        coordinator = AgentOperationCoordinator(store)
+        observed = store.load_agent_operation("overseer.default")
+        assert observed.state.value == "fenced"
+        with pytest.raises(
+            AgentOperationBlockedError,
+            match="operation is already fenced",
+        ):
+            coordinator.reserve(
+                "overseer.default",
+                owner_token="operation.handoff.blocked",
+            )
+        assert store.list_agent_sessions() == ()
+        assert store.list_agent_providers() == ()
+        assert store.list_resources() == ()
+        assert store.list_audit_events(subject_prefix="agent.discovery:") == ()
+        coordinator.release(observed)
+        handoff_reservation = coordinator.reserve(
+            "overseer.default",
+            owner_token="operation.handoff.race",
+        )
+
+    adapter_release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], AgentManagerPausedError)
+    with OverseerStore(path) as store:
+        assert store.list_agent_sessions() == ()
+        assert store.list_agent_providers() == ()
+        assert store.list_agent_instance_profiles() == ()
+        assert store.list_resources() == ()
+        assert store.list_audit_events(subject_prefix="agent.discovery:") == ()
+        assert store.load_agent_operation("overseer.default") == handoff_reservation
+
+
+def test_discovery_adapter_failure_releases_reservation_without_persistence(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    driver = registry.driver("overseer.default")
+
+    def fail_discovery(workspace=None):
+        raise RuntimeError("provider discovery failed")
+
+    driver.discover = fail_discovery
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+
+        with pytest.raises(RuntimeError, match="provider discovery failed"):
+            value.discover("overseer.default", "codex")
+
+        operation = store.load_agent_operation("overseer.default")
+        assert operation.state.value == "open"
+        assert operation.owner_token is None
+        assert operation.generation == 2
+        assert store.list_agent_sessions() == ()
+        assert store.list_agent_providers() == ()
+        assert store.list_audit_events(subject_prefix="agent.discovery:") == ()
+
+
+def test_discovery_audit_failure_rolls_back_normalized_persistence(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    driver = registry.driver("overseer.default")
+    driver.discover = lambda workspace=None: (
+        AgentSession(
+            id="session.codex.audit-failure",
+            provider_id="codex",
+            external_session_id="external.codex.audit-failure",
+            workspace=str(tmp_path),
+            transport=registry.providers["codex"].transports[0],
+            capabilities=registry.providers["codex"].capabilities,
+        ),
+    )
+
+    class AuditFailingStore(OverseerStore):
+        def save_audit_event(self, event) -> None:
+            raise RuntimeError("audit persistence failed")
+
+    with AuditFailingStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+
+        with pytest.raises(RuntimeError, match="audit persistence failed"):
+            value.discover("overseer.default", "codex")
+
+        assert store.list_agent_sessions() == ()
+        assert store.list_agent_providers() == ()
+        assert store.list_agent_instance_profiles() == ()
+        operation = store.load_agent_operation("overseer.default")
+        assert operation.state.value == "open"
+        assert operation.owner_token is None
 
 
 def test_activation_does_not_trust_adapter_owned_session_identity(

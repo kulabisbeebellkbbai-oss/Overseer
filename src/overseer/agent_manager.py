@@ -163,65 +163,81 @@ class AgentManager:
             },
         )
         try:
-            self.operations.require_open(instance_id)
+            reservation = self.operations.reserve(
+                instance_id,
+                owner_token=self._id_factory("operation.discovery"),
+            )
         except AgentOperationBlockedError as error:
             raise AgentManagerPausedError(str(error)) from error
-        profile = self.registry.profile_for_provider(instance_id, provider_id)
-        driver = self.registry.driver_for_provider(
-            provider_id,
-            instance_id=instance_id,
-        )
-        discovered = driver.discover(workspace)
-        sessions: list[AgentSession] = []
-        resources: list[Resource] = []
-        for session in discovered:
-            if session.provider_id != provider_id:
-                raise AgentManagerError(
-                    "discovered session provider binding mismatch"
-                )
-            if session.instance_id not in {None, instance_id}:
-                raise AgentManagerError(
-                    "discovered session instance binding mismatch"
-                )
-            normalized = replace(
-                session,
+        try:
+            profile = self.registry.profile_for_provider(instance_id, provider_id)
+            driver = self.registry.driver_for_provider(
+                provider_id,
                 instance_id=instance_id,
-                transport=profile.transport,
-                capabilities=driver.provider.capabilities,
-                model_profile_id=profile.model_profile_id,
             )
-            sessions.append(normalized)
-            if self.session_resource_factory is not None:
-                resource = self.session_resource_factory(normalized)
-                if resource is not None:
-                    resources.append(resource)
-        for provider in self.registry.providers.values():
-            self.store.save_agent_provider(provider)
-        for configured_profile in self.registry.profiles.values():
-            self.store.save_agent_instance_profile(configured_profile)
-        for session in sessions:
-            self.store.save_agent_session(session)
-        for resource in resources:
-            self.store.save_resource(resource)
-        evidence_ids = tuple(
-            [*(session.id for session in sessions), *(resource.id for resource in resources)]
-        )
-        self.store.save_audit_event(
-            AuditEvent(
-                id=self._id_factory("audit.agent.discovery"),
-                event_type=AuditEventType.VERIFIED,
-                owner_domain=OwnerDomain.SISKO,
-                subject_id=f"agent.discovery:{instance_id}:{provider_id}",
-                summary=(
-                    "discovered provider sessions through the authorized "
-                    "agent manager"
-                ),
-                risk_level=RiskLevel.LOW,
-                evidence_ids=evidence_ids,
-                occurred_at=self._clock(),
+            discovered = driver.discover(workspace)
+            sessions: list[AgentSession] = []
+            resources: list[Resource] = []
+            for session in discovered:
+                if session.provider_id != provider_id:
+                    raise AgentManagerError(
+                        "discovered session provider binding mismatch"
+                    )
+                if session.instance_id not in {None, instance_id}:
+                    raise AgentManagerError(
+                        "discovered session instance binding mismatch"
+                    )
+                normalized = replace(
+                    session,
+                    instance_id=instance_id,
+                    transport=profile.transport,
+                    capabilities=driver.provider.capabilities,
+                    model_profile_id=profile.model_profile_id,
+                )
+                sessions.append(normalized)
+                if self.session_resource_factory is not None:
+                    resource = self.session_resource_factory(normalized)
+                    if resource is not None:
+                        resources.append(resource)
+            evidence_ids = tuple(
+                [
+                    *(session.id for session in sessions),
+                    *(resource.id for resource in resources),
+                ]
             )
-        )
-        return tuple(sessions)
+            try:
+                with self.store.agent_transaction():
+                    self.operations.verify_owned(reservation)
+                    for provider in self.registry.providers.values():
+                        self.store.save_agent_provider(provider)
+                    for configured_profile in self.registry.profiles.values():
+                        self.store.save_agent_instance_profile(configured_profile)
+                    for session in sessions:
+                        self.store.save_agent_session(session)
+                    for resource in resources:
+                        self.store.save_resource(resource)
+                    self.store.save_audit_event(
+                        AuditEvent(
+                            id=self._id_factory("audit.agent.discovery"),
+                            event_type=AuditEventType.VERIFIED,
+                            owner_domain=OwnerDomain.SISKO,
+                            subject_id=(
+                                f"agent.discovery:{instance_id}:{provider_id}"
+                            ),
+                            summary=(
+                                "discovered provider sessions through the "
+                                "authorized agent manager"
+                            ),
+                            risk_level=RiskLevel.LOW,
+                            evidence_ids=evidence_ids,
+                            occurred_at=self._clock(),
+                        )
+                    )
+            except AgentOperationBlockedError as error:
+                raise AgentManagerPausedError(str(error)) from error
+            return tuple(sessions)
+        finally:
+            self.operations.release_if_owned(reservation)
 
     def activate(
         self,

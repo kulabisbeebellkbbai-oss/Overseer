@@ -342,6 +342,42 @@ def agent_instances_status(
         store.close()
 
 
+def agent_usage_status(
+    store_path: str | Path,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Return only persisted provider usage evidence; never query providers."""
+    registry = _load_agent_registry(registry_path, local_registry_path)
+    store = SQLiteStore(store_path)
+    try:
+        limits = {item.id: item for item in store.list_usage_limits()}
+        rows: list[dict[str, object]] = []
+        for provider in sorted(registry.providers.values(), key=lambda item: item.id):
+            source_id = provider.usage_limit_source_id
+            evidence = limits.get(source_id) if source_id else None
+            rows.append({
+                "provider_id": provider.id,
+                "usage_limit_source_id": source_id,
+                "evidence_status": (
+                    "source_unconfigured"
+                    if source_id is None
+                    else "missing"
+                    if evidence is None
+                    else "available"
+                ),
+                "usage_unit": evidence.kind.value if evidence is not None else None,
+                "remaining": evidence.remaining if evidence is not None else None,
+                "value": evidence.remaining if evidence is not None else None,
+                "capacity": evidence.capacity if evidence is not None else None,
+                "observed_at": evidence.observed_at if evidence is not None else None,
+                "resets_at": evidence.resets_at if evidence is not None else None,
+            })
+        return {"providers": rows}
+    finally:
+        store.close()
+
+
 def discover_agent_sessions_status(
     store_path: str | Path,
     provider_id: str,

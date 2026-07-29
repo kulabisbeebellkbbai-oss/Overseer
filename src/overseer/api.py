@@ -20,6 +20,7 @@ from .cli import (
     agent_instances_status,
     agent_providers_status,
     agent_sessions_status,
+    agent_usage_status,
     admin_adapter_capabilities_status,
     admin_adapter_enablement_plan_status,
     admin_executions_status,
@@ -347,6 +348,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                         _query_first(query, "instance_id"),
                     )
                 )
+                return
+            if path == "/agent-usage":
+                self._handle(lambda: agent_usage_status(store_path))
                 return
             if path == "/service-status":
                 self._handle(lambda: service_status(store_path))

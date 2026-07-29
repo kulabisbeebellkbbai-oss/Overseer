@@ -83,6 +83,14 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
         self.assertIn("Provider Capabilities", OPERATOR_CONSOLE_HTML)
         self.assertIn("approval_id", OPERATOR_CONSOLE_HTML)
         self.assertIn("window.confirm", OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentUsage: "/agent-usage"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.approved_fallback_provider_ids", OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.active_epoch", OPERATOR_CONSOLE_HTML)
+        self.assertIn('["id", "provider_id", "instance_id", "state", "checkpoint_id"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn('["id", "provider_id", "instance_id", "state", "driver_epoch_id"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn('["request_id", "state", "provider_id", "session_id"]', OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("primary.current_epoch", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("primary.fallback_order", OPERATOR_CONSOLE_HTML)
 
     def test_operator_console_has_responsive_mode_contract(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
@@ -97,6 +105,17 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
         self.assertIn('window.addEventListener("resize"', OPERATOR_CONSOLE_HTML)
         self.assertIn("data-layout-effective", OPERATOR_CONSOLE_HTML)
         self.assertIn("@media (prefers-reduced-motion: reduce)", OPERATOR_CONSOLE_HTML)
+        self.assertIn('body[data-layout-effective="desktop"] .shell', OPERATOR_CONSOLE_HTML)
+        self.assertIn('#driver .action-btn { min-height: 44px; }', OPERATOR_CONSOLE_HTML)
+
+    def test_driver_actions_fail_closed_by_exact_capability_and_route(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        for capability in ("session_discovery", "session_resume", "checkpoints", "handoff_import"):
+            self.assertIn(f'"{capability}"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("provider.available === true", OPERATOR_CONSOLE_HTML)
+        self.assertIn('provider.readiness === "available"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Cancellation route is unavailable", OPERATOR_CONSOLE_HTML)
 
     def test_gateway_prefix_serves_operator_console_with_token_form(self):
         with tempfile.TemporaryDirectory() as directory:

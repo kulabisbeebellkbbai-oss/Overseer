@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import threading
+from types import SimpleNamespace
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 import pytest
 
@@ -17,7 +19,8 @@ from overseer import (
     SQLiteStore,
 )
 from overseer.api import make_api_handler
-from overseer.cli import main
+from overseer.cli import agent_usage_status, main
+from overseer.usage_limits import LimitKind, UsageLimit
 from overseer.client import OverseerApiClient
 
 
@@ -141,6 +144,46 @@ def test_agent_inventory_uses_existing_api_authentication(tmp_path: Path) -> Non
 
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
+
+
+def test_agent_usage_is_authenticated_and_truthful_when_evidence_is_missing(tmp_path: Path) -> None:
+    with LocalAPI(tmp_path / "overseer.sqlite3", auth_token="test-token") as protected:
+        unauthorized = protected.get("/agent-usage", authenticated=False)
+        authorized = protected.get("/agent-usage")
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert all("usage_limit_source_id" in row for row in authorized.json()["providers"])
+    assert all(row["usage_unit"] is None for row in authorized.json()["providers"])
+    assert all("credential" not in json.dumps(row).lower() for row in authorized.json()["providers"])
+
+
+def test_agent_usage_returns_persisted_evidence_without_inventing_unit(tmp_path: Path) -> None:
+    store_path = tmp_path / "overseer.sqlite3"
+    store = SQLiteStore(store_path)
+    store.save_usage_limit(UsageLimit(
+        id="codex.native",
+        resource_id="codex",
+        kind=LimitKind.TOKENS,
+        capacity=100,
+        remaining=25,
+        resets_at="2026-07-30T00:00:00Z",
+        window="daily",
+        observed_at="2026-07-29T20:00:00Z",
+    ))
+    store.close()
+    registry = SimpleNamespace(providers={
+        "codex": SimpleNamespace(id="codex", usage_limit_source_id="codex.native")
+    })
+    with patch("overseer.cli._load_agent_registry", return_value=registry):
+        payload = agent_usage_status(store_path)
+    row = next(row for row in payload["providers"] if row["provider_id"] == "codex")
+    assert row["usage_limit_source_id"] == "codex.native"
+    assert row["remaining"] == 25
+    assert row["observed_at"] == "2026-07-29T20:00:00Z"
+    assert row["resets_at"] == "2026-07-30T00:00:00Z"
+    assert row["usage_unit"] == "tokens"
+    assert row["evidence_status"] == "available"
 
 
 def test_manual_handoff_requires_approval_id(api: LocalAPI) -> None:

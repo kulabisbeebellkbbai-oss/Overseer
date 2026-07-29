@@ -24,6 +24,11 @@ failed at the first new dashboard assertion:
 - Review-correction focused agent API/UI/workflow suite:
   `50 passed in 12.10s`
 - Review-correction full suite: `704 passed in 101.93s`
+- Second-review focused API/UI/workflow suite: `52 passed in 12.66s`
+- Second-review full suite: `706 passed in 102.52s`
+- Node v24 executed the extracted production `providerGate` and
+  `validatedTransferPayload` functions against ready, unavailable, unknown,
+  required-capability, valid-payload, and missing-approval cases.
 - `python3 -m py_compile src/overseer/ui.py`: passed
 - `git diff --check`: passed
 
@@ -52,6 +57,12 @@ effective-mode state, reduced motion, action wiring, and capability gating.
   `active_epoch`, session and dispatch `id`, `driver_epoch_id`, and result
   `request_id`/`state`). Actions fail closed on provider readiness and their
   exact capability.
+- Gates now recompute from operator-selected discovery, session, incoming, and
+  fallback destinations. Failover also verifies approved-fallback membership.
+- Instance status includes policy readiness/blocker, current checkpoint ID, and
+  current transition state using persisted records only.
+- Cancellation is a disabled non-action because no backend route exists, and is
+  intentionally omitted from normal workflow metadata.
 - `/agent-usage` performs no provider calls and reports the configured source,
   persisted value/remaining, exact persisted `UsageLimit.kind` unit, and
   observation/reset timestamps; missing evidence remains explicit.
@@ -73,3 +84,5 @@ effective-mode state, reduced motion, action wiring, and capability gating.
 Initial implementation: `02e652ae9fda2798d52d6a631d6d1ce9502f5d39`
 
 Review correction: `7c7e3764a591a34a7a7d734bc431a3e5f3b4ad1f`
+
+Second review correction: `f5864158b1cb6594d28ba935e4be151ce122c30a`

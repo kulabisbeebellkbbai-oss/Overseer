@@ -35,6 +35,11 @@ class AgentTransitionState(StrEnum):
     ROLLED_BACK = "rolled_back"
 
 
+class AgentOperationFenceState(StrEnum):
+    OPEN = "open"
+    FENCED = "fenced"
+
+
 class AgentErrorCategory(StrEnum):
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
     CONFIGURATION_ERROR = "configuration_error"
@@ -293,6 +298,26 @@ class AgentInstanceTransition:
         _require_identifier(self.outgoing_epoch_id, "outgoing epoch id")
         _require_identifier(self.incoming_epoch_id, "incoming epoch id")
         _require_identifier(self.updated_at, "transition timestamp")
+
+
+@dataclass(frozen=True)
+class AgentOperationReservation:
+    instance_id: str
+    generation: int
+    state: AgentOperationFenceState
+    owner_token: str | None
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.instance_id, "instance id")
+        if (
+            not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 1
+        ):
+            raise ValueError("operation generation must be a positive integer")
+        _validate_optional_identifier(self.owner_token, "operation owner token")
+        _require_identifier(self.updated_at, "operation timestamp")
 
 
 @dataclass(frozen=True)

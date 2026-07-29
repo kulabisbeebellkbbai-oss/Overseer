@@ -508,6 +508,7 @@ def test_existing_integer_schema_migration_rows_and_indexes_are_preserved(tmp_pa
             "agent_driver_v2",
             "agent_driver_v3",
             "agent_driver_v4",
+            "agent_driver_v5",
         ]
 
     with sqlite3.connect(path) as connection:
@@ -549,6 +550,7 @@ def test_agent_migration_rolls_back_cleanly_and_retries(tmp_path: Path) -> None:
             "agent_driver_v2",
             "agent_driver_v3",
             "agent_driver_v4",
+            "agent_driver_v5",
         ]
 
 

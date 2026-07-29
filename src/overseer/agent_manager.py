@@ -17,12 +17,15 @@ from .agent_contracts import (
     AgentErrorCategory,
     AgentHandoffPackage,
     AgentInstanceTransition,
+    AgentOperationFenceState,
+    AgentOperationReservation,
     AgentOperationState,
     AgentSession,
     AgentTransitionState,
     DriverEpoch,
 )
 from .agent_handoff import AgentHandoffService
+from .agent_operations import AgentOperationBlockedError, AgentOperationCoordinator
 from .agent_registry import AgentRegistry
 from .policy import PolicyDecision
 from .store import OverseerStore
@@ -63,6 +66,17 @@ class AgentTransitionRequiredError(AgentManagerPausedError):
         )
 
 
+class AgentOperationRequiredError(AgentManagerPausedError):
+    """Raised when a coordinator fence requires explicit recovery."""
+
+    def __init__(self, operation: AgentOperationReservation) -> None:
+        self.operation = operation
+        super().__init__(
+            f"agent instance {operation.instance_id} operation generation "
+            f"{operation.generation} is fenced and requires reconciliation"
+        )
+
+
 _ACKNOWLEDGED_STATES = {
     AgentOperationState.ACKNOWLEDGED,
     AgentOperationState.RUNNING,
@@ -98,6 +112,7 @@ class AgentManager:
         handoffs: AgentHandoffService | None = None,
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        operations: AgentOperationCoordinator | None = None,
         activation_lease_seconds: float = 30.0,
         activation_wait_seconds: float = 5.0,
     ) -> None:
@@ -119,6 +134,10 @@ class AgentManager:
             store,
             clock=self._clock,
             id_factory=lambda: self._id_factory("handoff"),
+        )
+        self.operations = operations or AgentOperationCoordinator(
+            store,
+            clock=self._clock,
         )
 
     def activate(
@@ -161,6 +180,7 @@ class AgentManager:
             observed_at=started_at,
         ):
             return self._await_activation_winner(instance_id)
+        activation = self.store.load_agent_activation(instance_id)
         try:
             start_result = driver.start(profile)
         except Exception:
@@ -168,6 +188,7 @@ class AgentManager:
                 instance_id,
                 reservation_id,
                 self._activation_owner_id,
+                activation.generation,
                 "blocked",
                 reason=AgentErrorCategory.PROVIDER_UNAVAILABLE.value,
             )
@@ -184,11 +205,16 @@ class AgentManager:
                 instance_id,
                 reservation_id,
                 self._activation_owner_id,
+                activation.generation,
                 "blocked",
                 reason=category.value,
             )
             raise AgentManagerError(f"activation failed: {category.value}")
         with self.store.agent_transaction():
+            self.store.ensure_agent_operation(
+                instance_id,
+                updated_at=self._clock(),
+            )
             epoch = self._open_epoch(
                 instance_id=instance_id,
                 provider_id=driver.provider.id,
@@ -204,6 +230,7 @@ class AgentManager:
                 instance_id,
                 reservation_id,
                 self._activation_owner_id,
+                activation.generation,
                 "active",
                 epoch_id=epoch.id,
             )
@@ -324,7 +351,9 @@ class AgentManager:
             requested_by=requested_by,
         )
         try:
-            self.store.save_agent_dispatch(request)
+            request = self.operations.accept_dispatch(request)
+        except AgentOperationBlockedError as error:
+            raise AgentManagerPausedError(str(error)) from error
         except (sqlite3.IntegrityError, ValueError):
             winner = self._dispatch_for_idempotency_key(
                 instance_id, idempotency_key
@@ -340,6 +369,14 @@ class AgentManager:
             epoch.provider_id,
             instance_id=instance_id,
         )
+        if not self.operations.claim_dispatch_execution(request):
+            result = self.operations.cancelled_result(
+                request,
+                provider_id=epoch.provider_id,
+                result_id=self._id_factory("result"),
+            )
+            self.operations.complete_dispatch(request, result)
+            return self._record_dispatch_result(result)
         try:
             result = driver.dispatch(request)
         except Exception:
@@ -353,7 +390,9 @@ class AgentManager:
                 state=AgentOperationState.FAILED,
                 error_category=AgentErrorCategory.PROVIDER_UNAVAILABLE,
             )
-        return self.record_provider_result(epoch.id, result)
+        recorded = self.record_provider_result(epoch.id, result)
+        self.operations.complete_dispatch(request, recorded)
+        return recorded
 
     def checkpoint(self, instance_id: str) -> AgentCheckpoint:
         self._raise_transition_required(
@@ -427,6 +466,26 @@ class AgentManager:
                 "initiated_by": initiated_by,
             },
         )
+        try:
+            operation = self.operations.reserve(
+                instance_id,
+                owner_token=self._id_factory("operation"),
+            )
+        except AgentOperationBlockedError as error:
+            raise AgentHandoffError(str(error)) from error
+        outgoing_driver = self.registry.driver_for_provider(
+            outgoing.provider_id,
+            instance_id=instance_id,
+        )
+        try:
+            self.operations.drain(
+                operation,
+                driver=outgoing_driver,
+                session=self._session_for_epoch(outgoing),
+            )
+            self.operations.verify_quiescent(operation)
+        except AgentOperationBlockedError as error:
+            raise AgentHandoffError(str(error)) from error
         checkpoint = self._collect_checkpoint(instance_id, outgoing)
         self._validate_checkpoint_for_handoff(checkpoint)
         incoming_driver = self.registry.driver_for_provider(
@@ -466,6 +525,8 @@ class AgentManager:
                     **package.evidence,
                     "incoming_epoch_id": incoming.id,
                     "incoming_session_id": incoming.session_id,
+                    "operation_generation": operation.generation,
+                    "operation_owner_ref": operation.owner_token,
                     "status": "importing",
                 },
             )
@@ -580,6 +641,45 @@ class AgentManager:
         incoming = self.store.load_driver_epoch(transition.incoming_epoch_id)
         if outgoing.closed_at is not None:
             raise AgentHandoffError("closed outgoing epoch cannot be resumed")
+        operation = self._operation_for_package(package)
+        incoming_driver = self.registry.driver_for_provider(
+            incoming.provider_id,
+            instance_id=incoming.instance_id,
+        )
+        try:
+            self.operations.cancel_and_verify(
+                operation,
+                driver=incoming_driver,
+                session=self._session_for_epoch(incoming),
+            )
+        except AgentOperationBlockedError:
+            blocked = replace(
+                incoming,
+                state=AgentOperationState.BLOCKED,
+                reason="rollback_cancel_unverified",
+            )
+            with self.store.agent_transaction():
+                self.store.save_driver_epoch(blocked)
+                self.store.save_agent_handoff(
+                    replace(
+                        package,
+                        evidence={
+                            **package.evidence,
+                            "status": "rollback_blocked",
+                            "reason": "incoming_cancel_unverified",
+                        },
+                    )
+                )
+                if transition.state is not AgentTransitionState.FAILED:
+                    self.store.save_agent_transition(
+                        replace(
+                            transition,
+                            state=AgentTransitionState.FAILED,
+                            updated_at=self._clock(),
+                            reason="incoming_cancel_unverified",
+                        )
+                    )
+            return blocked
         with self.store.agent_transaction():
             if incoming.closed_at is None:
                 self.store.save_driver_epoch(
@@ -610,6 +710,7 @@ class AgentManager:
                     reason="operator_rollback",
                 )
             )
+            self.operations.release(operation)
         return outgoing
 
     def _complete_handoff(
@@ -708,6 +809,7 @@ class AgentManager:
                         reason=None,
                     )
                 )
+                self.operations.release(self._operation_for_package(package))
         return incoming, failure
 
     def record_provider_result(
@@ -727,6 +829,11 @@ class AgentManager:
             request = self.store.load_agent_dispatch(result.request_id)
         except KeyError:
             return self._quarantine_result(result, "unknown_dispatch_request")
+        if request.evidence.get("status") == AgentOperationState.CANCELLED.value:
+            return self._quarantine_result(
+                result,
+                "cancelled_operation_generation",
+            )
         try:
             epoch = self.store.load_driver_epoch(epoch_id)
             active = self.active_epoch(epoch.instance_id)
@@ -915,6 +1022,19 @@ class AgentManager:
             return transition
         return None
 
+    def _operation_for_package(
+        self,
+        package: AgentHandoffPackage,
+    ) -> AgentOperationReservation:
+        operation = self.store.load_agent_operation(package.instance_id)
+        if (
+            operation.state is not AgentOperationFenceState.FENCED
+            or operation.generation != package.evidence.get("operation_generation")
+            or operation.owner_token != package.evidence.get("operation_owner_ref")
+        ):
+            raise AgentHandoffError("handoff operation reservation binding mismatch")
+        return operation
+
     def _raise_transition_required(
         self,
         instance_id: str,
@@ -922,14 +1042,24 @@ class AgentManager:
         error_type: type[AgentManagerError] | None = None,
     ) -> None:
         transition = self._blocking_transition(instance_id)
-        if transition is None:
+        if transition is not None:
+            if error_type is None:
+                raise AgentTransitionRequiredError(transition)
+            raise error_type(
+                f"agent instance {instance_id} transition "
+                f"{transition.state.value} blocks this operation"
+            )
+        try:
+            operation = self.store.load_agent_operation(instance_id)
+        except KeyError:
             return
-        if error_type is None:
-            raise AgentTransitionRequiredError(transition)
-        raise error_type(
-            f"agent instance {instance_id} transition "
-            f"{transition.state.value} blocks this operation"
-        )
+        if operation.state is AgentOperationFenceState.FENCED:
+            if error_type is None:
+                raise AgentOperationRequiredError(operation)
+            raise error_type(
+                f"agent instance {instance_id} operation generation "
+                f"{operation.generation} is fenced"
+            )
 
     def _await_activation_winner(self, instance_id: str) -> DriverEpoch:
         deadline = time.monotonic() + self._activation_wait_seconds
@@ -1016,6 +1146,9 @@ class AgentManager:
             "provider_id": result.provider_id,
             "status": result.state.value,
         }
+        operation_generation = request.evidence.get("operation_generation")
+        if isinstance(operation_generation, int):
+            evidence["operation_generation"] = operation_generation
         if result.provider_reference is not None:
             evidence["provider_ref"] = result.provider_reference
         if result.external_session_id is not None:
@@ -1044,8 +1177,11 @@ class AgentManager:
     ) -> AgentDispatchResult:
         evidence = dispatch.evidence
         epoch = self.store.load_driver_epoch(dispatch.driver_epoch_id)
-        state = AgentOperationState(
-            str(evidence.get("status", AgentOperationState.QUEUED.value))
+        status = str(evidence.get("status", AgentOperationState.QUEUED.value))
+        state = (
+            AgentOperationState.QUEUED
+            if status in {"accepted", "executing"}
+            else AgentOperationState(status)
         )
         reason = evidence.get("reason")
         error_category = None

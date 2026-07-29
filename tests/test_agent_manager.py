@@ -62,6 +62,10 @@ class FakeDriver:
         self.start_error_count = 0
         self.import_entered: Event | None = None
         self.import_release: Event | None = None
+        self.cancel_calls = 0
+        self.cancel_state = AgentOperationState.CANCELLED
+        self.cancel_entered: Event | None = None
+        self.cancel_release: Event | None = None
 
     def _result(
         self,
@@ -153,11 +157,17 @@ class FakeDriver:
         )
 
     def cancel(self, session: AgentSession) -> AgentDispatchResult:
+        self.cancel_calls += 1
+        self.events.append(f"cancel:{self.provider.id}")
+        if self.cancel_entered is not None:
+            self.cancel_entered.set()
+        if self.cancel_release is not None:
+            self.cancel_release.wait(timeout=5)
         return self._result(
             request_id=f"cancel.{self.provider.id}",
             session_id=session.id,
             epoch_id="pending",
-            state=AgentOperationState.CANCELLED,
+            state=self.cancel_state,
         )
 
     def import_handoff(

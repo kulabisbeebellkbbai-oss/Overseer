@@ -20,6 +20,8 @@ from .agent_contracts import (
     AgentHandoffPackage,
     AgentInstanceTransition,
     AgentInstanceProfile,
+    AgentOperationFenceState,
+    AgentOperationReservation,
     AgentOperationState,
     AgentProvider,
     AgentSession,
@@ -47,6 +49,7 @@ AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
 AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
+AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
         AgentTransitionState.RECONCILING,
@@ -432,13 +435,44 @@ class SQLiteStore:
             )
             self._connection.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS agent_dispatch_transition_fence
+                CREATE TABLE IF NOT EXISTS agent_operation_reservations (
+                    instance_id TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    owner_token TEXT,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                "DROP TRIGGER IF EXISTS agent_dispatch_transition_fence"
+            )
+            self._connection.execute(
+                """
+                CREATE TRIGGER agent_dispatch_transition_fence
                 BEFORE INSERT ON agent_dispatches
                 WHEN EXISTS (
                     SELECT 1
                     FROM agent_instance_transitions
                     WHERE instance_id = NEW.instance_id
                       AND state IN ('importing', 'reconciling', 'failed')
+                    UNION ALL
+                    SELECT 1
+                    FROM agent_operation_reservations
+                    WHERE instance_id = NEW.instance_id
+                      AND (
+                          state != 'open'
+                          OR json_type(
+                              NEW.payload,
+                              '$.evidence.operation_generation'
+                          ) != 'integer'
+                          OR generation != CAST(
+                              json_extract(
+                                  NEW.payload,
+                                  '$.evidence.operation_generation'
+                              ) AS INTEGER
+                          )
+                      )
                 )
                 BEGIN
                     SELECT RAISE(ABORT, 'agent transition active');
@@ -460,6 +494,10 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V4,
                 "fence agent transitions and lease activation ownership",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V5,
+                "coordinate generation-bound agent operations",
             )
 
     def _migrate_agent_activation_leases(self) -> None:
@@ -760,6 +798,7 @@ class SQLiteStore:
         instance_id: str,
         reservation_id: str,
         owner_id: str,
+        generation: int,
         state: str,
         *,
         epoch_id: str | None = None,
@@ -770,12 +809,93 @@ class SQLiteStore:
             UPDATE agent_activation_reservations
             SET state = ?, epoch_id = ?, reason = ?
             WHERE instance_id = ? AND reservation_id = ? AND owner_id = ?
-                AND state = 'starting'
+                AND generation = ? AND state = 'starting'
             """,
-            (state, epoch_id, reason, instance_id, reservation_id, owner_id),
+            (
+                state,
+                epoch_id,
+                reason,
+                instance_id,
+                reservation_id,
+                owner_id,
+                generation,
+            ),
         )
         if cursor.rowcount != 1:
             raise ValueError("activation reservation ownership changed")
+        self._commit_agent_mutation()
+
+    def ensure_agent_operation(
+        self,
+        instance_id: str,
+        *,
+        updated_at: str,
+    ) -> AgentOperationReservation:
+        operation = AgentOperationReservation(
+            instance_id=instance_id,
+            generation=1,
+            state=AgentOperationFenceState.OPEN,
+            owner_token=None,
+            updated_at=updated_at,
+        )
+        payload = json.dumps(
+            to_jsonable(operation),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO agent_operation_reservations
+                (instance_id, generation, state, owner_token, payload)
+            VALUES (?, 1, 'open', NULL, ?)
+            """,
+            (instance_id, payload),
+        )
+        self._commit_agent_mutation()
+        return self.load_agent_operation(instance_id)
+
+    def load_agent_operation(self, instance_id: str) -> AgentOperationReservation:
+        row = self._connection.execute(
+            "SELECT payload FROM agent_operation_reservations WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(instance_id)
+        return _load_dataclass(AgentOperationReservation, str(row["payload"]))
+
+    def save_agent_operation(
+        self,
+        operation: AgentOperationReservation,
+        *,
+        expected_generation: int,
+        expected_state: AgentOperationFenceState,
+        expected_owner_token: str | None,
+    ) -> None:
+        payload = json.dumps(
+            to_jsonable(operation),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        cursor = self._connection.execute(
+            """
+            UPDATE agent_operation_reservations
+            SET generation = ?, state = ?, owner_token = ?, payload = ?
+            WHERE instance_id = ? AND generation = ? AND state = ?
+              AND owner_token IS ?
+            """,
+            (
+                operation.generation,
+                operation.state.value,
+                operation.owner_token,
+                payload,
+                operation.instance_id,
+                expected_generation,
+                expected_state.value,
+                expected_owner_token,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("agent operation reservation changed concurrently")
         self._commit_agent_mutation()
 
     def begin_agent_transition(self, transition: AgentInstanceTransition) -> bool:

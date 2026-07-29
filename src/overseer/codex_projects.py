@@ -14,6 +14,10 @@ from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 DEFAULT_CODEX_MEMORY_SESSION = Path("/home/god/.local/bin/codex-memory-session")
 DEFAULT_TMUX = Path("/usr/bin/tmux")
+PROMPT_REJECTION_MARKERS = (
+    "message exceeds maximum length",
+    "maximum length allowed",
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +162,25 @@ class CodexProjectThreadAdapter:
                 reason="resolved codex-project thread did not include a tmux command name",
                 resume_result=resume_result,
             )
+        pane_command = [
+            str(self.tmux_path),
+            "capture-pane",
+            "-p",
+            "-t",
+            resume_result.command,
+            "-S",
+            "-200",
+        ]
+        baseline_pane_result = self.runner(
+            pane_command,
+            text=True,
+            capture_output=True,
+        )
+        baseline_pane_output = (
+            baseline_pane_result.stdout.casefold()
+            if baseline_pane_result.returncode == 0
+            else ""
+        )
         prompt_result = self.runner(
             [str(self.tmux_path), "load-buffer", "-b", "overseer-dispatch", "-"],
             input=prompt,
@@ -195,12 +218,46 @@ class CodexProjectThreadAdapter:
             text=True,
             capture_output=True,
         )
-        status = "prompt_dispatched" if enter_result.returncode == 0 else "failed"
-        reason = "prompt delivered to codex project tmux session" if enter_result.returncode == 0 else "tmux prompt submit failed"
+        if enter_result.returncode != 0:
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status="failed",
+                reason="tmux prompt submit failed",
+                resume_result=resume_result,
+                prompt_exit_code=prompt_result.returncode,
+                enter_exit_code=enter_result.returncode,
+                stdout=enter_result.stdout,
+                stderr=enter_result.stderr,
+            )
+        pane_result = self.runner(
+            pane_command,
+            text=True,
+            capture_output=True,
+        )
+        pane_output = pane_result.stdout.casefold() if pane_result.returncode == 0 else ""
+        rejection_marker = next(
+            (
+                marker
+                for marker in PROMPT_REJECTION_MARKERS
+                if pane_output.count(marker) > baseline_pane_output.count(marker)
+            ),
+            None,
+        )
+        if rejection_marker is not None:
+            return CodexProjectPromptDispatchResult(
+                owner_thread=owner_thread,
+                status="prompt_rejected",
+                reason=f"codex project rejected prompt: {rejection_marker}",
+                resume_result=resume_result,
+                prompt_exit_code=prompt_result.returncode,
+                enter_exit_code=enter_result.returncode,
+                stdout=pane_result.stdout,
+                stderr=pane_result.stderr,
+            )
         return CodexProjectPromptDispatchResult(
             owner_thread=owner_thread,
-            status=status,
-            reason=reason,
+            status="prompt_dispatched",
+            reason="prompt submitted to codex project; advisory result not yet confirmed",
             resume_result=resume_result,
             prompt_exit_code=prompt_result.returncode,
             enter_exit_code=enter_result.returncode,

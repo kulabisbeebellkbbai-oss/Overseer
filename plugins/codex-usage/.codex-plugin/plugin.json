@@ -1,0 +1,19 @@
+{
+  "name": "codex-usage",
+  "version": "0.1.0",
+  "description": "Authoritative local Codex quota, token usage, reset-time, history, and heuristic tools.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Usage",
+    "shortDescription": "Inspect Codex capacity, resets, history, and forecasts.",
+    "longDescription": "Codex Usage connects to the loopback-only Overseer Codex Usage MCP server for authoritative account limits and clearly labeled usage heuristics.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": ["MCP server", "skill", "hooks"],
+    "defaultPrompt": "Show my current Codex usage, remaining capacity, reset times, and usage recommendations."
+  },
+  "mcpServers": "./.mcp.json"
+}

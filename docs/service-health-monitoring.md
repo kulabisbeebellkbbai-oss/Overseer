@@ -149,6 +149,14 @@ Supported command target shapes:
 
 Unsupported command targets are recorded as failed health evidence and are not executed. Command probes do not invoke a shell and do not run service mutation, package, firewall, permission, mount, or file-write commands.
 
+## Codex Usage Diagnostics
+
+Julian's Health page includes the latest locally captured Codex usage evidence:
+quota windows, percentages used and remaining, reset times, account token
+totals, and the current usage posture. This panel reads the Codex Usage MCP
+snapshot database without refreshing the provider or dispatching Quark work.
+If no snapshot is available, the panel fails closed with a remediation step.
+
 ## Live Log Probes
 
 Log probes read only a bounded tail sample from an absolute path and persist only marker status, never raw log lines:

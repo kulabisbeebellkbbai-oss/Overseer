@@ -17,6 +17,7 @@ from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
 from .host import HostInspectionSnapshot
 from .ids_review import HostSecurityIDSReviewPackage
+from .key_broker import KeyBrokerTokenGrant, KeyBrokerTokenRequest, KeyProviderRecord
 from .maintenance_schedule import MaintenanceSchedule
 from .ops_records import OperationRecord
 from .physical import PhysicalIdentity
@@ -165,6 +166,23 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS maintenance_schedules (
                 id TEXT PRIMARY KEY,
                 target TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS key_providers (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS key_broker_token_requests (
+                id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS key_broker_token_grants (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                status TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             """
@@ -523,6 +541,53 @@ class SQLiteStore:
 
     def list_maintenance_schedules(self) -> tuple[MaintenanceSchedule, ...]:
         return tuple(_load_dataclass(MaintenanceSchedule, payload) for payload in self._list_payloads("maintenance_schedules"))
+
+    def save_key_provider(self, provider: KeyProviderRecord) -> None:
+        self._upsert("key_providers", provider.id, _dump(provider))
+
+    def load_key_provider(self, provider_id: str) -> KeyProviderRecord:
+        return _load_dataclass(KeyProviderRecord, self._get_payload("key_providers", provider_id))
+
+    def list_key_providers(self) -> tuple[KeyProviderRecord, ...]:
+        return tuple(_load_dataclass(KeyProviderRecord, payload) for payload in self._list_payloads("key_providers"))
+
+    def save_key_broker_token_request(self, request: KeyBrokerTokenRequest) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO key_broker_token_requests (id, provider_id, status, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (request.id, request.provider_id, request.status.value, _dump(request)),
+        )
+        self._connection.commit()
+
+    def load_key_broker_token_request(self, request_id: str) -> KeyBrokerTokenRequest:
+        return _load_dataclass(KeyBrokerTokenRequest, self._get_payload("key_broker_token_requests", request_id))
+
+    def list_key_broker_token_requests(self) -> tuple[KeyBrokerTokenRequest, ...]:
+        return tuple(
+            _load_dataclass(KeyBrokerTokenRequest, payload)
+            for payload in self._list_payloads("key_broker_token_requests")
+        )
+
+    def save_key_broker_token_grant(self, grant: KeyBrokerTokenGrant) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO key_broker_token_grants (id, request_id, provider_id, status, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (grant.id, grant.request_id, grant.provider_id, grant.status.value, _dump(grant)),
+        )
+        self._connection.commit()
+
+    def load_key_broker_token_grant(self, grant_id: str) -> KeyBrokerTokenGrant:
+        return _load_dataclass(KeyBrokerTokenGrant, self._get_payload("key_broker_token_grants", grant_id))
+
+    def list_key_broker_token_grants(self) -> tuple[KeyBrokerTokenGrant, ...]:
+        return tuple(
+            _load_dataclass(KeyBrokerTokenGrant, payload)
+            for payload in self._list_payloads("key_broker_token_grants")
+        )
 
     def save_audit_event(self, event: AuditEvent) -> None:
         self._connection.execute(

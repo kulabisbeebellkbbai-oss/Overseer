@@ -8,9 +8,16 @@ version = "0.1.0"
 description = "Local resource manager for service health, asset checkout, maintenance, security, and usage-limit coordination."
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.28.1,<2",
+  "pydantic>=2.11",
+  "starlette>=0.27",
+]
 
 [project.scripts]
 overseer = "overseer.cli:main"
+overseer-codex-usage-mcp = "overseer.codex_usage_mcp:main"
+overseer-quark-scheduler = "overseer.quark_scheduler_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

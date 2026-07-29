@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .codex_usage import CodexUsageTracker
 from .cli import (
     activate_claim_status,
     active_policy_profile_status,
@@ -68,8 +70,12 @@ from .cli import (
     host_security_sources_status,
     host_security_source_reviews_status,
     host_security_triage_status,
+    inspect_firmware_preflight_status,
+    inspect_firmware_status,
     inspect_host_status,
     inspect_packages_status,
+    issue_key_broker_token_status,
+    key_broker_status,
     list_state_status,
     maintenance_summary_status,
     operator_dashboard_status,
@@ -79,12 +85,14 @@ from .cli import (
     plan_host_security_remediation_status,
     physical_summary_status,
     plan_admin_change_status,
+    plan_firmware_updates_status,
     plan_package_updates_status,
     policy_customization_helper_cli_status,
     probe_stored_health_status,
     record_resource_status,
     record_crew_message_status,
     record_health_target_status,
+    record_key_provider_status,
     record_host_security_ids_review_result_status,
     release_claim_status,
     request_admin_adapter_enablement_status,
@@ -98,6 +106,7 @@ from .cli import (
     record_usage_limit_status,
     request_claim_status,
     request_claim_cleanup_status,
+    request_key_broker_token_status,
     run_obrien_package_maintenance_cycle_status,
     service_status,
     runtime_status,
@@ -106,6 +115,8 @@ from .cli import (
     usage_summary_status,
     submit_host_security_ids_review_package_status,
     unarchive_admin_history_status,
+    approve_key_broker_request_status,
+    revoke_key_broker_token_status,
     virtual_summary_status,
 )
 from .documents import (
@@ -195,6 +206,59 @@ from .virtual_ops import (
     virtual_operations_status,
 )
 from .ui import OPERATOR_CONSOLE_HTML
+
+
+DEFAULT_CODEX_USAGE_DB = Path("/home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3")
+
+
+def codex_usage_health_status(db_path: str | Path | None = None) -> dict[str, Any]:
+    """Return Julian's read-only view of the latest Codex usage evidence."""
+
+    selected = Path(
+        db_path
+        or os.environ.get("OVERSEER_CODEX_USAGE_DB")
+        or DEFAULT_CODEX_USAGE_DB
+    ).expanduser()
+    if not selected.is_file():
+        return {
+            "available": False,
+            "observed_at": None,
+            "posture": "unknown",
+            "minimum_remaining_percent": None,
+            "recommendation": "Codex usage has not produced a local snapshot yet.",
+            "rate_limits": [],
+            "account_usage": {},
+            "next_step": "Verify the codex-usage MCP service and refresh usage.",
+        }
+    try:
+        tracker = CodexUsageTracker(selected)
+        snapshot = tracker.latest(refresh=False)
+        heuristics = tracker.heuristics(refresh=False)
+    except (OSError, ValueError, RuntimeError) as error:
+        return {
+            "available": False,
+            "observed_at": None,
+            "posture": "unknown",
+            "minimum_remaining_percent": None,
+            "recommendation": "Codex usage evidence could not be read.",
+            "rate_limits": [],
+            "account_usage": {},
+            "error": type(error).__name__,
+            "next_step": "Check the codex-usage MCP service and its local snapshot database.",
+        }
+    return {
+        "available": True,
+        "observed_at": snapshot.get("observed_at"),
+        "posture": heuristics.get("posture"),
+        "minimum_remaining_percent": heuristics.get("minimum_remaining_percent"),
+        "recommendation": heuristics.get("recommendation"),
+        "confidence": heuristics.get("confidence"),
+        "rate_limits": snapshot.get("rate_limits") or [],
+        "account_usage": snapshot.get("account_usage") or {},
+        "window_forecasts": heuristics.get("window_forecasts") or [],
+        "warnings": heuristics.get("warnings") or [],
+        "next_step": "Refresh through the Codex Usage MCP when newer evidence is required.",
+    }
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
 PROTECTED_GATEWAY_PREFIX = "/Overseer"
@@ -294,6 +358,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/maintenance/package-status":
                 self._handle(lambda: inspect_packages_status())
                 return
+            if path == "/maintenance/firmware-status":
+                self._handle(lambda: inspect_firmware_status())
+                return
+            if path == "/maintenance/firmware-preflight":
+                self._handle(lambda: inspect_firmware_preflight_status())
+                return
             if path == "/maintenance/software-evidence":
                 self._handle(lambda: software_evidence_status(store_path))
                 return
@@ -308,6 +378,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/health/service-evidence":
                 self._handle(lambda: service_evidence_status(store_path, _query_first(query, "resource_id")))
+                return
+            if path == "/health/codex-usage":
+                self._handle(codex_usage_health_status)
                 return
             if path == "/observability/trends":
                 self._handle(lambda: observability_trends_status(store_path))
@@ -401,6 +474,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/security/evidence":
                 self._handle(lambda: security_evidence_status(store_path))
+                return
+            if path == "/security/key-broker":
+                self._handle(lambda: key_broker_status(store_path, _project_path_for_store(store_path)))
                 return
             if path == "/identity/evidence":
                 self._handle(lambda: identity_evidence_status(_project_path_for_store(store_path)))
@@ -502,8 +578,11 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            if path.startswith("/usage/remote-testing/") and auth_context.get("auth_type") != "admin_token":
-                self._write_json({"error": "remote testing control routes require admin authorization"}, HTTPStatus.FORBIDDEN)
+            if (
+                path.startswith("/usage/remote-testing/")
+                or path.startswith("/security/key-broker/")
+            ) and auth_context.get("auth_type") != "admin_token":
+                self._write_json({"error": "control routes require admin authorization"}, HTTPStatus.FORBIDDEN)
                 return
             if path == "/claims/request":
                 self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
@@ -706,6 +785,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/maintenance/package-update-plans":
                 self._handle_json(lambda payload: plan_package_updates_status(store_path, **_package_update_plan_args(payload)))
                 return
+            if path == "/maintenance/firmware-update-plans":
+                self._handle_json(lambda payload: plan_firmware_updates_status(store_path, **_firmware_update_plan_args(payload)))
+                return
             if path == "/maintenance/package-maintenance-cycle":
                 self._handle_json(lambda payload: run_obrien_package_maintenance_cycle_status(store_path, **_package_maintenance_cycle_args(payload)))
                 return
@@ -783,6 +865,21 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/usage/remote-testing/results":
                 self._handle_json(lambda payload: collect_remote_test_results_status(_project_path_for_store(store_path), **_remote_testing_results_args(payload)))
+                return
+            if path == "/security/key-broker/providers":
+                self._handle_json(lambda payload: record_key_provider_status(store_path, **_key_provider_args(payload)))
+                return
+            if path == "/security/key-broker/requests":
+                self._handle_json(lambda payload: request_key_broker_token_status(store_path, **_key_broker_request_args(payload)))
+                return
+            if path == "/security/key-broker/requests/approve":
+                self._handle_json(lambda payload: approve_key_broker_request_status(store_path, **_key_broker_approval_args(payload)))
+                return
+            if path == "/security/key-broker/tokens":
+                self._handle_json(lambda payload: issue_key_broker_token_status(store_path, _project_path_for_store(store_path), **_key_broker_issue_args(payload)))
+                return
+            if path == "/security/key-broker/tokens/revoke":
+                self._handle_json(lambda payload: revoke_key_broker_token_status(store_path, **_key_broker_revoke_args(payload)))
                 return
             if path == "/usage-limits":
                 self._handle_json(lambda payload: record_usage_limit_status(store_path, **_usage_limit_args(payload)))
@@ -1205,6 +1302,59 @@ def _remote_testing_revoke_args(payload: dict[str, Any]) -> dict[str, Any]:
         "token_id": str(payload["token_id"]),
         "revoked_by": str(payload.get("revoked_by", "quark")),
         "reason": str(payload.get("reason", "test complete")),
+    }
+
+
+def _key_provider_args(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("metadata", {})
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata) if metadata.strip() else {}
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a JSON object")
+    return {
+        "provider_id": str(payload["provider_id"]),
+        "display_name": str(payload["display_name"]),
+        "provider_kind": str(payload["provider_kind"]),
+        "secret_ref": str(payload["secret_ref"]),
+        "allowed_subjects": tuple(_list_payload(payload.get("allowed_subjects"), ["*"])),
+        "allowed_scopes": tuple(_list_payload(payload.get("allowed_scopes"), ["*"])),
+        "enabled": bool(payload.get("enabled", True)),
+        "metadata": metadata,
+    }
+
+
+def _key_broker_request_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider_id": str(payload["provider_id"]),
+        "subject": str(payload["subject"]),
+        "requested_scopes": tuple(_list_payload(payload.get("requested_scopes", payload.get("scopes")), [])),
+        "requested_by": str(payload["requested_by"]),
+        "justification": str(payload["justification"]),
+        "ttl_minutes": int(payload.get("ttl_minutes", 15)),
+    }
+
+
+def _key_broker_approval_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "approved_by": str(payload["approved_by"]),
+        "approval_id": str(payload["approval_id"]),
+        "approved_at": str(payload["approved_at"]) if payload.get("approved_at") else None,
+    }
+
+
+def _key_broker_issue_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": str(payload["request_id"]),
+        "issued_by": str(payload["issued_by"]),
+    }
+
+
+def _key_broker_revoke_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "grant_id": str(payload["grant_id"]),
+        "revoked_by": str(payload["revoked_by"]),
+        "reason": str(payload.get("reason", "work complete")),
     }
 
 
@@ -1900,6 +2050,13 @@ def _package_update_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "captured_at": str(payload["captured_at"]) if payload.get("captured_at") else None,
         "packages": tuple(str(package) for package in payload.get("packages", ())),
+    }
+
+
+def _firmware_update_plan_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "captured_at": str(payload["captured_at"]) if payload.get("captured_at") else None,
+        "release_ids": tuple(str(release_id) for release_id in payload.get("release_ids", ())),
     }
 
 

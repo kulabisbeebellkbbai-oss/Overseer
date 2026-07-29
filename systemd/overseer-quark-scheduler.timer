@@ -1,0 +1,12 @@
+[Unit]
+Description=Let Quark reassess checkpointed Codex work every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Persistent=true
+AccuracySec=1min
+Unit=overseer-quark-scheduler.service
+
+[Install]
+WantedBy=timers.target

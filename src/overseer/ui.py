@@ -710,6 +710,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       complianceEvidence: "/compliance/evidence",
       policyHelper: "/admin/policy-customization-helper",
       packageStatus: "/maintenance/package-status",
+      firmwareStatus: "/maintenance/firmware-status",
+      firmwarePreflight: "/maintenance/firmware-preflight",
       softwareEvidence: "/maintenance/software-evidence",
       advisories: "/maintenance/advisories",
       maintenanceSchedules: "/maintenance/schedules",
@@ -722,12 +724,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       imageScans: "/virtual/image-scans",
       security: "/security-summary",
       securityEvidence: "/security/evidence",
+      keyBroker: "/security/key-broker",
       identityEvidence: "/identity/evidence",
       identityRotationRequests: "/identity/rotation-requests",
       identityRotationReadiness: "/identity/rotation-readiness",
       health: "/health-efficiency",
       healthSummary: "/health-summary",
       serviceEvidence: "/health/service-evidence",
+      codexUsage: "/health/codex-usage",
       observabilityTrends: "/observability/trends",
       metricHistory: "/observability/metric-history",
       performanceHistory: "/observability/performance-history",
@@ -995,6 +999,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "enqueue-remote-test-job") return await enqueueRemoteTestJob();
       if (action === "collect-remote-test-results") return await collectRemoteTestResults();
       if (action === "plan-package-updates") return await postJson("/maintenance/package-update-plans", {});
+      if (action === "plan-firmware-updates") return await postJson("/maintenance/firmware-update-plans", {});
       if (action === "run-package-maintenance-cycle") return await postJson("/maintenance/package-maintenance-cycle", {});
       if (action === "refresh-advisories") return await refreshAdvisories();
       if (action === "record-maintenance-schedule") return await recordMaintenanceSchedule();
@@ -1932,6 +1937,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const complianceEvidence = state.data.complianceEvidence || {};
       const policyHelper = state.data.policyHelper || {};
       const packageStatus = state.data.packageStatus || {};
+      const firmwareStatus = state.data.firmwareStatus || {};
+      const firmwarePreflight = state.data.firmwarePreflight || {};
       const softwareEvidence = state.data.softwareEvidence || {};
       const advisories = state.data.advisories || softwareEvidence.advisories || {};
       const maintenanceSchedules = state.data.maintenanceSchedules || {};
@@ -1942,7 +1949,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("admin").innerHTML = `
         <div class="grid">
           ${stationIntro("O'Brien", "Maintenance Operations", "Protected changes, package work, and service restart gates.", ["admin plans", "policy profile", "maintenance"])}
-          <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button><button class="action-btn" data-action="plan-package-updates">Plan Updates</button><button class="action-btn" data-action="run-package-maintenance-cycle">Run Package Cycle</button></div></div>
+          <div class="section-head"><h3>Admin Actions</h3><div class="actions"><button class="action-btn" data-action="discover-user-services">Discover Services</button><button class="action-btn" data-action="plan-package-updates">Plan Updates</button><button class="action-btn" data-action="plan-firmware-updates">Plan Firmware</button><button class="action-btn" data-action="run-package-maintenance-cycle">Run Package Cycle</button></div></div>
           ${metric("Adapters", adapters.enabled, "enabled", "span-3", adapters.disabled ? "warn" : "good", "admin")}
           ${metric("Authorizations", auth.pending_count, "pending", "span-3", auth.pending_count ? "warn" : "good", "admin")}
           ${metric("Ready", readiness.ready_for_overseer_execution, "executable now", "span-3", "", "admin")}
@@ -2050,6 +2057,25 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             stderr: packageStatus.stderr
           })}</div>
           <div class="panel span-8">${table("Upgradable Packages", packageStatus.items || [], ["name", "installed_version", "candidate_version", "repository"])}</div>
+          <div class="panel span-4">${kv("Firmware Status", {
+            status: firmwareStatus.status,
+            updates: firmwareStatus.updates,
+            high_urgency: firmwareStatus.high_urgency,
+            blocked_updates: firmwareStatus.blocked_updates,
+            reboot_required: firmwareStatus.reboot_required,
+            next_step: firmwareStatus.next_step
+          })}</div>
+          <div class="panel span-8">${table("Firmware Updates", firmwareStatus.items || [], ["device", "title", "current_version", "new_version", "urgency", "status", "blocker_type", "reboot_required"])}</div>
+          <div class="panel span-12">${table("Firmware Blocker Guidance", firmwareBlockerRows(firmwareStatus.items || []), ["device", "blocker_type", "blocker_resolution", "safe_preflight"])}</div>
+          <div class="panel span-4">${kv("Firmware Preflight", {
+            status: firmwarePreflight.status,
+            efivar_accessible: firmwarePreflight.efivar_accessible,
+            efivar_count: firmwarePreflight.efivar_count,
+            stale_dump_candidate_count: firmwarePreflight.stale_dump_candidate_count,
+            next_step: firmwarePreflight.next_step
+          })}</div>
+          <div class="panel span-8">${table("Largest EFI Variables", firmwarePreflight.largest || [], ["name", "size_bytes"])}</div>
+          <div class="panel span-12">${table("Stale EFI Dump Candidates", firmwarePreflight.stale_dump_candidates || [], ["name", "size_bytes"])}</div>
           <div class="panel span-12">${kv("Active Policy Profile", {
             name: profile.name,
             source: activePolicy.source,
@@ -2432,6 +2458,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const listenerQueue = state.data.listenerReviewQueue || {};
       const sourceQueue = state.data.sourceReviewQueue || {};
       const securityEvidence = state.data.securityEvidence || {};
+      const keyBroker = state.data.keyBroker || {};
       const identityEvidence = state.data.identityEvidence || {};
       const identityRotationRequests = state.data.identityRotationRequests || {};
       const identityRotationReadiness = state.data.identityRotationReadiness || {};
@@ -2537,6 +2564,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-12">${table("Protective Plan Provenance", securityEvidence.protective_plan_provenance || [], ["id", "kind", "target", "approved", "canceled", "rollback"], {fills: {id: (row) => adminPlanFill(row.id)}, fillView: "admin"})}</div>
           <div class="panel span-6">${table("Security Baseline Drift", operations.security_drift || [], ["check", "status", "evidence", "next_step"])}</div>
           <div class="panel span-6">${table("Identity And Secrets", [operations.identity_access || {}], ["local_users", "local_groups", "service_accounts", "public_ssh_keys", "next_step"])}</div>
+          <div class="panel span-6">${kv("Key Broker Policy", {
+            broker_root: keyBroker.broker_root,
+            secret_policy: keyBroker.secret_policy,
+            pending_approval: keyBroker.summary?.pending_approval,
+            active_grants: keyBroker.summary?.active_grants
+          })}</div>
+          <div class="panel span-6">${table("Key Providers", keyBroker.providers || [], ["id", "provider_kind", "enabled", "allowed_subjects", "allowed_scopes"])}</div>
+          <div class="panel span-6">${table("Key Requests", keyBroker.requests || [], ["id", "provider_id", "subject", "status", "risk_level", "ttl_minutes"])}</div>
+          <div class="panel span-6">${table("Key Grants", keyBroker.grants || [], ["id", "provider_id", "subject", "status", "expires_at", "revoked_at"])}</div>
           <div class="panel span-12">${table("Identity Access Review", identityEvidence.users || [], ["user", "uid", "account_type", "home", "login_shell"])}</div>
           <div class="panel span-6">${table("SSH Key Custody", identityEvidence.ssh_keys || [], ["path", "kind", "fingerprint", "status"], {fills: {path: (row) => identityRotationFill({...row, subject_type: "ssh_key"})}, fillView: "security"})}</div>
           <div class="panel span-6">${table("Secret File Custody", identityEvidence.secret_files || [], ["path", "status", "content"], {fills: {path: (row) => identityRotationFill({...row, subject_type: "secret"})}, fillView: "security"})}</div>
@@ -2554,6 +2590,18 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const health = state.data.health || {};
       const healthSummary = state.data.healthSummary || {};
       const serviceEvidence = state.data.serviceEvidence || {};
+      const codexUsage = state.data.codexUsage || {};
+      const codexWindows = (codexUsage.rate_limits || []).flatMap((limit) =>
+        (limit.windows || []).map((window) => ({
+          limit: limit.limit_name || limit.limit_id,
+          plan: limit.plan_type,
+          window: window.name,
+          used_percent: window.used_percent,
+          remaining_percent: window.remaining_percent,
+          resets_at: window.resets_at
+        }))
+      );
+      const codexAccount = codexUsage.account_usage || {};
       const journalAccess = serviceEvidence.journal_access || {};
       const observabilityTrends = state.data.observabilityTrends || {};
       const metricHistory = state.data.metricHistory || {};
@@ -2568,6 +2616,21 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Unhealthy", health.unhealthy, "targets", "span-3", health.unhealthy ? "bad" : "good", "health")}
           ${metric("Recovery", health.recovery_required, "required", "span-3", health.recovery_required ? "warn" : "good", "health")}
           ${metric("Failures", health.latest_failures, "latest", "span-3", health.latest_failures ? "bad" : "good", "audit")}
+          ${metric("Codex Capacity", codexUsage.minimum_remaining_percent, "% remaining", "span-3", codexUsage.posture === "critical" ? "bad" : codexUsage.posture === "conserve" ? "warn" : "good", "health")}
+          ${metric("Codex Posture", codexUsage.posture, codexUsage.confidence || "unknown confidence", "span-3", codexUsage.available ? "good" : "bad", "health")}
+          <div class="panel span-6">${kv("Codex Usage Status", {
+            available: codexUsage.available,
+            observed_at: codexUsage.observed_at,
+            recommendation: codexUsage.recommendation,
+            next_step: codexUsage.next_step
+          })}</div>
+          <div class="panel span-6">${kv("Codex Account Usage", {
+            lifetime_tokens: codexAccount.lifetime_tokens,
+            peak_daily_tokens: codexAccount.peak_daily_tokens,
+            longest_running_turn_seconds: codexAccount.longest_running_turn_seconds,
+            current_streak_days: codexAccount.current_streak_days
+          })}</div>
+          <div class="panel span-12">${table("Codex Usage Windows", codexWindows, ["limit", "plan", "window", "used_percent", "remaining_percent", "resets_at"])}</div>
           <div class="panel span-6">${kv("Runtime Heartbeat", {
             service: runtime.service?.service_name,
             freshness: runtime.service?.freshness?.status,
@@ -2665,7 +2728,15 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return ["observation", "checkout", "lock", "lease", "hold", "quarantine"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function adminKindOptions() {
-      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+      return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function firmwareBlockerRows(items) {
+      return (items || []).filter((item) => item.blocker_type).map((item) => ({
+        device: item.device,
+        blocker_type: item.blocker_type,
+        blocker_resolution: item.blocker_resolution,
+        safe_preflight: (item.safe_preflight || []).join("; ")
+      }));
     }
     function sourceDispositionOptions() {
       return ["needs_review", "expected", "benign", "suspicious", "hostile"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
@@ -2924,6 +2995,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Plan a service restart or admin change", page: "Admin", owner: "O'Brien", action: "plan-admin-change", source, query: "Plan a service restart or admin change"},
         {workflow: "Execute an approved admin plan", page: "Admin", owner: "O'Brien", action: "execute-admin-change", source, query: "Execute an approved admin plan"},
         {workflow: "Plan package updates", page: "Admin", owner: "O'Brien", action: "plan-package-updates", source, query: "Plan package updates"},
+        {workflow: "Plan firmware updates", page: "Admin", owner: "O'Brien / Sisko", action: "plan-firmware-updates", source, query: "Plan firmware updates"},
         {workflow: "Run package maintenance cycle", page: "Admin", owner: "O'Brien", action: "run-package-maintenance-cycle", source, query: "Run package maintenance cycle"},
         {workflow: "Refresh CVE advisory feeds", page: "Admin", owner: "O'Brien", action: "refresh-advisories", source, query: "Refresh CVE advisory feeds"},
         {workflow: "Discover user services", page: "Admin", owner: "O'Brien / Julian", action: "discover-user-services", source, query: "Discover user services"},
@@ -2993,6 +3065,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Stage identity rotation request", page: "Security", owner: "Odo", action: "stage-identity-rotation-request", source, query: "Stage identity rotation request"},
         {workflow: "Approve identity rotation request", page: "Security", owner: "Sisko / Odo", action: "approve-identity-rotation-request", source, query: "Approve identity rotation request"},
         {workflow: "Execute identity rotation request", page: "Security", owner: "Odo", action: "execute-identity-rotation-request", source, query: "Execute identity rotation request"},
+        {workflow: "Review key broker providers and token grants", page: "Security", owner: "Odo / Quark", action: "view-key-broker-status", source: `${source}#key-broker`, query: "Review key broker providers and token grants"},
         {workflow: "Prepare an IDS review package", page: "Security", owner: "Odo IDS", action: "prepare-ids-review-package", source, query: "Prepare an IDS review package"},
         {workflow: "Export an IDS review prompt", page: "Security", owner: "Odo IDS", action: "export-ids-review-prompt", source, query: "Export an IDS review prompt"},
         {workflow: "Dispatch an IDS review package", page: "Security", owner: "Odo IDS", action: "dispatch-ids-review-package", source, query: "Dispatch an IDS review package"},

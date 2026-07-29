@@ -107,6 +107,10 @@ from overseer import (
     UsageLimit,
     CrewMessage,
     CrewMessageStatus,
+    EfivarEntry,
+    FirmwarePreflightAdapter,
+    FirmwarePreflightSnapshot,
+    FwupdFirmwareInspectionAdapter,
     assess_freshness,
     approval_from_decision,
     assess_maintenance_readiness,
@@ -118,6 +122,7 @@ from overseer import (
     needs_operator_approval,
     physical_identity_conflicts,
     parse_apt_upgradable,
+    parse_fwupd_upgrades,
     parse_systemd_service_rows,
     recommend_security_response,
     schedule_maintenance_window,
@@ -155,6 +160,7 @@ from overseer.remote_testing import (
     enqueue_remote_test_job_status,
     request_remote_testing_lease_status,
 )
+from overseer.key_broker import KeyBrokerRequestStatus, KeyBrokerGrantStatus
 from overseer.ui import OPERATOR_CONSOLE_HTML
 from overseer.cli import demo_status
 from overseer.cli import discover_codex_project_threads_status
@@ -209,6 +215,8 @@ from overseer.cli import host_security_sources_status
 from overseer.cli import create_host_security_source_review_status
 from overseer.cli import host_security_source_reviews_status
 from overseer.cli import host_security_triage_status
+from overseer.cli import inspect_firmware_preflight_status
+from overseer.cli import inspect_firmware_status
 from overseer.cli import inspect_host_status
 from overseer.cli import inspect_packages_status
 from overseer.cli import list_state_status
@@ -218,6 +226,7 @@ from overseer.cli import operator_dashboard_status
 from overseer.cli import physical_summary_status
 from overseer.cli import persistence_security_status
 from overseer.cli import plan_host_security_listener_queue_remediations_status
+from overseer.cli import plan_firmware_updates_status
 from overseer.cli import plan_package_updates_status
 from overseer.cli import prepare_host_security_ids_review_package_status
 from overseer.cli import host_security_ids_review_packages_status
@@ -256,6 +265,14 @@ from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
 from overseer.cli import usage_continuation_plan_status
 from overseer.cli import virtual_summary_status
+from overseer.cli import (
+    approve_key_broker_request_status,
+    issue_key_broker_token_status,
+    key_broker_status,
+    record_key_provider_status,
+    request_key_broker_token_status,
+    revoke_key_broker_token_status,
+)
 from overseer import parse_tcp_listeners
 
 
@@ -1248,6 +1265,132 @@ class PackageInspectionTests(unittest.TestCase):
         self.assertEqual(status["upgradable"], 0)
         self.assertEqual(status["stderr"], "apt lock unavailable")
 
+    def test_parse_fwupd_upgrades_reports_blocked_secure_boot_updates(self):
+        output = """
+Devices with no available firmware updates:
+ • System Firmware
+LENOVO 80VR
+│
+├─UEFI CA:
+│ │   Current version:    2011
+│ │   Vendor:             Microsoft (UEFI:Microsoft)
+│ │   Update Error:       Not enough efivarfs space, requested 16.4 kB and got 13.0 kB
+│ │   Device Flags:       • Internal device
+│ │                       • Needs a reboot after installation
+│ │
+│ └─Secure Boot Signature Database Configuration Update:
+│       New version:      2023
+│       Remote ID:        lvfs
+│       Release ID:       116503
+│       Summary:          UEFI Secure Boot Signature Database
+│       Urgency:          High
+│       Vendor:           Microsoft
+│
+└─UEFI dbx:
+  │   Current version:    20241101
+  │   Update Error:       Not enough efivarfs space, requested 30.7 kB and got 13.0 kB
+  │   Device Flags:       • Internal device
+  │                       • Needs a reboot after installation
+  │
+  └─Secure Boot dbx Configuration Update:
+        New version:      20260402
+        Remote ID:        lvfs
+        Release ID:       143971
+        Summary:          UEFI Secure Boot Forbidden Signature Database
+        Urgency:          High
+        Vendor:           Linux Foundation
+"""
+        updates, no_update_devices = parse_fwupd_upgrades(output)
+
+        self.assertEqual(no_update_devices, ("System Firmware",))
+        self.assertEqual([update.device for update in updates], ["UEFI CA", "UEFI dbx"])
+        self.assertEqual(updates[0].title, "Secure Boot Signature Database Configuration Update")
+        self.assertEqual(updates[0].current_version, "2011")
+        self.assertEqual(updates[0].new_version, "2023")
+        self.assertEqual(updates[0].urgency, "High")
+        self.assertIn("efivarfs", updates[0].update_error)
+        self.assertTrue(updates[0].reboot_required)
+        self.assertEqual(updates[1].release_id, "143971")
+
+    def test_inspect_firmware_status_reports_read_only_fwupd_updates(self):
+        commands = []
+
+        def runner(command):
+            commands.append(tuple(command))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                """
+LENOVO 80VR
+│
+└─UEFI dbx:
+  │   Current version:    20241101
+  │   Update Error:       Not enough efivarfs space, requested 30.7 kB and got 13.0 kB
+  │   Device Flags:       • Needs a reboot after installation
+  │
+  └─Secure Boot dbx Configuration Update:
+        New version:      20260402
+        Remote ID:        lvfs
+        Release ID:       143971
+        Summary:          UEFI Secure Boot Forbidden Signature Database
+        Urgency:          High
+        Vendor:           Linux Foundation
+""",
+                "",
+            )
+
+        status = inspect_firmware_status(
+            "2026-07-29T01:45:00+00:00",
+            FwupdFirmwareInspectionAdapter(command_runner=runner),
+        )
+
+        self.assertEqual(commands, [("fwupdmgr", "get-upgrades", "--no-reboot-check")])
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["updates"], 1)
+        self.assertEqual(status["blocked_updates"], 1)
+        self.assertEqual(status["high_urgency"], 1)
+        self.assertEqual(status["items"][0]["status"], "blocked")
+        self.assertEqual(status["items"][0]["blocker_type"], "efivarfs_space")
+        self.assertIn("EFI variable", status["items"][0]["blocker_resolution"])
+        self.assertTrue(
+            any("find /sys/firmware/efi/efivars" in command for command in status["items"][0]["safe_preflight"])
+        )
+        self.assertFalse(status["host_mutation_performed"])
+
+    def test_inspect_firmware_preflight_reports_efivar_candidates_without_mutation(self):
+        class Adapter:
+            def inspect(self, captured_at=None):
+                return FirmwarePreflightSnapshot(
+                    id="firmware-preflight.test",
+                    captured_at=captured_at or "2026-07-29T03:30:00+00:00",
+                    efivar_path="/sys/firmware/efi/efivars",
+                    efivar_accessible=True,
+                    efivars=(
+                        EfivarEntry("dump-type0-Example", 2048),
+                        EfivarEntry("Boot0000-Example", 128),
+                    ),
+                )
+
+        status = inspect_firmware_preflight_status("2026-07-29T03:30:00+00:00", adapter=Adapter())
+
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["efivar_count"], 2)
+        self.assertEqual(status["stale_dump_candidate_count"], 1)
+        self.assertEqual(status["stale_dump_candidates"][0]["name"], "dump-type0-Example")
+        self.assertFalse(status["host_mutation_performed"])
+
+    def test_firmware_preflight_adapter_reports_missing_efivarfs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            status = inspect_firmware_preflight_status(
+                "2026-07-29T03:31:00+00:00",
+                adapter=FirmwarePreflightAdapter(missing),
+            )
+
+        self.assertEqual(status["status"], "failed")
+        self.assertFalse(status["efivar_accessible"])
+        self.assertIn("not present", status["error"])
+
     def test_plan_package_updates_stages_approval_gated_plans(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -1286,6 +1429,76 @@ class PackageInspectionTests(unittest.TestCase):
                 store_path,
                 "2026-07-19T14:46:00+00:00",
                 adapter=AptPackageInspectionAdapter(command_runner=runner),
+            )
+
+            self.assertFalse(status["mutation_performed"])
+            self.assertEqual(status["plans"], 0)
+            self.assertEqual(status["inspection"]["status"], "failed")
+
+    def test_plan_firmware_updates_stages_approval_gated_disabled_adapter_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    """
+LENOVO 80VR
+│
+└─UEFI dbx:
+  │   Current version:    20241101
+  │   Update Error:       Not enough efivarfs space, requested 30.7 kB and got 13.0 kB
+  │   Device Flags:       • Internal device
+  │                       • Needs a reboot after installation
+  │
+  └─Secure Boot dbx Configuration Update:
+        New version:      20260402
+        Remote ID:        lvfs
+        Release ID:       143971
+        Summary:          UEFI Secure Boot Forbidden Signature Database
+        Urgency:          High
+        Vendor:           Linux Foundation
+""",
+                    "",
+                )
+
+            status = plan_firmware_updates_status(
+                store_path,
+                "2026-07-29T02:10:00+00:00",
+                adapter=FwupdFirmwareInspectionAdapter(command_runner=runner),
+            )
+            summary = admin_summary_status(store_path)
+            store = SQLiteStore(store_path)
+            try:
+                plan = store.load_admin_change_plan(status["items"][0]["id"])
+            finally:
+                store.close()
+            execution = execute_admin_change_plan(plan)
+
+            self.assertTrue(status["mutation_performed"])
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(status["plans"], 1)
+            self.assertEqual(status["blocked_updates"], 1)
+            self.assertEqual(status["items"][0]["kind"], AdminChangeKind.FIRMWARE_UPDATE.value)
+            self.assertEqual(status["items"][0]["risk_level"], RiskLevel.CRITICAL.value)
+            self.assertEqual(status["items"][0]["approval_level"], ApprovalLevel.HUMAN.value)
+            self.assertIn("143971", status["items"][0]["target"])
+            self.assertEqual(summary["plans"], 1)
+            self.assertEqual(execution.status, AdminExecutionStatus.BLOCKED)
+            self.assertIn("live adapter unavailable", execution.summary)
+
+    def test_plan_firmware_updates_reports_failed_inspection_without_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            def runner(command):
+                return subprocess.CompletedProcess(command, 127, "", "fwupdmgr missing")
+
+            status = plan_firmware_updates_status(
+                store_path,
+                "2026-07-29T02:11:00+00:00",
+                adapter=FwupdFirmwareInspectionAdapter(command_runner=runner),
             )
 
             self.assertFalse(status["mutation_performed"])
@@ -4003,6 +4216,62 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertEqual(status["plans"], 2)
         self.assertEqual(status["selected_packages"], ["openssl"])
 
+    def test_api_plans_firmware_updates(self):
+        original = overseer_api.plan_firmware_updates_status
+        overseer_api.plan_firmware_updates_status = lambda store_path, **kwargs: {
+            "store": str(store_path),
+            "plans": 1,
+            "selected_release_ids": tuple(kwargs["release_ids"]),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    request = Request(
+                        f"{server.url}/maintenance/firmware-update-plans",
+                        data=json.dumps({"release_ids": ["143971"]}).encode("utf-8"),
+                        headers={"Authorization": "Bearer client-secret", "Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urlopen(request, timeout=5) as response:
+                        status = json.loads(response.read().decode("utf-8"))
+        finally:
+            overseer_api.plan_firmware_updates_status = original
+
+        self.assertEqual(status["plans"], 1)
+        self.assertEqual(status["selected_release_ids"], ["143971"])
+        self.assertFalse(status["host_mutation_performed"])
+
+    def test_api_reads_firmware_preflight_status(self):
+        original = overseer_api.inspect_firmware_preflight_status
+        overseer_api.inspect_firmware_preflight_status = lambda: {
+            "status": "ok",
+            "efivar_accessible": True,
+            "stale_dump_candidate_count": 1,
+            "host_mutation_performed": False,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+
+                with LocalOverseerApiServer(store_path, auth_token="client-secret") as server:
+                    request = Request(
+                        f"{server.url}/maintenance/firmware-preflight",
+                        headers={"Authorization": "Bearer client-secret"},
+                        method="GET",
+                    )
+                    with urlopen(request, timeout=5) as response:
+                        status = json.loads(response.read().decode("utf-8"))
+        finally:
+            overseer_api.inspect_firmware_preflight_status = original
+
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["stale_dump_candidate_count"], 1)
+        self.assertFalse(status["host_mutation_performed"])
+
     def test_client_reads_security_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4454,12 +4723,22 @@ class OverseerApiClientTests(unittest.TestCase):
         self.assertIn("Active Policy Profile", OPERATOR_CONSOLE_HTML)
         self.assertIn('packageStatus: "/maintenance/package-status"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Package Status", OPERATOR_CONSOLE_HTML)
+        self.assertIn('firmwareStatus: "/maintenance/firmware-status"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('firmwarePreflight: "/maintenance/firmware-preflight"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Firmware Updates", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/services/discover-user"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Discover Services", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/physical/discover"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Discover Devices", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/maintenance/package-update-plans"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Plan Updates", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/maintenance/firmware-update-plans"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Plan Firmware", OPERATOR_CONSOLE_HTML)
+        self.assertIn("firmware_update", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Firmware Blocker Guidance", OPERATOR_CONSOLE_HTML)
+        self.assertIn("firmwareBlockerRows", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Firmware Preflight", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Largest EFI Variables", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/codex-projects/discover-threads"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Discover Codex Threads", OPERATOR_CONSOLE_HTML)
         self.assertIn('postJson("/usage-limits"', OPERATOR_CONSOLE_HTML)
@@ -6118,13 +6397,26 @@ class HostInspectionTests(unittest.TestCase):
             fake_runner.commands[0],
             ("/usr/bin/tmux", "has-session", "-t", "codex-intrusion-detection-019f09da"),
         )
-        self.assertEqual(fake_runner.commands[2], ("/usr/bin/tmux", "load-buffer", "-b", "overseer-dispatch", "-"))
-        self.assertIn("Evaluate this proposed Overseer security change before enforcement.", fake_runner.inputs[2])
         self.assertEqual(
-            fake_runner.commands[3],
+            fake_runner.commands[2],
+            (
+                "/usr/bin/tmux",
+                "capture-pane",
+                "-p",
+                "-t",
+                "codex-intrusion-detection-019f09da",
+                "-S",
+                "-200",
+            ),
+        )
+        self.assertEqual(fake_runner.commands[3], ("/usr/bin/tmux", "load-buffer", "-b", "overseer-dispatch", "-"))
+        self.assertIn("Evaluate this proposed Overseer security change before enforcement.", fake_runner.inputs[3])
+        self.assertEqual(
+            fake_runner.commands[4],
             ("/usr/bin/tmux", "paste-buffer", "-b", "overseer-dispatch", "-t", "codex-intrusion-detection-019f09da"),
         )
-        self.assertEqual(fake_runner.commands[4], ("/usr/bin/tmux", "send-keys", "-t", "codex-intrusion-detection-019f09da", "Enter"))
+        self.assertEqual(fake_runner.commands[5], ("/usr/bin/tmux", "send-keys", "-t", "codex-intrusion-detection-019f09da", "Enter"))
+        self.assertEqual(fake_runner.commands[6], fake_runner.commands[2])
         self.assertEqual(fake_runner.commands[1][0:4], ("/usr/bin/tmux", "new-session", "-d", "-s"))
 
     def test_ids_review_summary_excludes_canceled_plan_packages_from_active_gate_counts(self):
@@ -8404,6 +8696,83 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(runner.commands[0], ["/tmp/tmux", "has-session", "-t", "codex-overseer-019f7140"])
             self.assertEqual(runner.commands[1][0:6], ["/tmp/tmux", "new-session", "-d", "-s", "codex-overseer-019f7140", "-c"])
             self.assertIn("/tmp/codex-memory-session", runner.commands[1])
+
+    def test_codex_project_thread_adapter_reports_prompt_rejection_from_tmux_pane(self):
+        class RejectingRunner:
+            def __init__(self):
+                self.commands = []
+                self.capture_count = 0
+
+            def __call__(self, command, input=None, text=True, capture_output=True):
+                self.commands.append(command)
+                if command[:2] == ["/tmp/tmux", "capture-pane"]:
+                    self.capture_count += 1
+                    if self.capture_count == 1:
+                        return UsageContinuationRequestTests._Completed(stdout="Codex ready")
+                    return UsageContinuationRequestTests._Completed(
+                        stdout="Message exceeds maximum length allowed (6.6M provided)",
+                    )
+                return UsageContinuationRequestTests._Completed()
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f09da-25c8-72b2-9730-9a0a17b9e177,Intrusion Detection,"
+                "/workspace/Intrusion Detection,codex-intrusion-detection-019f09da,"
+                "/bin/codex-intrusion-detection-019f09da,"
+                "2026-06-27T16:11:59+00:00,2026-06-28T17:17:28+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            runner = RejectingRunner()
+            adapter = CodexProjectThreadAdapter(
+                registry,
+                tmux_path="/tmp/tmux",
+                codex_memory_session_path="/tmp/codex-memory-session",
+                runner=runner,
+            )
+
+            result = adapter.dispatch_prompt(
+                "codex-intrusion-detection-019f09da",
+                "Evaluate this proposed security change.",
+            )
+
+        self.assertEqual(result.status, "prompt_rejected")
+        self.assertIn("maximum length", result.reason)
+        self.assertTrue(any(command[:2] == ["/tmp/tmux", "capture-pane"] for command in runner.commands))
+
+    def test_codex_project_thread_adapter_ignores_historical_prompt_rejection(self):
+        class HistoricalRejectionRunner:
+            def __call__(self, command, input=None, text=True, capture_output=True):
+                if command[:2] == ["/tmp/tmux", "capture-pane"]:
+                    return UsageContinuationRequestTests._Completed(
+                        stdout="Message exceeds maximum length allowed (old prompt)\nCodex ready",
+                    )
+                return UsageContinuationRequestTests._Completed()
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f09da-25c8-72b2-9730-9a0a17b9e177,Intrusion Detection,"
+                "/workspace/Intrusion Detection,codex-intrusion-detection-019f09da,"
+                "/bin/codex-intrusion-detection-019f09da,"
+                "2026-06-27T16:11:59+00:00,2026-06-28T17:17:28+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            adapter = CodexProjectThreadAdapter(
+                registry,
+                tmux_path="/tmp/tmux",
+                codex_memory_session_path="/tmp/codex-memory-session",
+                runner=HistoricalRejectionRunner(),
+            )
+
+            result = adapter.dispatch_prompt(
+                "codex-intrusion-detection-019f09da",
+                "Evaluate this proposed security change.",
+            )
+
+        self.assertEqual(result.status, "prompt_dispatched")
 
     def test_maps_codex_project_thread_to_usage_limited_resource(self):
         thread = CodexProjectThread(
@@ -11213,6 +11582,112 @@ class OverseerCoordinatorTests(unittest.TestCase):
             self.assertEqual(store.load_claim(activated.claim.id).status, ClaimStatus.RELEASED)
             self.assertIsNone(store.load_resource(resource.id).current_claim_id)
             store.close()
+
+
+class KeyBrokerTests(unittest.TestCase):
+    def test_static_provider_can_issue_scoped_token_without_returning_raw_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            provider = record_key_provider_status(
+                store_path,
+                provider_id="static.github.read",
+                display_name="Static GitHub read token",
+                provider_kind="static_token",
+                secret_ref=str(root / "secrets" / "github.env"),
+                allowed_subjects=("project:Overseer",),
+                allowed_scopes=("contents:read",),
+            )
+            self.assertEqual(provider["provider"]["secret_ref"], "github.env")
+
+            requested = request_key_broker_token_status(
+                store_path,
+                provider_id="static.github.read",
+                subject="project:Overseer",
+                requested_scopes=("contents:read",),
+                requested_by="sisko",
+                justification="inspect repository",
+            )
+            self.assertEqual(requested["request"]["status"], KeyBrokerRequestStatus.APPROVED.value)
+
+            issued = issue_key_broker_token_status(store_path, root, requested["request"]["id"], "odo")
+
+            self.assertFalse(issued["raw_token_returned"])
+            self.assertEqual(issued["grant"]["status"], KeyBrokerGrantStatus.ACTIVE.value)
+            self.assertIn("token_hash_prefix", issued["grant"])
+            token_path = Path(issued["grant"]["token_path"])
+            self.assertTrue(token_path.exists())
+            self.assertNotIn(token_path.read_text(encoding="utf-8"), json.dumps(key_broker_status(store_path, root)))
+
+    def test_github_app_provider_requires_approval_before_issuance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            record_key_provider_status(
+                store_path,
+                provider_id="github.app.overseer",
+                display_name="Overseer GitHub App",
+                provider_kind="github_app",
+                secret_ref=str(root / "secrets" / "github-app.pem"),
+                allowed_subjects=("*",),
+                allowed_scopes=("contents:read", "pull_requests:write"),
+            )
+            requested = request_key_broker_token_status(
+                store_path,
+                provider_id="github.app.overseer",
+                subject="project:Overseer",
+                requested_scopes=("contents:read",),
+                requested_by="sisko",
+                justification="read live GitHub state",
+            )
+            self.assertEqual(requested["request"]["status"], KeyBrokerRequestStatus.PENDING_APPROVAL.value)
+            with self.assertRaises(ValueError):
+                issue_key_broker_token_status(store_path, root, requested["request"]["id"], "odo")
+
+            approved = approve_key_broker_request_status(
+                store_path,
+                requested["request"]["id"],
+                approved_by="sisko",
+                approval_id="approval.github.app.overseer.read",
+            )
+            self.assertEqual(approved["request"]["status"], KeyBrokerRequestStatus.APPROVED.value)
+            with self.assertRaises(ValueError):
+                issue_key_broker_token_status(store_path, root, requested["request"]["id"], "odo")
+
+    def test_key_broker_rejects_out_of_scope_requests_and_revokes_grants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "overseer.sqlite3"
+            record_key_provider_status(
+                store_path,
+                provider_id="static.github.read",
+                display_name="Static GitHub read token",
+                provider_kind="static_token",
+                secret_ref=str(root / "secrets" / "github.env"),
+                allowed_subjects=("project:Overseer",),
+                allowed_scopes=("contents:read",),
+            )
+            with self.assertRaises(ValueError):
+                request_key_broker_token_status(
+                    store_path,
+                    provider_id="static.github.read",
+                    subject="project:Other",
+                    requested_scopes=("contents:read",),
+                    requested_by="sisko",
+                    justification="wrong subject",
+                )
+            requested = request_key_broker_token_status(
+                store_path,
+                provider_id="static.github.read",
+                subject="project:Overseer",
+                requested_scopes=("contents:read",),
+                requested_by="sisko",
+                justification="inspect repository",
+            )
+            issued = issue_key_broker_token_status(store_path, root, requested["request"]["id"], "odo")
+            revoked = revoke_key_broker_token_status(store_path, issued["grant"]["id"], "odo", "done")
+            self.assertEqual(revoked["grant"]["status"], KeyBrokerGrantStatus.REVOKED.value)
+            self.assertEqual(Path(issued["grant"]["token_path"]).read_text(encoding="utf-8"), "")
 
 
 if __name__ == "__main__":

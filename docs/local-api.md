@@ -59,6 +59,7 @@ PYTHONPATH=src python3 -m overseer.cli serve-api --store state/overseer.sqlite3 
 - `GET /observability/metric-history`
 - `GET /observability/performance-history`
 - `GET /health-summary`
+- `GET /health/codex-usage`
 - `GET /health-efficiency`
 - `GET /host/security`
 - `GET /host/security/findings`
@@ -152,6 +153,10 @@ All request bodies are JSON objects. Claim operations use the same field names a
 `POST /resources` records or updates a managed resource. Required fields are `resource_id`, `name`, `resource_type`, `owner_domain`, and `risk_level`; optional fields are `state`, `identifiers`, `dependencies`, `exclusive_groups`, `current_claim_id`, `last_verified_at`, and `notes`. It does not inspect or mutate host state.
 `POST /host/inspect` captures read-only host evidence and persists it to the API store.
 Configured health probes route HTTP, HTTPS, MCP, HTML, and JSON targets through the HTTP adapter, and process targets through Julian's local read-only process adapter.
+`GET /health/codex-usage` gives Julian a read-only diagnostics view of the
+latest Codex Usage MCP snapshot, including quota windows, used and remaining
+percentages, reset times, account token totals, posture, and forecast warnings.
+It does not refresh the upstream provider or start scheduled work.
 `POST /health-targets` records or updates a Julian health target for an existing resource. Required fields are `target_id`, `resource_id`, `name`, `probe_type`, and `target`; optional fields are `owner_domain`, `expected_status`, `expected_content_type`, and `latency_warn_ms`. It does not run probes or mutate host state.
 `POST /health/probes/run` probes health targets already persisted in the API store and records Julian health evidence. Optional fields: `timeout_seconds`, `retention_per_target`.
 `POST /health/journal-access-requests` stages a Julian read-only system-journal access operation record without reading privileged logs.

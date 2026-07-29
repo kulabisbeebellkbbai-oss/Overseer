@@ -34,6 +34,18 @@
       "risk_level": "low"
     },
     {
+      "id": "svc.mcp.codex-usage",
+      "name": "Codex Usage MCP",
+      "type": "usage_limited_service",
+      "owner_domain": "quark",
+      "risk_level": "low",
+      "identifiers": {
+        "kind": "streamable_http_mcp",
+        "endpoint": "http://127.0.0.1:8797/mcp"
+      },
+      "notes": "Read-only provider access with metadata-only local snapshot history; backend remains loopback-only."
+    },
+    {
       "id": "svc.mcp.documents",
       "name": "Documents MCP",
       "type": "service",
@@ -79,6 +91,14 @@
       "name": "Skiller MCP Health",
       "probe_type": "json",
       "target": "http://127.0.0.1:8794/health",
+      "expected_content_type": "application/json"
+    },
+    {
+      "id": "health.mcp.codex-usage",
+      "resource_id": "svc.mcp.codex-usage",
+      "name": "Codex Usage MCP Health",
+      "probe_type": "json",
+      "target": "http://127.0.0.1:8797/health",
       "expected_content_type": "application/json"
     }
   ]

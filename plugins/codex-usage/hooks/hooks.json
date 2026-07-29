@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/codex-usage-mcp-usage-guard.py\" --preflight",
+            "timeout": 10,
+            "statusMessage": "Checking Codex usage MCP routing"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/codex-usage-mcp-usage-guard.py\" --stop-check",
+            "timeout": 10,
+            "statusMessage": "Checking Codex usage evidence"
+          }
+        ]
+      }
+    ]
+  }
+}

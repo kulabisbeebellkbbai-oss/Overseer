@@ -1,0 +1,11 @@
+[Unit]
+Description=Run one Quark usage-aware Codex work cycle
+After=overseer-codex-usage-mcp.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=
+ExecStart="/home/god/.local/share/overseer/codex-usage-mcp-venv/bin/overseer-quark-scheduler" --db /home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3 run-cycle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict

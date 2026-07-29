@@ -29,6 +29,7 @@ from .admin import (
     plan_apt_upgrade,
     plan_block_ip,
     plan_docker_compose_update,
+    plan_firmware_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewalld_source_scoped_deny_tcp,
@@ -105,6 +106,14 @@ from .ids_review import (
     record_ids_review_package_result,
     write_ids_review_prompt_file,
 )
+from .key_broker import (
+    KeyBrokerGrantStatus,
+    KeyBrokerRequestStatus,
+    KeyBrokerTokenGrant,
+    KeyBrokerTokenRequest,
+    KeyProviderKind,
+    KeyProviderRecord,
+)
 from .live_health import (
     HttpHealthProbeAdapter,
     LocalCommandHealthProbeAdapter,
@@ -127,7 +136,19 @@ from .maintenance import (
 )
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource, physical_identity_conflicts
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
-from .packages import AptPackageInspectionAdapter, PackageInspectionSnapshot, PackageUpdate, parse_apt_upgradable
+from .packages import (
+    AptPackageInspectionAdapter,
+    EfivarEntry,
+    FirmwareInspectionSnapshot,
+    FirmwarePreflightAdapter,
+    FirmwarePreflightSnapshot,
+    FirmwareUpdate,
+    FwupdFirmwareInspectionAdapter,
+    PackageInspectionSnapshot,
+    PackageUpdate,
+    parse_apt_upgradable,
+    parse_fwupd_upgrades,
+)
 from .policy import (
     BEST_PRACTICE_POLICY_PROFILE,
     PolicyCheck,
@@ -212,6 +233,8 @@ __all__ = [
     "plan_apt_update",
     "plan_apt_upgrade",
     "plan_block_ip",
+    "plan_docker_compose_update",
+    "plan_firmware_update",
     "plan_flatpak_install",
     "plan_firewalld_deny_tcp",
     "plan_firewalld_source_scoped_deny_tcp",
@@ -273,6 +296,12 @@ __all__ = [
     "systemd_user_service_resources",
     "HostSecurityIDSReviewPackage",
     "IDSReviewPackageStatus",
+    "KeyBrokerGrantStatus",
+    "KeyBrokerRequestStatus",
+    "KeyBrokerTokenGrant",
+    "KeyBrokerTokenRequest",
+    "KeyProviderKind",
+    "KeyProviderRecord",
     "admin_plan_requires_ids_review",
     "build_ids_review_package",
     "mark_ids_review_package_submitted",
@@ -301,9 +330,16 @@ __all__ = [
     "PathPhysicalDiscoveryAdapter",
     "StoragePhysicalDiscoveryAdapter",
     "AptPackageInspectionAdapter",
+    "EfivarEntry",
+    "FirmwareInspectionSnapshot",
+    "FirmwarePreflightAdapter",
+    "FirmwarePreflightSnapshot",
+    "FirmwareUpdate",
+    "FwupdFirmwareInspectionAdapter",
     "PackageInspectionSnapshot",
     "PackageUpdate",
     "parse_apt_upgradable",
+    "parse_fwupd_upgrades",
     "PolicyCheck",
     "PolicyCheckStatus",
     "PolicyDecision",

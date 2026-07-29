@@ -37,6 +37,7 @@ from .admin import (
     plan_apt_upgrade,
     plan_block_ip,
     plan_docker_compose_update,
+    plan_firmware_update,
     plan_flatpak_install,
     plan_firewalld_deny_tcp,
     plan_firewalld_source_scoped_deny_tcp,
@@ -96,11 +97,29 @@ from .image_scanning import (
     image_scan_status,
     stage_image_scan_request_status,
 )
+from .key_broker import (
+    approve_key_broker_token_request_status as approve_key_broker_token_request,
+    issue_key_broker_token_status as issue_key_broker_token,
+    key_broker_status as key_broker_broker_status,
+    record_key_provider_status as record_key_provider,
+    request_key_broker_token_status as request_key_broker_token,
+    revoke_key_broker_token_status as revoke_key_broker_token,
+)
 from .knowledge import DEFAULT_KNOWLEDGE_LIMIT, knowledge_capture_status
 from .live_health import health_probe_adapter_for
 from .physical import PhysicalAssetKind, PhysicalIdentity, PhysicalIdentitySource
 from .physical_discovery import PathPhysicalDiscoveryAdapter, StoragePhysicalDiscoveryAdapter
-from .packages import AptPackageInspectionAdapter, PackageInspectionSnapshot, PackageUpdate
+from .packages import (
+    AptPackageInspectionAdapter,
+    EfivarEntry,
+    FirmwarePreflightAdapter,
+    FirmwarePreflightSnapshot,
+    FirmwareInspectionSnapshot,
+    FirmwareUpdate,
+    FwupdFirmwareInspectionAdapter,
+    PackageInspectionSnapshot,
+    PackageUpdate,
+)
 from .policy import (
     PolicyCheck,
     PolicyDecision,
@@ -875,6 +894,94 @@ def inspect_packages_status(
     return package_inspection_snapshot_status(snapshot)
 
 
+def inspect_firmware_status(
+    captured_at: str | None = None,
+    adapter: FwupdFirmwareInspectionAdapter | None = None,
+) -> dict[str, object]:
+    snapshot = (adapter or FwupdFirmwareInspectionAdapter()).inspect(captured_at)
+    return firmware_inspection_snapshot_status(snapshot)
+
+
+def inspect_firmware_preflight_status(
+    captured_at: str | None = None,
+    adapter: FirmwarePreflightAdapter | None = None,
+) -> dict[str, object]:
+    snapshot = (adapter or FirmwarePreflightAdapter()).inspect(captured_at)
+    return firmware_preflight_snapshot_status(snapshot)
+
+
+def plan_firmware_updates_status(
+    store_path: str | Path,
+    captured_at: str | None = None,
+    release_ids: Sequence[str] = (),
+    adapter: FwupdFirmwareInspectionAdapter | None = None,
+) -> dict[str, object]:
+    snapshot = (adapter or FwupdFirmwareInspectionAdapter()).inspect(captured_at)
+    inspection = firmware_inspection_snapshot_status(snapshot)
+    if not snapshot.succeeded():
+        return {
+            "store": str(store_path),
+            "inspection": inspection,
+            "plans": 0,
+            "items": [],
+            "mutation_performed": False,
+            "host_mutation_performed": False,
+            "next_step": "repair fwupd firmware inspection before staging firmware maintenance",
+        }
+    detected_release_ids = tuple(update.release_id for update in snapshot.updates if update.release_id)
+    requested_release_ids = tuple(release_id for release_id in release_ids if release_id)
+    selected_release_ids = requested_release_ids or detected_release_ids
+    selected_updates = tuple(
+        update
+        for update in snapshot.updates
+        if not selected_release_ids or (update.release_id and update.release_id in selected_release_ids)
+    )
+    missing_release_ids = tuple(release_id for release_id in requested_release_ids if release_id not in detected_release_ids)
+    if not selected_updates:
+        return {
+            "store": str(store_path),
+            "inspection": inspection,
+            "plans": 0,
+            "items": [],
+            "selected_release_ids": selected_release_ids,
+            "missing_release_ids": missing_release_ids,
+            "mutation_performed": False,
+            "host_mutation_performed": False,
+            "next_step": "no firmware updates matched the requested release ids",
+        }
+
+    suffix = _status_id(snapshot.id)
+    plans = tuple(
+        plan_firmware_update(
+            f"admin.firmware.update.{suffix}.{_status_id(update.release_id or update.device or str(index))}",
+            _firmware_update_target(update),
+            "apply detected firmware update after explicit human approval",
+            _firmware_update_current_state(update),
+            release_id=update.release_id,
+            update_error=update.update_error,
+        )
+        for index, update in enumerate(selected_updates, start=1)
+    )
+    store = SQLiteStore(store_path)
+    try:
+        for plan in plans:
+            store.save_admin_change_plan(plan)
+        return {
+            "store": str(store.path),
+            "inspection": inspection,
+            "plans": len(plans),
+            "items": [admin_change_plan_status(plan) for plan in plans],
+            "selected_release_ids": selected_release_ids,
+            "missing_release_ids": missing_release_ids,
+            "blocked_updates": sum(1 for update in selected_updates if update.update_error),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+            "next_step": "Sisko must approve the firmware update plan and live fwupd adapter before O'Brien can execute it",
+        }
+    finally:
+        store.close()
+
+
 def plan_package_updates_status(
     store_path: str | Path,
     captured_at: str | None = None,
@@ -1040,6 +1147,162 @@ def package_inspection_snapshot_status(snapshot: PackageInspectionSnapshot) -> d
         "stderr": snapshot.stderr,
         "items": [package_update_status(update) for update in snapshot.updates],
     }
+
+
+def firmware_inspection_snapshot_status(snapshot: FirmwareInspectionSnapshot) -> dict[str, object]:
+    blocked = [item for item in snapshot.updates if item.update_error]
+    high = [item for item in snapshot.updates if item.urgency.lower() in {"high", "critical"}]
+    reboot_required = [item for item in snapshot.updates if item.reboot_required]
+    return {
+        "id": snapshot.id,
+        "captured_at": snapshot.captured_at,
+        "command": list(snapshot.command),
+        "exit_code": snapshot.exit_code,
+        "status": "ok" if snapshot.succeeded() else "failed",
+        "updates": len(snapshot.updates),
+        "blocked_updates": len(blocked),
+        "high_urgency": len(high),
+        "reboot_required": len(reboot_required),
+        "stderr": snapshot.stderr,
+        "items": [firmware_update_status(update) for update in snapshot.updates],
+        "no_update_devices": list(snapshot.no_update_devices),
+        "next_step": _firmware_next_step(snapshot),
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def firmware_preflight_snapshot_status(snapshot: FirmwarePreflightSnapshot) -> dict[str, object]:
+    dump_entries = [entry for entry in snapshot.efivars if _efivar_is_stale_dump_candidate(entry)]
+    largest = snapshot.efivars[:10]
+    return {
+        "id": snapshot.id,
+        "captured_at": snapshot.captured_at,
+        "status": "ok" if snapshot.succeeded() else "failed",
+        "efivar_path": snapshot.efivar_path,
+        "efivar_accessible": snapshot.efivar_accessible,
+        "efivar_count": len(snapshot.efivars),
+        "total_bytes": sum(entry.size_bytes for entry in snapshot.efivars),
+        "largest": [efivar_entry_status(entry) for entry in largest],
+        "stale_dump_candidates": [efivar_entry_status(entry) for entry in dump_entries],
+        "stale_dump_candidate_count": len(dump_entries),
+        "error": snapshot.error,
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+        "next_step": _firmware_preflight_next_step(snapshot, dump_entries),
+    }
+
+
+def efivar_entry_status(entry: EfivarEntry) -> dict[str, object]:
+    return {
+        "name": entry.name,
+        "size_bytes": entry.size_bytes,
+    }
+
+
+def firmware_update_status(update: FirmwareUpdate) -> dict[str, object]:
+    blocker_type = _firmware_blocker_type(update)
+    return {
+        "device": update.device,
+        "title": update.title,
+        "current_version": update.current_version,
+        "new_version": update.new_version,
+        "urgency": update.urgency,
+        "vendor": update.vendor,
+        "release_id": update.release_id,
+        "remote_id": update.remote_id,
+        "summary": update.summary,
+        "update_error": update.update_error,
+        "blocker_type": blocker_type,
+        "blocker_resolution": _firmware_blocker_resolution(update, blocker_type),
+        "safe_preflight": _firmware_safe_preflight(update, blocker_type),
+        "reboot_required": update.reboot_required,
+        "status": "blocked" if update.update_error else "available",
+        "next_step": "resolve firmware update blocker before approval" if update.update_error else "stage approval-gated firmware update plan",
+    }
+
+
+def _firmware_next_step(snapshot: FirmwareInspectionSnapshot) -> str:
+    if not snapshot.succeeded():
+        return "repair fwupd firmware inspection before staging firmware maintenance"
+    if any(update.update_error for update in snapshot.updates):
+        return "resolve blocked firmware update preconditions before staging firmware execution"
+    if snapshot.updates:
+        return "stage approval-gated firmware update plan with reboot and rollback notes"
+    return "no firmware updates detected"
+
+
+def _firmware_update_target(update: FirmwareUpdate) -> str:
+    parts = [part for part in (update.device, update.title, update.release_id) if part]
+    return " / ".join(parts) or "firmware update"
+
+
+def _firmware_update_current_state(update: FirmwareUpdate) -> str:
+    version = f"{update.current_version} -> {update.new_version}" if update.new_version else update.current_version
+    parts = [
+        f"device={update.device or 'unknown'}",
+        f"title={update.title or 'unknown'}",
+        f"version={version or 'unknown'}",
+        f"urgency={update.urgency or 'unknown'}",
+    ]
+    if update.update_error:
+        parts.append(f"blocker={update.update_error}")
+    if update.reboot_required:
+        parts.append("reboot_required=true")
+    return "; ".join(parts)
+
+
+def _firmware_blocker_type(update: FirmwareUpdate) -> str:
+    normalized = update.update_error.lower()
+    if "efivarfs" in normalized or "efi variable" in normalized:
+        return "efivarfs_space"
+    if "reboot" in normalized:
+        return "reboot_required"
+    if "not enough" in normalized and "space" in normalized:
+        return "space"
+    if normalized:
+        return "unknown"
+    return ""
+
+
+def _firmware_blocker_resolution(update: FirmwareUpdate, blocker_type: str) -> str:
+    if blocker_type == "efivarfs_space":
+        return (
+            "Inspect EFI variable usage and stale dump variables, then stage an explicit human-approved cleanup "
+            "or firmware-settings change before running fwupd."
+        )
+    if blocker_type == "reboot_required":
+        return "Schedule a reboot maintenance window, re-run firmware inspection, then stage the update."
+    if blocker_type == "space":
+        return "Inspect available storage for the firmware provider and stage a targeted cleanup before update execution."
+    if blocker_type == "unknown":
+        return "Review fwupd device details and vendor guidance before staging live firmware execution."
+    return "No blocker reported; stage approval-gated firmware update plan."
+
+
+def _firmware_safe_preflight(update: FirmwareUpdate, blocker_type: str) -> list[str]:
+    if blocker_type == "efivarfs_space":
+        return [
+            "fwupdmgr get-devices",
+            "fwupdmgr get-upgrades --no-reboot-check",
+            "find /sys/firmware/efi/efivars -maxdepth 1 -type f -printf '%f %s\\n'",
+        ]
+    if blocker_type:
+        return ["fwupdmgr get-devices", "fwupdmgr get-upgrades --no-reboot-check"]
+    return ["fwupdmgr get-upgrades --no-reboot-check"]
+
+
+def _efivar_is_stale_dump_candidate(entry: EfivarEntry) -> bool:
+    name = entry.name.lower()
+    return any(marker in name for marker in ("dump", "crash", "panic", "morc"))
+
+
+def _firmware_preflight_next_step(snapshot: FirmwarePreflightSnapshot, dump_entries: Sequence[EfivarEntry]) -> str:
+    if not snapshot.succeeded():
+        return "repair efivarfs access before firmware blocker analysis"
+    if dump_entries:
+        return "review stale dump candidates and stage explicit human-approved efivar cleanup before fwupd update"
+    return "no obvious stale dump efivars detected; review firmware settings or vendor guidance before fwupd update"
 
 
 def _package_update_current_state(snapshot: PackageInspectionSnapshot, package_names: Sequence[str]) -> str:
@@ -3272,6 +3535,8 @@ def plan_admin_change_status(
         plan = plan_apt_update(plan_id, reason, current_state)
     elif plan_kind == AdminChangeKind.APT_UPGRADE:
         plan = plan_apt_upgrade(plan_id, tuple(packages), reason, current_state)
+    elif plan_kind == AdminChangeKind.FIRMWARE_UPDATE:
+        plan = plan_firmware_update(plan_id, target, reason, current_state)
     elif plan_kind == AdminChangeKind.FLATPAK_INSTALL:
         plan = plan_flatpak_install(plan_id, target, reason, current_state)
     elif plan_kind == AdminChangeKind.NPM_GLOBAL_INSTALL:
@@ -5619,6 +5884,106 @@ def usage_summary_status(store_path: str | Path) -> dict[str, object]:
             },
             "items": [usage_limit_status(limit) for limit in limits],
         }
+    finally:
+        store.close()
+
+
+def key_broker_status(store_path: str | Path, project_root: str | Path = ".") -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return key_broker_broker_status(store, project_root)
+    finally:
+        store.close()
+
+
+def record_key_provider_status(
+    store_path: str | Path,
+    provider_id: str,
+    display_name: str,
+    provider_kind: str,
+    secret_ref: str,
+    allowed_subjects: tuple[str, ...] | list[str],
+    allowed_scopes: tuple[str, ...] | list[str],
+    enabled: bool = True,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return record_key_provider(
+            store,
+            provider_id,
+            display_name,
+            provider_kind,
+            secret_ref,
+            allowed_subjects,
+            allowed_scopes,
+            enabled,
+            metadata,
+        )
+    finally:
+        store.close()
+
+
+def request_key_broker_token_status(
+    store_path: str | Path,
+    provider_id: str,
+    subject: str,
+    requested_scopes: tuple[str, ...] | list[str],
+    requested_by: str,
+    justification: str,
+    ttl_minutes: int = 15,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return request_key_broker_token(
+            store,
+            provider_id,
+            subject,
+            requested_scopes,
+            requested_by,
+            justification,
+            ttl_minutes,
+        )
+    finally:
+        store.close()
+
+
+def approve_key_broker_request_status(
+    store_path: str | Path,
+    request_id: str,
+    approved_by: str,
+    approval_id: str,
+    approved_at: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return approve_key_broker_token_request(store, request_id, approved_by, approval_id, approved_at)
+    finally:
+        store.close()
+
+
+def issue_key_broker_token_status(
+    store_path: str | Path,
+    project_root: str | Path,
+    request_id: str,
+    issued_by: str,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return issue_key_broker_token(store, project_root, request_id, issued_by)
+    finally:
+        store.close()
+
+
+def revoke_key_broker_token_status(
+    store_path: str | Path,
+    grant_id: str,
+    revoked_by: str,
+    reason: str = "work complete",
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return revoke_key_broker_token(store, grant_id, revoked_by, reason)
     finally:
         store.close()
 
@@ -8349,6 +8714,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     maintenance_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     inspect_packages_parser = subparsers.add_parser("inspect-packages", help="read apt package update availability without changing packages")
     inspect_packages_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
+    inspect_firmware_parser = subparsers.add_parser("inspect-firmware", help="read fwupd firmware update availability without changing firmware")
+    inspect_firmware_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
+    inspect_firmware_preflight_parser = subparsers.add_parser(
+        "inspect-firmware-preflight",
+        help="read efivarfs firmware preflight evidence without changing firmware",
+    )
+    inspect_firmware_preflight_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
     plan_package_updates_parser = subparsers.add_parser(
         "plan-package-updates",
         help="stage approval-gated apt update and upgrade plans from current package inspection",
@@ -8356,6 +8728,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan_package_updates_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     plan_package_updates_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
     plan_package_updates_parser.add_argument("--package", action="append", default=[], help="limit upgrade plan to a detected package")
+    plan_firmware_updates_parser = subparsers.add_parser(
+        "plan-firmware-updates",
+        help="stage approval-gated firmware update plans from current fwupd inspection",
+    )
+    plan_firmware_updates_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    plan_firmware_updates_parser.add_argument("--captured-at", help="optional deterministic capture timestamp")
+    plan_firmware_updates_parser.add_argument("--release-id", action="append", default=[], help="limit firmware plan to a detected fwupd release id")
     run_package_maintenance_parser = subparsers.add_parser(
         "run-package-maintenance-cycle",
         help="refresh apt metadata, stage detected upgrades, and execute through O'Brien gates",
@@ -8720,6 +9099,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
     usage_summary_parser = subparsers.add_parser("usage-summary", help="summarize persisted usage limits")
     usage_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_broker_status_parser = subparsers.add_parser("key-broker-status", help="summarize key providers, requests, and scoped grants")
+    key_broker_status_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_broker_status_parser.add_argument("--project-root", default=".")
+    key_provider_parser = subparsers.add_parser("record-key-provider", help="record a key broker provider metadata record")
+    key_provider_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_provider_parser.add_argument("--provider-id", required=True)
+    key_provider_parser.add_argument("--display-name", required=True)
+    key_provider_parser.add_argument("--provider-kind", choices=("static_token", "github_app", "break_glass"), required=True)
+    key_provider_parser.add_argument("--secret-ref", required=True)
+    key_provider_parser.add_argument("--allowed-subject", action="append")
+    key_provider_parser.add_argument("--allowed-scope", action="append", required=True)
+    key_provider_parser.add_argument("--metadata-json", default="{}")
+    key_provider_parser.add_argument("--disabled", action="store_true")
+    key_request_parser = subparsers.add_parser("request-key-broker-token", help="request a scoped token from the key broker")
+    key_request_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_request_parser.add_argument("--provider-id", required=True)
+    key_request_parser.add_argument("--subject", required=True)
+    key_request_parser.add_argument("--scope", action="append", required=True)
+    key_request_parser.add_argument("--requested-by", required=True)
+    key_request_parser.add_argument("--justification", required=True)
+    key_request_parser.add_argument("--ttl-minutes", type=int, default=15)
+    key_approve_parser = subparsers.add_parser("approve-key-broker-request", help="approve a key broker token request")
+    key_approve_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_approve_parser.add_argument("--request-id", required=True)
+    key_approve_parser.add_argument("--approved-by", required=True)
+    key_approve_parser.add_argument("--approval-id", required=True)
+    key_approve_parser.add_argument("--approved-at")
+    key_issue_parser = subparsers.add_parser("issue-key-broker-token", help="issue an approved scoped key broker token")
+    key_issue_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_issue_parser.add_argument("--project-root", default=".")
+    key_issue_parser.add_argument("--request-id", required=True)
+    key_issue_parser.add_argument("--issued-by", required=True)
+    key_revoke_parser = subparsers.add_parser("revoke-key-broker-token", help="revoke a key broker token grant")
+    key_revoke_parser.add_argument("--store", required=True, help="explicit SQLite store path")
+    key_revoke_parser.add_argument("--grant-id", required=True)
+    key_revoke_parser.add_argument("--revoked-by", required=True)
+    key_revoke_parser.add_argument("--reason", default="work complete")
     remote_testing_status_parser = subparsers.add_parser("remote-testing-status", help="summarize Quark-managed remote testing queue profiles and leases")
     remote_testing_status_parser.add_argument("--project-root", default=".", help="project root containing local-secrets/remote-testing")
     remote_testing_profile_parser = subparsers.add_parser("record-remote-testing-profile", help="record or update the Tank/MSI remote testing connection profile")
@@ -9395,8 +9811,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(inspect_packages_status(args.captured_at), sort_keys=True))
         return 0
 
+    if args.command == "inspect-firmware":
+        print(json.dumps(inspect_firmware_status(args.captured_at), sort_keys=True))
+        return 0
+
+    if args.command == "inspect-firmware-preflight":
+        print(json.dumps(inspect_firmware_preflight_status(args.captured_at), sort_keys=True))
+        return 0
+
     if args.command == "plan-package-updates":
         print(json.dumps(plan_package_updates_status(args.store, args.captured_at, tuple(args.package)), sort_keys=True))
+        return 0
+
+    if args.command == "plan-firmware-updates":
+        print(json.dumps(plan_firmware_updates_status(args.store, args.captured_at, tuple(args.release_id)), sort_keys=True))
         return 0
 
     if args.command == "run-package-maintenance-cycle":
@@ -9873,6 +10301,89 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "usage-summary":
         print(json.dumps(usage_summary_status(args.store), sort_keys=True))
+        return 0
+
+    if args.command == "key-broker-status":
+        print(json.dumps(key_broker_status(args.store, args.project_root), sort_keys=True))
+        return 0
+
+    if args.command == "record-key-provider":
+        print(
+            json.dumps(
+                record_key_provider_status(
+                    args.store,
+                    args.provider_id,
+                    args.display_name,
+                    args.provider_kind,
+                    args.secret_ref,
+                    tuple(args.allowed_subject or ["*"]),
+                    tuple(args.allowed_scope),
+                    not args.disabled,
+                    _json_object_arg(args.metadata_json, "metadata-json"),
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "request-key-broker-token":
+        print(
+            json.dumps(
+                request_key_broker_token_status(
+                    args.store,
+                    args.provider_id,
+                    args.subject,
+                    tuple(args.scope),
+                    args.requested_by,
+                    args.justification,
+                    args.ttl_minutes,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "approve-key-broker-request":
+        print(
+            json.dumps(
+                approve_key_broker_request_status(
+                    args.store,
+                    args.request_id,
+                    args.approved_by,
+                    args.approval_id,
+                    args.approved_at,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "issue-key-broker-token":
+        print(
+            json.dumps(
+                issue_key_broker_token_status(
+                    args.store,
+                    args.project_root,
+                    args.request_id,
+                    args.issued_by,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "revoke-key-broker-token":
+        print(
+            json.dumps(
+                revoke_key_broker_token_status(
+                    args.store,
+                    args.grant_id,
+                    args.revoked_by,
+                    args.reason,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "remote-testing-status":

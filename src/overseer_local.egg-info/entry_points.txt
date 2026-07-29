@@ -1,0 +1,4 @@
+[console_scripts]
+overseer = overseer.cli:main
+overseer-codex-usage-mcp = overseer.codex_usage_mcp:main
+overseer-quark-scheduler = overseer.quark_scheduler_cli:main

@@ -97,6 +97,7 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
     "/Overseer/operations/gap-coverage",
     "/Overseer/operations/workflows",
             "/Overseer/health/service-evidence",
+            "/Overseer/health/codex-usage",
             "/Overseer/observability/trends",
             "/Overseer/observability/metric-history",
             "/Overseer/observability/performance-history",

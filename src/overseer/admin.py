@@ -19,6 +19,7 @@ class AdminChangeKind(StrEnum):
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
     APT_UPGRADE = "apt_upgrade"
+    FIRMWARE_UPDATE = "firmware_update"
     FLATPAK_INSTALL = "flatpak_install"
     NPM_GLOBAL_INSTALL = "npm_global_install"
     DOCKER_COMPOSE_UPDATE = "docker_compose_update"
@@ -185,6 +186,19 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
             ("sudo", "apt-get", "install", "--only-upgrade"),
             ("sudo", "apt-get", "check"),
             ("apt", "list", "--upgradable"),
+        ),
+    ),
+    AdminChangeKind.FIRMWARE_UPDATE: AdminExecutionCapability(
+        kind=AdminChangeKind.FIRMWARE_UPDATE,
+        adapter_name="fwupd-firmware-update",
+        status=AdminAdapterStatus.DISABLED,
+        summary="live firmware updates require explicit adapter enablement because they mutate boot-trust state and usually require a reboot",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(
+            ("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+            ("fwupdmgr", "update"),
+            ("fwupdmgr", "get-history"),
         ),
     ),
     AdminChangeKind.FLATPAK_INSTALL: AdminExecutionCapability(
@@ -500,6 +514,69 @@ def plan_apt_upgrade(
                 "Verify package upgrade",
                 verification_command,
                 "confirm upgraded packages or package manager state are queryable",
+            ),
+        ),
+    )
+
+
+def plan_firmware_update(
+    plan_id: str,
+    target: str,
+    reason: str,
+    current_state: str = "unknown",
+    release_id: str = "",
+    update_error: str = "",
+) -> AdminChangePlan:
+    if not target.strip():
+        raise ValueError("target is required")
+    fwupd_target = release_id.strip() or target.strip()
+    blockers = (update_error.strip(),) if update_error.strip() else ()
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.FIRMWARE_UPDATE,
+        owner_domain=OwnerDomain.OBRIEN,
+        risk_level=RiskLevel.CRITICAL,
+        approval_level=ApprovalLevel.HUMAN,
+        target=target.strip(),
+        reason=reason,
+        current_state=current_state,
+        proposed_state=f"apply approved fwupd firmware update for {target.strip()}",
+        steps=(
+            AdminCommandStep(
+                "Inspect firmware update readiness",
+                ("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+                "confirm the target update is still available and blockers are resolved immediately before mutation",
+            ),
+            AdminCommandStep(
+                "Apply firmware update",
+                ("fwupdmgr", "update", fwupd_target),
+                "apply the explicitly approved firmware update through fwupd",
+            ),
+        ),
+        rollback_steps=(
+            AdminCommandStep(
+                "Capture firmware history after failed update",
+                ("fwupdmgr", "get-history"),
+                "preserve vendor/fwupd history for rollback assessment because firmware rollback may be unavailable",
+            ),
+        ),
+        risks=(
+            "firmware mutation",
+            "boot trust database changes",
+            "reboot required",
+            "vendor rollback may be unavailable",
+            *blockers,
+        ),
+        verification_steps=(
+            AdminCommandStep(
+                "Verify firmware update history",
+                ("fwupdmgr", "get-history"),
+                "confirm fwupd records the firmware update result after reboot",
+            ),
+            AdminCommandStep(
+                "Verify no remaining firmware upgrades",
+                ("fwupdmgr", "get-upgrades", "--no-reboot-check"),
+                "confirm the targeted firmware update is no longer pending or record any remaining blockers",
             ),
         ),
     )

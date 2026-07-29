@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Usage MCP"
+  short_description: "Read Codex quotas, resets, history, and heuristics"
+  default_prompt: "Use $codex-usage-mcp to show current Codex usage, remaining capacity, reset times, and recommendations."

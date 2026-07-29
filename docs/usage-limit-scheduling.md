@@ -2,6 +2,59 @@
 
 Quark owns service levels, quotas, credits, rate limits, timeout windows, renewal schedules, and paused-thread continuation timing.
 
+## Checkpointed Codex Work
+
+Quark schedules long-running Codex work as bounded resumable turns rather than
+one unbounded process. Each turn must end at a durable checkpoint. Quark then
+refreshes account usage, records actual quota and token deltas, and either:
+
+- starts another slice when spendable capacity remains;
+- marks the work `waiting_capacity` until the live limit is safe again; or
+- marks it complete when the turn emits `QUARK_WORK_COMPLETED`.
+
+Normal pausing happens only between completed turns. Quark does not kill an
+active tmux session or treat `turn/interrupt` as a transactional pause.
+Interrupted or failed work is marked `reconcile_required`.
+
+The default policy uses percentage-point virtual budgeting:
+
+- 15 points remain reserved for interactive fixes and verification;
+- 2 additional points cover measurement uncertainty;
+- one work slice may reserve at most 5 points;
+- one high-usage Codex slice runs at a time;
+- queued projects receive slices round-robin so one project cannot monopolize
+  spendable capacity.
+
+Quark allocates all capacity above the reserve and uncertainty floor when
+checkpointable backlog exists. It never converts raw tokens into quota
+percentage points.
+
+```bash
+overseer-quark-scheduler \
+  --db /home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3 \
+  register-work \
+  --work-id work.example \
+  --project-id Example \
+  --owner-thread <conversation-id> \
+  --intent "continue the next approved implementation checkpoint" \
+  --estimated-quota-points 8
+
+overseer-quark-scheduler \
+  --db /home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3 \
+  plan
+
+overseer-quark-scheduler \
+  --db /home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3 \
+  project-effort --project-id Example
+```
+
+The matching user timer may execute `run-cycle` every 15 minutes. Only
+explicitly registered work is eligible.
+
+Project effort reports estimated quota points and tokens separately from actual
+before/after deltas. Account-wide deltas are labeled shared because Quark's
+queue reservation does not exclude other Codex clients from using the account.
+
 ## Intent
 
 Overseer should avoid wasting limited service capacity. When a project thread needs a service with usage limits, Quark records the current limit state, decides whether work can start now, and schedules continuation when capacity renews.

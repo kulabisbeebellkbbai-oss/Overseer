@@ -1598,6 +1598,7 @@ def _legacy_codex_discovery_status(
         provider_id="codex",
         instance_id="overseer.default",
         codex_projects_registry=selected_registry,
+        legacy_compatibility=True,
     )
     return {
         "store": str(Path(store_path)),

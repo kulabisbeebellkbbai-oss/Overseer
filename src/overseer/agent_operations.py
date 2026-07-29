@@ -80,6 +80,17 @@ class AgentOperationCoordinator:
             )
         return reserved
 
+    def require_open(self, instance_id: str) -> AgentOperationReservation:
+        operation = self.store.ensure_agent_operation(
+            instance_id,
+            updated_at=self._clock(),
+        )
+        if operation.state is not AgentOperationFenceState.OPEN:
+            raise AgentOperationBlockedError(
+                f"agent instance {instance_id} operation is fenced"
+            )
+        return operation
+
     def release(self, reservation: AgentOperationReservation) -> AgentOperationReservation:
         released = replace(
             reservation,

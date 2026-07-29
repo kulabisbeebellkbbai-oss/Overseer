@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -190,6 +191,26 @@ def _agent_capabilities_status(capabilities: AgentCapabilities) -> dict[str, boo
     return dict(to_jsonable(capabilities))
 
 
+def _agent_session_status(session) -> dict[str, object]:
+    workspace = str(session.workspace)
+    label = Path(workspace).name or "workspace"
+    reference = hashlib.sha256(workspace.encode("utf-8")).hexdigest()
+    return {
+        "id": session.id,
+        "provider_id": session.provider_id,
+        "instance_id": session.instance_id,
+        "external_session_id": session.external_session_id,
+        "state": "discovered",
+        "transport": session.transport.value,
+        "capabilities": _agent_capabilities_status(session.capabilities),
+        "model_profile_id": session.model_profile_id,
+        "workspace": {
+            "label": label,
+            "reference": f"workspace:sha256:{reference}",
+        },
+    }
+
+
 def _record_agent_audit(
     store: SQLiteStore,
     *,
@@ -240,9 +261,7 @@ def _load_agent_registry(
 
 
 def _configured_agent_profiles(registry: AgentRegistry):
-    # AgentRegistry intentionally owns the immutable mapping. This read-only
-    # projection avoids duplicating configuration parsing in operator surfaces.
-    return tuple(registry._profiles.values())
+    return tuple(registry.profiles.values())
 
 
 def agent_providers_status(
@@ -252,18 +271,35 @@ def agent_providers_status(
     registry = _load_agent_registry(registry_path, local_registry_path)
     return {
         "providers": [
-            {
-                "id": provider.id,
-                "adapter_id": provider.adapter_id,
-                "display_name": provider.display_name,
-                "transports": [transport.value for transport in provider.transports],
-                "capabilities": _agent_capabilities_status(provider.capabilities),
-                "profile_ids": list(provider.profile_ids),
-                "health_source_id": provider.health_source_id,
-                "usage_limit_source_id": provider.usage_limit_source_id,
-            }
+            _agent_provider_status(registry, provider)
             for provider in sorted(registry.providers.values(), key=lambda item: item.id)
         ]
+    }
+
+
+def _agent_provider_status(registry: AgentRegistry, provider) -> dict[str, object]:
+    installed = registry.adapter_factory_available(provider.adapter_id)
+    return {
+        "id": provider.id,
+        "adapter_id": provider.adapter_id,
+        "display_name": provider.display_name,
+        "configured": True,
+        "installed": installed,
+        "available": installed,
+        "readiness": "available" if installed else "unavailable",
+        "unavailable_reason": (
+            None
+            if installed
+            else {
+                "type": "adapter_not_installed",
+                "adapter_id": provider.adapter_id,
+            }
+        ),
+        "transports": [transport.value for transport in provider.transports],
+        "capabilities": _agent_capabilities_status(provider.capabilities),
+        "profile_ids": list(provider.profile_ids),
+        "health_source_id": provider.health_source_id,
+        "usage_limit_source_id": provider.usage_limit_source_id,
     }
 
 
@@ -313,33 +349,30 @@ def discover_agent_sessions_status(
     registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
     local_registry_path: str | Path | None = None,
     codex_projects_registry: str | Path | None = None,
+    *,
+    legacy_compatibility: bool = False,
 ) -> dict[str, object]:
     if not provider_id.strip():
         raise ValueError("provider_id is required")
     if not instance_id.strip():
         raise ValueError("instance_id is required")
-    registry = _load_agent_registry(
-        registry_path,
-        local_registry_path,
-        codex_projects_registry=codex_projects_registry,
-    )
-    driver = registry.driver_for_provider(provider_id, instance_id=instance_id)
-    sessions = driver.discover()
     store = SQLiteStore(store_path)
     try:
-        for provider in registry.providers.values():
-            store.save_agent_provider(provider)
-        for profile in _configured_agent_profiles(registry):
-            store.save_agent_instance_profile(profile)
-        for session in sessions:
-            store.save_agent_session(session)
-        resources = []
-        items = []
-        if provider_id == "codex":
+        manager = _agent_manager(
+            store,
+            registry_path,
+            local_registry_path,
+            codex_projects_registry=codex_projects_registry,
+            session_resource_factory=_agent_session_resource,
+        )
+        sessions = manager.discover(instance_id, provider_id)
+        resources = len(sessions) if provider_id == "codex" else 0
+        safe_sessions = [_agent_session_status(session) for session in sessions]
+        items: list[dict[str, object]]
+        if legacy_compatibility and provider_id == "codex":
+            items = []
             for session in sessions:
                 resource = legacy_codex_session_resource(session)
-                store.save_resource(resource)
-                resources.append(resource)
                 references = session.legacy_references
                 items.append(
                     {
@@ -351,23 +384,14 @@ def discover_agent_sessions_status(
                         "resource_id": resource.id,
                     }
                 )
-        _record_agent_audit(
-            store,
-            event_id=(
-                f"audit.agent.discovery.{instance_id}.{provider_id}."
-                f"{datetime.now(UTC).timestamp()}"
-            ),
-            event_type=AuditEventType.VERIFIED,
-            subject_id=f"agent.discovery:{instance_id}:{provider_id}",
-            summary="discovered provider sessions through the configured adapter",
-            risk_level=RiskLevel.LOW,
-        )
+        else:
+            items = safe_sessions
         return {
             "provider_id": provider_id,
             "instance_id": instance_id,
-            "sessions": [to_jsonable(session) for session in sessions],
+            "sessions": safe_sessions,
             "threads": len(sessions) if provider_id == "codex" else 0,
-            "resources": len(resources),
+            "resources": resources,
             "items": items,
             "mutation_performed": bool(sessions or resources),
             "host_mutation_performed": False,
@@ -377,6 +401,12 @@ def discover_agent_sessions_status(
         }
     finally:
         store.close()
+
+
+def _agent_session_resource(session):
+    if session.provider_id == "codex":
+        return legacy_codex_session_resource(session)
+    return None
 
 
 def agent_sessions_status(
@@ -392,7 +422,7 @@ def agent_sessions_status(
             if (provider_id is None or session.provider_id == provider_id)
             and (instance_id is None or session.instance_id == instance_id)
         ]
-        return {"sessions": [to_jsonable(session) for session in sessions]}
+        return {"sessions": [_agent_session_status(session) for session in sessions]}
     finally:
         store.close()
 
@@ -465,8 +495,14 @@ def _agent_manager(
     local_registry_path: str | Path | None,
     *,
     handoff_operation: str = "handoff",
+    codex_projects_registry: str | Path | None = None,
+    session_resource_factory=None,
 ) -> AgentManager:
-    registry = _load_agent_registry(registry_path, local_registry_path)
+    registry = _load_agent_registry(
+        registry_path,
+        local_registry_path,
+        codex_projects_registry=codex_projects_registry,
+    )
     return AgentManager(
         registry,
         store,
@@ -474,6 +510,7 @@ def _agent_manager(
             store,
             handoff_operation=handoff_operation,
         ),
+        session_resource_factory=session_resource_factory,
     )
 
 

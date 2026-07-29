@@ -111,8 +111,24 @@ def test_agent_provider_inventory(api: LocalAPI) -> None:
 
     response = client.list_agent_providers()
 
-    assert {row["id"] for row in response["providers"]} >= {"codex", "claude"}
+    providers = {row["id"]: row for row in response["providers"]}
+    assert set(providers) >= {"codex", "claude"}
     assert all("executable_path" not in row for row in response["providers"])
+    assert providers["codex"] | {
+        "configured": True,
+        "installed": True,
+        "available": True,
+        "readiness": "available",
+        "unavailable_reason": None,
+    } == providers["codex"]
+    assert providers["claude"]["configured"] is True
+    assert providers["claude"]["installed"] is False
+    assert providers["claude"]["available"] is False
+    assert providers["claude"]["readiness"] == "unavailable"
+    assert providers["claude"]["unavailable_reason"] == {
+        "type": "adapter_not_installed",
+        "adapter_id": "claude",
+    }
 
 
 def test_agent_inventory_uses_existing_api_authentication(tmp_path: Path) -> None:
@@ -217,9 +233,48 @@ def test_legacy_discovery_route_delegates_to_generic_handler(
     assert legacy.status_code == 200
     assert generic.status_code == 200
     assert legacy.json()["resources"] == generic.json()["resources"]
-    assert legacy.json()["items"] == generic.json()["items"]
     assert legacy.headers["Deprecation"] == "true"
     assert legacy.headers["Link"] == '</agent-sessions/discover>; rel="successor-version"'
+
+
+def test_generic_discovery_and_persisted_sessions_redact_machine_local_metadata(
+    api: LocalAPI,
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "private-codex-projects.csv"
+    registry.write_text(
+        "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+        "conversation-private,Private Project,/home/god/private/SecretProject,"
+        "codex-private,/home/god/.local/bin/private-launcher,"
+        "2026-07-29T00:00:00+00:00,2026-07-29T00:00:00+00:00,"
+        "machine-local-source,private operator notes\n",
+        encoding="utf-8",
+    )
+
+    discovered = api.post_json(
+        "/agent-sessions/discover",
+        {
+            "provider_id": "codex",
+            "instance_id": "overseer.default",
+            "codex_projects_registry": str(registry),
+        },
+    )
+    persisted = api.get("/agent-sessions")
+
+    for response in (discovered, persisted):
+        body = json.dumps(response.json(), sort_keys=True)
+        assert response.status_code == 200
+        assert "/home/god/private/SecretProject" not in body
+        assert "/home/god/.local/bin/private-launcher" not in body
+        assert "machine-local-source" not in body
+        assert "private operator notes" not in body
+        assert "legacy_references" not in body
+        assert '"notes"' not in body
+    session = discovered.json()["sessions"][0]
+    assert session["workspace"]["label"] == "SecretProject"
+    assert session["workspace"]["reference"].startswith("workspace:sha256:")
+    assert session["state"] == "discovered"
+    assert session == persisted.json()["sessions"][0]
 
 
 @pytest.mark.parametrize(

@@ -431,6 +431,13 @@ class AgentRegistry:
         except KeyError as error:
             raise KeyError(f"unknown agent instance: {instance_id}") from error
 
+    @property
+    def profiles(self) -> Mapping[str, AgentInstanceProfile]:
+        return self._profiles
+
+    def adapter_factory_available(self, adapter_id: str) -> bool:
+        return adapter_id in self._adapter_factories
+
     def driver(self, instance_id: str) -> PrimaryDriver:
         profile = self.profile(instance_id)
         return self._driver_for(profile)

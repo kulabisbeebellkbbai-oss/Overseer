@@ -27,6 +27,8 @@ from .agent_contracts import (
 from .agent_handoff import AgentHandoffService
 from .agent_operations import AgentOperationBlockedError, AgentOperationCoordinator
 from .agent_registry import AgentRegistry
+from .audit import AuditEvent, AuditEventType
+from .core import OwnerDomain, Resource, RiskLevel
 from .policy import PolicyDecision
 from .store import OverseerStore
 
@@ -37,6 +39,10 @@ class AuthorizationCallback(Protocol):
         operation: str,
         context: Mapping[str, object],
     ) -> bool | PolicyDecision: ...
+
+
+class SessionResourceFactory(Protocol):
+    def __call__(self, session: AgentSession) -> Resource | None: ...
 
 
 class AgentManagerError(RuntimeError):
@@ -114,6 +120,7 @@ class AgentManager:
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[str], str] | None = None,
         operations: AgentOperationCoordinator | None = None,
+        session_resource_factory: SessionResourceFactory | None = None,
         activation_lease_seconds: float = 30.0,
         activation_wait_seconds: float = 5.0,
     ) -> None:
@@ -140,6 +147,81 @@ class AgentManager:
             store,
             clock=self._clock,
         )
+        self.session_resource_factory = session_resource_factory
+
+    def discover(
+        self,
+        instance_id: str,
+        provider_id: str,
+        workspace: str | None = None,
+    ) -> tuple[AgentSession, ...]:
+        self._require_authorized(
+            "discover",
+            {
+                "instance_id": instance_id,
+                "provider_id": provider_id,
+            },
+        )
+        try:
+            self.operations.require_open(instance_id)
+        except AgentOperationBlockedError as error:
+            raise AgentManagerPausedError(str(error)) from error
+        profile = self.registry.profile_for_provider(instance_id, provider_id)
+        driver = self.registry.driver_for_provider(
+            provider_id,
+            instance_id=instance_id,
+        )
+        discovered = driver.discover(workspace)
+        sessions: list[AgentSession] = []
+        resources: list[Resource] = []
+        for session in discovered:
+            if session.provider_id != provider_id:
+                raise AgentManagerError(
+                    "discovered session provider binding mismatch"
+                )
+            if session.instance_id not in {None, instance_id}:
+                raise AgentManagerError(
+                    "discovered session instance binding mismatch"
+                )
+            normalized = replace(
+                session,
+                instance_id=instance_id,
+                transport=profile.transport,
+                capabilities=driver.provider.capabilities,
+                model_profile_id=profile.model_profile_id,
+            )
+            sessions.append(normalized)
+            if self.session_resource_factory is not None:
+                resource = self.session_resource_factory(normalized)
+                if resource is not None:
+                    resources.append(resource)
+        for provider in self.registry.providers.values():
+            self.store.save_agent_provider(provider)
+        for configured_profile in self.registry.profiles.values():
+            self.store.save_agent_instance_profile(configured_profile)
+        for session in sessions:
+            self.store.save_agent_session(session)
+        for resource in resources:
+            self.store.save_resource(resource)
+        evidence_ids = tuple(
+            [*(session.id for session in sessions), *(resource.id for resource in resources)]
+        )
+        self.store.save_audit_event(
+            AuditEvent(
+                id=self._id_factory("audit.agent.discovery"),
+                event_type=AuditEventType.VERIFIED,
+                owner_domain=OwnerDomain.SISKO,
+                subject_id=f"agent.discovery:{instance_id}:{provider_id}",
+                summary=(
+                    "discovered provider sessions through the authorized "
+                    "agent manager"
+                ),
+                risk_level=RiskLevel.LOW,
+                evidence_ids=evidence_ids,
+                occurred_at=self._clock(),
+            )
+        )
+        return tuple(sessions)
 
     def activate(
         self,

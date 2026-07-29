@@ -32,7 +32,7 @@ from overseer.agent_manager import (
     AgentTransitionRequiredError,
 )
 from overseer.agent_registry import AgentRegistry
-from overseer.core import OwnerDomain
+from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.policy import PolicyCheck, PolicyCheckStatus, PolicyDecision
 from overseer.store import OverseerStore
 
@@ -337,6 +337,121 @@ def test_dispatch_is_bound_to_active_epoch(
     assert result.driver_epoch_id == epoch.id
     assert result.session_id == epoch.session_id
     assert result.provider_id == epoch.provider_id
+
+
+def test_discovery_policy_rejection_prevents_driver_and_store_bypass(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, _ = _registry(tmp_path, events)
+    calls: list[tuple[str, Mapping[str, object]]] = []
+
+    def reject_discovery(
+        operation: str,
+        context: Mapping[str, object],
+    ) -> bool:
+        calls.append((operation, context))
+        return operation != "discover"
+
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(
+            registry,
+            store,
+            authorization_callback=reject_discovery,
+        )
+
+        with pytest.raises(AgentAuthorizationError, match="discover"):
+            value.discover("overseer.default", "codex")
+
+        assert calls == [
+            (
+                "discover",
+                {
+                    "instance_id": "overseer.default",
+                    "provider_id": "codex",
+                },
+            )
+        ]
+        assert "factory:codex" not in events
+        assert store.list_agent_sessions() == ()
+        assert store.list_agent_providers() == ()
+        assert store.list_audit_events(subject_prefix="agent.discovery:") == ()
+
+
+def test_manager_discovery_normalizes_and_persists_one_authorized_boundary(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    driver = registry.driver("overseer.default")
+    discovered = AgentSession(
+        id="session.codex.private",
+        provider_id="codex",
+        external_session_id="external.codex.private",
+        workspace="/home/god/private/SecretProject",
+        transport=registry.providers["codex"].transports[0],
+        capabilities=AgentCapabilities(),
+        legacy_references={"resource_id": "thread.codex.private"},
+    )
+    driver.discover = lambda workspace=None: (discovered,)
+
+    def resource_for_session(session: AgentSession) -> Resource:
+        return Resource(
+            id=str(session.legacy_references["resource_id"]),
+            name=session.id,
+            type=ResourceType.USAGE_LIMITED_SERVICE,
+            owner_domain=OwnerDomain.QUARK,
+            risk_level=RiskLevel.LOW,
+        )
+
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(
+            registry,
+            store,
+            authorization_callback=_allow,
+            session_resource_factory=resource_for_session,
+        )
+
+        sessions = value.discover("overseer.default", "codex")
+
+        assert sessions[0].instance_id == "overseer.default"
+        assert sessions[0].capabilities == registry.providers["codex"].capabilities
+        assert store.load_agent_session("session.codex.private") == sessions[0]
+        assert {item.id for item in store.list_agent_providers()} == {
+            "codex",
+            "claude",
+        }
+        assert store.load_agent_instance_profile("overseer.default") == (
+            registry.profile("overseer.default")
+        )
+        assert store.load_resource("thread.codex.private").id == (
+            "thread.codex.private"
+        )
+        events = store.list_audit_events(subject_prefix="agent.discovery:")
+        assert len(events) == 1
+        assert events[0].evidence_ids == (
+            "session.codex.private",
+            "thread.codex.private",
+        )
+
+
+def test_discovery_cannot_bypass_an_operation_coordinator_fence(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, _ = _registry(tmp_path, events)
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+        value.operations.reserve(
+            "overseer.default",
+            owner_token="operation.handoff",
+        )
+
+        with pytest.raises(AgentManagerPausedError, match="fenced"):
+            value.discover("overseer.default", "codex")
+
+        assert "factory:codex" not in events
+        assert store.list_agent_sessions() == ()
 
 
 def test_activation_does_not_trust_adapter_owned_session_identity(

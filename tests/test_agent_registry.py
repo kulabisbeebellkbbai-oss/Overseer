@@ -8,16 +8,21 @@ import pytest
 
 from overseer.agent_contracts import AgentTransport, CredentialReference, PrimaryDriver
 from overseer.agent_adapters.base_cli import CliCommandRunner
-from overseer.agent_registry import AgentRegistry
+from overseer.agent_registry import AgentAdapterUnavailableError, AgentRegistry
 
 
-def _provider(provider_id: str, executable: str | None = None) -> dict[str, object]:
+def _provider(
+    provider_id: str,
+    executable: str | None = None,
+    *,
+    capabilities: dict[str, bool] | None = None,
+) -> dict[str, object]:
     return {
         "id": provider_id,
         "adapter": "codex" if provider_id == "codex" else "claude",
         "transport": "interactive_cli",
         "executable": executable or provider_id,
-        "capabilities": {"session_resume": True},
+        "capabilities": capabilities or {"session_resume": True, "handoff_import": True},
     }
 
 
@@ -93,6 +98,33 @@ def test_registry_rejects_cyclic_fallbacks(tmp_path: Path) -> None:
         AgentRegistry.load(config)
 
 
+def test_registry_rejects_duplicate_fallback_order_entries(tmp_path: Path) -> None:
+    config = _write_registry(
+        tmp_path,
+        providers=[_provider("codex", "codex"), _provider("claude", "claude")],
+        instances=[_instance("overseer.default", "codex", ["claude", "claude"])],
+    )
+
+    with pytest.raises(ValueError, match="unique"):
+        AgentRegistry.load(config)
+
+
+def test_registry_requires_each_fallback_to_support_required_capabilities(
+    tmp_path: Path,
+) -> None:
+    config = _write_registry(
+        tmp_path,
+        providers=[
+            _provider("codex", "codex"),
+            _provider("claude", "claude", capabilities={"session_resume": True}),
+        ],
+        instances=[_instance("overseer.default", "codex", ["claude"])],
+    )
+
+    with pytest.raises(ValueError, match="required capabilities"):
+        AgentRegistry.load(config)
+
+
 def test_local_override_cannot_contain_secret_values(tmp_path: Path) -> None:
     committed = _write_registry(tmp_path)
     local = tmp_path / "local.json"
@@ -102,7 +134,82 @@ def test_local_override_cannot_contain_secret_values(tmp_path: Path) -> None:
         AgentRegistry.load(committed, local)
 
 
-def test_registry_builds_immutable_profile_and_configured_driver(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("section", "override"),
+    [
+        ("providers", {"codex": {"adapter": "claude"}}),
+        ("providers", {"codex": {"transport": "gateway"}}),
+        ("providers", {"codex": {"capabilities": {"handoff_import": False}}}),
+        ("instances", {"overseer.default": {"fallback_provider_ids": ["claude"]}}),
+    ],
+)
+def test_local_override_cannot_rewrite_committed_provider_or_failover_policy(
+    tmp_path: Path, section: str, override: dict[str, object]
+) -> None:
+    committed = _write_registry(
+        tmp_path,
+        providers=[_provider("codex", "codex"), _provider("claude", "claude")],
+    )
+    local = tmp_path / "local.json"
+    local.write_text(json.dumps({section: override}))
+
+    with pytest.raises(ValueError, match="local override"):
+        AgentRegistry.load(committed, local)
+
+
+def test_registry_rejects_invalid_adapter_transport_executable_combination(
+    tmp_path: Path,
+) -> None:
+    config = _write_registry(
+        tmp_path,
+        providers=[
+            {
+                **_provider("codex", "claude"),
+                "adapter": "codex",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="combination"):
+        AgentRegistry.load(config)
+
+
+def test_local_executable_path_must_be_canonical_and_match_provider_policy(
+    tmp_path: Path,
+) -> None:
+    committed = _write_registry(tmp_path)
+    executable = tmp_path / "user-bin" / "codex"
+    executable.parent.mkdir()
+    executable.write_text("placeholder")
+    local = tmp_path / "local.json"
+    local.write_text(json.dumps({"providers": {"codex": {"executable_path": str(executable)}}}))
+
+    registry = AgentRegistry.load(committed, local)
+
+    assert registry.providers["codex"].executable_allowlist == (str(executable.resolve()),)
+
+    local.write_text(
+        json.dumps(
+            {"providers": {"codex": {"executable_path": str(tmp_path / "user-bin" / "claude")}}}
+        )
+    )
+    with pytest.raises(ValueError, match="basename"):
+        AgentRegistry.load(committed, local)
+
+
+def test_committed_configuration_cannot_set_machine_local_executable_path(
+    tmp_path: Path,
+) -> None:
+    config = _write_registry(
+        tmp_path,
+        providers=[{**_provider("codex", "codex"), "executable_path": "/opt/user/codex"}],
+    )
+
+    with pytest.raises(ValueError, match="machine-local"):
+        AgentRegistry.load(config)
+
+
+def test_registry_builds_immutable_profile_and_reports_unavailable_adapter(tmp_path: Path) -> None:
     config = _write_registry(
         tmp_path,
         instances=[
@@ -116,12 +223,59 @@ def test_registry_builds_immutable_profile_and_configured_driver(tmp_path: Path)
 
     registry = AgentRegistry.load(config)
     profile = registry.profile("overseer.default")
-    driver = registry.driver("overseer.default")
 
     assert profile.transport is AgentTransport.INTERACTIVE_CLI
     assert profile.credential_references["provider"] == CredentialReference(
         id="secret://overseer/codex"
     )
+    with pytest.raises(AgentAdapterUnavailableError, match="codex"):
+        registry.driver("overseer.default")
+
+
+def test_registry_instantiates_only_explicitly_registered_adapter_factory(
+    tmp_path: Path,
+) -> None:
+    class Driver:
+        provider = None
+
+        def discover(self, workspace: str | None = None):
+            return ()
+
+        def resolve(self, reference: str):
+            return None
+
+        def start(self, profile):
+            raise NotImplementedError
+
+        def resume(self, session):
+            raise NotImplementedError
+
+        def dispatch(self, request):
+            raise NotImplementedError
+
+        def inspect(self, session):
+            raise NotImplementedError
+
+        def checkpoint(self, session):
+            raise NotImplementedError
+
+        def cancel(self, session):
+            raise NotImplementedError
+
+        def import_handoff(self, profile, package):
+            raise NotImplementedError
+
+    def build_driver(provider, profile):
+        driver = Driver()
+        driver.provider = provider
+        return driver
+
+    registry = AgentRegistry.load(
+        _write_registry(tmp_path),
+        adapter_factories={"codex": build_driver},
+    )
+
+    driver = registry.driver("overseer.default")
     assert isinstance(driver, PrimaryDriver)
     assert driver.provider.id == "codex"
 
@@ -141,7 +295,9 @@ def test_registry_rejects_inline_secret_keys_except_secret_reference_keys(
     )
 
     registry = AgentRegistry.load(config)
-    assert registry.profile("overseer.default").id == "overseer.default"
+    assert registry.profile("overseer.default").credential_references[
+        "provider_secret_ref"
+    ] == CredentialReference(id="secret://overseer/codex")
 
     config.write_text(
         json.dumps(
@@ -160,6 +316,57 @@ def test_registry_rejects_inline_secret_keys_except_secret_reference_keys(
     )
     with pytest.raises(ValueError, match="secret reference"):
         AgentRegistry.load(config)
+
+
+@pytest.mark.parametrize("secret_key", ["private_key", "access_key", "cookie", "bearer"])
+def test_registry_rejects_common_inline_secret_key_names(
+    tmp_path: Path, secret_key: str
+) -> None:
+    config = _write_registry(
+        tmp_path,
+        providers=[{**_provider("codex", "codex"), secret_key: "plaintext"}],
+    )
+
+    with pytest.raises(ValueError, match="secret reference"):
+        AgentRegistry.load(config)
+
+
+def test_registry_rejects_unknown_committed_top_level_sections(tmp_path: Path) -> None:
+    config = _write_registry(tmp_path)
+    payload = json.loads(config.read_text())
+    payload["unreviewed"] = {"enabled": True}
+    config.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="unknown sections"):
+        AgentRegistry.load(config)
+
+
+def test_registry_requires_profile_credential_references_required_by_provider(
+    tmp_path: Path,
+) -> None:
+    provider = {
+        **_provider("codex", "codex"),
+        "required_secret_references": ["provider_api"],
+    }
+    config = _write_registry(tmp_path, providers=[provider])
+
+    with pytest.raises(ValueError, match="required credential reference"):
+        AgentRegistry.load(config)
+
+    config = _write_registry(
+        tmp_path,
+        providers=[provider],
+        instances=[
+            _instance(
+                "overseer.default",
+                "codex",
+                credential_references={"provider_api": "secret://overseer/codex"},
+            )
+        ],
+    )
+    registry = AgentRegistry.load(config)
+
+    assert registry.providers["codex"].required_secret_references == ("provider_api",)
 
 
 def test_registry_rejects_non_allowlisted_executable(tmp_path: Path) -> None:
@@ -181,14 +388,16 @@ def test_committed_provider_configuration_loads() -> None:
 
 
 def test_cli_runner_uses_argv_environment_and_captured_text_output() -> None:
+    executable_name = Path(sys.executable).resolve().name
     runner = CliCommandRunner(
-        executable_allowlist=(sys.executable,),
+        executable_path=sys.executable,
+        executable_allowlist=(executable_name,),
         environment={"RUNNER_TEST_ENV": "configured"},
     )
 
     completed = runner.run(
         (
-            sys.executable,
+            executable_name,
             "-c",
             "import os, sys; print(os.environ['RUNNER_TEST_ENV']); print(sys.stdin.read())",
         ),
@@ -200,9 +409,27 @@ def test_cli_runner_uses_argv_environment_and_captured_text_output() -> None:
     assert completed.stderr == ""
 
 
+def test_cli_runner_ignores_caller_path_when_resolving_the_executable(
+    tmp_path: Path,
+) -> None:
+    executable_name = Path(sys.executable).resolve().name
+    runner = CliCommandRunner(
+        executable_path=sys.executable,
+        executable_allowlist=(executable_name,),
+        environment={"PATH": str(tmp_path)},
+    )
+
+    completed = runner.run(
+        (executable_name, "-c", "import sys; print(sys.executable)")
+    )
+
+    assert completed.stdout.strip() == str(Path(sys.executable).resolve())
+
+
 def test_cli_runner_rejects_shell_strings_and_non_allowlisted_programs() -> None:
     runner = CliCommandRunner(
-        executable_allowlist=("codex",),
+        executable_path=sys.executable,
+        executable_allowlist=(Path(sys.executable).resolve().name,),
         environment={},
     )
 

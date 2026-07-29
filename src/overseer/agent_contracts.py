@@ -148,6 +148,7 @@ class AgentProvider:
     transports: tuple[AgentTransport, ...] = ()
     display_name: str | None = None
     executable_allowlist: tuple[str, ...] = ()
+    required_secret_references: tuple[str, ...] = ()
     profile_ids: tuple[str, ...] = ()
     health_source_id: str | None = None
     usage_limit_source_id: str | None = None
@@ -155,10 +156,14 @@ class AgentProvider:
     def __post_init__(self) -> None:
         object.__setattr__(self, "transports", tuple(self.transports))
         object.__setattr__(self, "executable_allowlist", tuple(self.executable_allowlist))
+        object.__setattr__(self, "required_secret_references", tuple(self.required_secret_references))
         object.__setattr__(self, "profile_ids", tuple(self.profile_ids))
         _require_identifier(self.id, "provider id")
         _require_identifier(self.adapter_id, "adapter id")
         _validate_identifier_collection(self.executable_allowlist, "executable")
+        _validate_identifier_collection(
+            self.required_secret_references, "required secret reference"
+        )
         _validate_identifier_collection(self.profile_ids, "profile id")
         _validate_optional_identifier(self.health_source_id, "health source id")
         _validate_optional_identifier(self.usage_limit_source_id, "usage limit source id")
@@ -174,6 +179,7 @@ class AgentInstanceProfile:
     model_profile_id: str | None = None
     external_session_id: str | None = None
     declared_capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
+    required_capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     detected_capabilities: AgentCapabilities | None = None
     credential_references: Mapping[str, CredentialReference] = field(default_factory=dict)
     permission_policy_ref: str | None = None

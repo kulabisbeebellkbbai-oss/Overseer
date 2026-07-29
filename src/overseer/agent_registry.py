@@ -8,33 +8,53 @@ import json
 from pathlib import Path
 import re
 from types import MappingProxyType
-from typing import Any, NoReturn
+from typing import Any, Callable
 
 from .agent_contracts import (
     AgentCapabilities,
-    AgentCheckpoint,
-    AgentDispatchRequest,
-    AgentDispatchResult,
-    AgentHandoffPackage,
     AgentInstanceProfile,
     AgentProvider,
-    AgentSession,
     AgentTransport,
     CredentialReference,
     PrimaryDriver,
 )
 
 
+AgentAdapterFactory = Callable[[AgentProvider, AgentInstanceProfile], PrimaryDriver]
+
+
+class AgentAdapterUnavailableError(RuntimeError):
+    """Raised when a selected provider has no ready, registered adapter."""
+
+
 _ALLOWED_EXECUTABLES = frozenset({"codex", "claude", "qwen", "vibe"})
 _ALLOWED_ADAPTERS = frozenset(
     {"codex", "claude", "qwen_code", "mistral_vibe", "antigravity"}
 )
+_ADAPTER_COMBINATIONS = {
+    "codex": (AgentTransport.INTERACTIVE_CLI, "codex"),
+    "claude": (AgentTransport.INTERACTIVE_CLI, "claude"),
+    "qwen_code": (AgentTransport.INTERACTIVE_CLI, "qwen"),
+    "mistral_vibe": (AgentTransport.INTERACTIVE_CLI, "vibe"),
+    "antigravity": (AgentTransport.GATEWAY, None),
+}
 _SECRET_KEY_PATTERN = re.compile(
-    r"(?:secret|password|api[_-]?key|token|credential|authorization|auth)", re.IGNORECASE
+    r"(?:secret|password|(?:api|private|access)[_-]?key|token|credential|authorization|auth|cookie|bearer)",
+    re.IGNORECASE,
 )
 _EXECUTABLE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _CAPABILITY_NAMES = frozenset(field.name for field in fields(AgentCapabilities))
-_PROVIDER_FIELDS = frozenset({"id", "adapter", "transport", "executable", "capabilities"})
+_PROVIDER_FIELDS = frozenset(
+    {
+        "id",
+        "adapter",
+        "transport",
+        "executable",
+        "executable_path",
+        "capabilities",
+        "required_secret_references",
+    }
+)
 _INSTANCE_FIELDS = frozenset(
     {
         "id",
@@ -42,7 +62,13 @@ _INSTANCE_FIELDS = frozenset(
         "workspace",
         "fallback_provider_ids",
         "credential_references",
+        "required_capabilities",
+        "model_profile_id",
     }
+)
+_LOCAL_PROVIDER_FIELDS = frozenset({"executable_path"})
+_LOCAL_INSTANCE_FIELDS = frozenset(
+    {"workspace", "model_profile_id", "credential_references"}
 )
 
 
@@ -87,6 +113,11 @@ def _reject_inline_secrets(value: object, key: str | None = None) -> None:
                 for reference in references.values():
                     _secret_reference(reference)
                 continue
+            if child_key == "required_secret_references":
+                for reference_name in _require_list(child_value, child_key):
+                    if not isinstance(reference_name, str) or not reference_name:
+                        raise ValueError("required secret references must be non-empty names")
+                continue
             if _SECRET_KEY_PATTERN.search(child_key):
                 if not child_key.lower().endswith("_secret_ref"):
                     raise ValueError("configuration accepts only secret reference locators")
@@ -123,6 +154,19 @@ def _merge_mapping(base: dict[str, Any], override: Mapping[str, Any]) -> dict[st
     return merged
 
 
+def _validate_local_override_fields(section: str, override: Mapping[str, Any]) -> None:
+    allowed = _LOCAL_PROVIDER_FIELDS if section == "providers" else _LOCAL_INSTANCE_FIELDS
+    disallowed = {
+        key
+        for key in override
+        if key not in allowed and not key.lower().endswith("_secret_ref")
+    }
+    if disallowed:
+        raise ValueError(
+            f"local override cannot change committed {section} fields: {sorted(disallowed)}"
+        )
+
+
 def _merge_local_overrides(
     committed: dict[str, Any], local: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -141,6 +185,9 @@ def _merge_local_overrides(
         for record_id, override in overrides.items():
             if record_id not in records:
                 raise ValueError(f"local override references unknown {section} id: {record_id}")
+            _validate_local_override_fields(
+                section, _require_mapping(override, f"local {section} override")
+            )
             records[record_id] = _merge_mapping(
                 records[record_id], _require_mapping(override, f"local {section} override")
             )
@@ -162,21 +209,24 @@ def _capabilities(value: object) -> AgentCapabilities:
     return AgentCapabilities(**dict(mapping))
 
 
-def _validate_fields(record: Mapping[str, Any], allowed: frozenset[str], label: str) -> None:
+def _validate_fields(
+    record: Mapping[str, Any], allowed: frozenset[str], label: str, *, allow_secret_refs: bool
+) -> None:
     unknown = {
         key
         for key in record
-        if key not in allowed and not key.lower().endswith("_secret_ref")
+        if key not in allowed and not (allow_secret_refs and key.lower().endswith("_secret_ref"))
     }
     if unknown:
         raise ValueError(f"unknown {label} fields: {sorted(unknown)}")
 
 
 def _provider_from_record(record: Mapping[str, Any]) -> AgentProvider:
-    _validate_fields(record, _PROVIDER_FIELDS, "provider")
+    _validate_fields(record, _PROVIDER_FIELDS, "provider", allow_secret_refs=False)
     provider_id = record.get("id")
     adapter = record.get("adapter")
     executable = record.get("executable")
+    executable_path = record.get("executable_path")
     if not isinstance(provider_id, str) or not provider_id:
         raise ValueError("provider id must be non-empty")
     if not isinstance(adapter, str) or adapter not in _ALLOWED_ADAPTERS:
@@ -185,29 +235,43 @@ def _provider_from_record(record: Mapping[str, Any]) -> AgentProvider:
         transport = AgentTransport(record.get("transport"))
     except (TypeError, ValueError) as error:
         raise ValueError("provider transport is not supported") from error
-    if transport is AgentTransport.GATEWAY:
-        if executable is not None:
-            raise ValueError("gateway provider executable must be null")
-        executable_allowlist: tuple[str, ...] = ()
-    else:
+    if transport is not AgentTransport.GATEWAY:
         if not isinstance(executable, str) or not _EXECUTABLE_NAME_PATTERN.fullmatch(executable):
             raise ValueError("executable name must be a single command name")
         if executable not in _ALLOWED_EXECUTABLES:
             raise ValueError("executable is not allowlisted")
-        executable_allowlist = (executable,)
+    if _ADAPTER_COMBINATIONS[adapter] != (transport, executable):
+        raise ValueError("provider adapter, transport, and executable combination is invalid")
+    if transport is AgentTransport.GATEWAY:
+        if executable is not None or executable_path is not None:
+            raise ValueError("gateway provider executable must be null")
+        executable_allowlist: tuple[str, ...] = ()
+    else:
+        if executable_path is None:
+            executable_allowlist = (executable,)
+        else:
+            if not isinstance(executable_path, str) or not Path(executable_path).is_absolute():
+                raise ValueError("local executable_path must be an absolute path")
+            canonical_path = Path(executable_path).resolve()
+            if canonical_path.name != executable:
+                raise ValueError("local executable_path basename must match the provider executable")
+            executable_allowlist = (str(canonical_path),)
     return AgentProvider(
         id=provider_id,
         adapter_id=adapter,
         capabilities=_capabilities(record.get("capabilities", {})),
         transports=(transport,),
         executable_allowlist=executable_allowlist,
+        required_secret_references=tuple(
+            _require_list(record.get("required_secret_references", []), "required_secret_references")
+        ),
     )
 
 
 def _profile_from_record(
     record: Mapping[str, Any], providers: Mapping[str, AgentProvider]
 ) -> AgentInstanceProfile:
-    _validate_fields(record, _INSTANCE_FIELDS, "instance")
+    _validate_fields(record, _INSTANCE_FIELDS, "instance", allow_secret_refs=True)
     instance_id = record.get("id")
     primary_provider_id = record.get("primary_provider_id")
     workspace = record.get("workspace")
@@ -223,6 +287,15 @@ def _profile_from_record(
         for provider_id in fallback_ids
     ):
         raise ValueError("fallback providers must be configured provider ids")
+    if len(set(fallback_ids)) != len(fallback_ids):
+        raise ValueError("fallback provider ids must be unique and ordered")
+    required_capabilities = (
+        _capabilities(record["required_capabilities"])
+        if "required_capabilities" in record
+        else AgentCapabilities(handoff_import=True)
+        if fallback_ids
+        else AgentCapabilities()
+    )
     references = dict(_require_mapping(record.get("credential_references", {}), "credential_references"))
     for key, value in record.items():
         if key.lower().endswith("_secret_ref"):
@@ -233,13 +306,17 @@ def _profile_from_record(
         transport=providers[primary_provider_id].transports[0],
         workspace=workspace,
         primary_adapter_id=providers[primary_provider_id].adapter_id,
+        model_profile_id=record.get("model_profile_id"),
         declared_capabilities=providers[primary_provider_id].capabilities,
+        required_capabilities=required_capabilities,
         credential_references={key: _secret_reference(value) for key, value in references.items()},
         approved_fallback_provider_ids=tuple(fallback_ids),
     )
 
 
-def _validate_fallbacks(profiles: Mapping[str, AgentInstanceProfile]) -> None:
+def _validate_fallbacks(
+    profiles: Mapping[str, AgentInstanceProfile], providers: Mapping[str, AgentProvider]
+) -> None:
     graph: dict[str, set[str]] = {}
     for profile in profiles.values():
         graph.setdefault(profile.primary_provider_id, set()).update(
@@ -261,45 +338,32 @@ def _validate_fallbacks(profiles: Mapping[str, AgentInstanceProfile]) -> None:
 
     for provider_id in graph:
         visit(provider_id)
+    for profile in profiles.values():
+        for fallback_id in profile.approved_fallback_provider_ids:
+            if not providers[fallback_id].capabilities.supports(profile.required_capabilities):
+                raise ValueError("fallback provider lacks required capabilities")
 
 
-@dataclass(frozen=True)
-class _ConfiguredDriver:
-    """A configuration-only driver until a provider-specific adapter is installed."""
+def _validate_required_secret_references(
+    profiles: Mapping[str, AgentInstanceProfile], providers: Mapping[str, AgentProvider]
+) -> None:
+    for profile in profiles.values():
+        required = providers[profile.primary_provider_id].required_secret_references
+        missing = [name for name in required if name not in profile.credential_references]
+        if missing:
+            raise ValueError(f"profile is missing required credential reference: {missing[0]}")
 
-    provider: AgentProvider
 
-    def _unavailable(self) -> NoReturn:
-        raise RuntimeError(f"no adapter implementation is installed for {self.provider.adapter_id}")
+def _validate_top_level_sections(configuration: Mapping[str, Any], source: str) -> None:
+    unknown = set(configuration) - {"schema_version", "providers", "instances"}
+    if unknown:
+        raise ValueError(f"{source} configuration contains unknown sections: {sorted(unknown)}")
 
-    def discover(self, workspace: str | None = None) -> tuple[AgentSession, ...]:
-        self._unavailable()
 
-    def resolve(self, reference: str) -> AgentSession | None:
-        self._unavailable()
-
-    def start(self, profile: AgentInstanceProfile) -> AgentDispatchResult:
-        self._unavailable()
-
-    def resume(self, session: AgentSession) -> AgentDispatchResult:
-        self._unavailable()
-
-    def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult:
-        self._unavailable()
-
-    def inspect(self, session: AgentSession) -> AgentDispatchResult:
-        self._unavailable()
-
-    def checkpoint(self, session: AgentSession) -> AgentCheckpoint:
-        self._unavailable()
-
-    def cancel(self, session: AgentSession) -> AgentDispatchResult:
-        self._unavailable()
-
-    def import_handoff(
-        self, profile: AgentInstanceProfile, package: AgentHandoffPackage
-    ) -> AgentDispatchResult:
-        self._unavailable()
+def _validate_committed_machine_local_fields(configuration: Mapping[str, Any]) -> None:
+    for provider in _require_list(configuration.get("providers", []), "providers"):
+        if "executable_path" in _require_mapping(provider, "provider record"):
+            raise ValueError("committed configuration cannot set machine-local executable_path")
 
 
 @dataclass(frozen=True)
@@ -308,16 +372,23 @@ class AgentRegistry:
 
     providers: Mapping[str, AgentProvider]
     _profiles: Mapping[str, AgentInstanceProfile]
-    _drivers: Mapping[str, PrimaryDriver]
+    _adapter_factories: Mapping[str, AgentAdapterFactory]
 
     @classmethod
     def load(
-        cls, committed_path: str | Path, local_path: str | Path | None = None
+        cls,
+        committed_path: str | Path,
+        local_path: str | Path | None = None,
+        *,
+        adapter_factories: Mapping[str, AgentAdapterFactory] | None = None,
     ) -> AgentRegistry:
         committed = _read_json_object(Path(committed_path))
         local = _read_json_object(Path(local_path)) if local_path is not None else None
+        _validate_top_level_sections(committed, "committed")
+        _validate_committed_machine_local_fields(committed)
         _reject_inline_secrets(committed)
         if local is not None:
+            _validate_top_level_sections(local, "local override")
             _reject_inline_secrets(local)
         configuration = _merge_local_overrides(committed, local)
         if configuration.get("schema_version", 1) != 1:
@@ -332,15 +403,15 @@ class AgentRegistry:
             instance_id: _profile_from_record(record, providers)
             for instance_id, record in profile_records.items()
         }
-        _validate_fallbacks(profiles)
-        drivers = {
-            instance_id: _ConfiguredDriver(providers[profile.primary_provider_id])
-            for instance_id, profile in profiles.items()
-        }
+        _validate_required_secret_references(profiles, providers)
+        _validate_fallbacks(profiles, providers)
+        factories = dict(adapter_factories or {})
+        if any(not isinstance(adapter_id, str) or not callable(factory) for adapter_id, factory in factories.items()):
+            raise TypeError("adapter_factories must map adapter ids to callables")
         return cls(
             providers=MappingProxyType(providers),
             _profiles=MappingProxyType(profiles),
-            _drivers=MappingProxyType(drivers),
+            _adapter_factories=MappingProxyType(factories),
         )
 
     def profile(self, instance_id: str) -> AgentInstanceProfile:
@@ -350,7 +421,21 @@ class AgentRegistry:
             raise KeyError(f"unknown agent instance: {instance_id}") from error
 
     def driver(self, instance_id: str) -> PrimaryDriver:
+        profile = self.profile(instance_id)
+        provider = self.providers[profile.primary_provider_id]
+        factory = self._adapter_factories.get(provider.adapter_id)
+        if factory is None:
+            raise AgentAdapterUnavailableError(
+                f"no registered adapter factory for {provider.adapter_id}"
+            )
         try:
-            return self._drivers[instance_id]
-        except KeyError as error:
-            raise KeyError(f"unknown agent instance: {instance_id}") from error
+            driver = factory(provider, profile)
+        except Exception as error:
+            raise AgentAdapterUnavailableError(
+                f"adapter factory for {provider.adapter_id} is not ready"
+            ) from error
+        if not isinstance(driver, PrimaryDriver):
+            raise AgentAdapterUnavailableError(
+                f"adapter factory for {provider.adapter_id} returned an invalid driver"
+            )
+        return driver

@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from overseer.agent_contracts import AgentTransport, CredentialReference, PrimaryDriver
+from overseer.agent_contracts import (
+    AgentCapabilities,
+    AgentProvider,
+    AgentTransport,
+    CredentialReference,
+    PrimaryDriver,
+)
 from overseer.agent_adapters.base_cli import CliCommandRunner
 from overseer.agent_registry import AgentAdapterUnavailableError, AgentRegistry
 
@@ -59,6 +65,38 @@ def _write_registry(
         )
     )
     return config
+
+
+class _FactoryDriver:
+    def __init__(self, provider: AgentProvider) -> None:
+        self.provider = provider
+
+    def discover(self, workspace: str | None = None):
+        return ()
+
+    def resolve(self, reference: str):
+        return None
+
+    def start(self, profile):
+        raise NotImplementedError
+
+    def resume(self, session):
+        raise NotImplementedError
+
+    def dispatch(self, request):
+        raise NotImplementedError
+
+    def inspect(self, session):
+        raise NotImplementedError
+
+    def checkpoint(self, session):
+        raise NotImplementedError
+
+    def cancel(self, session):
+        raise NotImplementedError
+
+    def import_handoff(self, profile, package):
+        raise NotImplementedError
 
 
 def test_registry_rejects_shell_command_strings(tmp_path: Path) -> None:
@@ -280,6 +318,36 @@ def test_registry_instantiates_only_explicitly_registered_adapter_factory(
     assert driver.provider.id == "codex"
 
 
+@pytest.mark.parametrize(
+    "returned_provider",
+    [
+        AgentProvider(
+            id="claude",
+            adapter_id="claude",
+            transports=(AgentTransport.INTERACTIVE_CLI,),
+            executable_allowlist=("claude",),
+        ),
+        AgentProvider(
+            id="codex",
+            adapter_id="codex",
+            capabilities=AgentCapabilities(session_resume=True),
+            transports=(AgentTransport.INTERACTIVE_CLI,),
+            executable_allowlist=("codex",),
+        ),
+    ],
+)
+def test_registry_rejects_adapter_factory_driver_with_mismatched_provider(
+    tmp_path: Path, returned_provider: AgentProvider
+) -> None:
+    registry = AgentRegistry.load(
+        _write_registry(tmp_path),
+        adapter_factories={"codex": lambda provider, profile: _FactoryDriver(returned_provider)},
+    )
+
+    with pytest.raises(AgentAdapterUnavailableError, match="provider claims"):
+        registry.driver("overseer.default")
+
+
 def test_registry_rejects_inline_secret_keys_except_secret_reference_keys(
     tmp_path: Path,
 ) -> None:
@@ -367,6 +435,40 @@ def test_registry_requires_profile_credential_references_required_by_provider(
     registry = AgentRegistry.load(config)
 
     assert registry.providers["codex"].required_secret_references == ("provider_api",)
+
+
+def test_registry_requires_profile_credential_references_required_by_fallbacks(
+    tmp_path: Path,
+) -> None:
+    fallback = {
+        **_provider("claude", "claude"),
+        "required_secret_references": ["fallback_api"],
+    }
+    config = _write_registry(
+        tmp_path,
+        providers=[_provider("codex", "codex"), fallback],
+        instances=[_instance("overseer.default", "codex", ["claude"])],
+    )
+
+    with pytest.raises(ValueError, match="required credential reference"):
+        AgentRegistry.load(config)
+
+    config = _write_registry(
+        tmp_path,
+        providers=[_provider("codex", "codex"), fallback],
+        instances=[
+            _instance(
+                "overseer.default",
+                "codex",
+                ["claude"],
+                credential_references={"fallback_api": "secret://overseer/claude"},
+            )
+        ],
+    )
+
+    assert AgentRegistry.load(config).profile("overseer.default").credential_references[
+        "fallback_api"
+    ] == CredentialReference(id="secret://overseer/claude")
 
 
 def test_registry_rejects_non_allowlisted_executable(tmp_path: Path) -> None:

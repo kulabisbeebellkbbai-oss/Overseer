@@ -348,7 +348,15 @@ def _validate_required_secret_references(
     profiles: Mapping[str, AgentInstanceProfile], providers: Mapping[str, AgentProvider]
 ) -> None:
     for profile in profiles.values():
-        required = providers[profile.primary_provider_id].required_secret_references
+        selected_provider_ids = (
+            profile.primary_provider_id,
+            *profile.approved_fallback_provider_ids,
+        )
+        required = tuple(
+            reference_name
+            for provider_id in selected_provider_ids
+            for reference_name in providers[provider_id].required_secret_references
+        )
         missing = [name for name in required if name not in profile.credential_references]
         if missing:
             raise ValueError(f"profile is missing required credential reference: {missing[0]}")
@@ -437,5 +445,9 @@ class AgentRegistry:
         if not isinstance(driver, PrimaryDriver):
             raise AgentAdapterUnavailableError(
                 f"adapter factory for {provider.adapter_id} returned an invalid driver"
+            )
+        if not isinstance(driver.provider, AgentProvider) or driver.provider != provider:
+            raise AgentAdapterUnavailableError(
+                f"adapter factory for {provider.adapter_id} returned mismatched provider claims"
             )
         return driver

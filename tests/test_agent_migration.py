@@ -17,6 +17,7 @@ from overseer.codex_projects import (
 class LegacyRunner:
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
+        self.inputs: list[str | None] = []
 
     def __call__(
         self,
@@ -26,6 +27,7 @@ class LegacyRunner:
         capture_output: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         self.commands.append(tuple(command))
+        self.inputs.append(input)
         if command[1] == "has-session":
             return subprocess.CompletedProcess(command, 1, "", "missing")
         return subprocess.CompletedProcess(command, 0, "started", "")
@@ -134,3 +136,66 @@ def test_real_codex_factory_is_compatible_with_hardened_registry(
     assert isinstance(driver, CodexDriver)
     assert driver.provider == registry.providers["codex"]
     assert driver.profile == registry.profile("overseer.default")
+
+
+def test_legacy_facade_submits_whitespace_prompt_with_exact_tmux_sequence(
+    tmp_path: Path,
+) -> None:
+    runner = LegacyRunner()
+    adapter = CodexProjectThreadAdapter(
+        registry_path=_codex_csv(tmp_path),
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+    )
+    prompt = " \t\n"
+
+    result = adapter.dispatch_prompt("example", prompt)
+
+    assert result.status == "prompt_dispatched"
+    assert runner.commands == [
+        ("/tmp/tmux", "has-session", "-t", "example"),
+        (
+            "/tmp/tmux",
+            "new-session",
+            "-d",
+            "-s",
+            "example",
+            "-c",
+            "/workspace/example",
+            "/tmp/codex-memory-session",
+            "resume",
+            "conversation-1",
+            "--cd",
+            "/workspace/example",
+        ),
+        ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
+        ("/tmp/tmux", "load-buffer", "-b", "overseer-dispatch", "-"),
+        ("/tmp/tmux", "paste-buffer", "-b", "overseer-dispatch", "-t", "example"),
+        ("/tmp/tmux", "send-keys", "-t", "example", "Enter"),
+        ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
+    ]
+    assert runner.inputs[3] == prompt
+
+
+def test_legacy_resolve_uses_original_keys_before_generic_session_ids(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "codex-projects.csv"
+    registry.write_text(
+        "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+        "conversation-alpha,Alpha,/workspace/alpha,alpha,/bin/alpha,"
+        "2026-07-28T10:00:00+00:00,2026-07-29T10:00:00+00:00,registry,\n"
+        "conversation-later,Later,/workspace/later,session.codex.alpha,/bin/later,"
+        "2026-07-28T10:00:00+00:00,2026-07-29T10:00:00+00:00,registry,\n",
+        encoding="utf-8",
+    )
+    adapter = CodexProjectThreadAdapter(registry_path=registry)
+
+    generic = adapter.driver.resolve("session.codex.alpha")
+    legacy = adapter.resolve("session.codex.alpha")
+
+    assert generic is not None
+    assert generic.external_session_id == "conversation-alpha"
+    assert legacy is not None
+    assert legacy.conversation_id == "conversation-later"

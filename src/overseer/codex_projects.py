@@ -17,7 +17,7 @@ from .agent_adapters.codex import (
     LegacyResumeDetails,
     legacy_codex_session_resource,
 )
-from .agent_contracts import AgentDispatchRequest, AgentSession
+from .agent_contracts import AgentSession
 from .core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
 
 
@@ -81,11 +81,11 @@ class CodexProjectThreadAdapter:
         return tuple(_thread_from_session(session) for session in self.driver.discover())
 
     def resolve(self, owner_thread: str) -> CodexProjectThread | None:
-        session = self.driver.resolve(owner_thread)
+        session = self._resolve_legacy_session(owner_thread)
         return _thread_from_session(session) if session is not None else None
 
     def resume(self, owner_thread: str) -> CodexProjectResumeResult:
-        session = self.driver.resolve(owner_thread)
+        session = self._resolve_legacy_session(owner_thread)
         if session is None:
             return CodexProjectResumeResult(
                 owner_thread=owner_thread,
@@ -101,7 +101,7 @@ class CodexProjectThreadAdapter:
         owner_thread: str,
         prompt: str,
     ) -> CodexProjectPromptDispatchResult:
-        session = self.driver.resolve(owner_thread)
+        session = self._resolve_legacy_session(owner_thread)
         if session is None:
             resume_result = CodexProjectResumeResult(
                 owner_thread=owner_thread,
@@ -114,17 +114,27 @@ class CodexProjectThreadAdapter:
                 reason=resume_result.reason,
                 resume_result=resume_result,
             )
-        request = AgentDispatchRequest(
-            id=f"legacy.dispatch.{session.id}",
-            instance_id=self.driver.profile.id,
-            session_id=session.id,
-            driver_epoch_id="legacy.codex",
-            idempotency_key=f"legacy.dispatch.{session.id}",
-            prompt=prompt,
-        )
-        result = self.driver.dispatch(request)
+        result = self.driver.dispatch_legacy(session, prompt)
         details = self.driver.legacy_prompt_details(result)
         return _legacy_prompt_result(owner_thread, session, details)
+
+    def _resolve_legacy_session(self, owner_thread: str) -> AgentSession | None:
+        wanted = owner_thread.strip()
+        if not wanted:
+            return None
+        for session in self.driver.discover():
+            thread = _thread_from_session(session)
+            if wanted == thread.conversation_id:
+                return session
+            if wanted == thread.command:
+                return session
+            if wanted == thread.launcher:
+                return session
+            if wanted == thread.project:
+                return session
+            if thread.conversation_id.startswith(wanted):
+                return session
+        return None
 
 
 def codex_project_thread_resource(thread: CodexProjectThread) -> Resource:

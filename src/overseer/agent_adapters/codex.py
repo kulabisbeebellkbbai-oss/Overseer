@@ -305,6 +305,32 @@ class CodexDriver:
             return result
         return self._dispatch_session(session, request)
 
+    def dispatch_legacy(
+        self,
+        session: AgentSession,
+        prompt: str,
+    ) -> AgentDispatchResult:
+        """Dispatch the exact legacy prompt without weakening the generic DTO."""
+
+        if not isinstance(prompt, str):
+            raise TypeError("legacy prompt must be a string")
+        resolved = self._validated_session(session)
+        if resolved is None:
+            raise ValueError("cannot dispatch to an unknown Codex session")
+        request = AgentDispatchRequest(
+            id=f"legacy.dispatch.{resolved.id}",
+            instance_id=self.profile.id,
+            session_id=resolved.id,
+            driver_epoch_id="legacy.codex",
+            idempotency_key=f"legacy.dispatch.{resolved.id}",
+            prompt="legacy compatibility dispatch",
+        )
+        return self._dispatch_session(
+            resolved,
+            request,
+            prompt_text=prompt,
+        )
+
     def inspect(self, session: AgentSession) -> AgentDispatchResult:
         request_id = f"inspect.{_identifier_part(session.id)}"
         resolved = self._validated_session(session)
@@ -444,15 +470,12 @@ class CodexDriver:
         self, profile: AgentInstanceProfile
     ) -> AgentSession | None:
         if profile.external_session_id is not None:
-            resolved = self.resolve(profile.external_session_id)
-            if resolved is not None:
-                return resolved
+            for session in self.discover():
+                if session.external_session_id == profile.external_session_id:
+                    return session
         workspace_sessions = self.discover(profile.workspace)
         if len(workspace_sessions) == 1:
             return workspace_sessions[0]
-        all_sessions = self.discover()
-        if len(all_sessions) == 1:
-            return all_sessions[0]
         return None
 
     def _resume_session(
@@ -544,6 +567,8 @@ class CodexDriver:
         self,
         session: AgentSession,
         request: AgentDispatchRequest,
+        *,
+        prompt_text: str | None = None,
     ) -> AgentDispatchResult:
         resume_result, resume_details = self._resume_session(
             session,
@@ -579,7 +604,7 @@ class CodexDriver:
         )
         prompt_result = self._run(
             [str(self.tmux_path), "load-buffer", "-b", "overseer-dispatch", "-"],
-            input_text=request.prompt,
+            input_text=request.prompt if prompt_text is None else prompt_text,
         )
         if prompt_result.returncode != 0:
             return self._prompt_failure(

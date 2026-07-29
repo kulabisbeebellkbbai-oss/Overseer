@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,19 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 
 CURRENT_SCHEMA_VERSION = 1
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
+_REDACTED_AGENT_TRANSCRIPT = "[redacted agent transcript]"
+_REDACTED_DISPATCH_PROMPT = "[redacted dispatch prompt]"
+_AGENT_SECRET_KEY_RE = re.compile(
+    r"(?:authorization|bearer|cookie|private[_-]?key|(?:api|access)[_-]?key|token|password)",
+    re.IGNORECASE,
+)
+_AGENT_TRANSCRIPT_KEY_RE = re.compile(
+    r"(?:transcript|prompt|message|output)", re.IGNORECASE
+)
+_AGENT_SECRET_VALUE_RE = re.compile(
+    r"(?:\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----|(?:^|[;,\s])(?:session|auth|access)?_?token=\S+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -79,7 +93,7 @@ class SQLiteStore:
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (
-                version TEXT PRIMARY KEY,
+                version INTEGER PRIMARY KEY,
                 description TEXT NOT NULL,
                 applied_at TEXT NOT NULL
             );
@@ -204,9 +218,17 @@ class SQLiteStore:
             );
             """
         )
-        self._ensure_schema_migration_version_is_text()
         with self._connection:
             self._record_schema_migration(CURRENT_SCHEMA_VERSION, "bootstrap JSON payload store")
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_providers (
@@ -274,67 +296,60 @@ class SQLiteStore:
                 )
                 """
             )
-            self._record_schema_migration(
+            self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_VERSION,
                 "persist provider-neutral agent driver lifecycle records",
             )
 
-    def _ensure_schema_migration_version_is_text(self) -> None:
-        columns = self._connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
-        version_column = next(
-            (column for column in columns if str(column["name"]) == "version"), None
-        )
-        if version_column is None or str(version_column["type"]).upper() == "TEXT":
-            return
-
-        with self._connection:
-            self._connection.execute(
-                """
-                CREATE TABLE schema_migrations_text (
-                    version TEXT PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    applied_at TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                INSERT INTO schema_migrations_text (version, description, applied_at)
-                SELECT CAST(version AS TEXT), description, applied_at
-                FROM schema_migrations
-                """
-            )
-            self._connection.execute("DROP TABLE schema_migrations")
-            self._connection.execute("ALTER TABLE schema_migrations_text RENAME TO schema_migrations")
-
-    def _record_schema_migration(self, version: int | str, description: str) -> None:
+    def _record_schema_migration(self, version: int, description: str) -> None:
         self._connection.execute(
             """
             INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
             VALUES (?, ?, ?)
             """,
-            (str(version), description, datetime.now(UTC).isoformat()),
+            (version, description, datetime.now(UTC).isoformat()),
+        )
+
+    def _record_agent_schema_migration(self, version: str, description: str) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO agent_schema_migrations (version, description, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (version, description, datetime.now(UTC).isoformat()),
         )
 
     def list_schema_migrations(self) -> tuple[SchemaMigration, ...]:
-        rows = self._connection.execute(
+        numeric_rows = self._connection.execute(
             "SELECT version, description, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        named_rows = self._connection.execute(
+            "SELECT version, description, applied_at FROM agent_schema_migrations ORDER BY version"
         ).fetchall()
         return tuple(
             SchemaMigration(
-                version=(
-                    int(str(row["version"]))
-                    if str(row["version"]).isdigit()
-                    else str(row["version"])
-                ),
+                version=int(row["version"]),
                 description=str(row["description"]),
                 applied_at=str(row["applied_at"]),
             )
-            for row in rows
+            for row in numeric_rows
+        ) + tuple(
+            SchemaMigration(
+                version=str(row["version"]),
+                description=str(row["description"]),
+                applied_at=str(row["applied_at"]),
+            )
+            for row in named_rows
         )
 
     def save_agent_provider(self, provider: AgentProvider) -> None:
-        self._upsert("agent_providers", provider.id, _dump(provider))
+        self._save_agent_record(
+            "agent_providers",
+            provider,
+            AgentProvider,
+            tuple(AgentProvider.__dataclass_fields__),
+            {},
+        )
 
     def load_agent_provider(self, provider_id: str) -> AgentProvider:
         return _load_dataclass(AgentProvider, self._get_payload("agent_providers", provider_id))
@@ -346,7 +361,13 @@ class SQLiteStore:
         )
 
     def save_agent_instance_profile(self, profile: AgentInstanceProfile) -> None:
-        self._upsert("agent_instance_profiles", profile.id, _dump(profile))
+        self._save_agent_record(
+            "agent_instance_profiles",
+            profile,
+            AgentInstanceProfile,
+            tuple(AgentInstanceProfile.__dataclass_fields__),
+            {},
+        )
 
     def load_agent_instance_profile(self, instance_id: str) -> AgentInstanceProfile:
         return _load_dataclass(
@@ -361,11 +382,13 @@ class SQLiteStore:
         )
 
     def save_agent_session(self, session: AgentSession) -> None:
-        self._connection.execute(
-            "INSERT OR REPLACE INTO agent_sessions (id, provider_id, payload) VALUES (?, ?, ?)",
-            (session.id, session.provider_id, _dump(session)),
+        self._save_agent_record(
+            "agent_sessions",
+            session,
+            AgentSession,
+            tuple(AgentSession.__dataclass_fields__),
+            {"provider_id": session.provider_id},
         )
-        self._connection.commit()
 
     def load_agent_session(self, session_id: str) -> AgentSession:
         return _load_dataclass(AgentSession, self._get_payload("agent_sessions", session_id))
@@ -376,15 +399,23 @@ class SQLiteStore:
         )
 
     def save_driver_epoch(self, epoch: DriverEpoch) -> None:
-        self._connection.execute(
-            """
-            INSERT OR REPLACE INTO agent_driver_epochs
-                (id, instance_id, ordinal, state, payload)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (epoch.id, epoch.instance_id, epoch.ordinal, epoch.state.value, _dump(epoch)),
+        self._reject_agent_secondary_collision(
+            "agent_driver_epochs",
+            {"instance_id": epoch.instance_id, "ordinal": epoch.ordinal},
+            epoch.id,
+            "driver epoch instance_id and ordinal",
         )
-        self._connection.commit()
+        self._save_agent_record(
+            "agent_driver_epochs",
+            epoch,
+            DriverEpoch,
+            ("id", "instance_id", "session_id", "provider_id", "ordinal", "opened_at"),
+            {
+                "instance_id": epoch.instance_id,
+                "ordinal": epoch.ordinal,
+                "state": epoch.state.value,
+            },
+        )
 
     def load_driver_epoch(self, epoch_id: str) -> DriverEpoch:
         return _load_dataclass(DriverEpoch, self._get_payload("agent_driver_epochs", epoch_id))
@@ -396,21 +427,23 @@ class SQLiteStore:
         )
 
     def save_agent_dispatch(self, dispatch: AgentDispatchRequest) -> None:
-        self._connection.execute(
-            """
-            INSERT OR REPLACE INTO agent_dispatches
-                (id, driver_epoch_id, idempotency_key, state, payload)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                dispatch.id,
-                dispatch.driver_epoch_id,
-                dispatch.idempotency_key,
-                AgentOperationState.QUEUED.value,
-                _dump(_redacted_dispatch(dispatch)),
-            ),
+        self._reject_agent_secondary_collision(
+            "agent_dispatches",
+            {"idempotency_key": dispatch.idempotency_key},
+            dispatch.id,
+            "dispatch idempotency key",
         )
-        self._connection.commit()
+        self._save_agent_record(
+            "agent_dispatches",
+            dispatch,
+            AgentDispatchRequest,
+            ("id", "instance_id", "session_id", "driver_epoch_id", "idempotency_key", "prompt"),
+            {
+                "driver_epoch_id": dispatch.driver_epoch_id,
+                "idempotency_key": dispatch.idempotency_key,
+                "state": AgentOperationState.QUEUED.value,
+            },
+        )
 
     def load_agent_dispatch(self, dispatch_id: str) -> AgentDispatchRequest:
         return _load_dataclass(
@@ -425,11 +458,13 @@ class SQLiteStore:
         )
 
     def save_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> None:
-        self._connection.execute(
-            "INSERT OR REPLACE INTO agent_checkpoints (id, driver_epoch_id, payload) VALUES (?, ?, ?)",
-            (checkpoint.id, checkpoint.driver_epoch_id, _dump(checkpoint)),
+        self._save_agent_record(
+            "agent_checkpoints",
+            checkpoint,
+            AgentCheckpoint,
+            ("id", "instance_id", "session_id", "driver_epoch_id", "created_at", "expires_at"),
+            {"driver_epoch_id": checkpoint.driver_epoch_id},
         )
-        self._connection.commit()
 
     def load_agent_checkpoint(self, checkpoint_id: str) -> AgentCheckpoint:
         return _load_dataclass(
@@ -444,20 +479,25 @@ class SQLiteStore:
         )
 
     def save_agent_handoff(self, handoff: AgentHandoffPackage) -> None:
-        self._connection.execute(
-            """
-            INSERT OR REPLACE INTO agent_handoffs
-                (id, outgoing_epoch_id, incoming_provider_id, payload)
-            VALUES (?, ?, ?, ?)
-            """,
+        self._save_agent_record(
+            "agent_handoffs",
+            handoff,
+            AgentHandoffPackage,
             (
-                handoff.id,
-                handoff.outgoing_epoch_id,
-                handoff.incoming_provider_id,
-                _dump(handoff),
+                "id",
+                "instance_id",
+                "outgoing_epoch_id",
+                "incoming_provider_id",
+                "objective",
+                "checkpoint_id",
+                "required_capabilities",
+                "created_at",
             ),
+            {
+                "outgoing_epoch_id": handoff.outgoing_epoch_id,
+                "incoming_provider_id": handoff.incoming_provider_id,
+            },
         )
-        self._connection.commit()
 
     def load_agent_handoff(self, handoff_id: str) -> AgentHandoffPackage:
         return _load_dataclass(
@@ -919,6 +959,54 @@ class SQLiteStore:
         self._connection.execute(f"INSERT OR REPLACE INTO {table} (id, payload) VALUES (?, ?)", (row_id, payload))
         self._connection.commit()
 
+    def _save_agent_record(
+        self,
+        table: str,
+        record: Any,
+        record_type: type[Any],
+        immutable_fields: tuple[str, ...],
+        indexed_values: dict[str, object],
+    ) -> None:
+        payload = _dump_agent_record(record)
+        sanitized_record = _load_dataclass(record_type, payload)
+        row = self._connection.execute(
+            f"SELECT payload FROM {table} WHERE id = ?", (sanitized_record.id,)
+        ).fetchone()
+        if row is not None:
+            existing_record = _load_dataclass(record_type, str(row["payload"]))
+            if any(
+                getattr(existing_record, field) != getattr(sanitized_record, field)
+                for field in immutable_fields
+            ):
+                raise ValueError(f"{table} immutable identity cannot change")
+            assignments = ", ".join([*(f"{column} = ?" for column in indexed_values), "payload = ?"])
+            self._connection.execute(
+                f"UPDATE {table} SET {assignments} WHERE id = ?",
+                (*indexed_values.values(), payload, sanitized_record.id),
+            )
+        else:
+            columns = ("id", *indexed_values, "payload")
+            placeholders = ", ".join("?" for _ in columns)
+            self._connection.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                (sanitized_record.id, *indexed_values.values(), payload),
+            )
+        self._connection.commit()
+
+    def _reject_agent_secondary_collision(
+        self,
+        table: str,
+        values: dict[str, object],
+        record_id: str,
+        label: str,
+    ) -> None:
+        where = " AND ".join(f"{column} = ?" for column in values)
+        row = self._connection.execute(
+            f"SELECT id FROM {table} WHERE {where}", tuple(values.values())
+        ).fetchone()
+        if row is not None and str(row["id"]) != record_id:
+            raise ValueError(f"{label} already belongs to {row['id']}")
+
     def _get_payload(self, table: str, row_id: str) -> str:
         row = self._connection.execute(f"SELECT payload FROM {table} WHERE id = ?", (row_id,)).fetchone()
         if row is None:
@@ -934,14 +1022,31 @@ def _dump(value: Any) -> str:
     return json.dumps(to_jsonable(value), sort_keys=True, separators=(",", ":"))
 
 
+def _dump_agent_record(value: Any) -> str:
+    return json.dumps(
+        _sanitize_agent_json(to_jsonable(value)), sort_keys=True, separators=(",", ":")
+    )
+
+
+def _sanitize_agent_json(value: Any, *, key: str | None = None) -> Any:
+    if key == "prompt":
+        return _REDACTED_DISPATCH_PROMPT
+    if key is not None and _AGENT_TRANSCRIPT_KEY_RE.search(key):
+        return _REDACTED_AGENT_TRANSCRIPT
+    if key not in {"credential_references", "required_secret_references"} and key is not None:
+        if _AGENT_SECRET_KEY_RE.search(key):
+            raise ValueError("agent records cannot persist credential material")
+    if isinstance(value, dict):
+        return {str(item_key): _sanitize_agent_json(item, key=str(item_key)) for item_key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_agent_json(item, key=key) for item in value]
+    if isinstance(value, str) and _AGENT_SECRET_VALUE_RE.search(value):
+        raise ValueError("agent records cannot persist credential material")
+    return value
+
+
 def _load_dataclass(cls: type[Any], payload: str) -> Any:
     return dataclass_from_jsonable(cls, json.loads(payload))
-
-
-def _redacted_dispatch(dispatch: AgentDispatchRequest) -> AgentDispatchRequest:
-    """Retain dispatch identity while excluding the raw prompt transcript."""
-
-    return replace(dispatch, prompt="[redacted dispatch prompt]")
 
 
 # The provider-neutral driver design uses this descriptive name.  Retain

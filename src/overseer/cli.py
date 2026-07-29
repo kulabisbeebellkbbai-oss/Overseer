@@ -2070,16 +2070,34 @@ def _persistence_schema_status(path: Path) -> dict[str, object]:
         rows = connection.execute(
             "SELECT version, description, applied_at FROM schema_migrations ORDER BY version"
         ).fetchall()
+        named_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_schema_migrations'"
+        ).fetchone()
+        named_rows = (
+            connection.execute(
+                "SELECT version, description, applied_at FROM agent_schema_migrations ORDER BY version"
+            ).fetchall()
+            if named_table is not None
+            else ()
+        )
     finally:
         connection.close()
     migrations = [
         {
-            "version": int(str(row[0])) if str(row[0]).isdigit() else str(row[0]),
+            "version": int(row[0]),
             "description": str(row[1]),
             "applied_at": str(row[2]),
         }
         for row in rows
     ]
+    migrations.extend(
+        {
+            "version": str(row[0]),
+            "description": str(row[1]),
+            "applied_at": str(row[2]),
+        }
+        for row in named_rows
+    )
     numeric_versions = [
         migration["version"]
         for migration in migrations

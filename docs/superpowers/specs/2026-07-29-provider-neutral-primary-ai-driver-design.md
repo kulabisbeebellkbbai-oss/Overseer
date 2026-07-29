@@ -144,6 +144,25 @@ recovery, handoff, and failover. It binds every operation to the current driver
 epoch and requests authorization from existing Overseer policy services before
 performing mutations.
 
+### Instance operation coordinator
+
+`src/overseer/agent_operations.py` serializes provider operations that can
+produce external side effects. Before checkpointing for handoff it acquires a
+generation-fenced instance reservation, rejects new dispatches, and drains or
+cancels every persisted in-flight dispatch. A checkpoint may be captured only
+after the outgoing provider is verified quiescent.
+
+The coordinator persists dispatch intent before execution and uses a
+generation token for completion. Handoff, rollback, recovery, and activation
+must present the current generation. Stale completions are quarantined and
+cannot change authority.
+
+Rollback requests cancellation of the incoming provider and verifies its
+terminal state. The outgoing provider remains paused whenever cancellation is
+unsupported, fails, times out, or cannot be verified. Database quarantine of a
+late result is evidence handling, not a substitute for preventing the external
+action.
+
 ### Provider adapters
 
 `src/overseer/agent_adapters/` contains one focused adapter per provider:
@@ -223,9 +242,13 @@ within the same primary-driver identity unless a new epoch is required to
 quarantine an uncertain prior process.
 
 Manual handoff requires the operator to select and approve the replacement
-provider. Overseer creates a checkpoint, validates the incoming provider's
-capabilities, records the handoff package, closes the outgoing epoch, opens a
-new epoch, and dispatches the continuation.
+provider. Overseer first reserves the instance, fences new dispatch, and drains
+or cancels in-flight work. After verifying outgoing-provider quiescence it
+creates a checkpoint, validates the incoming provider's capabilities, records
+the handoff package and durable importing transition, imports the continuation,
+and atomically promotes the incoming epoch while closing the outgoing epoch.
+Rollback resumes outgoing work only after incoming-provider cancellation is
+verified. Otherwise the instance remains paused for operator reconciliation.
 
 Controlled failover selects the first healthy provider in a previously approved
 fallback order. Automatic failover requires all of the following:

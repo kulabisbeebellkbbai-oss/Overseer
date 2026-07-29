@@ -204,6 +204,116 @@ class OverseerApiClient:
     def usage_continuation_plan(self) -> dict[str, Any]:
         return self._get("/usage/continuation-plan")
 
+    def list_agent_providers(self) -> dict[str, Any]:
+        return self._get("/agent-providers")
+
+    def list_agent_instances(self) -> dict[str, Any]:
+        return self._get("/agent-instances")
+
+    def discover_agent_sessions(
+        self,
+        provider_id: str,
+        instance_id: str,
+        codex_projects_registry: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "provider_id": provider_id,
+            "instance_id": instance_id,
+        }
+        if codex_projects_registry:
+            payload["codex_projects_registry"] = codex_projects_registry
+        return self._post("/agent-sessions/discover", payload)
+
+    def list_agent_sessions(
+        self,
+        provider_id: str | None = None,
+        instance_id: str | None = None,
+    ) -> dict[str, Any]:
+        query = {
+            key: value
+            for key, value in {
+                "provider_id": provider_id,
+                "instance_id": instance_id,
+            }.items()
+            if value is not None
+        }
+        suffix = f"?{urlencode(query)}" if query else ""
+        return self._get(f"/agent-sessions{suffix}")
+
+    def dispatch_agent_goal(
+        self,
+        instance_id: str,
+        prompt: str,
+        idempotency_key: str,
+        requested_by: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "instance_id": instance_id,
+            "prompt": prompt,
+            "idempotency_key": idempotency_key,
+        }
+        if requested_by:
+            payload["requested_by"] = requested_by
+        return self._post("/agent-dispatches", payload)
+
+    def list_agent_dispatches(
+        self,
+        instance_id: str | None = None,
+    ) -> dict[str, Any]:
+        suffix = (
+            f"?{urlencode({'instance_id': instance_id})}"
+            if instance_id is not None
+            else ""
+        )
+        return self._get(f"/agent-dispatches{suffix}")
+
+    def checkpoint_agent(self, instance_id: str) -> dict[str, Any]:
+        return self._post("/agent-checkpoints", {"instance_id": instance_id})
+
+    def recover_agent(
+        self,
+        session_id: str,
+        initiated_by: str,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/agent-recovery",
+            {"session_id": session_id, "initiated_by": initiated_by},
+        )
+
+    def handoff_agent(
+        self,
+        instance_id: str,
+        incoming_provider_id: str,
+        initiated_by: str,
+        approval_id: str,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/agent-handoffs",
+            {
+                "instance_id": instance_id,
+                "incoming_provider_id": incoming_provider_id,
+                "initiated_by": initiated_by,
+                "approval_id": approval_id,
+            },
+        )
+
+    def failover_agent(
+        self,
+        instance_id: str,
+        incoming_provider_id: str,
+        initiated_by: str,
+        approval_id: str,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/agent-failover",
+            {
+                "instance_id": instance_id,
+                "incoming_provider_id": incoming_provider_id,
+                "initiated_by": initiated_by,
+                "approval_id": approval_id,
+            },
+        )
+
     def discover_codex_project_threads(self, codex_projects_registry: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if codex_projects_registry:

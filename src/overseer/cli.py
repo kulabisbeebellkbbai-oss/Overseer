@@ -50,6 +50,10 @@ from .admin import (
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
+from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
+from .agent_contracts import AgentCapabilities
+from .agent_manager import AgentAuthorizationError, AgentManager
+from .agent_registry import AgentRegistry
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
@@ -174,10 +178,436 @@ from .virtual_ops import (
     virtual_operations_status,
 )
 from .service_evidence import execute_journal_access_request_status, service_evidence_status, stage_journal_access_request_status
+from .serialization import to_jsonable
 
 POLICY_PROFILE_FILENAME = "policy-profile.json"
+DEFAULT_AGENT_REGISTRY = Path(__file__).parents[2] / "config" / "agent-providers.json"
 ODO_SECURITY_DOMAINS = {OwnerDomain.ODO, OwnerDomain.ODO_IDS, OwnerDomain.ODO_FIREWALL}
 PROTECTED_GATEWAY_SOURCE_ALLOWLIST: tuple[str, ...] = ("10.70.0.10/32", "10.70.0.11/32", "10.70.0.12/32")
+
+
+def _agent_capabilities_status(capabilities: AgentCapabilities) -> dict[str, bool]:
+    return dict(to_jsonable(capabilities))
+
+
+def _record_agent_audit(
+    store: SQLiteStore,
+    *,
+    event_id: str,
+    event_type: AuditEventType,
+    subject_id: str,
+    summary: str,
+    risk_level: RiskLevel,
+    evidence_ids: tuple[str, ...] = (),
+) -> None:
+    store.save_audit_event(
+        AuditEvent(
+            id=event_id,
+            event_type=event_type,
+            owner_domain=OwnerDomain.SISKO,
+            subject_id=subject_id,
+            summary=summary,
+            risk_level=risk_level,
+            evidence_ids=evidence_ids,
+            occurred_at=datetime.now(UTC).isoformat(),
+        )
+    )
+
+
+def _load_agent_registry(
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+    *,
+    codex_projects_registry: str | Path | None = None,
+) -> AgentRegistry:
+    adapter_factories = None
+    if codex_projects_registry is not None:
+        selected_registry = Path(codex_projects_registry)
+
+        def codex_factory(provider, profile):
+            return CodexDriver(
+                provider,
+                profile,
+                registry_path=selected_registry,
+            )
+
+        adapter_factories = {"codex": codex_factory}
+    return AgentRegistry.load(
+        registry_path,
+        local_registry_path,
+        adapter_factories=adapter_factories,
+    )
+
+
+def _configured_agent_profiles(registry: AgentRegistry):
+    # AgentRegistry intentionally owns the immutable mapping. This read-only
+    # projection avoids duplicating configuration parsing in operator surfaces.
+    return tuple(registry._profiles.values())
+
+
+def agent_providers_status(
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    registry = _load_agent_registry(registry_path, local_registry_path)
+    return {
+        "providers": [
+            {
+                "id": provider.id,
+                "adapter_id": provider.adapter_id,
+                "display_name": provider.display_name,
+                "transports": [transport.value for transport in provider.transports],
+                "capabilities": _agent_capabilities_status(provider.capabilities),
+                "profile_ids": list(provider.profile_ids),
+                "health_source_id": provider.health_source_id,
+                "usage_limit_source_id": provider.usage_limit_source_id,
+            }
+            for provider in sorted(registry.providers.values(), key=lambda item: item.id)
+        ]
+    }
+
+
+def agent_instances_status(
+    store_path: str | Path,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    registry = _load_agent_registry(registry_path, local_registry_path)
+    store = SQLiteStore(store_path)
+    try:
+        profiles = _configured_agent_profiles(registry)
+        epochs = store.list_driver_epochs()
+        instances: list[dict[str, object]] = []
+        for profile in sorted(profiles, key=lambda item: item.id):
+            current = [
+                epoch
+                for epoch in epochs
+                if epoch.instance_id == profile.id and epoch.closed_at is None
+            ]
+            active = max(current, key=lambda epoch: epoch.ordinal) if current else None
+            instances.append(
+                {
+                    "id": profile.id,
+                    "primary_provider_id": profile.primary_provider_id,
+                    "primary_adapter_id": profile.primary_adapter_id,
+                    "transport": profile.transport.value,
+                    "model_profile_id": profile.model_profile_id,
+                    "required_capabilities": _agent_capabilities_status(
+                        profile.required_capabilities
+                    ),
+                    "approved_fallback_provider_ids": list(
+                        profile.approved_fallback_provider_ids
+                    ),
+                    "active_epoch": to_jsonable(active) if active is not None else None,
+                }
+            )
+        return {"instances": instances}
+    finally:
+        store.close()
+
+
+def discover_agent_sessions_status(
+    store_path: str | Path,
+    provider_id: str,
+    instance_id: str,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+    codex_projects_registry: str | Path | None = None,
+) -> dict[str, object]:
+    if not provider_id.strip():
+        raise ValueError("provider_id is required")
+    if not instance_id.strip():
+        raise ValueError("instance_id is required")
+    registry = _load_agent_registry(
+        registry_path,
+        local_registry_path,
+        codex_projects_registry=codex_projects_registry,
+    )
+    driver = registry.driver_for_provider(provider_id, instance_id=instance_id)
+    sessions = driver.discover()
+    store = SQLiteStore(store_path)
+    try:
+        for provider in registry.providers.values():
+            store.save_agent_provider(provider)
+        for profile in _configured_agent_profiles(registry):
+            store.save_agent_instance_profile(profile)
+        for session in sessions:
+            store.save_agent_session(session)
+        resources = []
+        items = []
+        if provider_id == "codex":
+            for session in sessions:
+                resource = legacy_codex_session_resource(session)
+                store.save_resource(resource)
+                resources.append(resource)
+                references = session.legacy_references
+                items.append(
+                    {
+                        "conversation_id": session.external_session_id,
+                        "label": references.get("label"),
+                        "project": session.workspace,
+                        "command": references.get("command"),
+                        "launcher": references.get("launcher"),
+                        "resource_id": resource.id,
+                    }
+                )
+        _record_agent_audit(
+            store,
+            event_id=(
+                f"audit.agent.discovery.{instance_id}.{provider_id}."
+                f"{datetime.now(UTC).timestamp()}"
+            ),
+            event_type=AuditEventType.VERIFIED,
+            subject_id=f"agent.discovery:{instance_id}:{provider_id}",
+            summary="discovered provider sessions through the configured adapter",
+            risk_level=RiskLevel.LOW,
+        )
+        return {
+            "provider_id": provider_id,
+            "instance_id": instance_id,
+            "sessions": [to_jsonable(session) for session in sessions],
+            "threads": len(sessions) if provider_id == "codex" else 0,
+            "resources": len(resources),
+            "items": items,
+            "mutation_performed": bool(sessions or resources),
+            "host_mutation_performed": False,
+            "next_step": (
+                "review discovered agent sessions before activation or dispatch"
+            ),
+        }
+    finally:
+        store.close()
+
+
+def agent_sessions_status(
+    store_path: str | Path,
+    provider_id: str | None = None,
+    instance_id: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        sessions = [
+            session
+            for session in store.list_agent_sessions()
+            if (provider_id is None or session.provider_id == provider_id)
+            and (instance_id is None or session.instance_id == instance_id)
+        ]
+        return {"sessions": [to_jsonable(session) for session in sessions]}
+    finally:
+        store.close()
+
+
+def agent_dispatches_status(
+    store_path: str | Path,
+    instance_id: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        dispatches = [
+            dispatch
+            for dispatch in store.list_agent_dispatches()
+            if instance_id is None or dispatch.instance_id == instance_id
+        ]
+        request_ids = {dispatch.id for dispatch in dispatches}
+        results = [
+            result
+            for result in store.list_agent_dispatch_results()
+            if result.request_id in request_ids
+        ]
+        return {
+            "dispatches": [to_jsonable(dispatch) for dispatch in dispatches],
+            "results": [to_jsonable(result) for result in results],
+        }
+    finally:
+        store.close()
+
+
+def _agent_approval_subject(
+    operation: str,
+    instance_id: str,
+    incoming_provider_id: str,
+) -> str:
+    return f"agent-{operation}:{instance_id}:{incoming_provider_id}"
+
+
+def _agent_authorization_callback(
+    store: SQLiteStore,
+    *,
+    handoff_operation: str = "handoff",
+):
+    def authorize(operation: str, context) -> bool:
+        if operation != "manual_handoff":
+            return True
+        approval_id = context.get("approval_id")
+        instance_id = context.get("instance_id")
+        incoming_provider_id = context.get("incoming_provider_id")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (approval_id, instance_id, incoming_provider_id)
+        ):
+            return False
+        try:
+            approval = store.load_approval(approval_id)
+        except KeyError:
+            return False
+        return approval.can_execute() and approval.subject_id == _agent_approval_subject(
+            handoff_operation,
+            instance_id,
+            incoming_provider_id,
+        )
+
+    return authorize
+
+
+def _agent_manager(
+    store: SQLiteStore,
+    registry_path: str | Path,
+    local_registry_path: str | Path | None,
+    *,
+    handoff_operation: str = "handoff",
+) -> AgentManager:
+    registry = _load_agent_registry(registry_path, local_registry_path)
+    return AgentManager(
+        registry,
+        store,
+        authorization_callback=_agent_authorization_callback(
+            store,
+            handoff_operation=handoff_operation,
+        ),
+    )
+
+
+def dispatch_agent_goal_status(
+    store_path: str | Path,
+    instance_id: str,
+    prompt: str,
+    idempotency_key: str,
+    requested_by: str | None = None,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    if not idempotency_key.strip():
+        raise ValueError("idempotency_key is required")
+    store = SQLiteStore(store_path)
+    try:
+        result = _agent_manager(
+            store, registry_path, local_registry_path
+        ).dispatch(instance_id, prompt, idempotency_key, requested_by)
+        _record_agent_audit(
+            store,
+            event_id=f"audit.agent.dispatch.{result.request_id}",
+            event_type=AuditEventType.EXECUTED,
+            subject_id=f"agent.dispatch:{instance_id}:{result.request_id}",
+            summary="dispatched a provider-neutral agent goal",
+            risk_level=RiskLevel.MEDIUM,
+        )
+        return {"result": to_jsonable(result)}
+    finally:
+        store.close()
+
+
+def checkpoint_agent_status(
+    store_path: str | Path,
+    instance_id: str,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        checkpoint = _agent_manager(
+            store, registry_path, local_registry_path
+        ).checkpoint(instance_id)
+        _record_agent_audit(
+            store,
+            event_id=f"audit.agent.checkpoint.{checkpoint.id}",
+            event_type=AuditEventType.VERIFIED,
+            subject_id=f"agent.checkpoint:{instance_id}:{checkpoint.id}",
+            summary="captured a provider-neutral agent checkpoint",
+            risk_level=RiskLevel.MEDIUM,
+        )
+        return {"checkpoint": to_jsonable(checkpoint)}
+    finally:
+        store.close()
+
+
+def recover_agent_status(
+    store_path: str | Path,
+    session_id: str,
+    initiated_by: str,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        epoch = _agent_manager(
+            store, registry_path, local_registry_path
+        ).recover(session_id, initiated_by)
+        _record_agent_audit(
+            store,
+            event_id=f"audit.agent.recovery.{epoch.id}",
+            event_type=AuditEventType.EXECUTED,
+            subject_id=f"agent.recovery:{epoch.instance_id}:{session_id}",
+            summary="recovered a persisted provider-neutral agent session",
+            risk_level=RiskLevel.MEDIUM,
+        )
+        return {"epoch": to_jsonable(epoch)}
+    finally:
+        store.close()
+
+
+def handoff_agent_status(
+    store_path: str | Path,
+    instance_id: str,
+    incoming_provider_id: str,
+    initiated_by: str,
+    approval_id: str,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+    *,
+    operation: str = "handoff",
+) -> dict[str, object]:
+    if not incoming_provider_id.strip():
+        raise ValueError("incoming_provider_id is required")
+    if not approval_id.strip():
+        raise ValueError("approval_id is required")
+    store = SQLiteStore(store_path)
+    try:
+        authorization_callback = _agent_authorization_callback(
+            store,
+            handoff_operation=operation,
+        )
+        context = {
+            "approval_id": approval_id,
+            "instance_id": instance_id,
+            "incoming_provider_id": incoming_provider_id,
+        }
+        if authorization_callback("manual_handoff", context) is not True:
+            raise AgentAuthorizationError(
+                "manual_handoff rejected by Overseer policy callback"
+            )
+        epoch = _agent_manager(
+            store,
+            registry_path,
+            local_registry_path,
+            handoff_operation=operation,
+        ).manual_handoff(
+            instance_id,
+            incoming_provider_id,
+            initiated_by,
+            approval_id,
+        )
+        _record_agent_audit(
+            store,
+            event_id=f"audit.agent.{operation}.{epoch.id}",
+            event_type=AuditEventType.EXECUTED,
+            subject_id=f"agent.{operation}:{instance_id}:{incoming_provider_id}",
+            summary=f"completed an approved provider {operation}",
+            risk_level=RiskLevel.HIGH,
+            evidence_ids=(approval_id,),
+        )
+        return {"epoch": to_jsonable(epoch), "operation": operation}
+    finally:
+        store.close()
 
 
 def build_demo_registry() -> ResourceRegistry:
@@ -8494,6 +8924,104 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo_parser = subparsers.add_parser("demo", help="print a demo checkout decision")
     demo_parser.add_argument("--store", help="explicit SQLite path for persisting the demo decision")
+    agent_providers_parser = subparsers.add_parser(
+        "agent-providers",
+        help="list configured provider-neutral AI drivers",
+    )
+    agent_providers_parser.add_argument(
+        "--agent-registry",
+        default=str(DEFAULT_AGENT_REGISTRY),
+        help="committed provider registry JSON",
+    )
+    agent_providers_parser.add_argument("--agent-registry-local")
+    agent_instances_parser = subparsers.add_parser(
+        "agent-instances",
+        help="list configured agent instances and active epochs",
+    )
+    agent_instances_parser.add_argument("--store", required=True)
+    agent_instances_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    agent_instances_parser.add_argument("--agent-registry-local")
+    discover_agent_parser = subparsers.add_parser(
+        "discover-agent-sessions",
+        help="discover and persist sessions through a configured provider adapter",
+    )
+    discover_agent_parser.add_argument("--store", required=True)
+    discover_agent_parser.add_argument("--provider-id", required=True)
+    discover_agent_parser.add_argument("--instance-id", required=True)
+    discover_agent_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    discover_agent_parser.add_argument("--agent-registry-local")
+    discover_agent_parser.add_argument("--codex-projects-registry")
+    agent_sessions_parser = subparsers.add_parser(
+        "agent-session-status",
+        help="list persisted provider-neutral agent sessions",
+    )
+    agent_sessions_parser.add_argument("--store", required=True)
+    agent_sessions_parser.add_argument("--provider-id")
+    agent_sessions_parser.add_argument("--instance-id")
+    dispatch_agent_parser = subparsers.add_parser(
+        "dispatch-agent-goal",
+        help="dispatch a goal to an active agent epoch",
+    )
+    dispatch_agent_parser.add_argument("--store", required=True)
+    dispatch_agent_parser.add_argument("--instance-id", required=True)
+    dispatch_agent_parser.add_argument("--prompt", required=True)
+    dispatch_agent_parser.add_argument("--idempotency-key", required=True)
+    dispatch_agent_parser.add_argument("--requested-by", default="operator")
+    dispatch_agent_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    dispatch_agent_parser.add_argument("--agent-registry-local")
+    checkpoint_agent_parser = subparsers.add_parser(
+        "checkpoint-agent",
+        help="capture a checkpoint from an active agent epoch",
+    )
+    checkpoint_agent_parser.add_argument("--store", required=True)
+    checkpoint_agent_parser.add_argument("--instance-id", required=True)
+    checkpoint_agent_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    checkpoint_agent_parser.add_argument("--agent-registry-local")
+    recover_agent_parser = subparsers.add_parser(
+        "recover-agent",
+        help="recover a persisted agent session",
+    )
+    recover_agent_parser.add_argument("--store", required=True)
+    recover_agent_parser.add_argument("--session-id", required=True)
+    recover_agent_parser.add_argument("--initiated-by", default="operator")
+    recover_agent_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    recover_agent_parser.add_argument("--agent-registry-local")
+    handoff_agent_parser = subparsers.add_parser(
+        "handoff-agent",
+        help="perform an explicitly approved provider handoff",
+    )
+    handoff_agent_parser.add_argument("--store", required=True)
+    handoff_agent_parser.add_argument("--instance-id", required=True)
+    handoff_agent_parser.add_argument("--incoming-provider-id", required=True)
+    handoff_agent_parser.add_argument("--initiated-by", default="operator")
+    handoff_agent_parser.add_argument("--approval-id", required=True)
+    handoff_agent_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    handoff_agent_parser.add_argument("--agent-registry-local")
+    failover_agent_parser = subparsers.add_parser(
+        "failover-agent",
+        help="perform an explicitly selected and approved provider failover",
+    )
+    failover_agent_parser.add_argument("--store", required=True)
+    failover_agent_parser.add_argument("--instance-id", required=True)
+    failover_agent_parser.add_argument("--incoming-provider-id", required=True)
+    failover_agent_parser.add_argument("--initiated-by", default="operator")
+    failover_agent_parser.add_argument("--approval-id", required=True)
+    failover_agent_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    failover_agent_parser.add_argument("--agent-registry-local")
     seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
     seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
     seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -9392,6 +9920,128 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_parser.add_argument("--evidence-id", action="append", default=[])
     release_parser.add_argument("--released-at")
     args = parser.parse_args(argv)
+
+    if args.command == "agent-providers":
+        print(
+            json.dumps(
+                agent_providers_status(
+                    args.agent_registry,
+                    args.agent_registry_local,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "agent-instances":
+        print(
+            json.dumps(
+                agent_instances_status(
+                    args.store,
+                    args.agent_registry,
+                    args.agent_registry_local,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "discover-agent-sessions":
+        print(
+            json.dumps(
+                discover_agent_sessions_status(
+                    args.store,
+                    args.provider_id,
+                    args.instance_id,
+                    args.agent_registry,
+                    args.agent_registry_local,
+                    args.codex_projects_registry,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "agent-session-status":
+        print(
+            json.dumps(
+                agent_sessions_status(
+                    args.store,
+                    args.provider_id,
+                    args.instance_id,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "dispatch-agent-goal":
+        print(
+            json.dumps(
+                dispatch_agent_goal_status(
+                    args.store,
+                    args.instance_id,
+                    args.prompt,
+                    args.idempotency_key,
+                    args.requested_by,
+                    args.agent_registry,
+                    args.agent_registry_local,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "checkpoint-agent":
+        print(
+            json.dumps(
+                checkpoint_agent_status(
+                    args.store,
+                    args.instance_id,
+                    args.agent_registry,
+                    args.agent_registry_local,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "recover-agent":
+        print(
+            json.dumps(
+                recover_agent_status(
+                    args.store,
+                    args.session_id,
+                    args.initiated_by,
+                    args.agent_registry,
+                    args.agent_registry_local,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command in {"handoff-agent", "failover-agent"}:
+        print(
+            json.dumps(
+                handoff_agent_status(
+                    args.store,
+                    args.instance_id,
+                    args.incoming_provider_id,
+                    args.initiated_by,
+                    args.approval_id,
+                    args.agent_registry,
+                    args.agent_registry_local,
+                    operation=(
+                        "handoff"
+                        if args.command == "handoff-agent"
+                        else "failover"
+                    ),
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
 
     if args.command == "demo":
         status = persisted_demo_status(args.store) if args.store else demo_status()

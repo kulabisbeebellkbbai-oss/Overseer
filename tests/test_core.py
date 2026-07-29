@@ -2793,6 +2793,49 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_legacy_codex_discovery_keeps_payload_keys_and_successor_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,"
+                "updated_at,source,notes\n",
+                encoding="utf-8",
+            )
+
+            with LocalOverseerApiServer(store_path) as server:
+                request = Request(
+                    f"{server.url}/codex-projects/discover-threads",
+                    data=json.dumps(
+                        {"codex_projects_registry": str(registry)}
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    deprecation = response.headers["Deprecation"]
+                    successor = response.headers["Link"]
+
+            self.assertEqual(
+                set(payload),
+                {
+                    "store",
+                    "registry",
+                    "threads",
+                    "resources",
+                    "items",
+                    "mutation_performed",
+                    "host_mutation_performed",
+                    "next_step",
+                },
+            )
+            self.assertEqual(deprecation, "true")
+            self.assertEqual(
+                successor,
+                '</agent-sessions/discover>; rel="successor-version"',
+            )
+
     def test_loopback_api_reports_health_and_state(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -3600,6 +3643,23 @@ class OverseerApiTests(unittest.TestCase):
 
 
 class OverseerApiClientTests(unittest.TestCase):
+    def test_client_lists_provider_neutral_agent_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path) as server:
+                client = OverseerApiClient(server.url)
+                providers = client.list_agent_providers()
+                instances = client.list_agent_instances()
+                sessions = client.list_agent_sessions()
+
+            self.assertGreaterEqual(
+                {item["id"] for item in providers["providers"]},
+                {"codex", "claude"},
+            )
+            self.assertEqual(instances["instances"][0]["id"], "overseer.default")
+            self.assertEqual(sessions, {"sessions": []})
+
     def test_client_reads_state_with_token_file(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

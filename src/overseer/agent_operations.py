@@ -233,20 +233,24 @@ class AgentOperationCoordinator:
         driver: PrimaryDriver,
         session: AgentSession,
     ) -> AgentDispatchResult:
+        external_session_id = session.external_session_id
+        if (
+            not isinstance(external_session_id, str)
+            or not external_session_id.strip()
+        ):
+            raise AgentOperationBlockedError(
+                "provider cancellation lacks durable external session identity"
+            )
         try:
             result = driver.cancel(session)
         except Exception as error:
             raise AgentOperationBlockedError(
                 "provider cancellation could not be verified"
             ) from error
-        session_binding = result.session_id in {
-            session.id,
-            session.external_session_id,
-        }
         if (
             result.instance_id != reservation.instance_id
             or result.provider_id != session.provider_id
-            or not session_binding
+            or result.external_session_id != external_session_id
             or result.state
             not in {
                 AgentOperationState.CANCELLED,

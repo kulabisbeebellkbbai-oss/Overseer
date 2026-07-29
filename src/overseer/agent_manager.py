@@ -95,6 +95,7 @@ _TERMINAL_RESULT_STATES = {
 MAX_CHECKPOINT_AGE_SECONDS = 300
 _BLOCKING_TRANSITION_STATES = {
     AgentTransitionState.IMPORTING,
+    AgentTransitionState.IMPORT_ACKNOWLEDGED,
     AgentTransitionState.RECONCILING,
     AgentTransitionState.FAILED,
 }
@@ -586,6 +587,7 @@ class AgentManager:
             or transition.state
             not in {
                 AgentTransitionState.IMPORTING,
+                AgentTransitionState.IMPORT_ACKNOWLEDGED,
                 AgentTransitionState.RECONCILING,
                 AgentTransitionState.FAILED,
             }
@@ -597,6 +599,22 @@ class AgentManager:
         outgoing = self.store.load_driver_epoch(package.outgoing_epoch_id)
         if incoming.closed_at is not None:
             raise AgentHandoffError("closed incoming transition requires rollback")
+        if transition.state is AgentTransitionState.IMPORT_ACKNOWLEDGED:
+            durable_external_id = package.evidence.get(
+                "incoming_external_session_id"
+            )
+            if (
+                result.request_id != f"handoff.{package.id}"
+                or result.instance_id != package.instance_id
+                or result.provider_id != package.incoming_provider_id
+                or result.external_session_id != durable_external_id
+                or result.session_id != incoming.session_id
+                or result.driver_epoch_id != incoming.id
+            ):
+                raise AgentHandoffError(
+                    "reconciliation contradicts durable import acknowledgement"
+                )
+            return self._promote_acknowledged_handoff(package)
         with self.store.agent_transaction():
             transition = replace(
                 transition,
@@ -647,12 +665,13 @@ class AgentManager:
             instance_id=incoming.instance_id,
         )
         try:
+            incoming_session = self._durable_incoming_session(package, incoming)
             self.operations.cancel_and_verify(
                 operation,
                 driver=incoming_driver,
-                session=self._session_for_epoch(incoming),
+                session=incoming_session,
             )
-        except AgentOperationBlockedError:
+        except (AgentOperationBlockedError, AgentHandoffError):
             blocked = replace(
                 incoming,
                 state=AgentOperationState.BLOCKED,
@@ -740,15 +759,15 @@ class AgentManager:
             and result.error_category is not None
             else AgentErrorCategory.HANDOFF_INCOMPATIBLE
         )
-        with self.store.agent_transaction():
-            self.store.save_agent_dispatch_result(
-                replace(
-                    result,
-                    error_message=None,
-                    evidence=self._safe_result_evidence(result.evidence),
+        if failure is not None:
+            with self.store.agent_transaction():
+                self.store.save_agent_dispatch_result(
+                    replace(
+                        result,
+                        error_message=None,
+                        evidence=self._safe_result_evidence(result.evidence),
+                    )
                 )
-            )
-            if failure is not None:
                 transition_state = (
                     AgentOperationState.QUARANTINED
                     if invalid_state == "quarantined"
@@ -782,35 +801,116 @@ class AgentManager:
                         reason=failure.value,
                     )
                 )
-            else:
-                session = self.store.load_agent_session(incoming.session_id)
-                self.store.save_agent_session(
-                    replace(
-                        session,
-                        external_session_id=result.external_session_id,
-                        last_observed_at=self._clock(),
-                    )
+            return incoming, failure
+        package, incoming = self._persist_import_acknowledgement(
+            package,
+            incoming,
+            result,
+        )
+        return self._promote_acknowledged_handoff(package), None
+
+    def _persist_import_acknowledgement(
+        self,
+        package: AgentHandoffPackage,
+        incoming: DriverEpoch,
+        result: AgentDispatchResult,
+    ) -> tuple[AgentHandoffPackage, DriverEpoch]:
+        external_session_id = result.external_session_id
+        if not isinstance(external_session_id, str) or not external_session_id.strip():
+            raise AgentHandoffError("import acknowledgement lacks external session identity")
+        normalized = replace(
+            result,
+            error_message=None,
+            evidence=self._safe_result_evidence(result.evidence),
+        )
+        with self.store.agent_transaction():
+            self.store.save_agent_dispatch_result(normalized)
+            session = self.store.load_agent_session(incoming.session_id)
+            self.store.save_agent_session(
+                replace(
+                    session,
+                    external_session_id=external_session_id,
+                    last_observed_at=self._clock(),
                 )
-                incoming = replace(incoming, state=AgentOperationState.RUNNING)
-                self.store.save_agent_handoff(
-                    replace(
-                        package,
-                        evidence={**package.evidence, "status": "acknowledged"},
-                    )
+            )
+            package = replace(
+                package,
+                evidence={
+                    **package.evidence,
+                    "status": "import_acknowledged",
+                    "import_result_id": normalized.id,
+                    "incoming_external_session_id": external_session_id,
+                },
+            )
+            self.store.save_agent_handoff(package)
+            transition = self.store.load_agent_transition(package.instance_id)
+            self.store.save_agent_transition(
+                replace(
+                    transition,
+                    state=AgentTransitionState.IMPORT_ACKNOWLEDGED,
+                    updated_at=self._clock(),
+                    reason=None,
                 )
-                self._close_epoch(outgoing, replacement_epoch_id=incoming.id)
-                self.store.save_driver_epoch(incoming)
-                transition = self.store.load_agent_transition(package.instance_id)
-                self.store.save_agent_transition(
-                    replace(
-                        transition,
-                        state=AgentTransitionState.COMPLETED,
-                        updated_at=self._clock(),
-                        reason=None,
-                    )
+            )
+        return package, incoming
+
+    def _promote_acknowledged_handoff(
+        self,
+        package: AgentHandoffPackage,
+    ) -> DriverEpoch:
+        package = self.store.load_agent_handoff(package.id)
+        transition = self.store.load_agent_transition(package.instance_id)
+        if transition.state is not AgentTransitionState.IMPORT_ACKNOWLEDGED:
+            raise AgentHandoffError("handoff import is not durably acknowledged")
+        incoming = self.store.load_driver_epoch(transition.incoming_epoch_id)
+        outgoing = self.store.load_driver_epoch(transition.outgoing_epoch_id)
+        session = self.store.load_agent_session(incoming.session_id)
+        external_session_id = package.evidence.get("incoming_external_session_id")
+        result_id = package.evidence.get("import_result_id")
+        if (
+            not isinstance(external_session_id, str)
+            or not external_session_id.strip()
+            or session.external_session_id != external_session_id
+            or not isinstance(result_id, str)
+        ):
+            raise AgentHandoffError("durable import acknowledgement binding mismatch")
+        try:
+            result = self.store.load_agent_dispatch_result(result_id)
+        except KeyError as error:
+            raise AgentHandoffError(
+                "durable import acknowledgement result is missing"
+            ) from error
+        if (
+            result.request_id != f"handoff.{package.id}"
+            or result.id != result_id
+            or result.instance_id != package.instance_id
+            or result.provider_id != package.incoming_provider_id
+            or result.session_id != incoming.session_id
+            or result.driver_epoch_id != incoming.id
+            or result.external_session_id != external_session_id
+            or result.state not in _ACKNOWLEDGED_STATES
+        ):
+            raise AgentHandoffError("durable import result binding mismatch")
+        with self.store.agent_transaction():
+            incoming = replace(incoming, state=AgentOperationState.RUNNING)
+            self.store.save_agent_handoff(
+                replace(
+                    package,
+                    evidence={**package.evidence, "status": "acknowledged"},
                 )
-                self.operations.release(self._operation_for_package(package))
-        return incoming, failure
+            )
+            self._close_epoch(outgoing, replacement_epoch_id=incoming.id)
+            self.store.save_driver_epoch(incoming)
+            self.store.save_agent_transition(
+                replace(
+                    transition,
+                    state=AgentTransitionState.COMPLETED,
+                    updated_at=self._clock(),
+                    reason=None,
+                )
+            )
+            self.operations.release(self._operation_for_package(package))
+        return incoming
 
     def record_provider_result(
         self,
@@ -1034,6 +1134,43 @@ class AgentManager:
         ):
             raise AgentHandoffError("handoff operation reservation binding mismatch")
         return operation
+
+    def _durable_incoming_session(
+        self,
+        package: AgentHandoffPackage,
+        incoming: DriverEpoch,
+    ) -> AgentSession:
+        session = self._session_for_epoch(incoming)
+        external_session_id = package.evidence.get("incoming_external_session_id")
+        result_id = package.evidence.get("import_result_id")
+        if (
+            not isinstance(external_session_id, str)
+            or not external_session_id.strip()
+            or session.external_session_id != external_session_id
+            or not isinstance(result_id, str)
+        ):
+            raise AgentHandoffError(
+                "rollback lacks durable incoming external session identity"
+            )
+        try:
+            result = self.store.load_agent_dispatch_result(result_id)
+        except KeyError as error:
+            raise AgentHandoffError(
+                "rollback durable import acknowledgement result is missing"
+            ) from error
+        if (
+            result.request_id != f"handoff.{package.id}"
+            or result.provider_id != incoming.provider_id
+            or result.instance_id != incoming.instance_id
+            or result.session_id != incoming.session_id
+            or result.driver_epoch_id != incoming.id
+            or result.external_session_id != external_session_id
+            or result.state not in _ACKNOWLEDGED_STATES
+        ):
+            raise AgentHandoffError(
+                "rollback durable import acknowledgement is contradictory"
+            )
+        return session
 
     def _raise_transition_required(
         self,

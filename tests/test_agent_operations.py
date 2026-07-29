@@ -265,6 +265,11 @@ def test_rollback_keeps_fence_until_incoming_cancel_is_verified(
     assert len(rollback_results) == 1
     assert rollback_results[0].id == outgoing.id
     assert incoming_driver.cancel_calls == 1
+    assert incoming_driver.last_cancel_session is not None
+    assert (
+        incoming_driver.last_cancel_session.external_session_id
+        == "external.claude.handoff"
+    )
     with OverseerStore(path) as store:
         released = store.load_agent_operation("overseer.default")
         assert released.state == "open"
@@ -301,3 +306,40 @@ def test_rollback_cancel_failure_does_not_resume_outgoing(tmp_path: Path) -> Non
                 store.list_agent_sessions()[0].id,
                 initiated_by="operator",
             )
+
+
+def test_rollback_rejects_local_only_cancel_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    path = tmp_path / "state.sqlite3"
+
+    class FailPromotionOnceStore(OverseerStore):
+        fail_promotion = True
+
+        def save_driver_epoch(self, epoch: object) -> None:
+            if self.fail_promotion and getattr(epoch, "closed_at", None) is not None:
+                self.fail_promotion = False
+                raise RuntimeError("injected phase B failure")
+            super().save_driver_epoch(epoch)
+
+    with FailPromotionOnceStore(path) as store:
+        manager = AgentManager(registry, store, authorization_callback=_allow)
+        manager.activate("overseer.default", initiated_by="operator")
+        with pytest.raises(RuntimeError, match="phase B"):
+            manager.manual_handoff(
+                "overseer.default",
+                "claude",
+                "operator",
+                "approval.local-only-cancel",
+            )
+        handoff_id = store.list_agent_handoffs()[0].id
+
+    drivers["claude"].cancel_echo_local_only = True
+    with OverseerStore(path) as store:
+        manager = AgentManager(registry, store, authorization_callback=_allow)
+        blocked = manager.rollback_handoff(handoff_id, initiated_by="operator")
+
+        assert blocked.state is AgentOperationState.BLOCKED
+        assert store.load_agent_operation("overseer.default").state == "fenced"

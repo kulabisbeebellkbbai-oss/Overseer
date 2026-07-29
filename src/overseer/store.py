@@ -52,15 +52,20 @@ AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
 AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
+        AgentTransitionState.IMPORT_ACKNOWLEDGED,
         AgentTransitionState.RECONCILING,
         AgentTransitionState.FAILED,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.IMPORT_ACKNOWLEDGED: {
         AgentTransitionState.COMPLETED,
+        AgentTransitionState.FAILED,
         AgentTransitionState.ROLLED_BACK,
     },
     AgentTransitionState.RECONCILING: {
+        AgentTransitionState.IMPORT_ACKNOWLEDGED,
         AgentTransitionState.RECONCILING,
         AgentTransitionState.FAILED,
-        AgentTransitionState.COMPLETED,
         AgentTransitionState.ROLLED_BACK,
     },
     AgentTransitionState.FAILED: {
@@ -455,7 +460,12 @@ class SQLiteStore:
                     SELECT 1
                     FROM agent_instance_transitions
                     WHERE instance_id = NEW.instance_id
-                      AND state IN ('importing', 'reconciling', 'failed')
+                      AND state IN (
+                          'importing',
+                          'import_acknowledged',
+                          'reconciling',
+                          'failed'
+                      )
                     UNION ALL
                     SELECT 1
                     FROM agent_operation_reservations

@@ -29,6 +29,7 @@ class AgentOperationState(StrEnum):
 
 class AgentTransitionState(StrEnum):
     IMPORTING = "importing"
+    IMPORT_ACKNOWLEDGED = "import_acknowledged"
     RECONCILING = "reconciling"
     FAILED = "failed"
     COMPLETED = "completed"

@@ -66,6 +66,8 @@ class FakeDriver:
         self.cancel_state = AgentOperationState.CANCELLED
         self.cancel_entered: Event | None = None
         self.cancel_release: Event | None = None
+        self.cancel_echo_local_only = False
+        self.last_cancel_session: AgentSession | None = None
 
     def _result(
         self,
@@ -158,16 +160,27 @@ class FakeDriver:
 
     def cancel(self, session: AgentSession) -> AgentDispatchResult:
         self.cancel_calls += 1
+        self.last_cancel_session = session
         self.events.append(f"cancel:{self.provider.id}")
         if self.cancel_entered is not None:
             self.cancel_entered.set()
         if self.cancel_release is not None:
             self.cancel_release.wait(timeout=5)
-        return self._result(
+        result = self._result(
             request_id=f"cancel.{self.provider.id}",
-            session_id=session.id,
+            session_id=(
+                session.id
+                if self.cancel_echo_local_only
+                else session.external_session_id or session.id
+            ),
             epoch_id="pending",
             state=self.cancel_state,
+        )
+        return replace(
+            result,
+            external_session_id=(
+                None if self.cancel_echo_local_only else session.external_session_id
+            ),
         )
 
     def import_handoff(
@@ -611,7 +624,7 @@ def test_handoff_rejects_acknowledgement_with_mismatched_binding(
     assert transition.state is AgentOperationState.BLOCKED
 
 
-def test_failed_import_pauses_dispatch_until_explicit_rollback(
+def test_failed_import_without_durable_external_identity_cannot_rollback(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
     value, store, drivers, _ = manager
@@ -651,17 +664,19 @@ def test_failed_import_pauses_dispatch_until_explicit_rollback(
     with pytest.raises(AgentManagerPausedError, match="transition"):
         value.dispatch("overseer.default", "must remain paused", "paused-key")
 
-    resumed = value.rollback_handoff(
+    blocked = value.rollback_handoff(
         store.list_agent_handoffs()[0].id,
         initiated_by="operator",
     )
-    assert resumed.id == outgoing.id
+    assert blocked.id == transition.id
+    assert blocked.state is AgentOperationState.BLOCKED
     assert (
         store.load_agent_transition(outgoing.instance_id).state
-        is AgentTransitionState.ROLLED_BACK
+        is AgentTransitionState.FAILED
     )
-    result = value.dispatch("overseer.default", "continue safely", "outgoing-key")
-    assert result.driver_epoch_id == outgoing.id
+    assert store.load_agent_operation(outgoing.instance_id).state == "fenced"
+    with pytest.raises(AgentManagerPausedError, match="transition"):
+        value.dispatch("overseer.default", "must remain paused", "outgoing-key")
 
 
 def test_phase_a_fence_blocks_dispatch_and_competing_handoff(tmp_path: Path) -> None:
@@ -920,7 +935,7 @@ def test_result_and_quarantine_mutations_require_policy_authorization(
         assert store.list_agent_dispatch_results() == ()
 
 
-def test_handoff_phase_b_failure_preserves_durable_importing_state(
+def test_handoff_phase_b_failure_preserves_durable_import_acknowledgement(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
@@ -946,11 +961,15 @@ def test_handoff_phase_b_failure_preserves_durable_importing_state(
         assert store.load_driver_epoch(outgoing.id) == outgoing
         assert len(store.list_agent_checkpoints()) == 1
         handoff = store.list_agent_handoffs()[0]
-        assert handoff.evidence["status"] == "importing"
+        assert handoff.evidence["status"] == "import_acknowledged"
         incoming = store.load_driver_epoch(str(handoff.evidence["incoming_epoch_id"]))
         assert incoming.state is AgentOperationState.QUEUED
         assert incoming.closed_at is None
-        assert store.list_agent_dispatch_results() == ()
+        assert len(store.list_agent_dispatch_results()) == 1
+        assert (
+            store.load_agent_session(incoming.session_id).external_session_id
+            == "external.claude.handoff"
+        )
         with pytest.raises(AgentTransitionRequiredError) as transition_required:
             value.recover(outgoing.session_id, initiated_by="operator")
         assert transition_required.value.transition.handoff_id == handoff.id
@@ -1014,10 +1033,18 @@ def test_crash_after_external_success_keeps_importing_state_for_reconciliation(
             )
 
         handoff = store.list_agent_handoffs()[0]
-        assert handoff.evidence["status"] == "importing"
+        assert handoff.evidence["status"] == "import_acknowledged"
         assert store.list_agent_checkpoints()
         assert store.load_driver_epoch(outgoing.id).closed_at is None
         assert drivers["claude"].last_import_result is not None
+        incoming_session = store.load_agent_session(
+            str(handoff.evidence["incoming_session_id"])
+        )
+        assert incoming_session.external_session_id == "external.claude.handoff"
+        assert (
+            store.load_agent_transition(outgoing.instance_id).state.value
+            == "import_acknowledged"
+        )
 
         incoming = value.reconcile_handoff(
             handoff.id,

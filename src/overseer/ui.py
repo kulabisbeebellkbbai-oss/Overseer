@@ -691,6 +691,16 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     body[data-layout-effective="desktop"] .span-6 { grid-column: span 6; }
     body[data-layout-effective="desktop"] .span-8 { grid-column: span 8; }
     #driver .action-btn { min-height: 44px; }
+    .nav button[data-view="driver"],
+    #driver input, #driver select { min-height: 44px; }
+    body[data-layout-effective="desktop"] aside { width: min(294px, 28vw); }
+    @media (max-width: 390px) {
+      body[data-layout-effective="desktop"] .shell { grid-template-columns: 96px minmax(224px, 1fr); }
+      body[data-layout-effective="desktop"] aside { width: 96px; padding: 8px 4px; }
+      body[data-layout-effective="desktop"] .brand h1,
+      body[data-layout-effective="desktop"] .brand p { display: none; }
+      body[data-layout-effective="desktop"] .nav button { font-size: 10px; padding: 6px 3px; overflow-wrap: anywhere; }
+    }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
     }
@@ -826,6 +836,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       loadErrors: [],
       lastAction: null
     };
+    state.driverSelection = {};
     const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"];
     function viewportLayout(width) {
       if (width <= 700) return "mobile";
@@ -897,6 +908,31 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       event.preventDefault();
       await runAction(button.dataset.action, button);
     });
+    document.addEventListener("change", (event) => {
+      if (!event.target.closest("#driver")) return;
+      state.driverSelection[event.target.id] = event.target.value;
+      renderDriver();
+    });
+    function providerGate(providers, providerId, requiredCapabilities, capability) {
+      const provider = (providers || []).find((row) => row.id === providerId);
+      if (!provider) return {enabled: false, blocker: `Provider ${providerId || "unknown"} is not configured`};
+      if (provider.available !== true || provider.readiness !== "available") {
+        return {enabled: false, blocker: JSON.stringify(provider.unavailable_reason || `Provider readiness is ${provider.readiness || "unknown"}`)};
+      }
+      const capabilities = provider.capabilities || {};
+      const missing = Object.entries(requiredCapabilities || {})
+        .filter(([name, needed]) => needed === true && capabilities[name] !== true)
+        .map(([name]) => name);
+      if (missing.length) return {enabled: false, blocker: `Required capabilities unavailable: ${missing.join(", ")}`};
+      if (capabilities[capability] !== true) return {enabled: false, blocker: `Provider does not support ${capability}`};
+      return {enabled: true, blocker: ""};
+    }
+    function validatedTransferPayload(instanceId, incomingProviderId, initiatedBy, approvalId) {
+      if (!instanceId) throw new Error("instance_id is required");
+      if (!incomingProviderId) throw new Error("incoming_provider_id is required");
+      if (!approvalId) throw new Error("approval_id is required");
+      return {instance_id: instanceId, incoming_provider_id: incomingProviderId, initiated_by: initiatedBy || "operator", approval_id: approvalId};
+    }
     function selectView(view) {
       state.view = view;
       document.body.dataset.station = view;
@@ -1087,7 +1123,6 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "checkpoint-agent") return await checkpointAgent();
       if (action === "handoff-agent") return await changePrimaryAgent("/agent-handoffs", "manual handoff");
       if (action === "failover-agent") return await changePrimaryAgent("/agent-failover", "controlled failover");
-      if (action === "cancel-agent") throw new Error("Cancellation route is unavailable");
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
@@ -1171,12 +1206,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (!window.confirm(`Confirm ${operation} using approval ${approval_id}?`)) {
         throw new Error(`${operation} cancelled by operator`);
       }
-      return await postJson(path, {
-        instance_id: value("agent-instance-id"),
-        incoming_provider_id: value("agent-incoming-provider-id"),
-        initiated_by: value("agent-initiated-by") || "operator",
+      return await postJson(path, validatedTransferPayload(
+        value("agent-instance-id"),
+        value("agent-incoming-provider-id"),
+        value("agent-initiated-by"),
         approval_id
-      });
+      ));
     }
     async function registerResource() {
       const resourceId = document.getElementById("resource-id").value.trim();
@@ -2077,47 +2112,44 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const dispatches = state.data.agentDispatches?.dispatches || [];
       const results = state.data.agentDispatches?.results || [];
       const primary = instances.find((row) => row.primary || row.is_primary) || instances[0] || {};
-      const providerId = primary.primary_provider_id || primary.provider_id || "codex";
+      const providerId = primary.primary_provider_id || "codex";
       const provider = providers.find((row) => row.id === providerId) || {};
-      const capabilities = provider.capabilities || primary.capabilities || {};
-      const cancellationSupported = capabilities.cancellation === true || capabilities.cancel === true;
-      const readinessBlocker = provider.unavailable_reason || primary.blocker || primary.policy_blocker || "";
+      const capabilities = provider.capabilities || {};
+      const readinessBlocker = primary.policy_blocker || provider.unavailable_reason || "";
       const fallbackOrder = primary.approved_fallback_provider_ids || [];
       const activeEpoch = primary.active_epoch || null;
       const providerNativeUsage = state.data.agentUsage?.providers || [];
       const blockerText = readinessBlocker ? JSON.stringify(readinessBlocker) : "";
       const cancelTitle = "Cancellation route is unavailable";
-      const providerReady = provider.available === true && provider.readiness === "available";
       const required = primary.required_capabilities || {};
-      function blocker(capability) {
-        if (!providerReady) return blockerText || `Provider readiness is ${provider.readiness || "unknown"}`;
-        if (required[capability] === true && capabilities[capability] !== true) return `Required capability ${capability} is unavailable`;
-        if (capabilities[capability] !== true) return `Provider does not support ${capability}`;
-        return "";
-      }
-      function driverAction(action, label, capability, extraBlocker = "") {
-        const reason = extraBlocker || blocker(capability);
+      const selectedDiscoveryProvider = state.driverSelection["agent-provider-id"] || providerId;
+      const selectedIncomingProvider = state.driverSelection["agent-incoming-provider-id"] || fallbackOrder[0] || "";
+      const selectedSessionId = state.driverSelection["agent-session-id"] || sessions[0]?.id || "";
+      const selectedSession = sessions.find((row) => row.id === selectedSessionId);
+      function driverAction(action, label, capability, destinationProvider, extraBlocker = "") {
+        const gate = providerGate(providers, destinationProvider, required, capability);
+        const reason = extraBlocker || gate.blocker;
         return `<button class="action-btn" data-action="${action}"${reason ? " disabled" : ""} title="${safe(reason || label)}"${reason ? ` aria-label="${safe(`${label}: ${reason}`)}"` : ""}>${safe(label)}</button>`;
       }
       document.getElementById("driver").innerHTML = `
         <div class="grid">
           ${stationIntro("Sisko", "Primary AI Driver", "One primary provider per Overseer instance with controlled recovery, manual handoff, and failover.", ["provider neutral", "epoch fenced", "approval gated"])}
           <div class="section-head"><h3>Driver Actions</h3><div class="actions">
-            ${driverAction("discover-agent-sessions", "Discover Agent Sessions", "session_discovery")}
-            ${driverAction("resume-agent-sessions", "Resume Agent Sessions", "session_resume")}
-            ${driverAction("checkpoint-agent", "Checkpoint", "checkpoints")}
-            ${driverAction("handoff-agent", "Manual Handoff", "handoff_import")}
-            ${driverAction("failover-agent", "Controlled Failover", "handoff_import", fallbackOrder.length ? "" : "No approved fallback provider is configured")}
-            <button class="action-btn" data-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
+            ${driverAction("discover-agent-sessions", "Discover Agent Sessions", "session_discovery", selectedDiscoveryProvider)}
+            ${driverAction("resume-agent-sessions", "Resume Agent Sessions", "session_resume", selectedSession?.provider_id || "")}
+            ${driverAction("checkpoint-agent", "Checkpoint", "checkpoints", selectedSession?.provider_id || providerId)}
+            ${driverAction("handoff-agent", "Manual Handoff", "handoff_import", selectedIncomingProvider)}
+            ${driverAction("failover-agent", "Controlled Failover", "handoff_import", selectedIncomingProvider, fallbackOrder.includes(selectedIncomingProvider) ? "" : "Incoming provider is not an approved fallback")}
+            <button class="action-btn" data-disabled-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
           </div></div>
           <div id="agent-cancel-blocker" class="panel span-12 ${cancellationSupported ? "good" : "inactive"}">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
           <div class="panel span-12">
             <div class="toolbar"><h3>Operator Request</h3><span class="pill">${safe(providerId)}</span></div>
             <div class="form-grid">
               <div class="field span-3"><label for="agent-instance-id">Instance</label><input id="agent-instance-id" value="${safe(primary.id || "overseer.default")}"></div>
-              <div class="field span-3"><label for="agent-provider-id">Discovery Provider</label><input id="agent-provider-id" value="${safe(providerId)}"></div>
-              <div class="field span-3"><label for="agent-incoming-provider-id">Incoming Provider</label><input id="agent-incoming-provider-id" value="${safe(fallbackOrder[0] || "")}"></div>
-              <div class="field span-3"><label for="agent-session-id">Session</label><input id="agent-session-id" value="${safe(sessions[0]?.id || sessions[0]?.session_id || "")}"></div>
+              <div class="field span-3"><label for="agent-provider-id">Discovery Provider</label><input id="agent-provider-id" value="${safe(selectedDiscoveryProvider)}"></div>
+              <div class="field span-3"><label for="agent-incoming-provider-id">Incoming Provider</label><input id="agent-incoming-provider-id" value="${safe(selectedIncomingProvider)}"></div>
+              <div class="field span-3"><label for="agent-session-id">Session</label><input id="agent-session-id" value="${safe(selectedSessionId)}"></div>
               <div class="field span-6"><label for="agent-approval-id">Approval ID</label><input id="agent-approval-id" autocomplete="off" placeholder="required for handoff or failover"></div>
               <div class="field span-6"><label for="agent-initiated-by">Initiated By</label><input id="agent-initiated-by" value="operator"></div>
             </div>
@@ -2127,8 +2159,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Driver Epoch", activeEpoch?.id || "none", "generation fence", "span-3", "")}
           ${metric("Sessions", sessions.length, "normalized", "span-3", "")}
           <div class="panel span-6">${kv("Checkpoint and Recovery", {
-            checkpoint: activeEpoch?.checkpoint_id,
-            recovery: sessions[0]?.state,
+            checkpoint: primary.current_checkpoint_id,
+            recovery: primary.transition_state,
             blocker: readinessBlocker
           })}</div>
           <div class="panel span-6">${kv("Fallback Order", {providers: fallbackOrder})}</div>
@@ -2139,10 +2171,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             capabilities: row.capabilities,
             blocker: row.unavailable_reason
           })), ["provider_id", "readiness", "available", "capabilities", "blocker"])}</div>
-          <div class="panel span-12">${table("Provider Native Usage", providerNativeUsage, ["provider_id", "limit_id", "value", "usage_unit"])}</div>
+          <div class="panel span-12">${table("Provider Native Usage", providerNativeUsage, ["provider_id", "usage_limit_source_id", "evidence_status", "value", "usage_unit"])}</div>
           <div class="panel span-6">${table("Agent Sessions", sessions, ["id", "provider_id", "instance_id", "state", "checkpoint_id"])}</div>
           <div class="panel span-6">${table("Agent Dispatches", dispatches, ["id", "provider_id", "instance_id", "state", "driver_epoch_id"])}</div>
-          <div class="panel span-12">${table("Dispatch Results", results, ["request_id", "state", "provider_id", "session_id"])}</div>
+          <div class="panel span-12">${table("Dispatch Results", results, ["request_id", "state", "completed_at", "error_category"])}</div>
           ${officerPanel("sisko", "Primary AI driver review", "Review provider readiness, epoch, checkpoint, and approval evidence before changing the primary driver.")}
         </div>`;
     }
@@ -3200,12 +3232,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     function ezriWorkflowRows() {
       const source = "Overseer/Runbooks/operator-workflows.md";
       return [
-        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "discover-agent-sessions", source, query: "Review command status"},
-        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "resume-agent-sessions", source, query: "Review command status"},
-        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "checkpoint-agent", source, query: "Review command status"},
-        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "handoff-agent", source, query: "Review command status"},
-        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "failover-agent", source, query: "Review command status"},
-        {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "cancel-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "discover-agent-sessions", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "resume-agent-sessions", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "checkpoint-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "handoff-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "failover-agent", source, query: "Review command status"},
         {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "open drilldown", source, query: "Review command status"},
         {workflow: "Record an operations workflow", page: "Overview", owner: "Sisko / Ezri", action: "record-operation", source, query: "Record an operations workflow"},
         {workflow: "Stage a gap workflow from a template", page: "Overview", owner: "Sisko / Ezri", action: "stage-operation-workflow", source, query: "Stage a gap workflow from a template"},

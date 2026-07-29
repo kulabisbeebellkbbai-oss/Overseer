@@ -146,6 +146,18 @@ def test_agent_inventory_uses_existing_api_authentication(tmp_path: Path) -> Non
     assert authorized.status_code == 200
 
 
+def test_agent_instances_expose_truthful_policy_and_recovery_metadata(api: LocalAPI) -> None:
+    response = api.get("/agent-instances")
+    instance = response.json()["instances"][0]
+
+    assert response.status_code == 200
+    assert instance["policy_readiness"] in {"ready", "blocked"}
+    assert "policy_blocker" in instance
+    assert "current_checkpoint_id" in instance
+    assert "transition_state" in instance
+    assert "evidence" not in json.dumps(instance).lower()
+
+
 def test_agent_usage_is_authenticated_and_truthful_when_evidence_is_missing(tmp_path: Path) -> None:
     with LocalAPI(tmp_path / "overseer.sqlite3", auth_token="test-token") as protected:
         unauthorized = protected.get("/agent-usage", authenticated=False)

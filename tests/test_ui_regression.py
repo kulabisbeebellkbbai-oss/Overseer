@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -66,6 +67,29 @@ class LocalApiHarness:
 
 
 class ProtectedGatewayUiRegressionTests(unittest.TestCase):
+    def test_dashboard_pure_javascript_behavior_executes_in_node(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        start = OPERATOR_CONSOLE_HTML.index("    function providerGate(")
+        end = OPERATOR_CONSOLE_HTML.index("    function selectView(", start)
+        functions = OPERATOR_CONSOLE_HTML[start:end]
+        script = functions + r"""
+const providers = [
+  {id:"codex", available:true, readiness:"available", capabilities:{session_discovery:true, checkpoints:true}},
+  {id:"claude", available:false, readiness:"unavailable", unavailable_reason:{type:"not_installed"}, capabilities:{}}
+];
+if (!providerGate(providers, "codex", {checkpoints:true}, "session_discovery").enabled) process.exit(2);
+if (providerGate(providers, "claude", {}, "session_discovery").enabled) process.exit(3);
+if (!providerGate(providers, "missing", {}, "session_resume").blocker.includes("not configured")) process.exit(4);
+const payload = validatedTransferPayload("overseer.default", "claude", "operator", "approval.1");
+if (payload.approval_id !== "approval.1") process.exit(5);
+let rejected = false;
+try { validatedTransferPayload("overseer.default", "claude", "operator", ""); } catch (_) { rejected = true; }
+if (!rejected) process.exit(6);
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_operator_console_contains_primary_driver_controls(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 
@@ -79,7 +103,7 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
         self.assertIn('data-action="checkpoint-agent"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="handoff-agent"', OPERATOR_CONSOLE_HTML)
         self.assertIn('data-action="failover-agent"', OPERATOR_CONSOLE_HTML)
-        self.assertIn('data-action="cancel-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-disabled-action="cancel-agent"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Provider Capabilities", OPERATOR_CONSOLE_HTML)
         self.assertIn("approval_id", OPERATOR_CONSOLE_HTML)
         self.assertIn("window.confirm", OPERATOR_CONSOLE_HTML)
@@ -88,7 +112,7 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
         self.assertIn("primary.active_epoch", OPERATOR_CONSOLE_HTML)
         self.assertIn('["id", "provider_id", "instance_id", "state", "checkpoint_id"]', OPERATOR_CONSOLE_HTML)
         self.assertIn('["id", "provider_id", "instance_id", "state", "driver_epoch_id"]', OPERATOR_CONSOLE_HTML)
-        self.assertIn('["request_id", "state", "provider_id", "session_id"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn('["request_id", "state", "completed_at", "error_category"]', OPERATOR_CONSOLE_HTML)
         self.assertNotIn("primary.current_epoch", OPERATOR_CONSOLE_HTML)
         self.assertNotIn("primary.fallback_order", OPERATOR_CONSOLE_HTML)
 
@@ -113,8 +137,8 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
 
         for capability in ("session_discovery", "session_resume", "checkpoints", "handoff_import"):
             self.assertIn(f'"{capability}"', OPERATOR_CONSOLE_HTML)
-        self.assertIn("provider.available === true", OPERATOR_CONSOLE_HTML)
-        self.assertIn('provider.readiness === "available"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("provider.available !== true", OPERATOR_CONSOLE_HTML)
+        self.assertIn('provider.readiness !== "available"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Cancellation route is unavailable", OPERATOR_CONSOLE_HTML)
 
     def test_gateway_prefix_serves_operator_console_with_token_form(self):

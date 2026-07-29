@@ -18,7 +18,6 @@ EXPECTED_VIEWS = {
             "checkpoint-agent",
             "handoff-agent",
             "failover-agent",
-            "cancel-agent",
         },
         "officers": {"Sisko"},
     },
@@ -164,7 +163,6 @@ EXPECTED_VIEWS = {
 
 
 ACTION_ROUTES = {
-    "cancel-agent": ("GET", "/agent-dispatches"),
     "checkpoint-agent": ("POST", "/agent-checkpoints"),
     "discover-agent-sessions": ("POST", "/agent-sessions/discover"),
     "failover-agent": ("POST", "/agent-failover"),
@@ -658,7 +656,7 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
     def test_every_visible_action_is_handled_and_has_an_api_route(self):
         handled_actions = _handled_actions()
         self.assertEqual(handled_actions, set(ACTION_ROUTES))
-        self.assertTrue((_data_actions() - {"cancel-agent"}).issubset(handled_actions))
+        self.assertTrue(_data_actions().issubset(handled_actions))
 
         routes = _api_routes()
         for action, (method, route) in ACTION_ROUTES.items():

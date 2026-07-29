@@ -103,7 +103,7 @@ class OperatorWorkflowRegressionTests(unittest.TestCase):
             query = _normalize(row["query"])
             with self.subTest(workflow=row["workflow"]):
                 self.assertEqual(row["source"], RUNBOOK_SOURCE)
-                self.assertIn(row["page"], {"Any", "Overview", "Admin", "Assets", "Claims", "Security", "Health", "Usage", "Documents", "Audit"})
+                self.assertIn(row["page"], {"Any", "Overview", "Driver", "Admin", "Assets", "Claims", "Security", "Health", "Usage", "Documents", "Audit"})
                 self.assertTrue(workflow in headings or query in runbook_text or _workflow_is_covered_by_runbook_split(workflow, headings))
 
     def test_each_documented_workflow_is_represented_by_ezri(self):

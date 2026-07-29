@@ -313,6 +313,8 @@ def agent_instances_status(
     try:
         profiles = _configured_agent_profiles(registry)
         epochs = store.list_driver_epochs()
+        checkpoints = store.list_agent_checkpoints()
+        transitions = {item.instance_id: item for item in store.list_agent_transitions()}
         instances: list[dict[str, object]] = []
         for profile in sorted(profiles, key=lambda item: item.id):
             current = [
@@ -321,6 +323,25 @@ def agent_instances_status(
                 if epoch.instance_id == profile.id and epoch.closed_at is None
             ]
             active = max(current, key=lambda epoch: epoch.ordinal) if current else None
+            provider = registry.providers[profile.primary_provider_id]
+            provider_status = _agent_provider_status(registry, provider)
+            required = _agent_capabilities_status(profile.required_capabilities)
+            detected = provider_status["capabilities"]
+            missing = sorted(
+                name for name, required_value in required.items()
+                if required_value is True and detected.get(name) is not True
+            )
+            policy_blockers = []
+            if provider_status["available"] is not True:
+                policy_blockers.append(provider_status["unavailable_reason"])
+            if missing:
+                policy_blockers.append({"type": "required_capabilities_missing", "capabilities": missing})
+            transition = transitions.get(profile.id)
+            current_checkpoint = None
+            if active is not None:
+                matching = [item for item in checkpoints if item.driver_epoch_id == active.id]
+                if matching:
+                    current_checkpoint = max(matching, key=lambda item: item.created_at or "").id
             instances.append(
                 {
                     "id": profile.id,
@@ -335,6 +356,13 @@ def agent_instances_status(
                         profile.approved_fallback_provider_ids
                     ),
                     "active_epoch": to_jsonable(active) if active is not None else None,
+                    "policy_readiness": "ready" if not policy_blockers else "blocked",
+                    "policy_blocker": policy_blockers[0] if policy_blockers else None,
+                    "permission_policy_ref": profile.permission_policy_ref,
+                    "execution_policy_ref": profile.execution_policy_ref,
+                    "controlled_failover_policy_ref": profile.controlled_failover_policy_ref,
+                    "current_checkpoint_id": current_checkpoint,
+                    "transition_state": transition.state.value if transition else None,
                 }
             )
         return {"instances": instances}

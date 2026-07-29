@@ -224,7 +224,7 @@ def test_agent_store_redacts_transcript_fields_in_all_evidence_payloads(tmp_path
         session = replace(_session("session.1", "claude"), legacy_references={"transcript": transcript})
         dispatch = replace(_dispatch("dispatch.1", "epoch.1"), evidence={"provider_output": transcript})
         checkpoint = replace(_checkpoint("checkpoint.1", "epoch.1"), evidence={"transcript": transcript})
-        handoff = replace(_handoff("handoff.1", "epoch.1"), evidence={"message": transcript})
+        handoff = replace(_handoff("handoff.1", "epoch.1"), evidence={"raw_messages": transcript})
         store.save_agent_session(session)
         store.save_agent_dispatch(dispatch)
         store.save_agent_checkpoint(checkpoint)
@@ -233,7 +233,7 @@ def test_agent_store_redacts_transcript_fields_in_all_evidence_payloads(tmp_path
         assert store.load_agent_session(session.id).legacy_references["transcript"] == "[redacted agent transcript]"
         assert store.load_agent_dispatch(dispatch.id).evidence["provider_output"] == "[redacted agent transcript]"
         assert store.load_agent_checkpoint(checkpoint.id).evidence["transcript"] == "[redacted agent transcript]"
-        assert store.load_agent_handoff(handoff.id).evidence["message"] == "[redacted agent transcript]"
+        assert store.load_agent_handoff(handoff.id).evidence["raw_messages"] == "[redacted agent transcript]"
 
     database_bytes = b"".join(
         candidate.read_bytes()
@@ -241,6 +241,138 @@ def test_agent_store_redacts_transcript_fields_in_all_evidence_payloads(tmp_path
         if candidate.exists()
     )
     assert transcript.encode() not in database_bytes
+
+
+@pytest.mark.parametrize(
+    "transcript_key", ("conversation", "history", "raw_output", "body", "content")
+)
+def test_agent_store_redacts_normalized_dialogue_fields_without_writing_bytes(
+    tmp_path: Path, transcript_key: str
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    transcript = f"unredacted {transcript_key} dialogue"
+
+    with OverseerStore(path) as store:
+        checkpoint = replace(
+            _checkpoint("checkpoint.1", "epoch.1"), evidence={transcript_key: transcript}
+        )
+        store.save_agent_checkpoint(checkpoint)
+        assert store.load_agent_checkpoint(checkpoint.id).evidence[transcript_key] == (
+            "[redacted agent transcript]"
+        )
+
+    database_bytes = b"".join(
+        candidate.read_bytes()
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        if candidate.exists()
+    )
+    assert transcript.encode() not in database_bytes
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    (
+        "credential",
+        "credentials",
+        "secret",
+        "client-secret",
+        "client_secret_value",
+        "password",
+        "authorization",
+        "cookie",
+        "private key",
+        "access_key",
+        "bearer",
+        "token",
+    ),
+)
+def test_agent_store_rejects_normalized_credential_keys_without_writing_bytes(
+    tmp_path: Path, credential_key: str
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    raw_value = f"value-for-{credential_key}"
+
+    with OverseerStore(path) as store:
+        checkpoint = replace(
+            _checkpoint("checkpoint.1", "epoch.1"), evidence={credential_key: raw_value}
+        )
+        with pytest.raises(ValueError, match="credential material"):
+            store.save_agent_checkpoint(checkpoint)
+
+    database_bytes = b"".join(
+        candidate.read_bytes()
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        if candidate.exists()
+    )
+    assert raw_value.encode() not in database_bytes
+
+
+def test_agent_store_round_trips_safe_normalized_metadata(tmp_path: Path) -> None:
+    metadata = {
+        "message_id": "message.1",
+        "output_tokens": 12,
+        "input_tokens": 8,
+        "token_count": 20,
+        "usage_units": 3,
+        "evidence_id": "evidence.1",
+        "reference": "reference.1",
+        "status": "acknowledged",
+        "reason": "provider acknowledged request",
+        "hash": "sha256:abc123",
+        "captured_at": "2026-07-29T00:00:00+00:00",
+    }
+
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        session = replace(_session("session.1", "claude"), legacy_references=metadata)
+        dispatch = replace(_dispatch("dispatch.1", "epoch.1"), evidence=metadata)
+        checkpoint = replace(_checkpoint("checkpoint.1", "epoch.1"), evidence=metadata)
+        handoff = replace(_handoff("handoff.1", "epoch.1"), evidence=metadata)
+        store.save_agent_session(session)
+        store.save_agent_dispatch(dispatch)
+        store.save_agent_checkpoint(checkpoint)
+        store.save_agent_handoff(handoff)
+
+        assert dict(store.load_agent_session(session.id).legacy_references) == metadata
+        assert dict(store.load_agent_dispatch(dispatch.id).evidence) == metadata
+        assert dict(store.load_agent_checkpoint(checkpoint.id).evidence) == metadata
+        assert dict(store.load_agent_handoff(handoff.id).evidence) == metadata
+
+
+def test_session_profile_and_dispatch_allow_only_explicit_mutable_fields(tmp_path: Path) -> None:
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        session = _session("session.1", "claude")
+        store.save_agent_session(session)
+        refreshed_session = replace(
+            session,
+            capabilities=AgentCapabilities(session_resume=True, structured_events=True),
+            legacy_references={"status": "ready", "reason": "refreshed"},
+            last_observed_at="2026-07-29T00:00:00+00:00",
+        )
+        store.save_agent_session(refreshed_session)
+        assert store.load_agent_session(session.id) == refreshed_session
+        with pytest.raises(ValueError, match="immutable identity"):
+            store.save_agent_session(replace(refreshed_session, external_session_id="external.2"))
+
+        profile = _profile()
+        store.save_agent_instance_profile(profile)
+        refreshed_profile = replace(
+            profile, detected_capabilities=AgentCapabilities(session_resume=True)
+        )
+        store.save_agent_instance_profile(refreshed_profile)
+        assert store.load_agent_instance_profile(profile.id) == refreshed_profile
+        with pytest.raises(ValueError, match="immutable identity"):
+            store.save_agent_instance_profile(replace(refreshed_profile, workspace="/other"))
+
+        dispatch = replace(
+            _dispatch("dispatch.1", "epoch.1"),
+            requested_at="2026-07-29T00:00:00+00:00",
+            requested_by="operator.1",
+        )
+        store.save_agent_dispatch(dispatch)
+        store.save_agent_dispatch(replace(dispatch, evidence={"status": "acknowledged"}))
+        assert store.load_agent_dispatch(dispatch.id).evidence == {"status": "acknowledged"}
+        with pytest.raises(ValueError, match="immutable identity"):
+            store.save_agent_dispatch(replace(dispatch, requested_by="operator.2"))
 
 
 def test_lifecycle_unique_collisions_and_mutations_preserve_original_history(tmp_path: Path) -> None:

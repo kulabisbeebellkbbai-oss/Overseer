@@ -42,12 +42,40 @@ CURRENT_SCHEMA_VERSION = 1
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 _REDACTED_AGENT_TRANSCRIPT = "[redacted agent transcript]"
 _REDACTED_DISPATCH_PROMPT = "[redacted dispatch prompt]"
-_AGENT_SECRET_KEY_RE = re.compile(
-    r"(?:authorization|bearer|cookie|private[_-]?key|(?:api|access)[_-]?key|token|password)",
-    re.IGNORECASE,
+_AGENT_CREDENTIAL_KEYS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "secret",
+        "client_secret",
+        "client_secret_value",
+        "password",
+        "authorization",
+        "cookie",
+        "private_key",
+        "access_key",
+        "api_key",
+        "bearer",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+    }
 )
-_AGENT_TRANSCRIPT_KEY_RE = re.compile(
-    r"(?:transcript|prompt|message|output)", re.IGNORECASE
+_AGENT_TRANSCRIPT_KEYS = frozenset(
+    {
+        "transcript",
+        "conversation",
+        "history",
+        "raw_message",
+        "raw_messages",
+        "raw_output",
+        "raw_outputs",
+        "provider_output",
+        "prompt",
+        "body",
+        "content",
+    }
 )
 _AGENT_SECRET_VALUE_RE = re.compile(
     r"(?:\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----|(?:^|[;,\s])(?:session|auth|access)?_?token=\S+)",
@@ -365,7 +393,24 @@ class SQLiteStore:
             "agent_instance_profiles",
             profile,
             AgentInstanceProfile,
-            tuple(AgentInstanceProfile.__dataclass_fields__),
+            (
+                "id",
+                "primary_provider_id",
+                "transport",
+                "workspace",
+                "primary_adapter_id",
+                "model_profile_id",
+                "external_session_id",
+                "declared_capabilities",
+                "required_capabilities",
+                "credential_references",
+                "permission_policy_ref",
+                "execution_policy_ref",
+                "provider_health_source_id",
+                "usage_limit_source_id",
+                "approved_fallback_provider_ids",
+                "controlled_failover_policy_ref",
+            ),
             {},
         )
 
@@ -386,7 +431,16 @@ class SQLiteStore:
             "agent_sessions",
             session,
             AgentSession,
-            tuple(AgentSession.__dataclass_fields__),
+            (
+                "id",
+                "provider_id",
+                "external_session_id",
+                "workspace",
+                "transport",
+                "instance_id",
+                "model_profile_id",
+                "discovered_at",
+            ),
             {"provider_id": session.provider_id},
         )
 
@@ -437,7 +491,15 @@ class SQLiteStore:
             "agent_dispatches",
             dispatch,
             AgentDispatchRequest,
-            ("id", "instance_id", "session_id", "driver_epoch_id", "idempotency_key", "prompt"),
+            (
+                "id",
+                "instance_id",
+                "session_id",
+                "driver_epoch_id",
+                "idempotency_key",
+                "requested_at",
+                "requested_by",
+            ),
             {
                 "driver_epoch_id": dispatch.driver_epoch_id,
                 "idempotency_key": dispatch.idempotency_key,
@@ -1029,13 +1091,13 @@ def _dump_agent_record(value: Any) -> str:
 
 
 def _sanitize_agent_json(value: Any, *, key: str | None = None) -> Any:
-    if key == "prompt":
+    normalized_key = _normalize_agent_key(key) if key is not None else None
+    if normalized_key == "prompt":
         return _REDACTED_DISPATCH_PROMPT
-    if key is not None and _AGENT_TRANSCRIPT_KEY_RE.search(key):
+    if normalized_key in _AGENT_TRANSCRIPT_KEYS:
         return _REDACTED_AGENT_TRANSCRIPT
-    if key not in {"credential_references", "required_secret_references"} and key is not None:
-        if _AGENT_SECRET_KEY_RE.search(key):
-            raise ValueError("agent records cannot persist credential material")
+    if normalized_key in _AGENT_CREDENTIAL_KEYS:
+        raise ValueError("agent records cannot persist credential material")
     if isinstance(value, dict):
         return {str(item_key): _sanitize_agent_json(item, key=str(item_key)) for item_key, item in value.items()}
     if isinstance(value, list):
@@ -1043,6 +1105,10 @@ def _sanitize_agent_json(value: Any, *, key: str | None = None) -> Any:
     if isinstance(value, str) and _AGENT_SECRET_VALUE_RE.search(value):
         raise ValueError("agent records cannot persist credential material")
     return value
+
+
+def _normalize_agent_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
 
 
 def _load_dataclass(cls: type[Any], payload: str) -> Any:

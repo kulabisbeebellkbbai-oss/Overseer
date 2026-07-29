@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import Any, TypeVar, get_args, get_origin, get_type_hints
+from types import UnionType
+from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
 
 T = TypeVar("T")
 
@@ -42,6 +43,16 @@ def _coerce_value(target_type: Any, value: Any) -> Any:
 
     if value is None:
         return None
+
+    if origin in (Union, UnionType):
+        for subtype in args:
+            if subtype is type(None):
+                continue
+            try:
+                return _coerce_value(subtype, value)
+            except (TypeError, ValueError):
+                continue
+        return value
 
     if origin is frozenset:
         subtype = args[0] if args else Any

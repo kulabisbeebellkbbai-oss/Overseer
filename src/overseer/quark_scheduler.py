@@ -825,7 +825,10 @@ class ProviderWorkExecutor:
             return self.work_store.load_work(item.id), None
         except (KeyError, ValueError) as exc:
             return None, self._policy_block(
-                item, f"persisted work could not be loaded: {exc}"
+                item,
+                f"persisted work could not be loaded: {exc}",
+                persistence_allowed=False,
+                rejection_scope="persisted_work_load",
             )
 
     def _validate_initial_work_transition(
@@ -872,6 +875,8 @@ class ProviderWorkExecutor:
                 item,
                 "persisted work transition mismatch: "
                 + ", ".join(sorted(set(mismatches))),
+                persistence_allowed=False,
+                rejection_scope="initial_transition",
             )
         return None
 
@@ -912,6 +917,8 @@ class ProviderWorkExecutor:
                 item,
                 "persisted work binding mismatch: "
                 + ", ".join(sorted(set(mismatches))),
+                persistence_allowed=False,
+                rejection_scope="reconcile_binding",
             )
         return None
 
@@ -969,9 +976,13 @@ class ProviderWorkExecutor:
 
     @staticmethod
     def _policy_block(
-        item: AgentWorkItem, reason: str
+        item: AgentWorkItem,
+        reason: str,
+        *,
+        persistence_allowed: bool = True,
+        rejection_scope: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        result = {
             "status": "policy_blocked",
             "completed": False,
             "terminal": True,
@@ -988,6 +999,22 @@ class ProviderWorkExecutor:
             "idempotency_key": item.provider_idempotency_key,
             "error_reason": reason,
         }
+        if not persistence_allowed:
+            result.update(
+                {
+                    "persistence_allowed": False,
+                    "rejection_scope": rejection_scope,
+                    "rejected_generation": item.generation,
+                    "rejected_provider_dispatch_id": (
+                        item.provider_dispatch_id
+                    ),
+                    "rejected_provider_result_id": item.provider_result_id,
+                    "rejected_idempotency_key": (
+                        item.provider_idempotency_key
+                    ),
+                }
+            )
+        return result
 
     @staticmethod
     def _provider_result(
@@ -1296,6 +1323,49 @@ class QuarkSchedulerService:
         capacity_after: float | None,
         snapshot: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if result.get("persistence_allowed") is False:
+            try:
+                durable_item = self.store.load_work(item.id)
+            except KeyError:
+                durable_item = item
+            return {
+                "work_id": item.id,
+                "generation": result.get(
+                    "rejected_generation", item.generation
+                ),
+                "durable_generation": durable_item.generation,
+                "allocated_units": result.get(
+                    "allocated_units", item.reserved_units
+                ),
+                "allocated_quota_points": (
+                    result.get("allocated_units", item.reserved_units)
+                    if item.provider_id == "codex"
+                    and item.usage_unit == "quota_points"
+                    else None
+                ),
+                "usage_unit": item.usage_unit,
+                "provider_id": item.provider_id,
+                "limit_id": item.limit_id,
+                "status": result.get("status"),
+                "exit_code": result.get("exit_code"),
+                "checkpoint_ref": result.get("checkpoint_ref"),
+                "provider_dispatch_id": result.get(
+                    "rejected_provider_dispatch_id"
+                ),
+                "provider_result_id": result.get(
+                    "rejected_provider_result_id"
+                ),
+                "provider_reference": result.get(
+                    "provider_reference"
+                ),
+                "capacity_confidence": "not_recorded",
+                "persistence_performed": False,
+                "rejection_scope": result.get("rejection_scope"),
+                "error_reason": result.get("error_reason"),
+                "rejected_idempotency_key": result.get(
+                    "rejected_idempotency_key"
+                ),
+            }
         observed_at = str(snapshot.get("observed_at") or _timestamp())
         confidence = (
             "observed" if capacity_after is not None else "unknown"

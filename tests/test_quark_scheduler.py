@@ -1638,6 +1638,185 @@ def test_cycle_reconciles_nonterminal_provider_dispatch_on_later_cycle(
     assert store.load_work("work.claude").reserved_units == 0
 
 
+def test_cycle_stale_reconcile_rejection_does_not_overwrite_newer_winner(
+    tmp_path: Path,
+):
+    class FakeAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, *args, **kwargs):
+            self.calls.append(("recover", args, kwargs))
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    loaded = replace(
+        _agent_work(
+            "work.claude",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        reserved_units=5,
+        generation=1,
+        driver_epoch_id="epoch.claude.1",
+        provider_dispatch_id="dispatch.old",
+        provider_result_id="result.old",
+        provider_reference="provider-job-old",
+        provider_idempotency_key="quark:work.claude:1",
+        provider_dispatch_state="running",
+    )
+    store.save_work(loaded)
+    store.record_slice_start(
+        loaded.id,
+        1,
+        quota_before=80_000,
+        lifetime_tokens_before=None,
+        observed_at="2026-07-29T10:00:00+00:00",
+    )
+    slices_before = store.list_slices(loaded.id)
+    manager = FakeAgentManager()
+    inner = ProviderWorkExecutor(manager, work_store=store)
+
+    class RacingExecutor:
+        def __init__(self):
+            self.winner = None
+
+        def reconcile_slice(self, item, prompt):
+            store.save_work(
+                replace(
+                    item,
+                    generation=2,
+                    driver_epoch_id="epoch.claude.2",
+                    provider_dispatch_id="dispatch.new",
+                    provider_result_id="result.new",
+                    provider_reference="provider-job-new",
+                    provider_idempotency_key="quark:work.claude:2",
+                    provider_dispatch_state="running",
+                )
+            )
+            self.winner = store.load_work(item.id)
+            return inner.reconcile_slice(item, prompt)
+
+    executor = RacingExecutor()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (_native_snapshot("limit.claude.tokens", 79_995),)
+        ),
+        executor=executor,
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+
+    assert status["reconcile_results"][0]["status"] == "policy_blocked"
+    assert status["reconcile_results"][0]["persistence_performed"] is False
+    assert status["reconcile_results"][0]["durable_generation"] == 2
+    assert store.load_work(loaded.id) == executor.winner
+    assert store.list_slices(loaded.id) == slices_before
+    assert manager.calls == []
+
+
+def test_cycle_stale_initial_transition_rejection_preserves_newer_winner(
+    tmp_path: Path,
+):
+    class FakeAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, *args, **kwargs):
+            self.calls.append(("recover", args, kwargs))
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    queued = _agent_work(
+        "work.claude",
+        "project-a",
+        "claude",
+        "limit.claude.tokens",
+        8,
+        usage_unit="tokens",
+    )
+    store.save_work(queued)
+    manager = FakeAgentManager()
+    inner = ProviderWorkExecutor(manager, work_store=store)
+
+    class RacingExecutor:
+        def __init__(self):
+            self.winner = None
+            self.slices = None
+
+        def run_slice(self, item, allocation, prompt):
+            current = store.load_work(item.id)
+            store.save_work(
+                replace(
+                    current,
+                    generation=2,
+                    driver_epoch_id="epoch.claude.2",
+                    provider_dispatch_id="dispatch.new",
+                    provider_result_id="result.new",
+                    provider_reference="provider-job-new",
+                    provider_idempotency_key="quark:work.claude:2",
+                    provider_dispatch_state="running",
+                )
+            )
+            store.record_slice_start(
+                item.id,
+                2,
+                quota_before=79_995,
+                lifetime_tokens_before=None,
+                observed_at="2026-07-29T10:01:00+00:00",
+            )
+            self.winner = store.load_work(item.id)
+            self.slices = store.list_slices(item.id)
+            return inner.run_slice(item, allocation, prompt)
+
+    executor = RacingExecutor()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (
+                _native_snapshot("limit.claude.tokens", 80_000),
+                _native_snapshot("limit.claude.tokens", 79_995),
+            )
+        ),
+        executor=executor,
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+
+    assert status["results"][0]["status"] == "policy_blocked"
+    assert status["results"][0]["persistence_performed"] is False
+    assert store.load_work(queued.id) == executor.winner
+    assert store.list_slices(queued.id) == executor.slices
+    assert manager.calls == []
+
+
 def test_cycle_persists_unknown_post_dispatch_capacity_without_crashing(
     tmp_path: Path,
 ):

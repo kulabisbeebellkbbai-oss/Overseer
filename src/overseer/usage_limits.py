@@ -61,7 +61,7 @@ class UsageContinuationRequest:
     id: str
     limit_id: str
     resource_id: str
-    owner_thread: str
+    owner_thread: str | None
     requested_units: int
     intent: str
     risk_level: RiskLevel = RiskLevel.LOW
@@ -69,12 +69,15 @@ class UsageContinuationRequest:
     deadline: str | None = None
     requested_by: str = "quark"
     requested_at: str | None = None
+    agent_session_id: str | None = None
+    driver_epoch_id: str | None = None
+    provider_id: str | None = None
 
     def to_limited_work_request(self) -> LimitedWorkRequest:
         return LimitedWorkRequest(
             id=self.id,
             resource_id=self.resource_id,
-            owner_thread=self.owner_thread,
+            owner_thread=self.owner_thread or self.agent_session_id or "",
             requested_units=self.requested_units,
             intent=self.intent,
             risk_level=self.risk_level,
@@ -89,7 +92,7 @@ class UsageContinuationDispatch:
     request_id: str
     limit_id: str
     resource_id: str
-    owner_thread: str
+    owner_thread: str | None
     status: str
     reason: str
     dispatched_by: str
@@ -102,6 +105,11 @@ class UsageContinuationDispatch:
     resume_command: str | None = None
     resume_launcher: str | None = None
     resume_exit_code: int | None = None
+    agent_session_id: str | None = None
+    driver_epoch_id: str | None = None
+    provider_id: str | None = None
+    agent_instance_id: str | None = None
+    agent_dispatch_id: str | None = None
 
 
 @dataclass(frozen=True)

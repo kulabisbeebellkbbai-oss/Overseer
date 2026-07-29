@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
+    DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
     active_policy_profile_status,
     agent_dispatches_status,
@@ -1201,7 +1202,9 @@ def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "request_id": str(payload["request_id"]),
         "limit_id": str(payload["limit_id"]),
         "resource_id": str(payload["resource_id"]),
-        "owner_thread": str(payload["owner_thread"]),
+        "owner_thread": (
+            str(payload["owner_thread"]) if payload.get("owner_thread") else None
+        ),
         "requested_units": int(payload["requested_units"]),
         "intent": str(payload["intent"]),
         "risk_level": str(payload.get("risk_level", "low")),
@@ -1209,6 +1212,19 @@ def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "deadline": str(payload["deadline"]) if payload.get("deadline") else None,
         "requested_by": str(payload.get("requested_by", "quark")),
         "requested_at": str(payload["requested_at"]) if payload.get("requested_at") else None,
+        "agent_session_id": (
+            str(payload["agent_session_id"])
+            if payload.get("agent_session_id")
+            else None
+        ),
+        "driver_epoch_id": (
+            str(payload["driver_epoch_id"])
+            if payload.get("driver_epoch_id")
+            else None
+        ),
+        "provider_id": (
+            str(payload["provider_id"]) if payload.get("provider_id") else None
+        ),
     }
 
 
@@ -1358,6 +1374,17 @@ def _usage_continuation_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
         "resume_codex_projects": bool(payload.get("resume_codex_projects", False)),
         "codex_projects_registry": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
+        "resume_agent_sessions": bool(
+            payload.get("resume_agent_sessions", False)
+        ),
+        "agent_registry_path": str(
+            payload.get("agent_registry_path", DEFAULT_AGENT_REGISTRY)
+        ),
+        "local_agent_registry_path": (
+            str(payload["local_agent_registry_path"])
+            if payload.get("local_agent_registry_path")
+            else None
+        ),
     }
 
 

@@ -8,8 +8,8 @@ from pathlib import Path
 
 from .codex_usage import CodexUsageTracker
 from .quark_scheduler import (
+    AgentWorkItem,
     CodexExecSliceAdapter,
-    CodexWorkItem,
     QuarkSchedulerService,
     QuarkUsagePolicy,
     QuarkWorkStore,
@@ -34,9 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     register = subparsers.add_parser("register-work")
     register.add_argument("--work-id", required=True)
     register.add_argument("--project-id", required=True)
-    register.add_argument("--owner-thread", required=True)
+    register.add_argument("--agent-session-id")
+    register.add_argument("--provider-id", default="codex")
+    register.add_argument("--owner-thread")
     register.add_argument("--intent", required=True)
-    register.add_argument("--estimated-quota-points", required=True, type=float)
+    register.add_argument("--estimated-units", type=float)
+    register.add_argument("--usage-unit", default="quota_points")
+    register.add_argument("--estimated-quota-points", type=float)
     register.add_argument("--estimated-tokens", type=int)
     register.add_argument("--priority", type=int, default=50)
     register.add_argument("--limit-id", default="codex")
@@ -59,12 +63,25 @@ def run(args: argparse.Namespace) -> dict:
     store = QuarkWorkStore(args.db)
     try:
         if args.command == "register-work":
-            item = CodexWorkItem(
+            estimated_units = (
+                args.estimated_units
+                if args.estimated_units is not None
+                else args.estimated_quota_points
+            )
+            if estimated_units is None:
+                raise ValueError(
+                    "--estimated-units or --estimated-quota-points is required"
+                )
+            item = AgentWorkItem(
                 id=args.work_id,
                 project_id=args.project_id,
+                agent_session_id=args.agent_session_id,
+                provider_id=args.provider_id,
                 owner_thread=args.owner_thread,
                 limit_id=args.limit_id,
                 intent=args.intent,
+                estimated_units=estimated_units,
+                usage_unit=args.usage_unit,
                 estimated_quota_points=args.estimated_quota_points,
                 estimated_tokens=args.estimated_tokens,
                 priority=args.priority,

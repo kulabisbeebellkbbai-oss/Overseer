@@ -6,6 +6,7 @@ import threading
 import unittest
 import json
 import subprocess
+from types import SimpleNamespace
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -9515,6 +9516,191 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["dispatches"][0]["resume_status"], "resumed")
             self.assertEqual(status["dispatches"][0]["resume_command"], "codex-overseer-019f7140")
             self.assertEqual(plan["dispatch_items"][0]["resume_conversation_id"], "019f7140-debb-7c40-a056-d29be0630f01")
+
+    def test_generic_continuation_routes_through_session_provider(self):
+        class FakeAgentManager:
+            def __init__(self):
+                self.recovered_session_ids = []
+                self.dispatches = []
+
+            def recover(self, session_id, initiated_by="system"):
+                self.recovered_session_ids.append(session_id)
+                return SimpleNamespace(
+                    id="epoch.claude.1",
+                    instance_id="agent.claude.1",
+                    provider_id="claude",
+                )
+
+            def dispatch(
+                self,
+                instance_id,
+                prompt,
+                idempotency_key,
+                requested_by=None,
+            ):
+                self.dispatches.append(
+                    (instance_id, prompt, idempotency_key, requested_by)
+                )
+                return SimpleNamespace(
+                    request_id=idempotency_key,
+                    state=SimpleNamespace(value="running"),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.claude.tokens",
+                    resource_id="svc.claude",
+                    kind=LimitKind.TOKENS,
+                    capacity=100_000,
+                    remaining=80_000,
+                    resets_at="2026-07-18T12:00:00-04:00",
+                    window="daily",
+                )
+            )
+            store.save_usage_continuation_request(
+                UsageContinuationRequest(
+                    id="work.claude",
+                    limit_id="limit.claude.tokens",
+                    resource_id="svc.claude",
+                    owner_thread=None,
+                    requested_units=8_000,
+                    intent="continue Claude implementation",
+                    agent_session_id="session.claude.1",
+                    driver_epoch_id="epoch.claude.1",
+                    provider_id="claude",
+                )
+            )
+            store.close()
+            manager = FakeAgentManager()
+
+            result = dispatch_usage_continuations_status(
+                store_path=store_path,
+                resume_agent_sessions=True,
+                agent_manager=manager,
+            )
+
+        self.assertEqual(manager.recovered_session_ids, ["session.claude.1"])
+        self.assertEqual(
+            manager.dispatches,
+            [
+                (
+                    "agent.claude.1",
+                    "continue Claude implementation",
+                    "usage-continuation:work.claude",
+                    "quark",
+                )
+            ],
+        )
+        self.assertTrue(result["resume_agent_sessions"])
+        self.assertEqual(result["dispatches"][0]["provider_id"], "claude")
+        self.assertEqual(
+            result["dispatches"][0]["agent_session_id"],
+            "session.claude.1",
+        )
+        self.assertEqual(
+            result["dispatches"][0]["driver_epoch_id"],
+            "epoch.claude.1",
+        )
+
+    def test_generic_continuation_api_payload_accepts_session_identity(self):
+        args = overseer_api._usage_continuation_request_args(
+            {
+                "request_id": "work.claude",
+                "limit_id": "limit.claude.tokens",
+                "resource_id": "svc.claude",
+                "agent_session_id": "session.claude.1",
+                "driver_epoch_id": "epoch.claude.1",
+                "provider_id": "claude",
+                "requested_units": 8000,
+                "intent": "continue Claude implementation",
+            }
+        )
+
+        self.assertIsNone(args["owner_thread"])
+        self.assertEqual(args["agent_session_id"], "session.claude.1")
+        self.assertEqual(args["driver_epoch_id"], "epoch.claude.1")
+        self.assertEqual(args["provider_id"], "claude")
+
+    def test_generic_continuation_dispatch_api_enables_agent_recovery(self):
+        args = overseer_api._usage_continuation_dispatch_args(
+            {
+                "resume_agent_sessions": True,
+                "agent_registry_path": "/tmp/providers.json",
+                "local_agent_registry_path": "/tmp/providers.local.json",
+            }
+        )
+
+        self.assertTrue(args["resume_agent_sessions"])
+        self.assertEqual(args["agent_registry_path"], "/tmp/providers.json")
+        self.assertEqual(
+            args["local_agent_registry_path"],
+            "/tmp/providers.local.json",
+        )
+
+    def test_generic_continuation_cli_accepts_session_identity(self):
+        with patch(
+            "overseer.cli.request_usage_continuation_status",
+            return_value={"ok": True},
+        ) as request_status:
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = cli_main(
+                    [
+                        "request-usage-continuation",
+                        "--store",
+                        "/tmp/overseer.sqlite3",
+                        "--request-id",
+                        "work.claude",
+                        "--limit-id",
+                        "limit.claude.tokens",
+                        "--resource-id",
+                        "svc.claude",
+                        "--agent-session-id",
+                        "session.claude.1",
+                        "--driver-epoch-id",
+                        "epoch.claude.1",
+                        "--provider-id",
+                        "claude",
+                        "--requested-units",
+                        "8000",
+                        "--intent",
+                        "continue Claude implementation",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            request_status.call_args.args[-3:],
+            ("session.claude.1", "epoch.claude.1", "claude"),
+        )
+
+    def test_generic_continuation_dispatch_cli_enables_agent_recovery(self):
+        with patch(
+            "overseer.cli.dispatch_usage_continuations_status",
+            return_value={"ok": True},
+        ) as dispatch_status:
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = cli_main(
+                    [
+                        "dispatch-usage-continuations",
+                        "--store",
+                        "/tmp/overseer.sqlite3",
+                        "--resume-agent-sessions",
+                        "--agent-registry",
+                        "/tmp/providers.json",
+                        "--agent-registry-local",
+                        "/tmp/providers.local.json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(dispatch_status.call_args.kwargs["resume_agent_sessions"])
+        self.assertEqual(
+            dispatch_status.call_args.kwargs["agent_registry_path"],
+            "/tmp/providers.json",
+        )
 
     def test_dispatch_skips_waiting_usage_continuation(self):
         with tempfile.TemporaryDirectory() as directory:

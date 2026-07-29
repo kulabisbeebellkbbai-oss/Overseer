@@ -1,4 +1,4 @@
-"""Usage-aware, checkpointed Codex work scheduling for Quark."""
+"""Provider-native, usage-aware checkpointed work scheduling for Quark."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from collections import deque
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 class WorkState(StrEnum):
@@ -43,133 +44,266 @@ class QuarkUsagePolicy:
 
 
 @dataclass(frozen=True)
-class CodexWorkItem:
+class AgentWorkItem:
     id: str
     project_id: str
-    owner_thread: str
-    limit_id: str
-    intent: str
-    estimated_quota_points: float
-    estimated_tokens: int | None = None
+    agent_session_id: str | None = None
+    provider_id: str = "codex"
+    limit_id: str = "codex"
+    intent: str = ""
+    estimated_units: float | None = None
+    usage_unit: str = "quota_points"
+    owner_thread: str | None = None
     priority: int = 50
     state: WorkState = WorkState.QUEUED
-    reserved_quota_points: float = 0
+    reserved_units: float = 0
     generation: int = 0
     checkpoint_ref: str | None = None
+    driver_epoch_id: str | None = None
     pause_reason: str | None = None
     resume_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    # Compatibility fields for the existing Codex usage MCP and persisted rows.
+    estimated_quota_points: float | None = None
+    estimated_tokens: int | None = None
+    reserved_quota_points: float | None = None
 
     def __post_init__(self) -> None:
-        if not self.id.strip() or not self.project_id.strip() or not self.owner_thread.strip():
-            raise ValueError("work id, project id, and owner thread are required")
-        if self.estimated_quota_points <= 0:
-            raise ValueError("estimated quota points must be positive")
-        if self.reserved_quota_points < 0:
-            raise ValueError("reserved quota points cannot be negative")
+        if isinstance(self.intent, Real) and not isinstance(self.intent, bool):
+            legacy_limit_id = self.provider_id
+            legacy_intent = self.limit_id
+            legacy_estimated_units = float(self.intent)
+            legacy_estimated_tokens = (
+                int(self.estimated_units)
+                if isinstance(self.estimated_units, int)
+                else None
+            )
+            object.__setattr__(self, "owner_thread", self.agent_session_id)
+            object.__setattr__(self, "agent_session_id", None)
+            object.__setattr__(self, "limit_id", legacy_limit_id)
+            object.__setattr__(self, "provider_id", "codex")
+            object.__setattr__(self, "intent", legacy_intent)
+            object.__setattr__(self, "estimated_units", legacy_estimated_units)
+            object.__setattr__(self, "estimated_tokens", legacy_estimated_tokens)
+        estimate = (
+            self.estimated_units
+            if self.estimated_units is not None
+            else self.estimated_quota_points
+        )
+        reserved = (
+            self.reserved_units
+            if self.reserved_quota_points is None
+            else self.reserved_quota_points
+        )
+        if not self.id.strip() or not self.project_id.strip():
+            raise ValueError("work id and project id are required")
+        if not self.provider_id.strip() or not self.limit_id.strip():
+            raise ValueError("provider id and limit id are required")
+        if not self.usage_unit.strip():
+            raise ValueError("usage unit is required")
+        if not (self.agent_session_id or self.owner_thread):
+            raise ValueError("agent session id or owner thread is required")
+        if estimate is None or estimate <= 0:
+            raise ValueError("estimated units must be positive")
+        if reserved < 0:
+            raise ValueError("reserved units cannot be negative")
         if self.priority < 0 or self.priority > 100:
             raise ValueError("priority must be between 0 and 100")
+        object.__setattr__(self, "estimated_units", float(estimate))
+        object.__setattr__(self, "reserved_units", float(reserved))
+        if self.provider_id == "codex" and self.usage_unit == "quota_points":
+            object.__setattr__(self, "estimated_quota_points", float(estimate))
+            object.__setattr__(self, "reserved_quota_points", float(reserved))
 
-    def with_state(self, state: WorkState, **changes: Any) -> "CodexWorkItem":
+    def with_state(self, state: WorkState, **changes: Any) -> "AgentWorkItem":
+        if "reserved_quota_points" in changes and "reserved_units" not in changes:
+            changes["reserved_units"] = changes["reserved_quota_points"]
+        if "reserved_units" in changes and "reserved_quota_points" not in changes:
+            changes["reserved_quota_points"] = (
+                changes["reserved_units"]
+                if self.provider_id == "codex" and self.usage_unit == "quota_points"
+                else None
+            )
         return replace(self, state=state, **changes)
+
+
+CodexWorkItem = AgentWorkItem
 
 
 @dataclass(frozen=True)
 class WorkAllocation:
     work_id: str
     project_id: str
-    owner_thread: str
+    agent_session_id: str | None
+    provider_id: str
+    limit_id: str
+    usage_unit: str
+    owner_thread: str | None
     generation: int
-    allocated_quota_points: float
+    allocated_units: float
+
+    @property
+    def allocated_quota_points(self) -> float:
+        """Compatibility projection for Codex percentage-point callers."""
+        return self.allocated_units
 
 
 @dataclass(frozen=True)
 class QuarkWorkPlan:
     allocations: tuple[WorkAllocation, ...]
-    remaining_before_plan: float
-    active_reservations: float
-    guardrail_floor: float
-    spendable_capacity: float
-    remaining_after_plan: float
+    remaining_before_plan: float | dict[str, float | None]
+    active_reservations: float | dict[str, float]
+    guardrail_floor: float | dict[str, float]
+    spendable_capacity: float | dict[str, float]
+    remaining_after_plan: float | dict[str, float | None]
     reason: str
 
 
 def plan_quark_work(
     policy: QuarkUsagePolicy,
-    remaining_points: float,
-    work: tuple[CodexWorkItem, ...],
+    remaining_points: float | Mapping[str, float | None],
+    work: tuple[AgentWorkItem, ...],
 ) -> QuarkWorkPlan:
-    if remaining_points < 0 or remaining_points > 100:
-        raise ValueError("remaining points must be between 0 and 100")
-    active_reservations = sum(
-        item.reserved_quota_points
-        for item in work
-        if item.state is WorkState.RUNNING
-    )
-    guardrail_floor = policy.hard_reserve_points + policy.uncertainty_points
-    spendable = max(0.0, remaining_points - guardrail_floor - active_reservations)
-    if spendable <= 0:
-        return QuarkWorkPlan(
-            (),
-            remaining_points,
-            active_reservations,
-            guardrail_floor,
-            0,
-            remaining_points,
-            "capacity is at the reserve and uncertainty floor",
-        )
+    compatibility_scalar = not isinstance(remaining_points, Mapping)
+    if compatibility_scalar:
+        scalar_capacity = float(remaining_points)
+        if scalar_capacity < 0 or scalar_capacity > 100:
+            raise ValueError("remaining points must be between 0 and 100")
+        limit_ids = {item.limit_id for item in work}
+        if len(limit_ids) > 1:
+            raise ValueError("mixed-provider work requires capacity by limit id")
+        capacity_by_limit: dict[str, float | None] = {
+            next(iter(limit_ids), "codex"): scalar_capacity
+        }
+    else:
+        capacity_by_limit = dict(remaining_points)
+        if any(
+            value is not None and (not isinstance(value, (int, float)) or value < 0)
+            for value in capacity_by_limit.values()
+        ):
+            raise ValueError("provider capacity must be non-negative or unknown")
+        for item in work:
+            capacity_by_limit.setdefault(item.limit_id, None)
 
-    eligible = [
-        item
-        for item in work
-        if item.state in {WorkState.QUEUED, WorkState.CHECKPOINTED, WorkState.WAITING_CAPACITY}
-    ]
-    by_project: dict[str, deque[CodexWorkItem]] = {}
-    for item in sorted(eligible, key=lambda candidate: (-candidate.priority, candidate.id)):
-        by_project.setdefault(item.project_id, deque()).append(item)
-    project_order = deque(sorted(by_project))
-    allocated_by_work: dict[str, float] = {}
+    guardrail = policy.hard_reserve_points + policy.uncertainty_points
+    active_by_limit: dict[str, float] = {}
+    spendable_by_limit: dict[str, float] = {}
+    remaining_after_by_limit: dict[str, float | None] = {}
     allocations: list[WorkAllocation] = []
-    available = spendable
+    unknown_limit_ids: list[str] = []
+    exhausted_limit_ids: list[str] = []
+    unused_capacity = False
 
-    while available > 0 and project_order:
-        project_id = project_order.popleft()
-        queue = by_project[project_id]
-        item = queue[0]
-        remaining_estimate = item.estimated_quota_points - allocated_by_work.get(item.id, 0)
-        allocation = min(policy.max_slice_points, remaining_estimate, available)
-        if allocation > 0:
-            allocations.append(
-                WorkAllocation(
-                    work_id=item.id,
-                    project_id=item.project_id,
-                    owner_thread=item.owner_thread,
-                    generation=item.generation + 1,
-                    allocated_quota_points=allocation,
-                )
+    for limit_id in sorted(capacity_by_limit):
+        capacity = capacity_by_limit[limit_id]
+        limit_work = tuple(item for item in work if item.limit_id == limit_id)
+        active = sum(
+            item.reserved_units
+            for item in limit_work
+            if item.state is WorkState.RUNNING
+        )
+        active_by_limit[limit_id] = active
+        if capacity is None:
+            unknown_limit_ids.append(limit_id)
+            spendable_by_limit[limit_id] = 0
+            remaining_after_by_limit[limit_id] = None
+            continue
+        spendable = max(0.0, float(capacity) - guardrail - active)
+        spendable_by_limit[limit_id] = spendable
+        remaining_after_by_limit[limit_id] = float(capacity)
+        if spendable <= 0:
+            exhausted_limit_ids.append(limit_id)
+            continue
+
+        eligible = [
+            item
+            for item in limit_work
+            if item.state
+            in {
+                WorkState.QUEUED,
+                WorkState.CHECKPOINTED,
+                WorkState.WAITING_CAPACITY,
+            }
+        ]
+        by_project: dict[str, deque[AgentWorkItem]] = {}
+        for item in sorted(
+            eligible, key=lambda candidate: (-candidate.priority, candidate.id)
+        ):
+            by_project.setdefault(item.project_id, deque()).append(item)
+        project_order = deque(sorted(by_project))
+        allocated_by_work: dict[str, float] = {}
+        available = spendable
+
+        while available > 0 and project_order:
+            project_id = project_order.popleft()
+            queue = by_project[project_id]
+            item = queue[0]
+            remaining_estimate = item.estimated_units - allocated_by_work.get(
+                item.id, 0
             )
-            allocated_by_work[item.id] = allocated_by_work.get(item.id, 0) + allocation
-            available -= allocation
-        if allocated_by_work.get(item.id, 0) >= item.estimated_quota_points:
-            queue.popleft()
-        if queue:
-            project_order.append(project_id)
+            allocation = min(
+                policy.max_slice_points, remaining_estimate, available
+            )
+            if allocation > 0:
+                allocations.append(
+                    WorkAllocation(
+                        work_id=item.id,
+                        project_id=item.project_id,
+                        agent_session_id=item.agent_session_id,
+                        provider_id=item.provider_id,
+                        limit_id=item.limit_id,
+                        usage_unit=item.usage_unit,
+                        owner_thread=item.owner_thread,
+                        generation=item.generation + 1,
+                        allocated_units=allocation,
+                    )
+                )
+                allocated_by_work[item.id] = (
+                    allocated_by_work.get(item.id, 0) + allocation
+                )
+                available -= allocation
+            if allocated_by_work.get(item.id, 0) >= item.estimated_units:
+                queue.popleft()
+            if queue:
+                project_order.append(project_id)
 
-    allocated_total = spendable - available
-    remaining_after = remaining_points - active_reservations - allocated_total
-    reason = (
-        "allocated all spendable capacity while preserving reserve"
-        if available == 0
-        else "all queued estimated work is allocated and unused capacity remains"
-    )
+        allocated_total = spendable - available
+        remaining_after_by_limit[limit_id] = (
+            float(capacity) - active - allocated_total
+        )
+        unused_capacity = unused_capacity or available > 0
+
+    if unknown_limit_ids:
+        reason = (
+            "unknown capacity blocks provider work for "
+            + ", ".join(unknown_limit_ids)
+        )
+    elif not allocations and exhausted_limit_ids:
+        reason = "capacity is at the reserve and uncertainty floor"
+    elif unused_capacity:
+        reason = "all queued estimated work is allocated and unused capacity remains"
+    else:
+        reason = "allocated all spendable capacity while preserving reserve"
+
+    if compatibility_scalar:
+        limit_id = next(iter(capacity_by_limit))
+        return QuarkWorkPlan(
+            tuple(allocations),
+            float(capacity_by_limit[limit_id]),
+            active_by_limit[limit_id],
+            guardrail,
+            spendable_by_limit[limit_id],
+            remaining_after_by_limit[limit_id],
+            reason,
+        )
     return QuarkWorkPlan(
         tuple(allocations),
-        remaining_points,
-        active_reservations,
-        guardrail_floor,
-        spendable,
-        remaining_after,
+        dict(capacity_by_limit),
+        active_by_limit,
+        {limit_id: guardrail for limit_id in capacity_by_limit},
+        spendable_by_limit,
+        remaining_after_by_limit,
         reason,
     )
 
@@ -200,14 +334,14 @@ class QuarkWorkStore:
     def close(self) -> None:
         self.connection.close()
 
-    def save_work(self, item: CodexWorkItem) -> None:
+    def save_work(self, item: AgentWorkItem) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO quark_work_items (id, project_id, state, payload) VALUES (?, ?, ?, ?)",
             (item.id, item.project_id, item.state.value, json.dumps(_work_payload(item), sort_keys=True)),
         )
         self.connection.commit()
 
-    def load_work(self, work_id: str) -> CodexWorkItem:
+    def load_work(self, work_id: str) -> AgentWorkItem:
         row = self.connection.execute(
             "SELECT payload FROM quark_work_items WHERE id = ?", (work_id,)
         ).fetchone()
@@ -215,7 +349,7 @@ class QuarkWorkStore:
             raise KeyError(work_id)
         return _work_from_payload(json.loads(row["payload"]))
 
-    def list_work(self) -> tuple[CodexWorkItem, ...]:
+    def list_work(self) -> tuple[AgentWorkItem, ...]:
         rows = self.connection.execute(
             "SELECT payload FROM quark_work_items ORDER BY project_id, id"
         ).fetchall()
@@ -233,6 +367,9 @@ class QuarkWorkStore:
         payload = {
             "work_id": work_id,
             "project_id": item.project_id,
+            "provider_id": item.provider_id,
+            "limit_id": item.limit_id,
+            "usage_unit": item.usage_unit,
             "generation": generation,
             "quota_before": quota_before,
             "quota_after": None,
@@ -299,7 +436,7 @@ class QuarkWorkStore:
         self.save_work(
             item.with_state(
                 WorkState.COMPLETED if completed else WorkState.CHECKPOINTED,
-                reserved_quota_points=0,
+                reserved_units=0,
                 checkpoint_ref=checkpoint_ref,
                 pause_reason=None,
                 resume_at=None,
@@ -312,7 +449,7 @@ class QuarkWorkStore:
         self.save_work(
             item.with_state(
                 WorkState.WAITING_CAPACITY,
-                reserved_quota_points=0,
+                reserved_units=0,
                 pause_reason=reason,
                 resume_at=resume_at,
             )
@@ -331,12 +468,47 @@ class QuarkWorkStore:
         states: dict[str, int] = {}
         for item in work:
             states[item.state.value] = states.get(item.state.value, 0) + 1
+        estimated_by_limit = {
+            limit_id: sum(
+                item.estimated_units
+                for item in work
+                if item.limit_id == limit_id
+            )
+            for limit_id in sorted({item.limit_id for item in work})
+        }
+        actual_by_limit = {
+            limit_id: sum(
+                item.get("actual_quota_points") or 0
+                for item in slices
+                if item.get("limit_id", "codex") == limit_id
+            )
+            for limit_id in sorted(
+                {
+                    str(item.get("limit_id", "codex"))
+                    for item in slices
+                }
+            )
+        }
+        codex_only = all(
+            item.provider_id == "codex" and item.usage_unit == "quota_points"
+            for item in work
+        )
         return {
             "project_id": project_id,
             "work_items": len(work),
-            "estimated_quota_points": sum(item.estimated_quota_points for item in work),
+            "estimated_by_limit": estimated_by_limit,
+            "actual_by_limit": actual_by_limit,
+            "estimated_quota_points": (
+                sum(item.estimated_units for item in work)
+                if codex_only
+                else None
+            ),
             "estimated_tokens": sum(item.estimated_tokens or 0 for item in work),
-            "actual_quota_points": sum(item.get("actual_quota_points") or 0 for item in slices),
+            "actual_quota_points": (
+                sum(item.get("actual_quota_points") or 0 for item in slices)
+                if codex_only
+                else None
+            ),
             "actual_tokens": sum(item.get("actual_tokens") or 0 for item in slices),
             "completed_slices": sum(1 for item in slices if item.get("checkpointed_at")),
             "work_states": states,
@@ -344,19 +516,57 @@ class QuarkWorkStore:
         }
 
 
-class CodexExecSliceAdapter:
-    """Run one resumable noninteractive Codex turn as a natural checkpoint."""
+class ProviderWorkExecutor:
+    """Dispatch one bounded slice through AgentManager or the Codex façade."""
 
-    def __init__(self, codex_path: str = "codex", runner=subprocess.run):
+    def __init__(
+        self,
+        codex_path: object = "codex",
+        runner=subprocess.run,
+        *,
+        agent_manager: Any | None = None,
+    ):
+        if not isinstance(codex_path, str):
+            if agent_manager is not None:
+                raise TypeError("agent manager was provided twice")
+            agent_manager = codex_path
+            codex_path = "codex"
+        self.agent_manager = agent_manager
         self.codex_path = codex_path
         self.runner = runner
 
     def run_slice(
         self,
-        item: CodexWorkItem,
+        item: AgentWorkItem,
         allocated_quota_points: float,
         prompt: str,
     ) -> dict[str, Any]:
+        if self.agent_manager is not None and item.agent_session_id is not None:
+            epoch = self.agent_manager.recover(
+                item.agent_session_id,
+                initiated_by="quark",
+            )
+            if epoch.provider_id != item.provider_id:
+                raise ValueError("recovered provider does not match work provider")
+            result = self.agent_manager.dispatch(
+                epoch.instance_id,
+                prompt,
+                f"quark:{item.id}:{item.generation + 1}",
+                requested_by="quark",
+            )
+            state = getattr(result.state, "value", str(result.state))
+            return {
+                "status": state,
+                "completed": state == "succeeded",
+                "checkpoint_ref": None,
+                "exit_code": 0,
+                "allocated_units": allocated_quota_points,
+                "usage_unit": item.usage_unit,
+                "provider_id": item.provider_id,
+                "driver_epoch_id": epoch.id,
+            }
+        if not item.owner_thread:
+            raise ValueError("legacy Codex execution requires owner_thread")
         completed = self.runner(
             [
                 self.codex_path,
@@ -386,6 +596,9 @@ class CodexExecSliceAdapter:
         }
 
 
+CodexExecSliceAdapter = ProviderWorkExecutor
+
+
 class QuarkSchedulerService:
     """Plan and optionally execute one usage-bounded scheduling cycle."""
 
@@ -405,7 +618,17 @@ class QuarkSchedulerService:
         before = self.usage_source.refresh()
         window = _usage_window(before, limit_id)
         work = tuple(item for item in self.store.list_work() if item.limit_id == limit_id)
-        plan = plan_quark_work(self.policy, window["remaining_percent"], work)
+        remaining_capacity = _window_remaining_capacity(window)
+        codex_compatibility = limit_id == "codex" and all(
+            item.provider_id == "codex" and item.usage_unit == "quota_points"
+            for item in work
+        )
+        capacity_argument: float | Mapping[str, float | None] = (
+            remaining_capacity
+            if codex_compatibility and remaining_capacity is not None
+            else {limit_id: remaining_capacity}
+        )
+        plan = plan_quark_work(self.policy, capacity_argument, work)
         if not plan.allocations:
             for item in work:
                 if item.state in {
@@ -431,9 +654,9 @@ class QuarkSchedulerService:
             return {
                 "planned": len(selected),
                 "executed": 0,
-                "allocations": [asdict(item) for item in selected],
+                "allocations": [_allocation_payload(item) for item in selected],
                 "plan": _plan_payload(plan),
-                "reason": "dry-run plan; no Codex work was started",
+                "reason": "dry-run plan; no agent work was started",
             }
 
         results = []
@@ -442,7 +665,7 @@ class QuarkSchedulerService:
             started_at = before.get("observed_at") or _timestamp()
             reserved = item.with_state(
                 WorkState.RUNNING,
-                reserved_quota_points=allocation.allocated_quota_points,
+                reserved_units=allocation.allocated_units,
                 generation=allocation.generation,
                 updated_at=started_at,
             )
@@ -450,23 +673,24 @@ class QuarkSchedulerService:
             self.store.record_slice_start(
                 item.id,
                 allocation.generation,
-                quota_before=window["remaining_percent"],
+                quota_before=remaining_capacity,
                 lifetime_tokens_before=_lifetime_tokens(before),
                 observed_at=started_at,
             )
             prompt = _checkpoint_prompt(item, allocation)
             result = self.executor.run_slice(
                 item,
-                allocation.allocated_quota_points,
+                allocation.allocated_units,
                 prompt,
             )
             after = self.usage_source.refresh()
             after_window = _usage_window(after, limit_id)
+            after_remaining_capacity = _window_remaining_capacity(after_window)
             if result.get("exit_code") not in (None, 0):
                 failed = self.store.load_work(item.id).with_state(
                     WorkState.RECONCILE_REQUIRED,
-                    reserved_quota_points=0,
-                    pause_reason="Codex slice failed or was interrupted; reconcile workspace before resuming",
+                    reserved_units=0,
+                    pause_reason="agent slice failed or was interrupted; reconcile workspace before resuming",
                     updated_at=after.get("observed_at") or _timestamp(),
                 )
                 self.store.save_work(failed)
@@ -474,7 +698,7 @@ class QuarkSchedulerService:
                 self.store.record_slice_checkpoint(
                     work_id=item.id,
                     generation=allocation.generation,
-                    quota_after=after_window["remaining_percent"],
+                    quota_after=after_remaining_capacity,
                     lifetime_tokens_after=_lifetime_tokens(after),
                     observed_at=after.get("observed_at") or _timestamp(),
                     completed=bool(result.get("completed")),
@@ -484,7 +708,11 @@ class QuarkSchedulerService:
                 {
                     "work_id": item.id,
                     "generation": allocation.generation,
-                    "allocated_quota_points": allocation.allocated_quota_points,
+                    "allocated_units": allocation.allocated_units,
+                    "allocated_quota_points": allocation.allocated_units,
+                    "usage_unit": allocation.usage_unit,
+                    "provider_id": allocation.provider_id,
+                    "limit_id": allocation.limit_id,
                     "status": result.get("status"),
                     "exit_code": result.get("exit_code"),
                     "checkpoint_ref": result.get("checkpoint_ref"),
@@ -495,19 +723,19 @@ class QuarkSchedulerService:
             "executed": len(results),
             "results": results,
             "plan": _plan_payload(plan),
-            "reason": "bounded Codex slices reached a natural turn checkpoint",
+            "reason": "bounded agent slices reached a natural turn checkpoint",
         }
 
 
-def _work_payload(item: CodexWorkItem) -> dict[str, Any]:
+def _work_payload(item: AgentWorkItem) -> dict[str, Any]:
     payload = asdict(item)
     payload["state"] = item.state.value
     return payload
 
 
-def _work_from_payload(payload: dict[str, Any]) -> CodexWorkItem:
+def _work_from_payload(payload: dict[str, Any]) -> AgentWorkItem:
     payload["state"] = WorkState(payload["state"])
-    return CodexWorkItem(**payload)
+    return AgentWorkItem(**payload)
 
 
 def _usage_window(snapshot: dict[str, Any], limit_id: str) -> dict[str, Any]:
@@ -515,9 +743,17 @@ def _usage_window(snapshot: dict[str, Any], limit_id: str) -> dict[str, Any]:
         if limit.get("limit_id") != limit_id:
             continue
         for window in limit.get("windows", []):
-            if window.get("name") == "primary" and isinstance(window.get("remaining_percent"), (int, float)):
+            if window.get("name") == "primary":
                 return window
     raise ValueError(f"usage snapshot does not include a primary window for {limit_id}")
+
+
+def _window_remaining_capacity(window: Mapping[str, Any]) -> float | None:
+    for key in ("remaining_units", "remaining", "remaining_percent"):
+        value = window.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
 
 
 def _lifetime_tokens(snapshot: dict[str, Any]) -> int | None:
@@ -525,7 +761,7 @@ def _lifetime_tokens(snapshot: dict[str, Any]) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _checkpoint_prompt(item: CodexWorkItem, allocation: WorkAllocation) -> str:
+def _checkpoint_prompt(item: AgentWorkItem, allocation: WorkAllocation) -> str:
     return (
         f"Quark work slice {item.id} generation {allocation.generation}. "
         f"Continue this durable project work: {item.intent}. "
@@ -539,7 +775,19 @@ def _checkpoint_prompt(item: CodexWorkItem, allocation: WorkAllocation) -> str:
 
 def _plan_payload(plan: QuarkWorkPlan) -> dict[str, Any]:
     payload = asdict(plan)
-    payload["allocations"] = [asdict(item) for item in plan.allocations]
+    payload["allocations"] = [
+        _allocation_payload(item) for item in plan.allocations
+    ]
+    return payload
+
+
+def _allocation_payload(allocation: WorkAllocation) -> dict[str, Any]:
+    payload = asdict(allocation)
+    if (
+        allocation.provider_id == "codex"
+        and allocation.usage_unit == "quota_points"
+    ):
+        payload["allocated_quota_points"] = allocation.allocated_units
     return payload
 
 

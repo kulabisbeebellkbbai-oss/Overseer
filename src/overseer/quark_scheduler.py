@@ -581,8 +581,18 @@ class QuarkWorkStore:
             )
         )
 
-    def project_effort(self, project_id: str) -> dict[str, Any]:
-        work = tuple(item for item in self.list_work() if item.project_id == project_id)
+    def project_effort(
+        self,
+        project_id: str,
+        work_filter: Any | None = None,
+    ) -> dict[str, Any]:
+        work = tuple(
+            item
+            for item in self.list_work()
+            if item.project_id == project_id
+            and (work_filter is None or work_filter(item))
+        )
+        work_ids = {item.id for item in work}
         rows = self.connection.execute(
             "SELECT payload FROM quark_work_slices ORDER BY work_id, generation"
         ).fetchall()
@@ -590,89 +600,46 @@ class QuarkWorkStore:
             json.loads(row["payload"])
             for row in rows
             if json.loads(row["payload"]).get("project_id") == project_id
+            and json.loads(row["payload"]).get("work_id") in work_ids
         ]
         states: dict[str, int] = {}
         for item in work:
             states[item.state.value] = states.get(item.state.value, 0) + 1
-        estimated_units_by_limit = {
-            limit_id: sum(
-                item.estimated_units
-                for item in work
-                if item.limit_id == limit_id
-            )
-            for limit_id in sorted({item.limit_id for item in work})
-        }
-        actual_units_by_limit = {
-            limit_id: sum(
+        estimated_units_by_provider = _work_totals_by_binding(
+            work, lambda item: item.estimated_units
+        )
+        reserved_units_by_provider = _work_totals_by_binding(
+            work, lambda item: item.reserved_units
+        )
+        estimated_tokens_by_provider = _work_totals_by_binding(
+            work, lambda item: item.estimated_tokens or 0
+        )
+        actual_units_by_provider = _slice_totals_by_binding(
+            slices,
+            lambda item: (
                 item.get("actual_units")
                 if item.get("actual_units") is not None
                 else item.get("actual_quota_points") or 0
-                for item in slices
-                if item.get("limit_id", "codex") == limit_id
-            )
-            for limit_id in sorted(
-                {
-                    str(item.get("limit_id", "codex"))
-                    for item in slices
-                }
-            )
-        }
-        estimated_units_by_provider = {
-            provider_id: sum(
-                item.estimated_units
-                for item in work
-                if item.provider_id == provider_id
-            )
-            for provider_id in sorted({item.provider_id for item in work})
-        }
-        actual_units_by_provider = {
-            provider_id: sum(
-                item.get("actual_units")
-                if item.get("actual_units") is not None
-                else item.get("actual_quota_points") or 0
-                for item in slices
-                if item.get("provider_id", "codex") == provider_id
-            )
-            for provider_id in sorted(
-                {str(item.get("provider_id", "codex")) for item in slices}
-            )
-        }
-        estimated_tokens_by_limit = {
-            limit_id: sum(
-                item.estimated_tokens or 0
-                for item in work
-                if item.limit_id == limit_id
-            )
-            for limit_id in sorted({item.limit_id for item in work})
-        }
-        estimated_tokens_by_provider = {
-            provider_id: sum(
-                item.estimated_tokens or 0
-                for item in work
-                if item.provider_id == provider_id
-            )
-            for provider_id in sorted({item.provider_id for item in work})
-        }
-        actual_tokens_by_limit = {
-            limit_id: sum(
-                item.get("actual_tokens") or 0
-                for item in slices
-                if item.get("limit_id", "codex") == limit_id
-            )
-            for limit_id in sorted(
-                {str(item.get("limit_id", "codex")) for item in slices}
-            )
-        }
-        actual_tokens_by_provider = {
-            provider_id: sum(
-                item.get("actual_tokens") or 0
-                for item in slices
-                if item.get("provider_id", "codex") == provider_id
-            )
-            for provider_id in sorted(
-                {str(item.get("provider_id", "codex")) for item in slices}
-            )
-        }
+            ),
+        )
+        actual_tokens_by_provider = _slice_totals_by_binding(
+            slices, lambda item: item.get("actual_tokens") or 0
+        )
+        estimated_units_by_limit = _by_limit_projection(
+            estimated_units_by_provider
+        )
+        reserved_units_by_limit = _by_limit_projection(
+            reserved_units_by_provider
+        )
+        actual_units_by_limit = _by_limit_projection(
+            actual_units_by_provider
+        )
+        estimated_tokens_by_limit = _by_limit_projection(
+            estimated_tokens_by_provider
+        )
+        actual_tokens_by_limit = _by_limit_projection(
+            actual_tokens_by_provider
+        )
         legacy_codex_only = bool(work) and all(
             item.agent_session_id is None
             and item.provider_id == "codex"
@@ -685,8 +652,10 @@ class QuarkWorkStore:
             "estimated_by_limit": estimated_units_by_limit,
             "actual_by_limit": actual_units_by_limit,
             "estimated_units_by_limit": estimated_units_by_limit,
+            "reserved_units_by_limit": reserved_units_by_limit,
             "actual_units_by_limit": actual_units_by_limit,
             "estimated_units_by_provider": estimated_units_by_provider,
+            "reserved_units_by_provider": reserved_units_by_provider,
             "actual_units_by_provider": actual_units_by_provider,
             "estimated_tokens_by_limit": estimated_tokens_by_limit,
             "actual_tokens_by_limit": actual_tokens_by_limit,
@@ -727,6 +696,7 @@ class ProviderWorkExecutor:
         runner=subprocess.run,
         *,
         agent_manager: Any | None = None,
+        work_store: QuarkWorkStore | None = None,
     ):
         if not isinstance(codex_path, str):
             if agent_manager is not None:
@@ -734,6 +704,7 @@ class ProviderWorkExecutor:
             agent_manager = codex_path
             codex_path = "codex"
         self.agent_manager = agent_manager
+        self.work_store = work_store
         self.codex_path = codex_path
         self.runner = runner
 
@@ -744,16 +715,24 @@ class ProviderWorkExecutor:
         prompt: str,
     ) -> dict[str, Any]:
         if self.agent_manager is not None and item.agent_session_id is not None:
+            blocked = self._validate_persisted_work(item)
+            if blocked is not None:
+                return blocked
+            blocked = self._validate_persisted_session(item)
+            if blocked is not None:
+                return blocked
             epoch = self.agent_manager.recover(
                 item.agent_session_id,
                 initiated_by="quark",
             )
-            if epoch.provider_id != item.provider_id:
-                raise ValueError("recovered provider does not match work provider")
+            blocked = self._validate_epoch(item, epoch)
+            if blocked is not None:
+                return blocked
+            idempotency_key = f"quark:{item.id}:{item.generation + 1}"
             result = self.agent_manager.dispatch(
                 epoch.instance_id,
                 prompt,
-                f"quark:{item.id}:{item.generation + 1}",
+                idempotency_key,
                 requested_by="quark",
             )
             return self._provider_result(
@@ -761,7 +740,7 @@ class ProviderWorkExecutor:
                 epoch,
                 result,
                 allocated_quota_points,
-                f"quark:{item.id}:{item.generation + 1}",
+                idempotency_key,
             )
         if not item.owner_thread:
             raise ValueError("legacy Codex execution requires owner_thread")
@@ -806,10 +785,19 @@ class ProviderWorkExecutor:
             )
         if not item.provider_idempotency_key:
             raise ValueError("provider reconciliation requires idempotency key")
+        blocked = self._validate_persisted_work(item)
+        if blocked is not None:
+            return blocked
+        blocked = self._validate_persisted_session(item)
+        if blocked is not None:
+            return blocked
         epoch = self.agent_manager.recover(
             item.agent_session_id,
             initiated_by="quark",
         )
+        blocked = self._validate_epoch(item, epoch)
+        if blocked is not None:
+            return blocked
         result = self.agent_manager.dispatch(
             epoch.instance_id,
             prompt,
@@ -824,6 +812,93 @@ class ProviderWorkExecutor:
             item.provider_idempotency_key,
         )
 
+    def _validate_persisted_work(
+        self, item: AgentWorkItem
+    ) -> dict[str, Any] | None:
+        if self.work_store is None:
+            return None
+        try:
+            persisted = self.work_store.load_work(item.id)
+        except (KeyError, ValueError) as exc:
+            return self._policy_block(
+                item, f"persisted work could not be loaded: {exc}"
+            )
+        if persisted.agent_session_id != item.agent_session_id:
+            return self._policy_block(
+                item, "persisted work session does not match dispatched work"
+            )
+        if persisted.provider_id != item.provider_id:
+            return self._policy_block(
+                item, "persisted work provider does not match dispatched work"
+            )
+        return None
+
+    def _validate_persisted_session(
+        self, item: AgentWorkItem
+    ) -> dict[str, Any] | None:
+        manager_store = getattr(self.agent_manager, "store", None)
+        if manager_store is None or not hasattr(
+            manager_store, "load_agent_session"
+        ):
+            return self._policy_block(
+                item, "agent manager cannot reload persisted work session"
+            )
+        try:
+            session = manager_store.load_agent_session(item.agent_session_id)
+        except (KeyError, ValueError) as exc:
+            return self._policy_block(
+                item, f"persisted work session could not be loaded: {exc}"
+            )
+        if getattr(session, "id", None) != item.agent_session_id:
+            return self._policy_block(
+                item, "persisted session id does not match work session"
+            )
+        if getattr(session, "provider_id", None) != item.provider_id:
+            return self._policy_block(
+                item, "persisted session provider does not match work provider"
+            )
+        return None
+
+    @staticmethod
+    def _validate_epoch(
+        item: AgentWorkItem, epoch: Any
+    ) -> dict[str, Any] | None:
+        if getattr(epoch, "provider_id", None) != item.provider_id:
+            return ProviderWorkExecutor._policy_block(
+                item, "recovered epoch provider does not match work provider"
+            )
+        if getattr(epoch, "session_id", None) != item.agent_session_id:
+            return ProviderWorkExecutor._policy_block(
+                item, "recovered epoch session does not match work session"
+            )
+        if item.driver_epoch_id and getattr(epoch, "id", None) != item.driver_epoch_id:
+            return ProviderWorkExecutor._policy_block(
+                item, "recovered driver epoch does not match dispatched work"
+            )
+        return None
+
+    @staticmethod
+    def _policy_block(
+        item: AgentWorkItem, reason: str
+    ) -> dict[str, Any]:
+        return {
+            "status": "policy_blocked",
+            "completed": False,
+            "terminal": True,
+            "successful": False,
+            "checkpoint_ref": item.provider_reference,
+            "exit_code": 1,
+            "allocated_units": item.reserved_units,
+            "usage_unit": item.usage_unit,
+            "provider_id": item.provider_id,
+            "driver_epoch_id": item.driver_epoch_id,
+            "provider_dispatch_id": item.provider_dispatch_id,
+            "provider_result_id": item.provider_result_id,
+            "provider_reference": item.provider_reference,
+            "idempotency_key": item.provider_idempotency_key,
+            "error_reason": reason,
+        }
+
     @staticmethod
     def _provider_result(
         item: AgentWorkItem,
@@ -832,6 +907,27 @@ class ProviderWorkExecutor:
         allocated_units: float,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        mismatches = []
+        expected_bindings = {
+            "provider_id": item.provider_id,
+            "session_id": item.agent_session_id,
+            "driver_epoch_id": getattr(epoch, "id", None),
+        }
+        for field, expected in expected_bindings.items():
+            if getattr(result, field, None) != expected:
+                mismatches.append(field)
+        if (
+            item.provider_dispatch_id is not None
+            and getattr(result, "request_id", None)
+            != item.provider_dispatch_id
+        ):
+            mismatches.append("request_id")
+        if mismatches:
+            return ProviderWorkExecutor._policy_block(
+                item,
+                "provider result binding mismatch: "
+                + ", ".join(sorted(mismatches)),
+            )
         state = AgentOperationState(
             getattr(result.state, "value", str(result.state))
         )
@@ -866,6 +962,67 @@ class ProviderWorkExecutor:
 CodexExecSliceAdapter = ProviderWorkExecutor
 
 
+def _work_totals_by_binding(
+    work: tuple[AgentWorkItem, ...],
+    value: Any,
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    totals: dict[str, dict[str, dict[str, float | int]]] = {}
+    for item in work:
+        unit_totals = totals.setdefault(item.provider_id, {}).setdefault(
+            item.limit_id, {}
+        )
+        unit_totals[item.usage_unit] = (
+            unit_totals.get(item.usage_unit, 0) + value(item)
+        )
+    return _sorted_binding_totals(totals)
+
+
+def _slice_totals_by_binding(
+    slices: list[dict[str, Any]],
+    value: Any,
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    totals: dict[str, dict[str, dict[str, float | int]]] = {}
+    for item in slices:
+        provider_id = str(item.get("provider_id", "codex"))
+        limit_id = str(item.get("limit_id", "codex"))
+        usage_unit = str(item.get("usage_unit", "quota_points"))
+        unit_totals = totals.setdefault(provider_id, {}).setdefault(
+            limit_id, {}
+        )
+        unit_totals[usage_unit] = unit_totals.get(usage_unit, 0) + value(item)
+    return _sorted_binding_totals(totals)
+
+
+def _sorted_binding_totals(
+    totals: dict[str, dict[str, dict[str, float | int]]],
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    return {
+        provider_id: {
+            limit_id: dict(sorted(units.items()))
+            for limit_id, units in sorted(limits.items())
+        }
+        for provider_id, limits in sorted(totals.items())
+    }
+
+
+def _by_limit_projection(
+    by_provider: Mapping[
+        str, Mapping[str, Mapping[str, float | int]]
+    ],
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    by_limit: dict[str, dict[str, dict[str, float | int]]] = {}
+    for provider_id, limits in by_provider.items():
+        for limit_id, units in limits.items():
+            by_limit.setdefault(limit_id, {})[provider_id] = dict(units)
+    return {
+        limit_id: {
+            provider_id: dict(sorted(units.items()))
+            for provider_id, units in sorted(providers.items())
+        }
+        for limit_id, providers in sorted(by_limit.items())
+    }
+
+
 class QuarkSchedulerService:
     """Plan and optionally execute one usage-bounded scheduling cycle."""
 
@@ -875,16 +1032,45 @@ class QuarkSchedulerService:
         usage_source: Any,
         executor: Any,
         policy: QuarkUsagePolicy | None = None,
+        work_filter: Any | None = None,
     ):
         self.store = store
         self.usage_source = usage_source
         self.executor = executor
         self.policy = policy or QuarkUsagePolicy()
+        self.work_filter = work_filter
+
+    def _work_for_limit(self, limit_id: str) -> tuple[AgentWorkItem, ...]:
+        return tuple(
+            item
+            for item in self.store.list_work()
+            if item.limit_id == limit_id
+            and (
+                self.work_filter is None
+                or self.work_filter(item)
+            )
+        )
 
     def run_cycle(self, execute: bool = False, limit_id: str = "codex") -> dict[str, Any]:
         before = self.usage_source.refresh()
         window = _usage_window(before, limit_id)
-        work = tuple(item for item in self.store.list_work() if item.limit_id == limit_id)
+        work = self._work_for_limit(limit_id)
+        mismatch_reason = _usage_unit_mismatch_reason(window, work, limit_id)
+        if mismatch_reason is not None:
+            blocked_plan = plan_quark_work(
+                self.policy, {limit_id: None}, work
+            )
+            return {
+                "planned": 0,
+                "executed": 0,
+                "reconciled": 0,
+                "reconcile_results": [],
+                "plan": _plan_payload(
+                    replace(blocked_plan, reason=mismatch_reason)
+                ),
+                "resume_at": window.get("resets_at"),
+                "reason": mismatch_reason,
+            }
         remaining_capacity = _window_remaining_capacity(window)
         reconcile_results: list[dict[str, Any]] = []
         if execute and hasattr(self.executor, "reconcile_slice"):
@@ -920,11 +1106,7 @@ class QuarkSchedulerService:
                         snapshot=before,
                     )
                 )
-            work = tuple(
-                item
-                for item in self.store.list_work()
-                if item.limit_id == limit_id
-            )
+            work = self._work_for_limit(limit_id)
         codex_compatibility = limit_id == "codex" and all(
             item.provider_id == "codex" and item.usage_unit == "quota_points"
             for item in work
@@ -1043,6 +1225,7 @@ class QuarkSchedulerService:
             "provider_reference": result.get("provider_reference"),
             "provider_idempotency_key": result.get("idempotency_key"),
             "provider_dispatch_state": result.get("status"),
+            "driver_epoch_id": result.get("driver_epoch_id"),
             "updated_at": observed_at,
         }
         terminal = bool(
@@ -1168,6 +1351,100 @@ def _codex_queue_payload(
     }
 
 
+def _codex_allocation_payload(
+    allocation: WorkAllocation | Mapping[str, Any],
+) -> dict[str, Any]:
+    source = (
+        _allocation_payload(allocation)
+        if isinstance(allocation, WorkAllocation)
+        else allocation
+    )
+    return {
+        "work_id": source.get("work_id"),
+        "project_id": source.get("project_id"),
+        "owner_thread": source.get("owner_thread"),
+        "generation": source.get("generation"),
+        "allocated_quota_points": source.get("allocated_quota_points"),
+    }
+
+
+def _codex_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "allocations": [
+            _codex_allocation_payload(allocation)
+            for allocation in plan.get("allocations", [])
+        ],
+        "remaining_before_plan": plan.get("remaining_before_plan"),
+        "active_reservations": plan.get("active_reservations"),
+        "guardrail_floor": plan.get("guardrail_floor"),
+        "spendable_capacity": plan.get("spendable_capacity"),
+        "remaining_after_plan": plan.get("remaining_after_plan"),
+        "reason": plan.get("reason"),
+    }
+
+
+def _codex_cycle_payload(result: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "planned": result.get("planned", 0),
+        "executed": result.get("executed", 0),
+    }
+    if "allocations" in result:
+        payload["allocations"] = [
+            _codex_allocation_payload(allocation)
+            for allocation in result.get("allocations", [])
+        ]
+    if "results" in result:
+        payload["results"] = [
+            {
+                "work_id": row.get("work_id"),
+                "generation": row.get("generation"),
+                "allocated_quota_points": row.get(
+                    "allocated_quota_points"
+                ),
+                "status": row.get("status"),
+                "exit_code": row.get("exit_code"),
+                "checkpoint_ref": row.get("checkpoint_ref"),
+            }
+            for row in result.get("results", [])
+        ]
+    payload["plan"] = _codex_plan_payload(result.get("plan", {}))
+    if "resume_at" in result:
+        payload["resume_at"] = result.get("resume_at")
+    reason = result.get("reason")
+    if reason == "dry-run plan; no agent work was started":
+        reason = "dry-run plan; no Codex work was started"
+    elif reason == "bounded agent slices reached a natural turn checkpoint":
+        reason = "bounded Codex slices reached a natural turn checkpoint"
+    payload["reason"] = reason
+    return payload
+
+
+def _codex_project_effort_payload(
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    fields = (
+        "project_id",
+        "work_items",
+        "estimated_quota_points",
+        "estimated_tokens",
+        "actual_quota_points",
+        "actual_tokens",
+        "completed_slices",
+        "work_states",
+        "attribution",
+    )
+    return {field: result.get(field) for field in fields}
+
+
+def _legacy_codex_work(items: tuple[AgentWorkItem, ...]) -> bool:
+    return all(
+        item.agent_session_id is None
+        and item.provider_id == "codex"
+        and item.usage_unit == "quota_points"
+        for item in items
+    )
+
+
 def _work_from_payload(payload: dict[str, Any]) -> AgentWorkItem:
     payload["state"] = WorkState(payload["state"])
     return AgentWorkItem(**payload)
@@ -1188,6 +1465,42 @@ def _window_remaining_capacity(window: Mapping[str, Any]) -> float | None:
         value = window.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return float(value)
+    return None
+
+
+def _usage_unit_mismatch_reason(
+    window: Mapping[str, Any],
+    work: tuple[AgentWorkItem, ...],
+    limit_id: str,
+) -> str | None:
+    relevant_work = tuple(
+        item
+        for item in work
+        if item.state
+        in {
+            WorkState.QUEUED,
+            WorkState.RUNNING,
+            WorkState.CHECKPOINTED,
+            WorkState.WAITING_CAPACITY,
+        }
+    )
+    if not relevant_work:
+        return None
+    work_units = {item.usage_unit for item in relevant_work}
+    window_unit = window.get("usage_unit")
+    if (
+        window_unit is None
+        and _legacy_codex_work(relevant_work)
+        and "remaining_percent" in window
+    ):
+        window_unit = "quota_points"
+    if len(work_units) != 1 or window_unit not in work_units:
+        expected = ", ".join(sorted(work_units))
+        observed = str(window_unit) if window_unit is not None else "missing"
+        return (
+            f"usage unit mismatch for {limit_id}: queued work requires "
+            f"{expected}; usage window reports {observed}"
+        )
     return None
 
 

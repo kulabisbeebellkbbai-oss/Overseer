@@ -17,6 +17,10 @@ from .quark_scheduler import (
     QuarkSchedulerService,
     QuarkUsagePolicy,
     QuarkWorkStore,
+    _codex_cycle_payload,
+    _codex_project_effort_payload,
+    _codex_work_payload,
+    _legacy_codex_work,
     _work_payload,
 )
 from .store import SQLiteStore
@@ -72,6 +76,7 @@ def _provider_executor_for_work(
     agent_registry_local: str | Path | None,
     codex_projects_registry: str | Path,
     manager_factory: Callable[..., Any] = _agent_manager,
+    work_store: QuarkWorkStore | None = None,
 ) -> tuple[ProviderWorkExecutor, SQLiteStore | None]:
     if not any(item.agent_session_id is not None for item in work):
         return CodexExecSliceAdapter(), None
@@ -87,7 +92,10 @@ def _provider_executor_for_work(
         manager_store.close()
         raise
     return (
-        ProviderWorkExecutor(agent_manager=manager),
+        ProviderWorkExecutor(
+            agent_manager=manager,
+            work_store=work_store,
+        ),
         manager_store,
     )
 
@@ -114,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--owner-thread")
     register.add_argument("--intent", required=True)
     register.add_argument("--estimated-units", type=float)
-    register.add_argument("--usage-unit", default="quota_points")
+    register.add_argument("--usage-unit")
     register.add_argument("--estimated-quota-points", type=float)
     register.add_argument("--estimated-tokens", type=int)
     register.add_argument("--priority", type=int, default=50)
@@ -147,6 +155,15 @@ def run(args: argparse.Namespace) -> dict:
     store = QuarkWorkStore(args.db)
     try:
         if args.command == "register-work":
+            legacy_codex = (
+                args.agent_session_id is None
+                and args.provider_id == "codex"
+                and args.estimated_units is None
+            )
+            if not legacy_codex and not args.usage_unit:
+                raise ValueError(
+                    "--usage-unit is required for provider-native work"
+                )
             estimated_units = (
                 args.estimated_units
                 if args.estimated_units is not None
@@ -165,21 +182,49 @@ def run(args: argparse.Namespace) -> dict:
                 limit_id=args.limit_id,
                 intent=args.intent,
                 estimated_units=estimated_units,
-                usage_unit=args.usage_unit,
+                usage_unit=(
+                    "quota_points" if legacy_codex else args.usage_unit
+                ),
                 estimated_quota_points=args.estimated_quota_points,
                 estimated_tokens=args.estimated_tokens,
                 priority=args.priority,
             )
             store.save_work(item)
-            return {"work": _work_payload(item), "mutation_performed": True, "host_mutation_performed": False}
-        if args.command == "queue":
             return {
-                "items": [_work_payload(item) for item in store.list_work()],
+                "work": (
+                    _codex_work_payload(item)
+                    if legacy_codex
+                    else _work_payload(item)
+                ),
+                "mutation_performed": True,
+                "host_mutation_performed": False,
+            }
+        if args.command == "queue":
+            items = store.list_work()
+            return {
+                "items": [
+                    (
+                        _codex_work_payload(item)
+                        if _legacy_codex_work(items)
+                        else _work_payload(item)
+                    )
+                    for item in items
+                ],
                 "mutation_performed": False,
                 "host_mutation_performed": False,
             }
         if args.command == "project-effort":
-            return store.project_effort(args.project_id)
+            project_work = tuple(
+                item
+                for item in store.list_work()
+                if item.project_id == args.project_id
+            )
+            result = store.project_effort(args.project_id)
+            return (
+                _codex_project_effort_payload(result)
+                if _legacy_codex_work(project_work)
+                else result
+            )
         work = tuple(
             item for item in store.list_work() if item.limit_id == args.limit_id
         )
@@ -189,6 +234,7 @@ def run(args: argparse.Namespace) -> dict:
             agent_registry=args.agent_registry,
             agent_registry_local=args.agent_registry_local,
             codex_projects_registry=args.codex_projects_registry,
+            work_store=store,
         )
         try:
             usage_source = (
@@ -202,9 +248,14 @@ def run(args: argparse.Namespace) -> dict:
                 executor=executor,
                 policy=_policy(args),
             )
-            return service.run_cycle(
+            result = service.run_cycle(
                 execute=args.command == "run-cycle",
                 limit_id=args.limit_id,
+            )
+            return (
+                _codex_cycle_payload(result)
+                if _legacy_codex_work(work)
+                else result
             )
         finally:
             if manager_store is not None:

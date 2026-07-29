@@ -4,6 +4,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from overseer.agent_contracts import AgentOperationState
 from overseer.quark_scheduler import (
     AgentWorkItem,
@@ -14,6 +16,8 @@ from overseer.quark_scheduler import (
     QuarkUsagePolicy,
     QuarkWorkStore,
     WorkState,
+    _codex_cycle_payload,
+    _codex_project_effort_payload,
     _codex_queue_payload,
     _codex_work_payload,
     plan_quark_work,
@@ -235,12 +239,19 @@ def test_provider_executor_recovers_and_dispatches_through_agent_manager():
     class FakeAgentManager:
         def __init__(self):
             self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
 
         def recover(self, session_id, initiated_by="system"):
             self.calls.append(("recover", session_id, initiated_by))
             return SimpleNamespace(
                 id="epoch.claude.1",
                 instance_id="agent.claude.1",
+                session_id=session_id,
                 provider_id="claude",
             )
 
@@ -260,7 +271,12 @@ def test_provider_executor_recovers_and_dispatches_through_agent_manager():
                     requested_by,
                 )
             )
-            return SimpleNamespace(state=SimpleNamespace(value="running"))
+            return SimpleNamespace(
+                state=SimpleNamespace(value="running"),
+                provider_id="claude",
+                session_id="session.claude.project-a",
+                driver_epoch_id="epoch.claude.1",
+            )
 
     manager = FakeAgentManager()
     executor = ProviderWorkExecutor(manager)
@@ -291,10 +307,19 @@ def test_provider_executor_recovers_and_dispatches_through_agent_manager():
 
 def test_provider_executor_preserves_nonterminal_acknowledgement():
     class FakeAgentManager:
+        def __init__(self):
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
         def recover(self, session_id, initiated_by="system"):
             return SimpleNamespace(
                 id="epoch.claude.1",
                 instance_id="agent.claude.1",
+                session_id=session_id,
                 provider_id="claude",
             )
 
@@ -303,6 +328,9 @@ def test_provider_executor_preserves_nonterminal_acknowledgement():
                 id="result.claude.1",
                 request_id="dispatch.claude.1",
                 provider_reference="provider-job-1",
+                provider_id="claude",
+                session_id="session.claude.project-a",
+                driver_epoch_id="epoch.claude.1",
                 state=AgentOperationState.ACKNOWLEDGED,
             )
 
@@ -322,6 +350,212 @@ def test_provider_executor_preserves_nonterminal_acknowledgement():
     assert result["terminal"] is False
     assert result["successful"] is False
     assert result["exit_code"] is None
+    assert result["provider_dispatch_id"] == "dispatch.claude.1"
+    assert result["provider_result_id"] == "result.claude.1"
+    assert result["provider_reference"] == "provider-job-1"
+
+
+def test_provider_executor_reconcile_blocks_persisted_session_provider_mismatch():
+    class FakeAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda _session_id: SimpleNamespace(
+                    id="session.claude.project-a",
+                    provider_id="codex",
+                )
+            )
+
+        def recover(self, *args, **kwargs):
+            self.calls.append(("recover", args, kwargs))
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+
+    manager = FakeAgentManager()
+    item = replace(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        generation=1,
+        reserved_units=5,
+        provider_dispatch_id="dispatch.claude.1",
+        provider_idempotency_key="quark:work.1:1",
+    )
+
+    result = ProviderWorkExecutor(manager).reconcile_slice(
+        item,
+        "checkpoint prompt",
+    )
+
+    assert result["status"] == "policy_blocked"
+    assert result["terminal"] is True
+    assert result["successful"] is False
+    assert "persisted session provider" in result["error_reason"]
+    assert manager.calls == []
+
+
+def test_provider_executor_reconcile_blocks_stale_persisted_work_binding(
+    tmp_path: Path,
+):
+    class FakeAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, *args, **kwargs):
+            self.calls.append(("recover", args, kwargs))
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+
+    item = replace(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        generation=1,
+        reserved_units=5,
+        provider_dispatch_id="dispatch.claude.1",
+        provider_idempotency_key="quark:work.1:1",
+    )
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        replace(item, agent_session_id="session.claude.reassigned")
+    )
+    manager = FakeAgentManager()
+
+    result = ProviderWorkExecutor(
+        manager,
+        work_store=store,
+    ).reconcile_slice(item, "checkpoint prompt")
+
+    assert result["status"] == "policy_blocked"
+    assert "persisted work session" in result["error_reason"]
+    assert manager.calls == []
+
+
+def test_provider_executor_reconcile_blocks_recovered_epoch_session_mismatch():
+    class FakeAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda _session_id: SimpleNamespace(
+                    id="session.claude.project-a",
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, session_id, initiated_by="system"):
+            self.calls.append(("recover", session_id, initiated_by))
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id="session.claude.wrong",
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+
+    manager = FakeAgentManager()
+    item = replace(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        generation=1,
+        reserved_units=5,
+        provider_dispatch_id="dispatch.claude.1",
+        provider_idempotency_key="quark:work.1:1",
+    )
+
+    result = ProviderWorkExecutor(manager).reconcile_slice(
+        item,
+        "checkpoint prompt",
+    )
+
+    assert result["status"] == "policy_blocked"
+    assert "recovered epoch session" in result["error_reason"]
+    assert [call[0] for call in manager.calls] == ["recover"]
+
+
+def test_provider_executor_reconcile_rejects_mismatched_result_bindings():
+    class FakeAgentManager:
+        def __init__(self):
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, session_id, initiated_by="system"):
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id=session_id,
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            return SimpleNamespace(
+                id="result.wrong.1",
+                request_id="dispatch.wrong.1",
+                provider_reference="wrong-provider-job",
+                provider_id="codex",
+                session_id="session.codex.wrong",
+                driver_epoch_id="epoch.codex.wrong",
+                state=AgentOperationState.SUCCEEDED,
+            )
+
+    item = replace(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        generation=1,
+        reserved_units=5,
+        driver_epoch_id="epoch.claude.1",
+        provider_dispatch_id="dispatch.claude.1",
+        provider_result_id="result.claude.1",
+        provider_reference="provider-job-1",
+        provider_idempotency_key="quark:work.1:1",
+    )
+
+    result = ProviderWorkExecutor(FakeAgentManager()).reconcile_slice(
+        item,
+        "checkpoint prompt",
+    )
+
+    assert result["status"] == "policy_blocked"
+    assert "provider result binding mismatch" in result["error_reason"]
     assert result["provider_dispatch_id"] == "dispatch.claude.1"
     assert result["provider_result_id"] == "result.claude.1"
     assert result["provider_reference"] == "provider-job-1"
@@ -354,6 +588,67 @@ def test_scheduler_cli_accepts_provider_native_work_fields():
     assert args.provider_id == "claude"
     assert args.estimated_units == 8000
     assert args.usage_unit == "tokens"
+
+
+def test_scheduler_cli_requires_explicit_usage_unit_for_generic_work(tmp_path: Path):
+    args = build_parser().parse_args(
+        [
+            "--db",
+            str(tmp_path / "quark.sqlite3"),
+            "register-work",
+            "--work-id",
+            "work.claude",
+            "--project-id",
+            "project-a",
+            "--agent-session-id",
+            "session.claude.1",
+            "--provider-id",
+            "claude",
+            "--limit-id",
+            "limit.claude.tokens",
+            "--intent",
+            "continue implementation",
+            "--estimated-units",
+            "8000",
+        ]
+    )
+
+    assert args.usage_unit is None
+    with pytest.raises(ValueError, match="--usage-unit"):
+        quark_scheduler_cli.run(args)
+
+
+def test_scheduler_cli_preserves_legacy_codex_register_shape(tmp_path: Path):
+    args = build_parser().parse_args(
+        [
+            "--db",
+            str(tmp_path / "quark.sqlite3"),
+            "register-work",
+            "--work-id",
+            "work.codex",
+            "--project-id",
+            "project-a",
+            "--owner-thread",
+            "thread-project-a",
+            "--intent",
+            "continue implementation",
+            "--estimated-quota-points",
+            "5",
+        ]
+    )
+
+    result = quark_scheduler_cli.run(args)
+
+    assert result == {
+        "work": _codex_work_payload(
+            replace(
+                _work("work.codex", "project-a", 5),
+                intent="continue implementation",
+            )
+        ),
+        "mutation_performed": True,
+        "host_mutation_performed": False,
+    }
 
 
 def test_scheduler_cli_accepts_explicit_agent_manager_configuration():
@@ -549,14 +844,77 @@ def test_project_effort_never_sums_mixed_provider_tokens(tmp_path: Path):
 
     assert summary["estimated_tokens"] is None
     assert summary["estimated_tokens_by_limit"] == {
-        "limit.claude.tokens": 200,
-        "limit.codex.points": 100,
+        "limit.claude.tokens": {"claude": {"tokens": 200}},
+        "limit.codex.points": {"codex": {"quota_points": 100}},
     }
     assert summary["estimated_tokens_by_provider"] == {
-        "claude": 200,
-        "codex": 100,
+        "claude": {"limit.claude.tokens": {"tokens": 200}},
+        "codex": {"limit.codex.points": {"quota_points": 100}},
     }
     assert 300 not in summary.values()
+
+
+def test_project_effort_keeps_native_units_in_provider_limit_unit_buckets(
+    tmp_path: Path,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        _agent_work(
+            "work.tokens",
+            "mixed",
+            "claude",
+            "limit.claude.tokens",
+            100,
+            usage_unit="tokens",
+        )
+    )
+    store.save_work(
+        _agent_work(
+            "work.requests",
+            "mixed",
+            "claude",
+            "limit.claude.requests",
+            5,
+            usage_unit="requests",
+        )
+    )
+
+    summary = store.project_effort("mixed")
+
+    assert summary["estimated_units_by_provider"] == {
+        "claude": {
+            "limit.claude.requests": {"requests": 5},
+            "limit.claude.tokens": {"tokens": 100},
+        }
+    }
+    assert 105 not in summary.values()
+
+
+def test_codex_project_effort_serializer_preserves_nine_field_baseline():
+    expanded = {
+        "project_id": "project-a",
+        "work_items": 1,
+        "estimated_quota_points": 5,
+        "estimated_tokens": 100,
+        "actual_quota_points": 2,
+        "actual_tokens": 40,
+        "completed_slices": 1,
+        "work_states": {"checkpointed": 1},
+        "attribution": ["shared"],
+        "estimated_units_by_provider": {"codex": {"codex": {"quota_points": 5}}},
+    }
+
+    assert _codex_project_effort_payload(expanded) == {
+        "project_id": "project-a",
+        "work_items": 1,
+        "estimated_quota_points": 5,
+        "estimated_tokens": 100,
+        "actual_quota_points": 2,
+        "actual_tokens": 40,
+        "completed_slices": 1,
+        "work_states": {"checkpointed": 1},
+        "attribution": ["shared"],
+    }
 
 
 def test_checkpointed_work_becomes_waiting_when_capacity_is_below_floor(tmp_path: Path):
@@ -696,6 +1054,90 @@ def test_cycle_blocks_unknown_provider_native_capacity(tmp_path: Path):
 
     assert status["planned"] == 0
     assert "unknown capacity" in status["reason"]
+
+
+def test_cycle_blocks_usage_window_unit_mismatch_before_allocation(tmp_path: Path):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8000,
+            usage_unit="tokens",
+        )
+    )
+    mismatch = _native_snapshot("limit.claude.tokens", 80_000)
+    mismatch["rate_limits"][0]["windows"][0]["usage_unit"] = "requests"
+    executor = FakeExecutor()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource((mismatch,)),
+        executor=executor,
+    )
+
+    status = service.run_cycle(
+        execute=False,
+        limit_id="limit.claude.tokens",
+    )
+
+    assert status["planned"] == 0
+    assert "usage unit mismatch" in status["reason"]
+    assert executor.calls == []
+
+
+def test_codex_cycle_serializer_preserves_legacy_dry_plan_snapshot(
+    tmp_path: Path,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(_work("a1", "alpha", 8))
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource((_snapshot(84, 1_000),)),
+        executor=FakeExecutor(),
+    )
+
+    result = _codex_cycle_payload(service.run_cycle(execute=False))
+
+    assert result == {
+        "planned": 1,
+        "executed": 0,
+        "allocations": [
+            {
+                "work_id": "a1",
+                "project_id": "alpha",
+                "owner_thread": "thread-alpha",
+                "generation": 1,
+                "allocated_quota_points": 5,
+            }
+        ],
+        "plan": {
+            "allocations": [
+                {
+                    "work_id": "a1",
+                    "project_id": "alpha",
+                    "owner_thread": "thread-alpha",
+                    "generation": 1,
+                    "allocated_quota_points": 5,
+                },
+                {
+                    "work_id": "a1",
+                    "project_id": "alpha",
+                    "owner_thread": "thread-alpha",
+                    "generation": 1,
+                    "allocated_quota_points": 3,
+                },
+            ],
+            "remaining_before_plan": 84,
+            "active_reservations": 0,
+            "guardrail_floor": 17,
+            "spendable_capacity": 67,
+            "remaining_after_plan": 76,
+            "reason": "all queued estimated work is allocated and unused capacity remains",
+        },
+        "reason": "dry-run plan; no Codex work was started",
+    }
 
 
 def test_cycle_keeps_nonterminal_provider_dispatch_running(tmp_path: Path):

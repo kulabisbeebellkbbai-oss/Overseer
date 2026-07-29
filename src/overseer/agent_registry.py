@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import json
 from pathlib import Path
 import re
@@ -430,6 +430,65 @@ class AgentRegistry:
 
     def driver(self, instance_id: str) -> PrimaryDriver:
         profile = self.profile(instance_id)
+        return self._driver_for(profile)
+
+    def profile_for_provider(
+        self,
+        instance_id: str,
+        provider_id: str,
+    ) -> AgentInstanceProfile:
+        profile = self.profile(instance_id)
+        allowed_provider_ids = {
+            profile.primary_provider_id,
+            *profile.approved_fallback_provider_ids,
+        }
+        if provider_id not in allowed_provider_ids:
+            raise ValueError(
+                f"provider {provider_id} is not approved for instance {instance_id}"
+            )
+        provider = self.providers[provider_id]
+        alternate_provider_ids = (
+            profile.primary_provider_id,
+            *profile.approved_fallback_provider_ids,
+        )
+        return replace(
+            profile,
+            primary_provider_id=provider.id,
+            transport=provider.transports[0],
+            primary_adapter_id=provider.adapter_id,
+            external_session_id=None,
+            declared_capabilities=provider.capabilities,
+            approved_fallback_provider_ids=tuple(
+                alternate_id
+                for alternate_id in alternate_provider_ids
+                if alternate_id != provider_id
+            ),
+        )
+
+    def driver_for_provider(
+        self,
+        provider_id: str,
+        *,
+        instance_id: str | None = None,
+    ) -> PrimaryDriver:
+        if instance_id is None:
+            candidates = tuple(
+                profile.id
+                for profile in self._profiles.values()
+                if provider_id
+                in {
+                    profile.primary_provider_id,
+                    *profile.approved_fallback_provider_ids,
+                }
+            )
+            if len(candidates) != 1:
+                raise ValueError(
+                    "instance_id is required unless the provider selects one instance"
+                )
+            instance_id = candidates[0]
+        return self._driver_for(self.profile_for_provider(instance_id, provider_id))
+
+    def _driver_for(self, profile: AgentInstanceProfile) -> PrimaryDriver:
         provider = self.providers[profile.primary_provider_id]
         factory = self._adapter_factories.get(provider.adapter_id)
         if factory is None:

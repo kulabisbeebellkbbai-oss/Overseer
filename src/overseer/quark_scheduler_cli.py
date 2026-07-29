@@ -4,17 +4,92 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Callable
 
 from .codex_usage import CodexUsageTracker
+from .cli import DEFAULT_AGENT_REGISTRY, _agent_manager
 from .quark_scheduler import (
     AgentWorkItem,
     CodexExecSliceAdapter,
+    ProviderWorkExecutor,
     QuarkSchedulerService,
     QuarkUsagePolicy,
     QuarkWorkStore,
     _work_payload,
 )
+from .store import SQLiteStore
+
+
+class PersistedUsageLimitSource:
+    """Read one provider-native UsageLimit from Overseer's durable store."""
+
+    def __init__(self, db_path: str | Path, limit_id: str):
+        self.db_path = Path(db_path)
+        self.limit_id = limit_id
+
+    def refresh(self) -> dict[str, Any]:
+        store = SQLiteStore(self.db_path)
+        try:
+            try:
+                limit = store.load_usage_limit(self.limit_id)
+            except KeyError:
+                remaining = None
+                resets_at = None
+                observed_at = datetime.now(UTC).isoformat()
+                usage_unit = "unknown"
+            else:
+                remaining = limit.remaining
+                resets_at = limit.resets_at
+                observed_at = limit.observed_at or datetime.now(UTC).isoformat()
+                usage_unit = limit.kind.value
+            return {
+                "observed_at": observed_at,
+                "rate_limits": [
+                    {
+                        "limit_id": self.limit_id,
+                        "windows": [
+                            {
+                                "name": "primary",
+                                "remaining": remaining,
+                                "resets_at": resets_at,
+                                "usage_unit": usage_unit,
+                            }
+                        ],
+                    }
+                ],
+            }
+        finally:
+            store.close()
+
+
+def _provider_executor_for_work(
+    work: tuple[AgentWorkItem, ...],
+    *,
+    db_path: str | Path,
+    agent_registry: str | Path,
+    agent_registry_local: str | Path | None,
+    codex_projects_registry: str | Path,
+    manager_factory: Callable[..., Any] = _agent_manager,
+) -> tuple[ProviderWorkExecutor, SQLiteStore | None]:
+    if not any(item.agent_session_id is not None for item in work):
+        return CodexExecSliceAdapter(), None
+    manager_store = SQLiteStore(db_path)
+    try:
+        manager = manager_factory(
+            manager_store,
+            agent_registry,
+            agent_registry_local,
+            codex_projects_registry=codex_projects_registry,
+        )
+    except Exception:
+        manager_store.close()
+        raise
+    return (
+        ProviderWorkExecutor(agent_manager=manager),
+        manager_store,
+    )
 
 
 def _policy(args: argparse.Namespace) -> QuarkUsagePolicy:
@@ -56,6 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--uncertainty", type=float, default=2)
         command.add_argument("--max-slice", type=float, default=5)
         command.add_argument("--max-concurrent", type=int, default=1)
+        command.add_argument(
+            "--agent-registry",
+            default=str(DEFAULT_AGENT_REGISTRY),
+        )
+        command.add_argument("--agent-registry-local")
+        command.add_argument(
+            "--codex-projects-registry",
+            default="/home/god/.codex/codex-projects.csv",
+        )
     return parser
 
 
@@ -96,14 +180,35 @@ def run(args: argparse.Namespace) -> dict:
             }
         if args.command == "project-effort":
             return store.project_effort(args.project_id)
-        tracker = CodexUsageTracker(args.db)
-        service = QuarkSchedulerService(
-            store,
-            usage_source=tracker,
-            executor=CodexExecSliceAdapter(),
-            policy=_policy(args),
+        work = tuple(
+            item for item in store.list_work() if item.limit_id == args.limit_id
         )
-        return service.run_cycle(execute=args.command == "run-cycle", limit_id=args.limit_id)
+        executor, manager_store = _provider_executor_for_work(
+            work,
+            db_path=args.db,
+            agent_registry=args.agent_registry,
+            agent_registry_local=args.agent_registry_local,
+            codex_projects_registry=args.codex_projects_registry,
+        )
+        try:
+            usage_source = (
+                PersistedUsageLimitSource(args.db, args.limit_id)
+                if any(item.agent_session_id is not None for item in work)
+                else CodexUsageTracker(args.db)
+            )
+            service = QuarkSchedulerService(
+                store,
+                usage_source=usage_source,
+                executor=executor,
+                policy=_policy(args),
+            )
+            return service.run_cycle(
+                execute=args.command == "run-cycle",
+                limit_id=args.limit_id,
+            )
+        finally:
+            if manager_store is not None:
+                manager_store.close()
     finally:
         store.close()
 

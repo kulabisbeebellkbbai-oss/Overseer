@@ -11,12 +11,17 @@ from starlette.responses import JSONResponse
 
 from .codex_usage import CodexUsageTracker
 from .quark_scheduler import (
-    CodexExecSliceAdapter,
     CodexWorkItem,
     QuarkSchedulerService,
     QuarkUsagePolicy,
     QuarkWorkStore,
-    _work_payload,
+    _codex_queue_payload,
+    _codex_work_payload,
+)
+from .quark_scheduler_cli import (
+    DEFAULT_AGENT_REGISTRY,
+    PersistedUsageLimitSource,
+    _provider_executor_for_work,
 )
 
 
@@ -29,6 +34,9 @@ def create_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     tracker: CodexUsageTracker | None = None,
+    agent_registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_agent_registry_path: str | Path | None = None,
+    codex_projects_registry: str | Path = "/home/god/.codex/codex-projects.csv",
 ) -> FastMCP:
     if host != DEFAULT_HOST:
         raise ValueError("Codex usage MCP must bind to 127.0.0.1; use the protected gateway for approved remote access.")
@@ -101,7 +109,7 @@ def create_server(
             )
             store.save_work(item)
             return {
-                "work": _work_payload(item),
+                "work": _codex_work_payload(item),
                 "mutation_performed": True,
                 "host_mutation_performed": False,
                 "next_step": "run a dry Quark work plan before enabling execution",
@@ -115,15 +123,7 @@ def create_server(
         store = QuarkWorkStore(usage.db_path)
         try:
             items = store.list_work()
-            return {
-                "items": [_work_payload(item) for item in items],
-                "counts": {
-                    state: sum(1 for item in items if item.state.value == state)
-                    for state in sorted({item.state.value for item in items})
-                },
-                "mutation_performed": False,
-                "host_mutation_performed": False,
-            }
+            return _codex_queue_payload(items)
         finally:
             store.close()
 
@@ -139,21 +139,59 @@ def create_server(
         """Plan work against fresh usage; execute only explicitly requested bounded Codex turns."""
         store = QuarkWorkStore(usage.db_path)
         try:
-            service = QuarkSchedulerService(
-                store,
-                usage_source=usage,
-                executor=CodexExecSliceAdapter(),
-                policy=QuarkUsagePolicy(
-                    hard_reserve_points=hard_reserve_points,
-                    uncertainty_points=uncertainty_points,
-                    max_slice_points=max_slice_points,
-                    max_concurrent_work=max_concurrent_work,
-                ),
+            work = tuple(
+                item
+                for item in store.list_work()
+                if item.limit_id == limit_id
             )
-            result = service.run_cycle(execute=execute, limit_id=limit_id)
-            result["mutation_performed"] = bool(execute and result.get("executed"))
-            result["host_mutation_performed"] = bool(execute and result.get("executed"))
-            return result
+            executor, manager_store = _provider_executor_for_work(
+                work,
+                db_path=usage.db_path,
+                agent_registry=agent_registry_path,
+                agent_registry_local=local_agent_registry_path,
+                codex_projects_registry=codex_projects_registry,
+            )
+            try:
+                usage_source = (
+                    PersistedUsageLimitSource(usage.db_path, limit_id)
+                    if any(
+                        item.agent_session_id is not None for item in work
+                    )
+                    else usage
+                )
+                service = QuarkSchedulerService(
+                    store,
+                    usage_source=usage_source,
+                    executor=executor,
+                    policy=QuarkUsagePolicy(
+                        hard_reserve_points=hard_reserve_points,
+                        uncertainty_points=uncertainty_points,
+                        max_slice_points=max_slice_points,
+                        max_concurrent_work=max_concurrent_work,
+                    ),
+                )
+                result = service.run_cycle(
+                    execute=execute,
+                    limit_id=limit_id,
+                )
+                result["mutation_performed"] = bool(
+                    execute
+                    and (
+                        result.get("executed")
+                        or result.get("reconciled")
+                    )
+                )
+                result["host_mutation_performed"] = bool(
+                    execute
+                    and (
+                        result.get("executed")
+                        or result.get("reconciled")
+                    )
+                )
+                return result
+            finally:
+                if manager_store is not None:
+                    manager_store.close()
         finally:
             store.close()
 
@@ -177,8 +215,33 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("OVERSEER_CODEX_USAGE_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("OVERSEER_CODEX_USAGE_PORT", DEFAULT_PORT)))
     parser.add_argument("--db", default=os.environ.get("OVERSEER_CODEX_USAGE_DB", "state/codex-usage.sqlite3"))
+    parser.add_argument(
+        "--agent-registry",
+        default=os.environ.get(
+            "OVERSEER_AGENT_REGISTRY",
+            str(DEFAULT_AGENT_REGISTRY),
+        ),
+    )
+    parser.add_argument(
+        "--agent-registry-local",
+        default=os.environ.get("OVERSEER_AGENT_REGISTRY_LOCAL"),
+    )
+    parser.add_argument(
+        "--codex-projects-registry",
+        default=os.environ.get(
+            "OVERSEER_CODEX_PROJECTS_REGISTRY",
+            "/home/god/.codex/codex-projects.csv",
+        ),
+    )
     args = parser.parse_args()
-    create_server(args.db, args.host, args.port).run(transport="streamable-http")
+    create_server(
+        args.db,
+        args.host,
+        args.port,
+        agent_registry_path=args.agent_registry,
+        local_agent_registry_path=args.agent_registry_local,
+        codex_projects_registry=args.codex_projects_registry,
+    ).run(transport="streamable-http")
 
 
 if __name__ == "__main__":

@@ -9,9 +9,10 @@ from collections import deque
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from numbers import Real
 from pathlib import Path
 from typing import Any, Mapping
+
+from .agent_contracts import AgentOperationState
 
 
 class WorkState(StrEnum):
@@ -20,6 +21,7 @@ class WorkState(StrEnum):
     CHECKPOINTED = "checkpointed"
     WAITING_CAPACITY = "waiting_capacity"
     COMPLETED = "completed"
+    BLOCKED = "blocked"
     RECONCILE_REQUIRED = "reconcile_required"
 
 
@@ -43,7 +45,7 @@ class QuarkUsagePolicy:
             raise ValueError("max concurrent work must be positive")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class AgentWorkItem:
     id: str
     project_id: str
@@ -64,57 +66,101 @@ class AgentWorkItem:
     resume_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    provider_dispatch_id: str | None = None
+    provider_result_id: str | None = None
+    provider_reference: str | None = None
+    provider_idempotency_key: str | None = None
+    provider_dispatch_state: str | None = None
     # Compatibility fields for the existing Codex usage MCP and persisted rows.
     estimated_quota_points: float | None = None
     estimated_tokens: int | None = None
     reserved_quota_points: float | None = None
 
-    def __post_init__(self) -> None:
-        if isinstance(self.intent, Real) and not isinstance(self.intent, bool):
-            legacy_limit_id = self.provider_id
-            legacy_intent = self.limit_id
-            legacy_estimated_units = float(self.intent)
-            legacy_estimated_tokens = (
-                int(self.estimated_units)
-                if isinstance(self.estimated_units, int)
-                else None
-            )
-            object.__setattr__(self, "owner_thread", self.agent_session_id)
-            object.__setattr__(self, "agent_session_id", None)
-            object.__setattr__(self, "limit_id", legacy_limit_id)
-            object.__setattr__(self, "provider_id", "codex")
-            object.__setattr__(self, "intent", legacy_intent)
-            object.__setattr__(self, "estimated_units", legacy_estimated_units)
-            object.__setattr__(self, "estimated_tokens", legacy_estimated_tokens)
-        estimate = (
-            self.estimated_units
-            if self.estimated_units is not None
-            else self.estimated_quota_points
-        )
+    def __init__(
+        self,
+        id: str,
+        project_id: str,
+        owner_thread: str | None = None,
+        limit_id: str = "codex",
+        intent: str = "",
+        estimated_quota_points: float | None = None,
+        estimated_tokens: int | None = None,
+        priority: int = 50,
+        state: WorkState = WorkState.QUEUED,
+        reserved_quota_points: float | None = 0,
+        generation: int = 0,
+        checkpoint_ref: str | None = None,
+        pause_reason: str | None = None,
+        resume_at: str | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+        *,
+        agent_session_id: str | None = None,
+        provider_id: str = "codex",
+        estimated_units: float | None = None,
+        usage_unit: str = "quota_points",
+        reserved_units: float | None = None,
+        driver_epoch_id: str | None = None,
+        provider_dispatch_id: str | None = None,
+        provider_result_id: str | None = None,
+        provider_reference: str | None = None,
+        provider_idempotency_key: str | None = None,
+        provider_dispatch_state: str | None = None,
+    ) -> None:
+        estimate = estimated_units if estimated_units is not None else estimated_quota_points
         reserved = (
-            self.reserved_units
-            if self.reserved_quota_points is None
-            else self.reserved_quota_points
+            reserved_units
+            if reserved_units is not None
+            else (reserved_quota_points or 0)
         )
-        if not self.id.strip() or not self.project_id.strip():
+        if not id.strip() or not project_id.strip():
             raise ValueError("work id and project id are required")
-        if not self.provider_id.strip() or not self.limit_id.strip():
+        if not provider_id.strip() or not limit_id.strip():
             raise ValueError("provider id and limit id are required")
-        if not self.usage_unit.strip():
+        if not usage_unit.strip():
             raise ValueError("usage unit is required")
-        if not (self.agent_session_id or self.owner_thread):
+        if not (agent_session_id or owner_thread):
             raise ValueError("agent session id or owner thread is required")
         if estimate is None or estimate <= 0:
             raise ValueError("estimated units must be positive")
         if reserved < 0:
             raise ValueError("reserved units cannot be negative")
-        if self.priority < 0 or self.priority > 100:
+        if priority < 0 or priority > 100:
             raise ValueError("priority must be between 0 and 100")
-        object.__setattr__(self, "estimated_units", float(estimate))
-        object.__setattr__(self, "reserved_units", float(reserved))
-        if self.provider_id == "codex" and self.usage_unit == "quota_points":
-            object.__setattr__(self, "estimated_quota_points", float(estimate))
-            object.__setattr__(self, "reserved_quota_points", float(reserved))
+        values = {
+            "id": id,
+            "project_id": project_id,
+            "agent_session_id": agent_session_id,
+            "provider_id": provider_id,
+            "limit_id": limit_id,
+            "intent": intent,
+            "estimated_units": float(estimate),
+            "usage_unit": usage_unit,
+            "owner_thread": owner_thread,
+            "priority": priority,
+            "state": WorkState(state),
+            "reserved_units": float(reserved),
+            "generation": generation,
+            "checkpoint_ref": checkpoint_ref,
+            "driver_epoch_id": driver_epoch_id,
+            "pause_reason": pause_reason,
+            "resume_at": resume_at,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "provider_dispatch_id": provider_dispatch_id,
+            "provider_result_id": provider_result_id,
+            "provider_reference": provider_reference,
+            "provider_idempotency_key": provider_idempotency_key,
+            "provider_dispatch_state": provider_dispatch_state,
+            "estimated_quota_points": estimated_quota_points,
+            "estimated_tokens": estimated_tokens,
+            "reserved_quota_points": reserved_quota_points,
+        }
+        if provider_id == "codex" and usage_unit == "quota_points":
+            values["estimated_quota_points"] = float(estimate)
+            values["reserved_quota_points"] = float(reserved)
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
 
     def with_state(self, state: WorkState, **changes: Any) -> "AgentWorkItem":
         if "reserved_quota_points" in changes and "reserved_units" not in changes:
@@ -373,6 +419,8 @@ class QuarkWorkStore:
             "generation": generation,
             "quota_before": quota_before,
             "quota_after": None,
+            "actual_units": None,
+            "capacity_confidence": "observed",
             "lifetime_tokens_before": lifetime_tokens_before,
             "lifetime_tokens_after": None,
             "actual_quota_points": None,
@@ -384,6 +432,9 @@ class QuarkWorkStore:
             # A scheduler reservation prevents Quark from double-booking its own
             # queue; it does not exclude other Codex clients from account usage.
             "attribution_confidence": "shared",
+            "provider_dispatch_id": item.provider_dispatch_id,
+            "provider_result_id": item.provider_result_id,
+            "provider_reference": item.provider_reference,
         }
         self.connection.execute(
             "INSERT OR REPLACE INTO quark_work_slices (work_id, generation, payload) VALUES (?, ?, ?)",
@@ -416,8 +467,17 @@ class QuarkWorkStore:
             raise KeyError((work_id, generation))
         payload = json.loads(row["payload"])
         payload["quota_after"] = quota_after
+        payload["capacity_confidence"] = "observed"
         payload["lifetime_tokens_after"] = lifetime_tokens_after
-        payload["actual_quota_points"] = max(0.0, payload["quota_before"] - quota_after)
+        payload["actual_units"] = max(
+            0.0, payload["quota_before"] - quota_after
+        )
+        payload["actual_quota_points"] = (
+            payload["actual_units"]
+            if payload.get("provider_id", "codex") == "codex"
+            and payload.get("usage_unit", "quota_points") == "quota_points"
+            else None
+        )
         before_tokens = payload.get("lifetime_tokens_before")
         payload["actual_tokens"] = (
             max(0, lifetime_tokens_after - before_tokens)
@@ -444,6 +504,72 @@ class QuarkWorkStore:
             )
         )
 
+    def record_slice_observation(
+        self,
+        work_id: str,
+        generation: int,
+        *,
+        capacity_after: float | None,
+        lifetime_tokens_after: int | None,
+        observed_at: str,
+        capacity_confidence: str,
+        provider_dispatch_id: str | None = None,
+        provider_result_id: str | None = None,
+        provider_reference: str | None = None,
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT payload FROM quark_work_slices WHERE work_id = ? AND generation = ?",
+            (work_id, generation),
+        ).fetchone()
+        if row is None:
+            raise KeyError((work_id, generation))
+        payload = json.loads(row["payload"])
+        payload["quota_after"] = capacity_after
+        payload["capacity_confidence"] = capacity_confidence
+        payload["lifetime_tokens_after"] = lifetime_tokens_after
+        payload["actual_units"] = (
+            max(0.0, payload["quota_before"] - capacity_after)
+            if isinstance(capacity_after, (int, float))
+            else None
+        )
+        payload["actual_quota_points"] = (
+            payload["actual_units"]
+            if payload.get("provider_id", "codex") == "codex"
+            and payload.get("usage_unit", "quota_points") == "quota_points"
+            else None
+        )
+        before_tokens = payload.get("lifetime_tokens_before")
+        payload["actual_tokens"] = (
+            max(0, lifetime_tokens_after - before_tokens)
+            if isinstance(before_tokens, int)
+            and isinstance(lifetime_tokens_after, int)
+            else None
+        )
+        payload["last_observed_at"] = observed_at
+        payload["provider_dispatch_id"] = provider_dispatch_id
+        payload["provider_result_id"] = provider_result_id
+        payload["provider_reference"] = provider_reference
+        self.connection.execute(
+            "UPDATE quark_work_slices SET payload = ? "
+            "WHERE work_id = ? AND generation = ?",
+            (json.dumps(payload, sort_keys=True), work_id, generation),
+        )
+        self.connection.commit()
+
+    def list_slices(self, work_id: str | None = None) -> tuple[dict[str, Any], ...]:
+        if work_id is None:
+            rows = self.connection.execute(
+                "SELECT payload FROM quark_work_slices "
+                "ORDER BY work_id, generation"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT payload FROM quark_work_slices "
+                "WHERE work_id = ? ORDER BY generation",
+                (work_id,),
+            ).fetchall()
+        return tuple(json.loads(row["payload"]) for row in rows)
+
     def mark_waiting_capacity(self, work_id: str, resume_at: str | None, reason: str) -> None:
         item = self.load_work(work_id)
         self.save_work(
@@ -468,7 +594,7 @@ class QuarkWorkStore:
         states: dict[str, int] = {}
         for item in work:
             states[item.state.value] = states.get(item.state.value, 0) + 1
-        estimated_by_limit = {
+        estimated_units_by_limit = {
             limit_id: sum(
                 item.estimated_units
                 for item in work
@@ -476,9 +602,11 @@ class QuarkWorkStore:
             )
             for limit_id in sorted({item.limit_id for item in work})
         }
-        actual_by_limit = {
+        actual_units_by_limit = {
             limit_id: sum(
-                item.get("actual_quota_points") or 0
+                item.get("actual_units")
+                if item.get("actual_units") is not None
+                else item.get("actual_quota_points") or 0
                 for item in slices
                 if item.get("limit_id", "codex") == limit_id
             )
@@ -489,27 +617,101 @@ class QuarkWorkStore:
                 }
             )
         }
-        codex_only = all(
-            item.provider_id == "codex" and item.usage_unit == "quota_points"
+        estimated_units_by_provider = {
+            provider_id: sum(
+                item.estimated_units
+                for item in work
+                if item.provider_id == provider_id
+            )
+            for provider_id in sorted({item.provider_id for item in work})
+        }
+        actual_units_by_provider = {
+            provider_id: sum(
+                item.get("actual_units")
+                if item.get("actual_units") is not None
+                else item.get("actual_quota_points") or 0
+                for item in slices
+                if item.get("provider_id", "codex") == provider_id
+            )
+            for provider_id in sorted(
+                {str(item.get("provider_id", "codex")) for item in slices}
+            )
+        }
+        estimated_tokens_by_limit = {
+            limit_id: sum(
+                item.estimated_tokens or 0
+                for item in work
+                if item.limit_id == limit_id
+            )
+            for limit_id in sorted({item.limit_id for item in work})
+        }
+        estimated_tokens_by_provider = {
+            provider_id: sum(
+                item.estimated_tokens or 0
+                for item in work
+                if item.provider_id == provider_id
+            )
+            for provider_id in sorted({item.provider_id for item in work})
+        }
+        actual_tokens_by_limit = {
+            limit_id: sum(
+                item.get("actual_tokens") or 0
+                for item in slices
+                if item.get("limit_id", "codex") == limit_id
+            )
+            for limit_id in sorted(
+                {str(item.get("limit_id", "codex")) for item in slices}
+            )
+        }
+        actual_tokens_by_provider = {
+            provider_id: sum(
+                item.get("actual_tokens") or 0
+                for item in slices
+                if item.get("provider_id", "codex") == provider_id
+            )
+            for provider_id in sorted(
+                {str(item.get("provider_id", "codex")) for item in slices}
+            )
+        }
+        legacy_codex_only = bool(work) and all(
+            item.agent_session_id is None
+            and item.provider_id == "codex"
+            and item.usage_unit == "quota_points"
             for item in work
         )
         return {
             "project_id": project_id,
             "work_items": len(work),
-            "estimated_by_limit": estimated_by_limit,
-            "actual_by_limit": actual_by_limit,
+            "estimated_by_limit": estimated_units_by_limit,
+            "actual_by_limit": actual_units_by_limit,
+            "estimated_units_by_limit": estimated_units_by_limit,
+            "actual_units_by_limit": actual_units_by_limit,
+            "estimated_units_by_provider": estimated_units_by_provider,
+            "actual_units_by_provider": actual_units_by_provider,
+            "estimated_tokens_by_limit": estimated_tokens_by_limit,
+            "actual_tokens_by_limit": actual_tokens_by_limit,
+            "estimated_tokens_by_provider": estimated_tokens_by_provider,
+            "actual_tokens_by_provider": actual_tokens_by_provider,
             "estimated_quota_points": (
                 sum(item.estimated_units for item in work)
-                if codex_only
+                if legacy_codex_only
                 else None
             ),
-            "estimated_tokens": sum(item.estimated_tokens or 0 for item in work),
+            "estimated_tokens": (
+                sum(item.estimated_tokens or 0 for item in work)
+                if legacy_codex_only
+                else None
+            ),
             "actual_quota_points": (
                 sum(item.get("actual_quota_points") or 0 for item in slices)
-                if codex_only
+                if legacy_codex_only
                 else None
             ),
-            "actual_tokens": sum(item.get("actual_tokens") or 0 for item in slices),
+            "actual_tokens": (
+                sum(item.get("actual_tokens") or 0 for item in slices)
+                if legacy_codex_only
+                else None
+            ),
             "completed_slices": sum(1 for item in slices if item.get("checkpointed_at")),
             "work_states": states,
             "attribution": sorted({item.get("attribution_confidence", "unknown") for item in slices}),
@@ -554,17 +756,13 @@ class ProviderWorkExecutor:
                 f"quark:{item.id}:{item.generation + 1}",
                 requested_by="quark",
             )
-            state = getattr(result.state, "value", str(result.state))
-            return {
-                "status": state,
-                "completed": state == "succeeded",
-                "checkpoint_ref": None,
-                "exit_code": 0,
-                "allocated_units": allocated_quota_points,
-                "usage_unit": item.usage_unit,
-                "provider_id": item.provider_id,
-                "driver_epoch_id": epoch.id,
-            }
+            return self._provider_result(
+                item,
+                epoch,
+                result,
+                allocated_quota_points,
+                f"quark:{item.id}:{item.generation + 1}",
+            )
         if not item.owner_thread:
             raise ValueError("legacy Codex execution requires owner_thread")
         completed = self.runner(
@@ -588,11 +786,80 @@ class ProviderWorkExecutor:
         return {
             "status": "completed" if work_completed else "checkpointed",
             "completed": work_completed,
+            "terminal": True,
+            "successful": completed.returncode == 0,
             "checkpoint_ref": checkpoint_ref,
             "exit_code": completed.returncode,
             "stdout": output,
             "stderr": completed.stderr or "",
             "allocated_quota_points": allocated_quota_points,
+        }
+
+    def reconcile_slice(
+        self,
+        item: AgentWorkItem,
+        prompt: str,
+    ) -> dict[str, Any]:
+        if self.agent_manager is None or item.agent_session_id is None:
+            raise ValueError(
+                "provider reconciliation requires agent manager and session id"
+            )
+        if not item.provider_idempotency_key:
+            raise ValueError("provider reconciliation requires idempotency key")
+        epoch = self.agent_manager.recover(
+            item.agent_session_id,
+            initiated_by="quark",
+        )
+        result = self.agent_manager.dispatch(
+            epoch.instance_id,
+            prompt,
+            item.provider_idempotency_key,
+            requested_by="quark",
+        )
+        return self._provider_result(
+            item,
+            epoch,
+            result,
+            item.reserved_units,
+            item.provider_idempotency_key,
+        )
+
+    @staticmethod
+    def _provider_result(
+        item: AgentWorkItem,
+        epoch: Any,
+        result: Any,
+        allocated_units: float,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        state = AgentOperationState(
+            getattr(result.state, "value", str(result.state))
+        )
+        terminal = state in {
+            AgentOperationState.SUCCEEDED,
+            AgentOperationState.FAILED,
+            AgentOperationState.BLOCKED,
+            AgentOperationState.CANCELLED,
+            AgentOperationState.QUARANTINED,
+        }
+        successful = state is AgentOperationState.SUCCEEDED
+        return {
+            "status": state.value,
+            "completed": successful,
+            "terminal": terminal,
+            "successful": successful,
+            "checkpoint_ref": getattr(result, "provider_reference", None),
+            "exit_code": 0 if successful else (1 if terminal else None),
+            "allocated_units": allocated_units,
+            "usage_unit": item.usage_unit,
+            "provider_id": item.provider_id,
+            "driver_epoch_id": epoch.id,
+            "provider_dispatch_id": getattr(result, "request_id", None),
+            "provider_result_id": getattr(result, "id", None),
+            "provider_reference": getattr(
+                result, "provider_reference", None
+            ),
+            "idempotency_key": idempotency_key,
         }
 
 
@@ -619,6 +886,45 @@ class QuarkSchedulerService:
         window = _usage_window(before, limit_id)
         work = tuple(item for item in self.store.list_work() if item.limit_id == limit_id)
         remaining_capacity = _window_remaining_capacity(window)
+        reconcile_results: list[dict[str, Any]] = []
+        if execute and hasattr(self.executor, "reconcile_slice"):
+            for running in tuple(
+                item
+                for item in work
+                if item.state is WorkState.RUNNING
+                and item.agent_session_id is not None
+                and item.provider_dispatch_id is not None
+            ):
+                result = self.executor.reconcile_slice(
+                    running,
+                    _checkpoint_prompt(
+                        running,
+                        WorkAllocation(
+                            work_id=running.id,
+                            project_id=running.project_id,
+                            agent_session_id=running.agent_session_id,
+                            provider_id=running.provider_id,
+                            limit_id=running.limit_id,
+                            usage_unit=running.usage_unit,
+                            owner_thread=running.owner_thread,
+                            generation=running.generation,
+                            allocated_units=running.reserved_units,
+                        ),
+                    ),
+                )
+                reconcile_results.append(
+                    self._persist_execution_result(
+                        running,
+                        result,
+                        capacity_after=remaining_capacity,
+                        snapshot=before,
+                    )
+                )
+            work = tuple(
+                item
+                for item in self.store.list_work()
+                if item.limit_id == limit_id
+            )
         codex_compatibility = limit_id == "codex" and all(
             item.provider_id == "codex" and item.usage_unit == "quota_points"
             for item in work
@@ -644,6 +950,8 @@ class QuarkSchedulerService:
             return {
                 "planned": 0,
                 "executed": 0,
+                "reconciled": len(reconcile_results),
+                "reconcile_results": reconcile_results,
                 "plan": _plan_payload(plan),
                 "resume_at": window.get("resets_at"),
                 "reason": plan.reason,
@@ -654,6 +962,8 @@ class QuarkSchedulerService:
             return {
                 "planned": len(selected),
                 "executed": 0,
+                "reconciled": len(reconcile_results),
+                "reconcile_results": reconcile_results,
                 "allocations": [_allocation_payload(item) for item in selected],
                 "plan": _plan_payload(plan),
                 "reason": "dry-run plan; no agent work was started",
@@ -686,44 +996,133 @@ class QuarkSchedulerService:
             after = self.usage_source.refresh()
             after_window = _usage_window(after, limit_id)
             after_remaining_capacity = _window_remaining_capacity(after_window)
-            if result.get("exit_code") not in (None, 0):
-                failed = self.store.load_work(item.id).with_state(
-                    WorkState.RECONCILE_REQUIRED,
-                    reserved_units=0,
-                    pause_reason="agent slice failed or was interrupted; reconcile workspace before resuming",
-                    updated_at=after.get("observed_at") or _timestamp(),
-                )
-                self.store.save_work(failed)
-            else:
-                self.store.record_slice_checkpoint(
-                    work_id=item.id,
-                    generation=allocation.generation,
-                    quota_after=after_remaining_capacity,
-                    lifetime_tokens_after=_lifetime_tokens(after),
-                    observed_at=after.get("observed_at") or _timestamp(),
-                    completed=bool(result.get("completed")),
-                    checkpoint_ref=result.get("checkpoint_ref"),
-                )
             results.append(
-                {
-                    "work_id": item.id,
-                    "generation": allocation.generation,
-                    "allocated_units": allocation.allocated_units,
-                    "allocated_quota_points": allocation.allocated_units,
-                    "usage_unit": allocation.usage_unit,
-                    "provider_id": allocation.provider_id,
-                    "limit_id": allocation.limit_id,
-                    "status": result.get("status"),
-                    "exit_code": result.get("exit_code"),
-                    "checkpoint_ref": result.get("checkpoint_ref"),
-                }
+                self._persist_execution_result(
+                    self.store.load_work(item.id),
+                    result,
+                    capacity_after=after_remaining_capacity,
+                    snapshot=after,
+                )
             )
         return {
             "planned": len(selected),
             "executed": len(results),
+            "reconciled": len(reconcile_results),
+            "reconcile_results": reconcile_results,
             "results": results,
             "plan": _plan_payload(plan),
             "reason": "bounded agent slices reached a natural turn checkpoint",
+        }
+
+    def _persist_execution_result(
+        self,
+        item: AgentWorkItem,
+        result: Mapping[str, Any],
+        *,
+        capacity_after: float | None,
+        snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        observed_at = str(snapshot.get("observed_at") or _timestamp())
+        confidence = (
+            "observed" if capacity_after is not None else "unknown"
+        )
+        self.store.record_slice_observation(
+            item.id,
+            item.generation,
+            capacity_after=capacity_after,
+            lifetime_tokens_after=_lifetime_tokens(dict(snapshot)),
+            observed_at=observed_at,
+            capacity_confidence=confidence,
+            provider_dispatch_id=result.get("provider_dispatch_id"),
+            provider_result_id=result.get("provider_result_id"),
+            provider_reference=result.get("provider_reference"),
+        )
+        changes = {
+            "provider_dispatch_id": result.get("provider_dispatch_id"),
+            "provider_result_id": result.get("provider_result_id"),
+            "provider_reference": result.get("provider_reference"),
+            "provider_idempotency_key": result.get("idempotency_key"),
+            "provider_dispatch_state": result.get("status"),
+            "updated_at": observed_at,
+        }
+        terminal = bool(
+            result.get(
+                "terminal",
+                result.get("exit_code") is not None,
+            )
+        )
+        successful = bool(
+            result.get(
+                "successful",
+                result.get("exit_code") in (None, 0),
+            )
+        )
+        if not terminal:
+            self.store.save_work(
+                item.with_state(
+                    WorkState.RUNNING,
+                    **changes,
+                )
+            )
+        elif successful and capacity_after is not None:
+            self.store.save_work(item.with_state(item.state, **changes))
+            self.store.record_slice_checkpoint(
+                work_id=item.id,
+                generation=item.generation,
+                quota_after=capacity_after,
+                lifetime_tokens_after=_lifetime_tokens(dict(snapshot)),
+                observed_at=observed_at,
+                completed=bool(result.get("completed")),
+                checkpoint_ref=result.get("checkpoint_ref"),
+            )
+        elif successful:
+            self.store.save_work(
+                item.with_state(
+                    WorkState.RECONCILE_REQUIRED,
+                    pause_reason=(
+                        "provider completed but post-dispatch capacity "
+                        "is unknown; reconcile usage before resuming"
+                    ),
+                    **changes,
+                )
+            )
+        else:
+            target_state = (
+                WorkState.BLOCKED
+                if result.get("status") == AgentOperationState.BLOCKED.value
+                else WorkState.RECONCILE_REQUIRED
+            )
+            self.store.save_work(
+                item.with_state(
+                    target_state,
+                    reserved_units=0,
+                    pause_reason=(
+                        "provider dispatch ended without success: "
+                        f"{result.get('status', 'unknown')}"
+                    ),
+                    **changes,
+                )
+            )
+        return {
+            "work_id": item.id,
+            "generation": item.generation,
+            "allocated_units": item.reserved_units,
+            "allocated_quota_points": (
+                item.reserved_units
+                if item.provider_id == "codex"
+                and item.usage_unit == "quota_points"
+                else None
+            ),
+            "usage_unit": item.usage_unit,
+            "provider_id": item.provider_id,
+            "limit_id": item.limit_id,
+            "status": result.get("status"),
+            "exit_code": result.get("exit_code"),
+            "checkpoint_ref": result.get("checkpoint_ref"),
+            "provider_dispatch_id": result.get("provider_dispatch_id"),
+            "provider_result_id": result.get("provider_result_id"),
+            "provider_reference": result.get("provider_reference"),
+            "capacity_confidence": confidence,
         }
 
 
@@ -731,6 +1130,42 @@ def _work_payload(item: AgentWorkItem) -> dict[str, Any]:
     payload = asdict(item)
     payload["state"] = item.state.value
     return payload
+
+
+def _codex_work_payload(item: AgentWorkItem) -> dict[str, Any]:
+    """Exact compatibility payload for the Codex usage MCP."""
+    return {
+        "id": item.id,
+        "project_id": item.project_id,
+        "owner_thread": item.owner_thread,
+        "limit_id": item.limit_id,
+        "intent": item.intent,
+        "estimated_quota_points": item.estimated_quota_points,
+        "estimated_tokens": item.estimated_tokens,
+        "priority": item.priority,
+        "state": item.state.value,
+        "reserved_quota_points": item.reserved_quota_points,
+        "generation": item.generation,
+        "checkpoint_ref": item.checkpoint_ref,
+        "pause_reason": item.pause_reason,
+        "resume_at": item.resume_at,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
+def _codex_queue_payload(
+    items: tuple[AgentWorkItem, ...],
+) -> dict[str, Any]:
+    return {
+        "items": [_codex_work_payload(item) for item in items],
+        "counts": {
+            state: sum(1 for item in items if item.state.value == state)
+            for state in sorted({item.state.value for item in items})
+        },
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
 
 
 def _work_from_payload(payload: dict[str, Any]) -> AgentWorkItem:

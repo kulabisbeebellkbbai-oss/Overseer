@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+from overseer.agent_contracts import AgentOperationState
 from overseer.quark_scheduler import (
     AgentWorkItem,
     CodexExecSliceAdapter,
@@ -12,9 +14,12 @@ from overseer.quark_scheduler import (
     QuarkUsagePolicy,
     QuarkWorkStore,
     WorkState,
+    _codex_queue_payload,
+    _codex_work_payload,
     plan_quark_work,
 )
 from overseer.quark_scheduler_cli import build_parser
+import overseer.quark_scheduler_cli as quark_scheduler_cli
 
 
 def _agent_work(
@@ -143,6 +148,89 @@ def test_codex_work_item_preserves_legacy_positional_constructor():
     assert item.estimated_quota_points == 5
 
 
+def test_codex_work_item_preserves_eighth_legacy_positional_field():
+    item = CodexWorkItem(
+        "work.legacy",
+        "project-a",
+        "thread-project-a",
+        "codex",
+        "continue project-a",
+        5,
+        1_000,
+        77,
+    )
+
+    assert item.owner_thread == "thread-project-a"
+    assert item.estimated_tokens == 1_000
+    assert item.priority == 77
+
+
+def test_codex_work_item_preserves_full_legacy_positional_constructor():
+    item = CodexWorkItem(
+        "work.legacy",
+        "project-a",
+        "thread-project-a",
+        "codex",
+        "continue project-a",
+        5,
+        1_000,
+        77,
+        WorkState.CHECKPOINTED,
+        2,
+        3,
+        "commit:abc",
+        "paused",
+        "2026-08-01T00:00:00+00:00",
+        "2026-07-29T00:00:00+00:00",
+        "2026-07-30T00:00:00+00:00",
+    )
+
+    assert item.owner_thread == "thread-project-a"
+    assert item.priority == 77
+    assert item.state is WorkState.CHECKPOINTED
+    assert item.reserved_quota_points == 2
+    assert item.generation == 3
+    assert item.checkpoint_ref == "commit:abc"
+    assert item.pause_reason == "paused"
+    assert item.resume_at == "2026-08-01T00:00:00+00:00"
+    assert item.created_at == "2026-07-29T00:00:00+00:00"
+    assert item.updated_at == "2026-07-30T00:00:00+00:00"
+
+
+def test_codex_mcp_work_payload_preserves_exact_legacy_shape():
+    item = _work("work.legacy", "project-a", 5)
+
+    assert _codex_work_payload(item) == {
+        "id": "work.legacy",
+        "project_id": "project-a",
+        "owner_thread": "thread-project-a",
+        "limit_id": "codex",
+        "intent": "continue project-a",
+        "estimated_quota_points": 5.0,
+        "estimated_tokens": None,
+        "priority": 50,
+        "state": "queued",
+        "reserved_quota_points": 0.0,
+        "generation": 0,
+        "checkpoint_ref": None,
+        "pause_reason": None,
+        "resume_at": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+def test_codex_mcp_queue_payload_preserves_exact_legacy_shape():
+    item = _work("work.legacy", "project-a", 5)
+
+    assert _codex_queue_payload((item,)) == {
+        "items": [_codex_work_payload(item)],
+        "counts": {"queued": 1},
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
 def test_provider_executor_recovers_and_dispatches_through_agent_manager():
     class FakeAgentManager:
         def __init__(self):
@@ -201,6 +289,44 @@ def test_provider_executor_recovers_and_dispatches_through_agent_manager():
     assert result["usage_unit"] == "tokens"
 
 
+def test_provider_executor_preserves_nonterminal_acknowledgement():
+    class FakeAgentManager:
+        def recover(self, session_id, initiated_by="system"):
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            return SimpleNamespace(
+                id="result.claude.1",
+                request_id="dispatch.claude.1",
+                provider_reference="provider-job-1",
+                state=AgentOperationState.ACKNOWLEDGED,
+            )
+
+    result = ProviderWorkExecutor(FakeAgentManager()).run_slice(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        5,
+        "checkpoint prompt",
+    )
+
+    assert result["terminal"] is False
+    assert result["successful"] is False
+    assert result["exit_code"] is None
+    assert result["provider_dispatch_id"] == "dispatch.claude.1"
+    assert result["provider_result_id"] == "result.claude.1"
+    assert result["provider_reference"] == "provider-job-1"
+
+
 def test_scheduler_cli_accepts_provider_native_work_fields():
     args = build_parser().parse_args(
         [
@@ -228,6 +354,95 @@ def test_scheduler_cli_accepts_provider_native_work_fields():
     assert args.provider_id == "claude"
     assert args.estimated_units == 8000
     assert args.usage_unit == "tokens"
+
+
+def test_scheduler_cli_accepts_explicit_agent_manager_configuration():
+    args = build_parser().parse_args(
+        [
+            "--db",
+            "/tmp/quark.sqlite3",
+            "run-cycle",
+            "--limit-id",
+            "limit.claude.tokens",
+            "--agent-registry",
+            "/tmp/providers.json",
+            "--agent-registry-local",
+            "/tmp/providers.local.json",
+            "--codex-projects-registry",
+            "/tmp/codex-projects.csv",
+        ]
+    )
+
+    assert args.agent_registry == "/tmp/providers.json"
+    assert args.agent_registry_local == "/tmp/providers.local.json"
+    assert args.codex_projects_registry == "/tmp/codex-projects.csv"
+
+
+def test_scheduler_entrypoint_builds_manager_executor_for_generic_work(
+    tmp_path: Path,
+):
+    manager = object()
+    calls = []
+
+    def manager_factory(
+        store,
+        registry_path,
+        local_registry_path,
+        *,
+        codex_projects_registry,
+    ):
+        calls.append(
+            (
+                store.path,
+                registry_path,
+                local_registry_path,
+                codex_projects_registry,
+            )
+        )
+        return manager
+
+    executor, manager_store = quark_scheduler_cli._provider_executor_for_work(
+        (
+            _agent_work(
+                "work.claude",
+                "project-a",
+                "claude",
+                "limit.claude.tokens",
+                8,
+                usage_unit="tokens",
+            ),
+        ),
+        db_path=tmp_path / "quark.sqlite3",
+        agent_registry="/tmp/providers.json",
+        agent_registry_local="/tmp/providers.local.json",
+        codex_projects_registry="/tmp/codex-projects.csv",
+        manager_factory=manager_factory,
+    )
+    try:
+        assert executor.agent_manager is manager
+        assert calls == [
+            (
+                tmp_path / "quark.sqlite3",
+                "/tmp/providers.json",
+                "/tmp/providers.local.json",
+                "/tmp/codex-projects.csv",
+            )
+        ]
+    finally:
+        manager_store.close()
+
+
+def test_scheduler_entrypoint_keeps_legacy_codex_executor(tmp_path: Path):
+    executor, manager_store = quark_scheduler_cli._provider_executor_for_work(
+        (_work("work.codex", "project-a", 5),),
+        db_path=tmp_path / "quark.sqlite3",
+        agent_registry="/tmp/providers.json",
+        agent_registry_local=None,
+        codex_projects_registry="/tmp/codex-projects.csv",
+    )
+
+    assert executor.agent_manager is None
+    assert manager_store is None
 
 
 def test_planner_preserves_reserve_without_stranding_spendable_capacity():
@@ -299,6 +514,49 @@ def test_store_tracks_project_estimates_and_actual_effort(tmp_path: Path):
     assert summary["completed_slices"] == 1
     assert summary["work_states"] == {"checkpointed": 1}
     assert summary["attribution"] == ["shared"]
+
+
+def test_project_effort_never_sums_mixed_provider_tokens(tmp_path: Path):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        replace(
+            _agent_work(
+                "work.codex",
+                "mixed",
+                "codex",
+                "limit.codex.points",
+                5,
+                usage_unit="quota_points",
+            ),
+            estimated_tokens=100,
+        )
+    )
+    store.save_work(
+        replace(
+            _agent_work(
+                "work.claude",
+                "mixed",
+                "claude",
+                "limit.claude.tokens",
+                8,
+                usage_unit="tokens",
+            ),
+            estimated_tokens=200,
+        )
+    )
+
+    summary = store.project_effort("mixed")
+
+    assert summary["estimated_tokens"] is None
+    assert summary["estimated_tokens_by_limit"] == {
+        "limit.claude.tokens": 200,
+        "limit.codex.points": 100,
+    }
+    assert summary["estimated_tokens_by_provider"] == {
+        "claude": 200,
+        "codex": 100,
+    }
+    assert 300 not in summary.values()
 
 
 def test_checkpointed_work_becomes_waiting_when_capacity_is_below_floor(tmp_path: Path):
@@ -439,6 +697,177 @@ def test_cycle_blocks_unknown_provider_native_capacity(tmp_path: Path):
     assert status["planned"] == 0
     assert "unknown capacity" in status["reason"]
 
+
+def test_cycle_keeps_nonterminal_provider_dispatch_running(tmp_path: Path):
+    class NonterminalExecutor:
+        def run_slice(self, item, allocation, prompt):
+            return {
+                "status": "acknowledged",
+                "terminal": False,
+                "successful": False,
+                "provider_dispatch_id": "dispatch.claude.1",
+                "provider_result_id": "result.claude.1",
+                "provider_reference": "provider-job-1",
+                "idempotency_key": "quark:work.claude:1",
+                "exit_code": None,
+            }
+
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        )
+    )
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (
+                _native_snapshot("limit.claude.tokens", 80_000),
+                _native_snapshot("limit.claude.tokens", 79_995),
+            )
+        ),
+        executor=NonterminalExecutor(),
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+    item = store.load_work("work.claude")
+
+    assert status["results"][0]["status"] == "acknowledged"
+    assert item.state is WorkState.RUNNING
+    assert item.reserved_units == 5
+    assert item.provider_dispatch_id == "dispatch.claude.1"
+    assert item.provider_reference == "provider-job-1"
+
+
+def test_cycle_reconciles_nonterminal_provider_dispatch_on_later_cycle(
+    tmp_path: Path,
+):
+    class ReconcilingExecutor:
+        def __init__(self):
+            self.reconciled = []
+
+        def reconcile_slice(self, item, prompt):
+            self.reconciled.append(item.provider_dispatch_id)
+            return {
+                "status": "succeeded",
+                "terminal": True,
+                "successful": True,
+                "completed": True,
+                "provider_dispatch_id": item.provider_dispatch_id,
+                "provider_result_id": "result.claude.2",
+                "provider_reference": item.provider_reference,
+                "idempotency_key": item.provider_idempotency_key,
+                "checkpoint_ref": "provider-job-1",
+                "exit_code": 0,
+            }
+
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        replace(
+            _agent_work(
+                "work.claude",
+                "project-a",
+                "claude",
+                "limit.claude.tokens",
+                8,
+                usage_unit="tokens",
+            ),
+            state=WorkState.RUNNING,
+            reserved_units=5,
+            generation=1,
+            provider_dispatch_id="dispatch.claude.1",
+            provider_result_id="result.claude.1",
+            provider_reference="provider-job-1",
+            provider_idempotency_key="quark:work.claude:1",
+        )
+    )
+    store.record_slice_start(
+        "work.claude",
+        1,
+        quota_before=80_000,
+        lifetime_tokens_before=None,
+        observed_at="2026-07-29T10:00:00+00:00",
+    )
+    executor = ReconcilingExecutor()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (_native_snapshot("limit.claude.tokens", 79_995),)
+        ),
+        executor=executor,
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+
+    assert executor.reconciled == ["dispatch.claude.1"]
+    assert status["reconciled"] == 1
+    assert store.load_work("work.claude").state is WorkState.COMPLETED
+    assert store.load_work("work.claude").reserved_units == 0
+
+
+def test_cycle_persists_unknown_post_dispatch_capacity_without_crashing(
+    tmp_path: Path,
+):
+    class SuccessfulExecutor:
+        def run_slice(self, item, allocation, prompt):
+            return {
+                "status": "succeeded",
+                "terminal": True,
+                "successful": True,
+                "completed": True,
+                "provider_dispatch_id": "dispatch.claude.1",
+                "provider_result_id": "result.claude.1",
+                "provider_reference": "provider-job-1",
+                "idempotency_key": "quark:work.claude:1",
+                "checkpoint_ref": "provider-job-1",
+                "exit_code": 0,
+            }
+
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        )
+    )
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (
+                _native_snapshot("limit.claude.tokens", 80_000),
+                _native_snapshot("limit.claude.tokens", None),
+            )
+        ),
+        executor=SuccessfulExecutor(),
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+    item = store.load_work("work.claude")
+    slices = store.list_slices("work.claude")
+
+    assert status["results"][0]["capacity_confidence"] == "unknown"
+    assert item.state is WorkState.RECONCILE_REQUIRED
+    assert item.reserved_units == 5
+    assert slices[0]["capacity_confidence"] == "unknown"
+    assert slices[0]["actual_units"] is None
 
 def test_cycle_runs_one_bounded_slice_and_reconciles_usage(tmp_path: Path):
     store = QuarkWorkStore(tmp_path / "quark.sqlite3")

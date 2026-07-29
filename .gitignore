@@ -1,6 +1,7 @@
 # Local agent and Codex state
 .agents/
 .codex/
+.worktrees/
 
 # Secrets and credentials
 .env

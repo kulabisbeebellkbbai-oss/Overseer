@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import re
 from types import MappingProxyType
 from typing import Mapping, Protocol, runtime_checkable
 
@@ -53,7 +54,22 @@ def _validate_optional_identifier(value: str | None, label: str) -> None:
 
 
 def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
-    return MappingProxyType(dict(value))
+    frozen: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise TypeError("record mapping keys must be non-empty strings")
+        frozen[key] = _freeze_value(item)
+    return MappingProxyType(frozen)
+
+
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _freeze_mapping(value)
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_value(item) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError("record mappings support only scalar, sequence, and mapping values")
 
 
 def _validate_identifier_collection(values: tuple[str, ...], label: str) -> None:
@@ -100,6 +116,31 @@ class AgentCapabilities:
 
 
 @dataclass(frozen=True)
+class CredentialReference:
+    """A credential locator, never credential material."""
+
+    id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not re.fullmatch(
+            r"secret://[A-Za-z0-9][A-Za-z0-9._/-]*", self.id
+        ):
+            raise ValueError("credential reference must use a secret:// identifier")
+
+
+def _freeze_credential_references(
+    value: Mapping[str, CredentialReference],
+) -> Mapping[str, CredentialReference]:
+    frozen: dict[str, CredentialReference] = {}
+    for key, reference in value.items():
+        _require_identifier(key, "credential reference name")
+        if not isinstance(reference, CredentialReference):
+            raise TypeError("credential reference values must be CredentialReference")
+        frozen[key] = reference
+    return MappingProxyType(frozen)
+
+
+@dataclass(frozen=True)
 class AgentProvider:
     id: str
     adapter_id: str
@@ -134,7 +175,7 @@ class AgentInstanceProfile:
     external_session_id: str | None = None
     declared_capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     detected_capabilities: AgentCapabilities | None = None
-    credential_references: Mapping[str, object] = field(default_factory=dict)
+    credential_references: Mapping[str, CredentialReference] = field(default_factory=dict)
     permission_policy_ref: str | None = None
     execution_policy_ref: str | None = None
     provider_health_source_id: str | None = None
@@ -168,7 +209,9 @@ class AgentInstanceProfile:
         if self.primary_provider_id in self.approved_fallback_provider_ids:
             raise ValueError("primary provider cannot be its own fallback")
         object.__setattr__(
-            self, "credential_references", _freeze_mapping(self.credential_references)
+            self,
+            "credential_references",
+            _freeze_credential_references(self.credential_references),
         )
 
 
@@ -272,8 +315,9 @@ class AgentDispatchResult:
 
     @classmethod
     def unsupported(
-        cls, request: AgentDispatchRequest, capability: str
+        cls, request: AgentDispatchRequest, provider_id: str, capability: str
     ) -> AgentDispatchResult:
+        _require_identifier(provider_id, "provider id")
         _require_identifier(capability, "capability")
         return cls(
             id=f"{request.id}.unsupported",
@@ -281,7 +325,7 @@ class AgentDispatchResult:
             instance_id=request.instance_id,
             session_id=request.session_id,
             driver_epoch_id=request.driver_epoch_id,
-            provider_id="unknown",
+            provider_id=provider_id,
             state=AgentOperationState.FAILED,
             error_category=AgentErrorCategory.UNSUPPORTED_CAPABILITY,
             error_message=f"unsupported capability: {capability}",

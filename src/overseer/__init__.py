@@ -18,6 +18,7 @@ from .agent_contracts import (
     AgentProvider,
     AgentSession,
     AgentTransport,
+    CredentialReference,
     DriverEpoch,
     PrimaryDriver,
 )
@@ -235,6 +236,7 @@ __all__ = [
     "AgentProvider",
     "AgentSession",
     "AgentTransport",
+    "CredentialReference",
     "DriverEpoch",
     "PrimaryDriver",
     "DryRunExecutor",

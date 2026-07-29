@@ -117,22 +117,33 @@ def build_parser() -> argparse.ArgumentParser:
     register = subparsers.add_parser("register-work")
     register.add_argument("--work-id", required=True)
     register.add_argument("--project-id", required=True)
-    register.add_argument("--agent-session-id")
-    register.add_argument("--provider-id", default="codex")
-    register.add_argument("--owner-thread")
+    register.add_argument("--owner-thread", required=True)
     register.add_argument("--intent", required=True)
-    register.add_argument("--estimated-units", type=float)
-    register.add_argument("--usage-unit")
-    register.add_argument("--estimated-quota-points", type=float)
+    register.add_argument("--estimated-quota-points", required=True, type=float)
     register.add_argument("--estimated-tokens", type=int)
     register.add_argument("--priority", type=int, default=50)
     register.add_argument("--limit-id", default="codex")
 
+    register_agent = subparsers.add_parser("register-agent-work")
+    register_agent.add_argument("--work-id", required=True)
+    register_agent.add_argument("--project-id", required=True)
+    register_agent.add_argument("--agent-session-id", required=True)
+    register_agent.add_argument("--provider-id", required=True)
+    register_agent.add_argument("--intent", required=True)
+    register_agent.add_argument("--estimated-units", required=True, type=float)
+    register_agent.add_argument("--usage-unit")
+    register_agent.add_argument("--estimated-tokens", type=int)
+    register_agent.add_argument("--priority", type=int, default=50)
+    register_agent.add_argument("--limit-id", required=True)
+
     subparsers.add_parser("queue")
+    subparsers.add_parser("agent-queue")
     effort = subparsers.add_parser("project-effort")
     effort.add_argument("--project-id", required=True)
+    agent_effort = subparsers.add_parser("agent-project-effort")
+    agent_effort.add_argument("--project-id", required=True)
 
-    for name in ("plan", "run-cycle"):
+    for name in ("plan", "run-cycle", "agent-plan", "agent-run-cycle"):
         command = subparsers.add_parser(name)
         command.add_argument("--limit-id", default="codex")
         command.add_argument("--hard-reserve", type=float, default=15)
@@ -155,78 +166,100 @@ def run(args: argparse.Namespace) -> dict:
     store = QuarkWorkStore(args.db)
     try:
         if args.command == "register-work":
-            legacy_codex = (
-                args.agent_session_id is None
-                and args.provider_id == "codex"
-                and args.estimated_units is None
-            )
-            if not legacy_codex and not args.usage_unit:
-                raise ValueError(
-                    "--usage-unit is required for provider-native work"
-                )
-            estimated_units = (
-                args.estimated_units
-                if args.estimated_units is not None
-                else args.estimated_quota_points
-            )
-            if estimated_units is None:
-                raise ValueError(
-                    "--estimated-units or --estimated-quota-points is required"
-                )
             item = AgentWorkItem(
                 id=args.work_id,
                 project_id=args.project_id,
-                agent_session_id=args.agent_session_id,
-                provider_id=args.provider_id,
+                provider_id="codex",
                 owner_thread=args.owner_thread,
                 limit_id=args.limit_id,
                 intent=args.intent,
-                estimated_units=estimated_units,
-                usage_unit=(
-                    "quota_points" if legacy_codex else args.usage_unit
-                ),
+                estimated_units=args.estimated_quota_points,
+                usage_unit="quota_points",
                 estimated_quota_points=args.estimated_quota_points,
                 estimated_tokens=args.estimated_tokens,
                 priority=args.priority,
             )
             store.save_work(item)
             return {
-                "work": (
-                    _codex_work_payload(item)
-                    if legacy_codex
-                    else _work_payload(item)
-                ),
+                "work": _codex_work_payload(item),
+                "mutation_performed": True,
+                "host_mutation_performed": False,
+            }
+        if args.command == "register-agent-work":
+            if not args.usage_unit:
+                raise ValueError(
+                    "--usage-unit is required for provider-native work"
+                )
+            item = AgentWorkItem(
+                id=args.work_id,
+                project_id=args.project_id,
+                agent_session_id=args.agent_session_id,
+                provider_id=args.provider_id,
+                limit_id=args.limit_id,
+                intent=args.intent,
+                estimated_units=args.estimated_units,
+                usage_unit=args.usage_unit,
+                estimated_tokens=args.estimated_tokens,
+                priority=args.priority,
+            )
+            store.save_work(item)
+            return {
+                "work": _work_payload(item),
                 "mutation_performed": True,
                 "host_mutation_performed": False,
             }
         if args.command == "queue":
-            items = store.list_work()
+            items = tuple(
+                item
+                for item in store.list_work()
+                if _legacy_codex_work((item,))
+            )
             return {
-                "items": [
-                    (
-                        _codex_work_payload(item)
-                        if _legacy_codex_work(items)
-                        else _work_payload(item)
+                "items": [_codex_work_payload(item) for item in items],
+                "mutation_performed": False,
+                "host_mutation_performed": False,
+            }
+        if args.command == "agent-queue":
+            items = tuple(
+                item
+                for item in store.list_work()
+                if item.agent_session_id is not None
+            )
+            return {
+                "items": [_work_payload(item) for item in items],
+                "counts": {
+                    state: sum(
+                        1 for item in items if item.state.value == state
                     )
-                    for item in items
-                ],
+                    for state in sorted(
+                        {item.state.value for item in items}
+                    )
+                },
                 "mutation_performed": False,
                 "host_mutation_performed": False,
             }
         if args.command == "project-effort":
-            project_work = tuple(
-                item
-                for item in store.list_work()
-                if item.project_id == args.project_id
+            return _codex_project_effort_payload(
+                store.project_effort(
+                    args.project_id,
+                    work_filter=lambda item: _legacy_codex_work((item,)),
+                )
             )
-            result = store.project_effort(args.project_id)
-            return (
-                _codex_project_effort_payload(result)
-                if _legacy_codex_work(project_work)
-                else result
+        if args.command == "agent-project-effort":
+            return store.project_effort(
+                args.project_id,
+                work_filter=lambda item: item.agent_session_id is not None,
             )
+        provider_native = args.command in {"agent-plan", "agent-run-cycle"}
+        work_filter = (
+            (lambda item: item.agent_session_id is not None)
+            if provider_native
+            else (lambda item: _legacy_codex_work((item,)))
+        )
         work = tuple(
-            item for item in store.list_work() if item.limit_id == args.limit_id
+            item
+            for item in store.list_work()
+            if item.limit_id == args.limit_id and work_filter(item)
         )
         executor, manager_store = _provider_executor_for_work(
             work,
@@ -239,7 +272,7 @@ def run(args: argparse.Namespace) -> dict:
         try:
             usage_source = (
                 PersistedUsageLimitSource(args.db, args.limit_id)
-                if any(item.agent_session_id is not None for item in work)
+                if provider_native
                 else CodexUsageTracker(args.db)
             )
             service = QuarkSchedulerService(
@@ -247,15 +280,14 @@ def run(args: argparse.Namespace) -> dict:
                 usage_source=usage_source,
                 executor=executor,
                 policy=_policy(args),
+                work_filter=work_filter,
             )
             result = service.run_cycle(
-                execute=args.command == "run-cycle",
+                execute=args.command in {"run-cycle", "agent-run-cycle"},
                 limit_id=args.limit_id,
             )
             return (
-                _codex_cycle_payload(result)
-                if _legacy_codex_work(work)
-                else result
+                result if provider_native else _codex_cycle_payload(result)
             )
         finally:
             if manager_store is not None:

@@ -715,7 +715,9 @@ class ProviderWorkExecutor:
         prompt: str,
     ) -> dict[str, Any]:
         if self.agent_manager is not None and item.agent_session_id is not None:
-            blocked = self._validate_persisted_work(item)
+            blocked = self._validate_initial_work_transition(
+                item, allocated_quota_points
+            )
             if blocked is not None:
                 return blocked
             blocked = self._validate_persisted_session(item)
@@ -741,6 +743,7 @@ class ProviderWorkExecutor:
                 result,
                 allocated_quota_points,
                 idempotency_key,
+                expected_dispatch_id=None,
             )
         if not item.owner_thread:
             raise ValueError("legacy Codex execution requires owner_thread")
@@ -785,7 +788,7 @@ class ProviderWorkExecutor:
             )
         if not item.provider_idempotency_key:
             raise ValueError("provider reconciliation requires idempotency key")
-        blocked = self._validate_persisted_work(item)
+        blocked = self._validate_reconcile_work_binding(item)
         if blocked is not None:
             return blocked
         blocked = self._validate_persisted_session(item)
@@ -810,28 +813,115 @@ class ProviderWorkExecutor:
             result,
             item.reserved_units,
             item.provider_idempotency_key,
+            expected_dispatch_id=item.provider_dispatch_id,
         )
+
+    def _load_persisted_work(
+        self, item: AgentWorkItem
+    ) -> tuple[AgentWorkItem | None, dict[str, Any] | None]:
+        if self.work_store is None:
+            return None, None
+        try:
+            return self.work_store.load_work(item.id), None
+        except (KeyError, ValueError) as exc:
+            return None, self._policy_block(
+                item, f"persisted work could not be loaded: {exc}"
+            )
+
+    def _validate_initial_work_transition(
+        self,
+        item: AgentWorkItem,
+        allocated_units: float,
+    ) -> dict[str, Any] | None:
+        persisted, blocked = self._load_persisted_work(item)
+        if blocked is not None or persisted is None:
+            return blocked
+        expected_equal = (
+            "project_id",
+            "agent_session_id",
+            "provider_id",
+            "limit_id",
+            "usage_unit",
+            "owner_thread",
+            "driver_epoch_id",
+            "provider_dispatch_id",
+            "provider_result_id",
+            "provider_reference",
+            "provider_idempotency_key",
+            "provider_dispatch_state",
+        )
+        mismatches = [
+            field
+            for field in expected_equal
+            if getattr(persisted, field) != getattr(item, field)
+        ]
+        if item.state not in {
+            WorkState.QUEUED,
+            WorkState.CHECKPOINTED,
+            WorkState.WAITING_CAPACITY,
+        }:
+            mismatches.append("source_state")
+        if persisted.state is not WorkState.RUNNING:
+            mismatches.append("state")
+        if persisted.generation != item.generation + 1:
+            mismatches.append("generation")
+        if persisted.reserved_units != allocated_units:
+            mismatches.append("reserved_units")
+        if mismatches:
+            return self._policy_block(
+                item,
+                "persisted work transition mismatch: "
+                + ", ".join(sorted(set(mismatches))),
+            )
+        return None
+
+    def _validate_reconcile_work_binding(
+        self, item: AgentWorkItem
+    ) -> dict[str, Any] | None:
+        persisted, blocked = self._load_persisted_work(item)
+        if blocked is not None or persisted is None:
+            return blocked
+        binding_fields = (
+            "project_id",
+            "agent_session_id",
+            "provider_id",
+            "limit_id",
+            "usage_unit",
+            "owner_thread",
+            "generation",
+            "state",
+            "reserved_units",
+            "driver_epoch_id",
+            "provider_dispatch_id",
+            "provider_result_id",
+            "provider_reference",
+            "provider_idempotency_key",
+            "provider_dispatch_state",
+            "pause_reason",
+            "resume_at",
+        )
+        mismatches = [
+            field
+            for field in binding_fields
+            if getattr(persisted, field) != getattr(item, field)
+        ]
+        if persisted.state is not WorkState.RUNNING:
+            mismatches.append("lifecycle_state")
+        if mismatches:
+            return self._policy_block(
+                item,
+                "persisted work binding mismatch: "
+                + ", ".join(sorted(set(mismatches))),
+            )
+        return None
 
     def _validate_persisted_work(
         self, item: AgentWorkItem
     ) -> dict[str, Any] | None:
+        """Compatibility wrapper for callers that need exact reconcile checks."""
         if self.work_store is None:
             return None
-        try:
-            persisted = self.work_store.load_work(item.id)
-        except (KeyError, ValueError) as exc:
-            return self._policy_block(
-                item, f"persisted work could not be loaded: {exc}"
-            )
-        if persisted.agent_session_id != item.agent_session_id:
-            return self._policy_block(
-                item, "persisted work session does not match dispatched work"
-            )
-        if persisted.provider_id != item.provider_id:
-            return self._policy_block(
-                item, "persisted work provider does not match dispatched work"
-            )
-        return None
+        return self._validate_reconcile_work_binding(item)
 
     def _validate_persisted_session(
         self, item: AgentWorkItem
@@ -906,6 +996,8 @@ class ProviderWorkExecutor:
         result: Any,
         allocated_units: float,
         idempotency_key: str,
+        *,
+        expected_dispatch_id: str | None,
     ) -> dict[str, Any]:
         mismatches = []
         expected_bindings = {
@@ -917,9 +1009,9 @@ class ProviderWorkExecutor:
             if getattr(result, field, None) != expected:
                 mismatches.append(field)
         if (
-            item.provider_dispatch_id is not None
+            expected_dispatch_id is not None
             and getattr(result, "request_id", None)
-            != item.provider_dispatch_id
+            != expected_dispatch_id
         ):
             mismatches.append("request_id")
         if mismatches:
@@ -1422,18 +1514,24 @@ def _codex_cycle_payload(result: Mapping[str, Any]) -> dict[str, Any]:
 def _codex_project_effort_payload(
     result: Mapping[str, Any],
 ) -> dict[str, Any]:
-    fields = (
-        "project_id",
+    numeric_fields = (
         "work_items",
         "estimated_quota_points",
         "estimated_tokens",
         "actual_quota_points",
         "actual_tokens",
         "completed_slices",
-        "work_states",
-        "attribution",
     )
-    return {field: result.get(field) for field in fields}
+    payload = {
+        field: result.get(field) or 0
+        for field in numeric_fields
+    }
+    return {
+        "project_id": result.get("project_id"),
+        **payload,
+        "work_states": result.get("work_states", {}),
+        "attribution": result.get("attribution", []),
+    }
 
 
 def _legacy_codex_work(items: tuple[AgentWorkItem, ...]) -> bool:

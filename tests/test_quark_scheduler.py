@@ -447,8 +447,145 @@ def test_provider_executor_reconcile_blocks_stale_persisted_work_binding(
     ).reconcile_slice(item, "checkpoint prompt")
 
     assert result["status"] == "policy_blocked"
-    assert "persisted work session" in result["error_reason"]
+    assert "persisted work binding mismatch" in result["error_reason"]
+    assert "agent_session_id" in result["error_reason"]
     assert manager.calls == []
+
+
+def test_provider_executor_reconcile_blocks_stale_dispatch_replay(
+    tmp_path: Path,
+):
+    class FakeAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, session_id, initiated_by="system"):
+            self.calls.append(("recover", session_id, initiated_by))
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id=session_id,
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+
+    stale = replace(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        generation=1,
+        reserved_units=5,
+        driver_epoch_id="epoch.claude.1",
+        provider_dispatch_id="dispatch.claude.1",
+        provider_result_id="result.claude.1",
+        provider_idempotency_key="quark:work.1:1",
+    )
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        replace(
+            stale,
+            generation=2,
+            provider_dispatch_id="dispatch.claude.2",
+            provider_result_id="result.claude.2",
+            provider_idempotency_key="quark:work.1:2",
+        )
+    )
+    manager = FakeAgentManager()
+
+    result = ProviderWorkExecutor(
+        manager,
+        work_store=store,
+    ).reconcile_slice(stale, "checkpoint prompt")
+
+    assert result["status"] == "policy_blocked"
+    assert "persisted work binding mismatch" in result["error_reason"]
+    assert manager.calls == []
+
+
+def test_provider_executor_initial_dispatch_accepts_expected_generation_transition(
+    tmp_path: Path,
+):
+    class FakeAgentManager:
+        def __init__(self):
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+            self.dispatches = []
+
+        def recover(self, session_id, initiated_by="system"):
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id=session_id,
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            self.dispatches.append((args, kwargs))
+            return SimpleNamespace(
+                id="result.claude.2",
+                request_id="dispatch.claude.2",
+                provider_reference="provider-job-2",
+                provider_id="claude",
+                session_id="session.claude.project-a",
+                driver_epoch_id="epoch.claude.1",
+                state=AgentOperationState.ACKNOWLEDGED,
+            )
+
+    queued = replace(
+        _agent_work(
+            "work.1",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.CHECKPOINTED,
+        generation=1,
+        driver_epoch_id="epoch.claude.1",
+        provider_dispatch_id="dispatch.claude.1",
+        provider_result_id="result.claude.1",
+        provider_reference="provider-job-1",
+        provider_idempotency_key="quark:work.1:1",
+        provider_dispatch_state="succeeded",
+    )
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(
+        replace(
+            queued,
+            state=WorkState.RUNNING,
+            generation=2,
+            reserved_units=5,
+        )
+    )
+    manager = FakeAgentManager()
+
+    result = ProviderWorkExecutor(
+        manager,
+        work_store=store,
+    ).run_slice(queued, 5, "checkpoint prompt")
+
+    assert result["status"] == "acknowledged"
+    assert result["provider_dispatch_id"] == "dispatch.claude.2"
+    assert len(manager.dispatches) == 1
 
 
 def test_provider_executor_reconcile_blocks_recovered_epoch_session_mismatch():
@@ -564,7 +701,7 @@ def test_provider_executor_reconcile_rejects_mismatched_result_bindings():
 def test_scheduler_cli_accepts_provider_native_work_fields():
     args = build_parser().parse_args(
         [
-            "register-work",
+            "register-agent-work",
             "--work-id",
             "work.claude",
             "--project-id",
@@ -595,7 +732,7 @@ def test_scheduler_cli_requires_explicit_usage_unit_for_generic_work(tmp_path: P
         [
             "--db",
             str(tmp_path / "quark.sqlite3"),
-            "register-work",
+            "register-agent-work",
             "--work-id",
             "work.claude",
             "--project-id",
@@ -651,12 +788,229 @@ def test_scheduler_cli_preserves_legacy_codex_register_shape(tmp_path: Path):
     }
 
 
+def test_scheduler_cli_mixed_queue_keeps_legacy_rows_exact(tmp_path: Path):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    legacy = _work("work.codex", "mixed", 5)
+    store.save_work(legacy)
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "mixed",
+            "claude",
+            "limit.claude.tokens",
+            100,
+            usage_unit="tokens",
+        )
+    )
+    store.close()
+
+    result = quark_scheduler_cli.run(
+        build_parser().parse_args(
+            ["--db", str(tmp_path / "quark.sqlite3"), "queue"]
+        )
+    )
+
+    assert result == {
+        "items": [_codex_work_payload(legacy)],
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def test_scheduler_cli_agent_queue_is_separate_expanded_surface(tmp_path: Path):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    generic = _agent_work(
+        "work.claude",
+        "mixed",
+        "claude",
+        "limit.claude.tokens",
+        100,
+        usage_unit="tokens",
+    )
+    store.save_work(_work("work.codex", "mixed", 5))
+    store.save_work(generic)
+    store.close()
+
+    result = quark_scheduler_cli.run(
+        build_parser().parse_args(
+            ["--db", str(tmp_path / "quark.sqlite3"), "agent-queue"]
+        )
+    )
+
+    assert result["items"] == [quark_scheduler_cli._work_payload(generic)]
+    assert result["counts"] == {"queued": 1}
+
+
+def test_scheduler_cli_mixed_project_effort_keeps_legacy_nine_fields(
+    tmp_path: Path,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(_work("work.codex", "mixed", 5))
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "mixed",
+            "claude",
+            "limit.claude.tokens",
+            100,
+            usage_unit="tokens",
+        )
+    )
+    store.close()
+
+    result = quark_scheduler_cli.run(
+        build_parser().parse_args(
+            [
+                "--db",
+                str(tmp_path / "quark.sqlite3"),
+                "project-effort",
+                "--project-id",
+                "mixed",
+            ]
+        )
+    )
+
+    assert result == {
+        "project_id": "mixed",
+        "work_items": 1,
+        "estimated_quota_points": 5,
+        "estimated_tokens": 0,
+        "actual_quota_points": 0,
+        "actual_tokens": 0,
+        "completed_slices": 0,
+        "work_states": {"queued": 1},
+        "attribution": [],
+    }
+
+
+def test_scheduler_cli_empty_legacy_effort_uses_numeric_zero_totals(
+    tmp_path: Path,
+):
+    result = quark_scheduler_cli.run(
+        build_parser().parse_args(
+            [
+                "--db",
+                str(tmp_path / "quark.sqlite3"),
+                "project-effort",
+                "--project-id",
+                "missing",
+            ]
+        )
+    )
+
+    assert result == {
+        "project_id": "missing",
+        "work_items": 0,
+        "estimated_quota_points": 0,
+        "estimated_tokens": 0,
+        "actual_quota_points": 0,
+        "actual_tokens": 0,
+        "completed_slices": 0,
+        "work_states": {},
+        "attribution": [],
+    }
+
+
+def test_scheduler_cli_mixed_plan_uses_only_legacy_codex_rows(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(_work("work.codex", "mixed", 5))
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "mixed",
+            "claude",
+            "codex",
+            100,
+            usage_unit="tokens",
+        )
+    )
+    store.close()
+    monkeypatch.setattr(
+        quark_scheduler_cli,
+        "CodexUsageTracker",
+        lambda _path: FakeUsageSource((_snapshot(84, 1000),)),
+    )
+
+    result = quark_scheduler_cli.run(
+        build_parser().parse_args(
+            ["--db", str(tmp_path / "quark.sqlite3"), "plan"]
+        )
+    )
+
+    assert result["planned"] == 1
+    assert result["allocations"] == [
+        {
+            "work_id": "work.codex",
+            "project_id": "mixed",
+            "owner_thread": "thread-mixed",
+            "generation": 1,
+            "allocated_quota_points": 5,
+        }
+    ]
+    assert "reconciled" not in result
+
+
+def test_scheduler_cli_mixed_run_cycle_preserves_legacy_result_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    store.save_work(_work("work.codex", "mixed", 5))
+    store.save_work(
+        _agent_work(
+            "work.claude",
+            "mixed",
+            "claude",
+            "codex",
+            100,
+            usage_unit="tokens",
+        )
+    )
+    store.close()
+    usage = FakeUsageSource(
+        (_snapshot(84, 1000), _snapshot(82, 1400))
+    )
+    monkeypatch.setattr(
+        quark_scheduler_cli,
+        "CodexUsageTracker",
+        lambda _path: usage,
+    )
+    monkeypatch.setattr(
+        quark_scheduler_cli,
+        "CodexExecSliceAdapter",
+        lambda: FakeExecutor(),
+    )
+
+    result = quark_scheduler_cli.run(
+        build_parser().parse_args(
+            ["--db", str(tmp_path / "quark.sqlite3"), "run-cycle"]
+        )
+    )
+
+    assert result["planned"] == 1
+    assert result["executed"] == 1
+    assert result["results"] == [
+        {
+            "work_id": "work.codex",
+            "generation": 1,
+            "allocated_quota_points": 5,
+            "status": "checkpointed",
+            "exit_code": 0,
+            "checkpoint_ref": "commit:def456",
+        }
+    ]
+    assert "reconcile_results" not in result
+
+
 def test_scheduler_cli_accepts_explicit_agent_manager_configuration():
     args = build_parser().parse_args(
         [
             "--db",
             "/tmp/quark.sqlite3",
-            "run-cycle",
+            "agent-run-cycle",
             "--limit-id",
             "limit.claude.tokens",
             "--agent-registry",
@@ -914,6 +1268,32 @@ def test_codex_project_effort_serializer_preserves_nine_field_baseline():
         "completed_slices": 1,
         "work_states": {"checkpointed": 1},
         "attribution": ["shared"],
+    }
+
+
+def test_codex_project_effort_serializer_uses_zero_for_empty_project():
+    assert _codex_project_effort_payload(
+        {
+            "project_id": "missing",
+            "work_items": 0,
+            "estimated_quota_points": None,
+            "estimated_tokens": None,
+            "actual_quota_points": None,
+            "actual_tokens": None,
+            "completed_slices": 0,
+            "work_states": {},
+            "attribution": [],
+        }
+    ) == {
+        "project_id": "missing",
+        "work_items": 0,
+        "estimated_quota_points": 0,
+        "estimated_tokens": 0,
+        "actual_quota_points": 0,
+        "actual_tokens": 0,
+        "completed_slices": 0,
+        "work_states": {},
+        "attribution": [],
     }
 
 

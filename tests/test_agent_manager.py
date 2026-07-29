@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Mapping
@@ -43,7 +44,12 @@ class FakeDriver:
         self.profile = profile
         self.events = events
         self.dispatch_calls = 0
+        self.start_calls = 0
+        self.resume_calls = 0
         self.import_state = AgentOperationState.ACKNOWLEDGED
+        self.import_overrides: dict[str, str] = {}
+        self.checkpoint_expires_at: str | None = None
+        self.checkpoint_status = "ready"
 
     def _result(
         self,
@@ -74,19 +80,21 @@ class FakeDriver:
         return None
 
     def start(self, profile: AgentInstanceProfile) -> AgentDispatchResult:
+        self.start_calls += 1
         self.events.append(f"start:{self.provider.id}")
         return self._result(
             request_id=f"activate.{self.provider.id}",
-            session_id=f"session.{self.provider.id}",
+            session_id=f"external.{self.provider.id}.1",
             epoch_id="pending",
             state=AgentOperationState.ACKNOWLEDGED,
         )
 
     def resume(self, session: AgentSession) -> AgentDispatchResult:
+        self.resume_calls += 1
         self.events.append(f"resume:{self.provider.id}")
         return self._result(
             request_id=f"recover.{self.provider.id}",
-            session_id=session.id,
+            session_id=session.external_session_id,
             epoch_id="pending",
             state=AgentOperationState.RUNNING,
         )
@@ -116,7 +124,11 @@ class FakeDriver:
             instance_id=self.profile.id,
             session_id=session.id,
             driver_epoch_id="provider-owned-untrusted-epoch",
-            evidence={"status": "ready", "evidence_id": "evidence.checkpoint"},
+            evidence={
+                "status": self.checkpoint_status,
+                "evidence_id": "evidence.checkpoint",
+            },
+            expires_at=self.checkpoint_expires_at,
         )
 
     def cancel(self, session: AgentSession) -> AgentDispatchResult:
@@ -138,12 +150,23 @@ class FakeDriver:
             if self.import_state is AgentOperationState.FAILED
             else None
         )
-        return self._result(
-            request_id=f"handoff.{package.id}",
-            session_id=f"session.{self.provider.id}",
-            epoch_id="provider-owned-untrusted-epoch",
+        result = self._result(
+            request_id=self.import_overrides.get(
+                "request_id", f"handoff.{package.id}"
+            ),
+            session_id=self.import_overrides.get(
+                "session_id", str(package.evidence["incoming_session_id"])
+            ),
+            epoch_id=self.import_overrides.get(
+                "driver_epoch_id", str(package.evidence["incoming_epoch_id"])
+            ),
             state=self.import_state,
             error_category=category,
+        )
+        return replace(
+            result,
+            instance_id=self.import_overrides.get("instance_id", self.profile.id),
+            provider_id=self.import_overrides.get("provider_id", self.provider.id),
         )
 
 
@@ -250,7 +273,7 @@ def manager(
 def test_dispatch_is_bound_to_active_epoch(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
-    value, _, _, _ = manager
+    value, store, _, _ = manager
     epoch = value.activate("overseer.default", initiated_by="operator")
 
     result = value.dispatch(
@@ -284,9 +307,29 @@ def test_activation_does_not_trust_adapter_owned_session_identity(
 
     assert epoch.session_id != "session.codex"
     assert store.load_agent_session(epoch.session_id).provider_id == "codex"
+    assert (
+        store.load_agent_session(epoch.session_id).external_session_id
+        == "external.codex.1"
+    )
     assert store.load_agent_session(epoch.session_id).legacy_references[
         "initiated_by_ref"
     ] == "operator"
+
+
+def test_activate_is_idempotent_when_an_epoch_is_already_open(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, drivers, _ = manager
+    first = value.activate("overseer.default", initiated_by="operator")
+    second = value.activate("overseer.default", initiated_by="operator")
+
+    assert second == first
+    assert drivers["codex"].start_calls == 1
+    assert [
+        epoch
+        for epoch in store.list_driver_epochs()
+        if epoch.instance_id == "overseer.default" and epoch.closed_at is None
+    ] == [first]
 
 
 def test_repeated_idempotency_key_returns_recorded_result_without_redispatch(
@@ -344,6 +387,38 @@ def test_provider_evidence_cannot_override_manager_recorded_result_state(
     assert replayed == recorded
 
 
+def test_recorded_result_drops_unbounded_provider_error_message(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, _, _ = manager
+    epoch = value.activate("overseer.default", initiated_by="operator")
+    request = AgentDispatchRequest(
+        id="dispatch.error",
+        instance_id=epoch.instance_id,
+        session_id=epoch.session_id,
+        driver_epoch_id=epoch.id,
+        idempotency_key="error-key",
+        prompt="continue",
+    )
+    store.save_agent_dispatch(request)
+    result = AgentDispatchResult(
+        id="result.error",
+        request_id=request.id,
+        instance_id=epoch.instance_id,
+        session_id=epoch.session_id,
+        driver_epoch_id=epoch.id,
+        provider_id=epoch.provider_id,
+        state=AgentOperationState.FAILED,
+        error_category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+        error_message="unbounded provider response body",
+    )
+
+    recorded = value.record_provider_result(epoch.id, result)
+
+    assert recorded.error_message is None
+    assert store.load_agent_dispatch_result(recorded.id).error_message is None
+
+
 def test_repeated_idempotency_key_survives_manager_reconstruction(
     tmp_path: Path,
 ) -> None:
@@ -372,14 +447,46 @@ def test_idempotency_key_cannot_replay_a_different_instance_result(
     value.activate("overseer.default", initiated_by="operator")
     value.dispatch("overseer.default", "continue", "instance-bound-key")
 
-    with pytest.raises(ValueError, match="different agent instance"):
+    with pytest.raises(KeyError, match="no active driver epoch"):
         value.dispatch("other.instance", "continue", "instance-bound-key")
+
+
+def test_idempotency_uniqueness_race_reloads_scoped_winner(tmp_path: Path) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    path = tmp_path / "state.sqlite3"
+
+    class RacingStore(OverseerStore):
+        raced = False
+
+        def save_agent_dispatch(self, dispatch: AgentDispatchRequest) -> None:
+            if not self.raced:
+                self.raced = True
+                with OverseerStore(path) as competitor:
+                    competitor.save_agent_dispatch(
+                        replace(dispatch, id="dispatch.race-winner")
+                    )
+            super().save_agent_dispatch(dispatch)
+
+    with RacingStore(path) as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+        value.activate("overseer.default", initiated_by="operator")
+
+        result = value.dispatch(
+            "overseer.default",
+            "continue",
+            "race-key",
+        )
+
+        assert result.request_id == "dispatch.race-winner"
+        assert result.state is AgentOperationState.QUEUED
+        assert drivers["codex"].dispatch_calls == 0
 
 
 def test_late_result_from_closed_epoch_is_quarantined(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
-    value, _, _, _ = manager
+    value, store, _, _ = manager
     old = value.activate("overseer.default", initiated_by="operator")
     value.manual_handoff(
         "overseer.default",
@@ -402,7 +509,9 @@ def test_late_result_from_closed_epoch_is_quarantined(
 
     assert result.state is AgentOperationState.QUARANTINED
     assert result.error_category is AgentErrorCategory.QUARANTINED
-    assert result.evidence["reason"] == "closed_or_inactive_driver_epoch"
+    assert result.evidence["reason"] == "unknown_dispatch_request"
+    assert result.id != late.id
+    assert store.list_agent_dispatch_results() == (result,)
 
 
 def test_manual_handoff_closes_outgoing_only_after_incoming_acknowledgement(
@@ -428,6 +537,46 @@ def test_manual_handoff_closes_outgoing_only_after_incoming_acknowledgement(
     assert events.index("import:claude") < events.index("store:close-outgoing")
 
 
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    (
+        ("instance_id", "other.instance"),
+        ("provider_id", "codex"),
+        ("session_id", "session.wrong"),
+        ("driver_epoch_id", "epoch.wrong"),
+        ("request_id", "handoff.wrong"),
+    ),
+)
+def test_handoff_rejects_acknowledgement_with_mismatched_binding(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+    field: str,
+    bad_value: str,
+) -> None:
+    value, store, drivers, _ = manager
+    outgoing = value.activate("overseer.default", initiated_by="operator")
+    value.registry.driver_for_provider("claude", instance_id="overseer.default")
+    drivers["claude"].import_overrides[field] = bad_value
+
+    with pytest.raises(AgentHandoffError, match="handoff_incompatible"):
+        value.manual_handoff(
+            "overseer.default",
+            incoming_provider_id="claude",
+            initiated_by="operator",
+            approval_id="approval.invalid-ack",
+        )
+
+    paused = store.load_driver_epoch(outgoing.id)
+    assert paused.closed_at is None
+    assert paused.state is AgentOperationState.BLOCKED
+    assert len(
+        [
+            epoch
+            for epoch in store.list_driver_epochs()
+            if epoch.instance_id == outgoing.instance_id and epoch.closed_at is None
+        ]
+    ) == 1
+
+
 def test_failed_import_leaves_paused_auditable_state_and_outgoing_open(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
@@ -448,19 +597,20 @@ def test_failed_import_leaves_paused_auditable_state_and_outgoing_open(
         )
 
     stored_outgoing = store.load_driver_epoch(outgoing.id)
-    latest = value.active_epoch("overseer.default")
     assert stored_outgoing.closed_at is None
-    assert stored_outgoing.state is AgentOperationState.RUNNING
-    assert latest.ordinal == outgoing.ordinal + 1
-    assert latest.state is AgentOperationState.BLOCKED
-    assert latest.reason == f"handoff_failed:{AgentErrorCategory.HANDOFF_INCOMPATIBLE.value}"
+    assert stored_outgoing.state is AgentOperationState.BLOCKED
+    assert (
+        stored_outgoing.reason
+        == f"handoff_failed:{AgentErrorCategory.HANDOFF_INCOMPATIBLE.value}"
+    )
     assert len(store.list_agent_checkpoints()) == 1
-    assert store.list_agent_handoffs()[0].evidence == {
-        "checkpoint_id": store.list_agent_checkpoints()[0].id,
-        "outgoing_epoch_id": outgoing.id,
-        "reason": AgentErrorCategory.HANDOFF_INCOMPATIBLE.value,
-        "status": AgentOperationState.FAILED.value,
-    }
+    handoff_evidence = store.list_agent_handoffs()[0].evidence
+    assert handoff_evidence["checkpoint_id"] == store.list_agent_checkpoints()[0].id
+    assert handoff_evidence["outgoing_epoch_id"] == outgoing.id
+    assert handoff_evidence["reason"] == AgentErrorCategory.HANDOFF_INCOMPATIBLE.value
+    assert handoff_evidence["status"] == "blocked"
+    assert handoff_evidence["incoming_epoch_id"]
+    assert handoff_evidence["incoming_session_id"]
     with pytest.raises(AgentManagerPausedError, match="paused"):
         value.dispatch("overseer.default", "must not run", "paused-key")
 
@@ -539,6 +689,58 @@ def test_checkpoint_rebinds_untrusted_adapter_identity_to_active_epoch(
     assert store.load_agent_checkpoint(checkpoint.id) == checkpoint
 
 
+@pytest.mark.parametrize(
+    "expires_at",
+    (
+        "not-a-timestamp",
+        "2026-07-29T00:00:00",
+        "2026-07-28T23:59:59+00:00",
+    ),
+)
+def test_handoff_rejects_malformed_naive_or_expired_checkpoint(
+    tmp_path: Path,
+    expires_at: str,
+) -> None:
+    events: list[str] = []
+    registry, drivers = _registry(tmp_path, events)
+    now = datetime(2026, 7, 29, tzinfo=timezone.utc)
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(
+            registry,
+            store,
+            authorization_callback=_allow,
+            clock=lambda: now.isoformat(),
+        )
+        outgoing = value.activate("overseer.default", initiated_by="operator")
+        drivers["codex"].checkpoint_expires_at = expires_at
+
+        with pytest.raises(AgentHandoffError, match="checkpoint"):
+            value.manual_handoff(
+                "overseer.default",
+                "claude",
+                "operator",
+                "approval.checkpoint",
+            )
+
+        assert store.load_driver_epoch(outgoing.id).closed_at is None
+        assert store.list_agent_handoffs() == ()
+
+
+def test_handoff_rejects_nontransferable_checkpoint_state(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, drivers, _ = manager
+    outgoing = value.activate("overseer.default", initiated_by="operator")
+    drivers["codex"].checkpoint_status = "running"
+
+    with pytest.raises(AgentHandoffError, match="transferable"):
+        value.manual_handoff(
+            "overseer.default", "claude", "operator", "approval.transfer"
+        )
+
+    assert store.load_driver_epoch(outgoing.id).closed_at is None
+
+
 def test_recover_opens_next_epoch_for_persisted_session(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
@@ -558,6 +760,98 @@ def test_recover_opens_next_epoch_for_persisted_session(
     assert recovered.provider_id == first.provider_id
     assert recovered.session_id == first.session_id
     assert recovered.state is AgentOperationState.RUNNING
+
+    repeated = value.recover(first.session_id, initiated_by="operator")
+    assert repeated == recovered
+    assert len(
+        [
+            epoch
+            for epoch in store.list_driver_epochs()
+            if epoch.instance_id == first.instance_id and epoch.closed_at is None
+        ]
+    ) == 1
+
+
+def test_result_binding_mismatch_quarantines_without_overwriting_request(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, _, _ = manager
+    epoch = value.activate("overseer.default", initiated_by="operator")
+    winner = value.dispatch("overseer.default", "continue", "winner-key")
+    before = store.load_agent_dispatch(winner.request_id)
+    mismatched = replace(
+        winner,
+        id="result.mismatched",
+        driver_epoch_id="epoch.other",
+        evidence={"message_id": "message.late"},
+    )
+
+    quarantined = value.record_provider_result(epoch.id, mismatched)
+
+    assert quarantined.state is AgentOperationState.QUARANTINED
+    assert quarantined.evidence["reason"] == "dispatch_request_binding_mismatch"
+    assert quarantined.evidence["message_id"] == "message.late"
+    assert store.load_agent_dispatch(winner.request_id) == before
+    assert {result.id for result in store.list_agent_dispatch_results()} == {
+        winner.id,
+        quarantined.id,
+    }
+
+
+def test_result_and_quarantine_mutations_require_policy_authorization(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, _ = _registry(tmp_path, events)
+
+    def authorize(operation: str, context: Mapping[str, object]) -> bool:
+        return operation not in {"record_provider_result", "quarantine_result"}
+
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=authorize)
+        epoch = value.activate("overseer.default", initiated_by="operator")
+        result = AgentDispatchResult(
+            id="result.denied",
+            request_id="request.denied",
+            instance_id=epoch.instance_id,
+            session_id=epoch.session_id,
+            driver_epoch_id=epoch.id,
+            provider_id=epoch.provider_id,
+            state=AgentOperationState.SUCCEEDED,
+        )
+        with pytest.raises(AgentAuthorizationError, match="record_provider_result"):
+            value.record_provider_result(epoch.id, result)
+        with pytest.raises(AgentAuthorizationError, match="quarantine_result"):
+            value.quarantine_result(result, reason="denied")
+        assert store.list_agent_dispatch_results() == ()
+
+
+def test_handoff_transition_rolls_back_all_writes_on_final_save_failure(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry, _ = _registry(tmp_path, events)
+
+    class FailingStore(OverseerStore):
+        def save_driver_epoch(self, epoch: object) -> None:
+            if getattr(epoch, "closed_at", None) is not None:
+                raise RuntimeError("injected final transition failure")
+            super().save_driver_epoch(epoch)
+
+    with FailingStore(tmp_path / "state.sqlite3") as store:
+        value = AgentManager(registry, store, authorization_callback=_allow)
+        outgoing = value.activate("overseer.default", initiated_by="operator")
+        with pytest.raises(RuntimeError, match="final transition"):
+            value.manual_handoff(
+                "overseer.default",
+                "claude",
+                "operator",
+                "approval.rollback",
+            )
+
+        assert store.load_driver_epoch(outgoing.id) == outgoing
+        assert store.list_agent_checkpoints() == ()
+        assert store.list_agent_handoffs() == ()
 
 
 def test_registry_provider_specific_resolution_is_typed_and_scoped(

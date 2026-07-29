@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRec
 from .agent_contracts import (
     AgentCheckpoint,
     AgentDispatchRequest,
+    AgentDispatchResult,
     AgentHandoffPackage,
     AgentInstanceProfile,
     AgentOperationState,
@@ -40,6 +42,7 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 
 CURRENT_SCHEMA_VERSION = 1
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
+AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 _REDACTED_AGENT_TRANSCRIPT = "[redacted agent transcript]"
 _REDACTED_DISPATCH_PROMPT = "[redacted dispatch prompt]"
 _AGENT_CREDENTIAL_KEYS = frozenset(
@@ -121,6 +124,7 @@ class SQLiteStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self.path, timeout=30.0)
         self._connection.row_factory = sqlite3.Row
+        self._agent_transaction_depth = 0
         self._configure_connection()
         self.initialize()
 
@@ -321,8 +325,22 @@ class SQLiteStore:
                 """
                 CREATE TABLE IF NOT EXISTS agent_dispatches (
                     id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL,
                     driver_epoch_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    UNIQUE(instance_id, idempotency_key)
+                )
+                """
+            )
+            self._migrate_agent_dispatch_scope()
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_dispatch_results (
+                    id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    driver_epoch_id TEXT NOT NULL,
                     state TEXT NOT NULL,
                     payload TEXT NOT NULL
                 )
@@ -351,6 +369,78 @@ class SQLiteStore:
                 AGENT_DRIVER_SCHEMA_VERSION,
                 "persist provider-neutral agent driver lifecycle records",
             )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V2,
+                "scope dispatch idempotency and persist distinct result attempts",
+            )
+
+    def _migrate_agent_dispatch_scope(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(agent_dispatches)"
+            ).fetchall()
+        }
+        if "instance_id" in columns:
+            return
+        rows = self._connection.execute(
+            "SELECT id, driver_epoch_id, idempotency_key, state, payload "
+            "FROM agent_dispatches"
+        ).fetchall()
+        self._connection.execute(
+            "ALTER TABLE agent_dispatches RENAME TO agent_dispatches_legacy_v1"
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE agent_dispatches (
+                id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                driver_epoch_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(instance_id, idempotency_key)
+            )
+            """
+        )
+        for row in rows:
+            instance_id = json.loads(str(row["payload"])).get("instance_id")
+            if not isinstance(instance_id, str) or not instance_id:
+                raise ValueError("legacy agent dispatch lacks instance identity")
+            self._connection.execute(
+                "INSERT INTO agent_dispatches VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row["id"],
+                    instance_id,
+                    row["driver_epoch_id"],
+                    row["idempotency_key"],
+                    row["state"],
+                    row["payload"],
+                ),
+            )
+        self._connection.execute("DROP TABLE agent_dispatches_legacy_v1")
+
+    @contextmanager
+    def agent_transaction(self) -> Iterable[None]:
+        outermost = self._agent_transaction_depth == 0
+        if outermost:
+            self._connection.execute("BEGIN IMMEDIATE")
+        self._agent_transaction_depth += 1
+        try:
+            yield
+        except Exception:
+            self._agent_transaction_depth -= 1
+            if outermost:
+                self._connection.rollback()
+            raise
+        else:
+            self._agent_transaction_depth -= 1
+            if outermost:
+                self._connection.commit()
+
+    def _commit_agent_mutation(self) -> None:
+        if self._agent_transaction_depth == 0:
+            self._connection.commit()
 
     def _record_schema_migration(self, version: int, description: str) -> None:
         self._connection.execute(
@@ -506,7 +596,10 @@ class SQLiteStore:
     def save_agent_dispatch(self, dispatch: AgentDispatchRequest) -> None:
         self._reject_agent_secondary_collision(
             "agent_dispatches",
-            {"idempotency_key": dispatch.idempotency_key},
+            {
+                "instance_id": dispatch.instance_id,
+                "idempotency_key": dispatch.idempotency_key,
+            },
             dispatch.id,
             "dispatch idempotency key",
         )
@@ -524,6 +617,7 @@ class SQLiteStore:
                 "requested_by",
             ),
             {
+                "instance_id": dispatch.instance_id,
                 "driver_epoch_id": dispatch.driver_epoch_id,
                 "idempotency_key": dispatch.idempotency_key,
                 "state": AgentOperationState.QUEUED.value,
@@ -540,6 +634,45 @@ class SQLiteStore:
         return tuple(
             _load_dataclass(AgentDispatchRequest, payload)
             for payload in self._list_payloads("agent_dispatches")
+        )
+
+    def load_agent_dispatch_by_idempotency(
+        self,
+        instance_id: str,
+        idempotency_key: str,
+    ) -> AgentDispatchRequest:
+        row = self._connection.execute(
+            "SELECT payload FROM agent_dispatches "
+            "WHERE instance_id = ? AND idempotency_key = ?",
+            (instance_id, idempotency_key),
+        ).fetchone()
+        if row is None:
+            raise KeyError((instance_id, idempotency_key))
+        return _load_dataclass(AgentDispatchRequest, str(row["payload"]))
+
+    def save_agent_dispatch_result(self, result: AgentDispatchResult) -> None:
+        self._save_agent_record(
+            "agent_dispatch_results",
+            result,
+            AgentDispatchResult,
+            tuple(AgentDispatchResult.__dataclass_fields__),
+            {
+                "request_id": result.request_id,
+                "driver_epoch_id": result.driver_epoch_id,
+                "state": result.state.value,
+            },
+        )
+
+    def load_agent_dispatch_result(self, result_id: str) -> AgentDispatchResult:
+        return _load_dataclass(
+            AgentDispatchResult,
+            self._get_payload("agent_dispatch_results", result_id),
+        )
+
+    def list_agent_dispatch_results(self) -> tuple[AgentDispatchResult, ...]:
+        return tuple(
+            _load_dataclass(AgentDispatchResult, payload)
+            for payload in self._list_payloads("agent_dispatch_results")
         )
 
     def save_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> None:
@@ -1076,7 +1209,7 @@ class SQLiteStore:
                 f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
                 (sanitized_record.id, *indexed_values.values(), payload),
             )
-        self._connection.commit()
+        self._commit_agent_mutation()
 
     def _reject_agent_secondary_collision(
         self,

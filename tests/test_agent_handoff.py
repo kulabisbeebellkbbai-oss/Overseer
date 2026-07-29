@@ -11,7 +11,12 @@ from overseer.agent_contracts import (
     AgentOperationState,
     DriverEpoch,
 )
-from overseer.agent_handoff import AgentHandoffService
+from overseer.agent_handoff import (
+    MAX_HANDOFF_DEPTH,
+    MAX_HANDOFF_ITEMS,
+    MAX_HANDOFF_STRING_LENGTH,
+    AgentHandoffService,
+)
 from overseer.store import OverseerStore
 
 
@@ -153,5 +158,72 @@ def test_handoff_build_from_store_rejects_mismatched_checkpoint() -> None:
             checkpoint=checkpoint,
             incoming_provider_id="claude",
             objective="continue",
+            required_capabilities=AgentCapabilities(handoff_import=True),
+        )
+
+
+def test_handoff_accepts_values_at_deterministic_size_boundaries() -> None:
+    nested: dict[str, object] = {"status": "x" * MAX_HANDOFF_STRING_LENGTH}
+    for index in range(MAX_HANDOFF_DEPTH - 1):
+        nested = {f"level_{index}": nested}
+    evidence = {f"item_{index}": index for index in range(MAX_HANDOFF_ITEMS - 1)}
+    evidence["nested"] = nested
+
+    package = AgentHandoffService().build(
+        instance_id="overseer.default",
+        outgoing_epoch_id="epoch.1",
+        incoming_provider_id="claude",
+        objective="x" * MAX_HANDOFF_STRING_LENGTH,
+        evidence=evidence,
+        required_capabilities=AgentCapabilities(handoff_import=True),
+    )
+
+    assert len(package.objective) == MAX_HANDOFF_STRING_LENGTH
+
+
+@pytest.mark.parametrize(
+    ("objective", "evidence", "message"),
+    (
+        ("x" * (MAX_HANDOFF_STRING_LENGTH + 1), {}, "string size"),
+        (
+            "continue",
+            {"status": "x" * (MAX_HANDOFF_STRING_LENGTH + 1)},
+            "string size",
+        ),
+        (
+            "continue",
+            {f"item_{index}": index for index in range(MAX_HANDOFF_ITEMS + 1)},
+            "item count",
+        ),
+    ),
+)
+def test_handoff_rejects_values_beyond_deterministic_bounds(
+    objective: str,
+    evidence: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AgentHandoffService().build(
+            instance_id="overseer.default",
+            outgoing_epoch_id="epoch.1",
+            incoming_provider_id="claude",
+            objective=objective,
+            evidence=evidence,
+            required_capabilities=AgentCapabilities(handoff_import=True),
+        )
+
+
+def test_handoff_rejects_excessive_nesting_depth() -> None:
+    evidence: dict[str, object] = {"status": "ready"}
+    for index in range(MAX_HANDOFF_DEPTH + 1):
+        evidence = {f"level_{index}": evidence}
+
+    with pytest.raises(ValueError, match="nesting depth"):
+        AgentHandoffService().build(
+            instance_id="overseer.default",
+            outgoing_epoch_id="epoch.1",
+            incoming_provider_id="claude",
+            objective="continue",
+            evidence=evidence,
             required_capabilities=AgentCapabilities(handoff_import=True),
         )

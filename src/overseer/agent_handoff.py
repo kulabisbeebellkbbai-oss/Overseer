@@ -15,6 +15,10 @@ from .agent_contracts import (
     DriverEpoch,
 )
 
+MAX_HANDOFF_DEPTH = 8
+MAX_HANDOFF_ITEMS = 256
+MAX_HANDOFF_STRING_LENGTH = 4096
+
 
 class AgentHandoffStore(Protocol):
     def load_agent_checkpoint(self, checkpoint_id: str) -> AgentCheckpoint: ...
@@ -64,6 +68,8 @@ class AgentHandoffService:
         checkpoint_id: str | None = None,
         package_id: str | None = None,
     ) -> AgentHandoffPackage:
+        _validate_handoff_bounds(objective)
+        _validate_handoff_bounds(evidence)
         _reject_sensitive_material(objective, key="objective")
         _reject_sensitive_material(evidence)
         package = AgentHandoffPackage(
@@ -131,6 +137,29 @@ class AgentHandoffService:
         if not incoming_capabilities.supports(package.required_capabilities):
             raise ValueError("incoming provider lacks required capabilities")
         return package
+
+
+def _validate_handoff_bounds(value: object, *, depth: int = 0) -> None:
+    if isinstance(value, str):
+        if len(value) > MAX_HANDOFF_STRING_LENGTH:
+            raise ValueError("handoff string size exceeds limit")
+        return
+    if isinstance(value, Mapping):
+        if depth > MAX_HANDOFF_DEPTH:
+            raise ValueError("handoff nesting depth exceeds limit")
+        if len(value) > MAX_HANDOFF_ITEMS:
+            raise ValueError("handoff item count exceeds limit")
+        for key, child_value in value.items():
+            _validate_handoff_bounds(str(key), depth=depth)
+            _validate_handoff_bounds(child_value, depth=depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        if depth > MAX_HANDOFF_DEPTH:
+            raise ValueError("handoff nesting depth exceeds limit")
+        if len(value) > MAX_HANDOFF_ITEMS:
+            raise ValueError("handoff item count exceeds limit")
+        for child_value in value:
+            _validate_handoff_bounds(child_value, depth=depth + 1)
 
 
 def _reject_sensitive_material(value: object, *, key: str | None = None) -> None:

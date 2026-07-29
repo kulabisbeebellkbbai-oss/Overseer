@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,8 @@ from overseer.agent_contracts import (
     AgentCapabilities,
     AgentCheckpoint,
     AgentDispatchRequest,
+    AgentDispatchResult,
+    AgentErrorCategory,
     AgentHandoffPackage,
     AgentInstanceProfile,
     AgentOperationState,
@@ -497,7 +500,13 @@ def test_existing_integer_schema_migration_rows_and_indexes_are_preserved(tmp_pa
         )
 
     with OverseerStore(path) as store:
-        assert [row.version for row in store.list_schema_migrations()] == [1, 2, 10, "agent_driver_v1"]
+        assert [row.version for row in store.list_schema_migrations()] == [
+            1,
+            2,
+            10,
+            "agent_driver_v1",
+            "agent_driver_v2",
+        ]
 
     with sqlite3.connect(path) as connection:
         schema = connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
@@ -532,4 +541,131 @@ def test_agent_migration_rolls_back_cleanly_and_retries(tmp_path: Path) -> None:
     assert tables_after_failure == set()
 
     with OverseerStore(path) as store:
-        assert [row.version for row in store.list_schema_migrations()] == [1, "agent_driver_v1"]
+        assert [row.version for row in store.list_schema_migrations()] == [
+            1,
+            "agent_driver_v1",
+            "agent_driver_v2",
+        ]
+
+
+def test_dispatch_idempotency_is_scoped_by_instance(tmp_path: Path) -> None:
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        first = _dispatch("dispatch.1", "epoch.1")
+        second = replace(
+            first,
+            id="dispatch.2",
+            instance_id="instance.2",
+            session_id="session.2",
+            driver_epoch_id="epoch.2",
+        )
+        store.save_agent_dispatch(first)
+        store.save_agent_dispatch(second)
+
+        assert (
+            store.load_agent_dispatch_by_idempotency("instance.1", "key.1")
+            == replace(first, prompt="[redacted dispatch prompt]")
+        )
+        assert (
+            store.load_agent_dispatch_by_idempotency("instance.2", "key.1")
+            == replace(second, prompt="[redacted dispatch prompt]")
+        )
+
+
+def test_legacy_global_dispatch_key_schema_migrates_without_losing_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    dispatch = _dispatch("dispatch.legacy", "epoch.legacy")
+    payload = json.dumps(
+        {
+            "id": dispatch.id,
+            "instance_id": dispatch.instance_id,
+            "session_id": dispatch.session_id,
+            "driver_epoch_id": dispatch.driver_epoch_id,
+            "idempotency_key": dispatch.idempotency_key,
+            "prompt": "[redacted dispatch prompt]",
+            "requested_at": None,
+            "requested_by": None,
+            "evidence": {},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE agent_dispatches (
+                id TEXT PRIMARY KEY,
+                driver_epoch_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO agent_dispatches VALUES (?, ?, ?, ?, ?)",
+            (
+                dispatch.id,
+                dispatch.driver_epoch_id,
+                dispatch.idempotency_key,
+                AgentOperationState.QUEUED.value,
+                payload,
+            ),
+        )
+
+    with OverseerStore(path) as store:
+        assert store.load_agent_dispatch(dispatch.id) == replace(
+            dispatch, prompt="[redacted dispatch prompt]"
+        )
+        store.save_agent_dispatch(
+            replace(
+                dispatch,
+                id="dispatch.other",
+                instance_id="instance.other",
+                session_id="session.other",
+                driver_epoch_id="epoch.other",
+            )
+        )
+        versions = {row.version for row in store.list_schema_migrations()}
+
+    assert "agent_driver_v2" in versions
+
+
+def test_agent_dispatch_results_round_trip_as_distinct_attempts(tmp_path: Path) -> None:
+    request = _dispatch("dispatch.1", "epoch.1")
+    succeeded = AgentDispatchResult(
+        id="result.success",
+        request_id=request.id,
+        instance_id=request.instance_id,
+        session_id=request.session_id,
+        driver_epoch_id=request.driver_epoch_id,
+        provider_id="claude",
+        state=AgentOperationState.SUCCEEDED,
+        evidence={"message_id": "message.success", "status": "succeeded"},
+    )
+    quarantined = replace(
+        succeeded,
+        id="result.quarantine",
+        state=AgentOperationState.QUARANTINED,
+        error_category=AgentErrorCategory.QUARANTINED,
+        evidence={"message_id": "message.late", "reason": "late_epoch"},
+    )
+
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        store.save_agent_dispatch_result(succeeded)
+        store.save_agent_dispatch_result(quarantined)
+        assert store.load_agent_dispatch_result(succeeded.id) == succeeded
+        assert store.list_agent_dispatch_results() == (quarantined, succeeded)
+
+
+def test_agent_transaction_rolls_back_all_lifecycle_writes(tmp_path: Path) -> None:
+    with OverseerStore(tmp_path / "state.sqlite3") as store:
+        with pytest.raises(RuntimeError, match="injected"):
+            with store.agent_transaction():
+                store.save_agent_checkpoint(_checkpoint("checkpoint.tx", "epoch.tx"))
+                store.save_agent_handoff(_handoff("handoff.tx", "epoch.tx"))
+                raise RuntimeError("injected transaction failure")
+
+        assert store.list_agent_checkpoints() == ()
+        assert store.list_agent_handoffs() == ()

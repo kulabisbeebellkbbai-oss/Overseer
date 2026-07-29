@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
+import sqlite3
 from typing import Callable, Protocol
 from uuid import uuid4
 
@@ -57,6 +58,12 @@ _DISPATCHABLE_STATES = {
     AgentOperationState.RUNNING,
     AgentOperationState.SUCCEEDED,
 }
+_TERMINAL_RESULT_STATES = {
+    AgentOperationState.SUCCEEDED,
+    AgentOperationState.CANCELLED,
+    AgentOperationState.QUARANTINED,
+}
+MAX_CHECKPOINT_AGE_SECONDS = 300
 
 
 class AgentManager:
@@ -95,10 +102,21 @@ class AgentManager:
                 "initiated_by": initiated_by,
             },
         )
+        open_epochs = self._open_epochs(instance_id)
+        if len(open_epochs) == 1:
+            return open_epochs[0]
+        if len(open_epochs) > 1:
+            raise AgentManagerError(
+                f"multiple open driver epochs require recovery for {instance_id}"
+            )
         profile = self.registry.profile(instance_id)
         driver = self.registry.driver(instance_id)
         start_result = driver.start(profile)
-        if start_result.state not in _ACKNOWLEDGED_STATES:
+        if (
+            start_result.state not in _ACKNOWLEDGED_STATES
+            or start_result.instance_id != instance_id
+            or start_result.provider_id != driver.provider.id
+        ):
             category = (
                 start_result.error_category or AgentErrorCategory.DISPATCH_REJECTED
             )
@@ -107,6 +125,7 @@ class AgentManager:
             instance_id=instance_id,
             provider_id=driver.provider.id,
             session_id=None,
+            external_session_id=start_result.session_id,
             reason="activate",
             initiated_by=initiated_by,
             state=AgentOperationState.RUNNING,
@@ -129,7 +148,31 @@ class AgentManager:
             session.provider_id,
             instance_id=session.instance_id,
         )
+        open_epochs = self._open_epochs(session.instance_id)
+        if open_epochs:
+            active = max(open_epochs, key=lambda epoch: epoch.ordinal)
+            if len(open_epochs) > 1:
+                for stale in open_epochs:
+                    if stale.id != active.id:
+                        self.store.save_driver_epoch(
+                            replace(
+                                stale,
+                                state=AgentOperationState.QUARANTINED,
+                                closed_at=self._clock(),
+                                replacement_epoch_id=active.id,
+                            )
+                        )
+            if active.state in _DISPATCHABLE_STATES:
+                return active
+            if active.session_id != session.id:
+                return active
         result = driver.resume(session)
+        if (
+            result.instance_id != session.instance_id
+            or result.provider_id != session.provider_id
+            or result.session_id != session.external_session_id
+        ):
+            raise AgentManagerError("recovery result binding mismatch")
         state = (
             AgentOperationState.RUNNING
             if result.state in _ACKNOWLEDGED_STATES
@@ -140,23 +183,26 @@ class AgentManager:
             if state is AgentOperationState.RUNNING
             else f"recovery_failed:{(result.error_category or AgentErrorCategory.DISPATCH_REJECTED).value}"
         )
+        if open_epochs:
+            reconciled = replace(active, state=state, reason=reason)
+            self.store.save_driver_epoch(reconciled)
+            return reconciled
         return self._open_epoch(
             instance_id=session.instance_id,
             provider_id=session.provider_id,
             session_id=session.id,
+            external_session_id=session.external_session_id,
             reason=reason,
             initiated_by=initiated_by,
             state=state,
         )
 
     def active_epoch(self, instance_id: str) -> DriverEpoch:
-        epochs = tuple(
-            epoch
-            for epoch in self.store.list_driver_epochs()
-            if epoch.instance_id == instance_id and epoch.closed_at is None
-        )
+        epochs = self._open_epochs(instance_id)
         if not epochs:
             raise KeyError(f"no active driver epoch for {instance_id}")
+        if len(epochs) > 1:
+            raise AgentManagerError(f"multiple open driver epochs for {instance_id}")
         return max(epochs, key=lambda epoch: epoch.ordinal)
 
     def dispatch(
@@ -166,12 +212,8 @@ class AgentManager:
         idempotency_key: str,
         requested_by: str | None = None,
     ) -> AgentDispatchResult:
-        recorded = self._dispatch_for_idempotency_key(idempotency_key)
+        recorded = self._dispatch_for_idempotency_key(instance_id, idempotency_key)
         if recorded is not None:
-            if recorded.instance_id != instance_id:
-                raise ValueError(
-                    "idempotency key belongs to a different agent instance"
-                )
             return self._result_from_dispatch(recorded)
         epoch = self.active_epoch(instance_id)
         if epoch.state not in _DISPATCHABLE_STATES:
@@ -198,7 +240,15 @@ class AgentManager:
             requested_at=self._clock(),
             requested_by=requested_by,
         )
-        self.store.save_agent_dispatch(request)
+        try:
+            self.store.save_agent_dispatch(request)
+        except (sqlite3.IntegrityError, ValueError):
+            winner = self._dispatch_for_idempotency_key(
+                instance_id, idempotency_key
+            )
+            if winner is None:
+                raise
+            return self._result_from_dispatch(winner)
         driver = self.registry.driver_for_provider(
             epoch.provider_id,
             instance_id=instance_id,
@@ -274,68 +324,108 @@ class AgentManager:
                 "initiated_by": initiated_by,
             },
         )
-        checkpoint = self.checkpoint(instance_id)
-        package = self.handoffs.build_from_store(
-            instance_id=instance_id,
-            outgoing_epoch=outgoing,
-            checkpoint=checkpoint,
-            incoming_provider_id=incoming_provider_id,
-            objective="continue approved work from recorded checkpoint",
-            required_capabilities=self.registry.profile(instance_id).required_capabilities,
-        )
-        incoming_driver = self.registry.driver_for_provider(
-            incoming_provider_id,
-            instance_id=instance_id,
-        )
-        incoming_profile = self.registry.profile_for_provider(
-            instance_id,
-            incoming_provider_id,
-        )
-        self.handoffs.validate(package, incoming_driver.provider.capabilities)
-        incoming = self._open_epoch(
-            instance_id=instance_id,
-            provider_id=incoming_provider_id,
-            session_id=None,
-            reason="manual_handoff",
-            initiated_by=initiated_by,
-            state=AgentOperationState.QUEUED,
-        )
-        try:
-            result = incoming_driver.import_handoff(incoming_profile, package)
-        except Exception:
-            result = AgentDispatchResult(
-                id=self._id_factory("result"),
-                request_id=f"handoff.{package.id}",
+        failure: AgentErrorCategory | None = None
+        incoming: DriverEpoch | None = None
+        with self.store.agent_transaction():
+            checkpoint = self.checkpoint(instance_id)
+            self._validate_checkpoint_for_handoff(checkpoint)
+            package = self.handoffs.build_from_store(
                 instance_id=instance_id,
-                session_id=incoming.session_id,
-                driver_epoch_id=incoming.id,
+                outgoing_epoch=outgoing,
+                checkpoint=checkpoint,
+                incoming_provider_id=incoming_provider_id,
+                objective="continue approved work from recorded checkpoint",
+                required_capabilities=self.registry.profile(
+                    instance_id
+                ).required_capabilities,
+            )
+            incoming_driver = self.registry.driver_for_provider(
+                incoming_provider_id,
+                instance_id=instance_id,
+            )
+            incoming_profile = self.registry.profile_for_provider(
+                instance_id,
+                incoming_provider_id,
+            )
+            self.handoffs.validate(package, incoming_driver.provider.capabilities)
+            incoming = self._open_epoch(
+                instance_id=instance_id,
                 provider_id=incoming_provider_id,
-                state=AgentOperationState.FAILED,
-                error_category=AgentErrorCategory.PROVIDER_UNAVAILABLE,
+                session_id=None,
+                external_session_id=f"handoff.{package.id}",
+                reason="manual_handoff",
+                initiated_by=initiated_by,
+                state=AgentOperationState.QUEUED,
+                persist_epoch=False,
             )
-        if result.state not in _ACKNOWLEDGED_STATES:
-            category = result.error_category or AgentErrorCategory.HANDOFF_INCOMPATIBLE
-            paused = replace(
-                incoming,
-                state=AgentOperationState.BLOCKED,
-                reason=f"handoff_failed:{category.value}",
+            package = replace(
+                package,
+                evidence={
+                    **package.evidence,
+                    "incoming_epoch_id": incoming.id,
+                    "incoming_session_id": incoming.session_id,
+                    "status": "importing",
+                },
             )
-            self.store.save_driver_epoch(paused)
-            self.store.save_agent_handoff(
-                replace(
-                    package,
-                    evidence={
-                        "checkpoint_id": checkpoint.id,
-                        "outgoing_epoch_id": outgoing.id,
-                        "status": result.state.value,
-                        "reason": category.value,
-                    },
+            self.store.save_agent_handoff(package)
+            try:
+                result = incoming_driver.import_handoff(incoming_profile, package)
+            except Exception:
+                result = AgentDispatchResult(
+                    id=self._id_factory("result"),
+                    request_id=f"handoff.{package.id}",
+                    instance_id=instance_id,
+                    session_id=incoming.session_id,
+                    driver_epoch_id=incoming.id,
+                    provider_id=incoming_provider_id,
+                    state=AgentOperationState.FAILED,
+                    error_category=AgentErrorCategory.PROVIDER_UNAVAILABLE,
                 )
+            expected_request_id = f"handoff.{package.id}"
+            binding_valid = (
+                result.request_id == expected_request_id
+                and result.instance_id == instance_id
+                and result.provider_id == incoming_provider_id
+                and result.session_id == incoming.session_id
+                and result.driver_epoch_id == incoming.id
             )
-            raise AgentHandoffError(category.value)
-        incoming = replace(incoming, state=AgentOperationState.RUNNING)
-        self.store.save_driver_epoch(incoming)
-        self._close_epoch(outgoing, replacement_epoch_id=incoming.id)
+            if result.state not in _ACKNOWLEDGED_STATES or not binding_valid:
+                failure = (
+                    result.error_category
+                    if result.state not in _ACKNOWLEDGED_STATES
+                    and result.error_category is not None
+                    else AgentErrorCategory.HANDOFF_INCOMPATIBLE
+                )
+                self.store.save_driver_epoch(
+                    replace(
+                        outgoing,
+                        state=AgentOperationState.BLOCKED,
+                        reason=f"handoff_failed:{failure.value}",
+                    )
+                )
+                self.store.save_agent_handoff(
+                    replace(
+                        package,
+                        evidence={
+                            **package.evidence,
+                            "status": "blocked",
+                            "reason": failure.value,
+                        },
+                    )
+                )
+            else:
+                incoming = replace(incoming, state=AgentOperationState.RUNNING)
+                self.store.save_agent_handoff(
+                    replace(
+                        package,
+                        evidence={**package.evidence, "status": "acknowledged"},
+                    )
+                )
+                self._close_epoch(outgoing, replacement_epoch_id=incoming.id)
+                self.store.save_driver_epoch(incoming)
+        if failure is not None:
+            raise AgentHandoffError(failure.value)
+        assert incoming is not None
         return incoming
 
     def record_provider_result(
@@ -343,25 +433,39 @@ class AgentManager:
         epoch_id: str,
         result: AgentDispatchResult,
     ) -> AgentDispatchResult:
+        self._require_authorized(
+            "record_provider_result",
+            {
+                "driver_epoch_id": epoch_id,
+                "result_id": result.id,
+                "request_id": result.request_id,
+            },
+        )
+        try:
+            request = self.store.load_agent_dispatch(result.request_id)
+        except KeyError:
+            return self._quarantine_result(result, "unknown_dispatch_request")
         try:
             epoch = self.store.load_driver_epoch(epoch_id)
             active = self.active_epoch(epoch.instance_id)
         except KeyError:
-            return self.quarantine_result(
-                result,
-                reason="unknown_driver_epoch",
+            return self._quarantine_result(result, "unknown_driver_epoch")
+        request_binding_valid = (
+            request.instance_id == result.instance_id == epoch.instance_id
+            and request.session_id == result.session_id == epoch.session_id
+            and request.driver_epoch_id == result.driver_epoch_id == epoch.id
+            and result.provider_id == epoch.provider_id
+        )
+        if not request_binding_valid:
+            return self._quarantine_result(
+                result, "dispatch_request_binding_mismatch"
             )
         if (
             epoch.closed_at is not None
             or active.id != epoch.id
-            or result.driver_epoch_id != epoch.id
-            or result.instance_id != epoch.instance_id
-            or result.session_id != epoch.session_id
-            or result.provider_id != epoch.provider_id
         ):
-            return self.quarantine_result(
-                result,
-                reason="closed_or_inactive_driver_epoch",
+            return self._quarantine_result(
+                result, "closed_or_inactive_driver_epoch"
             )
         return self._record_dispatch_result(result)
 
@@ -371,14 +475,34 @@ class AgentManager:
         *,
         reason: str = "invalid_provider_result",
     ) -> AgentDispatchResult:
+        self._require_authorized(
+            "quarantine_result",
+            {
+                "result_id": result.id,
+                "request_id": result.request_id,
+                "reason": reason,
+            },
+        )
+        return self._quarantine_result(result, reason)
+
+    def _quarantine_result(
+        self,
+        result: AgentDispatchResult,
+        reason: str,
+    ) -> AgentDispatchResult:
+        evidence = self._safe_result_evidence(result.evidence)
+        evidence["source_result_id"] = result.id
+        evidence["reason"] = reason
         quarantined = replace(
             result,
+            id=self._id_factory("quarantine"),
             state=AgentOperationState.QUARANTINED,
             error_category=AgentErrorCategory.QUARANTINED,
             error_message=None,
-            evidence={"reason": reason},
+            evidence=evidence,
         )
-        return self._record_dispatch_result(quarantined)
+        self.store.save_agent_dispatch_result(quarantined)
+        return quarantined
 
     def _open_epoch(
         self,
@@ -386,9 +510,11 @@ class AgentManager:
         instance_id: str,
         provider_id: str,
         session_id: str | None,
+        external_session_id: str,
         reason: str,
         initiated_by: str,
         state: AgentOperationState,
+        persist_epoch: bool = True,
     ) -> DriverEpoch:
         profile = self.registry.profile_for_provider(instance_id, provider_id)
         ordinal = 1 + max(
@@ -410,7 +536,7 @@ class AgentManager:
                 AgentSession(
                     id=selected_session_id,
                     provider_id=provider_id,
-                    external_session_id=selected_session_id,
+                    external_session_id=external_session_id,
                     workspace=profile.workspace,
                     transport=profile.transport,
                     capabilities=self.registry.providers[provider_id].capabilities,
@@ -435,7 +561,12 @@ class AgentManager:
             opened_at=self._clock(),
             reason=reason,
         )
-        self.store.save_driver_epoch(epoch)
+        if persist_epoch:
+            if self._open_epochs(instance_id):
+                raise AgentManagerError(
+                    f"instance {instance_id} already has an open driver epoch"
+                )
+            self.store.save_driver_epoch(epoch)
         return epoch
 
     def _close_epoch(
@@ -461,6 +592,51 @@ class AgentManager:
                 f"driver epoch {epoch.id} references an unknown session"
             ) from error
 
+    def _open_epochs(self, instance_id: str) -> tuple[DriverEpoch, ...]:
+        return tuple(
+            epoch
+            for epoch in self.store.list_driver_epochs()
+            if epoch.instance_id == instance_id and epoch.closed_at is None
+        )
+
+    def _validate_checkpoint_for_handoff(
+        self,
+        checkpoint: AgentCheckpoint,
+    ) -> None:
+        try:
+            now = _aware_datetime(self._clock())
+            created_at = _aware_datetime(checkpoint.created_at)
+            expires_at = (
+                _aware_datetime(checkpoint.expires_at)
+                if checkpoint.expires_at is not None
+                else None
+            )
+        except ValueError as error:
+            raise AgentHandoffError("checkpoint timestamp is malformed") from error
+        age = (now - created_at).total_seconds()
+        if age < 0 or age > MAX_CHECKPOINT_AGE_SECONDS:
+            raise AgentHandoffError("checkpoint is stale")
+        if expires_at is not None and expires_at <= now:
+            raise AgentHandoffError("checkpoint is expired")
+        if checkpoint.evidence.get("status") not in {
+            "ready",
+            "completed",
+            "checkpointed",
+        }:
+            raise AgentHandoffError("checkpoint state is not transferable")
+
+    @staticmethod
+    def _safe_result_evidence(
+        source: Mapping[str, object],
+    ) -> dict[str, object]:
+        evidence: dict[str, object] = {}
+        for key, value in source.items():
+            if key.endswith(("_id", "_ref", "_at")) or key in {"status", "reason"}:
+                evidence[key] = value
+            elif isinstance(value, (int, float, bool)):
+                evidence[key] = value
+        return evidence
+
     def _require_authorized(
         self,
         operation: str,
@@ -475,25 +651,21 @@ class AgentManager:
 
     def _dispatch_for_idempotency_key(
         self,
+        instance_id: str,
         idempotency_key: str,
     ) -> AgentDispatchRequest | None:
-        return next(
-            (
-                dispatch
-                for dispatch in self.store.list_agent_dispatches()
-                if dispatch.idempotency_key == idempotency_key
-            ),
-            None,
-        )
+        try:
+            return self.store.load_agent_dispatch_by_idempotency(
+                instance_id, idempotency_key
+            )
+        except KeyError:
+            return None
 
     def _record_dispatch_result(
         self,
         result: AgentDispatchResult,
     ) -> AgentDispatchResult:
-        try:
-            request = self.store.load_agent_dispatch(result.request_id)
-        except KeyError:
-            return replace(result, evidence={"reason": result.evidence.get("reason", "unrecorded")})
+        request = self.store.load_agent_dispatch(result.request_id)
         evidence: dict[str, object] = {
             "result_id": result.id,
             "provider_id": result.provider_id,
@@ -512,8 +684,12 @@ class AgentManager:
                 continue
             if key.endswith(("_id", "_ref", "_at")):
                 evidence[key] = value
-        self.store.save_agent_dispatch(replace(request, evidence=evidence))
-        return replace(result, evidence=evidence)
+        recorded = replace(result, error_message=None, evidence=evidence)
+        self.store.save_agent_dispatch_result(recorded)
+        prior_state = request.evidence.get("status")
+        if prior_state not in {state.value for state in _TERMINAL_RESULT_STATES}:
+            self.store.save_agent_dispatch(replace(request, evidence=evidence))
+        return recorded
 
     def _result_from_dispatch(
         self,
@@ -557,3 +733,12 @@ class AgentManager:
 
 def _identifier_fragment(value: str) -> str:
     return "".join(character if character.isalnum() else "-" for character in value)
+
+
+def _aware_datetime(value: str | None) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("timestamp is required")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return parsed.astimezone(timezone.utc)

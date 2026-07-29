@@ -6,6 +6,9 @@
 - `tests/test_ui_regression.py`
 - `tests/test_ui_full_regression.py`
 - `tests/test_codex_usage.py`
+- `src/overseer/cli.py` (review-approved read-only usage status)
+- `src/overseer/api.py` (review-approved authenticated usage route)
+- `tests/test_agent_api.py`
 
 ## RED evidence
 
@@ -17,10 +20,10 @@ failed at the first new dashboard assertion:
 
 ## GREEN evidence
 
-- Focused UI suite: `23 passed in 6.22s`
-- Focused UI plus the cross-suite operator workflow regression:
-  `27 passed in 6.23s`
-- Full suite: `701 passed in 101.44s`
+- Initial focused UI suite: `23 passed in 6.22s`
+- Review-correction focused agent API/UI/workflow suite:
+  `50 passed in 12.10s`
+- Review-correction full suite: `704 passed in 101.93s`
 - `python3 -m py_compile src/overseer/ui.py`: passed
 - `git diff --check`: passed
 
@@ -37,13 +40,21 @@ effective-mode state, reduced motion, action wiring, and capability gating.
 ## Behavior and compatibility
 
 - Added a provider-neutral Primary AI Driver view consuming the four generic
-  inventory/session/dispatch endpoints.
+  inventory/session/dispatch endpoints plus authenticated persisted usage
+  evidence.
 - Added discovery, recovery, checkpoint, approval-confirmed handoff, and
   approval-confirmed failover controls.
 - Cancellation is disabled with accessible blocker text when unsupported.
 - Provider readiness/blockers, capability matrix, epoch/checkpoint/recovery,
   fallback order, and native usage units are rendered without credentials,
   transcripts, or checkpoint payload content.
+- Rendering uses the exact API fields (`approved_fallback_provider_ids`,
+  `active_epoch`, session and dispatch `id`, `driver_epoch_id`, and result
+  `request_id`/`state`). Actions fail closed on provider readiness and their
+  exact capability.
+- `/agent-usage` performs no provider calls and reports the configured source,
+  persisted value/remaining, exact persisted `UsageLimit.kind` unit, and
+  observation/reset timestamps; missing evidence remains explicit.
 - Existing Codex usage panels and legacy Codex action remain Codex-specific.
 - Added persistent auto/desktop/tablet/mobile modes with breakpoint-driven auto
   resolution, resize recomputation, accessible saved/effective mode state,
@@ -59,4 +70,6 @@ effective-mode state, reduced motion, action wiring, and capability gating.
 
 ## Commit
 
-`1af1afc1e4a7d2b11b4ecb0bfd702e65487632d4`
+Initial implementation: `02e652ae9fda2798d52d6a631d6d1ce9502f5d39`
+
+Review correction: `7c7e3764a591a34a7a7d734bc431a3e5f3b4ad1f`

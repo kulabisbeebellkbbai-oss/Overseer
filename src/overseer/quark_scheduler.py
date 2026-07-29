@@ -177,6 +177,36 @@ class AgentWorkItem:
 CodexWorkItem = AgentWorkItem
 
 
+_DURABLE_WORK_BINDING_FIELDS = (
+    "project_id",
+    "agent_session_id",
+    "provider_id",
+    "limit_id",
+    "usage_unit",
+    "owner_thread",
+    "generation",
+    "state",
+    "reserved_units",
+    "driver_epoch_id",
+    "provider_dispatch_id",
+    "provider_result_id",
+    "provider_reference",
+    "provider_idempotency_key",
+    "provider_dispatch_state",
+    "pause_reason",
+    "resume_at",
+)
+
+
+def _durable_work_binding(item: AgentWorkItem) -> dict[str, Any]:
+    binding = {
+        field: getattr(item, field)
+        for field in _DURABLE_WORK_BINDING_FIELDS
+    }
+    binding["state"] = item.state.value
+    return binding
+
+
 @dataclass(frozen=True)
 class WorkAllocation:
     work_id: str
@@ -360,6 +390,7 @@ class QuarkWorkStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        self._atomic_depth = 0
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS quark_work_items (
@@ -380,12 +411,46 @@ class QuarkWorkStore:
     def close(self) -> None:
         self.connection.close()
 
+    def _commit(self) -> None:
+        if self._atomic_depth == 0:
+            self.connection.commit()
+
+    def begin_work_binding_cas(
+        self,
+        work_id: str,
+        expected_binding: Mapping[str, Any],
+    ) -> tuple[bool, AgentWorkItem | None]:
+        if self._atomic_depth:
+            raise RuntimeError("nested Quark work transaction is not allowed")
+        self.connection.execute("BEGIN IMMEDIATE")
+        self._atomic_depth = 1
+        try:
+            current = self.load_work(work_id)
+        except KeyError:
+            self.finish_work_binding_cas(commit=False)
+            return False, None
+        if _durable_work_binding(current) != dict(expected_binding):
+            self.finish_work_binding_cas(commit=False)
+            return False, current
+        return True, current
+
+    def finish_work_binding_cas(self, *, commit: bool) -> None:
+        if self._atomic_depth != 1:
+            raise RuntimeError("no Quark work transaction is active")
+        try:
+            if commit:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self._atomic_depth = 0
+
     def save_work(self, item: AgentWorkItem) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO quark_work_items (id, project_id, state, payload) VALUES (?, ?, ?, ?)",
             (item.id, item.project_id, item.state.value, json.dumps(_work_payload(item), sort_keys=True)),
         )
-        self.connection.commit()
+        self._commit()
 
     def load_work(self, work_id: str) -> AgentWorkItem:
         row = self.connection.execute(
@@ -440,7 +505,7 @@ class QuarkWorkStore:
             "INSERT OR REPLACE INTO quark_work_slices (work_id, generation, payload) VALUES (?, ?, ?)",
             (work_id, generation, json.dumps(payload, sort_keys=True)),
         )
-        self.connection.commit()
+        self._commit()
         self.save_work(
             item.with_state(
                 WorkState.RUNNING,
@@ -491,7 +556,7 @@ class QuarkWorkStore:
             "UPDATE quark_work_slices SET payload = ? WHERE work_id = ? AND generation = ?",
             (json.dumps(payload, sort_keys=True), work_id, generation),
         )
-        self.connection.commit()
+        self._commit()
         item = self.load_work(work_id)
         self.save_work(
             item.with_state(
@@ -554,7 +619,7 @@ class QuarkWorkStore:
             "WHERE work_id = ? AND generation = ?",
             (json.dumps(payload, sort_keys=True), work_id, generation),
         )
-        self.connection.commit()
+        self._commit()
 
     def list_slices(self, work_id: str | None = None) -> tuple[dict[str, Any], ...]:
         if work_id is None:
@@ -720,16 +785,27 @@ class ProviderWorkExecutor:
             )
             if blocked is not None:
                 return blocked
+            expected_work_binding = _durable_work_binding(
+                item.with_state(
+                    WorkState.RUNNING,
+                    generation=item.generation + 1,
+                    reserved_units=allocated_quota_points,
+                )
+            )
             blocked = self._validate_persisted_session(item)
             if blocked is not None:
-                return blocked
+                return self._with_expected_work_binding(
+                    blocked, expected_work_binding
+                )
             epoch = self.agent_manager.recover(
                 item.agent_session_id,
                 initiated_by="quark",
             )
             blocked = self._validate_epoch(item, epoch)
             if blocked is not None:
-                return blocked
+                return self._with_expected_work_binding(
+                    blocked, expected_work_binding
+                )
             idempotency_key = f"quark:{item.id}:{item.generation + 1}"
             result = self.agent_manager.dispatch(
                 epoch.instance_id,
@@ -744,6 +820,7 @@ class ProviderWorkExecutor:
                 allocated_quota_points,
                 idempotency_key,
                 expected_dispatch_id=None,
+                expected_work_binding=expected_work_binding,
             )
         if not item.owner_thread:
             raise ValueError("legacy Codex execution requires owner_thread")
@@ -791,16 +868,21 @@ class ProviderWorkExecutor:
         blocked = self._validate_reconcile_work_binding(item)
         if blocked is not None:
             return blocked
+        expected_work_binding = _durable_work_binding(item)
         blocked = self._validate_persisted_session(item)
         if blocked is not None:
-            return blocked
+            return self._with_expected_work_binding(
+                blocked, expected_work_binding
+            )
         epoch = self.agent_manager.recover(
             item.agent_session_id,
             initiated_by="quark",
         )
         blocked = self._validate_epoch(item, epoch)
         if blocked is not None:
-            return blocked
+            return self._with_expected_work_binding(
+                blocked, expected_work_binding
+            )
         result = self.agent_manager.dispatch(
             epoch.instance_id,
             prompt,
@@ -814,7 +896,16 @@ class ProviderWorkExecutor:
             item.reserved_units,
             item.provider_idempotency_key,
             expected_dispatch_id=item.provider_dispatch_id,
+            expected_work_binding=expected_work_binding,
         )
+
+    @staticmethod
+    def _with_expected_work_binding(
+        result: dict[str, Any],
+        expected_work_binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        result["expected_work_binding"] = dict(expected_work_binding)
+        return result
 
     def _load_persisted_work(
         self, item: AgentWorkItem
@@ -1025,6 +1116,7 @@ class ProviderWorkExecutor:
         idempotency_key: str,
         *,
         expected_dispatch_id: str | None,
+        expected_work_binding: Mapping[str, Any],
     ) -> dict[str, Any]:
         mismatches = []
         expected_bindings = {
@@ -1042,10 +1134,13 @@ class ProviderWorkExecutor:
         ):
             mismatches.append("request_id")
         if mismatches:
-            return ProviderWorkExecutor._policy_block(
-                item,
-                "provider result binding mismatch: "
-                + ", ".join(sorted(mismatches)),
+            return ProviderWorkExecutor._with_expected_work_binding(
+                ProviderWorkExecutor._policy_block(
+                    item,
+                    "provider result binding mismatch: "
+                    + ", ".join(sorted(mismatches)),
+                ),
+                expected_work_binding,
             )
         state = AgentOperationState(
             getattr(result.state, "value", str(result.state))
@@ -1075,6 +1170,7 @@ class ProviderWorkExecutor:
                 result, "provider_reference", None
             ),
             "idempotency_key": idempotency_key,
+            "expected_work_binding": dict(expected_work_binding),
         }
 
 
@@ -1323,6 +1419,71 @@ class QuarkSchedulerService:
         capacity_after: float | None,
         snapshot: Mapping[str, Any],
     ) -> dict[str, Any]:
+        expected_binding = result.get("expected_work_binding")
+        if (
+            result.get("persistence_allowed") is False
+            or not isinstance(expected_binding, Mapping)
+        ):
+            return self._persist_execution_result_unchecked(
+                item,
+                result,
+                capacity_after=capacity_after,
+                snapshot=snapshot,
+            )
+        acquired, durable_item = self.store.begin_work_binding_cas(
+            item.id, expected_binding
+        )
+        if not acquired:
+            conflict = dict(result)
+            conflict.update(
+                {
+                    "persistence_allowed": False,
+                    "rejection_scope": "persistence_compare_and_swap",
+                    "error_reason": (
+                        "durable work binding advanced after provider "
+                        "validation; result was not persisted"
+                    ),
+                    "rejected_generation": expected_binding.get(
+                        "generation"
+                    ),
+                    "rejected_provider_dispatch_id": result.get(
+                        "provider_dispatch_id"
+                    ),
+                    "rejected_provider_result_id": result.get(
+                        "provider_result_id"
+                    ),
+                    "rejected_idempotency_key": result.get(
+                        "idempotency_key"
+                    ),
+                }
+            )
+            return self._persist_execution_result_unchecked(
+                durable_item or item,
+                conflict,
+                capacity_after=capacity_after,
+                snapshot=snapshot,
+            )
+        try:
+            payload = self._persist_execution_result_unchecked(
+                item,
+                result,
+                capacity_after=capacity_after,
+                snapshot=snapshot,
+            )
+        except Exception:
+            self.store.finish_work_binding_cas(commit=False)
+            raise
+        self.store.finish_work_binding_cas(commit=True)
+        return payload
+
+    def _persist_execution_result_unchecked(
+        self,
+        item: AgentWorkItem,
+        result: Mapping[str, Any],
+        *,
+        capacity_after: float | None,
+        snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
         if result.get("persistence_allowed") is False:
             try:
                 durable_item = self.store.load_work(item.id)
@@ -1468,6 +1629,7 @@ class QuarkSchedulerService:
             "provider_result_id": result.get("provider_result_id"),
             "provider_reference": result.get("provider_reference"),
             "capacity_confidence": confidence,
+            "persistence_performed": True,
         }
 
 

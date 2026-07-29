@@ -1817,6 +1817,286 @@ def test_cycle_stale_initial_transition_rejection_preserves_newer_winner(
     assert manager.calls == []
 
 
+def test_cycle_reconcile_cas_rejects_winner_advanced_during_dispatch(
+    tmp_path: Path,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    loaded = replace(
+        _agent_work(
+            "work.claude",
+            "project-a",
+            "claude",
+            "limit.claude.tokens",
+            8,
+            usage_unit="tokens",
+        ),
+        state=WorkState.RUNNING,
+        reserved_units=5,
+        generation=1,
+        driver_epoch_id="epoch.claude.1",
+        provider_dispatch_id="dispatch.old",
+        provider_result_id="result.old",
+        provider_reference="provider-job-old",
+        provider_idempotency_key="quark:work.claude:1",
+        provider_dispatch_state="running",
+    )
+    store.save_work(loaded)
+    store.record_slice_start(
+        loaded.id,
+        1,
+        quota_before=80_000,
+        lifetime_tokens_before=None,
+        observed_at="2026-07-29T10:00:00+00:00",
+    )
+
+    class RacingAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.winner = None
+            self.slices = None
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, session_id, initiated_by="system"):
+            self.calls.append(("recover", session_id, initiated_by))
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id=session_id,
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+            current = store.load_work(loaded.id)
+            store.save_work(
+                replace(
+                    current,
+                    generation=2,
+                    driver_epoch_id="epoch.claude.2",
+                    provider_dispatch_id="dispatch.new",
+                    provider_result_id="result.new",
+                    provider_reference="provider-job-new",
+                    provider_idempotency_key="quark:work.claude:2",
+                    provider_dispatch_state="running",
+                )
+            )
+            store.record_slice_start(
+                loaded.id,
+                2,
+                quota_before=79_995,
+                lifetime_tokens_before=None,
+                observed_at="2026-07-29T10:01:00+00:00",
+            )
+            self.winner = store.load_work(loaded.id)
+            self.slices = store.list_slices(loaded.id)
+            return SimpleNamespace(
+                id="result.old.poll",
+                request_id="dispatch.old",
+                provider_reference="provider-job-old",
+                provider_id="claude",
+                session_id=loaded.agent_session_id,
+                driver_epoch_id="epoch.claude.1",
+                state=AgentOperationState.RUNNING,
+            )
+
+    manager = RacingAgentManager()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (_native_snapshot("limit.claude.tokens", 79_995),)
+        ),
+        executor=ProviderWorkExecutor(manager, work_store=store),
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+
+    rejection = status["reconcile_results"][0]
+    assert rejection["status"] == "running"
+    assert rejection["persistence_performed"] is False
+    assert rejection["rejection_scope"] == "persistence_compare_and_swap"
+    assert rejection["durable_generation"] == 2
+    assert store.load_work(loaded.id) == manager.winner
+    assert store.list_slices(loaded.id) == manager.slices
+    assert [call[0] for call in manager.calls] == ["recover", "dispatch"]
+
+
+def test_cycle_initial_cas_rejects_winner_advanced_during_dispatch(
+    tmp_path: Path,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    queued = _agent_work(
+        "work.claude",
+        "project-a",
+        "claude",
+        "limit.claude.tokens",
+        8,
+        usage_unit="tokens",
+    )
+    store.save_work(queued)
+
+    class RacingAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.winner = None
+            self.slices = None
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, session_id, initiated_by="system"):
+            self.calls.append(("recover", session_id, initiated_by))
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id=session_id,
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+            current = store.load_work(queued.id)
+            store.save_work(
+                replace(
+                    current,
+                    generation=2,
+                    driver_epoch_id="epoch.claude.2",
+                    provider_dispatch_id="dispatch.new",
+                    provider_result_id="result.new",
+                    provider_reference="provider-job-new",
+                    provider_idempotency_key="quark:work.claude:2",
+                    provider_dispatch_state="running",
+                )
+            )
+            store.record_slice_start(
+                queued.id,
+                2,
+                quota_before=79_995,
+                lifetime_tokens_before=None,
+                observed_at="2026-07-29T10:01:00+00:00",
+            )
+            self.winner = store.load_work(queued.id)
+            self.slices = store.list_slices(queued.id)
+            return SimpleNamespace(
+                id="result.gen1",
+                request_id="dispatch.gen1",
+                provider_reference="provider-job-gen1",
+                provider_id="claude",
+                session_id=queued.agent_session_id,
+                driver_epoch_id="epoch.claude.1",
+                state=AgentOperationState.RUNNING,
+            )
+
+    manager = RacingAgentManager()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (
+                _native_snapshot("limit.claude.tokens", 80_000),
+                _native_snapshot("limit.claude.tokens", 79_995),
+            )
+        ),
+        executor=ProviderWorkExecutor(manager, work_store=store),
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+
+    rejection = status["results"][0]
+    assert rejection["status"] == "running"
+    assert rejection["persistence_performed"] is False
+    assert rejection["rejection_scope"] == "persistence_compare_and_swap"
+    assert rejection["durable_generation"] == 2
+    assert store.load_work(queued.id) == manager.winner
+    assert store.list_slices(queued.id) == manager.slices
+    assert [call[0] for call in manager.calls] == ["recover", "dispatch"]
+
+
+def test_cycle_provider_result_persists_when_cas_binding_is_unchanged(
+    tmp_path: Path,
+):
+    store = QuarkWorkStore(tmp_path / "quark.sqlite3")
+    queued = _agent_work(
+        "work.claude",
+        "project-a",
+        "claude",
+        "limit.claude.tokens",
+        8,
+        usage_unit="tokens",
+    )
+    store.save_work(queued)
+
+    class SerialAgentManager:
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(
+                load_agent_session=lambda session_id: SimpleNamespace(
+                    id=session_id,
+                    provider_id="claude",
+                )
+            )
+
+        def recover(self, session_id, initiated_by="system"):
+            self.calls.append(("recover", session_id, initiated_by))
+            return SimpleNamespace(
+                id="epoch.claude.1",
+                instance_id="agent.claude.1",
+                session_id=session_id,
+                provider_id="claude",
+            )
+
+        def dispatch(self, *args, **kwargs):
+            self.calls.append(("dispatch", args, kwargs))
+            return SimpleNamespace(
+                id="result.gen1",
+                request_id="dispatch.gen1",
+                provider_reference="provider-job-gen1",
+                provider_id="claude",
+                session_id=queued.agent_session_id,
+                driver_epoch_id="epoch.claude.1",
+                state=AgentOperationState.ACKNOWLEDGED,
+            )
+
+    manager = SerialAgentManager()
+    service = QuarkSchedulerService(
+        store,
+        usage_source=FakeUsageSource(
+            (
+                _native_snapshot("limit.claude.tokens", 80_000),
+                _native_snapshot("limit.claude.tokens", 79_995),
+            )
+        ),
+        executor=ProviderWorkExecutor(manager, work_store=store),
+    )
+
+    status = service.run_cycle(
+        execute=True,
+        limit_id="limit.claude.tokens",
+    )
+
+    result = status["results"][0]
+    persisted = store.load_work(queued.id)
+    assert result["persistence_performed"] is True
+    assert persisted.state is WorkState.RUNNING
+    assert persisted.generation == 1
+    assert persisted.provider_dispatch_id == "dispatch.gen1"
+    assert persisted.provider_idempotency_key == "quark:work.claude:1"
+    assert store.list_slices(queued.id)[0]["actual_units"] == 5
+    assert store._atomic_depth == 0
+
+
 def test_cycle_persists_unknown_post_dispatch_capacity_without_crashing(
     tmp_path: Path,
 ):

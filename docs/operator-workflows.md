@@ -164,6 +164,20 @@ Use this to keep packages up to date without applying changes blindly.
    live package commands.
 4. Review generated plans, rollback notes, and readiness.
 
+### Plan Firmware Updates
+
+Use this to stage firmware updates for approval without applying them directly.
+
+1. Open Admin.
+2. Review Firmware Status, Firmware Updates, Firmware Blocker Guidance, and
+   Firmware Preflight.
+3. Click Plan Firmware to stage the eligible firmware releases shown by the
+   read-only inspection.
+4. Review the generated plans, blocker resolution, safe preflight steps,
+   rollback notes, and reboot requirements.
+5. Approve and execute firmware plans only through the separate Admin approval
+   and execution gates.
+
 ### Run Package Maintenance Cycle
 
 Use this when O'Brien should keep apt-managed system packages current through

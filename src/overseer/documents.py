@@ -51,8 +51,19 @@ def documents_list_notes_status(
     env_file: str = DEFAULT_OBSIDIAN_ENV_FILE,
     folder: str = "",
 ) -> dict[str, Any]:
-    config = load_obsidian_documents_config(env_file)
-    return ObsidianDocumentsClient(config).list_notes(folder)
+    normalized_folder = _normalize_folder(folder)
+    try:
+        config = load_obsidian_documents_config(env_file)
+        notes = ObsidianDocumentsClient(config).list_notes(normalized_folder)
+    except ValueError as error:
+        return {
+            "available": False,
+            "folder": normalized_folder,
+            "count": 0,
+            "files": [],
+            "error": str(error),
+        }
+    return {"available": True, **notes}
 
 
 def documents_search_status(

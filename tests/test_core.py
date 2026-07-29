@@ -2887,6 +2887,22 @@ class OverseerApiTests(unittest.TestCase):
         self.assertTrue(write["mutation_performed"])
         self.assertNotIn("test-token", json.dumps(status))
 
+    def test_documents_list_notes_reports_unavailable_dependency(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=wrong-token\n",
+                encoding="utf-8",
+            )
+
+            status = overseer_documents.documents_list_notes_status(str(env_file), "Overseer")
+
+        self.assertFalse(status["available"])
+        self.assertEqual(status["folder"], "Overseer")
+        self.assertEqual(status["count"], 0)
+        self.assertEqual(status["files"], [])
+        self.assertIn("HTTP 401", status["error"])
+
     def test_documents_client_rejects_writes_outside_allowed_folders(self):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
             env_file = Path(directory) / "obsidian.env"

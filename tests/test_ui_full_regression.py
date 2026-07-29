@@ -2,6 +2,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 
 from overseer.ui import OPERATOR_CONSOLE_HTML
@@ -18,6 +19,7 @@ EXPECTED_VIEWS = {
         "title": "Maintenance Operations",
         "actions": {
             "discover-user-services",
+            "plan-firmware-updates",
             "plan-package-updates",
             "run-package-maintenance-cycle",
             "record-maintenance-schedule",
@@ -204,6 +206,7 @@ ACTION_ROUTES = {
     "plan-admin-change": ("POST", "/admin/plans"),
     "plan-host-security-remediation": ("POST", "/host/security/remediations/plans"),
     "plan-listener-queue-remediations": ("POST", "/host/security/listener-review-queue/remediation-plans"),
+    "plan-firmware-updates": ("POST", "/maintenance/firmware-update-plans"),
     "plan-package-updates": ("POST", "/maintenance/package-update-plans"),
     "plan-source-block": ("POST", "/host/security/source-reviews/block-plans"),
     "prepare-ids-review-package": ("POST", "/host/security/ids-review-packages"),
@@ -1049,6 +1052,22 @@ class FullOperatorUiRegressionTests(unittest.TestCase):
                 self.assertIn(f'action === "{action}"', OPERATOR_CONSOLE_HTML)
 
     def test_safe_disposable_workflows_execute_through_gateway_routes(self):
+        note_files = {
+            "Overseer": ["Runbooks/"],
+            "Overseer/Runbooks": ["ui-regression-testing.md"],
+        }
+        documents_patch = patch(
+            "overseer.api.documents_list_notes_status",
+            side_effect=lambda folder="": {
+                "available": True,
+                "folder": folder,
+                "count": len(note_files.get(folder, [])),
+                "files": note_files.get(folder, []),
+            },
+        )
+        documents_patch.start()
+        self.addCleanup(documents_patch.stop)
+
         with tempfile.TemporaryDirectory() as directory:
             cleanup_target = Path(directory) / "artifacts" / "ui-cleanup"
             cleanup_target.mkdir(parents=True)

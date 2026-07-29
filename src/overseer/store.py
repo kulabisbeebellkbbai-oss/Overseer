@@ -72,9 +72,32 @@ _AGENT_TRANSCRIPT_KEYS = frozenset(
         "raw_output",
         "raw_outputs",
         "provider_output",
+        "message",
+        "messages",
+        "output",
+        "outputs",
         "prompt",
         "body",
         "content",
+    }
+)
+_AGENT_DYNAMIC_EVIDENCE_KEYS = frozenset({"evidence", "legacy_references"})
+_AGENT_SAFE_EVIDENCE_KEYS = frozenset(
+    {
+        "status",
+        "state",
+        "reason",
+        "available",
+        "healthy",
+        "provider",
+        "model",
+        "version",
+        "capability",
+        "reference",
+        "hash",
+        "duration",
+        "duration_ms",
+        "exit_code",
     }
 )
 _AGENT_SECRET_VALUE_RE = re.compile(
@@ -1090,7 +1113,12 @@ def _dump_agent_record(value: Any) -> str:
     )
 
 
-def _sanitize_agent_json(value: Any, *, key: str | None = None) -> Any:
+def _sanitize_agent_json(
+    value: Any,
+    *,
+    key: str | None = None,
+    dynamic_evidence: bool = False,
+) -> Any:
     normalized_key = _normalize_agent_key(key) if key is not None else None
     if normalized_key == "prompt":
         return _REDACTED_DISPATCH_PROMPT
@@ -1099,16 +1127,42 @@ def _sanitize_agent_json(value: Any, *, key: str | None = None) -> Any:
     if normalized_key in _AGENT_CREDENTIAL_KEYS:
         raise ValueError("agent records cannot persist credential material")
     if isinstance(value, dict):
-        return {str(item_key): _sanitize_agent_json(item, key=str(item_key)) for item_key, item in value.items()}
+        child_dynamic_evidence = dynamic_evidence or normalized_key in _AGENT_DYNAMIC_EVIDENCE_KEYS
+        return {
+            str(item_key): _sanitize_agent_json(
+                item,
+                key=str(item_key),
+                dynamic_evidence=child_dynamic_evidence,
+            )
+            for item_key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_sanitize_agent_json(item, key=key) for item in value]
+        return [
+            _sanitize_agent_json(item, key=key, dynamic_evidence=dynamic_evidence)
+            for item in value
+        ]
     if isinstance(value, str) and _AGENT_SECRET_VALUE_RE.search(value):
         raise ValueError("agent records cannot persist credential material")
+    if isinstance(value, str) and dynamic_evidence and not _is_safe_evidence_key(normalized_key):
+        return "[redacted agent evidence]"
     return value
 
 
 def _normalize_agent_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    with_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    with_boundaries = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", with_boundaries)
+    return re.sub(r"[^a-z0-9]+", "_", with_boundaries.lower()).strip("_")
+
+
+def _is_safe_evidence_key(normalized_key: str | None) -> bool:
+    if normalized_key is None:
+        return False
+    return (
+        normalized_key in _AGENT_SAFE_EVIDENCE_KEYS
+        or normalized_key.endswith(("_id", "_ref", "_hash", "_at", "_count", "_tokens", "_units"))
+        or normalized_key.startswith("supports_")
+        or normalized_key.endswith(("_available", "_healthy", "_enabled", "_supported"))
+    )
 
 
 def _load_dataclass(cls: type[Any], payload: str) -> Any:

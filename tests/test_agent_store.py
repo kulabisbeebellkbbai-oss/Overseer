@@ -81,7 +81,7 @@ def _checkpoint(checkpoint_id: str, epoch_id: str) -> AgentCheckpoint:
         instance_id="instance.1",
         session_id="session.1",
         driver_epoch_id=epoch_id,
-        evidence={"completed": "safe summary"},
+        evidence={"status": "completed", "reason": "safe summary"},
     )
 
 
@@ -315,11 +315,13 @@ def test_agent_store_round_trips_safe_normalized_metadata(tmp_path: Path) -> Non
         "token_count": 20,
         "usage_units": 3,
         "evidence_id": "evidence.1",
+        "evidence_ref": "evidence.ref.1",
         "reference": "reference.1",
         "status": "acknowledged",
         "reason": "provider acknowledged request",
         "hash": "sha256:abc123",
         "captured_at": "2026-07-29T00:00:00+00:00",
+        "observed_at": "2026-07-29T00:00:01+00:00",
     }
 
     with OverseerStore(tmp_path / "state.sqlite3") as store:
@@ -336,6 +338,75 @@ def test_agent_store_round_trips_safe_normalized_metadata(tmp_path: Path) -> Non
         assert dict(store.load_agent_dispatch(dispatch.id).evidence) == metadata
         assert dict(store.load_agent_checkpoint(checkpoint.id).evidence) == metadata
         assert dict(store.load_agent_handoff(handoff.id).evidence) == metadata
+
+
+@pytest.mark.parametrize(
+    ("key", "disposition"),
+    (
+        ("clientSecret", "reject"),
+        ("clientSecretValue", "reject"),
+        ("apiKey", "reject"),
+        ("accessToken", "reject"),
+        ("refreshToken", "reject"),
+        ("privateKey", "reject"),
+        ("rawOutput", "redact"),
+        ("rawMessages", "redact"),
+        ("message", "redact"),
+        ("messages", "redact"),
+        ("output", "redact"),
+        ("outputs", "redact"),
+    ),
+)
+def test_agent_store_camel_case_sensitive_evidence_never_reaches_sqlite(
+    tmp_path: Path, key: str, disposition: str
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    raw_value = f"raw-value-for-{key}"
+    checkpoint = replace(_checkpoint("checkpoint.1", "epoch.1"), evidence={key: raw_value})
+
+    with OverseerStore(path) as store:
+        if disposition == "reject":
+            with pytest.raises(ValueError, match="credential material"):
+                store.save_agent_checkpoint(checkpoint)
+        else:
+            store.save_agent_checkpoint(checkpoint)
+            assert store.load_agent_checkpoint(checkpoint.id).evidence[key] == (
+                "[redacted agent transcript]"
+            )
+
+    database_bytes = b"".join(
+        candidate.read_bytes()
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        if candidate.exists()
+    )
+    assert raw_value.encode() not in database_bytes
+
+
+def test_agent_store_redacts_unknown_evidence_strings_but_keeps_safe_scalars(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    unknown_dialogue = "this is an unclassified free-form dialogue string"
+    evidence = {
+        "note": unknown_dialogue,
+        "nested": {"comment": unknown_dialogue, "exit_code": 0, "available": True},
+        "retry_limit": 3,
+    }
+
+    with OverseerStore(path) as store:
+        checkpoint = replace(_checkpoint("checkpoint.1", "epoch.1"), evidence=evidence)
+        store.save_agent_checkpoint(checkpoint)
+        loaded = store.load_agent_checkpoint(checkpoint.id).evidence
+        assert loaded["note"] == "[redacted agent evidence]"
+        assert loaded["nested"]["comment"] == "[redacted agent evidence]"
+        assert loaded["nested"]["exit_code"] == 0
+        assert loaded["nested"]["available"] is True
+        assert loaded["retry_limit"] == 3
+
+    database_bytes = b"".join(
+        candidate.read_bytes()
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        if candidate.exists()
+    )
+    assert unknown_dialogue.encode() not in database_bytes
 
 
 def test_session_profile_and_dispatch_allow_only_explicit_mutable_fields(tmp_path: Path) -> None:
@@ -396,8 +467,8 @@ def test_lifecycle_unique_collisions_and_mutations_preserve_original_history(tmp
             store.save_agent_dispatch(replace(dispatch, id="dispatch.2"))
         assert store.load_agent_dispatch(dispatch.id).idempotency_key == dispatch.idempotency_key
 
-        store.save_agent_dispatch(replace(dispatch, evidence={"summary": "updated"}))
-        assert store.load_agent_dispatch(dispatch.id).evidence == {"summary": "updated"}
+        store.save_agent_dispatch(replace(dispatch, evidence={"reason": "updated"}))
+        assert store.load_agent_dispatch(dispatch.id).evidence == {"reason": "updated"}
         with pytest.raises(ValueError, match="immutable identity"):
             store.save_agent_dispatch(replace(dispatch, driver_epoch_id="epoch.2"))
         assert store.load_agent_dispatch(dispatch.id).driver_epoch_id == epoch.id

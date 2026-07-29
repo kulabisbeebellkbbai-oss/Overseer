@@ -8806,6 +8806,25 @@ class UsageContinuationRequestTests(unittest.TestCase):
         self.assertEqual(resource.owner_domain, OwnerDomain.QUARK)
         self.assertEqual(resource.identifiers["conversation_id"], thread.conversation_id)
 
+    def test_codex_project_thread_facade_exposes_generic_session_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f7140-debb-7c40-a056-d29be0630f01,Overseer,"
+                "/workspace/Overseer,codex-overseer-019f7140,/bin/codex-overseer-019f7140,"
+                "2026-07-17T18:05:04+00:00,2026-07-18T19:57:08+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            adapter = CodexProjectThreadAdapter(registry)
+
+            session = adapter.driver.discover()[0]
+
+        self.assertEqual(
+            session.legacy_references["resource_id"],
+            "thread.codex.codex-overseer-019f7140",
+        )
+
     def test_discovers_codex_project_threads_as_resources(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

@@ -413,7 +413,10 @@ class AgentRegistry:
         }
         _validate_required_secret_references(profiles, providers)
         _validate_fallbacks(profiles, providers)
-        factories = dict(adapter_factories or {})
+        from .agent_adapters import ADAPTER_FACTORIES
+
+        factories = dict(ADAPTER_FACTORIES)
+        factories.update(adapter_factories or {})
         if any(not isinstance(adapter_id, str) or not callable(factory) for adapter_id, factory in factories.items()):
             raise TypeError("adapter_factories must map adapter ids to callables")
         return cls(

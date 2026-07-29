@@ -76,7 +76,9 @@ from .codex_projects import (
     CodexProjectThreadAdapter,
     codex_project_thread_resource,
     codex_project_thread_resources,
+    legacy_codex_session_resource,
 )
+from .agent_adapters.codex import CodexDriver, codex_adapter_factory
 from .core import (
     ApprovalLevel,
     Claim,
@@ -291,6 +293,9 @@ __all__ = [
     "CodexProjectResumeResult",
     "CodexProjectThread",
     "CodexProjectThreadAdapter",
+    "CodexDriver",
+    "codex_adapter_factory",
+    "legacy_codex_session_resource",
     "OverseerConfig",
     "config_from_mapping",
     "load_config",

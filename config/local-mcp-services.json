@@ -43,7 +43,7 @@
         "kind": "streamable_http_mcp",
         "endpoint": "http://127.0.0.1:8797/mcp"
       },
-      "notes": "Read-only provider access with metadata-only local snapshot history; backend remains loopback-only."
+      "notes": "Read-only Codex provider usage observer with metadata-only local snapshot history; this is not a universal agent usage service and the backend remains loopback-only."
     },
     {
       "id": "svc.mcp.documents",

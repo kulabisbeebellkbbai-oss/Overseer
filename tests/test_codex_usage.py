@@ -111,3 +111,6 @@ def test_julian_health_page_renders_codex_usage_panels():
     assert "Codex Capacity" in OPERATOR_CONSOLE_HTML
     assert "Codex Usage Windows" in OPERATOR_CONSOLE_HTML
     assert "Codex Account Usage" in OPERATOR_CONSOLE_HTML
+    assert "Codex Usage" in OPERATOR_CONSOLE_HTML
+    assert "providerNativeUsage" in OPERATOR_CONSOLE_HTML
+    assert "usage_unit" in OPERATOR_CONSOLE_HTML

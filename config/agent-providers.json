@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "id": "codex",
+      "adapter": "codex",
+      "transport": "interactive_cli",
+      "executable": "codex",
+      "capabilities": {
+        "session_discovery": true,
+        "session_resume": true,
+        "interactive_dispatch": true,
+        "structured_events": false,
+        "checkpoints": true,
+        "cancellation": false,
+        "handoff_import": true,
+        "usage_observation": true
+      }
+    },
+    {
+      "id": "claude",
+      "adapter": "claude",
+      "transport": "noninteractive_cli",
+      "executable": "claude",
+      "capabilities": {
+        "session_discovery": false,
+        "session_resume": true,
+        "interactive_dispatch": false,
+        "noninteractive_dispatch": true,
+        "structured_events": false,
+        "checkpoints": false,
+        "cancellation": false,
+        "delegated_workers": false,
+        "usage_observation": false,
+        "handoff_import": true
+      }
+    },
+    {
+      "id": "qwen-code",
+      "adapter": "qwen_code",
+      "transport": "interactive_cli",
+      "executable": "qwen",
+      "capabilities": {}
+    },
+    {
+      "id": "mistral-vibe",
+      "adapter": "mistral_vibe",
+      "transport": "interactive_cli",
+      "executable": "vibe",
+      "capabilities": {}
+    },
+    {
+      "id": "antigravity",
+      "adapter": "antigravity",
+      "transport": "gateway",
+      "executable": null,
+      "capabilities": {}
+    }
+  ],
+  "instances": [
+    {
+      "id": "overseer.default",
+      "primary_provider_id": "codex",
+      "workspace": ".",
+      "fallback_provider_ids": []
+    }
+  ]
+}

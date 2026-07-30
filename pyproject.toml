@@ -14,6 +14,11 @@ dependencies = [
   "starlette>=0.27",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+]
+
 [project.scripts]
 overseer = "overseer.cli:main"
 overseer-codex-usage-mcp = "overseer.codex_usage_mcp:main"
@@ -24,3 +29,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+markers = [
+  "live_agent: opt-in disposable live provider checks",
+]

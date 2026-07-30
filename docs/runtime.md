@@ -2,6 +2,31 @@
 
 The runtime entrypoint can run a single foreground tick against an explicit SQLite store, and this workstation has an approved user systemd service installed for continuous local operation.
 
+## Primary driver lifecycle
+
+At startup, Overseer resolves the configured provider/profile and creates or
+loads one active driver epoch. Editing configuration does not replace the
+active driver. Dispatch intent is persisted before provider execution and is
+bound to the current session, epoch, idempotency key, and operation generation.
+Stale completions are quarantined.
+
+Recovery resumes the same provider from persisted continuity. Manual handoff is
+operator-selected and approval-bound. Controlled failover is separately
+policy/evidence/decision/approval-bound. Both reserve the instance, fence new
+dispatches, drain or cancel in-flight work, and require outgoing quiescence
+before checkpoint/import. Promotion is atomic only after the incoming provider
+acknowledges the exact session and epoch identities.
+
+Rollback resumes the outgoing provider only after exact incoming cancellation
+is terminal and externally verified. Crash-ambiguous and blocked states remain
+paused. `agent-instances`, `agent-session-status`, `GET /agent-dispatches`,
+and `GET /agent-failover-executions` provide normalized lifecycle evidence;
+`recover-agent-failover` is limited to an exact approved pre-import execution
+recovery.
+
+See `docs/agent-provider-architecture.md` for exact commands and pause
+semantics.
+
 ## Boundaries
 
 - The user systemd unit is local machine state and is not committed to the repository.

@@ -1,6 +1,6 @@
 # Overseer
 
-Overseer is a local resource manager for coordinating shared machine services, physical assets, virtual assets, usage-limited services, maintenance, updates, and security actions across multiple Codex projects or threads.
+Overseer is a local resource manager for coordinating shared machine services, physical assets, virtual assets, usage-limited services, maintenance, updates, security actions, and provider-neutral agent sessions.
 
 Its purpose is to prevent conflicting work by tracking ownership, checkout state, locks, limits, health, and safe timing for resources such as the Protected Gateway, USB and serial devices, emulators, VMs, gateways, proxies, MCP services, hosted pages, update pipelines, storage arrays, and power-sensitive assets.
 
@@ -13,6 +13,20 @@ The first release should include a working initial slice for every major domain:
 - usage-limit scheduling
 - security monitoring and protective actions
 
+## Primary AI Driver
+
+Each Overseer instance has one primary AI driver. Codex remains the
+compatibility provider; Claude can replace it through a tested, approved manual
+handoff. Qwen Code, Mistral Vibe, and Antigravity are recognized but remain
+live-unavailable until a local programmatic interface is verified. Provider
+capabilities never bypass Overseer's policy, approval, claim, audit, secret,
+or scheduling boundaries.
+
+See [Agent Provider Architecture](docs/agent-provider-architecture.md),
+[Provider Adapter Contract](docs/provider-adapter-contract.md), and
+[Agent Provider Migration](docs/agent-provider-migration.md). Ordinary
+regression never runs live provider prompts.
+
 ## Project Layout
 
 - `src/` - application source code
@@ -23,6 +37,9 @@ The first release should include a working initial slice for every major domain:
 ## Development Commands
 
 - `pytest -q` - run the current unit test suite with the configured `src/` import path.
+- `PYTHONPATH=src python3 scripts/run_full_regression.py` - run the staged local regression package, including provider-neutral suites while excluding opt-in live agent tests.
+- `PYTHONPATH=src python3 -m overseer.cli agent-providers` - inspect configured provider readiness and capabilities without dispatching work.
+- `PYTHONPATH=src python3 -m overseer.cli agent-instances --store state/overseer.sqlite3` - inspect primary driver epochs, checkpoints, transitions, and failover-policy readiness.
 - `PYTHONPATH=src python3 -m unittest discover -s tests -v` - run the current unit test suite.
 - `PYTHONPATH=src python3 -m overseer.cli demo` - print a read-only demo checkout decision.
 - `PYTHONPATH=src python3 -m overseer.cli demo --store state/overseer.sqlite3` - persist the demo decision to an explicit ignored local database path.

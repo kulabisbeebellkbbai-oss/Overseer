@@ -2,6 +2,24 @@
 
 Quark owns service levels, quotas, credits, rate limits, timeout windows, renewal schedules, and paused-thread continuation timing.
 
+## Provider-neutral agent work
+
+Quark routes generic agent work by provider, instance session, and driver epoch.
+Capacity evidence must match the work's provider, limit identifier, and native
+usage unit. Accounting is partitioned by `(provider_id, limit_id, usage_unit)`;
+tokens, requests, credits, and other incompatible values are never summed or
+converted.
+
+Legacy Codex work and payloads remain compatible for one migration cycle.
+Generic scheduling uses explicit provider/session/epoch bindings, and recovered
+work is revalidated against the current epoch before dispatch. A missing or
+unknown provider capacity blocks scheduling rather than borrowing another
+provider's observation.
+
+`svc.mcp.codex-usage` supplies Codex-specific usage evidence only. Other
+providers require their own verified observer/source and retain their
+provider-native usage semantics.
+
 ## Checkpointed Codex Work
 
 Quark schedules long-running Codex work as bounded resumable turns rather than

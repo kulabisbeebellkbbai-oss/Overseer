@@ -2,6 +2,18 @@
 
 Overseer agents are organized around a Deep Space 9 inspired command crew. These names describe responsibility boundaries, not external service accounts.
 
+## AI drivers are not crew roles
+
+An AI provider drives one Overseer instance through the provider-neutral
+contract. Sisko, Kira, Dax, O'Brien, Odo, Julian, Ezri, Quark, and the other DS9
+names below are responsibility, evidence, and approval domains. They are never
+provider accounts, credentials, sessions, or fallback identities.
+
+Changing the primary AI driver does not transfer or weaken a crew role's
+authority. Overseer's deterministic policy layer continues to route approvals,
+claims, audits, scheduling, and risk decisions to the same responsibility
+domains. See `docs/agent-provider-architecture.md`.
+
 ## Sisko
 
 Command manager and coordinator.

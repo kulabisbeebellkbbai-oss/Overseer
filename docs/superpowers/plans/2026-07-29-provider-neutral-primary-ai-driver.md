@@ -34,6 +34,7 @@
 - `src/overseer/agent_contracts.py` — normalized enums, dataclasses, protocols, and error categories.
 - `src/overseer/agent_registry.py` — provider/profile configuration loading, validation, and adapter construction.
 - `src/overseer/agent_manager.py` — active epoch lifecycle and provider-neutral operation routing.
+- `src/overseer/agent_operations.py` — generation-fenced external-operation reservation, dispatch draining, quiescence, and cancellation verification.
 - `src/overseer/agent_handoff.py` — redacted handoff creation and compatibility validation.
 - `src/overseer/agent_adapters/__init__.py` — adapter exports and built-in factory map.
 - `src/overseer/agent_adapters/base_cli.py` — shared safe subprocess/tmux primitives, not provider semantics.
@@ -487,12 +488,28 @@ git commit -m "Persist agent driver lifecycle"
 **Files:**
 - Create: `src/overseer/agent_handoff.py`
 - Create: `src/overseer/agent_manager.py`
+- Create: `src/overseer/agent_operations.py`
 - Create: `tests/test_agent_handoff.py`
 - Create: `tests/test_agent_manager.py`
+- Create: `tests/test_agent_operations.py`
 
 **Interfaces:**
 - Consumes: `AgentRegistry`, `OverseerStore`, normalized contracts, existing policy decision callbacks.
-- Produces: `AgentHandoffService.build`, `AgentHandoffService.validate`, `AgentManager.activate`, `recover`, `dispatch`, `checkpoint`, `manual_handoff`, `quarantine_result`.
+- Produces: `AgentHandoffService.build`, `AgentHandoffService.validate`, `AgentOperationCoordinator.reserve`, `drain`, `verify_quiescent`, `cancel_and_verify`, `AgentManager.activate`, `recover`, `dispatch`, `checkpoint`, `manual_handoff`, `rollback_handoff`, `quarantine_result`.
+
+**Operation-coordination constraints:**
+
+- Reserve and fence the instance before checkpoint collection.
+- Persist dispatch intent before any provider-side effect and bind completion
+  to the current reservation generation.
+- Reject new dispatches and drain or cancel all persisted in-flight dispatches
+  before declaring the outgoing provider quiescent.
+- Capture the handoff checkpoint only after quiescence is verified.
+- Rollback must call the incoming adapter's cancellation operation and verify a
+  terminal state before outgoing dispatch is resumed.
+- If cancellation or quiescence cannot be proven, keep the instance paused and
+  require reconciliation.
+- Include activation generation in every completion compare-and-swap.
 
 - [ ] **Step 1: Write failing epoch and handoff tests**
 
@@ -536,6 +553,30 @@ def test_handoff_rejects_raw_secret_material() -> None:
             evidence={"authorization": "Bearer abc123"},
             required_capabilities=AgentCapabilities(handoff_import=True),
         )
+
+
+def test_handoff_fences_and_drains_before_checkpoint(
+    manager: AgentManager,
+    outgoing_driver: RecordingDriver,
+) -> None:
+    manager.dispatch("overseer.default", "long operation", "operation.long")
+    manager.manual_handoff(
+        "overseer.default", "claude", "operator", "approval.to-claude"
+    )
+    assert outgoing_driver.events.index("dispatch_terminal") < (
+        outgoing_driver.events.index("checkpoint")
+    )
+
+
+def test_rollback_remains_paused_when_incoming_cancel_is_unverified(
+    manager: AgentManager,
+    incoming_driver: RecordingDriver,
+) -> None:
+    incoming_driver.cancel_result = AgentOperationState.FAILED
+    result = manager.rollback_handoff("overseer.default", "handoff.1", "operator")
+    assert result.state is AgentOperationState.BLOCKED
+    with pytest.raises(AgentTransitionRequiredError):
+        manager.dispatch("overseer.default", "must stay paused", "operation.blocked")
 ```
 
 - [ ] **Step 2: Run tests and verify missing services**
@@ -587,18 +628,25 @@ def manual_handoff(
     return incoming
 ```
 
-Do not close the outgoing epoch until the incoming adapter acknowledges the imported handoff. If import fails, leave the instance paused with both the failure and outgoing checkpoint recorded. Redaction recursively rejects keys and string values matching token, cookie, authorization, password, private key, bearer, or known secret-reference resolution output.
+Do not close the outgoing epoch until the incoming adapter acknowledges the
+imported handoff. Reserve and fence the instance before checkpoint collection;
+drain or cancel persisted in-flight dispatches and verify outgoing quiescence.
+If import fails, leave the instance paused with both the failure and outgoing
+checkpoint recorded. Rollback may resume outgoing dispatch only after verified
+incoming cancellation. Redaction recursively rejects keys and string values
+matching token, cookie, authorization, password, private key, bearer, or known
+secret-reference resolution output.
 
 - [ ] **Step 4: Run lifecycle tests**
 
-Run: `pytest -q tests/test_agent_handoff.py tests/test_agent_manager.py tests/test_agent_store.py`
+Run: `pytest -q tests/test_agent_handoff.py tests/test_agent_manager.py tests/test_agent_operations.py tests/test_agent_store.py`
 
 Expected: all tests pass, including idempotency and late-output quarantine.
 
 - [ ] **Step 5: Commit lifecycle manager**
 
 ```bash
-git add src/overseer/agent_handoff.py src/overseer/agent_manager.py tests/test_agent_handoff.py tests/test_agent_manager.py
+git add src/overseer/agent_handoff.py src/overseer/agent_manager.py src/overseer/agent_operations.py tests/test_agent_handoff.py tests/test_agent_manager.py tests/test_agent_operations.py
 git commit -m "Add agent driver lifecycle manager"
 ```
 

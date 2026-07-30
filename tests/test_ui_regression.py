@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -66,6 +67,134 @@ class LocalApiHarness:
 
 
 class ProtectedGatewayUiRegressionTests(unittest.TestCase):
+    def test_failover_recovery_ui_uses_status_contract(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        for state in ("reserved", "draining", "blocked_preimport", "recovering"):
+            self.assertIn(state, OPERATOR_CONSOLE_HTML)
+        self.assertIn("item.recovery_state", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/agent-failover/recover"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("blockedFailoverExecution.blocker", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("operation_owner_ref", OPERATOR_CONSOLE_HTML)
+
+    def test_dashboard_pure_javascript_behavior_executes_in_node(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        start = OPERATOR_CONSOLE_HTML.index("    function providerGate(")
+        end = OPERATOR_CONSOLE_HTML.index("    function selectView(", start)
+        functions = OPERATOR_CONSOLE_HTML[start:end]
+        render_start = OPERATOR_CONSOLE_HTML.index("    function renderDriver()")
+        render_end = OPERATOR_CONSOLE_HTML.index("    function renderAdmin()", render_start)
+        render_function = OPERATOR_CONSOLE_HTML[render_start:render_end]
+        script = functions + r"""
+const providers = [
+  {id:"codex", available:true, readiness:"available", capabilities:{session_discovery:true, checkpoints:true}},
+  {id:"claude", available:false, readiness:"unavailable", unavailable_reason:{type:"not_installed"}, capabilities:{}}
+];
+if (!providerGate(providers, "codex", {checkpoints:true}, "session_discovery").enabled) process.exit(2);
+if (providerGate(providers, "claude", {}, "session_discovery").enabled) process.exit(3);
+if (!providerGate(providers, "missing", {}, "session_resume").blocker.includes("not configured")) process.exit(4);
+const payload = validatedTransferPayload("overseer.default", "claude", "operator", "approval.1");
+if (payload.approval_id !== "approval.1") process.exit(5);
+let rejected = false;
+try { validatedTransferPayload("overseer.default", "claude", "operator", ""); } catch (_) { rejected = true; }
+if (!rejected) process.exit(6);
+""" + render_function + r"""
+const driverElement = {innerHTML:""};
+const document = {getElementById:(id) => id === "driver" ? driverElement : null};
+const safe = (value) => String(value ?? "").replaceAll('"', "&quot;");
+const stationIntro = () => "";
+const metric = () => "";
+const kv = () => "";
+const table = () => "";
+const officerPanel = () => "";
+const state = {driverSelection:{}, data:{
+  agentProviders:{providers:[
+    {id:"codex",available:true,readiness:"available",capabilities:{session_discovery:true,session_resume:true,checkpoints:true,handoff_import:true}},
+    {id:"claude",available:false,readiness:"unavailable",unavailable_reason:{type:"not_installed"},capabilities:{}}
+  ]},
+  agentInstances:{instances:[{id:"overseer.default",primary_provider_id:"codex",required_capabilities:{},approved_fallback_provider_ids:["claude"],policy_readiness:"ready",controlled_failover_policy_ref:"policy.failover"}]},
+  agentSessions:{sessions:[{id:"session.codex",provider_id:"codex",instance_id:"overseer.default",state:"active"}]},
+  agentDispatches:{dispatches:[],results:[]}, agentUsage:{providers:[]}
+}};
+renderDriver();
+if (!driverElement.innerHTML.includes('data-action="discover-agent-sessions"')) process.exit(7);
+if (!driverElement.innerHTML.includes('Cancellation route is unavailable')) process.exit(8);
+state.driverSelection["agent-provider-id"] = "claude";
+renderDriver();
+if (!driverElement.innerHTML.includes('data-action="discover-agent-sessions" disabled')) process.exit(9);
+if (!driverElement.innerHTML.includes('not_installed')) process.exit(10);
+state.driverSelection["agent-incoming-provider-id"] = "claude";
+renderDriver();
+if (!driverElement.innerHTML.includes('data-action="failover-agent" disabled')) process.exit(11);
+state.data.agentProviders.providers[0].available = false;
+state.data.agentProviders.providers[0].readiness = "unavailable";
+state.data.agentProviders.providers[1] = {id:"claude",available:true,readiness:"available",capabilities:{handoff_import:true}};
+state.data.agentInstances.instances[0].failover_policy_readiness = "ready";
+renderDriver();
+const failoverButton = driverElement.innerHTML.match(/<button[^>]*data-action="failover-agent"[^>]*>/)?.[0] || "";
+if (!failoverButton || failoverButton.includes(" disabled")) process.exit(12);
+state.data.agentInstances.instances[0].controlled_failover_policy_ref = null;
+renderDriver();
+const blockedFailover = driverElement.innerHTML.match(/<button[^>]*data-action="failover-agent"[^>]*>/)?.[0] || "";
+if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Controlled failover policy is not configured")) process.exit(13);
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_operator_console_contains_primary_driver_controls(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn("Primary AI Driver", OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentProviders: "/agent-providers"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentInstances: "/agent-instances"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentSessions: "/agent-sessions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentDispatches: "/agent-dispatches"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="discover-agent-sessions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="resume-agent-sessions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="checkpoint-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="handoff-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="failover-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-disabled-action="cancel-agent"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Provider Capabilities", OPERATOR_CONSOLE_HTML)
+        self.assertIn("approval_id", OPERATOR_CONSOLE_HTML)
+        self.assertIn("window.confirm", OPERATOR_CONSOLE_HTML)
+        self.assertIn('agentUsage: "/agent-usage"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.approved_fallback_provider_ids", OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.active_epoch", OPERATOR_CONSOLE_HTML)
+        self.assertIn('["id", "provider_id", "instance_id", "state", "checkpoint_id"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn('["id", "instance_id", "session_id", "driver_epoch_id", "requested_at", "requested_by"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn('["request_id", "state", "completed_at", "error_category"]', OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("primary.current_epoch", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("primary.fallback_order", OPERATOR_CONSOLE_HTML)
+
+    def test_operator_console_has_responsive_mode_contract(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('id="layout-mode"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('aria-live="polite"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn("width <= 700", OPERATOR_CONSOLE_HTML)
+        self.assertIn("width <= 1024", OPERATOR_CONSOLE_HTML)
+        self.assertIn('localStorage.getItem("overseerLayoutMode")', OPERATOR_CONSOLE_HTML)
+        self.assertIn('localStorage.setItem("overseerLayoutMode"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('window.addEventListener("resize"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("data-layout-effective", OPERATOR_CONSOLE_HTML)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", OPERATOR_CONSOLE_HTML)
+        self.assertIn('body[data-layout-effective="desktop"] .shell', OPERATOR_CONSOLE_HTML)
+        self.assertIn('#driver .action-btn { min-height: 44px; }', OPERATOR_CONSOLE_HTML)
+
+    def test_driver_actions_fail_closed_by_exact_capability_and_route(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        for capability in ("session_discovery", "session_resume", "checkpoints", "handoff_import"):
+            self.assertIn(f'"{capability}"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("provider.available !== true", OPERATOR_CONSOLE_HTML)
+        self.assertIn('provider.readiness !== "available"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Cancellation route is unavailable", OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.failover_policy_readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.current_driver_blocker", OPERATOR_CONSOLE_HTML)
+
     def test_gateway_prefix_serves_operator_console_with_token_form(self):
         with tempfile.TemporaryDirectory() as directory:
             with LocalApiHarness(Path(directory) / "overseer.sqlite3") as server:

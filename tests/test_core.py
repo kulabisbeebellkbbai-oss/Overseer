@@ -6,6 +6,7 @@ import threading
 import unittest
 import json
 import subprocess
+from types import SimpleNamespace
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -406,6 +407,12 @@ class _FakeCodexProjectRunner:
         if tuple(command[:3]) == ("/usr/bin/tmux", "has-session", "-t"):
             return subprocess.CompletedProcess(command, 1, "", "missing")
         return subprocess.CompletedProcess(command, 0, "resumed", "")
+
+    def run_bounded(
+        self, command, input_text=None, timeout_seconds=30, cwd=None,
+        *, stdout_limit_bytes, stderr_limit_bytes
+    ):
+        return self(command, input=input_text)
 
 
 class LocalHttpServer:
@@ -2793,6 +2800,49 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_legacy_codex_discovery_keeps_payload_keys_and_successor_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,"
+                "updated_at,source,notes\n",
+                encoding="utf-8",
+            )
+
+            with LocalOverseerApiServer(store_path) as server:
+                request = Request(
+                    f"{server.url}/codex-projects/discover-threads",
+                    data=json.dumps(
+                        {"codex_projects_registry": str(registry)}
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    deprecation = response.headers["Deprecation"]
+                    successor = response.headers["Link"]
+
+            self.assertEqual(
+                set(payload),
+                {
+                    "store",
+                    "registry",
+                    "threads",
+                    "resources",
+                    "items",
+                    "mutation_performed",
+                    "host_mutation_performed",
+                    "next_step",
+                },
+            )
+            self.assertEqual(deprecation, "true")
+            self.assertEqual(
+                successor,
+                '</agent-sessions/discover>; rel="successor-version"',
+            )
+
     def test_loopback_api_reports_health_and_state(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -2886,6 +2936,22 @@ class OverseerApiTests(unittest.TestCase):
         self.assertEqual(search["results"][0]["filename"], "Overseer/Runbooks/REST.md")
         self.assertTrue(write["mutation_performed"])
         self.assertNotIn("test-token", json.dumps(status))
+
+    def test_documents_list_notes_reports_unavailable_dependency(self):
+        with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
+            env_file = Path(directory) / "obsidian.env"
+            env_file.write_text(
+                f"OBSIDIAN_BASE_URL={obsidian.url}\nOBSIDIAN_API_KEY=wrong-token\n",
+                encoding="utf-8",
+            )
+
+            status = overseer_documents.documents_list_notes_status(str(env_file), "Overseer")
+
+        self.assertFalse(status["available"])
+        self.assertEqual(status["folder"], "Overseer")
+        self.assertEqual(status["count"], 0)
+        self.assertEqual(status["files"], [])
+        self.assertIn("HTTP 401", status["error"])
 
     def test_documents_client_rejects_writes_outside_allowed_folders(self):
         with tempfile.TemporaryDirectory() as directory, LocalFakeObsidianServer() as obsidian:
@@ -3584,6 +3650,23 @@ class OverseerApiTests(unittest.TestCase):
 
 
 class OverseerApiClientTests(unittest.TestCase):
+    def test_client_lists_provider_neutral_agent_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+
+            with LocalOverseerApiServer(store_path) as server:
+                client = OverseerApiClient(server.url)
+                providers = client.list_agent_providers()
+                instances = client.list_agent_instances()
+                sessions = client.list_agent_sessions()
+
+            self.assertGreaterEqual(
+                {item["id"] for item in providers["providers"]},
+                {"codex", "claude"},
+            )
+            self.assertEqual(instances["instances"][0]["id"], "overseer.default")
+            self.assertEqual(sessions, {"sessions": []})
+
     def test_client_reads_state_with_token_file(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -4648,6 +4731,10 @@ class OverseerApiClientTests(unittest.TestCase):
                         if tuple(command) == ("hostname",)
                         else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
                         if tuple(command) == ("ss", "-ltnp")
+                        else "running"
+                        if tuple(command) == ("firewall-cmd", "--state")
+                        else "public\n  interfaces: eth0"
+                        if tuple(command) == ("firewall-cmd", "--get-active-zones")
                         else "ok"
                     ),
                 ),
@@ -8671,6 +8758,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
                 return UsageContinuationRequestTests._Completed(returncode=1, stderr="no session")
             return UsageContinuationRequestTests._Completed(returncode=0, stdout="started")
 
+        def run_bounded(
+            self, command, input_text=None, timeout_seconds=30, cwd=None,
+            *, stdout_limit_bytes, stderr_limit_bytes
+        ):
+            return self(command)
+
     def test_codex_project_thread_adapter_resumes_registry_thread_detached(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "codex-projects.csv"
@@ -8714,6 +8807,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
                     )
                 return UsageContinuationRequestTests._Completed()
 
+            def run_bounded(
+                self, command, input_text=None, timeout_seconds=30, cwd=None,
+                *, stdout_limit_bytes, stderr_limit_bytes
+            ):
+                return self(command, input=input_text)
+
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "codex-projects.csv"
             registry.write_text(
@@ -8749,6 +8848,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
                         stdout="Message exceeds maximum length allowed (old prompt)\nCodex ready",
                     )
                 return UsageContinuationRequestTests._Completed()
+
+            def run_bounded(
+                self, command, input_text=None, timeout_seconds=30, cwd=None,
+                *, stdout_limit_bytes, stderr_limit_bytes
+            ):
+                return self(command, input=input_text)
 
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "codex-projects.csv"
@@ -8789,6 +8894,25 @@ class UsageContinuationRequestTests(unittest.TestCase):
         self.assertEqual(resource.type, ResourceType.USAGE_LIMITED_SERVICE)
         self.assertEqual(resource.owner_domain, OwnerDomain.QUARK)
         self.assertEqual(resource.identifiers["conversation_id"], thread.conversation_id)
+
+    def test_codex_project_thread_facade_exposes_generic_session_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "codex-projects.csv"
+            registry.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f7140-debb-7c40-a056-d29be0630f01,Overseer,"
+                "/workspace/Overseer,codex-overseer-019f7140,/bin/codex-overseer-019f7140,"
+                "2026-07-17T18:05:04+00:00,2026-07-18T19:57:08+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            adapter = CodexProjectThreadAdapter(registry)
+
+            session = adapter.driver.discover()[0]
+
+        self.assertEqual(
+            session.legacy_references["resource_id"],
+            "thread.codex.codex-overseer-019f7140",
+        )
 
     def test_discovers_codex_project_threads_as_resources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -9127,6 +9251,21 @@ class UsageContinuationRequestTests(unittest.TestCase):
     def test_dispatching_odo_stages_exact_sisko_and_ids_review_requests(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
+            registry_path = Path(directory) / "codex-projects.csv"
+            registry_path.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f09da-25c8-72b2-9730-9a0a17b9e177,Intrusion Detection,"
+                "/workspace/Intrusion Detection,codex-intrusion-detection-019f09da,"
+                "/bin/codex-intrusion-detection-019f09da,"
+                "2026-06-27T16:11:59+00:00,2026-06-28T17:17:28+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            adapter = CodexProjectThreadAdapter(
+                registry_path,
+                tmux_path="/tmp/tmux",
+                codex_memory_session_path="/tmp/codex-memory-session",
+                runner=self._FakeRunner(),
+            )
             snapshot = HostInspectionAdapter(
                 command_runner=lambda command, timeout_seconds: HostCommandObservation(
                     name=command[0],
@@ -9157,11 +9296,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
             )
 
             with patch("overseer.cli.inspect_host_status", return_value={"id": snapshot.id}):
-                status = dispatch_crew_messages_status(
-                    store_path,
-                    owner_domain=OwnerDomain.ODO.value,
-                    dispatched_at="2026-07-19T13:07:00+00:00",
-                )
+                with patch("overseer.cli.CodexProjectThreadAdapter", return_value=adapter):
+                    status = dispatch_crew_messages_status(
+                        store_path,
+                        owner_domain=OwnerDomain.ODO.value,
+                        dispatched_at="2026-07-19T13:07:00+00:00",
+                    )
             readiness = admin_execution_readiness_status(store_path)
             messages = crew_messages_status(store_path, owner_domain=OwnerDomain.SISKO.value, status=CrewMessageStatus.OPEN.value)
             ids_packages = host_security_ids_review_packages_status(store_path)
@@ -9420,6 +9560,191 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["dispatches"][0]["resume_status"], "resumed")
             self.assertEqual(status["dispatches"][0]["resume_command"], "codex-overseer-019f7140")
             self.assertEqual(plan["dispatch_items"][0]["resume_conversation_id"], "019f7140-debb-7c40-a056-d29be0630f01")
+
+    def test_generic_continuation_routes_through_session_provider(self):
+        class FakeAgentManager:
+            def __init__(self):
+                self.recovered_session_ids = []
+                self.dispatches = []
+
+            def recover(self, session_id, initiated_by="system"):
+                self.recovered_session_ids.append(session_id)
+                return SimpleNamespace(
+                    id="epoch.claude.1",
+                    instance_id="agent.claude.1",
+                    provider_id="claude",
+                )
+
+            def dispatch(
+                self,
+                instance_id,
+                prompt,
+                idempotency_key,
+                requested_by=None,
+            ):
+                self.dispatches.append(
+                    (instance_id, prompt, idempotency_key, requested_by)
+                )
+                return SimpleNamespace(
+                    request_id=idempotency_key,
+                    state=SimpleNamespace(value="running"),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_usage_limit(
+                UsageLimit(
+                    id="limit.claude.tokens",
+                    resource_id="svc.claude",
+                    kind=LimitKind.TOKENS,
+                    capacity=100_000,
+                    remaining=80_000,
+                    resets_at="2026-07-18T12:00:00-04:00",
+                    window="daily",
+                )
+            )
+            store.save_usage_continuation_request(
+                UsageContinuationRequest(
+                    id="work.claude",
+                    limit_id="limit.claude.tokens",
+                    resource_id="svc.claude",
+                    owner_thread=None,
+                    requested_units=8_000,
+                    intent="continue Claude implementation",
+                    agent_session_id="session.claude.1",
+                    driver_epoch_id="epoch.claude.1",
+                    provider_id="claude",
+                )
+            )
+            store.close()
+            manager = FakeAgentManager()
+
+            result = dispatch_usage_continuations_status(
+                store_path=store_path,
+                resume_agent_sessions=True,
+                agent_manager=manager,
+            )
+
+        self.assertEqual(manager.recovered_session_ids, ["session.claude.1"])
+        self.assertEqual(
+            manager.dispatches,
+            [
+                (
+                    "agent.claude.1",
+                    "continue Claude implementation",
+                    "usage-continuation:work.claude",
+                    "quark",
+                )
+            ],
+        )
+        self.assertTrue(result["resume_agent_sessions"])
+        self.assertEqual(result["dispatches"][0]["provider_id"], "claude")
+        self.assertEqual(
+            result["dispatches"][0]["agent_session_id"],
+            "session.claude.1",
+        )
+        self.assertEqual(
+            result["dispatches"][0]["driver_epoch_id"],
+            "epoch.claude.1",
+        )
+
+    def test_generic_continuation_api_payload_accepts_session_identity(self):
+        args = overseer_api._usage_continuation_request_args(
+            {
+                "request_id": "work.claude",
+                "limit_id": "limit.claude.tokens",
+                "resource_id": "svc.claude",
+                "agent_session_id": "session.claude.1",
+                "driver_epoch_id": "epoch.claude.1",
+                "provider_id": "claude",
+                "requested_units": 8000,
+                "intent": "continue Claude implementation",
+            }
+        )
+
+        self.assertIsNone(args["owner_thread"])
+        self.assertEqual(args["agent_session_id"], "session.claude.1")
+        self.assertEqual(args["driver_epoch_id"], "epoch.claude.1")
+        self.assertEqual(args["provider_id"], "claude")
+
+    def test_generic_continuation_dispatch_api_enables_agent_recovery(self):
+        args = overseer_api._usage_continuation_dispatch_args(
+            {
+                "resume_agent_sessions": True,
+                "agent_registry_path": "/tmp/providers.json",
+                "local_agent_registry_path": "/tmp/providers.local.json",
+            }
+        )
+
+        self.assertTrue(args["resume_agent_sessions"])
+        self.assertEqual(args["agent_registry_path"], "/tmp/providers.json")
+        self.assertEqual(
+            args["local_agent_registry_path"],
+            "/tmp/providers.local.json",
+        )
+
+    def test_generic_continuation_cli_accepts_session_identity(self):
+        with patch(
+            "overseer.cli.request_usage_continuation_status",
+            return_value={"ok": True},
+        ) as request_status:
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = cli_main(
+                    [
+                        "request-usage-continuation",
+                        "--store",
+                        "/tmp/overseer.sqlite3",
+                        "--request-id",
+                        "work.claude",
+                        "--limit-id",
+                        "limit.claude.tokens",
+                        "--resource-id",
+                        "svc.claude",
+                        "--agent-session-id",
+                        "session.claude.1",
+                        "--driver-epoch-id",
+                        "epoch.claude.1",
+                        "--provider-id",
+                        "claude",
+                        "--requested-units",
+                        "8000",
+                        "--intent",
+                        "continue Claude implementation",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            request_status.call_args.args[-3:],
+            ("session.claude.1", "epoch.claude.1", "claude"),
+        )
+
+    def test_generic_continuation_dispatch_cli_enables_agent_recovery(self):
+        with patch(
+            "overseer.cli.dispatch_usage_continuations_status",
+            return_value={"ok": True},
+        ) as dispatch_status:
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = cli_main(
+                    [
+                        "dispatch-usage-continuations",
+                        "--store",
+                        "/tmp/overseer.sqlite3",
+                        "--resume-agent-sessions",
+                        "--agent-registry",
+                        "/tmp/providers.json",
+                        "--agent-registry-local",
+                        "/tmp/providers.local.json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(dispatch_status.call_args.kwargs["resume_agent_sessions"])
+        self.assertEqual(
+            dispatch_status.call_args.kwargs["agent_registry_path"],
+            "/tmp/providers.json",
+        )
 
     def test_dispatch_skips_waiting_usage_continuation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -10029,9 +10354,18 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(len(migrations), 1)
+        self.assertEqual(len(migrations), 10)
         self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
         self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
+        self.assertEqual(migrations[1].version, "agent_driver_v1")
+        self.assertEqual(migrations[2].version, "agent_driver_v2")
+        self.assertEqual(migrations[3].version, "agent_driver_v3")
+        self.assertEqual(migrations[4].version, "agent_driver_v4")
+        self.assertEqual(migrations[5].version, "agent_driver_v5")
+        self.assertEqual(
+            migrations[1].description,
+            "persist provider-neutral agent driver lifecycle records",
+        )
         self.assertEqual(reopened_migrations, migrations)
 
     def test_persists_resource_claim_and_decision_in_explicit_temp_database(self):

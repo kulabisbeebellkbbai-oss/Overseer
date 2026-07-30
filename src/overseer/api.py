@@ -13,8 +13,15 @@ from urllib.parse import parse_qs, urlsplit
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
+    DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
     active_policy_profile_status,
+    agent_dispatches_status,
+    agent_failover_executions_status,
+    agent_instances_status,
+    agent_providers_status,
+    agent_sessions_status,
+    agent_usage_status,
     admin_adapter_capabilities_status,
     admin_adapter_enablement_plan_status,
     admin_executions_status,
@@ -46,7 +53,11 @@ from .cli import (
     command_summary_status,
     create_host_security_source_review_status,
     crew_messages_status,
-    discover_codex_project_threads_status,
+    checkpoint_agent_status,
+    evaluate_agent_failover_status,
+    execute_agent_failover_status,
+    discover_agent_sessions_status,
+    dispatch_agent_goal_status,
     dispatch_crew_messages_status,
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
@@ -75,6 +86,7 @@ from .cli import (
     inspect_host_status,
     inspect_packages_status,
     issue_key_broker_token_status,
+    handoff_agent_status,
     key_broker_status,
     list_state_status,
     maintenance_summary_status,
@@ -107,6 +119,8 @@ from .cli import (
     request_claim_status,
     request_claim_cleanup_status,
     request_key_broker_token_status,
+    recover_agent_status,
+    recover_agent_failover_execution_status,
     run_obrien_package_maintenance_cycle_status,
     service_status,
     runtime_status,
@@ -119,6 +133,8 @@ from .cli import (
     revoke_key_broker_token_status,
     virtual_summary_status,
 )
+from .agent_manager import AgentAuthorizationError, AgentManagerError
+from .agent_registry import AgentAdapterUnavailableError
 from .documents import (
     documents_config_status,
     documents_list_notes_status,
@@ -313,6 +329,39 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                         "token_id": auth_context.get("token_id"),
                     }
                 )
+                return
+            if path == "/agent-providers":
+                self._handle(agent_providers_status)
+                return
+            if path == "/agent-instances":
+                self._handle(lambda: agent_instances_status(store_path))
+                return
+            if path == "/agent-sessions":
+                self._handle(
+                    lambda: agent_sessions_status(
+                        store_path,
+                        _query_first(query, "provider_id"),
+                        _query_first(query, "instance_id"),
+                    )
+                )
+                return
+            if path == "/agent-dispatches":
+                self._handle(
+                    lambda: agent_dispatches_status(
+                        store_path,
+                        _query_first(query, "instance_id"),
+                    )
+                )
+                return
+            if path == "/agent-failover-executions":
+                self._handle(
+                    lambda: agent_failover_executions_status(
+                        store_path, _query_first(query, "instance_id")
+                    )
+                )
+                return
+            if path == "/agent-usage":
+                self._handle(lambda: agent_usage_status(store_path))
                 return
             if path == "/service-status":
                 self._handle(lambda: service_status(store_path))
@@ -583,6 +632,70 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 or path.startswith("/security/key-broker/")
             ) and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error": "control routes require admin authorization"}, HTTPStatus.FORBIDDEN)
+                return
+            if path == "/agent-sessions/discover":
+                self._handle_json(
+                    lambda payload: discover_agent_sessions_status(
+                        store_path,
+                        **_agent_session_discovery_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-dispatches":
+                self._handle_json(
+                    lambda payload: dispatch_agent_goal_status(
+                        store_path,
+                        **_agent_dispatch_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-checkpoints":
+                self._handle_json(
+                    lambda payload: checkpoint_agent_status(
+                        store_path,
+                        **_agent_checkpoint_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-recovery":
+                self._handle_json(
+                    lambda payload: recover_agent_status(
+                        store_path,
+                        **_agent_recovery_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-handoffs":
+                self._handle_json(
+                    lambda payload: handoff_agent_status(
+                        store_path,
+                        **_agent_handoff_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-failover":
+                self._handle_json(
+                    lambda payload: execute_agent_failover_status(
+                        store_path,
+                        **_agent_failover_execution_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-failover/evaluate":
+                self._handle_json(
+                    lambda payload: evaluate_agent_failover_status(
+                        store_path,
+                        **_agent_failover_evaluation_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-failover/recover":
+                self._handle_json(
+                    lambda payload: recover_agent_failover_execution_status(
+                        store_path,
+                        **_agent_failover_recovery_args(payload),
+                    )
+                )
                 return
             if path == "/claims/request":
                 self._handle_json(lambda payload: request_claim_status(store_path, **_request_claim_args(payload)))
@@ -903,7 +1016,16 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 self._handle_json(lambda payload: dispatch_usage_continuations_status(store_path, **_usage_continuation_dispatch_args(payload)))
                 return
             if path == "/codex-projects/discover-threads":
-                self._handle_json(lambda payload: discover_codex_project_threads_status(store_path, **_codex_project_discovery_args(payload)))
+                self._handle_json(
+                    lambda payload: _legacy_codex_discovery_status(
+                        store_path,
+                        payload,
+                    ),
+                    response_headers={
+                        "Deprecation": "true",
+                        "Link": '</agent-sessions/discover>; rel="successor-version"',
+                    },
+                )
                 return
             if path == "/admin/history-unarchive":
                 self._handle_json(lambda payload: unarchive_admin_history_status(store_path, **_unarchive_admin_history_args(payload)))
@@ -954,15 +1076,43 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 self._write_json({"error": f"missing record: {error.args[0]}"}, HTTPStatus.NOT_FOUND)
             except ValueError as error:
                 self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except AgentAuthorizationError as error:
+                self._write_json({"error": str(error)}, HTTPStatus.FORBIDDEN)
+            except (AgentManagerError, AgentAdapterUnavailableError) as error:
+                self._write_json({"error": str(error)}, HTTPStatus.CONFLICT)
 
-        def _handle_json(self, handler) -> None:
+        def _handle_json(
+            self,
+            handler,
+            response_headers: dict[str, str] | None = None,
+        ) -> None:
             try:
                 payload = self._read_json()
-                self._write_json(handler(payload))
+                self._write_json(handler(payload), headers=response_headers)
             except KeyError as error:
-                self._write_json({"error": f"missing field: {error.args[0]}"}, HTTPStatus.BAD_REQUEST)
+                self._write_json(
+                    {"error": f"missing field: {error.args[0]}"},
+                    HTTPStatus.BAD_REQUEST,
+                    headers=response_headers,
+                )
             except ValueError as error:
-                self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                self._write_json(
+                    {"error": str(error)},
+                    HTTPStatus.BAD_REQUEST,
+                    headers=response_headers,
+                )
+            except AgentAuthorizationError as error:
+                self._write_json(
+                    {"error": str(error)},
+                    HTTPStatus.FORBIDDEN,
+                    headers=response_headers,
+                )
+            except (AgentManagerError, AgentAdapterUnavailableError) as error:
+                self._write_json(
+                    {"error": str(error)},
+                    HTTPStatus.CONFLICT,
+                    headers=response_headers,
+                )
 
         def _handle_admin_execute(self) -> None:
             try:
@@ -986,11 +1136,18 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 raise ValueError("request body must be a JSON object")
             return parsed
 
-        def _write_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        def _write_json(
+            self,
+            payload: dict[str, Any],
+            status: HTTPStatus = HTTPStatus.OK,
+            headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps(payload, sort_keys=True).encode("utf-8")
             self.send_response(int(status))
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -1075,7 +1232,9 @@ def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "request_id": str(payload["request_id"]),
         "limit_id": str(payload["limit_id"]),
         "resource_id": str(payload["resource_id"]),
-        "owner_thread": str(payload["owner_thread"]),
+        "owner_thread": (
+            str(payload["owner_thread"]) if payload.get("owner_thread") else None
+        ),
         "requested_units": int(payload["requested_units"]),
         "intent": str(payload["intent"]),
         "risk_level": str(payload.get("risk_level", "low")),
@@ -1083,6 +1242,19 @@ def _usage_continuation_request_args(payload: dict[str, Any]) -> dict[str, Any]:
         "deadline": str(payload["deadline"]) if payload.get("deadline") else None,
         "requested_by": str(payload.get("requested_by", "quark")),
         "requested_at": str(payload["requested_at"]) if payload.get("requested_at") else None,
+        "agent_session_id": (
+            str(payload["agent_session_id"])
+            if payload.get("agent_session_id")
+            else None
+        ),
+        "driver_epoch_id": (
+            str(payload["driver_epoch_id"])
+            if payload.get("driver_epoch_id")
+            else None
+        ),
+        "provider_id": (
+            str(payload["provider_id"]) if payload.get("provider_id") else None
+        ),
     }
 
 
@@ -1232,6 +1404,17 @@ def _usage_continuation_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
         "resume_codex_projects": bool(payload.get("resume_codex_projects", False)),
         "codex_projects_registry": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
+        "resume_agent_sessions": bool(
+            payload.get("resume_agent_sessions", False)
+        ),
+        "agent_registry_path": str(
+            payload.get("agent_registry_path", DEFAULT_AGENT_REGISTRY)
+        ),
+        "local_agent_registry_path": (
+            str(payload["local_agent_registry_path"])
+            if payload.get("local_agent_registry_path")
+            else None
+        ),
     }
 
 
@@ -1407,6 +1590,151 @@ def _remote_testing_results_args(payload: dict[str, Any]) -> dict[str, Any]:
 def _codex_project_discovery_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "registry_path": str(payload.get("codex_projects_registry", "/home/god/.codex/codex-projects.csv")),
+    }
+
+
+def _required_agent_string(payload: dict[str, Any], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def _agent_session_discovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload,
+        {"provider_id", "instance_id", "codex_projects_registry"},
+        "agent session discovery",
+    )
+    return {
+        "provider_id": _required_agent_string(payload, "provider_id"),
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "codex_projects_registry": (
+            str(payload["codex_projects_registry"])
+            if payload.get("codex_projects_registry")
+            else None
+        ),
+    }
+
+
+def _agent_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload,
+        {"instance_id", "prompt", "idempotency_key", "requested_by"},
+        "agent dispatch",
+    )
+    return {
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "prompt": _required_agent_string(payload, "prompt"),
+        "idempotency_key": _required_agent_string(payload, "idempotency_key"),
+        "requested_by": (
+            str(payload["requested_by"]) if payload.get("requested_by") else None
+        ),
+    }
+
+
+def _agent_checkpoint_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(payload, {"instance_id"}, "agent checkpoint")
+    return {"instance_id": _required_agent_string(payload, "instance_id")}
+
+
+def _agent_recovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload, {"session_id", "initiated_by"}, "agent recovery"
+    )
+    return {
+        "session_id": _required_agent_string(payload, "session_id"),
+        "initiated_by": _required_agent_string(payload, "initiated_by"),
+    }
+
+
+def _agent_handoff_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload,
+        {"instance_id", "incoming_provider_id", "initiated_by", "approval_id"},
+        "agent handoff",
+    )
+    return {
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "incoming_provider_id": _required_agent_string(
+            payload, "incoming_provider_id"
+        ),
+        "initiated_by": _required_agent_string(payload, "initiated_by"),
+        "approval_id": _required_agent_string(payload, "approval_id"),
+    }
+
+
+def _reject_unknown_agent_fields(
+    payload: dict[str, Any], allowed: set[str], route_name: str
+) -> None:
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"unknown {route_name} fields: {sorted(unknown)}")
+
+
+def _agent_failover_evaluation_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {"instance_id", "policy_id"}
+    if unknown:
+        raise ValueError(f"unknown failover evaluation fields: {sorted(unknown)}")
+    return {
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "policy_id": (
+            _required_agent_string(payload, "policy_id")
+            if payload.get("policy_id") is not None
+            else None
+        ),
+    }
+
+
+def _agent_failover_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {
+        "instance_id", "decision_id", "initiated_by", "approval_id"
+    }
+    if unknown:
+        raise ValueError(f"unknown failover execution fields: {sorted(unknown)}")
+    return {
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "decision_id": _required_agent_string(payload, "decision_id"),
+        "initiated_by": _required_agent_string(payload, "initiated_by"),
+        "approval_id": _required_agent_string(payload, "approval_id"),
+    }
+
+
+def _agent_failover_recovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {"execution_id", "initiated_by", "approval_id"}
+    if unknown:
+        raise ValueError(f"unknown failover recovery fields: {sorted(unknown)}")
+    return {
+        "execution_id": _required_agent_string(payload, "execution_id"),
+        "initiated_by": _required_agent_string(payload, "initiated_by"),
+        "approval_id": _required_agent_string(payload, "approval_id"),
+    }
+
+
+def _legacy_codex_discovery_status(
+    store_path: str,
+    payload: dict[str, Any],
+) -> dict[str, object]:
+    selected_registry = _codex_project_discovery_args(payload)["registry_path"]
+    result = discover_agent_sessions_status(
+        store_path,
+        provider_id="codex",
+        instance_id="overseer.default",
+        codex_projects_registry=selected_registry,
+        legacy_compatibility=True,
+    )
+    return {
+        "store": str(Path(store_path)),
+        "registry": selected_registry,
+        "threads": result["threads"],
+        "resources": result["resources"],
+        "items": result["items"],
+        "mutation_performed": result["mutation_performed"],
+        "host_mutation_performed": result["host_mutation_performed"],
+        "next_step": (
+            "review imported codex-project thread resources before scheduling "
+            "continuation work"
+        ),
     }
 
 

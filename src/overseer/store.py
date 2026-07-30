@@ -3,14 +3,45 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import os
+import re
+import secrets
 import sqlite3
+import stat
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
+from .agent_contracts import (
+    AgentCheckpoint,
+    AgentRecoveryAttempt,
+    AgentRecoveryAttemptState,
+    AgentRecoveryOutcome,
+    ActiveAgentRisk,
+    AgentDispatchRequest,
+    AgentDispatchResult,
+    AgentHandoffPackage,
+    AgentInstanceTransition,
+    AgentInstanceProfile,
+    AgentOperationFenceState,
+    AgentOperationReservation,
+    AgentOperationState,
+    AgentProvider,
+    AgentSession,
+    AgentTransitionState,
+    DriverEpoch,
+    FailoverDecision,
+    FailoverExecution,
+    FailoverExecutionState,
+    FailoverPolicy,
+    ProviderHealthObservation,
+)
 from .audit import ApprovalRequest, AuditEvent, AuditEventType
 from .core import Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
@@ -28,25 +59,260 @@ from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, U
 
 
 CURRENT_SCHEMA_VERSION = 1
+AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
+AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
+AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
+AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
+AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
+AGENT_DRIVER_SCHEMA_V6 = "agent_driver_v6"
+AGENT_DRIVER_SCHEMA_V7 = "agent_driver_v7"
+AGENT_DRIVER_SCHEMA_V8 = "agent_driver_v8"
+AGENT_DRIVER_SCHEMA_V9 = "agent_driver_v9"
+_AGENT_TRANSITION_SUCCESSORS = {
+    AgentTransitionState.IMPORTING: {
+        AgentTransitionState.IMPORT_ACKNOWLEDGED,
+        AgentTransitionState.RECONCILING,
+        AgentTransitionState.FAILED,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.IMPORT_ACKNOWLEDGED: {
+        AgentTransitionState.COMPLETED,
+        AgentTransitionState.FAILED,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.RECONCILING: {
+        AgentTransitionState.IMPORT_ACKNOWLEDGED,
+        AgentTransitionState.RECONCILING,
+        AgentTransitionState.FAILED,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.FAILED: {
+        AgentTransitionState.RECONCILING,
+        AgentTransitionState.ROLLED_BACK,
+    },
+    AgentTransitionState.COMPLETED: set(),
+    AgentTransitionState.ROLLED_BACK: set(),
+}
+_REDACTED_AGENT_TRANSCRIPT = "[redacted agent transcript]"
+_REDACTED_DISPATCH_PROMPT = "[redacted dispatch prompt]"
+_AGENT_CREDENTIAL_KEYS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "secret",
+        "client_secret",
+        "client_secret_value",
+        "password",
+        "authorization",
+        "cookie",
+        "private_key",
+        "access_key",
+        "api_key",
+        "bearer",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+    }
+)
+_AGENT_TRANSCRIPT_KEYS = frozenset(
+    {
+        "transcript",
+        "conversation",
+        "history",
+        "raw_message",
+        "raw_messages",
+        "raw_output",
+        "raw_outputs",
+        "provider_output",
+        "message",
+        "messages",
+        "output",
+        "outputs",
+        "prompt",
+        "body",
+        "content",
+    }
+)
+_AGENT_DYNAMIC_EVIDENCE_KEYS = frozenset({"evidence", "legacy_references"})
+_AGENT_SAFE_EVIDENCE_KEYS = frozenset(
+    {
+        "status",
+        "state",
+        "reason",
+        "available",
+        "healthy",
+        "provider",
+        "model",
+        "version",
+        "capability",
+        "reference",
+        "hash",
+        "duration",
+        "duration_ms",
+        "exit_code",
+    }
+)
+_AGENT_SECRET_VALUE_RE = re.compile(
+    r"(?:\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----|(?:^|[;,\s])(?:session|auth|access)?_?token=\S+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class SchemaMigration:
-    version: int
+    version: int | str
     description: str
     applied_at: str
 
 
+@dataclass(frozen=True)
+class AgentActivationReservation:
+    instance_id: str
+    reservation_id: str
+    owner_id: str
+    generation: int
+    state: str
+    started_at: str
+    lease_expires_at: str
+    epoch_id: str | None
+    reason: str | None
+
+
 class SQLiteStore:
-    """Small JSON-payload SQLite store for early durable state."""
+    """Small JSON-payload SQLite store with owner-only database artifacts.
+
+    The database and SQLite-created sidecars are restricted to mode ``0600``.
+    The containing directory's existing permissions are never broadened or
+    otherwise changed.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._database_identity = self._prepare_database_file()
+        self._sidecar_identities: dict[str, tuple[int, int]] = {}
+        self._compromised_sidecars: set[str] = set()
         self._connection = sqlite3.connect(self.path, timeout=30.0)
+        try:
+            self._inspect_and_harden(
+                self.path, expected=self._database_identity
+            )
+        except Exception:
+            self._connection.close()
+            raise
         self._connection.row_factory = sqlite3.Row
+        self._agent_transaction_depth = 0
         self._configure_connection()
         self.initialize()
+        self._harden_database_files()
+
+    def _prepare_database_file(self) -> tuple[int, int]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except FileExistsError:
+            status = self._inspect_and_harden(self.path)
+            if status is None:
+                raise FileNotFoundError(self.path)
+            return status
+        else:
+            try:
+                status = os.fstat(descriptor)
+                self._validate_artifact_status(self.path, status)
+                os.fchmod(descriptor, 0o600)
+                return status.st_dev, status.st_ino
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _validate_artifact_status(path: Path, status: os.stat_result) -> None:
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(
+                f"SQLite artifact must be an owned regular file: {path}"
+            )
+        if hasattr(os, "geteuid") and status.st_uid != os.geteuid():
+            raise PermissionError(
+                f"SQLite artifact is not owned by this process: {path}"
+            )
+
+    @classmethod
+    def _inspect_and_harden(
+        cls,
+        path: Path,
+        *,
+        expected: tuple[int, int] | None = None,
+        missing_ok: bool = False,
+    ) -> tuple[int, int] | None:
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        except OSError as error:
+            raise ValueError(
+                f"SQLite artifact must be an owned regular file: {path}"
+            ) from error
+        try:
+            status = os.fstat(descriptor)
+            cls._validate_artifact_status(path, status)
+            identity = (status.st_dev, status.st_ino)
+            if expected is not None and identity != expected:
+                raise ValueError(f"SQLite artifact identity changed: {path}")
+            os.fchmod(descriptor, 0o600)
+            return identity
+        finally:
+            os.close(descriptor)
+
+    def _harden_database_files(
+        self, *, database_missing_ok: bool = False
+    ) -> bool:
+        database = self._inspect_and_harden(
+            self.path,
+            expected=self._database_identity,
+            missing_ok=database_missing_ok,
+        )
+        if database is None:
+            return False
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{self.path}{suffix}")
+            try:
+                identity = self._inspect_and_harden(
+                    sidecar,
+                    expected=self._sidecar_identities.get(suffix),
+                    missing_ok=True,
+                )
+            except (ValueError, PermissionError):
+                self._compromised_sidecars.add(suffix)
+                raise
+            if identity is not None:
+                self._sidecar_identities.setdefault(suffix, identity)
+        return True
+
+    def _stash_compromised_sidecars(self) -> list[tuple[Path, Path]]:
+        stashed: list[tuple[Path, Path]] = []
+        for suffix in sorted(self._compromised_sidecars):
+            sidecar = Path(f"{self.path}{suffix}")
+            try:
+                sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            quarantine = sidecar.with_name(
+                f".{sidecar.name}.untrusted.{secrets.token_hex(16)}"
+            )
+            os.replace(sidecar, quarantine)
+            stashed.append((sidecar, quarantine))
+        return stashed
 
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA busy_timeout = 30000")
@@ -54,9 +320,46 @@ class SQLiteStore:
             self._connection.execute("PRAGMA journal_mode = WAL")
         except sqlite3.OperationalError:
             pass
+        self._harden_database_files()
 
     def close(self) -> None:
-        self._connection.close()
+        failure: Exception | None = None
+        stashed: list[tuple[Path, Path]] = []
+        try:
+            try:
+                verified = self._harden_database_files(database_missing_ok=True)
+                if verified:
+                    try:
+                        self._connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass
+                    self._harden_database_files(database_missing_ok=True)
+            except (ValueError, PermissionError) as error:
+                failure = error
+                stashed = self._stash_compromised_sidecars()
+        finally:
+            self._connection.close()
+            for sidecar, quarantine in stashed:
+                if quarantine.exists():
+                    os.replace(quarantine, sidecar)
+        if failure is None:
+            try:
+                self._harden_database_files(database_missing_ok=True)
+            except (ValueError, PermissionError) as error:
+                failure = error
+        if failure is not None:
+            raise failure
+
+    def _commit(self) -> None:
+        self._harden_database_files()
+        self._connection.commit()
+        self._harden_database_files()
+
+    def __enter__(self) -> SQLiteStore:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
 
     def initialize(self) -> None:
         self._connection.executescript(
@@ -187,8 +490,332 @@ class SQLiteStore:
             );
             """
         )
-        self._record_schema_migration(CURRENT_SCHEMA_VERSION, "bootstrap JSON payload store")
-        self._connection.commit()
+        with self._connection:
+            self._record_schema_migration(CURRENT_SCHEMA_VERSION, "bootstrap JSON payload store")
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_providers (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_instance_profiles (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_driver_epochs (
+                    id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    UNIQUE(instance_id, ordinal)
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_dispatches (
+                    id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL,
+                    driver_epoch_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    UNIQUE(instance_id, idempotency_key)
+                )
+                """
+            )
+            self._migrate_agent_dispatch_scope()
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_dispatch_results (
+                    id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    driver_epoch_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_checkpoints (
+                    id TEXT PRIMARY KEY,
+                    driver_epoch_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_handoffs (
+                    id TEXT PRIMARY KEY,
+                    outgoing_epoch_id TEXT NOT NULL,
+                    incoming_provider_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_private_metadata (
+                    key TEXT PRIMARY KEY,
+                    value BLOB NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO agent_private_metadata(key, value) VALUES (?, ?)",
+                ("handoff_hmac_sha256_v1", secrets.token_bytes(32)),
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_activation_reservations (
+                    instance_id TEXT PRIMARY KEY,
+                    reservation_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    state TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00',
+                    lease_expires_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00',
+                    epoch_id TEXT,
+                    reason TEXT
+                )
+                """
+            )
+            self._migrate_agent_activation_leases()
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_instance_transitions (
+                    instance_id TEXT PRIMARY KEY,
+                    handoff_id TEXT NOT NULL,
+                    outgoing_epoch_id TEXT NOT NULL,
+                    incoming_epoch_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_operation_reservations (
+                    instance_id TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    owner_token TEXT,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            for table in (
+                "agent_failover_policies",
+                "agent_provider_health_observations",
+                "agent_active_risks",
+                "agent_failover_decisions",
+                "agent_failover_executions",
+                "agent_recovery_attempts",
+                "agent_recovery_outcomes",
+            ):
+                self._connection.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} "
+                    "(id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+                )
+            self._connection.execute(
+                "DROP TRIGGER IF EXISTS agent_dispatch_transition_fence"
+            )
+            self._connection.execute(
+                """
+                CREATE TRIGGER agent_dispatch_transition_fence
+                BEFORE INSERT ON agent_dispatches
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM agent_instance_transitions
+                    WHERE instance_id = NEW.instance_id
+                      AND state IN (
+                          'importing',
+                          'import_acknowledged',
+                          'reconciling',
+                          'failed'
+                      )
+                    UNION ALL
+                    SELECT 1
+                    FROM agent_operation_reservations
+                    WHERE instance_id = NEW.instance_id
+                      AND (
+                          state != 'open'
+                          OR json_type(
+                              NEW.payload,
+                              '$.evidence.operation_generation'
+                          ) != 'integer'
+                          OR generation != CAST(
+                              json_extract(
+                                  NEW.payload,
+                                  '$.evidence.operation_generation'
+                              ) AS INTEGER
+                          )
+                      )
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'agent transition active');
+                END
+                """
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_VERSION,
+                "persist provider-neutral agent driver lifecycle records",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V2,
+                "scope dispatch idempotency and persist distinct result attempts",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V3,
+                "persist atomic agent activation reservations",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V4,
+                "fence agent transitions and lease activation ownership",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V5,
+                "coordinate generation-bound agent operations",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V6,
+                "persist generation-bound controlled failover evidence",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V7,
+                "persist recoverable pre-import failover execution state",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V8,
+                "persist crash-safe provider recovery attempts and outcomes",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V9,
+                "attest new handoffs; legacy unsigned packages remain fail-safe invalid",
+            )
+
+    def _migrate_agent_activation_leases(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(agent_activation_reservations)"
+            ).fetchall()
+        }
+        additions = (
+            ("owner_id", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("generation", "INTEGER NOT NULL DEFAULT 1"),
+            (
+                "started_at",
+                "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+            ),
+            (
+                "lease_expires_at",
+                "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+            ),
+        )
+        for name, declaration in additions:
+            if name not in columns:
+                self._connection.execute(
+                    f"ALTER TABLE agent_activation_reservations "
+                    f"ADD COLUMN {name} {declaration}"
+                )
+
+    def _migrate_agent_dispatch_scope(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(agent_dispatches)"
+            ).fetchall()
+        }
+        if "instance_id" in columns:
+            return
+        rows = self._connection.execute(
+            "SELECT id, driver_epoch_id, idempotency_key, state, payload "
+            "FROM agent_dispatches"
+        ).fetchall()
+        self._connection.execute(
+            "ALTER TABLE agent_dispatches RENAME TO agent_dispatches_legacy_v1"
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE agent_dispatches (
+                id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                driver_epoch_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(instance_id, idempotency_key)
+            )
+            """
+        )
+        for row in rows:
+            instance_id = json.loads(str(row["payload"])).get("instance_id")
+            if not isinstance(instance_id, str) or not instance_id:
+                raise ValueError("legacy agent dispatch lacks instance identity")
+            self._connection.execute(
+                "INSERT INTO agent_dispatches VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row["id"],
+                    instance_id,
+                    row["driver_epoch_id"],
+                    row["idempotency_key"],
+                    row["state"],
+                    row["payload"],
+                ),
+            )
+        self._connection.execute("DROP TABLE agent_dispatches_legacy_v1")
+
+    @contextmanager
+    def agent_transaction(self) -> Iterable[None]:
+        outermost = self._agent_transaction_depth == 0
+        if outermost:
+            self._connection.execute("BEGIN IMMEDIATE")
+        self._agent_transaction_depth += 1
+        try:
+            yield
+        except Exception:
+            self._agent_transaction_depth -= 1
+            if outermost:
+                self._connection.rollback()
+            raise
+        else:
+            self._agent_transaction_depth -= 1
+            if outermost:
+                self._commit()
+
+    def _commit_agent_mutation(self) -> None:
+        if self._agent_transaction_depth == 0:
+            self._commit()
 
     def _record_schema_migration(self, version: int, description: str) -> None:
         self._connection.execute(
@@ -199,9 +826,21 @@ class SQLiteStore:
             (version, description, datetime.now(UTC).isoformat()),
         )
 
+    def _record_agent_schema_migration(self, version: str, description: str) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO agent_schema_migrations (version, description, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (version, description, datetime.now(UTC).isoformat()),
+        )
+
     def list_schema_migrations(self) -> tuple[SchemaMigration, ...]:
-        rows = self._connection.execute(
+        numeric_rows = self._connection.execute(
             "SELECT version, description, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        named_rows = self._connection.execute(
+            "SELECT version, description, applied_at FROM agent_schema_migrations ORDER BY version"
         ).fetchall()
         return tuple(
             SchemaMigration(
@@ -209,8 +848,883 @@ class SQLiteStore:
                 description=str(row["description"]),
                 applied_at=str(row["applied_at"]),
             )
+            for row in numeric_rows
+        ) + tuple(
+            SchemaMigration(
+                version=str(row["version"]),
+                description=str(row["description"]),
+                applied_at=str(row["applied_at"]),
+            )
+            for row in named_rows
+        )
+
+    def save_agent_provider(self, provider: AgentProvider) -> None:
+        self._save_agent_record(
+            "agent_providers",
+            provider,
+            AgentProvider,
+            tuple(AgentProvider.__dataclass_fields__),
+            {},
+        )
+
+    def load_agent_provider(self, provider_id: str) -> AgentProvider:
+        return _load_dataclass(AgentProvider, self._get_payload("agent_providers", provider_id))
+
+    def list_agent_providers(self) -> tuple[AgentProvider, ...]:
+        return tuple(
+            _load_dataclass(AgentProvider, payload)
+            for payload in self._list_payloads("agent_providers")
+        )
+
+    def save_agent_instance_profile(self, profile: AgentInstanceProfile) -> None:
+        self._save_agent_record(
+            "agent_instance_profiles",
+            profile,
+            AgentInstanceProfile,
+            (
+                "id",
+                "primary_provider_id",
+                "transport",
+                "workspace",
+                "primary_adapter_id",
+                "model_profile_id",
+                "external_session_id",
+                "declared_capabilities",
+                "required_capabilities",
+                "credential_references",
+                "permission_policy_ref",
+                "execution_policy_ref",
+                "provider_health_source_id",
+                "usage_limit_source_id",
+                "approved_fallback_provider_ids",
+                "controlled_failover_policy_ref",
+            ),
+            {},
+        )
+
+    def load_agent_instance_profile(self, instance_id: str) -> AgentInstanceProfile:
+        return _load_dataclass(
+            AgentInstanceProfile,
+            self._get_payload("agent_instance_profiles", instance_id),
+        )
+
+    def list_agent_instance_profiles(self) -> tuple[AgentInstanceProfile, ...]:
+        return tuple(
+            _load_dataclass(AgentInstanceProfile, payload)
+            for payload in self._list_payloads("agent_instance_profiles")
+        )
+
+    def save_agent_session(self, session: AgentSession) -> None:
+        try:
+            existing = self.load_agent_session(session.id)
+        except KeyError:
+            existing = None
+        if (
+            existing is not None
+            and existing.external_session_id is not None
+            and session.external_session_id != existing.external_session_id
+        ):
+            raise ValueError(
+                "agent_sessions immutable identity field external_session_id cannot change"
+            )
+        self._save_agent_record(
+            "agent_sessions",
+            session,
+            AgentSession,
+            (
+                "id",
+                "provider_id",
+                "workspace",
+                "transport",
+                "instance_id",
+                "model_profile_id",
+                "discovered_at",
+            ),
+            {"provider_id": session.provider_id},
+        )
+
+    def reserve_agent_activation(
+        self,
+        instance_id: str,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        started_at: str,
+        lease_expires_at: str,
+        allow_blocked_retry: bool,
+        observed_at: str,
+    ) -> bool:
+        cursor = self._connection.execute(
+            """
+            INSERT INTO agent_activation_reservations
+                (
+                    instance_id, reservation_id, owner_id, generation, state,
+                    started_at, lease_expires_at, epoch_id, reason
+                )
+            VALUES (?, ?, ?, 1, 'starting', ?, ?, NULL, NULL)
+            ON CONFLICT(instance_id) DO UPDATE SET
+                reservation_id = excluded.reservation_id,
+                owner_id = excluded.owner_id,
+                generation = agent_activation_reservations.generation + 1,
+                state = 'starting',
+                started_at = excluded.started_at,
+                lease_expires_at = excluded.lease_expires_at,
+                epoch_id = NULL,
+                reason = NULL
+            WHERE (
+                agent_activation_reservations.state = 'blocked' AND ? = 1
+            ) OR (
+                agent_activation_reservations.state = 'starting'
+                AND julianday(agent_activation_reservations.lease_expires_at)
+                    <= julianday(?)
+            )
+            """,
+            (
+                instance_id,
+                reservation_id,
+                owner_id,
+                started_at,
+                lease_expires_at,
+                int(allow_blocked_retry),
+                observed_at,
+            ),
+        )
+        self._commit()
+        return cursor.rowcount == 1
+
+    def load_agent_activation(
+        self,
+        instance_id: str,
+    ) -> AgentActivationReservation:
+        row = self._connection.execute(
+            "SELECT instance_id, reservation_id, owner_id, generation, state, "
+            "started_at, lease_expires_at, epoch_id, reason "
+            "FROM agent_activation_reservations WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(instance_id)
+        return AgentActivationReservation(
+            instance_id=str(row["instance_id"]),
+            reservation_id=str(row["reservation_id"]),
+            owner_id=str(row["owner_id"]),
+            generation=int(row["generation"]),
+            state=str(row["state"]),
+            started_at=str(row["started_at"]),
+            lease_expires_at=str(row["lease_expires_at"]),
+            epoch_id=str(row["epoch_id"]) if row["epoch_id"] is not None else None,
+            reason=str(row["reason"]) if row["reason"] is not None else None,
+        )
+
+    def finish_agent_activation(
+        self,
+        instance_id: str,
+        reservation_id: str,
+        owner_id: str,
+        generation: int,
+        state: str,
+        *,
+        epoch_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE agent_activation_reservations
+            SET state = ?, epoch_id = ?, reason = ?
+            WHERE instance_id = ? AND reservation_id = ? AND owner_id = ?
+                AND generation = ? AND state = 'starting'
+            """,
+            (
+                state,
+                epoch_id,
+                reason,
+                instance_id,
+                reservation_id,
+                owner_id,
+                generation,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("activation reservation ownership changed")
+        self._commit_agent_mutation()
+
+    def ensure_agent_operation(
+        self,
+        instance_id: str,
+        *,
+        updated_at: str,
+    ) -> AgentOperationReservation:
+        operation = AgentOperationReservation(
+            instance_id=instance_id,
+            generation=1,
+            state=AgentOperationFenceState.OPEN,
+            owner_token=None,
+            updated_at=updated_at,
+        )
+        payload = json.dumps(
+            to_jsonable(operation),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO agent_operation_reservations
+                (instance_id, generation, state, owner_token, payload)
+            VALUES (?, 1, 'open', NULL, ?)
+            """,
+            (instance_id, payload),
+        )
+        self._commit_agent_mutation()
+        return self.load_agent_operation(instance_id)
+
+    def load_agent_operation(self, instance_id: str) -> AgentOperationReservation:
+        row = self._connection.execute(
+            "SELECT payload FROM agent_operation_reservations WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(instance_id)
+        return _load_dataclass(AgentOperationReservation, str(row["payload"]))
+
+    def save_agent_operation(
+        self,
+        operation: AgentOperationReservation,
+        *,
+        expected_generation: int,
+        expected_state: AgentOperationFenceState,
+        expected_owner_token: str | None,
+    ) -> None:
+        payload = json.dumps(
+            to_jsonable(operation),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        cursor = self._connection.execute(
+            """
+            UPDATE agent_operation_reservations
+            SET generation = ?, state = ?, owner_token = ?, payload = ?
+            WHERE instance_id = ? AND generation = ? AND state = ?
+              AND owner_token IS ?
+            """,
+            (
+                operation.generation,
+                operation.state.value,
+                operation.owner_token,
+                payload,
+                operation.instance_id,
+                expected_generation,
+                expected_state.value,
+                expected_owner_token,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("agent operation reservation changed concurrently")
+        self._commit_agent_mutation()
+
+    def begin_agent_transition(self, transition: AgentInstanceTransition) -> bool:
+        if transition.state is not AgentTransitionState.IMPORTING:
+            raise ValueError("new agent transition must begin in importing state")
+        payload = json.dumps(
+            to_jsonable(transition),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        cursor = self._connection.execute(
+            """
+            INSERT INTO agent_instance_transitions
+                (
+                    instance_id, handoff_id, outgoing_epoch_id,
+                    incoming_epoch_id, state, payload
+                )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(instance_id) DO UPDATE SET
+                handoff_id = excluded.handoff_id,
+                outgoing_epoch_id = excluded.outgoing_epoch_id,
+                incoming_epoch_id = excluded.incoming_epoch_id,
+                state = excluded.state,
+                payload = excluded.payload
+            WHERE agent_instance_transitions.state IN ('completed', 'rolled_back')
+            """,
+            (
+                transition.instance_id,
+                transition.handoff_id,
+                transition.outgoing_epoch_id,
+                transition.incoming_epoch_id,
+                transition.state.value,
+                payload,
+            ),
+        )
+        self._commit_agent_mutation()
+        return cursor.rowcount == 1
+
+    def save_agent_transition(self, transition: AgentInstanceTransition) -> None:
+        current = self.load_agent_transition(transition.instance_id)
+        if (
+            current.handoff_id != transition.handoff_id
+            or current.outgoing_epoch_id != transition.outgoing_epoch_id
+            or current.incoming_epoch_id != transition.incoming_epoch_id
+        ):
+            raise ValueError("agent transition identity cannot change")
+        if transition.state not in _AGENT_TRANSITION_SUCCESSORS[current.state]:
+            raise ValueError(
+                f"invalid agent transition {current.state.value} "
+                f"to {transition.state.value}"
+            )
+        payload = json.dumps(
+            to_jsonable(transition),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        cursor = self._connection.execute(
+            """
+            UPDATE agent_instance_transitions
+            SET state = ?, payload = ?
+            WHERE instance_id = ? AND handoff_id = ? AND state = ?
+            """,
+            (
+                transition.state.value,
+                payload,
+                transition.instance_id,
+                transition.handoff_id,
+                current.state.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("agent transition state changed concurrently")
+        self._commit_agent_mutation()
+
+    def load_agent_transition(self, instance_id: str) -> AgentInstanceTransition:
+        row = self._connection.execute(
+            "SELECT payload FROM agent_instance_transitions WHERE instance_id = ?",
+            (instance_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(instance_id)
+        return _load_dataclass(AgentInstanceTransition, str(row["payload"]))
+
+    def list_agent_transitions(self) -> tuple[AgentInstanceTransition, ...]:
+        rows = self._connection.execute(
+            "SELECT payload FROM agent_instance_transitions ORDER BY instance_id"
+        ).fetchall()
+        return tuple(
+            _load_dataclass(AgentInstanceTransition, str(row["payload"]))
             for row in rows
         )
+
+    def load_agent_session(self, session_id: str) -> AgentSession:
+        return _load_dataclass(AgentSession, self._get_payload("agent_sessions", session_id))
+
+    def list_agent_sessions(self) -> tuple[AgentSession, ...]:
+        return tuple(
+            _load_dataclass(AgentSession, payload) for payload in self._list_payloads("agent_sessions")
+        )
+
+    def save_driver_epoch(self, epoch: DriverEpoch) -> None:
+        self._reject_agent_secondary_collision(
+            "agent_driver_epochs",
+            {"instance_id": epoch.instance_id, "ordinal": epoch.ordinal},
+            epoch.id,
+            "driver epoch instance_id and ordinal",
+        )
+        self._save_agent_record(
+            "agent_driver_epochs",
+            epoch,
+            DriverEpoch,
+            ("id", "instance_id", "session_id", "provider_id", "ordinal", "opened_at"),
+            {
+                "instance_id": epoch.instance_id,
+                "ordinal": epoch.ordinal,
+                "state": epoch.state.value,
+            },
+        )
+
+    def load_driver_epoch(self, epoch_id: str) -> DriverEpoch:
+        return _load_dataclass(DriverEpoch, self._get_payload("agent_driver_epochs", epoch_id))
+
+    def list_driver_epochs(self) -> tuple[DriverEpoch, ...]:
+        return tuple(
+            _load_dataclass(DriverEpoch, payload)
+            for payload in self._list_payloads("agent_driver_epochs")
+        )
+
+    def save_agent_dispatch(self, dispatch: AgentDispatchRequest) -> None:
+        self._reject_agent_secondary_collision(
+            "agent_dispatches",
+            {
+                "instance_id": dispatch.instance_id,
+                "idempotency_key": dispatch.idempotency_key,
+            },
+            dispatch.id,
+            "dispatch idempotency key",
+        )
+        self._save_agent_record(
+            "agent_dispatches",
+            dispatch,
+            AgentDispatchRequest,
+            (
+                "id",
+                "instance_id",
+                "session_id",
+                "driver_epoch_id",
+                "idempotency_key",
+                "requested_at",
+                "requested_by",
+            ),
+            {
+                "instance_id": dispatch.instance_id,
+                "driver_epoch_id": dispatch.driver_epoch_id,
+                "idempotency_key": dispatch.idempotency_key,
+                "state": AgentOperationState.QUEUED.value,
+            },
+        )
+
+    def load_agent_dispatch(self, dispatch_id: str) -> AgentDispatchRequest:
+        return _load_dataclass(
+            AgentDispatchRequest,
+            self._get_payload("agent_dispatches", dispatch_id),
+        )
+
+    def list_agent_dispatches(self) -> tuple[AgentDispatchRequest, ...]:
+        return tuple(
+            _load_dataclass(AgentDispatchRequest, payload)
+            for payload in self._list_payloads("agent_dispatches")
+        )
+
+    def load_agent_dispatch_by_idempotency(
+        self,
+        instance_id: str,
+        idempotency_key: str,
+    ) -> AgentDispatchRequest:
+        row = self._connection.execute(
+            "SELECT payload FROM agent_dispatches "
+            "WHERE instance_id = ? AND idempotency_key = ?",
+            (instance_id, idempotency_key),
+        ).fetchone()
+        if row is None:
+            raise KeyError((instance_id, idempotency_key))
+        return _load_dataclass(AgentDispatchRequest, str(row["payload"]))
+
+    def save_agent_dispatch_result(self, result: AgentDispatchResult) -> None:
+        self._save_agent_record(
+            "agent_dispatch_results",
+            result,
+            AgentDispatchResult,
+            tuple(AgentDispatchResult.__dataclass_fields__),
+            {
+                "request_id": result.request_id,
+                "driver_epoch_id": result.driver_epoch_id,
+                "state": result.state.value,
+            },
+        )
+
+    def load_agent_dispatch_result(self, result_id: str) -> AgentDispatchResult:
+        return _load_dataclass(
+            AgentDispatchResult,
+            self._get_payload("agent_dispatch_results", result_id),
+        )
+
+    def list_agent_dispatch_results(self) -> tuple[AgentDispatchResult, ...]:
+        return tuple(
+            _load_dataclass(AgentDispatchResult, payload)
+            for payload in self._list_payloads("agent_dispatch_results")
+        )
+
+    def save_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> None:
+        self._save_agent_record(
+            "agent_checkpoints",
+            checkpoint,
+            AgentCheckpoint,
+            ("id", "instance_id", "session_id", "driver_epoch_id", "created_at", "expires_at"),
+            {"driver_epoch_id": checkpoint.driver_epoch_id},
+        )
+
+    def load_agent_checkpoint(self, checkpoint_id: str) -> AgentCheckpoint:
+        return _load_dataclass(
+            AgentCheckpoint,
+            self._get_payload("agent_checkpoints", checkpoint_id),
+        )
+
+    def list_agent_checkpoints(self) -> tuple[AgentCheckpoint, ...]:
+        return tuple(
+            _load_dataclass(AgentCheckpoint, payload)
+            for payload in self._list_payloads("agent_checkpoints")
+        )
+
+    def save_agent_handoff(self, handoff: AgentHandoffPackage) -> None:
+        self._save_agent_record(
+            "agent_handoffs",
+            handoff,
+            AgentHandoffPackage,
+            (
+                "id",
+                "instance_id",
+                "outgoing_epoch_id",
+                "incoming_provider_id",
+                "objective",
+                "checkpoint_id",
+                "required_capabilities",
+                "created_at",
+            ),
+            {
+                "outgoing_epoch_id": handoff.outgoing_epoch_id,
+                "incoming_provider_id": handoff.incoming_provider_id,
+            },
+        )
+
+    def sign_and_save_agent_handoff(
+        self, handoff: AgentHandoffPackage
+    ) -> AgentHandoffPackage:
+        from dataclasses import replace
+        from .agent_handoff import canonical_handoff_bytes
+
+        with self.agent_transaction():
+            versioned = replace(
+                handoff, attestation_version="hmac-sha256-v1", signature=None
+            )
+            signature = hmac.new(
+                self._handoff_attestation_key(),
+                canonical_handoff_bytes(versioned),
+                hashlib.sha256,
+            ).hexdigest()
+            signed = replace(versioned, signature=signature)
+            self.save_agent_handoff(signed)
+        return signed
+
+    def verify_agent_handoff_attestation(
+        self, handoff: AgentHandoffPackage
+    ) -> bool:
+        from .agent_handoff import canonical_handoff_bytes
+
+        if (
+            handoff.attestation_version != "hmac-sha256-v1"
+            or handoff.signature is None
+        ):
+            return False
+        try:
+            persisted = self.load_agent_handoff(handoff.id)
+        except KeyError:
+            return False
+        if persisted != handoff:
+            return False
+        expected = hmac.new(
+            self._handoff_attestation_key(),
+            canonical_handoff_bytes(handoff),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, handoff.signature)
+
+    def _handoff_attestation_key(self) -> bytes:
+        row = self._connection.execute(
+            "SELECT value FROM agent_private_metadata WHERE key = ?",
+            ("handoff_hmac_sha256_v1",),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("handoff attestation key is unavailable")
+        return bytes(row["value"])
+
+    def load_agent_handoff(self, handoff_id: str) -> AgentHandoffPackage:
+        return _load_dataclass(
+            AgentHandoffPackage,
+            self._get_payload("agent_handoffs", handoff_id),
+        )
+
+    def list_agent_handoffs(self) -> tuple[AgentHandoffPackage, ...]:
+        return tuple(
+            _load_dataclass(AgentHandoffPackage, payload)
+            for payload in self._list_payloads("agent_handoffs")
+        )
+
+    def save_failover_policy(self, policy: FailoverPolicy) -> None:
+        self._save_agent_record(
+            "agent_failover_policies", policy, FailoverPolicy,
+            tuple(FailoverPolicy.__dataclass_fields__), {},
+        )
+
+    def load_failover_policy(self, policy_id: str) -> FailoverPolicy:
+        return _load_dataclass(
+            FailoverPolicy, self._get_payload("agent_failover_policies", policy_id)
+        )
+
+    def save_provider_health_observation(
+        self, observation: ProviderHealthObservation
+    ) -> None:
+        self._save_agent_record(
+            "agent_provider_health_observations",
+            observation,
+            ProviderHealthObservation,
+            tuple(ProviderHealthObservation.__dataclass_fields__),
+            {},
+        )
+
+    def list_provider_health_observations(
+        self, instance_id: str
+    ) -> tuple[ProviderHealthObservation, ...]:
+        return tuple(
+            item
+            for item in (
+                _load_dataclass(ProviderHealthObservation, payload)
+                for payload in self._list_payloads("agent_provider_health_observations")
+            )
+            if item.instance_id == instance_id
+        )
+
+    def save_active_agent_risk(self, risk: ActiveAgentRisk) -> None:
+        self._save_agent_record(
+            "agent_active_risks", risk, ActiveAgentRisk,
+            tuple(ActiveAgentRisk.__dataclass_fields__), {},
+        )
+
+    def list_active_agent_risks(self, instance_id: str) -> tuple[ActiveAgentRisk, ...]:
+        return tuple(
+            item
+            for item in (
+                _load_dataclass(ActiveAgentRisk, payload)
+                for payload in self._list_payloads("agent_active_risks")
+            )
+            if item.instance_id == instance_id
+        )
+
+    def save_failover_decision(self, decision: FailoverDecision) -> None:
+        self._save_agent_record(
+            "agent_failover_decisions",
+            decision,
+            FailoverDecision,
+            tuple(FailoverDecision.__dataclass_fields__),
+            {},
+        )
+
+    def load_failover_decision(self, decision_id: str) -> FailoverDecision:
+        return _load_dataclass(
+            FailoverDecision, self._get_payload("agent_failover_decisions", decision_id)
+        )
+
+    def consume_failover_decision(
+        self, decision_id: str, *, expected_generation: int, consumed_at: str
+    ) -> FailoverDecision:
+        current = self.load_failover_decision(decision_id)
+        if current.consumed_at is not None:
+            raise ValueError("failover decision is already consumed")
+        if current.operation_generation != expected_generation:
+            raise ValueError("failover decision generation changed")
+        updated = dataclass_from_jsonable(
+            FailoverDecision,
+            {**to_jsonable(current), "consumed_at": consumed_at},
+        )
+        cursor = self._connection.execute(
+            "UPDATE agent_failover_decisions SET payload = ? "
+            "WHERE id = ? AND json_extract(payload, '$.consumed_at') IS NULL",
+            (_dump_agent_record(updated), decision_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("failover decision is already consumed")
+        self._commit_agent_mutation()
+        return updated
+
+    def save_failover_execution(self, execution: FailoverExecution) -> None:
+        self._save_agent_record(
+            "agent_failover_executions",
+            execution,
+            FailoverExecution,
+            (
+                "id", "decision_id", "instance_id", "outgoing_epoch_id",
+                "outgoing_session_id", "outgoing_provider_id", "checkpoint_id",
+                "operation_generation", "operation_owner_ref", "created_at",
+            ),
+            {},
+        )
+
+    def load_failover_execution(self, execution_id: str) -> FailoverExecution:
+        return _load_dataclass(
+            FailoverExecution,
+            self._get_payload("agent_failover_executions", execution_id),
+        )
+
+    def list_failover_executions(self) -> tuple[FailoverExecution, ...]:
+        return tuple(
+            _load_dataclass(FailoverExecution, payload)
+            for payload in self._list_payloads("agent_failover_executions")
+        )
+
+    def transition_failover_execution(
+        self,
+        execution_id: str,
+        *,
+        expected_state: FailoverExecutionState,
+        state: FailoverExecutionState,
+        updated_at: str,
+        reason: str | None = None,
+        resume_result_ref: str | None = None,
+    ) -> FailoverExecution:
+        current = self.load_failover_execution(execution_id)
+        if current.state is not expected_state:
+            raise ValueError("failover execution state changed")
+        allowed = {
+            FailoverExecutionState.RESERVED: {
+                FailoverExecutionState.DRAINING,
+                FailoverExecutionState.RECOVERED,
+            },
+            FailoverExecutionState.DRAINING: {
+                FailoverExecutionState.BLOCKED_PREIMPORT,
+                FailoverExecutionState.TRANSITION_STARTED,
+                FailoverExecutionState.RECOVERED,
+            },
+            FailoverExecutionState.BLOCKED_PREIMPORT: {
+                FailoverExecutionState.RECOVERING,
+            },
+            FailoverExecutionState.RECOVERING: {
+                FailoverExecutionState.BLOCKED_PREIMPORT,
+                FailoverExecutionState.RECOVERED,
+            },
+        }
+        if state not in allowed.get(expected_state, set()):
+            raise ValueError("invalid failover execution transition")
+        updated = dataclass_from_jsonable(
+            FailoverExecution,
+            {
+                **to_jsonable(current),
+                "state": state.value,
+                "updated_at": updated_at,
+                "reason": reason,
+                "resume_result_ref": resume_result_ref,
+            },
+        )
+        cursor = self._connection.execute(
+            "UPDATE agent_failover_executions SET payload = ? "
+            "WHERE id = ? AND json_extract(payload, '$.state') = ?",
+            (_dump_agent_record(updated), execution_id, expected_state.value),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("failover execution state changed")
+        self._commit_agent_mutation()
+        return updated
+
+    def save_agent_recovery_attempt(self, attempt: AgentRecoveryAttempt) -> None:
+        self._save_agent_record(
+            "agent_recovery_attempts", attempt, AgentRecoveryAttempt,
+            (
+                "id", "idempotency_key", "execution_id", "decision_id",
+                "instance_id", "outgoing_epoch_id", "provider_id",
+                "internal_session_id", "external_session_id",
+                "operation_generation", "operation_owner_ref", "created_at",
+            ),
+            {},
+        )
+
+    def claim_failover_recovery(
+        self, execution_id: str, attempt: AgentRecoveryAttempt, *, updated_at: str
+    ) -> FailoverExecution:
+        with self.agent_transaction():
+            if self.recovery_attempt_for_execution(execution_id) is not None:
+                raise ValueError("recovery attempt already exists")
+            execution = self.transition_failover_execution(
+                execution_id,
+                expected_state=FailoverExecutionState.BLOCKED_PREIMPORT,
+                state=FailoverExecutionState.RECOVERING,
+                updated_at=updated_at,
+            )
+            self.save_agent_recovery_attempt(attempt)
+            return execution
+
+    def load_agent_recovery_attempt(self, attempt_id: str) -> AgentRecoveryAttempt:
+        return _load_dataclass(
+            AgentRecoveryAttempt,
+            self._get_payload("agent_recovery_attempts", attempt_id),
+        )
+
+    def recovery_attempt_for_execution(
+        self, execution_id: str
+    ) -> AgentRecoveryAttempt | None:
+        matches = tuple(
+            item for item in (
+                _load_dataclass(AgentRecoveryAttempt, payload)
+                for payload in self._list_payloads("agent_recovery_attempts")
+            ) if item.execution_id == execution_id
+        )
+        if len(matches) > 1:
+            raise ValueError("multiple recovery attempts for one execution")
+        return matches[0] if matches else None
+
+    def transition_agent_recovery_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected_state: AgentRecoveryAttemptState,
+        state: AgentRecoveryAttemptState,
+        updated_at: str,
+    ) -> AgentRecoveryAttempt:
+        current = self.load_agent_recovery_attempt(attempt_id)
+        if current.state is not expected_state:
+            raise ValueError("recovery attempt state changed")
+        updated = dataclass_from_jsonable(
+            AgentRecoveryAttempt,
+            {**to_jsonable(current), "state": state.value, "updated_at": updated_at},
+        )
+        cursor = self._connection.execute(
+            "UPDATE agent_recovery_attempts SET payload = ? WHERE id = ? "
+            "AND json_extract(payload, '$.state') = ?",
+            (_dump_agent_record(updated), attempt_id, expected_state.value),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("recovery attempt state changed")
+        self._commit_agent_mutation()
+        return updated
+
+    def save_agent_recovery_outcome(self, outcome: AgentRecoveryOutcome) -> None:
+        existing = self._connection.execute(
+            "SELECT payload FROM agent_recovery_outcomes WHERE id = ?",
+            (outcome.id,),
+        ).fetchone()
+        if existing is not None and _load_dataclass(
+            AgentRecoveryOutcome, str(existing["payload"])
+        ) != outcome:
+            raise ValueError("recovery outcome is immutable")
+        self._save_agent_record(
+            "agent_recovery_outcomes", outcome, AgentRecoveryOutcome,
+            tuple(AgentRecoveryOutcome.__dataclass_fields__), {},
+        )
+
+    def record_agent_recovery_result_bundle(
+        self,
+        result: AgentDispatchResult,
+        outcome: AgentRecoveryOutcome,
+        *,
+        attempt_id: str,
+        updated_at: str,
+    ) -> None:
+        with self.agent_transaction():
+            try:
+                existing = self.load_agent_dispatch_result(result.id)
+            except KeyError:
+                pass
+            else:
+                raise ValueError(
+                    "forged preexisting recovery result"
+                    if existing != result
+                    else "recovery result already exists without owned outcome"
+                )
+            if self.recovery_outcome_for_attempt(attempt_id) is not None:
+                raise ValueError("recovery outcome already exists")
+            self.save_agent_dispatch_result(result)
+            self.save_agent_recovery_outcome(outcome)
+            self.transition_agent_recovery_attempt(
+                attempt_id,
+                expected_state=AgentRecoveryAttemptState.EXTERNAL_STARTED,
+                state=AgentRecoveryAttemptState.RESULT_RECORDED,
+                updated_at=updated_at,
+            )
+
+    def recovery_outcome_for_attempt(
+        self, attempt_id: str
+    ) -> AgentRecoveryOutcome | None:
+        matches = tuple(
+            item for item in (
+                _load_dataclass(AgentRecoveryOutcome, payload)
+                for payload in self._list_payloads("agent_recovery_outcomes")
+            ) if item.attempt_id == attempt_id
+        )
+        if len(matches) > 1:
+            raise ValueError("multiple recovery outcomes for one attempt")
+        return matches[0] if matches else None
 
     def save_resource(self, resource: Resource) -> None:
         self._upsert("resources", resource.id, _dump(resource))
@@ -226,7 +1740,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO usage_limits (id, resource_id, payload) VALUES (?, ?, ?)",
             (usage_limit.id, usage_limit.resource_id, _dump(usage_limit)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_usage_limit(self, usage_limit_id: str) -> UsageLimit:
         return _load_dataclass(UsageLimit, self._get_payload("usage_limits", usage_limit_id))
@@ -242,7 +1756,7 @@ class SQLiteStore:
             """,
             (request.id, request.limit_id, request.resource_id, _dump(request)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_usage_continuation_request(self, request_id: str) -> UsageContinuationRequest:
         return _load_dataclass(UsageContinuationRequest, self._get_payload("usage_continuation_requests", request_id))
@@ -261,7 +1775,7 @@ class SQLiteStore:
             """,
             (dispatch.id, dispatch.request_id, _dump(dispatch)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_usage_continuation_dispatch(self, dispatch_id: str) -> UsageContinuationDispatch:
         return _load_dataclass(
@@ -280,7 +1794,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO health_evidence (id, resource_id, payload) VALUES (?, ?, ?)",
             (evidence.id, evidence.resource_id, _dump(evidence)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_health_evidence(self, evidence_id: str) -> HealthEvidence:
         return _load_dataclass(HealthEvidence, self._get_payload("health_evidence", evidence_id))
@@ -290,7 +1804,7 @@ class SQLiteStore:
 
     def delete_health_evidence(self, evidence_id: str) -> None:
         self._connection.execute("DELETE FROM health_evidence WHERE id = ?", (evidence_id,))
-        self._connection.commit()
+        self._commit()
 
     def prune_health_evidence(self, retain_per_target: int) -> int:
         if retain_per_target < 1:
@@ -304,7 +1818,7 @@ class SQLiteStore:
             for stale in ordered[retain_per_target:]:
                 self._connection.execute("DELETE FROM health_evidence WHERE id = ?", (stale.id,))
                 deleted += 1
-        self._connection.commit()
+        self._commit()
         return deleted
 
     def save_health_target(self, target: HealthTarget) -> None:
@@ -312,7 +1826,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO health_targets (id, resource_id, payload) VALUES (?, ?, ?)",
             (target.id, target.resource_id, _dump(target)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_health_target(self, target_id: str) -> HealthTarget:
         return _load_dataclass(HealthTarget, self._get_payload("health_targets", target_id))
@@ -325,7 +1839,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO physical_identities (stable_id, payload) VALUES (?, ?)",
             (identity.stable_id, _dump(identity)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_physical_identity(self, stable_id: str) -> PhysicalIdentity:
         row = self._connection.execute(
@@ -350,7 +1864,7 @@ class SQLiteStore:
                 "INSERT OR REPLACE INTO decisions (claim_id, payload) VALUES (?, ?)",
                 (claim.id, _dump(decision)),
             )
-        self._connection.commit()
+        self._commit()
 
     def load_claim(self, claim_id: str) -> Claim:
         return _load_dataclass(Claim, self._get_payload("claims", claim_id))
@@ -369,7 +1883,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO approvals (id, subject_id, payload) VALUES (?, ?, ?)",
             (approval.id, approval.subject_id, _dump(approval)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_approval(self, approval_id: str) -> ApprovalRequest:
         return _load_dataclass(ApprovalRequest, self._get_payload("approvals", approval_id))
@@ -425,7 +1939,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO admin_executions (id, plan_id, payload) VALUES (?, ?, ?)",
             (result.id, result.plan_id, _dump(result)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_admin_execution(self, result_id: str) -> AdminExecutionResult:
         return _load_dataclass(AdminExecutionResult, self._get_payload("admin_executions", result_id))
@@ -438,7 +1952,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO admin_history_archives (id, plan_id, payload) VALUES (?, ?, ?)",
             (archive.id, archive.plan_id, _dump(archive)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_admin_history_archive(self, archive_id: str) -> AdminHistoryArchiveRecord:
         return _load_dataclass(AdminHistoryArchiveRecord, self._get_payload("admin_history_archives", archive_id))
@@ -451,7 +1965,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO host_security_source_reviews (id, remote_address, payload) VALUES (?, ?, ?)",
             (review.id, review.remote_address, _dump(review)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_host_security_source_review(self, review_id: str) -> HostSecuritySourceReview:
         return _load_dataclass(HostSecuritySourceReview, self._get_payload("host_security_source_reviews", review_id))
@@ -464,7 +1978,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO host_security_ids_review_packages (id, plan_id, payload) VALUES (?, ?, ?)",
             (package.id, package.plan_id, _dump(package)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_host_security_ids_review_package(self, package_id: str) -> HostSecurityIDSReviewPackage:
         return _load_dataclass(HostSecurityIDSReviewPackage, self._get_payload("host_security_ids_review_packages", package_id))
@@ -484,7 +1998,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO crew_messages (id, owner_domain, payload) VALUES (?, ?, ?)",
             (message.id, message.owner_domain.value, _dump(message)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_crew_message(self, message_id: str) -> CrewMessage:
         return _load_dataclass(CrewMessage, self._get_payload("crew_messages", message_id))
@@ -500,7 +2014,7 @@ class SQLiteStore:
             """,
             (record.id, record.kind.value, record.owner_domain.value, record.status.value, _dump(record)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_operation_record(self, record_id: str) -> OperationRecord:
         return _load_dataclass(OperationRecord, self._get_payload("operation_records", record_id))
@@ -534,7 +2048,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO maintenance_schedules (id, target, payload) VALUES (?, ?, ?)",
             (schedule.id, schedule.target, _dump(schedule)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_maintenance_schedule(self, schedule_id: str) -> MaintenanceSchedule:
         return _load_dataclass(MaintenanceSchedule, self._get_payload("maintenance_schedules", schedule_id))
@@ -559,7 +2073,7 @@ class SQLiteStore:
             """,
             (request.id, request.provider_id, request.status.value, _dump(request)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_key_broker_token_request(self, request_id: str) -> KeyBrokerTokenRequest:
         return _load_dataclass(KeyBrokerTokenRequest, self._get_payload("key_broker_token_requests", request_id))
@@ -578,7 +2092,7 @@ class SQLiteStore:
             """,
             (grant.id, grant.request_id, grant.provider_id, grant.status.value, _dump(grant)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_key_broker_token_grant(self, grant_id: str) -> KeyBrokerTokenGrant:
         return _load_dataclass(KeyBrokerTokenGrant, self._get_payload("key_broker_token_grants", grant_id))
@@ -594,7 +2108,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO audit_events (id, subject_id, payload) VALUES (?, ?, ?)",
             (event.id, event.subject_id, _dump(event)),
         )
-        self._connection.commit()
+        self._commit_agent_mutation()
 
     def list_audit_events(
         self,
@@ -658,7 +2172,55 @@ class SQLiteStore:
 
     def _upsert(self, table: str, row_id: str, payload: str) -> None:
         self._connection.execute(f"INSERT OR REPLACE INTO {table} (id, payload) VALUES (?, ?)", (row_id, payload))
-        self._connection.commit()
+        self._commit_agent_mutation()
+
+    def _save_agent_record(
+        self,
+        table: str,
+        record: Any,
+        record_type: type[Any],
+        immutable_fields: tuple[str, ...],
+        indexed_values: dict[str, object],
+    ) -> None:
+        payload = _dump_agent_record(record)
+        sanitized_record = _load_dataclass(record_type, payload)
+        row = self._connection.execute(
+            f"SELECT payload FROM {table} WHERE id = ?", (sanitized_record.id,)
+        ).fetchone()
+        if row is not None:
+            existing_record = _load_dataclass(record_type, str(row["payload"]))
+            if any(
+                getattr(existing_record, field) != getattr(sanitized_record, field)
+                for field in immutable_fields
+            ):
+                raise ValueError(f"{table} immutable identity cannot change")
+            assignments = ", ".join([*(f"{column} = ?" for column in indexed_values), "payload = ?"])
+            self._connection.execute(
+                f"UPDATE {table} SET {assignments} WHERE id = ?",
+                (*indexed_values.values(), payload, sanitized_record.id),
+            )
+        else:
+            columns = ("id", *indexed_values, "payload")
+            placeholders = ", ".join("?" for _ in columns)
+            self._connection.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                (sanitized_record.id, *indexed_values.values(), payload),
+            )
+        self._commit_agent_mutation()
+
+    def _reject_agent_secondary_collision(
+        self,
+        table: str,
+        values: dict[str, object],
+        record_id: str,
+        label: str,
+    ) -> None:
+        where = " AND ".join(f"{column} = ?" for column in values)
+        row = self._connection.execute(
+            f"SELECT id FROM {table} WHERE {where}", tuple(values.values())
+        ).fetchone()
+        if row is not None and str(row["id"]) != record_id:
+            raise ValueError(f"{label} already belongs to {row['id']}")
 
     def _get_payload(self, table: str, row_id: str) -> str:
         row = self._connection.execute(f"SELECT payload FROM {table} WHERE id = ?", (row_id,)).fetchone()
@@ -675,5 +2237,68 @@ def _dump(value: Any) -> str:
     return json.dumps(to_jsonable(value), sort_keys=True, separators=(",", ":"))
 
 
+def _dump_agent_record(value: Any) -> str:
+    return json.dumps(
+        _sanitize_agent_json(to_jsonable(value)), sort_keys=True, separators=(",", ":")
+    )
+
+
+def _sanitize_agent_json(
+    value: Any,
+    *,
+    key: str | None = None,
+    dynamic_evidence: bool = False,
+) -> Any:
+    normalized_key = _normalize_agent_key(key) if key is not None else None
+    if normalized_key == "prompt":
+        return _REDACTED_DISPATCH_PROMPT
+    if normalized_key in _AGENT_TRANSCRIPT_KEYS:
+        return _REDACTED_AGENT_TRANSCRIPT
+    if normalized_key in _AGENT_CREDENTIAL_KEYS:
+        raise ValueError("agent records cannot persist credential material")
+    if isinstance(value, dict):
+        child_dynamic_evidence = dynamic_evidence or normalized_key in _AGENT_DYNAMIC_EVIDENCE_KEYS
+        return {
+            str(item_key): _sanitize_agent_json(
+                item,
+                key=str(item_key),
+                dynamic_evidence=child_dynamic_evidence,
+            )
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _sanitize_agent_json(item, key=key, dynamic_evidence=dynamic_evidence)
+            for item in value
+        ]
+    if isinstance(value, str) and _AGENT_SECRET_VALUE_RE.search(value):
+        raise ValueError("agent records cannot persist credential material")
+    if isinstance(value, str) and dynamic_evidence and not _is_safe_evidence_key(normalized_key):
+        return "[redacted agent evidence]"
+    return value
+
+
+def _normalize_agent_key(key: str) -> str:
+    with_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    with_boundaries = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", with_boundaries)
+    return re.sub(r"[^a-z0-9]+", "_", with_boundaries.lower()).strip("_")
+
+
+def _is_safe_evidence_key(normalized_key: str | None) -> bool:
+    if normalized_key is None:
+        return False
+    return (
+        normalized_key in _AGENT_SAFE_EVIDENCE_KEYS
+        or normalized_key.endswith(("_id", "_ref", "_hash", "_at", "_count", "_tokens", "_units"))
+        or normalized_key.startswith("supports_")
+        or normalized_key.endswith(("_available", "_healthy", "_enabled", "_supported"))
+    )
+
+
 def _load_dataclass(cls: type[Any], payload: str) -> Any:
     return dataclass_from_jsonable(cls, json.loads(payload))
+
+
+# The provider-neutral driver design uses this descriptive name.  Retain
+# SQLiteStore as the established public API for existing callers.
+OverseerStore = SQLiteStore

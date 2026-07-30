@@ -4390,10 +4390,6 @@ class OverseerApiClientTests(unittest.TestCase):
                         if tuple(command) == ("hostname",)
                         else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
                         if tuple(command) == ("ss", "-ltnp")
-                        else "running"
-                        if tuple(command) == ("firewall-cmd", "--state")
-                        else "public\n  interfaces: eth0"
-                        if tuple(command) == ("firewall-cmd", "--get-active-zones")
                         else "ok"
                     ),
                 ),
@@ -4444,6 +4440,10 @@ class OverseerApiClientTests(unittest.TestCase):
                         if tuple(command) == ("hostname",)
                         else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
                         if tuple(command) == ("ss", "-ltnp")
+                        else "running"
+                        if tuple(command) == ("firewall-cmd", "--state")
+                        else "public\n  interfaces: eth0"
+                        if tuple(command) == ("firewall-cmd", "--get-active-zones")
                         else "ok"
                     ),
                 ),

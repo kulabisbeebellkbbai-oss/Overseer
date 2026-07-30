@@ -341,7 +341,15 @@ def _allow(operation: str, context: Mapping[str, object]) -> bool:
 @pytest.fixture
 def manager(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]]:
+    import overseer.agent_manager as agent_manager_module
+
+    monkeypatch.setattr(
+        agent_manager_module.shutil,
+        "which",
+        lambda executable: f"/opt/test-providers/{executable}",
+    )
     events: list[str] = []
     registry, drivers = _registry(tmp_path, events)
     store = TrackingStore(tmp_path / "state.sqlite3", events)

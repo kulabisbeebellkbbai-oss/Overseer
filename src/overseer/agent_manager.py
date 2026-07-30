@@ -18,6 +18,7 @@ from .agent_contracts import (
     AgentRecoveryAttempt,
     AgentRecoveryAttemptState,
     AgentRecoveryOutcome,
+    AgentRecoveryRequest,
     AgentDispatchRequest,
     AgentDispatchResult,
     AgentErrorCategory,
@@ -863,12 +864,6 @@ class AgentManager:
         if execution.state is FailoverExecutionState.BLOCKED_PREIMPORT:
             if attempt is not None:
                 raise AgentHandoffError("recovery attempt already exists")
-            execution = self.store.transition_failover_execution(
-                execution.id,
-                expected_state=FailoverExecutionState.BLOCKED_PREIMPORT,
-                state=FailoverExecutionState.RECOVERING,
-                updated_at=self._clock(),
-            )
             attempt = AgentRecoveryAttempt(
                 id=self._id_factory("recovery-attempt"),
                 idempotency_key=f"recover.{execution.id}",
@@ -878,29 +873,73 @@ class AgentManager:
                 outgoing_epoch_id=execution.outgoing_epoch_id,
                 provider_id=execution.outgoing_provider_id,
                 internal_session_id=session.id,
-                external_session_id=str(session.external_session_id),
+                external_session_id=session.external_session_id,
                 operation_generation=execution.operation_generation,
                 operation_owner_ref=execution.operation_owner_ref,
                 state=AgentRecoveryAttemptState.PENDING,
                 created_at=self._clock(),
                 updated_at=self._clock(),
             )
-            self.store.save_agent_recovery_attempt(attempt)
+            try:
+                execution = self.store.claim_failover_recovery(
+                    execution.id, attempt, updated_at=self._clock()
+                )
+            except ValueError as error:
+                raise AgentHandoffError(
+                    "failover recovery claim requires repair"
+                ) from error
         assert attempt is not None
         outcome = self.store.recovery_outcome_for_attempt(attempt.id)
         if outcome is not None:
+            raw = self.store.load_agent_dispatch_result(outcome.raw_result_id)
+            self._validate_recovery_result(
+                execution,
+                session,
+                raw,
+                attempt_id=(
+                    attempt.id
+                    if raw.evidence.get("recovery_request_id") is not None
+                    else None
+                ),
+            )
+            adapter_id = self.registry.providers[
+                execution.outgoing_provider_id
+            ].adapter_id
+            expected_provenance = hashlib.sha256(
+                f"{adapter_id}|{raw.request_id}|{raw.id}|{raw.request_id}".encode()
+            ).hexdigest()
+            if (
+                outcome.request_id != raw.request_id
+                or outcome.state is not raw.state
+                or outcome.provenance_ref
+                != f"provenance.{expected_provenance}"
+            ):
+                raise AgentHandoffError("recovery outcome provenance mismatch")
             return self._finalize_failover_recovery(
                 execution, operation, resume_result_ref=outcome.raw_result_id
             )
-        if attempt.state is AgentRecoveryAttemptState.PENDING:
+        result_from_recover = attempt.state is AgentRecoveryAttemptState.PENDING
+        if result_from_recover:
             attempt = self.store.transition_agent_recovery_attempt(
                 attempt.id,
                 expected_state=AgentRecoveryAttemptState.PENDING,
                 state=AgentRecoveryAttemptState.EXTERNAL_STARTED,
                 updated_at=self._clock(),
             )
+            request = AgentRecoveryRequest(
+                id=f"recovery-request.{attempt.id}",
+                idempotency_key=attempt.idempotency_key,
+                attempt_id=attempt.id,
+                execution_id=execution.id,
+                instance_id=execution.instance_id,
+                driver_epoch_id=execution.outgoing_epoch_id,
+                provider_id=execution.outgoing_provider_id,
+                internal_session_id=session.id,
+                external_session_id=session.external_session_id,
+                requested_at=self._clock(),
+            )
             try:
-                result = driver.resume(session)
+                result = driver.recover(request, session)
             except Exception:
                 result = None
         else:
@@ -912,30 +951,35 @@ class AgentManager:
                 raise AgentHandoffError("inspection_unavailable")
         if result is None:
             raise AgentHandoffError("outgoing provider recovery is uncertain")
-        self._validate_recovery_result(execution, session, result)
-        try:
-            self.store.load_agent_dispatch_result(result.id)
-        except KeyError:
-            pass
-        else:
-            raise AgentHandoffError("forged preexisting recovery result")
-        self.store.save_agent_dispatch_result(result)
+        self._validate_recovery_result(
+            execution,
+            session,
+            result,
+            attempt_id=attempt.id if result_from_recover else None,
+        )
+        request_id = result.request_id
+        adapter_id = self.registry.providers[execution.outgoing_provider_id].adapter_id
+        provenance = hashlib.sha256(
+            f"{adapter_id}|{request_id}|{result.id}|{result.request_id}".encode()
+        ).hexdigest()
         outcome = AgentRecoveryOutcome(
             id=self._id_factory("recovery-outcome"),
             attempt_id=attempt.id,
             raw_result_id=result.id,
             request_id=result.request_id,
-            provenance_ref=f"provider.{result.provider_id}",
+            provenance_ref=f"provenance.{provenance}",
             state=result.state,
             recorded_at=self._clock(),
         )
-        self.store.save_agent_recovery_outcome(outcome)
-        self.store.transition_agent_recovery_attempt(
-            attempt.id,
-            expected_state=AgentRecoveryAttemptState.EXTERNAL_STARTED,
-            state=AgentRecoveryAttemptState.RESULT_RECORDED,
-            updated_at=self._clock(),
-        )
+        try:
+            self.store.record_agent_recovery_result_bundle(
+                result,
+                outcome,
+                attempt_id=attempt.id,
+                updated_at=self._clock(),
+            )
+        except ValueError as error:
+            raise AgentHandoffError(str(error)) from error
         return self._finalize_failover_recovery(
             execution, operation, resume_result_ref=result.id
         )
@@ -945,7 +989,13 @@ class AgentManager:
         execution: FailoverExecution,
         session: AgentSession,
         result: AgentDispatchResult,
+        *,
+        attempt_id: str | None = None,
     ) -> None:
+        adapter_id = self.registry.providers[execution.outgoing_provider_id].adapter_id
+        expected_request_id = (
+            f"recovery-request.{attempt_id}" if attempt_id is not None else None
+        )
         if (
             result.state not in _ACKNOWLEDGED_STATES
             or result.instance_id != execution.instance_id
@@ -955,6 +1005,23 @@ class AgentManager:
             or result.external_session_id not in {None, session.external_session_id}
             or not result.id.strip()
             or not result.request_id.strip()
+            or (
+                expected_request_id is not None
+                and result.request_id != expected_request_id
+            )
+            or (
+                expected_request_id is not None
+                and result.evidence.get("recovery_request_id")
+                != expected_request_id
+            )
+            or (
+                expected_request_id is not None
+                and result.evidence.get("adapter_id") != adapter_id
+            )
+            or (
+                result.provider_reference is not None
+                and not result.provider_reference.strip()
+            )
         ):
             raise AgentHandoffError("outgoing provider result binding mismatch")
 

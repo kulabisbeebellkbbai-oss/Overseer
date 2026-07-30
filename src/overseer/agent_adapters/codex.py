@@ -21,6 +21,7 @@ from ..agent_contracts import (
     AgentInstanceProfile,
     AgentOperationState,
     AgentProvider,
+    AgentRecoveryRequest,
     AgentSession,
     AgentTransport,
 )
@@ -271,6 +272,22 @@ class CodexDriver:
         )
         self._legacy_resume_details[result.id] = details
         return result
+
+    def recover(
+        self, request: AgentRecoveryRequest, session: AgentSession
+    ) -> AgentDispatchResult:
+        result = self.resume(session)
+        return replace(
+            result,
+            id=f"result.{request.id}",
+            request_id=request.id,
+            driver_epoch_id=request.driver_epoch_id,
+            evidence={
+                **result.evidence,
+                "recovery_request_id": request.id,
+                "adapter_id": self.provider.adapter_id,
+            },
+        )
 
     def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult:
         if request.instance_id != self.profile.id:

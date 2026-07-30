@@ -708,7 +708,7 @@ class AgentRecoveryAttempt:
     outgoing_epoch_id: str
     provider_id: str
     internal_session_id: str
-    external_session_id: str
+    external_session_id: str | None
     operation_generation: int
     operation_owner_ref: str
     state: AgentRecoveryAttemptState
@@ -725,13 +725,17 @@ class AgentRecoveryAttempt:
             (self.outgoing_epoch_id, "outgoing epoch id"),
             (self.provider_id, "provider id"),
             (self.internal_session_id, "internal session id"),
-            (self.external_session_id, "external session id"),
             (self.operation_owner_ref, "operation owner reference"),
         ):
             _require_safe_identifier(value, label)
         if not isinstance(self.state, AgentRecoveryAttemptState):
             raise TypeError("recovery attempt state is invalid")
-        if self.operation_generation < 1:
+        _validate_optional_identifier(self.external_session_id, "external session id")
+        if (
+            not isinstance(self.operation_generation, int)
+            or isinstance(self.operation_generation, bool)
+            or self.operation_generation < 1
+        ):
             raise ValueError("operation generation must be positive")
         _require_timestamp(self.created_at, "attempt creation timestamp")
         _require_timestamp(self.updated_at, "attempt update timestamp")
@@ -759,6 +763,35 @@ class AgentRecoveryOutcome:
         if self.state not in _ACKNOWLEDGED_RECOVERY_STATES:
             raise ValueError("recovery outcome state is not resumable")
         _require_timestamp(self.recorded_at, "outcome timestamp")
+
+
+@dataclass(frozen=True)
+class AgentRecoveryRequest:
+    id: str
+    idempotency_key: str
+    attempt_id: str
+    execution_id: str
+    instance_id: str
+    driver_epoch_id: str
+    provider_id: str
+    internal_session_id: str
+    external_session_id: str | None
+    requested_at: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.id, "recovery request id"),
+            (self.idempotency_key, "recovery idempotency key"),
+            (self.attempt_id, "recovery attempt id"),
+            (self.execution_id, "failover execution id"),
+            (self.instance_id, "instance id"),
+            (self.driver_epoch_id, "driver epoch id"),
+            (self.provider_id, "provider id"),
+            (self.internal_session_id, "internal session id"),
+        ):
+            _require_safe_identifier(value, label)
+        _validate_optional_identifier(self.external_session_id, "external session id")
+        _require_timestamp(self.requested_at, "recovery request timestamp")
 
 
 _ACKNOWLEDGED_RECOVERY_STATES = {
@@ -802,6 +835,10 @@ class PrimaryDriver(Protocol):
     def start(self, profile: AgentInstanceProfile) -> AgentDispatchResult: ...
 
     def resume(self, session: AgentSession) -> AgentDispatchResult: ...
+
+    def recover(
+        self, request: AgentRecoveryRequest, session: AgentSession
+    ) -> AgentDispatchResult: ...
 
     def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult: ...
 

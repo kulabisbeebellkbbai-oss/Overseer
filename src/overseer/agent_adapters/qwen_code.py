@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from ..agent_contracts import (
     AgentInstanceProfile,
     AgentOperationState,
     AgentProvider,
+    AgentRecoveryRequest,
     AgentSession,
     AgentTransport,
 )
@@ -78,6 +80,22 @@ class UnavailablePrimaryDriver:
 
     def resume(self, session: AgentSession) -> AgentDispatchResult:
         return self._session_unavailable("resume", session)
+
+    def recover(
+        self, request: AgentRecoveryRequest, session: AgentSession
+    ) -> AgentDispatchResult:
+        result = self._session_unavailable("recover", session)
+        return replace(
+            result,
+            id=f"result.{request.id}",
+            request_id=request.id,
+            driver_epoch_id=request.driver_epoch_id,
+            evidence={
+                **result.evidence,
+                "recovery_request_id": request.id,
+                "adapter_id": self.provider.adapter_id,
+            },
+        )
 
     def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult:
         return self._unavailable(

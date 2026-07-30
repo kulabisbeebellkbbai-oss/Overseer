@@ -287,6 +287,9 @@ def test_primary_driver_protocol_matches_normalized_contract() -> None:
         def resume(self, session: AgentSession) -> AgentDispatchResult:
             return result
 
+        def recover(self, recovery_request, session: AgentSession) -> AgentDispatchResult:
+            return result
+
         def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult:
             return result
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -20,6 +20,7 @@ from ..agent_contracts import (
     AgentInstanceProfile,
     AgentOperationState,
     AgentProvider,
+    AgentRecoveryRequest,
     AgentSession,
     AgentTransport,
 )
@@ -136,6 +137,22 @@ class ClaudeDriver:
             prompt="Continue the approved Overseer objective.",
         )
         return self._invoke(request, external_session_id=session.external_session_id)
+
+    def recover(
+        self, request: AgentRecoveryRequest, session: AgentSession
+    ) -> AgentDispatchResult:
+        result = self.resume(session)
+        return replace(
+            result,
+            id=f"result.{request.id}",
+            request_id=request.id,
+            driver_epoch_id=request.driver_epoch_id,
+            evidence={
+                **result.evidence,
+                "recovery_request_id": request.id,
+                "adapter_id": self.provider.adapter_id,
+            },
+        )
 
     def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult:
         if request.instance_id != self.profile.id:

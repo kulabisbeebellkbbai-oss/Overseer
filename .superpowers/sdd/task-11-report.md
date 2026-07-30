@@ -150,6 +150,40 @@ durable results. The normalized attempt-bound outcome is durable before exact
 fence release, and the attempt is finalized atomically with recovery. No path
 dispatches work, imports a handoff, replays completed work, or creates an epoch.
 
+### Atomic v8 completion
+
+Recovery claim is now one `BEGIN IMMEDIATE` transaction that CAS-transitions
+`blocked_preimport` to `recovering` and inserts exactly one attempt. Injected
+attempt-insert failure proves both changes roll back. The raw normalized result,
+immutable outcome, and `external_started -> result_recorded` transition are a
+second atomic transaction; injected outcome failure leaves no result/outcome
+and retains the uncertain started attempt for inspection-only reconciliation.
+Final outcome verification and fence release remain a later idempotent
+transaction.
+
+`AgentRecoveryRequest` supplies a stable attempt-owned request and idempotency
+key. Codex and Claude use their established resume mechanics but return exact
+request/epoch binding and adapter evidence; unavailable adapters return an exact
+request-bound unsupported result. Manager validation accepts the provider's
+documented internal-or-external session identity only, verifies adapter proof,
+and persists a privacy-safe SHA-256 provenance binding rather than a fabricated
+provider label.
+
+The explicit recovery test matrix covers claim rollback, result-bundle
+rollback, restart inspection without resume replay, concurrent callers with one
+external recovery call, Codex external-session identity, Claude internal-session
+identity, and independent rejection of forged request, epoch, provider,
+internal session, external session, recovery-request proof, and adapter proof.
+Durable outcome restart validates the exact raw result ID/request/state and
+SHA-256 provenance before finalization; the store rejects preexisting or
+conflicting result/outcome records.
+
+Separate tests inject an attempt-owned result ID before outcome ownership and
+prove recovery rejects it while retaining the fence. Another test crashes after
+the committed result bundle, tampers the durable provenance digest, proves
+restart rejects finalization, restores the exact bundle, and then finalizes
+without another resume.
+
 ## Commit
 
 `c10b231` — `Add controlled primary driver failover`.

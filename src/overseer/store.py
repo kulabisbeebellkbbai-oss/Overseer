@@ -1383,6 +1383,21 @@ class SQLiteStore:
             {},
         )
 
+    def claim_failover_recovery(
+        self, execution_id: str, attempt: AgentRecoveryAttempt, *, updated_at: str
+    ) -> FailoverExecution:
+        with self.agent_transaction():
+            if self.recovery_attempt_for_execution(execution_id) is not None:
+                raise ValueError("recovery attempt already exists")
+            execution = self.transition_failover_execution(
+                execution_id,
+                expected_state=FailoverExecutionState.BLOCKED_PREIMPORT,
+                state=FailoverExecutionState.RECOVERING,
+                updated_at=updated_at,
+            )
+            self.save_agent_recovery_attempt(attempt)
+            return execution
+
     def load_agent_recovery_attempt(self, attempt_id: str) -> AgentRecoveryAttempt:
         return _load_dataclass(
             AgentRecoveryAttempt,
@@ -1440,6 +1455,36 @@ class SQLiteStore:
             "agent_recovery_outcomes", outcome, AgentRecoveryOutcome,
             tuple(AgentRecoveryOutcome.__dataclass_fields__), {},
         )
+
+    def record_agent_recovery_result_bundle(
+        self,
+        result: AgentDispatchResult,
+        outcome: AgentRecoveryOutcome,
+        *,
+        attempt_id: str,
+        updated_at: str,
+    ) -> None:
+        with self.agent_transaction():
+            try:
+                existing = self.load_agent_dispatch_result(result.id)
+            except KeyError:
+                pass
+            else:
+                raise ValueError(
+                    "forged preexisting recovery result"
+                    if existing != result
+                    else "recovery result already exists without owned outcome"
+                )
+            if self.recovery_outcome_for_attempt(attempt_id) is not None:
+                raise ValueError("recovery outcome already exists")
+            self.save_agent_dispatch_result(result)
+            self.save_agent_recovery_outcome(outcome)
+            self.transition_agent_recovery_attempt(
+                attempt_id,
+                expected_state=AgentRecoveryAttemptState.EXTERNAL_STARTED,
+                state=AgentRecoveryAttemptState.RESULT_RECORDED,
+                updated_at=updated_at,
+            )
 
     def recovery_outcome_for_attempt(
         self, attempt_id: str

@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 import time
 from typing import Mapping
 
@@ -20,10 +20,13 @@ from overseer.agent_contracts import (
     AgentInstanceProfile,
     AgentOperationState,
     AgentProvider,
+    AgentRecoveryRequest,
+    AgentRecoveryAttemptState,
     AgentSession,
     AgentTransitionState,
     FailoverPolicy,
     FailoverExecutionState,
+    FailoverExecution,
     ProviderHealthObservation,
     ProviderHealthState,
 )
@@ -131,6 +134,22 @@ class FakeDriver:
             session_id=session.external_session_id,
             epoch_id=str(session.legacy_references.get("driver_epoch_id", "pending")),
             state=AgentOperationState.RUNNING,
+        )
+
+    def recover(
+        self, request: AgentRecoveryRequest, session: AgentSession
+    ) -> AgentDispatchResult:
+        result = self.resume(session)
+        return replace(
+            result,
+            id=f"result.{request.id}",
+            request_id=request.id,
+            driver_epoch_id=request.driver_epoch_id,
+            evidence={
+                **result.evidence,
+                "recovery_request_id": request.id,
+                "adapter_id": self.provider.adapter_id,
+            },
         )
 
     def dispatch(self, request: AgentDispatchRequest) -> AgentDispatchResult:
@@ -568,20 +587,91 @@ def test_controlled_failover_rechecks_policy_checkpoint_age_after_drain(
             "overseer.default", "must remain fenced", "dispatch.after.blocked"
         )
 
-    driver = manager[2]["codex"]
-    original_resume = driver.resume
-    driver.resume = lambda session: replace(
-        original_resume(session), provider_id="claude"
+    original_save_attempt = store.save_agent_recovery_attempt
+    store.save_agent_recovery_attempt = lambda attempt: (_ for _ in ()).throw(
+        RuntimeError("injected claim rollback")
     )
-    with pytest.raises(AgentHandoffError, match="binding mismatch"):
+    with pytest.raises(RuntimeError, match="claim rollback"):
         value.recover_failover_execution(
             execution.id,
             initiated_by="operator",
             approval_id="approval.recover.failover",
         )
+    assert store.load_failover_execution(execution.id).state is FailoverExecutionState.BLOCKED_PREIMPORT
+    assert store.recovery_attempt_for_execution(execution.id) is None
+    store.save_agent_recovery_attempt = original_save_attempt
+
+    original_save_outcome = store.save_agent_recovery_outcome
+    store.save_agent_recovery_outcome = lambda outcome: (_ for _ in ()).throw(
+        RuntimeError("injected result bundle rollback")
+    )
+    with pytest.raises(RuntimeError, match="bundle rollback"):
+        value.recover_failover_execution(
+            execution.id,
+            initiated_by="operator",
+            approval_id="approval.recover.failover",
+        )
+    attempt = store.recovery_attempt_for_execution(execution.id)
+    assert attempt is not None
+    assert attempt.state is AgentRecoveryAttemptState.EXTERNAL_STARTED
+    assert store.recovery_outcome_for_attempt(attempt.id) is None
+    with pytest.raises(KeyError):
+        store.load_agent_dispatch_result(f"result.recovery-request.{attempt.id}")
+    store.save_agent_recovery_outcome = original_save_outcome
     assert store.load_failover_execution(execution.id).state is FailoverExecutionState.RECOVERING
     assert store.load_agent_operation("overseer.default").state.value == "fenced"
-    driver.resume = original_resume
+
+    bound_session = replace(
+        store.load_agent_session(execution.outgoing_session_id),
+        legacy_references={"driver_epoch_id": execution.outgoing_epoch_id},
+    )
+    preexisting = manager[2]["codex"].inspect(bound_session)
+    store.save_agent_dispatch_result(preexisting)
+    with pytest.raises(AgentHandoffError, match="already exists"):
+        value.recover_failover_execution(
+            execution.id,
+            initiated_by="operator",
+            approval_id="approval.recover.failover",
+        )
+    store._connection.execute(
+        "DELETE FROM agent_dispatch_results WHERE id = ?", (preexisting.id,)
+    )
+    store._connection.commit()
+
+    original_finalize = value._finalize_failover_recovery
+    value._finalize_failover_recovery = lambda *args, **kwargs: (
+        (_ for _ in ()).throw(RuntimeError("injected crash after result bundle"))
+    )
+    with pytest.raises(RuntimeError, match="after result bundle"):
+        value.recover_failover_execution(
+            execution.id,
+            initiated_by="operator",
+            approval_id="approval.recover.failover",
+        )
+    value._finalize_failover_recovery = original_finalize
+    outcome = store.recovery_outcome_for_attempt(attempt.id)
+    assert outcome is not None
+    original_payload = store._connection.execute(
+        "SELECT payload FROM agent_recovery_outcomes WHERE id = ?", (outcome.id,)
+    ).fetchone()["payload"]
+    tampered = json.loads(original_payload)
+    tampered["provenance_ref"] = "provenance.forged"
+    store._connection.execute(
+        "UPDATE agent_recovery_outcomes SET payload = ? WHERE id = ?",
+        (json.dumps(tampered, sort_keys=True, separators=(",", ":")), outcome.id),
+    )
+    store._connection.commit()
+    with pytest.raises(AgentHandoffError, match="provenance mismatch"):
+        value.recover_failover_execution(
+            execution.id,
+            initiated_by="operator",
+            approval_id="approval.recover.failover",
+        )
+    store._connection.execute(
+        "UPDATE agent_recovery_outcomes SET payload = ? WHERE id = ?",
+        (original_payload, outcome.id),
+    )
+    store._connection.commit()
     recovered = value.recover_failover_execution(
         execution.id,
         initiated_by="operator",
@@ -591,7 +681,187 @@ def test_controlled_failover_rechecks_policy_checkpoint_age_after_drain(
     assert recovered.resume_result_ref
     assert store.load_agent_operation("overseer.default").state.value == "open"
     assert max(epoch.ordinal for epoch in store.list_driver_epochs()) == 1
-    assert manager[2]["codex"].resume_calls == 1
+    assert manager[2]["codex"].resume_calls == 1, outcomes
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("request_id", "forged.request"),
+        ("driver_epoch_id", "epoch.forged"),
+        ("provider_id", "claude"),
+        ("session_id", "session.forged"),
+        ("external_session_id", "external.forged"),
+    ),
+)
+def test_recovery_result_rejects_each_forged_binding(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+    field: str,
+    value: str,
+) -> None:
+    value_manager, store, drivers, _ = manager
+    epoch = value_manager.activate("overseer.default", initiated_by="operator")
+    session = store.load_agent_session(epoch.session_id)
+    request = AgentRecoveryRequest(
+        id="recovery-request.attempt.test",
+        idempotency_key="recover.execution.test",
+        attempt_id="attempt.test",
+        execution_id="execution.test",
+        instance_id=epoch.instance_id,
+        driver_epoch_id=epoch.id,
+        provider_id=epoch.provider_id,
+        internal_session_id=session.id,
+        external_session_id=session.external_session_id,
+        requested_at=datetime.now(timezone.utc).isoformat(),
+    )
+    bound_session = replace(
+        session,
+        legacy_references={**session.legacy_references, "driver_epoch_id": epoch.id},
+    )
+    result = drivers["codex"].recover(request, bound_session)
+    execution = FailoverExecution(
+        id="execution.test",
+        decision_id="decision.test",
+        instance_id=epoch.instance_id,
+        outgoing_epoch_id=epoch.id,
+        outgoing_session_id=session.id,
+        outgoing_provider_id=epoch.provider_id,
+        checkpoint_id="checkpoint.test",
+        operation_generation=1,
+        operation_owner_ref="owner.test",
+        state=FailoverExecutionState.RECOVERING,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    forged = replace(result, **{field: value})
+    with pytest.raises(AgentHandoffError, match="binding mismatch"):
+        value_manager._validate_recovery_result(
+            execution, bound_session, forged, attempt_id="attempt.test"
+        )
+
+
+@pytest.mark.parametrize(
+    ("evidence",),
+    (
+        ({"recovery_request_id": "forged.request", "adapter_id": "codex"},),
+        ({"recovery_request_id": "recovery-request.attempt.test", "adapter_id": "forged"},),
+    ),
+)
+def test_recovery_result_rejects_forged_adapter_proof(
+    manager, evidence
+) -> None:
+    value_manager, store, drivers, _ = manager
+    epoch = value_manager.activate("overseer.default", initiated_by="operator")
+    session = store.load_agent_session(epoch.session_id)
+    bound = replace(session, legacy_references={"driver_epoch_id": epoch.id})
+    request = AgentRecoveryRequest(
+        id="recovery-request.attempt.test", idempotency_key="recover.test",
+        attempt_id="attempt.test", execution_id="execution.test",
+        instance_id=epoch.instance_id, driver_epoch_id=epoch.id,
+        provider_id=epoch.provider_id, internal_session_id=session.id,
+        external_session_id=session.external_session_id,
+        requested_at=datetime.now(timezone.utc).isoformat(),
+    )
+    result = replace(drivers["codex"].recover(request, bound), evidence=evidence)
+    execution = FailoverExecution(
+        id="execution.test", decision_id="decision.test",
+        instance_id=epoch.instance_id, outgoing_epoch_id=epoch.id,
+        outgoing_session_id=session.id, outgoing_provider_id=epoch.provider_id,
+        checkpoint_id="checkpoint.test", operation_generation=1,
+        operation_owner_ref="owner.test", state=FailoverExecutionState.RECOVERING,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    with pytest.raises(AgentHandoffError, match="binding mismatch"):
+        value_manager._validate_recovery_result(
+            execution, bound, result, attempt_id="attempt.test"
+        )
+
+
+def test_claude_internal_session_recovery_result_is_accepted(manager) -> None:
+    value_manager, store, drivers, _ = manager
+    epoch = value_manager.activate("overseer.default", initiated_by="operator")
+    codex_session = store.load_agent_session(epoch.session_id)
+    claude_session = replace(
+        codex_session,
+        id="session.claude.test",
+        provider_id="claude",
+        legacy_references={"driver_epoch_id": "epoch.claude.test"},
+    )
+    execution = FailoverExecution(
+        id="execution.claude", decision_id="decision.claude",
+        instance_id=epoch.instance_id, outgoing_epoch_id="epoch.claude.test",
+        outgoing_session_id=claude_session.id, outgoing_provider_id="claude",
+        checkpoint_id="checkpoint.claude", operation_generation=1,
+        operation_owner_ref="owner.claude", state=FailoverExecutionState.RECOVERING,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    request = AgentRecoveryRequest(
+        id="recovery-request.attempt.claude", idempotency_key="recover.claude",
+        attempt_id="attempt.claude", execution_id=execution.id,
+        instance_id=execution.instance_id, driver_epoch_id=execution.outgoing_epoch_id,
+        provider_id="claude", internal_session_id=claude_session.id,
+        external_session_id=claude_session.external_session_id,
+        requested_at=datetime.now(timezone.utc).isoformat(),
+    )
+    value_manager.registry.driver_for_provider(
+        "claude", instance_id="overseer.default"
+    )
+    result = replace(
+        drivers["claude"].recover(request, claude_session),
+        session_id=claude_session.id,
+        external_session_id=claude_session.external_session_id,
+    )
+    value_manager._validate_recovery_result(
+        execution, claude_session, result, attempt_id="attempt.claude"
+    )
+
+
+def test_concurrent_failover_recovery_calls_resume_at_most_once(manager) -> None:
+    value, store, decision = _prepare_allowed_failover(
+        manager, checkpoint_max_age_seconds=1
+    )
+    checkpoint = store.load_agent_checkpoint(decision.checkpoint_id)
+    original_drain = value.operations.drain
+    def stale_drain(*args, **kwargs):
+        result = original_drain(*args, **kwargs)
+        value._clock = lambda: (
+            datetime.fromisoformat(checkpoint.created_at) + timedelta(seconds=2)
+        ).isoformat()
+        return result
+    value.operations.drain = stale_drain
+    with pytest.raises(AgentHandoffError):
+        value.execute_failover(
+            "overseer.default", decision.id,
+            initiated_by="operator", approval_id="approval.execute.failover",
+        )
+    execution = store.list_failover_executions()[0]
+    barrier = Barrier(2)
+    outcomes: list[object] = []
+    def recover() -> None:
+        thread_store = OverseerStore(store.path)
+        selected_manager = AgentManager(
+            value.registry, thread_store, authorization_callback=_allow,
+            clock=value._clock,
+        )
+        barrier.wait()
+        try:
+            outcomes.append(selected_manager.recover_failover_execution(
+                execution.id, initiated_by="operator",
+                approval_id="approval.recover.failover",
+            ))
+        except Exception as error:
+            outcomes.append(error)
+        finally:
+            thread_store.close()
+    threads = [Thread(target=recover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert manager[2]["codex"].resume_calls == 1, repr(outcomes)
+    assert sum(isinstance(item, FailoverExecution) for item in outcomes) == 1
 
 
 def test_discovery_policy_rejection_prevents_driver_and_store_bypass(

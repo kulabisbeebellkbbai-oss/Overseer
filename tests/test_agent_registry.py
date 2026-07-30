@@ -86,6 +86,9 @@ class _FactoryDriver:
     def resume(self, session):
         raise NotImplementedError
 
+    def recover(self, request, session):
+        raise NotImplementedError
+
     def dispatch(self, request):
         raise NotImplementedError
 
@@ -289,6 +292,9 @@ def test_registry_instantiates_only_explicitly_registered_adapter_factory(
             raise NotImplementedError
 
         def resume(self, session):
+            raise NotImplementedError
+
+        def recover(self, request, session):
             raise NotImplementedError
 
         def dispatch(self, request):

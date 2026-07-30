@@ -11,10 +11,15 @@ from overseer.agent_contracts import (
     AgentOperationState,
     DriverEpoch,
     FailoverPolicy,
+    FailoverExecution,
+    FailoverExecutionState,
+    FAILOVER_RECOVERY_BLOCKERS,
+    RECOVERABLE_FAILOVER_EXECUTION_STATES,
     ProviderHealthObservation,
     ProviderHealthState,
 )
 from overseer.agent_handoff import evaluate_failover_evidence
+from overseer.cli import agent_failover_executions_status
 from overseer.store import OverseerStore
 
 
@@ -248,3 +253,51 @@ def test_failover_decision_is_immutable_and_consumed_once(tmp_path) -> None:
                 expected_generation=decision.operation_generation,
                 consumed_at=(NOW + timedelta(seconds=2)).isoformat(),
             )
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        FailoverExecutionState.RESERVED,
+        FailoverExecutionState.DRAINING,
+        FailoverExecutionState.BLOCKED_PREIMPORT,
+        FailoverExecutionState.RECOVERING,
+    ),
+)
+def test_every_nonterminal_failover_state_has_private_recovery_status(
+    tmp_path, state
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    now = NOW.isoformat()
+    with OverseerStore(path) as store:
+        store.save_failover_execution(
+            FailoverExecution(
+                id=f"execution.{state.value}",
+                decision_id="decision.1",
+                instance_id="overseer.default",
+                outgoing_epoch_id="epoch.1",
+                outgoing_session_id="session.secret.internal",
+                outgoing_provider_id="codex",
+                checkpoint_id="checkpoint.1",
+                operation_generation=7,
+                operation_owner_ref="owner.must-not-leak",
+                state=state,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    status = agent_failover_executions_status(path)
+    item = status["executions"][0]
+    assert status["recovery_required"] is True
+    assert item["recovery_state"] == state.value
+    assert item["blocker"]
+    assert item["next_action"].startswith("POST /agent-failover/recover")
+    serialized = repr(status)
+    assert "owner.must-not-leak" not in serialized
+    assert "session.secret.internal" not in serialized
+
+
+def test_failover_recovery_state_and_blocker_contract_cannot_drift() -> None:
+    assert set(FAILOVER_RECOVERY_BLOCKERS) == set(
+        RECOVERABLE_FAILOVER_EXECUTION_STATES
+    )

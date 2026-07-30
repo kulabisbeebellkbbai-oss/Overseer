@@ -166,6 +166,7 @@ ACTION_ROUTES = {
     "checkpoint-agent": ("POST", "/agent-checkpoints"),
     "discover-agent-sessions": ("POST", "/agent-sessions/discover"),
     "failover-agent": ("POST", "/agent-failover"),
+    "recover-agent-failover": ("POST", "/agent-failover/recover"),
     "handoff-agent": ("POST", "/agent-handoffs"),
     "resume-agent-sessions": ("POST", "/agent-recovery"),
     "activate-claim": ("POST", "/claims/activate"),

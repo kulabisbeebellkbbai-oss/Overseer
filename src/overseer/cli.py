@@ -52,7 +52,11 @@ from .admin import (
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
-from .agent_contracts import AgentCapabilities
+from .agent_contracts import (
+    AgentCapabilities,
+    FAILOVER_RECOVERY_BLOCKERS,
+    RECOVERABLE_FAILOVER_EXECUTION_STATES,
+)
 from .agent_manager import AgentAuthorizationError, AgentManager
 from .agent_registry import AgentRegistry
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
@@ -806,10 +810,29 @@ def agent_failover_executions_status(
             for item in store.list_failover_executions()
             if instance_id is None or item.instance_id == instance_id
         )
+        projected = [
+            {
+                "id": item.id,
+                "decision_id": item.decision_id,
+                "instance_id": item.instance_id,
+                "outgoing_epoch_id": item.outgoing_epoch_id,
+                "outgoing_provider_id": item.outgoing_provider_id,
+                "checkpoint_id": item.checkpoint_id,
+                "recovery_state": item.state.value,
+                "blocker": FAILOVER_RECOVERY_BLOCKERS.get(item.state),
+                "next_action": (
+                    "POST /agent-failover/recover with execution_id, initiated_by, and approval_id"
+                    if item.state in RECOVERABLE_FAILOVER_EXECUTION_STATES
+                    else None
+                ),
+                "updated_at": item.updated_at,
+            }
+            for item in executions
+        ]
         return {
-            "executions": [to_jsonable(item) for item in executions],
+            "executions": projected,
             "recovery_required": any(
-                item.state.value in {"blocked_preimport", "recovering"}
+                item.state in RECOVERABLE_FAILOVER_EXECUTION_STATES
                 for item in executions
             ),
             "mutation_performed": False,

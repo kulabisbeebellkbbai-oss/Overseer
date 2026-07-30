@@ -184,6 +184,18 @@ the committed result bundle, tampers the durable provenance digest, proves
 restart rejects finalization, restores the exact bundle, and then finalizes
 without another resume.
 
+### Shared recovery status and UI
+
+One shared contract now defines the recoverable nonterminal states:
+`reserved`, `draining`, `blocked_preimport`, and `recovering`, with one exact
+state-specific blocker mapping. The read-only status projection excludes
+operation owner tokens, internal sessions, operation generations, and evidence
+content; it returns only safe identifiers, `recovery_state`, blocker,
+`next_action`, and update time. API/status tests snapshot every state and assert
+private fields are absent. The Driver UI consumes that projection, alerts for
+all four states, and exposes the approval-gated recovery endpoint. Source and
+route-contract tests prevent the state/action definitions from drifting.
+
 ## Commit
 
 `c10b231` — `Add controlled primary driver failover`.

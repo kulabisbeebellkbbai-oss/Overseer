@@ -1124,6 +1124,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "checkpoint-agent") return await checkpointAgent();
       if (action === "handoff-agent") return await changePrimaryAgent("/agent-handoffs", "manual handoff");
       if (action === "failover-agent") return await controlledFailover();
+      if (action === "recover-agent-failover") return await recoverAgentFailover();
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
@@ -1236,6 +1237,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/agent-failover", {
         instance_id,
         decision_id: decision.id,
+        initiated_by: value("agent-initiated-by"),
+        approval_id
+      });
+    }
+    async function recoverAgentFailover() {
+      const execution = (state.data.agentFailoverExecutions?.executions || []).find(
+        (item) => ["reserved", "draining", "blocked_preimport", "recovering"].includes(item.recovery_state)
+      );
+      if (!execution) throw new Error("no recoverable failover execution");
+      const approval_id = value("agent-approval-id");
+      if (!approval_id) throw new Error("approval_id is required");
+      if (!window.confirm(`Confirm recovery ${execution.id} using approval ${approval_id}?`)) {
+        throw new Error("failover recovery cancelled by operator");
+      }
+      return await postJson("/agent-failover/recover", {
+        execution_id: execution.id,
         initiated_by: value("agent-initiated-by"),
         approval_id
       });
@@ -2148,7 +2165,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const providerNativeUsage = state.data.agentUsage?.providers || [];
       const failoverExecutions = state.data.agentFailoverExecutions?.executions || [];
       const blockedFailoverExecution = failoverExecutions.find(
-        (item) => item.state === "blocked_preimport" || item.state === "recovering"
+        (item) => ["reserved", "draining", "blocked_preimport", "recovering"].includes(item.recovery_state)
       );
       const blockerText = readinessBlocker ? JSON.stringify(readinessBlocker) : "";
       const cancelTitle = "Cancellation route is unavailable";
@@ -2178,11 +2195,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             ${driverAction("checkpoint-agent", "Checkpoint", "checkpoints", selectedSession?.provider_id || providerId)}
             ${driverAction("handoff-agent", "Manual Handoff", "handoff_import", selectedIncomingProvider)}
             ${driverAction("failover-agent", "Controlled Failover", "handoff_import", selectedIncomingProvider, failoverBlocker)}
+            <button class="action-btn" data-action="recover-agent-failover"${blockedFailoverExecution ? "" : " disabled"} title="${safe(blockedFailoverExecution?.blocker || "No recovery required")}">Recover Failover</button>
             <button class="action-btn" data-disabled-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
           </div></div>
           <div id="agent-cancel-blocker" class="panel span-12 inactive">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
           <div id="agent-failover-blockers" class="panel span-12 inactive">Evaluate controlled failover to view exact blockers.</div>
-          ${blockedFailoverExecution ? `<div class="panel span-12 bad">Failover recovery required: ${safe(blockedFailoverExecution.id)} (${safe(blockedFailoverExecution.state)})</div>` : ""}
+          ${blockedFailoverExecution ? `<div class="panel span-12 bad">Failover recovery required: ${safe(blockedFailoverExecution.id)} (${safe(blockedFailoverExecution.recovery_state)}): ${safe(blockedFailoverExecution.blocker)}. ${safe(blockedFailoverExecution.next_action)}</div>` : ""}
           <div class="panel span-12">
             <div class="toolbar"><h3>Operator Request</h3><span class="pill">${safe(providerId)}</span></div>
             <div class="form-grid">
@@ -3277,6 +3295,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "checkpoint-agent", source, query: "Review command status"},
         {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "handoff-agent", source, query: "Review command status"},
         {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "failover-agent", source, query: "Review command status"},
+        {workflow: "Review command status", page: "Driver", owner: "Sisko", action: "recover-agent-failover", source, query: "Review command status"},
         {workflow: "Review command status", page: "Overview", owner: "Sisko", action: "open drilldown", source, query: "Review command status"},
         {workflow: "Record an operations workflow", page: "Overview", owner: "Sisko / Ezri", action: "record-operation", source, query: "Record an operations workflow"},
         {workflow: "Stage a gap workflow from a template", page: "Overview", owner: "Sisko / Ezri", action: "stage-operation-workflow", source, query: "Stage a gap workflow from a template"},

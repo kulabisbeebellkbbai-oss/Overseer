@@ -64,6 +64,23 @@ class FailoverExecutionState(StrEnum):
     TRANSITION_STARTED = "transition_started"
 
 
+RECOVERABLE_FAILOVER_EXECUTION_STATES = frozenset(
+    {
+        FailoverExecutionState.RESERVED,
+        FailoverExecutionState.DRAINING,
+        FailoverExecutionState.BLOCKED_PREIMPORT,
+        FailoverExecutionState.RECOVERING,
+    }
+)
+
+FAILOVER_RECOVERY_BLOCKERS = {
+    FailoverExecutionState.RESERVED: "reserved_before_drain",
+    FailoverExecutionState.DRAINING: "drain_state_requires_inspection",
+    FailoverExecutionState.BLOCKED_PREIMPORT: "preimport_recovery_required",
+    FailoverExecutionState.RECOVERING: "recovery_attempt_requires_reconciliation",
+}
+
+
 class AgentRecoveryAttemptState(StrEnum):
     PENDING = "pending"
     EXTERNAL_STARTED = "external_started"

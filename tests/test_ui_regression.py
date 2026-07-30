@@ -67,6 +67,16 @@ class LocalApiHarness:
 
 
 class ProtectedGatewayUiRegressionTests(unittest.TestCase):
+    def test_failover_recovery_ui_uses_status_contract(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        for state in ("reserved", "draining", "blocked_preimport", "recovering"):
+            self.assertIn(state, OPERATOR_CONSOLE_HTML)
+        self.assertIn("item.recovery_state", OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/agent-failover/recover"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("blockedFailoverExecution.blocker", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("operation_owner_ref", OPERATOR_CONSOLE_HTML)
+
     def test_dashboard_pure_javascript_behavior_executes_in_node(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 

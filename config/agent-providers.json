@@ -27,7 +27,7 @@
         "session_resume": true,
         "interactive_dispatch": false,
         "noninteractive_dispatch": true,
-        "structured_events": true,
+        "structured_events": false,
         "checkpoints": false,
         "cancellation": false,
         "delegated_workers": false,

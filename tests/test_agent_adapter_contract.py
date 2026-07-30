@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import json
 import os
 import shutil
 from dataclasses import replace
@@ -11,7 +12,7 @@ import pytest
 
 from overseer.agent_adapters.codex import CodexDriver
 from overseer.agent_adapters.claude import ClaudeDriver
-from overseer.agent_adapters.base_cli import CliCommandRunner
+from overseer.agent_adapters.base_cli import CliCommandRunner, CliOutputLimitExceeded
 from overseer.agent_contracts import (
     AgentCapabilities,
     AgentDispatchRequest,
@@ -66,16 +67,30 @@ def fake_claude(tmp_path: Path) -> Path:
         "import json, os, sys\n"
         "mode = os.environ.get('FAKE_CLAUDE_MODE', 'success')\n"
         "prompt = sys.stdin.read()\n"
+        "def option(name):\n"
+        " i = sys.argv.index(name) if name in sys.argv else -1\n"
+        " return sys.argv[i + 1] if i >= 0 else None\n"
+        "session_id = option('--resume') or option('--session-id')\n"
         "if mode == 'nonzero':\n"
         " print('authentication failed', file=sys.stderr); raise SystemExit(2)\n"
         "if mode == 'malformed': print('{bad json'); raise SystemExit(0)\n"
         "if mode == 'oversized': print('x' * 70000); raise SystemExit(0)\n"
+        "if mode == 'oversized_stderr': print('x' * 70000, file=sys.stderr); raise SystemExit(0)\n"
         "if mode == 'json_error':\n"
-        " print(json.dumps({'is_error': True, 'result': 'request rejected', "
-        "'session_id': 'provider-session-error'})); raise SystemExit(0)\n"
+        " print(json.dumps({'type': 'result', 'is_error': True, 'result': 'request rejected', "
+        "'session_id': session_id})); raise SystemExit(0)\n"
+        "if mode == 'spoof_identity': session_id = '00000000-0000-4000-8000-000000000099'\n"
+        "if mode == 'system_shape':\n"
+        " print(json.dumps({'type':'system','subtype':'init','is_error':False,'session_id':session_id})); raise SystemExit(0)\n"
+        "if mode == 'unknown_subtype':\n"
+        " print(json.dumps({'type':'result','subtype':'mystery','is_error':False,'session_id':session_id})); raise SystemExit(0)\n"
+        "if mode == 'missing_is_error':\n"
+        " print(json.dumps({'type':'result','subtype':'success','session_id':session_id})); raise SystemExit(0)\n"
+        "if mode == 'nonboolean_is_error':\n"
+        " print(json.dumps({'type':'result','subtype':'success','is_error':'false','session_id':session_id})); raise SystemExit(0)\n"
         "print(json.dumps({'type': 'result', 'subtype': 'success', "
         "'is_error': False, 'result': 'private transcript must not persist', "
-        "'session_id': 'provider-session-1', 'duration_ms': 10, "
+        "'session_id': session_id, 'duration_ms': 10, "
         "'num_turns': 1, 'prompt_echo': prompt}))\n",
         encoding="utf-8",
     )
@@ -93,7 +108,7 @@ def _claude_adapter(
     capabilities = AgentCapabilities(
         session_resume=True,
         noninteractive_dispatch=True,
-        structured_events=True,
+        structured_events=False,
         handoff_import=True,
     )
     provider = AgentProvider(
@@ -503,11 +518,14 @@ def test_claude_dispatch_is_bounded_confined_and_privacy_safe(
     assert result.instance_id == request.instance_id
     assert result.session_id == request.session_id
     assert result.driver_epoch_id == request.driver_epoch_id
-    assert result.external_session_id == "provider-session-1"
+    expected_session_id = adapter.last_invocation.argv[
+        adapter.last_invocation.argv.index("--session-id") + 1
+    ]
+    assert result.external_session_id == expected_session_id
     assert result.evidence == {
         "result_type": "result",
         "result_subtype": "success",
-        "provider_session_id": "provider-session-1",
+        "provider_session_id": expected_session_id,
     }
     assert "private transcript" not in repr(result)
     assert adapter.last_invocation.cwd == str(workspace.resolve())
@@ -558,6 +576,29 @@ def test_claude_normalizes_provider_failures_without_raw_output(
     assert "request rejected" not in repr(result)
 
 
+@pytest.mark.parametrize(
+    ("mode", "stream"),
+    [("oversized", "stdout"), ("oversized_stderr", "stderr")],
+)
+def test_cli_runner_bounds_real_process_output_before_materializing_it(
+    fake_claude: Path, tmp_path: Path, mode: str, stream: str
+) -> None:
+    runner = CliCommandRunner(
+        executable_path=fake_claude,
+        executable_allowlist=(str(fake_claude),),
+        environment={**os.environ, "FAKE_CLAUDE_MODE": mode},
+    )
+
+    with pytest.raises(CliOutputLimitExceeded, match=stream):
+        runner.run_bounded(
+            ["claude", "--session-id", "00000000-0000-4000-8000-000000000001"],
+            input_text="bounded",
+            cwd=tmp_path,
+            stdout_limit_bytes=1024,
+            stderr_limit_bytes=1024,
+        )
+
+
 def test_claude_resume_requires_proven_external_identity(
     fake_claude: Path, tmp_path: Path
 ) -> None:
@@ -567,7 +608,7 @@ def test_claude_resume_requires_proven_external_identity(
     session = AgentSession(
         id="session.claude.1",
         provider_id="claude",
-        external_session_id="provider-session-existing",
+        external_session_id="00000000-0000-4000-8000-000000000001",
         workspace=str(workspace),
         transport=AgentTransport.NONINTERACTIVE_CLI,
         capabilities=adapter.provider.capabilities,
@@ -578,7 +619,11 @@ def test_claude_resume_requires_proven_external_identity(
 
     assert result.state is AgentOperationState.SUCCEEDED
     resume_index = adapter.last_invocation.argv.index("--resume")
-    assert adapter.last_invocation.argv[resume_index + 1] == "provider-session-existing"
+    assert (
+        adapter.last_invocation.argv[resume_index + 1]
+        == "00000000-0000-4000-8000-000000000001"
+    )
+    assert result.external_session_id == "00000000-0000-4000-8000-000000000001"
     assert result.session_id == session.id
 
 
@@ -612,6 +657,87 @@ def test_claude_handoff_prompt_contains_only_normalized_identifiers(
     assert "must-never-appear" not in adapter.last_invocation.input_text
 
 
+@pytest.mark.parametrize("resume", [False, True])
+def test_claude_rejects_spoofed_provider_session_identity(
+    fake_claude: Path, tmp_path: Path, resume: bool
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    external = "00000000-0000-4000-8000-000000000001" if resume else None
+    adapter = _claude_adapter(
+        fake_claude, workspace, mode="spoof_identity", external_session_id=external
+    )
+    request = AgentDispatchRequest(
+        id="dispatch.claude.spoof",
+        instance_id="overseer.default",
+        session_id="session.claude.spoof",
+        driver_epoch_id="epoch.claude.spoof",
+        idempotency_key="key.claude.spoof",
+        prompt="continue",
+    )
+
+    result = adapter.dispatch(request)
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_category is AgentErrorCategory.PROVIDER_PROTOCOL_ERROR
+    assert result.external_session_id is None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["system_shape", "unknown_subtype", "missing_is_error", "nonboolean_is_error"],
+)
+def test_claude_rejects_nonterminal_or_ambiguous_json_shapes(
+    fake_claude: Path, tmp_path: Path, mode: str
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace, mode=mode)
+    request = AgentDispatchRequest(
+        id=f"dispatch.claude.{mode}",
+        instance_id="overseer.default",
+        session_id="session.claude.shape",
+        driver_epoch_id="epoch.claude.shape",
+        idempotency_key=f"key.claude.{mode}",
+        prompt="continue",
+    )
+
+    result = adapter.dispatch(request)
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_category is AgentErrorCategory.PROVIDER_PROTOCOL_ERROR
+
+
+def test_claude_handoff_rejects_foreign_bindings(
+    fake_claude: Path, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace)
+    valid = AgentHandoffPackage(
+        id="handoff.claude.foreign",
+        instance_id="overseer.default",
+        outgoing_epoch_id="epoch.codex.1",
+        incoming_provider_id="claude",
+        objective="Continue.",
+        evidence={
+            "incoming_session_id": "session.claude.2",
+            "incoming_epoch_id": "epoch.claude.2",
+        },
+    )
+
+    with pytest.raises(ValueError, match="profile"):
+        adapter.import_handoff(replace(adapter.profile, id="foreign"), valid)
+    with pytest.raises(ValueError, match="instance"):
+        adapter.import_handoff(
+            adapter.profile, replace(valid, instance_id="foreign.instance")
+        )
+    with pytest.raises(ValueError, match="provider"):
+        adapter.import_handoff(
+            adapter.profile, replace(valid, incoming_provider_id="codex")
+        )
+
+
 def test_claude_unsupported_operations_do_not_scrape_or_emulate(
     fake_claude: Path, tmp_path: Path
 ) -> None:
@@ -638,13 +764,38 @@ def test_claude_unsupported_operations_do_not_scrape_or_emulate(
 def test_live_claude_disposable_structured_dispatch(tmp_path: Path) -> None:
     if os.environ.get("OVERSEER_LIVE_AGENT_PROVIDER") != "claude":
         pytest.skip("live Claude disabled: OVERSEER_LIVE_AGENT_PROVIDER is not claude")
-    if os.environ.get("OVERSEER_LIVE_AGENT_AUTH_VERIFIED") != "1":
-        pytest.skip("live Claude disabled: authentication was not verified non-mutatingly")
     executable_name = shutil.which("claude")
     if executable_name is None:
         pytest.skip("live Claude disabled: executable is unavailable")
     workspace = tmp_path / "disposable-claude-workspace"
     workspace.mkdir()
+    auth_runner = CliCommandRunner(
+        executable_path=executable_name,
+        executable_allowlist=(Path(executable_name).name, str(Path(executable_name).resolve())),
+        environment=dict(os.environ),
+    )
+    try:
+        auth_status = auth_runner.run_bounded(
+            ["claude", "auth", "status", "--json"],
+            timeout_seconds=15,
+            cwd=workspace,
+            stdout_limit_bytes=8192,
+            stderr_limit_bytes=8192,
+        )
+        auth_payload = json.loads(auth_status.stdout)
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        CliOutputLimitExceeded,
+        json.JSONDecodeError,
+    ):
+        pytest.skip("live Claude disabled: auth status could not be verified")
+    if (
+        auth_status.returncode != 0
+        or not isinstance(auth_payload, dict)
+        or auth_payload.get("loggedIn") is not True
+    ):
+        pytest.skip("live Claude disabled: Claude auth status is unauthenticated")
     adapter = _claude_adapter(Path(executable_name), workspace)
     request = AgentDispatchRequest(
         id="dispatch.claude.live",

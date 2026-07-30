@@ -91,3 +91,56 @@ passed
 ## Commit
 
 Implementation commit: `62e7bc860a5e0ae4bbe819e843166f8222bdbfd4`
+
+## Independent Review Remediation
+
+All six review findings were addressed test-first:
+
+1. New and resumed Claude invocations now require the terminal JSON session ID
+   to exactly equal the UUID supplied through `--session-id` or `--resume`.
+   Spoofed identities fail closed as provider protocol errors.
+2. Handoff import rejects foreign profiles, instances, providers, and malformed
+   normalized incoming session/epoch identifiers before provider invocation.
+3. Successful parsing accepts only `type=result`, `subtype=success`, and an
+   explicitly boolean false `is_error`. Error results require a boolean true;
+   init/system shapes, unknown subtypes, and missing/nonboolean error flags fail
+   closed.
+4. Claude uses `CliCommandRunner.run_bounded`, which spools stdout and stderr to
+   temporary files, checks byte sizes before reading, and kills the isolated
+   subprocess group on timeout. Real-process tests cover oversized stdout and
+   stderr without materializing them.
+5. The live test now runs the read-only
+   `claude auth status --json` command with bounded output and requires parsed
+   `loggedIn: true`; no environment variable is accepted as authentication
+   proof. Provider opt-in remains separately required.
+6. `structured_events` is false in the adapter contract and committed registry
+   because final JSON output is not a streamed event contract.
+
+Review-remediation verification:
+
+```text
+pytest -q tests/test_agent_adapter_contract.py -k claude
+15 passed, 1 skipped
+
+pytest -q tests/test_agent_adapter_contract.py tests/test_agent_manager.py \
+  tests/test_agent_registry.py tests/test_agent_api.py -x
+126 passed, 1 skipped in 8.33s
+
+pytest -q
+724 passed, 1 skipped in 103.21s
+
+python3 -m compileall -q src tests
+passed
+
+git diff --check
+passed
+```
+
+The live skip remained:
+
+```text
+live Claude disabled: OVERSEER_LIVE_AGENT_PROVIDER is not claude
+```
+
+No live prompt, settings mutation, credential change, service action, package
+installation, or checkout-as-provider-workspace action occurred.

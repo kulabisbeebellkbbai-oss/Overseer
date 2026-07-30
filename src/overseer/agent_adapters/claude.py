@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import uuid
 
@@ -22,7 +23,7 @@ from ..agent_contracts import (
     AgentSession,
     AgentTransport,
 )
-from .base_cli import CliCommandRunner
+from .base_cli import CliCommandRunner, CliOutputLimitExceeded
 
 
 MAX_PROMPT_BYTES = 32_768
@@ -62,7 +63,6 @@ class ClaudeDriver:
         required = (
             provider.capabilities.session_resume,
             provider.capabilities.noninteractive_dispatch,
-            provider.capabilities.structured_events,
             provider.capabilities.handoff_import,
         )
         if not all(required):
@@ -70,6 +70,7 @@ class ClaudeDriver:
         unsupported = (
             provider.capabilities.session_discovery,
             provider.capabilities.interactive_dispatch,
+            provider.capabilities.structured_events,
             provider.capabilities.checkpoints,
             provider.capabilities.cancellation,
             provider.capabilities.delegated_workers,
@@ -167,6 +168,12 @@ class ClaudeDriver:
     def import_handoff(
         self, profile: AgentInstanceProfile, package: AgentHandoffPackage
     ) -> AgentDispatchResult:
+        if profile != self.profile:
+            raise ValueError("handoff profile does not match Claude driver profile")
+        if package.instance_id != self.profile.id:
+            raise ValueError("handoff instance does not match Claude driver profile")
+        if package.incoming_provider_id != self.provider.id:
+            raise ValueError("handoff incoming provider does not match Claude")
         session_id = self._evidence_identifier(package, "incoming_session_id")
         epoch_id = self._evidence_identifier(package, "incoming_epoch_id")
         checkpoint = package.checkpoint_id or "none"
@@ -209,27 +216,37 @@ class ClaudeDriver:
             "1.00",
         ]
         if external_session_id:
+            try:
+                expected_session_id = str(uuid.UUID(external_session_id))
+            except (ValueError, AttributeError):
+                return self._protocol_failure(
+                    request, "Claude external session identity is not a UUID"
+                )
             argv.extend(("--resume", external_session_id))
         else:
-            manager_session_uuid = str(
+            expected_session_id = str(
                 uuid.uuid5(
                     uuid.NAMESPACE_URL,
                     f"overseer:{request.instance_id}:{request.session_id}",
                 )
             )
-            argv.extend(("--session-id", manager_session_uuid))
+            argv.extend(("--session-id", expected_session_id))
         if _DANGEROUS_ARGUMENTS.intersection(argv):
             raise RuntimeError("dangerous Claude permission flag rejected")
         self.last_invocation = ClaudeInvocation(
             argv=tuple(argv), cwd=str(self.workspace), input_text=request.prompt
         )
         try:
-            completed = self.runner.run(
+            completed = self.runner.run_bounded(
                 argv,
                 input_text=request.prompt,
                 timeout_seconds=30,
                 cwd=self.workspace,
+                stdout_limit_bytes=MAX_OUTPUT_BYTES,
+                stderr_limit_bytes=MAX_OUTPUT_BYTES,
             )
+        except CliOutputLimitExceeded:
+            return self._protocol_failure(request, "Claude output exceeds adapter limit")
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return self._failure(
                 request.id,
@@ -248,8 +265,6 @@ class ClaudeDriver:
                 AgentErrorCategory.PROVIDER_UNAVAILABLE,
                 "Claude CLI exited unsuccessfully",
             )
-        if len(completed.stdout.encode("utf-8")) > MAX_OUTPUT_BYTES:
-            return self._protocol_failure(request, "Claude output exceeds adapter limit")
         try:
             payload = json.loads(completed.stdout)
         except (json.JSONDecodeError, TypeError):
@@ -259,7 +274,14 @@ class ClaudeDriver:
         provider_session_id = payload.get("session_id")
         if not isinstance(provider_session_id, str) or not provider_session_id.strip():
             return self._protocol_failure(request, "Claude result omitted session identity")
-        if payload.get("is_error") is True:
+        if provider_session_id != expected_session_id:
+            return self._protocol_failure(request, "Claude result session identity mismatch")
+        if payload.get("type") != "result":
+            return self._protocol_failure(request, "Claude JSON is not a terminal result")
+        is_error = payload.get("is_error")
+        if not isinstance(is_error, bool):
+            return self._protocol_failure(request, "Claude result is_error must be boolean")
+        if is_error:
             return self._failure(
                 request.id,
                 request.instance_id,
@@ -269,10 +291,9 @@ class ClaudeDriver:
                 "Claude rejected the dispatch",
                 external_session_id=provider_session_id,
             )
-        result_type = payload.get("type")
         result_subtype = payload.get("subtype")
-        if not isinstance(result_type, str) or not isinstance(result_subtype, str):
-            return self._protocol_failure(request, "Claude result fields are invalid")
+        if result_subtype != "success":
+            return self._protocol_failure(request, "Claude result subtype is unsupported")
         return AgentDispatchResult(
             id=f"result.{request.id}",
             request_id=request.id,
@@ -284,7 +305,7 @@ class ClaudeDriver:
             external_session_id=provider_session_id,
             completed_at=self._now(),
             evidence={
-                "result_type": result_type,
+                "result_type": "result",
                 "result_subtype": result_subtype,
                 "provider_session_id": provider_session_id,
             },
@@ -358,7 +379,9 @@ class ClaudeDriver:
     @staticmethod
     def _evidence_identifier(package: AgentHandoffPackage, key: str) -> str:
         value = package.evidence.get(key)
-        if not isinstance(value, str) or not value.strip():
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]*", value
+        ):
             raise ValueError(f"handoff requires normalized {key}")
         return value
 

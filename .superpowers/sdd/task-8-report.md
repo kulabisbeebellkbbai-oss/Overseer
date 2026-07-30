@@ -26,9 +26,15 @@ failed at the first new dashboard assertion:
 - Review-correction full suite: `704 passed in 101.93s`
 - Second-review focused API/UI/workflow suite: `52 passed in 12.66s`
 - Second-review full suite: `706 passed in 102.52s`
+- Third-review focused API/UI/workflow suite: `52 passed in 12.86s`
+- Third-review full suite: `706 passed in 102.47s`
 - Node v24 executed the extracted production `providerGate` and
   `validatedTransferPayload` functions against ready, unavailable, unknown,
   required-capability, valid-payload, and missing-approval cases.
+- Node also executed production `renderDriver()` with real-shape fixtures,
+  proving it renders without a `ReferenceError`, then changed discovery and
+  incoming selections and verified the actual rendered disabled states and
+  exact blocker titles.
 - `python3 -m py_compile src/overseer/ui.py`: passed
 - `git diff --check`: passed
 
@@ -86,3 +92,5 @@ Initial implementation: `02e652ae9fda2798d52d6a631d6d1ce9502f5d39`
 Review correction: `7c7e3764a591a34a7a7d734bc431a3e5f3b4ad1f`
 
 Second review correction: `f5864158b1cb6594d28ba935e4be151ce122c30a`
+
+Third review correction: `6746640cdd513a19045dda4756643304dfbe46fa`

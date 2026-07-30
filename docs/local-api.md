@@ -2,6 +2,47 @@
 
 The Overseer API is a loopback-only HTTP surface for local Codex threads and tools that should not shell out to the CLI for every operation.
 
+## Agent provider routes
+
+All routes below use the existing loopback authentication boundary. Read
+surfaces return normalized, privacy-safe identifiers and state; they do not
+return prompts, transcripts, checkpoint contents, credential values, local
+auth output, or raw provider output.
+
+- `GET /agent-providers` reports adapter availability, transports,
+  capabilities, and provider-specific health/usage source references.
+- `GET /agent-instances` reports the selected primary provider, active driver
+  epoch, current-driver and failover-policy readiness, checkpoint reference,
+  and transition state.
+- `GET /agent-sessions?provider_id=...&instance_id=...` and
+  `GET /agent-dispatches?instance_id=...` inspect persisted normalized state.
+- `GET /agent-failover-executions?instance_id=...` reports exact persisted
+  execution and recovery state for crash-safe reconciliation.
+- `POST /agent-sessions/discover` accepts `provider_id`, `instance_id`, and an
+  optional Codex compatibility registry reference.
+- `POST /agent-dispatches` accepts `instance_id`, `prompt`,
+  `idempotency_key`, and optional `requested_by`.
+- `POST /agent-checkpoints` accepts `instance_id`.
+- `POST /agent-recovery` accepts `session_id` and `initiated_by`.
+- `POST /agent-handoffs` accepts `instance_id`, `incoming_provider_id`,
+  `initiated_by`, and the exact `approval_id`.
+- `POST /agent-failover/evaluate` accepts `instance_id` and optional
+  `policy_id`. It persists only an allowed, short-lived, evidence-bound
+  decision.
+- `POST /agent-failover` accepts `instance_id`, `decision_id`,
+  `initiated_by`, and the exact `approval_id`.
+- `POST /agent-failover/recover` accepts `execution_id`, `initiated_by`, and
+  a separately exact `approval_id`.
+
+Controlled failover evidence must already be persisted by an authorized
+integration: policy, repeated health observations, fresh checkpoint, active
+risk evidence, and provider readiness. Evaluation does not create that
+evidence. Execution re-evaluates every binding and remains fenced on ambiguity.
+
+Legacy `/codex-projects/` routes remain compatibility aliases for one migration
+cycle. New callers should use the generic routes above; see
+`docs/agent-provider-migration.md`.
+
 ## Boundary
 
 - The API may bind only to `127.0.0.1` or `localhost`.

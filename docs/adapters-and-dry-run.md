@@ -2,6 +2,26 @@
 
 Adapters are the boundary between Overseer's coordination model and the local machine. The first adapter slice is intentionally dry-run only: it defines contracts and records intended operations without touching services, devices, packages, firewall rules, or daemon state.
 
+## Agent provider adapters
+
+Agent adapters are isolated translations of a verified provider interface.
+They construct subprocess argument arrays, run with `shell=False`, confine the
+workspace, bound input/output/time, verify session identity, and normalize
+results without exposing provider output. Unsupported operations return
+`unsupported_capability`; dry-run code must not scrape a GUI, fabricate a
+session, or emulate cancellation.
+
+Ordinary tests use `tests/fake_agent_provider.py`. The Claude adapter is proven
+through fake-executable, identity, protocol, bounded-output, recovery, and
+manager handoff tests. The `live_agent` test requires explicit provider opt-in,
+local authentication, and a disposable workspace and is excluded from normal
+regression. No live provider prompt was run for this release. Qwen Code,
+Mistral Vibe, and Antigravity remain unavailable until their programmatic
+interfaces are verified; no command should be inferred from a product name.
+
+The complete implementation checklist is in
+`docs/provider-adapter-contract.md`.
+
 ## Adapter Categories
 
 - health probes

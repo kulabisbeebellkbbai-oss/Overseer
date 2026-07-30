@@ -13,6 +13,25 @@ DEFAULT_OUTPUT_DIR = ROOT / "artifacts" / "regression"
 
 SUITES = [
     {
+        "name": "provider-neutral-agent",
+        "command": [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-m",
+            "not live_agent",
+            "tests/test_agent_contracts.py",
+            "tests/test_agent_registry.py",
+            "tests/test_agent_store.py",
+            "tests/test_agent_handoff.py",
+            "tests/test_agent_manager.py",
+            "tests/test_agent_adapter_contract.py",
+            "tests/test_agent_api.py",
+            "tests/test_agent_migration.py",
+        ],
+    },
+    {
         "name": "operator-functional",
         "command": [
             sys.executable,

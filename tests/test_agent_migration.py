@@ -14,6 +14,29 @@ from overseer.codex_projects import (
 )
 
 
+def test_agent_provider_docs_cover_required_safety_boundaries() -> None:
+    architecture = Path("docs/agent-provider-architecture.md").read_text(
+        encoding="utf-8"
+    )
+    contract = Path("docs/provider-adapter-contract.md").read_text(encoding="utf-8")
+    migration = Path("docs/agent-provider-migration.md").read_text(encoding="utf-8")
+
+    for phrase in (
+        "one primary driver",
+        "driver epoch",
+        "manual handoff",
+        "controlled failover",
+        "old-epoch output",
+        "provider-native usage",
+    ):
+        assert phrase in architecture
+    assert "argument arrays" in contract
+    assert "unsupported_capability" in contract
+    assert "/codex-projects/" in migration
+    assert "one migration cycle" in migration
+    assert "rollback" in migration
+
+
 class LegacyRunner:
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []

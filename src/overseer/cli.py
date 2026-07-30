@@ -279,19 +279,25 @@ def agent_providers_status(
 
 def _agent_provider_status(registry: AgentRegistry, provider) -> dict[str, object]:
     installed = registry.adapter_factory_available(provider.adapter_id)
+    unavailable_type = {
+        "qwen-code": "executable_not_installed",
+        "mistral-vibe": "executable_not_installed",
+        "antigravity": "programmatic_interface_unverified",
+    }.get(provider.id)
+    available = installed and unavailable_type is None
     return {
         "id": provider.id,
         "adapter_id": provider.adapter_id,
         "display_name": provider.display_name,
         "configured": True,
         "installed": installed,
-        "available": installed,
-        "readiness": "available" if installed else "unavailable",
+        "available": available,
+        "readiness": "available" if available else "unavailable",
         "unavailable_reason": (
             None
-            if installed
+            if available
             else {
-                "type": "adapter_not_installed",
+                "type": unavailable_type or "adapter_not_installed",
                 "adapter_id": provider.adapter_id,
             }
         ),

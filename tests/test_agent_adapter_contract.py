@@ -12,6 +12,9 @@ import pytest
 
 from overseer.agent_adapters.codex import CodexDriver
 from overseer.agent_adapters.claude import ClaudeDriver
+from overseer.agent_adapters.antigravity import antigravity_adapter_factory
+from overseer.agent_adapters.mistral_vibe import mistral_vibe_adapter_factory
+from overseer.agent_adapters.qwen_code import qwen_code_adapter_factory
 from overseer.agent_adapters.base_cli import CliCommandRunner, CliOutputLimitExceeded
 from overseer.agent_contracts import (
     AgentCapabilities,
@@ -27,6 +30,75 @@ from overseer.agent_contracts import (
 )
 from overseer.agent_operations import AgentOperationCoordinator
 from overseer.store import OverseerStore
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "adapter_id", "transport", "executable", "factory"),
+    [
+        ("qwen-code", "qwen_code", AgentTransport.INTERACTIVE_CLI, "qwen", qwen_code_adapter_factory),
+        ("mistral-vibe", "mistral_vibe", AgentTransport.INTERACTIVE_CLI, "vibe", mistral_vibe_adapter_factory),
+        ("antigravity", "antigravity", AgentTransport.GATEWAY, None, antigravity_adapter_factory),
+    ],
+)
+def test_unverified_adapters_never_invoke_provider_interfaces(
+    tmp_path: Path,
+    provider_id: str,
+    adapter_id: str,
+    transport: AgentTransport,
+    executable: str | None,
+    factory,
+) -> None:
+    provider = AgentProvider(
+        id=provider_id,
+        adapter_id=adapter_id,
+        capabilities=AgentCapabilities(),
+        transports=(transport,),
+        executable_allowlist=(executable,) if executable else (),
+    )
+    profile = AgentInstanceProfile(
+        id="overseer.unavailable",
+        primary_provider_id=provider_id,
+        primary_adapter_id=adapter_id,
+        transport=transport,
+        workspace=str(tmp_path),
+    )
+    driver = factory(provider, profile)
+    request = AgentDispatchRequest(
+        id="dispatch.unavailable",
+        instance_id=profile.id,
+        session_id="session.unavailable",
+        driver_epoch_id="epoch.unavailable",
+        idempotency_key="unavailable.1",
+        prompt="do not execute",
+    )
+    session = AgentSession(
+        id=request.session_id,
+        provider_id=provider_id,
+        external_session_id="external.unavailable",
+        workspace=str(tmp_path),
+        transport=transport,
+        capabilities=AgentCapabilities(),
+        instance_id=profile.id,
+        legacy_references={"driver_epoch_id": request.driver_epoch_id},
+    )
+
+    assert driver.discover() == ()
+    assert driver.resolve("anything") is None
+    for result in (
+        driver.start(profile),
+        driver.resume(session),
+        driver.dispatch(request),
+        driver.inspect(session),
+        driver.cancel(session),
+    ):
+        assert result.provider_id == provider_id
+        assert result.error_category is AgentErrorCategory.PROVIDER_UNAVAILABLE
+        assert result.state is AgentOperationState.FAILED
+    checkpoint = driver.checkpoint(session)
+    assert checkpoint.instance_id == profile.id
+    assert checkpoint.session_id == session.id
+    assert checkpoint.driver_epoch_id == request.driver_epoch_id
+    assert checkpoint.evidence == {"unsupported_capability": "checkpoints"}
 
 
 class RecordingRunner:

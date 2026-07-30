@@ -129,6 +129,21 @@ def test_agent_provider_inventory(api: LocalAPI) -> None:
     assert providers["claude"]["available"] is True
     assert providers["claude"]["readiness"] == "available"
     assert providers["claude"]["unavailable_reason"] is None
+    for provider_id in ("qwen-code", "mistral-vibe"):
+        assert providers[provider_id]["installed"] is True
+        assert providers[provider_id]["available"] is False
+        assert providers[provider_id]["readiness"] == "unavailable"
+        assert providers[provider_id]["unavailable_reason"] == {
+            "type": "executable_not_installed",
+            "adapter_id": providers[provider_id]["adapter_id"],
+        }
+    assert providers["antigravity"]["installed"] is True
+    assert providers["antigravity"]["available"] is False
+    assert providers["antigravity"]["readiness"] == "unavailable"
+    assert providers["antigravity"]["unavailable_reason"] == {
+        "type": "programmatic_interface_unverified",
+        "adapter_id": "antigravity",
+    }
 
 
 def test_agent_inventory_uses_existing_api_authentication(tmp_path: Path) -> None:

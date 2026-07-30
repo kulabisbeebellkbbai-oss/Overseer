@@ -489,6 +489,10 @@ def test_committed_provider_configuration_loads() -> None:
     registry = AgentRegistry.load(config)
 
     assert registry.profile("overseer.default").primary_provider_id == "codex"
+    for provider_id in ("qwen-code", "mistral-vibe", "antigravity"):
+        provider = registry.providers[provider_id]
+        assert not any(vars(provider.capabilities).values())
+        assert registry.adapter_factory_available(provider.adapter_id)
 
 
 def test_cli_runner_uses_argv_environment_and_captured_text_output() -> None:

@@ -90,5 +90,4 @@ passed
 
 ## Commit
 
-Pending at report creation; populated by the enclosing task handoff with the
-exact commit SHA.
+Implementation commit: `62e7bc860a5e0ae4bbe819e843166f8222bdbfd4`

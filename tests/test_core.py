@@ -4390,6 +4390,10 @@ class OverseerApiClientTests(unittest.TestCase):
                         if tuple(command) == ("hostname",)
                         else "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
                         if tuple(command) == ("ss", "-ltnp")
+                        else "running"
+                        if tuple(command) == ("firewall-cmd", "--state")
+                        else "public\n  interfaces: eth0"
+                        if tuple(command) == ("firewall-cmd", "--get-active-zones")
                         else "ok"
                     ),
                 ),
@@ -9247,6 +9251,21 @@ class UsageContinuationRequestTests(unittest.TestCase):
     def test_dispatching_odo_stages_exact_sisko_and_ids_review_requests(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
+            registry_path = Path(directory) / "codex-projects.csv"
+            registry_path.write_text(
+                "conversation_id,label,project,command,launcher,created_at,updated_at,source,notes\n"
+                "019f09da-25c8-72b2-9730-9a0a17b9e177,Intrusion Detection,"
+                "/workspace/Intrusion Detection,codex-intrusion-detection-019f09da,"
+                "/bin/codex-intrusion-detection-019f09da,"
+                "2026-06-27T16:11:59+00:00,2026-06-28T17:17:28+00:00,registry,\n",
+                encoding="utf-8",
+            )
+            adapter = CodexProjectThreadAdapter(
+                registry_path,
+                tmux_path="/tmp/tmux",
+                codex_memory_session_path="/tmp/codex-memory-session",
+                runner=self._FakeRunner(),
+            )
             snapshot = HostInspectionAdapter(
                 command_runner=lambda command, timeout_seconds: HostCommandObservation(
                     name=command[0],
@@ -9277,11 +9296,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
             )
 
             with patch("overseer.cli.inspect_host_status", return_value={"id": snapshot.id}):
-                status = dispatch_crew_messages_status(
-                    store_path,
-                    owner_domain=OwnerDomain.ODO.value,
-                    dispatched_at="2026-07-19T13:07:00+00:00",
-                )
+                with patch("overseer.cli.CodexProjectThreadAdapter", return_value=adapter):
+                    status = dispatch_crew_messages_status(
+                        store_path,
+                        owner_domain=OwnerDomain.ODO.value,
+                        dispatched_at="2026-07-19T13:07:00+00:00",
+                    )
             readiness = admin_execution_readiness_status(store_path)
             messages = crew_messages_status(store_path, owner_domain=OwnerDomain.SISKO.value, status=CrewMessageStatus.OPEN.value)
             ids_packages = host_security_ids_review_packages_status(store_path)

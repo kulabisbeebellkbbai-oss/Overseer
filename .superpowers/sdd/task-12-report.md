@@ -108,3 +108,20 @@ Review-fix verification:
   private user path, authorization, bearer, cookie, prompt, password, API-key,
   or private-key pattern;
 - compileall, diff check, and unsafe provider shell scan passed.
+
+The final command-shape hardening uses an allowlist rather than trusting
+unrecognized arguments. Only the executable basename, fixed pytest
+module/options/marker, and traversal-safe repository-relative `tests/*.py`
+paths remain readable. Every other argument is replaced by a classification
+and truncated SHA-256 digest. Adversarial tests cover positional prompt text,
+authorization/bearer data, cookies, generic secret assignments, multiline PEM
+private keys, home/workspace paths, credential URLs, unknown flags and values,
+oversize arguments, path traversal, and absolute test paths.
+
+Final verification after command-shape hardening:
+
+- focused provider-neutral and runner suite: `267 passed, 1 deselected`;
+- full suite: `776 passed, 1 skipped`;
+- wrapper: all four stages passed;
+- final artifact:
+  `artifacts/regression/full-regression-20260730T033010Z.json`.

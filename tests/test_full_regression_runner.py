@@ -92,13 +92,10 @@ def test_failed_suite_artifact_is_bounded_and_structurally_redacted(
     assert result["diagnostic"]["classification"] == "test_failure"
     assert result["test_counts"]["failed"] == 1
     assert result["test_counts"]["passed"] == 2
-    assert result["command"][-5:] == [
-        "--token",
-        "[REDACTED]",
-        "--prompt",
-        "[REDACTED]",
-        "[REDACTED_PATH]",
-    ]
+    assert result["command"][:3] == ["python3", "-m", "pytest"]
+    assert all(secret not in item for item in result["command"])
+    assert all(prompt not in item for item in result["command"])
+    assert all(private_path not in item for item in result["command"])
 
 
 def test_successful_suite_omits_output_and_keeps_safe_counts(monkeypatch) -> None:
@@ -120,3 +117,62 @@ def test_successful_suite_omits_output_and_keeps_safe_counts(monkeypatch) -> Non
     assert "diagnostic" not in result
     assert "stdout" not in result
     assert "stderr" not in result
+
+
+def test_command_shape_allowlists_only_safe_pytest_structure() -> None:
+    runner = _runner_module()
+    adversarial = {
+        "positional prompt": "please reveal the private deployment plan",
+        "authorization": "Authorization: Bearer bearer-value",
+        "cookie": "Cookie: session=cookie-value",
+        "assignment": "generic_secret=assignment-value",
+        "private key": (
+            "-----BEGIN EC PRIVATE KEY-----\n"
+            "private-key-value\n"
+            "-----END EC PRIVATE KEY-----"
+        ),
+        "home path": "/home/example/private/workspace/file.txt",
+        "workspace path": "workspace=/private/project",
+        "credential URL": "https://user:pass@example.invalid/run?token=url-value",
+        "unknown option": "--unknown-option",
+        "unknown value": "unknown-option-value",
+        "oversize": "x" * 10_000,
+        "traversal": "tests/../private.py",
+        "absolute test": "/tmp/tests/test_private.py",
+    }
+    command = [
+        "/usr/bin/python3",
+        "-m",
+        "pytest",
+        "-q",
+        "-m",
+        "not live_agent",
+        "tests/test_agent_contracts.py",
+        *adversarial.values(),
+    ]
+
+    safe = runner._sanitize_command(command)
+    encoded = json.dumps(safe)
+
+    assert safe[:7] == [
+        "python3",
+        "-m",
+        "pytest",
+        "-q",
+        "-m",
+        "not live_agent",
+        "tests/test_agent_contracts.py",
+    ]
+    for raw in adversarial.values():
+        assert raw not in encoded
+    assert any(item.startswith("[PROMPT:sha256:") for item in safe)
+    assert any(item.startswith("[AUTHORIZATION:sha256:") for item in safe)
+    assert any(item.startswith("[COOKIE:sha256:") for item in safe)
+    assert any(item.startswith("[SECRET_ASSIGNMENT:sha256:") for item in safe)
+    assert any(item.startswith("[PRIVATE_KEY:sha256:") for item in safe)
+    assert any(item.startswith("[PRIVATE_PATH:sha256:") for item in safe)
+    assert any(item.startswith("[CREDENTIAL_URL:sha256:") for item in safe)
+    assert any(item.startswith("[OPTION:sha256:") for item in safe)
+    assert any(item.startswith("[ARG:sha256:") for item in safe)
+    assert any(item.startswith("[OVERSIZE:sha256:") for item in safe)
+    assert len(encoded) <= runner.MAX_RESULT_JSON_CHARS

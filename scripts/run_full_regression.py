@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,19 +18,21 @@ MAX_DIAGNOSTIC_LINE_CHARS = 240
 MAX_RESULT_JSON_CHARS = 12_000
 MAX_COMMAND_ARGUMENTS = 32
 
-_SENSITIVE_ARGUMENT_FLAGS = {
-    "--api-key",
-    "--authorization",
-    "--cookie",
-    "--password",
-    "--prompt",
-    "--token",
-    "--workspace",
-}
 _SENSITIVE_LINE_RE = re.compile(
     r"(?i)(authorization|bearer|cookie|password|api[_-]?key|secret|token|prompt|workspace)"
 )
-_PRIVATE_PATH_RE = re.compile(r"(?:/home|/Users)/[^\s\"']+")
+_PRIVATE_PATH_RE = re.compile(r"(?:/home|/Users|/private|/tmp)/[^\s\"']+")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?:^|[^a-z])(authorization|cookie|password|prompt|secret|token|"
+    r"(?:api[_-]?)?key|workspace)\s*[:=]"
+)
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_SAFE_COMMAND_TOKEN_RE = re.compile(r"[A-Za-z0-9._+-]+")
+_SAFE_TEST_PATH_RE = re.compile(r"tests/[A-Za-z0-9_/-]+\.py")
+_SAFE_COMMAND_TOKENS = {"-m", "-q", "-x", "pytest", "not live_agent"}
 _PYTEST_COUNT_RE = re.compile(
     r"\b(\d+)\s+(passed|failed|skipped|deselected|xfailed|xpassed|errors?)\b"
 )
@@ -80,32 +83,81 @@ SUITES = [
 ]
 
 
+def _digest_label(label: str, value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    return f"[{label}:sha256:{digest}]"
+
+
+def _credential_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return True
+    return any(
+        re.search(r"(?i)(authorization|cookie|password|secret|token|key)", key)
+        for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+    )
+
+
+def _sensitive_classification(value: str) -> str | None:
+    if len(value) > MAX_DIAGNOSTIC_LINE_CHARS:
+        return "OVERSIZE"
+    if _PRIVATE_KEY_RE.search(value):
+        return "PRIVATE_KEY"
+    if re.search(r"(?i)(authorization\s*:|bearer\s+\S+)", value):
+        return "AUTHORIZATION"
+    if re.search(r"(?i)cookie\s*:", value):
+        return "COOKIE"
+    if _credential_url(value):
+        return "CREDENTIAL_URL"
+    if _SECRET_ASSIGNMENT_RE.search(value):
+        return "SECRET_ASSIGNMENT"
+    if Path(value).is_absolute() or _PRIVATE_PATH_RE.search(value):
+        return "PRIVATE_PATH"
+    if len(value.split()) >= 3:
+        return "PROMPT"
+    return None
+
+
+def _safe_test_path(value: str) -> bool:
+    path = Path(value)
+    return (
+        not path.is_absolute()
+        and ".." not in path.parts
+        and _SAFE_TEST_PATH_RE.fullmatch(value) is not None
+    )
+
+
 def _sanitize_command(argv: object) -> list[str]:
     if not isinstance(argv, (list, tuple)):
         return ["[INVALID_COMMAND]"]
     safe: list[str] = []
-    redact_next = False
     for index, raw in enumerate(argv[:MAX_COMMAND_ARGUMENTS]):
         value = str(raw)
-        if redact_next:
-            safe.append("[REDACTED]")
-            redact_next = False
-            continue
-        flag = value.casefold().split("=", 1)[0]
-        if flag in _SENSITIVE_ARGUMENT_FLAGS:
-            safe.append(flag)
-            if "=" in value:
-                safe[-1] = f"{flag}=[REDACTED]"
+        if index == 0:
+            executable = Path(value).name
+            classification = _sensitive_classification(executable)
+            if (
+                classification is None
+                and len(executable) <= 80
+                and _SAFE_COMMAND_TOKEN_RE.fullmatch(executable)
+            ):
+                safe.append(executable)
             else:
-                redact_next = True
+                safe.append(_digest_label(classification or "EXECUTABLE", value))
             continue
-        if index == 0 and Path(value).is_absolute():
-            safe.append(Path(value).name)
+        classification = _sensitive_classification(value)
+        if classification is not None:
+            safe.append(_digest_label(classification, value))
             continue
-        if _PRIVATE_PATH_RE.search(value):
-            safe.append("[REDACTED_PATH]")
+        if value in _SAFE_COMMAND_TOKENS or _safe_test_path(value):
+            safe.append(value)
             continue
-        safe.append(value[:MAX_DIAGNOSTIC_LINE_CHARS])
+        safe.append(_digest_label("OPTION" if value.startswith("-") else "ARG", value))
     if len(argv) > MAX_COMMAND_ARGUMENTS:
         safe.append("[TRUNCATED_ARGUMENTS]")
     return safe
@@ -132,8 +184,9 @@ def _redacted_diagnostic_lines(output: str) -> list[str]:
             if re.search(r"END [^-]*PRIVATE KEY", raw):
                 in_private_key = False
             continue
-        if _SENSITIVE_LINE_RE.search(raw):
-            value = "[REDACTED_SENSITIVE_LINE]"
+        classification = _sensitive_classification(raw)
+        if classification is not None or _SENSITIVE_LINE_RE.search(raw):
+            value = f"[REDACTED_{classification or 'SENSITIVE_LINE'}]"
         else:
             value = _PRIVATE_PATH_RE.sub("[REDACTED_PATH]", raw)
             value = value[:MAX_DIAGNOSTIC_LINE_CHARS]

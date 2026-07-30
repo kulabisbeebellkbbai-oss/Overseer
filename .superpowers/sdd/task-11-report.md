@@ -81,4 +81,4 @@ handoff pipeline with reason `controlled_failover`.
 
 ## Commit
 
-`Add controlled primary driver failover` (SHA recorded after commit).
+`c10b231` — `Add controlled primary driver failover`.

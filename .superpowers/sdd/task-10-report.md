@@ -56,4 +56,29 @@ protocol, and capabilities are independently verified.
 
 ## Commit
 
-Pending at report creation; recorded in the task handoff after commit.
+Initial implementation: `cdb25e9112e1708aef3ba75f3004b6be52fecdd8`.
+
+## Independent review follow-up
+
+Review found that the unavailable Qwen Code and Mistral Vibe constructors
+rejected the absolute canonical executable paths produced by a valid local
+registry override. Regression coverage first reproduced that constructor
+failure. The adapters now accept either the committed literal executable name
+or one absolute canonical path with the expected basename, while rejecting
+multiple entries, relative paths, and wrong basenames. No accepted path is
+executed.
+
+Added coverage also proves:
+
+- `AgentRegistry.driver` and `driver_for_provider` construct these unavailable
+  adapters from local executable-path overrides without configuration crashes;
+- status remains unavailable with `executable_not_installed`;
+- all three unavailable adapters preserve supplied handoff instance, session,
+  epoch, and provider bindings and return privacy-safe
+  `provider_unavailable` evidence without invocation.
+
+Review-fix verification:
+
+- focused suite: `89 passed, 1 skipped in 7.42s`;
+- full suite: `734 passed, 1 skipped in 103.22s`;
+- `python3 -m compileall -q src tests` and `git diff --check`: passed.

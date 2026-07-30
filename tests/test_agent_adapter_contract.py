@@ -101,6 +101,71 @@ def test_unverified_adapters_never_invoke_provider_interfaces(
     assert checkpoint.evidence == {"unsupported_capability": "checkpoints"}
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "adapter_id", "transport", "executable", "factory"),
+    [
+        ("qwen-code", "qwen_code", AgentTransport.INTERACTIVE_CLI, "qwen", qwen_code_adapter_factory),
+        ("mistral-vibe", "mistral_vibe", AgentTransport.INTERACTIVE_CLI, "vibe", mistral_vibe_adapter_factory),
+    ],
+)
+def test_unavailable_cli_adapters_accept_registry_valid_absolute_executable(
+    tmp_path: Path, provider_id: str, adapter_id: str, transport, executable: str, factory
+) -> None:
+    executable_path = tmp_path / executable
+    provider = AgentProvider(
+        id=provider_id, adapter_id=adapter_id, transports=(transport,),
+        executable_allowlist=(str(executable_path.resolve()),),
+    )
+    profile = AgentInstanceProfile(
+        id="overseer.unavailable", primary_provider_id=provider_id,
+        primary_adapter_id=adapter_id, transport=transport, workspace=str(tmp_path),
+    )
+    assert factory(provider, profile).discover() == ()
+
+    for invalid in (("relative/path",), (str(tmp_path / "wrong"),), (executable, executable)):
+        bad_provider = replace(provider, executable_allowlist=invalid)
+        with pytest.raises(ValueError, match="executable selection"):
+            factory(bad_provider, profile)
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "adapter_id", "transport", "executable", "factory"),
+    [
+        ("qwen-code", "qwen_code", AgentTransport.INTERACTIVE_CLI, "qwen", qwen_code_adapter_factory),
+        ("mistral-vibe", "mistral_vibe", AgentTransport.INTERACTIVE_CLI, "vibe", mistral_vibe_adapter_factory),
+        ("antigravity", "antigravity", AgentTransport.GATEWAY, None, antigravity_adapter_factory),
+    ],
+)
+def test_unavailable_adapter_handoff_preserves_supplied_bindings(
+    tmp_path: Path, provider_id: str, adapter_id: str, transport, executable, factory
+) -> None:
+    provider = AgentProvider(
+        id=provider_id, adapter_id=adapter_id, transports=(transport,),
+        executable_allowlist=(executable,) if executable else (),
+    )
+    profile = AgentInstanceProfile(
+        id="overseer.unavailable", primary_provider_id=provider_id,
+        primary_adapter_id=adapter_id, transport=transport, workspace=str(tmp_path),
+    )
+    package = AgentHandoffPackage(
+        id="handoff.unavailable", instance_id=profile.id,
+        outgoing_epoch_id="epoch.outgoing", incoming_provider_id=provider_id,
+        objective="continue safely",
+        evidence={"incoming_session_id": "session.incoming", "incoming_epoch_id": "epoch.incoming"},
+    )
+
+    result = factory(provider, profile).import_handoff(profile, package)
+
+    assert (result.request_id, result.instance_id, result.session_id) == (
+        "handoff.handoff.unavailable", profile.id, "session.incoming"
+    )
+    assert result.driver_epoch_id == "epoch.incoming"
+    assert result.provider_id == provider_id
+    assert result.error_category is AgentErrorCategory.PROVIDER_UNAVAILABLE
+    assert result.evidence == {"provider_unavailable": True}
+    assert "objective" not in json.dumps(dict(result.evidence))
+
+
 class RecordingRunner:
     def __init__(self, *, reject_prompt: bool = False) -> None:
         self.commands: list[tuple[str, ...]] = []

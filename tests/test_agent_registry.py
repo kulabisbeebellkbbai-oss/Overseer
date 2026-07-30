@@ -15,6 +15,7 @@ from overseer.agent_contracts import (
 )
 from overseer.agent_adapters.base_cli import CliCommandRunner
 from overseer.agent_registry import AgentAdapterUnavailableError, AgentRegistry
+from overseer.cli import agent_providers_status
 
 
 def _provider(
@@ -493,6 +494,43 @@ def test_committed_provider_configuration_loads() -> None:
         provider = registry.providers[provider_id]
         assert not any(vars(provider.capabilities).values())
         assert registry.adapter_factory_available(provider.adapter_id)
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "adapter_id", "executable"),
+    [
+        ("qwen-code", "qwen_code", "qwen"),
+        ("mistral-vibe", "mistral_vibe", "vibe"),
+    ],
+)
+def test_unavailable_provider_local_executable_override_constructs_but_stays_unavailable(
+    tmp_path: Path, provider_id: str, adapter_id: str, executable: str
+) -> None:
+    committed = _write_registry(
+        tmp_path,
+        providers=[{
+            "id": provider_id, "adapter": adapter_id,
+            "transport": "interactive_cli", "executable": executable,
+            "capabilities": {},
+        }],
+        instances=[_instance("overseer.unavailable", provider_id)],
+    )
+    executable_path = (tmp_path / executable).resolve()
+    local = tmp_path / "providers.local.json"
+    local.write_text(json.dumps({
+        "providers": {provider_id: {"executable_path": str(executable_path)}}
+    }))
+
+    registry = AgentRegistry.load(committed, local)
+
+    assert registry.driver("overseer.unavailable").provider.id == provider_id
+    assert registry.driver_for_provider(
+        provider_id, instance_id="overseer.unavailable"
+    ).provider.id == provider_id
+    row = agent_providers_status(committed, local)["providers"][0]
+    assert row["installed"] is True
+    assert row["available"] is False
+    assert row["unavailable_reason"]["type"] == "executable_not_installed"
 
 
 def test_cli_runner_uses_argv_environment_and_captured_text_output() -> None:

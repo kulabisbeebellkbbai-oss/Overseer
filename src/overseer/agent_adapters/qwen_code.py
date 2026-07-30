@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from ..agent_contracts import (
     AgentCheckpoint,
@@ -31,7 +32,7 @@ class UnavailablePrimaryDriver:
             raise ValueError(f"{self.adapter_id} factory received the wrong provider")
         if provider.transports != (self.transport,):
             raise ValueError(f"{self.adapter_id} provider transport is not verified")
-        if provider.executable_allowlist != self.executable_allowlist:
+        if not self._valid_executable_selection(provider.executable_allowlist):
             raise ValueError(f"{self.adapter_id} executable selection is not verified")
         if profile.primary_provider_id != self.provider_id:
             raise ValueError(f"{self.adapter_id} profile does not select its provider")
@@ -45,6 +46,22 @@ class UnavailablePrimaryDriver:
             raise ValueError(f"{self.adapter_id} profile has unverified capability claims")
         self.provider = provider
         self.profile = profile
+
+    def _valid_executable_selection(self, values: tuple[str, ...]) -> bool:
+        if self.executable_allowlist == ():
+            return values == ()
+        if len(values) != 1:
+            return False
+        value = values[0]
+        expected = self.executable_allowlist[0]
+        if value == expected:
+            return True
+        path = Path(value)
+        return (
+            path.is_absolute()
+            and path.name == expected
+            and str(path.resolve()) == value
+        )
 
     def discover(self, workspace: str | None = None) -> tuple[AgentSession, ...]:
         return ()

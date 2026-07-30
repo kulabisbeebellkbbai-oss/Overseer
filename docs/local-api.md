@@ -1,6 +1,9 @@
 # Local API
 
-The Overseer API is a loopback-only HTTP surface for local Codex threads and tools that should not shell out to the CLI for every operation.
+The Overseer API is a loopback-only HTTP surface for local Overseer agents and
+tools that should not shell out to the CLI for every operation. Its agent
+lifecycle routes are provider-neutral; Codex-specific compatibility is called
+out explicitly.
 
 ## Agent provider routes
 
@@ -39,8 +42,8 @@ integration: policy, repeated health observations, fresh checkpoint, active
 risk evidence, and provider readiness. Evaluation does not create that
 evidence. Execution re-evaluates every binding and remains fenced on ambiguity.
 
-Legacy `/codex-projects/` routes remain compatibility aliases for one migration
-cycle. New callers should use the generic routes above; see
+The exact legacy alias `POST /codex-projects/discover-threads` remains for one
+migration cycle. New callers should use `POST /agent-sessions/discover`; see
 `docs/agent-provider-migration.md`.
 
 ## Boundary

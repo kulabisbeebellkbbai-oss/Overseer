@@ -15,11 +15,14 @@ responsibility and approval domains, never provider accounts.
 
 `config/agent-providers.json` is the committed provider catalog and instance
 selection. An instance records `primary_provider_id`, optional approved
-`fallback_provider_ids`, and the workspace. `--agent-registry-local` may point
-to a machine-local override. Local configuration may select an executable or
-credential reference, but never an inline credential value. Credential
-references are resolved outside committed configuration and persisted agent
-records.
+`fallback_provider_ids`, and the workspace. Provider selection is committed
+configuration in the current contract. `--agent-registry-local` may point to a
+machine-local override, but a local override cannot change provider selection:
+it cannot change `primary_provider_id`, fallback order, or provider identity.
+Local overrides are limited to workspace, model profile, credential references,
+and `executable_path`; they never contain an inline credential value.
+Credential references are resolved outside committed configuration and
+persisted agent records.
 
 Editing either registry while an instance is active does not replace its
 driver. Selection is activated only at startup or through a lifecycle

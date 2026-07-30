@@ -71,3 +71,40 @@ argument tuples and `shell=False`. The unsafe shell scan found no
 `df4cfd0b3402adb9c4e392a6874008bde9b1d24e` initially recorded
 `Document provider-neutral AI drivers`; the final amended SHA is reported to
 the parent reviewer.
+
+## Review-finding corrections
+
+The review identified that the first wrapper artifact retained raw subprocess
+stdout/stderr. The runner now treats its JSON report as a privacy boundary:
+
+- successful stages omit output and retain only safe status, duration, return
+  code, sanitized command shape, and parsed test counts;
+- failed stages add a bounded diagnostic classification, hashes, and redacted
+  lines with secret, prompt, authorization, cookie, bearer, private-key, private
+  path, and workspace patterns removed;
+- command arguments redact sensitive flag values and private user paths;
+- synthetic tests prove sensitive values are absent and diagnostics remain
+  bounded.
+
+The provider-neutral wrapper stage now includes
+`tests/test_agent_operations.py` and `tests/test_agent_failover.py`. Runner
+tests assert the exact suite list and ordinary `live_agent` exclusion.
+
+Documentation now states the current registry restriction: provider and
+fallback selection are committed configuration only. Local overrides are
+limited to workspace, model profile, credential references, and
+`executable_path`. The API overview is provider-neutral and names only the
+exact legacy alias `POST /codex-projects/discover-threads`.
+
+Review-fix verification:
+
+- focused expanded provider-neutral and runner suite:
+  `266 passed, 1 deselected`;
+- full suite: `775 passed, 1 skipped`;
+- wrapper: all four stages passed;
+- structurally redacted wrapper artifact:
+  `artifacts/regression/full-regression-20260730T032135Z.json`;
+- artifact contains no `stdout`, `stderr`, diagnostics on successful stages,
+  private user path, authorization, bearer, cookie, prompt, password, API-key,
+  or private-key pattern;
+- compileall, diff check, and unsafe provider shell scan passed.

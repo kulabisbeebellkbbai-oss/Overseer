@@ -35,6 +35,9 @@ def test_agent_provider_docs_cover_required_safety_boundaries() -> None:
     assert "/codex-projects/" in migration
     assert "one migration cycle" in migration
     assert "rollback" in migration
+    assert "cannot change provider selection" in architecture
+    assert "POST /codex-projects/discover-threads" in migration
+    assert "`/codex-projects/` routes" not in migration
 
 
 class LegacyRunner:

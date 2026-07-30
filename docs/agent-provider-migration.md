@@ -8,9 +8,9 @@ entry points remain available for one migration cycle.
 
 New integrations should use `/agent-providers`, `/agent-instances`,
 `/agent-sessions`, `/agent-dispatches`, `/agent-checkpoints`,
-`/agent-recovery`, `/agent-handoffs`, and `/agent-failover`. Existing
-`/codex-projects/` routes remain aliases during the compatibility window and
-emit deprecation and successor-link headers where implemented. Legacy
+`/agent-recovery`, `/agent-handoffs`, and `/agent-failover`. The exact legacy
+alias `POST /codex-projects/discover-threads` remains during the compatibility
+window and emits deprecation and successor-link headers. Legacy
 `thread.codex.*` resources link to normalized `session.codex.*` records without
 deleting or rewriting the original CSV data.
 
@@ -25,7 +25,9 @@ epoch, limit, and usage-unit bindings.
 2. Inspect `agent-providers` and `agent-instances` readiness.
 3. Discover/import Codex sessions and verify legacy resource links.
 4. Move callers to generic session, dispatch, checkpoint, and recovery routes.
-5. Configure only secret references and verified executable overrides locally.
+5. Configure only workspace, model, credential-reference, and verified
+   `executable_path` overrides locally. Provider and fallback selection remain
+   committed configuration.
 6. Contract-test the replacement adapter with fake executables.
 7. Stage the exact manual-handoff approval, then hand off in a disposable
    instance.

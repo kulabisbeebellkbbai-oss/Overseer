@@ -101,6 +101,18 @@ All seven review findings were resolved:
 Hardening verification: 134 focused tests passed. Final full suite: 754 passed,
 1 skipped. Compileall and diff-check passed.
 
+### Final fence review
+
+- Final CAS comparison now includes the exact readiness evidence references in
+  addition to the complete immutable stored-decision equality check. A
+  ready-path A to ready-path B race is rejected before reservation, consumption,
+  provider import, or epoch mutation.
+- After drain, failover reloads exact checkpoint A, verifies persisted equality
+  and decision bindings, and applies the decision policy's checkpoint maximum
+  age using the current aware clock immediately before transition/import.
+  Crossing the policy window leaves the consumed decision and owned reservation
+  safely fenced for reconciliation and performs no import or epoch promotion.
+
 ## Commit
 
 `c10b231` — `Add controlled primary driver failover`.

@@ -714,6 +714,7 @@ class AgentManager:
                 "health_evidence_ids",
                 "risk_evidence_ids",
                 "evidence_timestamps",
+                "readiness_evidence_refs",
                 "checkpoint_id",
                 "id",
             )
@@ -738,6 +739,8 @@ class AgentManager:
             )
         assert original.incoming_provider_id is not None
         assert original.checkpoint_id is not None
+        assert original.policy_id is not None
+        decision_policy = self.store.load_failover_policy(original.policy_id)
         return self._perform_handoff(
             instance_id,
             original.incoming_provider_id,
@@ -750,6 +753,7 @@ class AgentManager:
             persisted_checkpoint=self.store.load_agent_checkpoint(
                 original.checkpoint_id
             ),
+            checkpoint_max_age_seconds=decision_policy.checkpoint_max_age_seconds,
         )
 
     def _has_active_transition(self, instance_id: str) -> bool:
@@ -776,6 +780,7 @@ class AgentManager:
             authorization_already_proven=False,
             reserved_operation=None,
             persisted_checkpoint=None,
+            checkpoint_max_age_seconds=None,
         )
 
     def _perform_handoff(
@@ -790,6 +795,7 @@ class AgentManager:
         authorization_already_proven: bool,
         reserved_operation: AgentOperationReservation | None,
         persisted_checkpoint: AgentCheckpoint | None,
+        checkpoint_max_age_seconds: int | None,
     ) -> DriverEpoch:
         if reserved_operation is None:
             self._raise_transition_required(
@@ -854,7 +860,10 @@ class AgentManager:
                 or checkpoint.session_id != outgoing.session_id
             ):
                 raise AgentHandoffError("failover checkpoint binding changed")
-        self._validate_checkpoint_for_handoff(checkpoint)
+        self._validate_checkpoint_for_handoff(
+            checkpoint,
+            max_age_seconds=checkpoint_max_age_seconds,
+        )
         incoming_driver = self.registry.driver_for_provider(
             incoming_provider_id,
             instance_id=instance_id,
@@ -1599,6 +1608,8 @@ class AgentManager:
     def _validate_checkpoint_for_handoff(
         self,
         checkpoint: AgentCheckpoint,
+        *,
+        max_age_seconds: int | None = None,
     ) -> None:
         try:
             now = _aware_datetime(self._clock())
@@ -1611,7 +1622,12 @@ class AgentManager:
         except ValueError as error:
             raise AgentHandoffError("checkpoint timestamp is malformed") from error
         age = (now - created_at).total_seconds()
-        if age < 0 or age > MAX_CHECKPOINT_AGE_SECONDS:
+        maximum_age = (
+            MAX_CHECKPOINT_AGE_SECONDS
+            if max_age_seconds is None
+            else max_age_seconds
+        )
+        if age < 0 or age > maximum_age:
             raise AgentHandoffError("checkpoint is stale")
         if expires_at is not None and expires_at <= now:
             raise AgentHandoffError("checkpoint is expired")

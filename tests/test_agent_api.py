@@ -155,6 +155,10 @@ def test_agent_instances_expose_truthful_policy_and_recovery_metadata(api: Local
     assert "policy_blocker" in instance
     assert "current_checkpoint_id" in instance
     assert "transition_state" in instance
+    assert instance["current_driver_readiness"] in {"ready", "blocked"}
+    assert instance["failover_policy_readiness"] in {"ready", "blocked"}
+    assert "current_driver_blocker" in instance
+    assert "failover_policy_blocker" in instance
     assert "evidence" not in json.dumps(instance).lower()
 
 

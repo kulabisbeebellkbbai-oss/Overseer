@@ -2115,7 +2115,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const providerId = primary.primary_provider_id || "codex";
       const provider = providers.find((row) => row.id === providerId) || {};
       const capabilities = provider.capabilities || {};
-      const readinessBlocker = primary.policy_blocker || provider.unavailable_reason || "";
+      const readinessBlocker = primary.current_driver_blocker || provider.unavailable_reason || "";
       const fallbackOrder = primary.approved_fallback_provider_ids || [];
       const activeEpoch = primary.active_epoch || null;
       const providerNativeUsage = state.data.agentUsage?.providers || [];
@@ -2126,10 +2126,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const selectedIncomingProvider = state.driverSelection["agent-incoming-provider-id"] || fallbackOrder[0] || "";
       const selectedSessionId = state.driverSelection["agent-session-id"] || sessions[0]?.id || "";
       const selectedSession = sessions.find((row) => row.id === selectedSessionId);
-      const failoverBlocker = primary.policy_readiness !== "ready"
-        ? JSON.stringify(primary.policy_blocker || "Instance policy is not ready")
-        : !primary.controlled_failover_policy_ref
+      const failoverBlocker = !primary.controlled_failover_policy_ref
         ? "Controlled failover policy is not configured"
+        : primary.failover_policy_readiness !== "ready"
+        ? JSON.stringify(primary.failover_policy_blocker || "Failover policy is not ready")
         : !fallbackOrder.includes(selectedIncomingProvider)
         ? "Incoming provider is not an approved fallback"
         : "";

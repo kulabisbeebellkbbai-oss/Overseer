@@ -331,16 +331,17 @@ def agent_instances_status(
                 name for name, required_value in required.items()
                 if required_value is True and detected.get(name) is not True
             )
-            policy_blockers = []
+            current_driver_blockers = []
             if provider_status["available"] is not True:
-                policy_blockers.append(provider_status["unavailable_reason"])
+                current_driver_blockers.append(provider_status["unavailable_reason"])
             if missing:
-                policy_blockers.append({"type": "required_capabilities_missing", "capabilities": missing})
+                current_driver_blockers.append({"type": "required_capabilities_missing", "capabilities": missing})
+            failover_policy_blocker = None
             if (
                 profile.approved_fallback_provider_ids
                 and not profile.controlled_failover_policy_ref
             ):
-                policy_blockers.append({"type": "controlled_failover_policy_missing"})
+                failover_policy_blocker = {"type": "controlled_failover_policy_missing"}
             transition = transitions.get(profile.id)
             current_checkpoint = None
             if active is not None:
@@ -361,8 +362,12 @@ def agent_instances_status(
                         profile.approved_fallback_provider_ids
                     ),
                     "active_epoch": to_jsonable(active) if active is not None else None,
-                    "policy_readiness": "ready" if not policy_blockers else "blocked",
-                    "policy_blocker": policy_blockers[0] if policy_blockers else None,
+                    "current_driver_readiness": "ready" if not current_driver_blockers else "blocked",
+                    "current_driver_blocker": current_driver_blockers[0] if current_driver_blockers else None,
+                    "failover_policy_readiness": "ready" if failover_policy_blocker is None else "blocked",
+                    "failover_policy_blocker": failover_policy_blocker,
+                    "policy_readiness": "ready" if not current_driver_blockers else "blocked",
+                    "policy_blocker": current_driver_blockers[0] if current_driver_blockers else None,
                     "permission_policy_ref": profile.permission_policy_ref,
                     "execution_policy_ref": profile.execution_policy_ref,
                     "controlled_failover_policy_ref": profile.controlled_failover_policy_ref,

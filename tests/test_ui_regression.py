@@ -117,9 +117,17 @@ if (!driverElement.innerHTML.includes('not_installed')) process.exit(10);
 state.driverSelection["agent-incoming-provider-id"] = "claude";
 renderDriver();
 if (!driverElement.innerHTML.includes('data-action="failover-agent" disabled')) process.exit(11);
+state.data.agentProviders.providers[0].available = false;
+state.data.agentProviders.providers[0].readiness = "unavailable";
+state.data.agentProviders.providers[1] = {id:"claude",available:true,readiness:"available",capabilities:{handoff_import:true}};
+state.data.agentInstances.instances[0].failover_policy_readiness = "ready";
+renderDriver();
+const failoverButton = driverElement.innerHTML.match(/<button[^>]*data-action="failover-agent"[^>]*>/)?.[0] || "";
+if (!failoverButton || failoverButton.includes(" disabled")) process.exit(12);
 state.data.agentInstances.instances[0].controlled_failover_policy_ref = null;
 renderDriver();
-if (!driverElement.innerHTML.includes("Controlled failover policy is not configured")) process.exit(12);
+const blockedFailover = driverElement.innerHTML.match(/<button[^>]*data-action="failover-agent"[^>]*>/)?.[0] || "";
+if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Controlled failover policy is not configured")) process.exit(13);
 """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -174,6 +182,8 @@ if (!driverElement.innerHTML.includes("Controlled failover policy is not configu
         self.assertIn("provider.available !== true", OPERATOR_CONSOLE_HTML)
         self.assertIn('provider.readiness !== "available"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Cancellation route is unavailable", OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.failover_policy_readiness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("primary.current_driver_blocker", OPERATOR_CONSOLE_HTML)
 
     def test_gateway_prefix_serves_operator_console_with_token_form(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -727,6 +727,57 @@ def handoff_agent_status(
         store.close()
 
 
+def evaluate_agent_failover_status(
+    store_path: str | Path,
+    instance_id: str,
+    policy_id: str | None = None,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        decision = _agent_manager(
+            store, registry_path, local_registry_path
+        ).evaluate_failover(instance_id, policy_id)
+        return {
+            "decision": to_jsonable(decision),
+            "mutation_performed": decision.allowed,
+        }
+    finally:
+        store.close()
+
+
+def execute_agent_failover_status(
+    store_path: str | Path,
+    instance_id: str,
+    decision_id: str,
+    initiated_by: str,
+    approval_id: str,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        epoch = _agent_manager(
+            store,
+            registry_path,
+            local_registry_path,
+            handoff_operation="failover",
+        ).execute_failover(instance_id, decision_id, initiated_by, approval_id)
+        _record_agent_audit(
+            store,
+            event_id=f"audit.agent.failover.{epoch.id}",
+            event_type=AuditEventType.EXECUTED,
+            subject_id=f"agent.failover:{instance_id}:{decision_id}",
+            summary="completed an approved controlled provider failover",
+            risk_level=RiskLevel.HIGH,
+            evidence_ids=(approval_id, decision_id),
+        )
+        return {"epoch": to_jsonable(epoch), "operation": "controlled_failover"}
+    finally:
+        store.close()
+
+
 def build_demo_registry() -> ResourceRegistry:
     registry = ResourceRegistry()
     registry.register_resource(
@@ -9240,17 +9291,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     handoff_agent_parser.add_argument("--agent-registry-local")
     failover_agent_parser = subparsers.add_parser(
         "failover-agent",
-        help="perform an explicitly selected and approved provider failover",
+        help="execute a persisted and explicitly approved failover decision",
     )
     failover_agent_parser.add_argument("--store", required=True)
     failover_agent_parser.add_argument("--instance-id", required=True)
-    failover_agent_parser.add_argument("--incoming-provider-id", required=True)
+    failover_agent_parser.add_argument("--decision-id", required=True)
     failover_agent_parser.add_argument("--initiated-by", default="operator")
     failover_agent_parser.add_argument("--approval-id", required=True)
     failover_agent_parser.add_argument(
         "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
     )
     failover_agent_parser.add_argument("--agent-registry-local")
+    evaluate_failover_parser = subparsers.add_parser(
+        "evaluate-agent-failover",
+        help="evaluate persisted controlled-failover evidence",
+    )
+    evaluate_failover_parser.add_argument("--store", required=True)
+    evaluate_failover_parser.add_argument("--instance-id", required=True)
+    evaluate_failover_parser.add_argument("--policy-id")
+    evaluate_failover_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    evaluate_failover_parser.add_argument("--agent-registry-local")
     seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
     seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
     seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -10266,7 +10328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    if args.command in {"handoff-agent", "failover-agent"}:
+    if args.command == "handoff-agent":
         print(
             json.dumps(
                 handoff_agent_status(
@@ -10277,15 +10339,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.approval_id,
                     args.agent_registry,
                     args.agent_registry_local,
-                    operation=(
-                        "handoff"
-                        if args.command == "handoff-agent"
-                        else "failover"
-                    ),
                 ),
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "evaluate-agent-failover":
+        print(json.dumps(evaluate_agent_failover_status(
+            args.store, args.instance_id, args.policy_id,
+            args.agent_registry, args.agent_registry_local,
+        ), sort_keys=True))
+        return 0
+
+    if args.command == "failover-agent":
+        print(json.dumps(execute_agent_failover_status(
+            args.store, args.instance_id, args.decision_id, args.initiated_by,
+            args.approval_id, args.agent_registry, args.agent_registry_local,
+        ), sort_keys=True))
         return 0
 
     if args.command == "demo":

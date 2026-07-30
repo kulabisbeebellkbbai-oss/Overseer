@@ -300,7 +300,7 @@ class OverseerApiClient:
     def failover_agent(
         self,
         instance_id: str,
-        incoming_provider_id: str,
+        decision_id: str,
         initiated_by: str,
         approval_id: str,
     ) -> dict[str, Any]:
@@ -308,11 +308,21 @@ class OverseerApiClient:
             "/agent-failover",
             {
                 "instance_id": instance_id,
-                "incoming_provider_id": incoming_provider_id,
+                "decision_id": decision_id,
                 "initiated_by": initiated_by,
                 "approval_id": approval_id,
             },
         )
+
+    def evaluate_agent_failover(
+        self,
+        instance_id: str,
+        policy_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"instance_id": instance_id}
+        if policy_id is not None:
+            payload["policy_id"] = policy_id
+        return self._post("/agent-failover/evaluate", payload)
 
     def discover_codex_project_threads(self, codex_projects_registry: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}

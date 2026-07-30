@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 import re
 from types import MappingProxyType
@@ -39,6 +40,19 @@ class AgentTransitionState(StrEnum):
 class AgentOperationFenceState(StrEnum):
     OPEN = "open"
     FENCED = "fenced"
+
+
+class ProviderHealthState(StrEnum):
+    HEALTHY = "healthy"
+    TRANSPORT_FAILURE = "transport_failure"
+    FAILED = "failed"
+    SLOW = "slow"
+
+
+class ActiveAgentRiskLevel(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
 
 
 class AgentErrorCategory(StrEnum):
@@ -89,6 +103,25 @@ def _freeze_value(value: object) -> object:
 def _validate_identifier_collection(values: tuple[str, ...], label: str) -> None:
     for value in values:
         _require_identifier(value, label)
+
+
+def _validate_unique_identifier_collection(
+    values: tuple[str, ...], label: str
+) -> None:
+    _validate_identifier_collection(values, label)
+    if len(set(values)) != len(values):
+        raise ValueError(f"{label} values must be unique")
+
+
+def _require_timestamp(value: str, label: str) -> datetime:
+    _require_identifier(value, label)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be an ISO-8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -223,7 +256,7 @@ class AgentInstanceProfile:
         _validate_optional_identifier(
             self.controlled_failover_policy_ref, "controlled failover policy reference"
         )
-        _validate_identifier_collection(
+        _validate_unique_identifier_collection(
             self.approved_fallback_provider_ids, "fallback provider id"
         )
         if self.primary_provider_id in self.approved_fallback_provider_ids:
@@ -409,6 +442,139 @@ class AgentCheckpoint:
         _require_identifier(self.session_id, "session id")
         _require_identifier(self.driver_epoch_id, "driver epoch id")
         object.__setattr__(self, "evidence", _freeze_mapping(self.evidence))
+
+
+@dataclass(frozen=True)
+class FailoverPolicy:
+    id: str
+    instance_id: str
+    approved: bool
+    approval_ref: str | None
+    approved_at: str | None
+    failure_threshold: int
+    checkpoint_max_age_seconds: int
+    approved_fallback_provider_ids: tuple[str, ...]
+    decision_lifetime_seconds: int
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.id, "failover policy id")
+        _require_identifier(self.instance_id, "instance id")
+        _validate_optional_identifier(self.approval_ref, "approval reference")
+        if self.approved:
+            if self.approval_ref is None or self.approved_at is None:
+                raise ValueError("approved failover policy requires approval evidence")
+        if self.approved_at is not None:
+            _require_timestamp(self.approved_at, "policy approval timestamp")
+        for value, label in (
+            (self.failure_threshold, "failure threshold"),
+            (self.checkpoint_max_age_seconds, "checkpoint maximum age"),
+            (self.decision_lifetime_seconds, "decision lifetime"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{label} must be a non-negative integer")
+        if self.failure_threshold == 0 or self.decision_lifetime_seconds == 0:
+            raise ValueError("failure threshold and decision lifetime must be positive")
+        object.__setattr__(
+            self,
+            "approved_fallback_provider_ids",
+            tuple(self.approved_fallback_provider_ids),
+        )
+        _validate_identifier_collection(
+            self.approved_fallback_provider_ids, "fallback provider id"
+        )
+
+
+@dataclass(frozen=True)
+class ProviderHealthObservation:
+    id: str
+    instance_id: str
+    provider_id: str
+    state: ProviderHealthState
+    observed_at: str
+    reason_category: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.id, "health evidence id")
+        _require_identifier(self.instance_id, "instance id")
+        _require_identifier(self.provider_id, "provider id")
+        _require_timestamp(self.observed_at, "health observation timestamp")
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", self.reason_category):
+            raise ValueError("health reason must be a redacted category")
+
+
+@dataclass(frozen=True)
+class ActiveAgentRisk:
+    id: str
+    instance_id: str
+    risk_level: ActiveAgentRiskLevel
+    resolved: bool
+    transferable: bool
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.id, "active risk id")
+        _require_identifier(self.instance_id, "instance id")
+        _require_identifier(self.evidence_ref, "risk evidence reference")
+
+
+@dataclass(frozen=True)
+class FailoverDecision:
+    id: str
+    instance_id: str
+    outgoing_epoch_id: str
+    outgoing_provider_id: str
+    operation_generation: int
+    policy_id: str | None
+    incoming_provider_id: str | None
+    allowed: bool
+    blockers: tuple[str, ...]
+    health_evidence_ids: tuple[str, ...]
+    risk_evidence_ids: tuple[str, ...]
+    evidence_timestamps: tuple[str, ...]
+    checkpoint_id: str | None
+    evaluated_at: str
+    expires_at: str
+    consumed_at: str | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.id, "failover decision id"),
+            (self.instance_id, "instance id"),
+            (self.outgoing_epoch_id, "outgoing epoch id"),
+            (self.outgoing_provider_id, "outgoing provider id"),
+        ):
+            _require_identifier(value, label)
+        _validate_optional_identifier(self.policy_id, "failover policy id")
+        _validate_optional_identifier(self.incoming_provider_id, "incoming provider id")
+        _validate_optional_identifier(self.checkpoint_id, "checkpoint id")
+        if self.operation_generation < 1:
+            raise ValueError("operation generation must be positive")
+        object.__setattr__(self, "blockers", tuple(self.blockers))
+        object.__setattr__(self, "health_evidence_ids", tuple(self.health_evidence_ids))
+        object.__setattr__(self, "risk_evidence_ids", tuple(self.risk_evidence_ids))
+        object.__setattr__(self, "evidence_timestamps", tuple(self.evidence_timestamps))
+        _validate_unique_identifier_collection(
+            self.health_evidence_ids, "health evidence id"
+        )
+        _validate_unique_identifier_collection(
+            self.risk_evidence_ids, "risk evidence id"
+        )
+        for timestamp in self.evidence_timestamps:
+            _require_timestamp(timestamp, "failover evidence timestamp")
+        evaluated = _require_timestamp(self.evaluated_at, "decision evaluation timestamp")
+        expires = _require_timestamp(self.expires_at, "decision expiry timestamp")
+        if expires <= evaluated:
+            raise ValueError("decision expiry must follow evaluation")
+        if self.consumed_at is not None:
+            _require_timestamp(self.consumed_at, "decision consumed timestamp")
+        if self.allowed != (not self.blockers):
+            raise ValueError("allowed decision must have no blockers")
+        if self.allowed and (
+            self.policy_id is None
+            or self.incoming_provider_id is None
+            or self.checkpoint_id is None
+        ):
+            raise ValueError("allowed decision requires policy, checkpoint, and fallback")
 
 
 @dataclass(frozen=True)

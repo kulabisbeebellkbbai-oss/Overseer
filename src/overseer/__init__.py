@@ -9,6 +9,8 @@ from .adapters import (
 from .agent_contracts import (
     AgentCapabilities,
     AgentCheckpoint,
+    ActiveAgentRisk,
+    ActiveAgentRiskLevel,
     AgentDispatchRequest,
     AgentDispatchResult,
     AgentErrorCategory,
@@ -24,6 +26,10 @@ from .agent_contracts import (
     AgentTransitionState,
     CredentialReference,
     DriverEpoch,
+    FailoverDecision,
+    FailoverPolicy,
+    ProviderHealthObservation,
+    ProviderHealthState,
     PrimaryDriver,
 )
 from .admin import (
@@ -233,6 +239,8 @@ from .virtual_discovery import ListenerVirtualDiscoveryAdapter, TcpListener, par
 __all__ = [
     "AgentCapabilities",
     "AgentCheckpoint",
+    "ActiveAgentRisk",
+    "ActiveAgentRiskLevel",
     "AgentDispatchRequest",
     "AgentDispatchResult",
     "AgentErrorCategory",
@@ -248,6 +256,10 @@ __all__ = [
     "AgentTransitionState",
     "CredentialReference",
     "DriverEpoch",
+    "FailoverDecision",
+    "FailoverPolicy",
+    "ProviderHealthObservation",
+    "ProviderHealthState",
     "PrimaryDriver",
     "DryRunExecutor",
     "ExecutionMode",

@@ -1122,7 +1122,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "resume-agent-sessions") return await resumeAgentSession();
       if (action === "checkpoint-agent") return await checkpointAgent();
       if (action === "handoff-agent") return await changePrimaryAgent("/agent-handoffs", "manual handoff");
-      if (action === "failover-agent") return await changePrimaryAgent("/agent-failover", "controlled failover");
+      if (action === "failover-agent") return await controlledFailover();
       if (action === "discover-codex-threads") return await postJson("/codex-projects/discover-threads", {});
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
@@ -1212,6 +1212,32 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         value("agent-initiated-by"),
         approval_id
       ));
+    }
+    async function controlledFailover() {
+      const instance_id = value("agent-instance-id");
+      const selectedProvider = value("agent-incoming-provider-id");
+      const evaluation = await postJson("/agent-failover/evaluate", {instance_id});
+      const decision = evaluation.decision || {};
+      const blockers = decision.blockers || [];
+      const display = document.getElementById("agent-failover-blockers");
+      if (display) display.textContent = blockers.length
+        ? blockers.join("; ")
+        : `Allowed candidate: ${decision.incoming_provider_id || "none"}`;
+      if (!decision.allowed) throw new Error(blockers.join("; ") || "failover is blocked");
+      if (decision.instance_id !== instance_id || decision.incoming_provider_id !== selectedProvider) {
+        throw new Error("fresh failover decision does not match the selected approved fallback");
+      }
+      const approval_id = value("agent-approval-id");
+      if (!approval_id) throw new Error("approval_id is required");
+      if (!window.confirm(`Confirm controlled failover using approval ${approval_id}?`)) {
+        throw new Error("controlled failover cancelled by operator");
+      }
+      return await postJson("/agent-failover", {
+        instance_id,
+        decision_id: decision.id,
+        initiated_by: value("agent-initiated-by"),
+        approval_id
+      });
     }
     async function registerResource() {
       const resourceId = document.getElementById("resource-id").value.trim();
@@ -2150,6 +2176,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             <button class="action-btn" data-disabled-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
           </div></div>
           <div id="agent-cancel-blocker" class="panel span-12 inactive">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
+          <div id="agent-failover-blockers" class="panel span-12 inactive">Evaluate controlled failover to view exact blockers.</div>
           <div class="panel span-12">
             <div class="toolbar"><h3>Operator Request</h3><span class="pill">${safe(providerId)}</span></div>
             <div class="form-grid">

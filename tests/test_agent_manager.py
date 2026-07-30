@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from threading import Event, Thread
@@ -22,6 +22,9 @@ from overseer.agent_contracts import (
     AgentProvider,
     AgentSession,
     AgentTransitionState,
+    FailoverPolicy,
+    ProviderHealthObservation,
+    ProviderHealthState,
 )
 from overseer.agent_manager import (
     AgentAuthorizationError,
@@ -346,6 +349,106 @@ def test_dispatch_is_bound_to_active_epoch(
     assert result.driver_epoch_id == epoch.id
     assert result.session_id == epoch.session_id
     assert result.provider_id == epoch.provider_id
+
+
+def _prepare_allowed_failover(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> tuple[AgentManager, OverseerStore, object]:
+    value, store, _, _ = manager
+    epoch = value.activate("overseer.default", initiated_by="operator")
+    checkpoint = value.checkpoint("overseer.default")
+    approved_at = (
+        datetime.fromisoformat(checkpoint.created_at) - timedelta(minutes=5)
+    ).isoformat()
+    policy = FailoverPolicy(
+        id="policy.failover.test",
+        instance_id="overseer.default",
+        approved=True,
+        approval_ref="approval.policy.failover",
+        approved_at=approved_at,
+        failure_threshold=2,
+        checkpoint_max_age_seconds=300,
+        approved_fallback_provider_ids=("claude",),
+        decision_lifetime_seconds=60,
+    )
+    store.save_failover_policy(policy)
+    for observation in (
+        ProviderHealthObservation(
+            id="health.codex.failure.1",
+            instance_id=epoch.instance_id,
+            provider_id="codex",
+            state=ProviderHealthState.TRANSPORT_FAILURE,
+            observed_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+            reason_category="transport_error",
+        ),
+        ProviderHealthObservation(
+            id="health.codex.failure.2",
+            instance_id=epoch.instance_id,
+            provider_id="codex",
+            state=ProviderHealthState.FAILED,
+            observed_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+            reason_category="provider_unavailable",
+        ),
+        ProviderHealthObservation(
+            id="health.claude.healthy",
+            instance_id=epoch.instance_id,
+            provider_id="claude",
+            state=ProviderHealthState.HEALTHY,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            reason_category="probe_ok",
+        ),
+    ):
+        store.save_provider_health_observation(observation)
+    return value, store, value.evaluate_failover(epoch.instance_id, policy.id)
+
+
+def test_controlled_failover_consumes_decision_and_opens_one_new_epoch(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, decision = _prepare_allowed_failover(manager)
+    assert decision.allowed
+    incoming = value.execute_failover(
+        "overseer.default",
+        decision.id,
+        initiated_by="operator",
+        approval_id="approval.execute.failover",
+    )
+    assert incoming.provider_id == "claude"
+    assert incoming.reason == "controlled_failover"
+    assert store.load_failover_decision(decision.id).consumed_at is not None
+    with pytest.raises(AgentHandoffError, match="already used"):
+        value.execute_failover(
+            "overseer.default",
+            decision.id,
+            initiated_by="operator",
+            approval_id="approval.execute.failover",
+        )
+    assert len([epoch for epoch in store.list_driver_epochs() if epoch.ordinal == 2]) == 1
+
+
+def test_controlled_failover_rechecks_recovery_after_evaluation(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, decision = _prepare_allowed_failover(manager)
+    store.save_provider_health_observation(
+        ProviderHealthObservation(
+            id="health.codex.recovered",
+            instance_id="overseer.default",
+            provider_id="codex",
+            state=ProviderHealthState.HEALTHY,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            reason_category="probe_ok",
+        )
+    )
+    with pytest.raises(AgentHandoffError, match="evidence or generation changed"):
+        value.execute_failover(
+            "overseer.default",
+            decision.id,
+            initiated_by="operator",
+            approval_id="approval.execute.failover",
+        )
+    assert store.load_failover_decision(decision.id).consumed_at is None
+    assert max(epoch.ordinal for epoch in store.list_driver_epochs()) == 1
 
 
 def test_discovery_policy_rejection_prevents_driver_and_store_bypass(

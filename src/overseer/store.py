@@ -15,6 +15,7 @@ from typing import Any
 from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
 from .agent_contracts import (
     AgentCheckpoint,
+    ActiveAgentRisk,
     AgentDispatchRequest,
     AgentDispatchResult,
     AgentHandoffPackage,
@@ -27,6 +28,9 @@ from .agent_contracts import (
     AgentSession,
     AgentTransitionState,
     DriverEpoch,
+    FailoverDecision,
+    FailoverPolicy,
+    ProviderHealthObservation,
 )
 from .audit import ApprovalRequest, AuditEvent, AuditEventType
 from .core import Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
@@ -50,6 +54,7 @@ AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
 AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
 AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
+AGENT_DRIVER_SCHEMA_V6 = "agent_driver_v6"
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
         AgentTransitionState.IMPORT_ACKNOWLEDGED,
@@ -449,6 +454,16 @@ class SQLiteStore:
                 )
                 """
             )
+            for table in (
+                "agent_failover_policies",
+                "agent_provider_health_observations",
+                "agent_active_risks",
+                "agent_failover_decisions",
+            ):
+                self._connection.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} "
+                    "(id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+                )
             self._connection.execute(
                 "DROP TRIGGER IF EXISTS agent_dispatch_transition_fence"
             )
@@ -508,6 +523,10 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V5,
                 "coordinate generation-bound agent operations",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V6,
+                "persist generation-bound controlled failover evidence",
             )
 
     def _migrate_agent_activation_leases(self) -> None:
@@ -1169,6 +1188,92 @@ class SQLiteStore:
             _load_dataclass(AgentHandoffPackage, payload)
             for payload in self._list_payloads("agent_handoffs")
         )
+
+    def save_failover_policy(self, policy: FailoverPolicy) -> None:
+        self._save_agent_record(
+            "agent_failover_policies", policy, FailoverPolicy,
+            tuple(FailoverPolicy.__dataclass_fields__), {},
+        )
+
+    def load_failover_policy(self, policy_id: str) -> FailoverPolicy:
+        return _load_dataclass(
+            FailoverPolicy, self._get_payload("agent_failover_policies", policy_id)
+        )
+
+    def save_provider_health_observation(
+        self, observation: ProviderHealthObservation
+    ) -> None:
+        self._save_agent_record(
+            "agent_provider_health_observations",
+            observation,
+            ProviderHealthObservation,
+            tuple(ProviderHealthObservation.__dataclass_fields__),
+            {},
+        )
+
+    def list_provider_health_observations(
+        self, instance_id: str
+    ) -> tuple[ProviderHealthObservation, ...]:
+        return tuple(
+            item
+            for item in (
+                _load_dataclass(ProviderHealthObservation, payload)
+                for payload in self._list_payloads("agent_provider_health_observations")
+            )
+            if item.instance_id == instance_id
+        )
+
+    def save_active_agent_risk(self, risk: ActiveAgentRisk) -> None:
+        self._save_agent_record(
+            "agent_active_risks", risk, ActiveAgentRisk,
+            tuple(ActiveAgentRisk.__dataclass_fields__), {},
+        )
+
+    def list_active_agent_risks(self, instance_id: str) -> tuple[ActiveAgentRisk, ...]:
+        return tuple(
+            item
+            for item in (
+                _load_dataclass(ActiveAgentRisk, payload)
+                for payload in self._list_payloads("agent_active_risks")
+            )
+            if item.instance_id == instance_id
+        )
+
+    def save_failover_decision(self, decision: FailoverDecision) -> None:
+        self._save_agent_record(
+            "agent_failover_decisions",
+            decision,
+            FailoverDecision,
+            tuple(FailoverDecision.__dataclass_fields__),
+            {},
+        )
+
+    def load_failover_decision(self, decision_id: str) -> FailoverDecision:
+        return _load_dataclass(
+            FailoverDecision, self._get_payload("agent_failover_decisions", decision_id)
+        )
+
+    def consume_failover_decision(
+        self, decision_id: str, *, expected_generation: int, consumed_at: str
+    ) -> FailoverDecision:
+        current = self.load_failover_decision(decision_id)
+        if current.consumed_at is not None:
+            raise ValueError("failover decision is already consumed")
+        if current.operation_generation != expected_generation:
+            raise ValueError("failover decision generation changed")
+        updated = dataclass_from_jsonable(
+            FailoverDecision,
+            {**to_jsonable(current), "consumed_at": consumed_at},
+        )
+        cursor = self._connection.execute(
+            "UPDATE agent_failover_decisions SET payload = ? "
+            "WHERE id = ? AND json_extract(payload, '$.consumed_at') IS NULL",
+            (_dump_agent_record(updated), decision_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("failover decision is already consumed")
+        self._commit_agent_mutation()
+        return updated
 
     def save_resource(self, resource: Resource) -> None:
         self._upsert("resources", resource.id, _dump(resource))

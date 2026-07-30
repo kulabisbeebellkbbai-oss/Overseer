@@ -10310,7 +10310,7 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(len(migrations), 6)
+        self.assertEqual(len(migrations), 7)
         self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
         self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
         self.assertEqual(migrations[1].version, "agent_driver_v1")

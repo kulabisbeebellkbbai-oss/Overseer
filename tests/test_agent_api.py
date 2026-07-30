@@ -242,8 +242,8 @@ def test_dispatch_requires_idempotency_key(api: LocalAPI) -> None:
     assert response.json()["error"] == "idempotency_key is required"
 
 
-def test_failover_requires_explicit_provider_and_approval(api: LocalAPI) -> None:
-    missing_provider = api.post_json(
+def test_failover_requires_persisted_decision_and_explicit_approval(api: LocalAPI) -> None:
+    missing_decision = api.post_json(
         "/agent-failover",
         {
             "instance_id": "overseer.default",
@@ -255,13 +255,13 @@ def test_failover_requires_explicit_provider_and_approval(api: LocalAPI) -> None
         "/agent-failover",
         {
             "instance_id": "overseer.default",
-            "incoming_provider_id": "claude",
+            "decision_id": "decision.failover",
             "initiated_by": "operator",
         },
     )
 
-    assert missing_provider.status_code == 400
-    assert missing_provider.json()["error"] == "incoming_provider_id is required"
+    assert missing_decision.status_code == 400
+    assert missing_decision.json()["error"] == "decision_id is required"
     assert missing_approval.status_code == 400
     assert missing_approval.json()["error"] == "approval_id is required"
 

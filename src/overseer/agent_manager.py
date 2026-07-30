@@ -23,8 +23,10 @@ from .agent_contracts import (
     AgentSession,
     AgentTransitionState,
     DriverEpoch,
+    FailoverDecision,
+    ProviderHealthState,
 )
-from .agent_handoff import AgentHandoffService
+from .agent_handoff import AgentHandoffService, evaluate_failover_evidence
 from .agent_operations import AgentOperationBlockedError, AgentOperationCoordinator
 from .agent_registry import AgentRegistry
 from .audit import AuditEvent, AuditEventType
@@ -537,6 +539,172 @@ class AgentManager:
         )
         return checkpoint
 
+    def evaluate_failover(
+        self, instance_id: str, policy_id: str | None = None
+    ) -> FailoverDecision:
+        """Return blockers without mutation, or persist one fenced allowed decision."""
+        decision = self._evaluate_failover(instance_id, policy_id=policy_id)
+        if decision.allowed:
+            self.store.save_failover_decision(decision)
+        return decision
+
+    def _evaluate_failover(
+        self,
+        instance_id: str,
+        *,
+        policy_id: str | None,
+        decision_id: str | None = None,
+    ) -> FailoverDecision:
+        profile = self.registry.profile(instance_id)
+        selected_policy_id = policy_id or profile.controlled_failover_policy_ref
+        try:
+            policy = (
+                self.store.load_failover_policy(selected_policy_id)
+                if selected_policy_id
+                else None
+            )
+        except KeyError:
+            policy = None
+        epoch = self.active_epoch(instance_id)
+        try:
+            operation = self.store.load_agent_operation(instance_id)
+        except KeyError:
+            # Reading an unevaluated instance must not create a reservation.
+            operation_generation = 1
+            operation_changed = False
+        else:
+            operation_generation = operation.generation
+            operation_changed = (
+                operation.state is not AgentOperationFenceState.OPEN
+                or operation.owner_token is not None
+            )
+        health = self.store.list_provider_health_observations(instance_id)
+        risks = self.store.list_active_agent_risks(instance_id)
+        checkpoints = tuple(
+            item
+            for item in self.store.list_agent_checkpoints()
+            if item.instance_id == instance_id and item.driver_epoch_id == epoch.id
+        )
+        checkpoint = max(
+            checkpoints,
+            key=lambda item: item.created_at or "",
+            default=None,
+        )
+        latest_health: dict[str, object] = {}
+        for item in sorted(health, key=lambda record: record.observed_at):
+            latest_health[item.provider_id] = item
+        healthy_candidates = frozenset(
+            provider_id
+            for provider_id, item in latest_health.items()
+            if item.state is ProviderHealthState.HEALTHY
+        )
+        candidate_capabilities = {
+            provider_id: self.registry.providers[provider_id].capabilities
+            for provider_id in (
+                policy.approved_fallback_provider_ids if policy else ()
+            )
+            if provider_id in self.registry.providers
+            and provider_id in profile.approved_fallback_provider_ids
+        }
+        return evaluate_failover_evidence(
+            decision_id=decision_id or self._id_factory("failover-decision"),
+            instance_id=instance_id,
+            outgoing_epoch=epoch,
+            operation_generation=operation_generation,
+            policy=policy,
+            health=health,
+            checkpoint=checkpoint,
+            risks=risks,
+            candidate_capabilities=candidate_capabilities,
+            healthy_candidates=healthy_candidates,
+            required_capabilities=profile.required_capabilities,
+            evaluated_at=self._clock(),
+            transition_changed=operation_changed or self._has_active_transition(instance_id),
+        )
+
+    def execute_failover(
+        self,
+        instance_id: str,
+        decision_id: str,
+        initiated_by: str,
+        approval_id: str,
+    ) -> DriverEpoch:
+        if not approval_id.strip():
+            raise ValueError("approval_id is required")
+        original = self.store.load_failover_decision(decision_id)
+        if original.instance_id != instance_id:
+            raise AgentHandoffError("failover decision belongs to another instance")
+        if not original.allowed or original.consumed_at is not None:
+            raise AgentHandoffError("failover decision is blocked or already used")
+        if _aware_datetime(original.expires_at) <= _aware_datetime(self._clock()):
+            raise AgentHandoffError("failover decision is expired")
+        self._require_authorized(
+            "controlled_failover",
+            {
+                "approval_id": approval_id,
+                "decision_id": decision_id,
+                "instance_id": instance_id,
+                "incoming_provider_id": original.incoming_provider_id,
+                "initiated_by": initiated_by,
+            },
+        )
+        with self.store.agent_transaction():
+            current = self.store.load_failover_decision(decision_id)
+            reevaluated = self._evaluate_failover(
+                instance_id,
+                policy_id=current.policy_id,
+                decision_id=current.id,
+            )
+            comparable = (
+                "instance_id",
+                "outgoing_epoch_id",
+                "outgoing_provider_id",
+                "operation_generation",
+                "policy_id",
+                "incoming_provider_id",
+                "allowed",
+                "blockers",
+                "health_evidence_ids",
+                "risk_evidence_ids",
+                "evidence_timestamps",
+                "checkpoint_id",
+            )
+            if any(
+                getattr(current, field) != getattr(reevaluated, field)
+                for field in comparable
+            ):
+                raise AgentHandoffError("failover evidence or generation changed")
+            try:
+                reserved_operation = self.operations.reserve(
+                    instance_id,
+                    owner_token=self._id_factory("operation.failover"),
+                )
+            except AgentOperationBlockedError as error:
+                raise AgentHandoffError(str(error)) from error
+            self.store.consume_failover_decision(
+                decision_id,
+                expected_generation=current.operation_generation,
+                consumed_at=self._clock(),
+            )
+        assert original.incoming_provider_id is not None
+        return self._perform_handoff(
+            instance_id,
+            original.incoming_provider_id,
+            initiated_by,
+            approval_id,
+            authorization_operation="controlled_failover",
+            reason="controlled_failover",
+            authorization_already_proven=True,
+            reserved_operation=reserved_operation,
+        )
+
+    def _has_active_transition(self, instance_id: str) -> bool:
+        try:
+            transition = self.store.load_agent_transition(instance_id)
+        except KeyError:
+            return False
+        return transition.state in _BLOCKING_TRANSITION_STATES
+
     def manual_handoff(
         self,
         instance_id: str,
@@ -544,10 +712,38 @@ class AgentManager:
         initiated_by: str,
         approval_id: str,
     ) -> DriverEpoch:
-        self._raise_transition_required(
+        return self._perform_handoff(
             instance_id,
-            error_type=AgentHandoffError,
+            incoming_provider_id,
+            initiated_by,
+            approval_id,
+            authorization_operation="manual_handoff",
+            reason="manual_handoff",
+            authorization_already_proven=False,
+            reserved_operation=None,
         )
+
+    def _perform_handoff(
+        self,
+        instance_id: str,
+        incoming_provider_id: str,
+        initiated_by: str,
+        approval_id: str,
+        *,
+        authorization_operation: str,
+        reason: str,
+        authorization_already_proven: bool,
+        reserved_operation: AgentOperationReservation | None,
+    ) -> DriverEpoch:
+        if reserved_operation is None:
+            self._raise_transition_required(
+                instance_id,
+                error_type=AgentHandoffError,
+            )
+        elif self._blocking_transition(instance_id) is not None:
+            raise AgentHandoffError(
+                f"agent instance {instance_id} transition blocks failover"
+            )
         outgoing = self.active_epoch(instance_id)
         if outgoing.state not in _DISPATCHABLE_STATES:
             raise AgentManagerPausedError(
@@ -555,23 +751,28 @@ class AgentManager:
             )
         if not isinstance(approval_id, str) or not approval_id.strip():
             raise ValueError("approval_id is required")
-        self._require_authorized(
-            "manual_handoff",
-            {
-                "approval_id": approval_id,
-                "instance_id": instance_id,
-                "incoming_provider_id": incoming_provider_id,
-                "outgoing_epoch_id": outgoing.id,
-                "initiated_by": initiated_by,
-            },
-        )
-        try:
-            operation = self.operations.reserve(
-                instance_id,
-                owner_token=self._id_factory("operation"),
+        if not authorization_already_proven:
+            self._require_authorized(
+                authorization_operation,
+                {
+                    "approval_id": approval_id,
+                    "instance_id": instance_id,
+                    "incoming_provider_id": incoming_provider_id,
+                    "outgoing_epoch_id": outgoing.id,
+                    "initiated_by": initiated_by,
+                },
             )
-        except AgentOperationBlockedError as error:
-            raise AgentHandoffError(str(error)) from error
+        if reserved_operation is None:
+            try:
+                operation = self.operations.reserve(
+                    instance_id,
+                    owner_token=self._id_factory("operation"),
+                )
+            except AgentOperationBlockedError as error:
+                raise AgentHandoffError(str(error)) from error
+        else:
+            operation = reserved_operation
+            self.operations.verify_owned(operation)
         outgoing_driver = self.registry.driver_for_provider(
             outgoing.provider_id,
             instance_id=instance_id,
@@ -613,7 +814,7 @@ class AgentManager:
                 provider_id=incoming_provider_id,
                 session_id=None,
                 external_session_id=None,
-                reason="manual_handoff",
+                reason=reason,
                 initiated_by=initiated_by,
                 state=AgentOperationState.QUEUED,
                 persist_epoch=False,

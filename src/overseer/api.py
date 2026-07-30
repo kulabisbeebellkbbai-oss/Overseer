@@ -53,6 +53,8 @@ from .cli import (
     create_host_security_source_review_status,
     crew_messages_status,
     checkpoint_agent_status,
+    evaluate_agent_failover_status,
+    execute_agent_failover_status,
     discover_agent_sessions_status,
     dispatch_agent_goal_status,
     dispatch_crew_messages_status,
@@ -664,10 +666,17 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/agent-failover":
                 self._handle_json(
-                    lambda payload: handoff_agent_status(
+                    lambda payload: execute_agent_failover_status(
                         store_path,
-                        **_agent_handoff_args(payload),
-                        operation="failover",
+                        **_agent_failover_execution_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-failover/evaluate":
+                self._handle_json(
+                    lambda payload: evaluate_agent_failover_status(
+                        store_path,
+                        **_agent_failover_evaluation_args(payload),
                     )
                 )
                 return
@@ -1614,6 +1623,26 @@ def _agent_handoff_args(payload: dict[str, Any]) -> dict[str, Any]:
         "incoming_provider_id": _required_agent_string(
             payload, "incoming_provider_id"
         ),
+        "initiated_by": _required_agent_string(payload, "initiated_by"),
+        "approval_id": _required_agent_string(payload, "approval_id"),
+    }
+
+
+def _agent_failover_evaluation_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "policy_id": (
+            _required_agent_string(payload, "policy_id")
+            if payload.get("policy_id") is not None
+            else None
+        ),
+    }
+
+
+def _agent_failover_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "instance_id": _required_agent_string(payload, "instance_id"),
+        "decision_id": _required_agent_string(payload, "decision_id"),
         "initiated_by": _required_agent_string(payload, "initiated_by"),
         "approval_id": _required_agent_string(payload, "approval_id"),
     }

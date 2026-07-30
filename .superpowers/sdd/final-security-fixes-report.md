@@ -52,3 +52,22 @@ calling live providers, services, or credential resolvers.
 - The secure-open path also rechecks device and inode identity immediately
   after SQLite connects, before PRAGMAs or schema writes. The final fresh full
   suite passed with `788 passed, 1 skipped`; compileall and diff checks passed.
+
+## Filesystem Race Follow-up
+
+- Existing database and sidecar candidates are opened with
+  `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` before `fstat`, so FIFOs and other
+  nonregular paths reject promptly without waiting for a peer. Tests cover
+  both an unconsumed FIFO and a bound Unix-domain socket.
+- The store retains the original database device/inode and the first securely
+  observed identity of each WAL, SHM, or journal sidecar. Commit, checkpoint,
+  and close paths compare those identities before any descriptor-based chmod.
+- A missing or replaced database prevents all sidecar hardening. Replaced
+  sidecars are rejected without chmod; close temporarily moves a compromised
+  sidecar pathname aside while SQLite releases its original handles, then
+  restores the replacement atomically so SQLite cannot delete it.
+- Race reproductions verify unchanged `0644` mode and content for substituted
+  database/WAL/SHM files, prompt FIFO rejection, deleted-path close
+  compatibility, and normal owner-only modes. The focused store/lifecycle/core
+  suite passed with `490 passed`; the final full suite passed with
+  `793 passed, 1 skipped`.

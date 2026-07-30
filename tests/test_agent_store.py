@@ -4,6 +4,8 @@ import json
 import os
 import sqlite3
 import stat
+import socket
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -739,3 +741,71 @@ def test_store_rejects_symlink_database_without_chmodding_target(
         OverseerStore(link)
 
     assert _mode(target) == 0o644
+
+
+def test_store_rejects_fifo_promptly_without_reader(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    os.mkfifo(path, 0o644)
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="regular file"):
+        OverseerStore(path)
+
+    assert time.monotonic() - started < 1.0
+    assert stat.S_ISFIFO(path.stat().st_mode)
+    assert _mode(path) == 0o644
+
+
+def test_store_rejects_unix_socket_promptly(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    try:
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="regular file"):
+            OverseerStore(path)
+        assert time.monotonic() - started < 1.0
+        assert stat.S_ISSOCK(path.lstat().st_mode)
+    finally:
+        listener.close()
+
+
+def test_store_rejects_replaced_database_without_touching_replacement(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    replacement = tmp_path / "replacement.txt"
+    store = OverseerStore(path)
+    replacement.write_text("unrelated replacement", encoding="utf-8")
+    replacement.chmod(0o644)
+    os.replace(replacement, path)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        store.save_agent_checkpoint(_checkpoint("checkpoint.race", "epoch.race"))
+    with pytest.raises(ValueError, match="identity changed"):
+        store.close()
+
+    assert path.read_text(encoding="utf-8") == "unrelated replacement"
+    assert _mode(path) == 0o644
+
+
+@pytest.mark.parametrize("suffix", ("-wal", "-shm"))
+def test_store_rejects_replaced_sidecar_without_touching_replacement(
+    tmp_path: Path, suffix: str
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = OverseerStore(path)
+    sidecar = Path(f"{path}{suffix}")
+    assert sidecar.exists()
+    replacement = tmp_path / f"replacement{suffix}"
+    replacement.write_text("unrelated sidecar", encoding="utf-8")
+    replacement.chmod(0o644)
+    os.replace(replacement, sidecar)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        store.save_agent_checkpoint(_checkpoint(f"checkpoint{suffix}", "epoch.race"))
+    with pytest.raises(ValueError, match="identity changed"):
+        store.close()
+
+    assert sidecar.read_text(encoding="utf-8") == "unrelated sidecar"
+    assert _mode(sidecar) == 0o644

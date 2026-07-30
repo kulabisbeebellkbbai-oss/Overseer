@@ -190,9 +190,17 @@ class SQLiteStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        expected_identity = self._prepare_database_file()
+        self._database_identity = self._prepare_database_file()
+        self._sidecar_identities: dict[str, tuple[int, int]] = {}
+        self._compromised_sidecars: set[str] = set()
         self._connection = sqlite3.connect(self.path, timeout=30.0)
-        self._verify_database_identity(expected_identity)
+        try:
+            self._inspect_and_harden(
+                self.path, expected=self._database_identity
+            )
+        except Exception:
+            self._connection.close()
+            raise
         self._connection.row_factory = sqlite3.Row
         self._agent_transaction_depth = 0
         self._configure_connection()
@@ -200,31 +208,51 @@ class SQLiteStore:
         self._harden_database_files()
 
     def _prepare_database_file(self) -> tuple[int, int]:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
         try:
             descriptor = os.open(self.path, flags, 0o600)
         except FileExistsError:
-            status = self._harden_regular_owner_file(self.path)
+            status = self._inspect_and_harden(self.path)
             if status is None:
                 raise FileNotFoundError(self.path)
-            return status.st_dev, status.st_ino
+            return status
         else:
             try:
                 status = os.fstat(descriptor)
+                self._validate_artifact_status(self.path, status)
                 os.fchmod(descriptor, 0o600)
                 return status.st_dev, status.st_ino
             finally:
                 os.close(descriptor)
 
     @staticmethod
-    def _harden_regular_owner_file(
-        path: Path, *, missing_ok: bool = False
-    ) -> os.stat_result | None:
-        flags = os.O_RDONLY
+    def _validate_artifact_status(path: Path, status: os.stat_result) -> None:
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(
+                f"SQLite artifact must be an owned regular file: {path}"
+            )
+        if hasattr(os, "geteuid") and status.st_uid != os.geteuid():
+            raise PermissionError(
+                f"SQLite artifact is not owned by this process: {path}"
+            )
+
+    @classmethod
+    def _inspect_and_harden(
+        cls,
+        path: Path,
+        *,
+        expected: tuple[int, int] | None = None,
+        missing_ok: bool = False,
+    ) -> tuple[int, int] | None:
+        flags = os.O_RDONLY | os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
         try:
             descriptor = os.open(path, flags)
         except FileNotFoundError:
@@ -232,42 +260,59 @@ class SQLiteStore:
                 return None
             raise
         except OSError as error:
-            raise ValueError(f"SQLite artifact must be an owned regular file: {path}") from error
+            raise ValueError(
+                f"SQLite artifact must be an owned regular file: {path}"
+            ) from error
         try:
             status = os.fstat(descriptor)
-            if not stat.S_ISREG(status.st_mode):
-                raise ValueError(f"SQLite artifact must be an owned regular file: {path}")
-            if hasattr(os, "geteuid") and status.st_uid != os.geteuid():
-                raise PermissionError(f"SQLite artifact is not owned by this process: {path}")
+            cls._validate_artifact_status(path, status)
+            identity = (status.st_dev, status.st_ino)
+            if expected is not None and identity != expected:
+                raise ValueError(f"SQLite artifact identity changed: {path}")
             os.fchmod(descriptor, 0o600)
-            return status
+            return identity
         finally:
             os.close(descriptor)
 
-    def _verify_database_identity(self, expected: tuple[int, int]) -> None:
-        try:
-            status = self.path.lstat()
-        except FileNotFoundError:
-            self._connection.close()
-            raise ValueError("SQLite database path changed during secure open")
-        if (
-            not stat.S_ISREG(status.st_mode)
-            or (status.st_dev, status.st_ino) != expected
-        ):
-            self._connection.close()
-            raise ValueError("SQLite database path changed during secure open")
-
-    def _harden_database_files(self, *, database_missing_ok: bool = False) -> None:
-        self._harden_regular_owner_file(
-            self.path, missing_ok=database_missing_ok
+    def _harden_database_files(
+        self, *, database_missing_ok: bool = False
+    ) -> bool:
+        database = self._inspect_and_harden(
+            self.path,
+            expected=self._database_identity,
+            missing_ok=database_missing_ok,
         )
+        if database is None:
+            return False
         for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{self.path}{suffix}")
+            try:
+                identity = self._inspect_and_harden(
+                    sidecar,
+                    expected=self._sidecar_identities.get(suffix),
+                    missing_ok=True,
+                )
+            except (ValueError, PermissionError):
+                self._compromised_sidecars.add(suffix)
+                raise
+            if identity is not None:
+                self._sidecar_identities.setdefault(suffix, identity)
+        return True
+
+    def _stash_compromised_sidecars(self) -> list[tuple[Path, Path]]:
+        stashed: list[tuple[Path, Path]] = []
+        for suffix in sorted(self._compromised_sidecars):
             sidecar = Path(f"{self.path}{suffix}")
             try:
                 sidecar.lstat()
             except FileNotFoundError:
                 continue
-            self._harden_regular_owner_file(sidecar, missing_ok=True)
+            quarantine = sidecar.with_name(
+                f".{sidecar.name}.untrusted.{secrets.token_hex(16)}"
+            )
+            os.replace(sidecar, quarantine)
+            stashed.append((sidecar, quarantine))
+        return stashed
 
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA busy_timeout = 30000")
@@ -278,17 +323,35 @@ class SQLiteStore:
         self._harden_database_files()
 
     def close(self) -> None:
+        failure: Exception | None = None
+        stashed: list[tuple[Path, Path]] = []
         try:
             try:
-                self._connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            self._harden_database_files(database_missing_ok=True)
+                verified = self._harden_database_files(database_missing_ok=True)
+                if verified:
+                    try:
+                        self._connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass
+                    self._harden_database_files(database_missing_ok=True)
+            except (ValueError, PermissionError) as error:
+                failure = error
+                stashed = self._stash_compromised_sidecars()
         finally:
             self._connection.close()
-            self._harden_database_files(database_missing_ok=True)
+            for sidecar, quarantine in stashed:
+                if quarantine.exists():
+                    os.replace(quarantine, sidecar)
+        if failure is None:
+            try:
+                self._harden_database_files(database_missing_ok=True)
+            except (ValueError, PermissionError) as error:
+                failure = error
+        if failure is not None:
+            raise failure
 
     def _commit(self) -> None:
+        self._harden_database_files()
         self._connection.commit()
         self._harden_database_files()
 

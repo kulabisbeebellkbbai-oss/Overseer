@@ -27,6 +27,8 @@ from .agent_contracts import (
     AgentTransitionState,
     DriverEpoch,
     FailoverDecision,
+    FailoverExecution,
+    FailoverExecutionState,
     ProviderHealthState,
 )
 from .agent_handoff import AgentHandoffService, evaluate_failover_evidence
@@ -732,6 +734,21 @@ class AgentManager:
                 raise AgentHandoffError(str(error)) from error
             if _aware_datetime(current.expires_at) <= _aware_datetime(self._clock()):
                 raise AgentHandoffError("failover decision is expired")
+            execution = FailoverExecution(
+                id=self._id_factory("failover-execution"),
+                decision_id=current.id,
+                instance_id=instance_id,
+                outgoing_epoch_id=current.outgoing_epoch_id,
+                outgoing_session_id=self.active_epoch(instance_id).session_id,
+                outgoing_provider_id=current.outgoing_provider_id,
+                checkpoint_id=str(current.checkpoint_id),
+                operation_generation=reserved_operation.generation,
+                operation_owner_ref=str(reserved_operation.owner_token),
+                state=FailoverExecutionState.RESERVED,
+                created_at=self._clock(),
+                updated_at=self._clock(),
+            )
+            self.store.save_failover_execution(execution)
             self.store.consume_failover_decision(
                 decision_id,
                 expected_generation=current.operation_generation,
@@ -754,6 +771,7 @@ class AgentManager:
                 original.checkpoint_id
             ),
             checkpoint_max_age_seconds=decision_policy.checkpoint_max_age_seconds,
+            failover_execution=execution,
         )
 
     def _has_active_transition(self, instance_id: str) -> bool:
@@ -762,6 +780,102 @@ class AgentManager:
         except KeyError:
             return False
         return transition.state in _BLOCKING_TRANSITION_STATES
+
+    def recover_failover_execution(
+        self,
+        execution_id: str,
+        *,
+        initiated_by: str,
+        approval_id: str,
+    ) -> FailoverExecution:
+        if not approval_id.strip():
+            raise ValueError("approval_id is required")
+        execution = self.store.load_failover_execution(execution_id)
+        if execution.state is not FailoverExecutionState.BLOCKED_PREIMPORT:
+            raise AgentHandoffError("failover execution is not recoverable")
+        self._require_authorized(
+            "recover_failover_execution",
+            {
+                "execution_id": execution.id,
+                "instance_id": execution.instance_id,
+                "approval_id": approval_id,
+                "initiated_by": initiated_by,
+            },
+        )
+        operation = self.store.load_agent_operation(execution.instance_id)
+        if (
+            operation.generation != execution.operation_generation
+            or operation.owner_token != execution.operation_owner_ref
+            or operation.state is not AgentOperationFenceState.FENCED
+        ):
+            raise AgentHandoffError("failover recovery fence binding changed")
+        if self._has_active_transition(execution.instance_id):
+            raise AgentHandoffError("active transition blocks failover recovery")
+        outgoing = self.store.load_driver_epoch(execution.outgoing_epoch_id)
+        if (
+            outgoing.instance_id != execution.instance_id
+            or outgoing.session_id != execution.outgoing_session_id
+            or outgoing.provider_id != execution.outgoing_provider_id
+            or any(
+                epoch.ordinal > outgoing.ordinal and epoch.closed_at is None
+                for epoch in self.store.list_driver_epochs()
+                if epoch.instance_id == execution.instance_id
+            )
+        ):
+            raise AgentHandoffError("outgoing failover epoch binding changed")
+        try:
+            execution = self.store.transition_failover_execution(
+                execution.id,
+                expected_state=FailoverExecutionState.BLOCKED_PREIMPORT,
+                state=FailoverExecutionState.RECOVERING,
+                updated_at=self._clock(),
+            )
+        except ValueError as error:
+            raise AgentHandoffError(
+                "failover execution recovery already claimed"
+            ) from error
+        session = self.store.load_agent_session(execution.outgoing_session_id)
+        driver = self.registry.driver_for_provider(
+            execution.outgoing_provider_id,
+            instance_id=execution.instance_id,
+        )
+        try:
+            result = driver.resume(session)
+        except Exception:
+            result = None
+        valid = (
+            result is not None
+            and result.state in _ACKNOWLEDGED_STATES
+            and result.instance_id == execution.instance_id
+            and result.provider_id == execution.outgoing_provider_id
+            and result.session_id == session.external_session_id
+            and result.external_session_id in {None, session.external_session_id}
+        )
+        if not valid:
+            self.store.transition_failover_execution(
+                execution.id,
+                expected_state=FailoverExecutionState.RECOVERING,
+                state=FailoverExecutionState.BLOCKED_PREIMPORT,
+                updated_at=self._clock(),
+                reason="resume_unverified",
+            )
+            raise AgentHandoffError("outgoing provider resume was not verified")
+        assert result is not None
+        self.store.save_agent_dispatch_result(result)
+        with self.store.agent_transaction():
+            current = self.store.load_failover_execution(execution.id)
+            if current.state is not FailoverExecutionState.RECOVERING:
+                raise AgentHandoffError("failover execution recovery already completed")
+            self.operations.verify_owned(operation)
+            self.operations.release(operation)
+            return self.store.transition_failover_execution(
+                execution.id,
+                expected_state=FailoverExecutionState.RECOVERING,
+                state=FailoverExecutionState.RECOVERED,
+                updated_at=self._clock(),
+                reason=None,
+                resume_result_ref=result.id,
+            )
 
     def manual_handoff(
         self,
@@ -781,6 +895,7 @@ class AgentManager:
             reserved_operation=None,
             persisted_checkpoint=None,
             checkpoint_max_age_seconds=None,
+            failover_execution=None,
         )
 
     def _perform_handoff(
@@ -796,6 +911,7 @@ class AgentManager:
         reserved_operation: AgentOperationReservation | None,
         persisted_checkpoint: AgentCheckpoint | None,
         checkpoint_max_age_seconds: int | None,
+        failover_execution: FailoverExecution | None,
     ) -> DriverEpoch:
         if reserved_operation is None:
             self._raise_transition_required(
@@ -839,6 +955,13 @@ class AgentManager:
             outgoing.provider_id,
             instance_id=instance_id,
         )
+        if failover_execution is not None:
+            failover_execution = self.store.transition_failover_execution(
+                failover_execution.id,
+                expected_state=FailoverExecutionState.RESERVED,
+                state=FailoverExecutionState.DRAINING,
+                updated_at=self._clock(),
+            )
         try:
             self.operations.drain(
                 operation,
@@ -848,22 +971,33 @@ class AgentManager:
             self.operations.verify_quiescent(operation)
         except AgentOperationBlockedError as error:
             raise AgentHandoffError(str(error)) from error
-        if persisted_checkpoint is None:
-            checkpoint = self._collect_checkpoint(instance_id, outgoing)
-        else:
-            checkpoint = self.store.load_agent_checkpoint(persisted_checkpoint.id)
-            if checkpoint != persisted_checkpoint:
-                raise AgentHandoffError("failover checkpoint record changed")
-            if (
-                checkpoint.instance_id != instance_id
-                or checkpoint.driver_epoch_id != outgoing.id
-                or checkpoint.session_id != outgoing.session_id
-            ):
-                raise AgentHandoffError("failover checkpoint binding changed")
-        self._validate_checkpoint_for_handoff(
-            checkpoint,
-            max_age_seconds=checkpoint_max_age_seconds,
-        )
+        try:
+            if persisted_checkpoint is None:
+                checkpoint = self._collect_checkpoint(instance_id, outgoing)
+            else:
+                checkpoint = self.store.load_agent_checkpoint(persisted_checkpoint.id)
+                if checkpoint != persisted_checkpoint:
+                    raise AgentHandoffError("failover checkpoint record changed")
+                if (
+                    checkpoint.instance_id != instance_id
+                    or checkpoint.driver_epoch_id != outgoing.id
+                    or checkpoint.session_id != outgoing.session_id
+                ):
+                    raise AgentHandoffError("failover checkpoint binding changed")
+            self._validate_checkpoint_for_handoff(
+                checkpoint,
+                max_age_seconds=checkpoint_max_age_seconds,
+            )
+        except AgentHandoffError:
+            if failover_execution is not None:
+                self.store.transition_failover_execution(
+                    failover_execution.id,
+                    expected_state=FailoverExecutionState.DRAINING,
+                    state=FailoverExecutionState.BLOCKED_PREIMPORT,
+                    updated_at=self._clock(),
+                    reason="checkpoint_invalid",
+                )
+            raise
         incoming_driver = self.registry.driver_for_provider(
             incoming_provider_id,
             instance_id=instance_id,
@@ -872,6 +1006,13 @@ class AgentManager:
             instance_id,
             incoming_provider_id,
         )
+        if failover_execution is not None:
+            self.store.transition_failover_execution(
+                failover_execution.id,
+                expected_state=FailoverExecutionState.DRAINING,
+                state=FailoverExecutionState.TRANSITION_STARTED,
+                updated_at=self._clock(),
+            )
         with self.store.agent_transaction():
             self.store.save_agent_checkpoint(checkpoint)
             package = self.handoffs.build_from_store(

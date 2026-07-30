@@ -546,6 +546,23 @@ def _agent_authorization_callback(
     handoff_operation: str = "handoff",
 ):
     def authorize(operation: str, context) -> bool:
+        if operation == "recover_failover_execution":
+            approval_id = context.get("approval_id")
+            execution_id = context.get("execution_id")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (approval_id, execution_id)
+            ):
+                return False
+            try:
+                approval = store.load_approval(approval_id)
+            except KeyError:
+                return False
+            return (
+                approval.can_execute()
+                and approval.subject_id
+                == f"agent.failover-recovery:{execution_id}"
+            )
         if operation != "manual_handoff":
             return True
         approval_id = context.get("approval_id")
@@ -774,6 +791,52 @@ def execute_agent_failover_status(
             evidence_ids=(approval_id, decision_id),
         )
         return {"epoch": to_jsonable(epoch), "operation": "controlled_failover"}
+    finally:
+        store.close()
+
+
+def agent_failover_executions_status(
+    store_path: str | Path,
+    instance_id: str | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        executions = tuple(
+            item
+            for item in store.list_failover_executions()
+            if instance_id is None or item.instance_id == instance_id
+        )
+        return {
+            "executions": [to_jsonable(item) for item in executions],
+            "recovery_required": any(
+                item.state.value in {"blocked_preimport", "recovering"}
+                for item in executions
+            ),
+            "mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
+def recover_agent_failover_execution_status(
+    store_path: str | Path,
+    execution_id: str,
+    initiated_by: str,
+    approval_id: str,
+    registry_path: str | Path = DEFAULT_AGENT_REGISTRY,
+    local_registry_path: str | Path | None = None,
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        execution = _agent_manager(
+            store, registry_path, local_registry_path,
+            handoff_operation="failover",
+        ).recover_failover_execution(
+            execution_id,
+            initiated_by=initiated_by,
+            approval_id=approval_id,
+        )
+        return {"execution": to_jsonable(execution)}
     finally:
         store.close()
 
@@ -9313,6 +9376,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
     )
     evaluate_failover_parser.add_argument("--agent-registry-local")
+    recover_failover_parser = subparsers.add_parser(
+        "recover-agent-failover",
+        help="recover an exact blocked pre-import failover execution",
+    )
+    recover_failover_parser.add_argument("--store", required=True)
+    recover_failover_parser.add_argument("--execution-id", required=True)
+    recover_failover_parser.add_argument("--initiated-by", default="operator")
+    recover_failover_parser.add_argument("--approval-id", required=True)
+    recover_failover_parser.add_argument(
+        "--agent-registry", default=str(DEFAULT_AGENT_REGISTRY)
+    )
+    recover_failover_parser.add_argument("--agent-registry-local")
     seed_parser = subparsers.add_parser("seed-config", help="persist explicit JSON config into a SQLite store")
     seed_parser.add_argument("--config", required=True, help="explicit JSON config path")
     seed_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -10356,6 +10431,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(execute_agent_failover_status(
             args.store, args.instance_id, args.decision_id, args.initiated_by,
             args.approval_id, args.agent_registry, args.agent_registry_local,
+        ), sort_keys=True))
+        return 0
+
+    if args.command == "recover-agent-failover":
+        print(json.dumps(recover_agent_failover_execution_status(
+            args.store, args.execution_id, args.initiated_by, args.approval_id,
+            args.agent_registry, args.agent_registry_local,
         ), sort_keys=True))
         return 0
 

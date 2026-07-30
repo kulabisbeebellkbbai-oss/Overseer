@@ -29,6 +29,8 @@ from .agent_contracts import (
     AgentTransitionState,
     DriverEpoch,
     FailoverDecision,
+    FailoverExecution,
+    FailoverExecutionState,
     FailoverPolicy,
     ProviderHealthObservation,
 )
@@ -55,6 +57,7 @@ AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
 AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
 AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
 AGENT_DRIVER_SCHEMA_V6 = "agent_driver_v6"
+AGENT_DRIVER_SCHEMA_V7 = "agent_driver_v7"
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
         AgentTransitionState.IMPORT_ACKNOWLEDGED,
@@ -459,6 +462,7 @@ class SQLiteStore:
                 "agent_provider_health_observations",
                 "agent_active_risks",
                 "agent_failover_decisions",
+                "agent_failover_executions",
             ):
                 self._connection.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} "
@@ -527,6 +531,10 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V6,
                 "persist generation-bound controlled failover evidence",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V7,
+                "persist recoverable pre-import failover execution state",
             )
 
     def _migrate_agent_activation_leases(self) -> None:
@@ -1272,6 +1280,80 @@ class SQLiteStore:
         )
         if cursor.rowcount != 1:
             raise ValueError("failover decision is already consumed")
+        self._commit_agent_mutation()
+        return updated
+
+    def save_failover_execution(self, execution: FailoverExecution) -> None:
+        self._save_agent_record(
+            "agent_failover_executions",
+            execution,
+            FailoverExecution,
+            (
+                "id", "decision_id", "instance_id", "outgoing_epoch_id",
+                "outgoing_session_id", "outgoing_provider_id", "checkpoint_id",
+                "operation_generation", "operation_owner_ref", "created_at",
+            ),
+            {},
+        )
+
+    def load_failover_execution(self, execution_id: str) -> FailoverExecution:
+        return _load_dataclass(
+            FailoverExecution,
+            self._get_payload("agent_failover_executions", execution_id),
+        )
+
+    def list_failover_executions(self) -> tuple[FailoverExecution, ...]:
+        return tuple(
+            _load_dataclass(FailoverExecution, payload)
+            for payload in self._list_payloads("agent_failover_executions")
+        )
+
+    def transition_failover_execution(
+        self,
+        execution_id: str,
+        *,
+        expected_state: FailoverExecutionState,
+        state: FailoverExecutionState,
+        updated_at: str,
+        reason: str | None = None,
+        resume_result_ref: str | None = None,
+    ) -> FailoverExecution:
+        current = self.load_failover_execution(execution_id)
+        if current.state is not expected_state:
+            raise ValueError("failover execution state changed")
+        allowed = {
+            FailoverExecutionState.RESERVED: {FailoverExecutionState.DRAINING},
+            FailoverExecutionState.DRAINING: {
+                FailoverExecutionState.BLOCKED_PREIMPORT,
+                FailoverExecutionState.TRANSITION_STARTED,
+            },
+            FailoverExecutionState.BLOCKED_PREIMPORT: {
+                FailoverExecutionState.RECOVERING,
+            },
+            FailoverExecutionState.RECOVERING: {
+                FailoverExecutionState.BLOCKED_PREIMPORT,
+                FailoverExecutionState.RECOVERED,
+            },
+        }
+        if state not in allowed.get(expected_state, set()):
+            raise ValueError("invalid failover execution transition")
+        updated = dataclass_from_jsonable(
+            FailoverExecution,
+            {
+                **to_jsonable(current),
+                "state": state.value,
+                "updated_at": updated_at,
+                "reason": reason,
+                "resume_result_ref": resume_result_ref,
+            },
+        )
+        cursor = self._connection.execute(
+            "UPDATE agent_failover_executions SET payload = ? "
+            "WHERE id = ? AND json_extract(payload, '$.state') = ?",
+            (_dump_agent_record(updated), execution_id, expected_state.value),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("failover execution state changed")
         self._commit_agent_mutation()
         return updated
 

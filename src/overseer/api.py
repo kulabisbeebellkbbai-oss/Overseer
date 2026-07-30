@@ -17,6 +17,7 @@ from .cli import (
     activate_claim_status,
     active_policy_profile_status,
     agent_dispatches_status,
+    agent_failover_executions_status,
     agent_instances_status,
     agent_providers_status,
     agent_sessions_status,
@@ -119,6 +120,7 @@ from .cli import (
     request_claim_cleanup_status,
     request_key_broker_token_status,
     recover_agent_status,
+    recover_agent_failover_execution_status,
     run_obrien_package_maintenance_cycle_status,
     service_status,
     runtime_status,
@@ -348,6 +350,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                     lambda: agent_dispatches_status(
                         store_path,
                         _query_first(query, "instance_id"),
+                    )
+                )
+                return
+            if path == "/agent-failover-executions":
+                self._handle(
+                    lambda: agent_failover_executions_status(
+                        store_path, _query_first(query, "instance_id")
                     )
                 )
                 return
@@ -677,6 +686,14 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                     lambda payload: evaluate_agent_failover_status(
                         store_path,
                         **_agent_failover_evaluation_args(payload),
+                    )
+                )
+                return
+            if path == "/agent-failover/recover":
+                self._handle_json(
+                    lambda payload: recover_agent_failover_execution_status(
+                        store_path,
+                        **_agent_failover_recovery_args(payload),
                     )
                 )
                 return
@@ -1651,6 +1668,17 @@ def _agent_failover_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "instance_id": _required_agent_string(payload, "instance_id"),
         "decision_id": _required_agent_string(payload, "decision_id"),
+        "initiated_by": _required_agent_string(payload, "initiated_by"),
+        "approval_id": _required_agent_string(payload, "approval_id"),
+    }
+
+
+def _agent_failover_recovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {"execution_id", "initiated_by", "approval_id"}
+    if unknown:
+        raise ValueError(f"unknown failover recovery fields: {sorted(unknown)}")
+    return {
+        "execution_id": _required_agent_string(payload, "execution_id"),
         "initiated_by": _required_agent_string(payload, "initiated_by"),
         "approval_id": _required_agent_string(payload, "approval_id"),
     }

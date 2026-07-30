@@ -285,6 +285,17 @@ def test_failover_surfaces_reject_caller_asserted_evidence(api: LocalAPI) -> Non
     assert "unknown failover evaluation fields" in evaluate.json()["error"]
     assert execute.status_code == 400
     assert "unknown failover execution fields" in execute.json()["error"]
+    recovery = api.post_json(
+        "/agent-failover/recover",
+        {
+            "execution_id": "execution.1",
+            "initiated_by": "operator",
+            "approval_id": "approval.1",
+            "resume_verified": True,
+        },
+    )
+    assert recovery.status_code == 400
+    assert "unknown failover recovery fields" in recovery.json()["error"]
 
 
 def test_agent_session_and_dispatch_lists_are_persisted_store_views(

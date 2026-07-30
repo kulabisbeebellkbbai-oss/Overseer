@@ -324,6 +324,28 @@ class OverseerApiClient:
             payload["policy_id"] = policy_id
         return self._post("/agent-failover/evaluate", payload)
 
+    def agent_failover_executions(
+        self, instance_id: str | None = None
+    ) -> dict[str, Any]:
+        suffix = (
+            f"?{urlencode({'instance_id': instance_id})}"
+            if instance_id is not None
+            else ""
+        )
+        return self._get(f"/agent-failover-executions{suffix}")
+
+    def recover_agent_failover(
+        self, execution_id: str, initiated_by: str, approval_id: str
+    ) -> dict[str, Any]:
+        return self._post(
+            "/agent-failover/recover",
+            {
+                "execution_id": execution_id,
+                "initiated_by": initiated_by,
+                "approval_id": approval_id,
+            },
+        )
+
     def discover_codex_project_threads(self, codex_projects_registry: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if codex_projects_registry:

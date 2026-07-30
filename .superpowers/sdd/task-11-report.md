@@ -113,6 +113,24 @@ Hardening verification: 134 focused tests passed. Final full suite: 754 passed,
   Crossing the policy window leaves the consumed decision and owned reservation
   safely fenced for reconciliation and performs no import or epoch promotion.
 
+### Recoverable pre-import execution
+
+The post-drain blocked state now has a durable `agent_driver_v7`
+`FailoverExecution` record. It binds the decision, exact outgoing
+epoch/session/provider, checkpoint, and exact operation generation/owner.
+State transitions are CAS-controlled:
+`reserved -> draining -> blocked_preimport -> recovering -> recovered`, or
+`draining -> transition_started`.
+
+Post-drain checkpoint rejection records `blocked_preimport` while retaining the
+fence and creates no handoff, incoming epoch, or provider import. The read-only
+status route and Driver UI expose that recovery is required. Explicit recovery
+requires execution, operator, and approval IDs; rejects caller assertions; and
+CAS-claims recovery before the sole external resume attempt. Only a normalized,
+exactly bound acknowledged/running/succeeded result releases the exact fence
+and atomically marks the execution recovered. Unsupported, failed, mismatched,
+unauthorized, stale, or concurrent recovery remains blocked and fenced.
+
 ## Commit
 
 `c10b231` — `Add controlled primary driver failover`.

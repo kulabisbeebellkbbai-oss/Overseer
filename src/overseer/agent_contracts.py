@@ -55,6 +55,15 @@ class ActiveAgentRiskLevel(StrEnum):
     HIGH = "high"
 
 
+class FailoverExecutionState(StrEnum):
+    RESERVED = "reserved"
+    DRAINING = "draining"
+    BLOCKED_PREIMPORT = "blocked_preimport"
+    RECOVERING = "recovering"
+    RECOVERED = "recovered"
+    TRANSITION_STARTED = "transition_started"
+
+
 FAILOVER_BLOCKER_VOCABULARY = (
     "failover policy missing or not approved",
     "policy approval does not predate failure sequence",
@@ -633,6 +642,52 @@ class FailoverDecision:
             or self.checkpoint_id is None
         ):
             raise ValueError("allowed decision requires policy, checkpoint, and fallback")
+
+
+@dataclass(frozen=True)
+class FailoverExecution:
+    id: str
+    decision_id: str
+    instance_id: str
+    outgoing_epoch_id: str
+    outgoing_session_id: str
+    outgoing_provider_id: str
+    checkpoint_id: str
+    operation_generation: int
+    operation_owner_ref: str
+    state: FailoverExecutionState
+    created_at: str
+    updated_at: str
+    reason: str | None = None
+    resume_result_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.id, "failover execution id"),
+            (self.decision_id, "failover decision id"),
+            (self.instance_id, "instance id"),
+            (self.outgoing_epoch_id, "outgoing epoch id"),
+            (self.outgoing_session_id, "outgoing session id"),
+            (self.outgoing_provider_id, "outgoing provider id"),
+            (self.checkpoint_id, "checkpoint id"),
+            (self.operation_owner_ref, "operation owner reference"),
+        ):
+            _require_safe_identifier(value, label)
+        if (
+            not isinstance(self.operation_generation, int)
+            or isinstance(self.operation_generation, bool)
+            or self.operation_generation < 1
+        ):
+            raise ValueError("operation generation must be positive")
+        if not isinstance(self.state, FailoverExecutionState):
+            raise TypeError("failover execution state is invalid")
+        _require_timestamp(self.created_at, "execution creation timestamp")
+        _require_timestamp(self.updated_at, "execution update timestamp")
+        _validate_optional_identifier(self.resume_result_ref, "resume result reference")
+        if self.reason is not None and not re.fullmatch(
+            r"[a-z][a-z0-9_.-]{0,63}", self.reason
+        ):
+            raise ValueError("execution reason must be a redacted category")
 
 
 @dataclass(frozen=True)

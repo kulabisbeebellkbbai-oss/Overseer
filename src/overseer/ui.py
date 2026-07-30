@@ -819,6 +819,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       sourceReviewQueue: "/host/security/source-review-queue"
       ,agentProviders: "/agent-providers"
       ,agentInstances: "/agent-instances"
+      ,agentFailoverExecutions: "/agent-failover-executions"
       ,agentSessions: "/agent-sessions"
       ,agentDispatches: "/agent-dispatches"
       ,agentUsage: "/agent-usage"
@@ -2145,6 +2146,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const fallbackOrder = primary.approved_fallback_provider_ids || [];
       const activeEpoch = primary.active_epoch || null;
       const providerNativeUsage = state.data.agentUsage?.providers || [];
+      const failoverExecutions = state.data.agentFailoverExecutions?.executions || [];
+      const blockedFailoverExecution = failoverExecutions.find(
+        (item) => item.state === "blocked_preimport" || item.state === "recovering"
+      );
       const blockerText = readinessBlocker ? JSON.stringify(readinessBlocker) : "";
       const cancelTitle = "Cancellation route is unavailable";
       const required = primary.required_capabilities || {};
@@ -2177,6 +2182,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           </div></div>
           <div id="agent-cancel-blocker" class="panel span-12 inactive">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
           <div id="agent-failover-blockers" class="panel span-12 inactive">Evaluate controlled failover to view exact blockers.</div>
+          ${blockedFailoverExecution ? `<div class="panel span-12 bad">Failover recovery required: ${safe(blockedFailoverExecution.id)} (${safe(blockedFailoverExecution.state)})</div>` : ""}
           <div class="panel span-12">
             <div class="toolbar"><h3>Operator Request</h3><span class="pill">${safe(providerId)}</span></div>
             <div class="form-grid">

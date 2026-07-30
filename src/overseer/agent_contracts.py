@@ -64,6 +64,14 @@ class FailoverExecutionState(StrEnum):
     TRANSITION_STARTED = "transition_started"
 
 
+class AgentRecoveryAttemptState(StrEnum):
+    PENDING = "pending"
+    EXTERNAL_STARTED = "external_started"
+    RESULT_RECORDED = "result_recorded"
+    FINALIZED = "finalized"
+    BLOCKED = "blocked"
+
+
 FAILOVER_BLOCKER_VOCABULARY = (
     "failover policy missing or not approved",
     "policy approval does not predate failure sequence",
@@ -688,6 +696,76 @@ class FailoverExecution:
             r"[a-z][a-z0-9_.-]{0,63}", self.reason
         ):
             raise ValueError("execution reason must be a redacted category")
+
+
+@dataclass(frozen=True)
+class AgentRecoveryAttempt:
+    id: str
+    idempotency_key: str
+    execution_id: str
+    decision_id: str
+    instance_id: str
+    outgoing_epoch_id: str
+    provider_id: str
+    internal_session_id: str
+    external_session_id: str
+    operation_generation: int
+    operation_owner_ref: str
+    state: AgentRecoveryAttemptState
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.id, "recovery attempt id"),
+            (self.idempotency_key, "recovery idempotency key"),
+            (self.execution_id, "failover execution id"),
+            (self.decision_id, "failover decision id"),
+            (self.instance_id, "instance id"),
+            (self.outgoing_epoch_id, "outgoing epoch id"),
+            (self.provider_id, "provider id"),
+            (self.internal_session_id, "internal session id"),
+            (self.external_session_id, "external session id"),
+            (self.operation_owner_ref, "operation owner reference"),
+        ):
+            _require_safe_identifier(value, label)
+        if not isinstance(self.state, AgentRecoveryAttemptState):
+            raise TypeError("recovery attempt state is invalid")
+        if self.operation_generation < 1:
+            raise ValueError("operation generation must be positive")
+        _require_timestamp(self.created_at, "attempt creation timestamp")
+        _require_timestamp(self.updated_at, "attempt update timestamp")
+
+
+@dataclass(frozen=True)
+class AgentRecoveryOutcome:
+    id: str
+    attempt_id: str
+    raw_result_id: str
+    request_id: str
+    provenance_ref: str
+    state: AgentOperationState
+    recorded_at: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.id, "recovery outcome id"),
+            (self.attempt_id, "recovery attempt id"),
+            (self.raw_result_id, "raw result id"),
+            (self.request_id, "request id"),
+            (self.provenance_ref, "result provenance reference"),
+        ):
+            _require_safe_identifier(value, label)
+        if self.state not in _ACKNOWLEDGED_RECOVERY_STATES:
+            raise ValueError("recovery outcome state is not resumable")
+        _require_timestamp(self.recorded_at, "outcome timestamp")
+
+
+_ACKNOWLEDGED_RECOVERY_STATES = {
+    AgentOperationState.ACKNOWLEDGED,
+    AgentOperationState.RUNNING,
+    AgentOperationState.SUCCEEDED,
+}
 
 
 @dataclass(frozen=True)

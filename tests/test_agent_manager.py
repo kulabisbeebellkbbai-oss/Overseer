@@ -129,7 +129,7 @@ class FakeDriver:
         return self._result(
             request_id=f"recover.{self.provider.id}",
             session_id=session.external_session_id,
-            epoch_id="pending",
+            epoch_id=str(session.legacy_references.get("driver_epoch_id", "pending")),
             state=AgentOperationState.RUNNING,
         )
 
@@ -147,7 +147,7 @@ class FakeDriver:
         return self._result(
             request_id=f"inspect.{self.provider.id}",
             session_id=session.id,
-            epoch_id="pending",
+            epoch_id=str(session.legacy_references.get("driver_epoch_id", "pending")),
             state=AgentOperationState.ACKNOWLEDGED,
         )
 
@@ -573,13 +573,13 @@ def test_controlled_failover_rechecks_policy_checkpoint_age_after_drain(
     driver.resume = lambda session: replace(
         original_resume(session), provider_id="claude"
     )
-    with pytest.raises(AgentHandoffError, match="not verified"):
+    with pytest.raises(AgentHandoffError, match="binding mismatch"):
         value.recover_failover_execution(
             execution.id,
             initiated_by="operator",
             approval_id="approval.recover.failover",
         )
-    assert store.load_failover_execution(execution.id).state is FailoverExecutionState.BLOCKED_PREIMPORT
+    assert store.load_failover_execution(execution.id).state is FailoverExecutionState.RECOVERING
     assert store.load_agent_operation("overseer.default").state.value == "fenced"
     driver.resume = original_resume
     recovered = value.recover_failover_execution(
@@ -591,7 +591,7 @@ def test_controlled_failover_rechecks_policy_checkpoint_age_after_drain(
     assert recovered.resume_result_ref
     assert store.load_agent_operation("overseer.default").state.value == "open"
     assert max(epoch.ordinal for epoch in store.list_driver_epochs()) == 1
-    assert manager[2]["codex"].resume_calls == 2
+    assert manager[2]["codex"].resume_calls == 1
 
 
 def test_discovery_policy_rejection_prevents_driver_and_store_bypass(

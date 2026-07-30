@@ -131,6 +131,25 @@ exactly bound acknowledged/running/succeeded result releases the exact fence
 and atomically marks the execution recovered. Unsupported, failed, mismatched,
 unauthorized, stale, or concurrent recovery remains blocked and fenced.
 
+### Crash-safe recovery attempts
+
+The additive `agent_driver_v8` migration persists one typed
+`AgentRecoveryAttempt` and immutable `AgentRecoveryOutcome` per execution.
+Every nonterminal execution state is reported as recovery-required. `reserved`
+can release without a provider call because drain has not begun. `draining`
+requires exact provider inspection and otherwise reports
+`inspection_unavailable`. `blocked_preimport` CAS-creates an attempt before
+resume and records `external_started` before calling the provider. A restarted
+`recovering` execution finalizes a durable outcome, or inspects an uncertain
+started attempt; it never replays resume.
+
+Returned or inspected results must bind the exact instance, provider, outgoing
+epoch, expected internal-or-external session semantics, and optional external
+session ID. Result/request IDs must be nonempty and cannot collide with forged
+durable results. The normalized attempt-bound outcome is durable before exact
+fence release, and the attempt is finalized atomically with recovery. No path
+dispatches work, imports a handoff, replays completed work, or creates an epoch.
+
 ## Commit
 
 `c10b231` — `Add controlled primary driver failover`.

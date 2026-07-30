@@ -9,6 +9,9 @@ from .adapters import (
 from .agent_contracts import (
     AgentCapabilities,
     AgentCheckpoint,
+    AgentRecoveryAttempt,
+    AgentRecoveryAttemptState,
+    AgentRecoveryOutcome,
     ActiveAgentRisk,
     ActiveAgentRiskLevel,
     AgentDispatchRequest,
@@ -241,6 +244,9 @@ from .virtual_discovery import ListenerVirtualDiscoveryAdapter, TcpListener, par
 __all__ = [
     "AgentCapabilities",
     "AgentCheckpoint",
+    "AgentRecoveryAttempt",
+    "AgentRecoveryAttemptState",
+    "AgentRecoveryOutcome",
     "ActiveAgentRisk",
     "ActiveAgentRiskLevel",
     "AgentDispatchRequest",

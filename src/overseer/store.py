@@ -15,6 +15,9 @@ from typing import Any
 from .admin import AdminChangePlan, AdminExecutionResult, AdminHistoryArchiveRecord
 from .agent_contracts import (
     AgentCheckpoint,
+    AgentRecoveryAttempt,
+    AgentRecoveryAttemptState,
+    AgentRecoveryOutcome,
     ActiveAgentRisk,
     AgentDispatchRequest,
     AgentDispatchResult,
@@ -58,6 +61,7 @@ AGENT_DRIVER_SCHEMA_V4 = "agent_driver_v4"
 AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
 AGENT_DRIVER_SCHEMA_V6 = "agent_driver_v6"
 AGENT_DRIVER_SCHEMA_V7 = "agent_driver_v7"
+AGENT_DRIVER_SCHEMA_V8 = "agent_driver_v8"
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
         AgentTransitionState.IMPORT_ACKNOWLEDGED,
@@ -463,6 +467,8 @@ class SQLiteStore:
                 "agent_active_risks",
                 "agent_failover_decisions",
                 "agent_failover_executions",
+                "agent_recovery_attempts",
+                "agent_recovery_outcomes",
             ):
                 self._connection.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} "
@@ -535,6 +541,10 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V7,
                 "persist recoverable pre-import failover execution state",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V8,
+                "persist crash-safe provider recovery attempts and outcomes",
             )
 
     def _migrate_agent_activation_leases(self) -> None:
@@ -1322,10 +1332,14 @@ class SQLiteStore:
         if current.state is not expected_state:
             raise ValueError("failover execution state changed")
         allowed = {
-            FailoverExecutionState.RESERVED: {FailoverExecutionState.DRAINING},
+            FailoverExecutionState.RESERVED: {
+                FailoverExecutionState.DRAINING,
+                FailoverExecutionState.RECOVERED,
+            },
             FailoverExecutionState.DRAINING: {
                 FailoverExecutionState.BLOCKED_PREIMPORT,
                 FailoverExecutionState.TRANSITION_STARTED,
+                FailoverExecutionState.RECOVERED,
             },
             FailoverExecutionState.BLOCKED_PREIMPORT: {
                 FailoverExecutionState.RECOVERING,
@@ -1356,6 +1370,89 @@ class SQLiteStore:
             raise ValueError("failover execution state changed")
         self._commit_agent_mutation()
         return updated
+
+    def save_agent_recovery_attempt(self, attempt: AgentRecoveryAttempt) -> None:
+        self._save_agent_record(
+            "agent_recovery_attempts", attempt, AgentRecoveryAttempt,
+            (
+                "id", "idempotency_key", "execution_id", "decision_id",
+                "instance_id", "outgoing_epoch_id", "provider_id",
+                "internal_session_id", "external_session_id",
+                "operation_generation", "operation_owner_ref", "created_at",
+            ),
+            {},
+        )
+
+    def load_agent_recovery_attempt(self, attempt_id: str) -> AgentRecoveryAttempt:
+        return _load_dataclass(
+            AgentRecoveryAttempt,
+            self._get_payload("agent_recovery_attempts", attempt_id),
+        )
+
+    def recovery_attempt_for_execution(
+        self, execution_id: str
+    ) -> AgentRecoveryAttempt | None:
+        matches = tuple(
+            item for item in (
+                _load_dataclass(AgentRecoveryAttempt, payload)
+                for payload in self._list_payloads("agent_recovery_attempts")
+            ) if item.execution_id == execution_id
+        )
+        if len(matches) > 1:
+            raise ValueError("multiple recovery attempts for one execution")
+        return matches[0] if matches else None
+
+    def transition_agent_recovery_attempt(
+        self,
+        attempt_id: str,
+        *,
+        expected_state: AgentRecoveryAttemptState,
+        state: AgentRecoveryAttemptState,
+        updated_at: str,
+    ) -> AgentRecoveryAttempt:
+        current = self.load_agent_recovery_attempt(attempt_id)
+        if current.state is not expected_state:
+            raise ValueError("recovery attempt state changed")
+        updated = dataclass_from_jsonable(
+            AgentRecoveryAttempt,
+            {**to_jsonable(current), "state": state.value, "updated_at": updated_at},
+        )
+        cursor = self._connection.execute(
+            "UPDATE agent_recovery_attempts SET payload = ? WHERE id = ? "
+            "AND json_extract(payload, '$.state') = ?",
+            (_dump_agent_record(updated), attempt_id, expected_state.value),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("recovery attempt state changed")
+        self._commit_agent_mutation()
+        return updated
+
+    def save_agent_recovery_outcome(self, outcome: AgentRecoveryOutcome) -> None:
+        existing = self._connection.execute(
+            "SELECT payload FROM agent_recovery_outcomes WHERE id = ?",
+            (outcome.id,),
+        ).fetchone()
+        if existing is not None and _load_dataclass(
+            AgentRecoveryOutcome, str(existing["payload"])
+        ) != outcome:
+            raise ValueError("recovery outcome is immutable")
+        self._save_agent_record(
+            "agent_recovery_outcomes", outcome, AgentRecoveryOutcome,
+            tuple(AgentRecoveryOutcome.__dataclass_fields__), {},
+        )
+
+    def recovery_outcome_for_attempt(
+        self, attempt_id: str
+    ) -> AgentRecoveryOutcome | None:
+        matches = tuple(
+            item for item in (
+                _load_dataclass(AgentRecoveryOutcome, payload)
+                for payload in self._list_payloads("agent_recovery_outcomes")
+            ) if item.attempt_id == attempt_id
+        )
+        if len(matches) > 1:
+            raise ValueError("multiple recovery outcomes for one attempt")
+        return matches[0] if matches else None
 
     def save_resource(self, resource: Resource) -> None:
         self._upsert("resources", resource.id, _dump(resource))

@@ -15,6 +15,9 @@ from uuid import uuid4
 
 from .agent_contracts import (
     AgentCheckpoint,
+    AgentRecoveryAttempt,
+    AgentRecoveryAttemptState,
+    AgentRecoveryOutcome,
     AgentDispatchRequest,
     AgentDispatchResult,
     AgentErrorCategory,
@@ -791,7 +794,12 @@ class AgentManager:
         if not approval_id.strip():
             raise ValueError("approval_id is required")
         execution = self.store.load_failover_execution(execution_id)
-        if execution.state is not FailoverExecutionState.BLOCKED_PREIMPORT:
+        if execution.state not in {
+            FailoverExecutionState.RESERVED,
+            FailoverExecutionState.DRAINING,
+            FailoverExecutionState.BLOCKED_PREIMPORT,
+            FailoverExecutionState.RECOVERING,
+        }:
             raise AgentHandoffError("failover execution is not recoverable")
         self._require_authorized(
             "recover_failover_execution",
@@ -823,58 +831,161 @@ class AgentManager:
             )
         ):
             raise AgentHandoffError("outgoing failover epoch binding changed")
-        try:
+        if execution.state is FailoverExecutionState.RESERVED:
+            return self._finalize_failover_recovery(
+                execution, operation, resume_result_ref=None
+            )
+        session = self.store.load_agent_session(execution.outgoing_session_id)
+        session = replace(
+            session,
+            legacy_references={
+                **session.legacy_references,
+                "driver_epoch_id": execution.outgoing_epoch_id,
+            },
+        )
+        driver = self.registry.driver_for_provider(
+            execution.outgoing_provider_id,
+            instance_id=execution.instance_id,
+        )
+        if execution.state is FailoverExecutionState.DRAINING:
+            try:
+                result = driver.inspect(session)
+            except Exception as error:
+                raise AgentHandoffError("inspection_unavailable") from error
+            if result.error_category is AgentErrorCategory.UNSUPPORTED_CAPABILITY:
+                raise AgentHandoffError("inspection_unavailable")
+            self._validate_recovery_result(execution, session, result)
+            self.store.save_agent_dispatch_result(result)
+            return self._finalize_failover_recovery(
+                execution, operation, resume_result_ref=result.id
+            )
+        attempt = self.store.recovery_attempt_for_execution(execution.id)
+        if execution.state is FailoverExecutionState.BLOCKED_PREIMPORT:
+            if attempt is not None:
+                raise AgentHandoffError("recovery attempt already exists")
             execution = self.store.transition_failover_execution(
                 execution.id,
                 expected_state=FailoverExecutionState.BLOCKED_PREIMPORT,
                 state=FailoverExecutionState.RECOVERING,
                 updated_at=self._clock(),
             )
-        except ValueError as error:
-            raise AgentHandoffError(
-                "failover execution recovery already claimed"
-            ) from error
-        session = self.store.load_agent_session(execution.outgoing_session_id)
-        driver = self.registry.driver_for_provider(
-            execution.outgoing_provider_id,
-            instance_id=execution.instance_id,
-        )
-        try:
-            result = driver.resume(session)
-        except Exception:
-            result = None
-        valid = (
-            result is not None
-            and result.state in _ACKNOWLEDGED_STATES
-            and result.instance_id == execution.instance_id
-            and result.provider_id == execution.outgoing_provider_id
-            and result.session_id == session.external_session_id
-            and result.external_session_id in {None, session.external_session_id}
-        )
-        if not valid:
-            self.store.transition_failover_execution(
-                execution.id,
-                expected_state=FailoverExecutionState.RECOVERING,
-                state=FailoverExecutionState.BLOCKED_PREIMPORT,
+            attempt = AgentRecoveryAttempt(
+                id=self._id_factory("recovery-attempt"),
+                idempotency_key=f"recover.{execution.id}",
+                execution_id=execution.id,
+                decision_id=execution.decision_id,
+                instance_id=execution.instance_id,
+                outgoing_epoch_id=execution.outgoing_epoch_id,
+                provider_id=execution.outgoing_provider_id,
+                internal_session_id=session.id,
+                external_session_id=str(session.external_session_id),
+                operation_generation=execution.operation_generation,
+                operation_owner_ref=execution.operation_owner_ref,
+                state=AgentRecoveryAttemptState.PENDING,
+                created_at=self._clock(),
                 updated_at=self._clock(),
-                reason="resume_unverified",
             )
-            raise AgentHandoffError("outgoing provider resume was not verified")
-        assert result is not None
+            self.store.save_agent_recovery_attempt(attempt)
+        assert attempt is not None
+        outcome = self.store.recovery_outcome_for_attempt(attempt.id)
+        if outcome is not None:
+            return self._finalize_failover_recovery(
+                execution, operation, resume_result_ref=outcome.raw_result_id
+            )
+        if attempt.state is AgentRecoveryAttemptState.PENDING:
+            attempt = self.store.transition_agent_recovery_attempt(
+                attempt.id,
+                expected_state=AgentRecoveryAttemptState.PENDING,
+                state=AgentRecoveryAttemptState.EXTERNAL_STARTED,
+                updated_at=self._clock(),
+            )
+            try:
+                result = driver.resume(session)
+            except Exception:
+                result = None
+        else:
+            try:
+                result = driver.inspect(session)
+            except Exception as error:
+                raise AgentHandoffError("inspection_unavailable") from error
+            if result.error_category is AgentErrorCategory.UNSUPPORTED_CAPABILITY:
+                raise AgentHandoffError("inspection_unavailable")
+        if result is None:
+            raise AgentHandoffError("outgoing provider recovery is uncertain")
+        self._validate_recovery_result(execution, session, result)
+        try:
+            self.store.load_agent_dispatch_result(result.id)
+        except KeyError:
+            pass
+        else:
+            raise AgentHandoffError("forged preexisting recovery result")
         self.store.save_agent_dispatch_result(result)
+        outcome = AgentRecoveryOutcome(
+            id=self._id_factory("recovery-outcome"),
+            attempt_id=attempt.id,
+            raw_result_id=result.id,
+            request_id=result.request_id,
+            provenance_ref=f"provider.{result.provider_id}",
+            state=result.state,
+            recorded_at=self._clock(),
+        )
+        self.store.save_agent_recovery_outcome(outcome)
+        self.store.transition_agent_recovery_attempt(
+            attempt.id,
+            expected_state=AgentRecoveryAttemptState.EXTERNAL_STARTED,
+            state=AgentRecoveryAttemptState.RESULT_RECORDED,
+            updated_at=self._clock(),
+        )
+        return self._finalize_failover_recovery(
+            execution, operation, resume_result_ref=result.id
+        )
+
+    def _validate_recovery_result(
+        self,
+        execution: FailoverExecution,
+        session: AgentSession,
+        result: AgentDispatchResult,
+    ) -> None:
+        if (
+            result.state not in _ACKNOWLEDGED_STATES
+            or result.instance_id != execution.instance_id
+            or result.provider_id != execution.outgoing_provider_id
+            or result.driver_epoch_id != execution.outgoing_epoch_id
+            or result.session_id not in {session.id, session.external_session_id}
+            or result.external_session_id not in {None, session.external_session_id}
+            or not result.id.strip()
+            or not result.request_id.strip()
+        ):
+            raise AgentHandoffError("outgoing provider result binding mismatch")
+
+    def _finalize_failover_recovery(
+        self,
+        execution: FailoverExecution,
+        operation: AgentOperationReservation,
+        *,
+        resume_result_ref: str | None,
+    ) -> FailoverExecution:
         with self.store.agent_transaction():
-            current = self.store.load_failover_execution(execution.id)
-            if current.state is not FailoverExecutionState.RECOVERING:
-                raise AgentHandoffError("failover execution recovery already completed")
             self.operations.verify_owned(operation)
+            attempt = self.store.recovery_attempt_for_execution(execution.id)
+            if attempt is not None and attempt.state in {
+                AgentRecoveryAttemptState.EXTERNAL_STARTED,
+                AgentRecoveryAttemptState.RESULT_RECORDED,
+            }:
+                self.store.transition_agent_recovery_attempt(
+                    attempt.id,
+                    expected_state=attempt.state,
+                    state=AgentRecoveryAttemptState.FINALIZED,
+                    updated_at=self._clock(),
+                )
             self.operations.release(operation)
             return self.store.transition_failover_execution(
                 execution.id,
-                expected_state=FailoverExecutionState.RECOVERING,
+                expected_state=execution.state,
                 state=FailoverExecutionState.RECOVERED,
                 updated_at=self._clock(),
                 reason=None,
-                resume_result_ref=result.id,
+                resume_result_ref=resume_result_ref,
             )
 
     def manual_handoff(

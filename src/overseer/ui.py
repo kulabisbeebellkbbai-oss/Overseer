@@ -2126,6 +2126,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const selectedIncomingProvider = state.driverSelection["agent-incoming-provider-id"] || fallbackOrder[0] || "";
       const selectedSessionId = state.driverSelection["agent-session-id"] || sessions[0]?.id || "";
       const selectedSession = sessions.find((row) => row.id === selectedSessionId);
+      const failoverBlocker = primary.policy_readiness !== "ready"
+        ? JSON.stringify(primary.policy_blocker || "Instance policy is not ready")
+        : !primary.controlled_failover_policy_ref
+        ? "Controlled failover policy is not configured"
+        : !fallbackOrder.includes(selectedIncomingProvider)
+        ? "Incoming provider is not an approved fallback"
+        : "";
       function driverAction(action, label, capability, destinationProvider, extraBlocker = "") {
         const gate = providerGate(providers, destinationProvider, required, capability);
         const reason = extraBlocker || gate.blocker;
@@ -2139,10 +2146,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
             ${driverAction("resume-agent-sessions", "Resume Agent Sessions", "session_resume", selectedSession?.provider_id || "")}
             ${driverAction("checkpoint-agent", "Checkpoint", "checkpoints", selectedSession?.provider_id || providerId)}
             ${driverAction("handoff-agent", "Manual Handoff", "handoff_import", selectedIncomingProvider)}
-            ${driverAction("failover-agent", "Controlled Failover", "handoff_import", selectedIncomingProvider, fallbackOrder.includes(selectedIncomingProvider) ? "" : "Incoming provider is not an approved fallback")}
+            ${driverAction("failover-agent", "Controlled Failover", "handoff_import", selectedIncomingProvider, failoverBlocker)}
             <button class="action-btn" data-disabled-action="cancel-agent" disabled title="${safe(cancelTitle)}" aria-describedby="agent-cancel-blocker">Cancel</button>
           </div></div>
-          <div id="agent-cancel-blocker" class="panel span-12 ${cancellationSupported ? "good" : "inactive"}">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
+          <div id="agent-cancel-blocker" class="panel span-12 inactive">${safe(cancelTitle)}${blockerText ? `; ${safe(blockerText)}` : ""}</div>
           <div class="panel span-12">
             <div class="toolbar"><h3>Operator Request</h3><span class="pill">${safe(providerId)}</span></div>
             <div class="form-grid">
@@ -2173,7 +2180,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           })), ["provider_id", "readiness", "available", "capabilities", "blocker"])}</div>
           <div class="panel span-12">${table("Provider Native Usage", providerNativeUsage, ["provider_id", "usage_limit_source_id", "evidence_status", "value", "usage_unit"])}</div>
           <div class="panel span-6">${table("Agent Sessions", sessions, ["id", "provider_id", "instance_id", "state", "checkpoint_id"])}</div>
-          <div class="panel span-6">${table("Agent Dispatches", dispatches, ["id", "provider_id", "instance_id", "state", "driver_epoch_id"])}</div>
+          <div class="panel span-6">${table("Agent Dispatches", dispatches, ["id", "instance_id", "session_id", "driver_epoch_id", "requested_at", "requested_by"])}</div>
           <div class="panel span-12">${table("Dispatch Results", results, ["request_id", "state", "completed_at", "error_category"])}</div>
           ${officerPanel("sisko", "Primary AI driver review", "Review provider readiness, epoch, checkpoint, and approval evidence before changing the primary driver.")}
         </div>`;

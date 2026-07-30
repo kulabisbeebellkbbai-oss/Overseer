@@ -73,6 +73,9 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
         start = OPERATOR_CONSOLE_HTML.index("    function providerGate(")
         end = OPERATOR_CONSOLE_HTML.index("    function selectView(", start)
         functions = OPERATOR_CONSOLE_HTML[start:end]
+        render_start = OPERATOR_CONSOLE_HTML.index("    function renderDriver()")
+        render_end = OPERATOR_CONSOLE_HTML.index("    function renderAdmin()", render_start)
+        render_function = OPERATOR_CONSOLE_HTML[render_start:render_end]
         script = functions + r"""
 const providers = [
   {id:"codex", available:true, readiness:"available", capabilities:{session_discovery:true, checkpoints:true}},
@@ -86,6 +89,37 @@ if (payload.approval_id !== "approval.1") process.exit(5);
 let rejected = false;
 try { validatedTransferPayload("overseer.default", "claude", "operator", ""); } catch (_) { rejected = true; }
 if (!rejected) process.exit(6);
+""" + render_function + r"""
+const driverElement = {innerHTML:""};
+const document = {getElementById:(id) => id === "driver" ? driverElement : null};
+const safe = (value) => String(value ?? "").replaceAll('"', "&quot;");
+const stationIntro = () => "";
+const metric = () => "";
+const kv = () => "";
+const table = () => "";
+const officerPanel = () => "";
+const state = {driverSelection:{}, data:{
+  agentProviders:{providers:[
+    {id:"codex",available:true,readiness:"available",capabilities:{session_discovery:true,session_resume:true,checkpoints:true,handoff_import:true}},
+    {id:"claude",available:false,readiness:"unavailable",unavailable_reason:{type:"not_installed"},capabilities:{}}
+  ]},
+  agentInstances:{instances:[{id:"overseer.default",primary_provider_id:"codex",required_capabilities:{},approved_fallback_provider_ids:["claude"],policy_readiness:"ready",controlled_failover_policy_ref:"policy.failover"}]},
+  agentSessions:{sessions:[{id:"session.codex",provider_id:"codex",instance_id:"overseer.default",state:"active"}]},
+  agentDispatches:{dispatches:[],results:[]}, agentUsage:{providers:[]}
+}};
+renderDriver();
+if (!driverElement.innerHTML.includes('data-action="discover-agent-sessions"')) process.exit(7);
+if (!driverElement.innerHTML.includes('Cancellation route is unavailable')) process.exit(8);
+state.driverSelection["agent-provider-id"] = "claude";
+renderDriver();
+if (!driverElement.innerHTML.includes('data-action="discover-agent-sessions" disabled')) process.exit(9);
+if (!driverElement.innerHTML.includes('not_installed')) process.exit(10);
+state.driverSelection["agent-incoming-provider-id"] = "claude";
+renderDriver();
+if (!driverElement.innerHTML.includes('data-action="failover-agent" disabled')) process.exit(11);
+state.data.agentInstances.instances[0].controlled_failover_policy_ref = null;
+renderDriver();
+if (!driverElement.innerHTML.includes("Controlled failover policy is not configured")) process.exit(12);
 """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -111,7 +145,7 @@ if (!rejected) process.exit(6);
         self.assertIn("primary.approved_fallback_provider_ids", OPERATOR_CONSOLE_HTML)
         self.assertIn("primary.active_epoch", OPERATOR_CONSOLE_HTML)
         self.assertIn('["id", "provider_id", "instance_id", "state", "checkpoint_id"]', OPERATOR_CONSOLE_HTML)
-        self.assertIn('["id", "provider_id", "instance_id", "state", "driver_epoch_id"]', OPERATOR_CONSOLE_HTML)
+        self.assertIn('["id", "instance_id", "session_id", "driver_epoch_id", "requested_at", "requested_by"]', OPERATOR_CONSOLE_HTML)
         self.assertIn('["request_id", "state", "completed_at", "error_category"]', OPERATOR_CONSOLE_HTML)
         self.assertNotIn("primary.current_epoch", OPERATOR_CONSOLE_HTML)
         self.assertNotIn("primary.fallback_order", OPERATOR_CONSOLE_HTML)

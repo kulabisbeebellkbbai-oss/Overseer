@@ -336,6 +336,11 @@ def agent_instances_status(
                 policy_blockers.append(provider_status["unavailable_reason"])
             if missing:
                 policy_blockers.append({"type": "required_capabilities_missing", "capabilities": missing})
+            if (
+                profile.approved_fallback_provider_ids
+                and not profile.controlled_failover_policy_ref
+            ):
+                policy_blockers.append({"type": "controlled_failover_policy_missing"})
             transition = transitions.get(profile.id)
             current_checkpoint = None
             if active is not None:

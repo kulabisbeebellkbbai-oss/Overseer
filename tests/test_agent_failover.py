@@ -95,10 +95,15 @@ def _evaluate(**changes):
             "qwen-code": AgentCapabilities(handoff_import=True),
         },
         healthy_candidates=frozenset({"claude"}),
+        candidate_readiness={"claude": "readiness.claude.cli"},
         required_capabilities=AgentCapabilities(handoff_import=True),
         evaluated_at=NOW.isoformat(),
     )
     values.update(changes)
+    if values["policy"] is None and "health" not in changes:
+        values["health"] = tuple(
+            item for item in health if item.provider_id == epoch.provider_id
+        )
     return evaluate_failover_evidence(**values)
 
 
@@ -169,6 +174,53 @@ def test_capability_mismatch_does_not_skip_to_unhealthy_provider() -> None:
     )
     assert decision.incoming_provider_id is None
     assert "fallback capability mismatch or missing handoff_import" in decision.blockers
+
+
+def test_foreign_persisted_evidence_is_rejected() -> None:
+    foreign = ProviderHealthObservation(
+        id="health.foreign",
+        instance_id="another.instance",
+        provider_id="codex",
+        state=ProviderHealthState.FAILED,
+        observed_at=NOW.isoformat(),
+        reason_category="transport_error",
+    )
+    with pytest.raises(ValueError, match="foreign health"):
+        _evaluate(health=(foreign,))
+
+
+def test_timestamp_order_uses_instants_not_lexical_offsets() -> None:
+    earlier = ProviderHealthObservation(
+        id="health.offset.earlier",
+        instance_id="overseer.default",
+        provider_id="codex",
+        state=ProviderHealthState.FAILED,
+        observed_at="2026-07-29T12:30:00-04:00",
+        reason_category="transport_error",
+    )
+    later = replace(
+        earlier,
+        id="health.offset.later",
+        observed_at="2026-07-29T17:00:00+00:00",
+    )
+    decision = _evaluate(health=(later, earlier))
+    assert decision.health_evidence_ids == (later.id, earlier.id)
+
+
+def test_failover_contracts_reject_loose_types_and_duplicate_order() -> None:
+    with pytest.raises(TypeError, match="boolean"):
+        _policy(approved=1)
+    with pytest.raises(ValueError, match="unique"):
+        _policy(approved_fallback_provider_ids=("claude", "claude"))
+    with pytest.raises(TypeError, match="health state"):
+        ProviderHealthObservation(
+            id="health.bad",
+            instance_id="overseer.default",
+            provider_id="codex",
+            state="failed",  # type: ignore[arg-type]
+            observed_at=NOW.isoformat(),
+            reason_category="transport_error",
+        )
 
 
 def test_failover_blocked_evaluation_is_not_persisted_implicitly(tmp_path) -> None:

@@ -1629,6 +1629,9 @@ def _agent_handoff_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _agent_failover_evaluation_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {"instance_id", "policy_id"}
+    if unknown:
+        raise ValueError(f"unknown failover evaluation fields: {sorted(unknown)}")
     return {
         "instance_id": _required_agent_string(payload, "instance_id"),
         "policy_id": (
@@ -1640,6 +1643,11 @@ def _agent_failover_evaluation_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _agent_failover_execution_args(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(payload) - {
+        "instance_id", "decision_id", "initiated_by", "approval_id"
+    }
+    if unknown:
+        raise ValueError(f"unknown failover execution fields: {sorted(unknown)}")
     return {
         "instance_id": _required_agent_string(payload, "instance_id"),
         "decision_id": _required_agent_string(payload, "decision_id"),

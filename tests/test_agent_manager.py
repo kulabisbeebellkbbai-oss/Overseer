@@ -406,6 +406,7 @@ def test_controlled_failover_consumes_decision_and_opens_one_new_epoch(
     manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
 ) -> None:
     value, store, decision = _prepare_allowed_failover(manager)
+    checkpoint_calls = list(manager[3]).count("checkpoint:codex")
     assert decision.allowed
     incoming = value.execute_failover(
         "overseer.default",
@@ -416,6 +417,7 @@ def test_controlled_failover_consumes_decision_and_opens_one_new_epoch(
     assert incoming.provider_id == "claude"
     assert incoming.reason == "controlled_failover"
     assert store.load_failover_decision(decision.id).consumed_at is not None
+    assert manager[3].count("checkpoint:codex") == checkpoint_calls
     with pytest.raises(AgentHandoffError, match="already used"):
         value.execute_failover(
             "overseer.default",
@@ -449,6 +451,53 @@ def test_controlled_failover_rechecks_recovery_after_evaluation(
         )
     assert store.load_failover_decision(decision.id).consumed_at is None
     assert max(epoch.ordinal for epoch in store.list_driver_epochs()) == 1
+
+
+def test_controlled_failover_expiry_after_authorization_rolls_back_reservation(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, store, decision = _prepare_allowed_failover(manager)
+    before = datetime.fromisoformat(decision.expires_at) - timedelta(seconds=1)
+    after = datetime.fromisoformat(decision.expires_at) + timedelta(seconds=1)
+    current = {"now": before}
+    value._clock = lambda: current["now"].isoformat()
+
+    def authorize(operation: str, context: Mapping[str, object]) -> bool:
+        if operation == "controlled_failover":
+            current["now"] = after
+        return True
+
+    value.authorization_callback = authorize
+    with pytest.raises(AgentHandoffError):
+        value.execute_failover(
+            "overseer.default",
+            decision.id,
+            initiated_by="operator",
+            approval_id="approval.execute.failover",
+        )
+    assert store.load_failover_decision(decision.id).consumed_at is None
+    assert store.load_agent_operation("overseer.default").state.value == "open"
+    assert max(epoch.ordinal for epoch in store.list_driver_epochs()) == 1
+
+
+def test_controlled_failover_rechecks_readiness_without_provider_execution(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value, store, decision = _prepare_allowed_failover(manager)
+    import overseer.agent_manager as agent_manager_module
+
+    monkeypatch.setattr(agent_manager_module.shutil, "which", lambda _: None)
+    imports_before = list(manager[3]).count("import:claude")
+    with pytest.raises(AgentHandoffError, match="evidence or generation changed"):
+        value.execute_failover(
+            "overseer.default",
+            decision.id,
+            initiated_by="operator",
+            approval_id="approval.execute.failover",
+        )
+    assert manager[3].count("import:claude") == imports_before
+    assert store.load_failover_decision(decision.id).consumed_at is None
 
 
 def test_discovery_policy_rejection_prevents_driver_and_store_bypass(

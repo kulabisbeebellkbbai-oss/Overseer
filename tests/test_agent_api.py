@@ -266,6 +266,27 @@ def test_failover_requires_persisted_decision_and_explicit_approval(api: LocalAP
     assert missing_approval.json()["error"] == "approval_id is required"
 
 
+def test_failover_surfaces_reject_caller_asserted_evidence(api: LocalAPI) -> None:
+    evaluate = api.post_json(
+        "/agent-failover/evaluate",
+        {"instance_id": "overseer.default", "failure_count": 99},
+    )
+    execute = api.post_json(
+        "/agent-failover",
+        {
+            "instance_id": "overseer.default",
+            "decision_id": "decision.1",
+            "initiated_by": "operator",
+            "approval_id": "approval.1",
+            "checkpoint_fresh": True,
+        },
+    )
+    assert evaluate.status_code == 400
+    assert "unknown failover evaluation fields" in evaluate.json()["error"]
+    assert execute.status_code == 400
+    assert "unknown failover execution fields" in execute.json()["error"]
+
+
 def test_agent_session_and_dispatch_lists_are_persisted_store_views(
     api: LocalAPI,
 ) -> None:

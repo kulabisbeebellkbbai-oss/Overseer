@@ -38,6 +38,7 @@ def evaluate_failover_evidence(
     risks: tuple[ActiveAgentRisk, ...],
     candidate_capabilities: Mapping[str, AgentCapabilities],
     healthy_candidates: frozenset[str],
+    candidate_readiness: Mapping[str, str],
     required_capabilities: AgentCapabilities,
     evaluated_at: str,
     transition_changed: bool = False,
@@ -47,7 +48,24 @@ def evaluate_failover_evidence(
     blockers: list[str] = []
     selected: str | None = None
     if policy is not None and policy.instance_id != instance_id:
-        policy = None
+        raise ValueError("failover policy belongs to another instance")
+    approved_provider_ids = (
+        frozenset(policy.approved_fallback_provider_ids) if policy else frozenset()
+    )
+    if any(
+        item.instance_id != instance_id
+        or item.provider_id not in {outgoing_epoch.provider_id, *approved_provider_ids}
+        for item in health
+    ):
+        raise ValueError("foreign health evidence is not allowed")
+    if any(item.instance_id != instance_id for item in risks):
+        raise ValueError("foreign risk evidence is not allowed")
+    if checkpoint is not None and (
+        checkpoint.instance_id != instance_id
+        or checkpoint.driver_epoch_id != outgoing_epoch.id
+        or checkpoint.session_id != outgoing_epoch.session_id
+    ):
+        raise ValueError("foreign checkpoint evidence is not allowed")
     if policy is None or not policy.approved:
         blockers.append("failover policy missing or not approved")
     approval_at = _aware(policy.approved_at) if policy and policy.approved_at else None
@@ -56,7 +74,9 @@ def evaluate_failover_evidence(
         for item in health
         if item.instance_id == instance_id and item.provider_id == outgoing_epoch.provider_id
     )
-    ordered_outgoing = tuple(sorted(outgoing_health, key=lambda item: item.observed_at))
+    ordered_outgoing = tuple(
+        sorted(outgoing_health, key=lambda item: _aware(item.observed_at))
+    )
     failure_states = {
         ProviderHealthState.TRANSPORT_FAILURE,
         ProviderHealthState.FAILED,
@@ -111,7 +131,9 @@ def evaluate_failover_evidence(
         tuple(
             item
             for item in policy.approved_fallback_provider_ids
-            if item in healthy_candidates and item in candidate_capabilities
+            if item in healthy_candidates
+            and item in candidate_capabilities
+            and item in candidate_readiness
         )
         if policy
         else ()
@@ -156,6 +178,13 @@ def evaluate_failover_evidence(
                 checkpoint.expires_at if checkpoint else None,
             )
             if item is not None
+        ),
+        readiness_evidence_refs=tuple(
+            candidate_readiness[item]
+            for item in (
+                policy.approved_fallback_provider_ids if policy else ()
+            )
+            if item in candidate_readiness
         ),
         checkpoint_id=checkpoint.id if checkpoint else None,
         evaluated_at=evaluated_at,

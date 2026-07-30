@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import hashlib
 import sqlite3
+import shutil
 import time
+from pathlib import Path
 from typing import Callable, Protocol
 from uuid import uuid4
 
@@ -578,7 +581,15 @@ class AgentManager:
                 operation.state is not AgentOperationFenceState.OPEN
                 or operation.owner_token is not None
             )
-        health = self.store.list_provider_health_observations(instance_id)
+        allowed_health_providers = {
+            epoch.provider_id,
+            *(policy.approved_fallback_provider_ids if policy else ()),
+        }
+        health = tuple(
+            item
+            for item in self.store.list_provider_health_observations(instance_id)
+            if item.provider_id in allowed_health_providers
+        )
         risks = self.store.list_active_agent_risks(instance_id)
         checkpoints = tuple(
             item
@@ -587,11 +598,13 @@ class AgentManager:
         )
         checkpoint = max(
             checkpoints,
-            key=lambda item: item.created_at or "",
+            key=lambda item: _aware_datetime(item.created_at),
             default=None,
         )
         latest_health: dict[str, object] = {}
-        for item in sorted(health, key=lambda record: record.observed_at):
+        for item in sorted(
+            health, key=lambda record: _aware_datetime(record.observed_at)
+        ):
             latest_health[item.provider_id] = item
         healthy_candidates = frozenset(
             provider_id
@@ -606,6 +619,16 @@ class AgentManager:
             if provider_id in self.registry.providers
             and provider_id in profile.approved_fallback_provider_ids
         }
+        candidate_readiness = {
+            provider_id: readiness_ref
+            for provider_id in candidate_capabilities
+            if (
+                readiness_ref := self._provider_readiness_reference(
+                    instance_id, provider_id
+                )
+            )
+            is not None
+        }
         return evaluate_failover_evidence(
             decision_id=decision_id or self._id_factory("failover-decision"),
             instance_id=instance_id,
@@ -617,10 +640,32 @@ class AgentManager:
             risks=risks,
             candidate_capabilities=candidate_capabilities,
             healthy_candidates=healthy_candidates,
+            candidate_readiness=candidate_readiness,
             required_capabilities=profile.required_capabilities,
             evaluated_at=self._clock(),
             transition_changed=operation_changed or self._has_active_transition(instance_id),
         )
+
+    def _provider_readiness_reference(
+        self, instance_id: str, provider_id: str
+    ) -> str | None:
+        provider = self.registry.providers[provider_id]
+        if not self.registry.adapter_factory_available(provider.adapter_id):
+            return None
+        if provider.id in {"qwen-code", "mistral-vibe", "antigravity"}:
+            return None
+        if not provider.executable_allowlist:
+            return None  # gateway readiness needs separately verified configuration
+        configured = provider.executable_allowlist[0]
+        resolved = (
+            str(Path(configured).resolve())
+            if Path(configured).is_absolute() and Path(configured).is_file()
+            else shutil.which(configured)
+        )
+        if resolved is None:
+            return None
+        digest = hashlib.sha256(str(Path(resolved).resolve()).encode()).hexdigest()[:16]
+        return f"readiness.{provider_id}.{digest}"
 
     def execute_failover(
         self,
@@ -650,6 +695,8 @@ class AgentManager:
         )
         with self.store.agent_transaction():
             current = self.store.load_failover_decision(decision_id)
+            if current != original:
+                raise AgentHandoffError("failover decision record changed")
             reevaluated = self._evaluate_failover(
                 instance_id,
                 policy_id=current.policy_id,
@@ -668,6 +715,7 @@ class AgentManager:
                 "risk_evidence_ids",
                 "evidence_timestamps",
                 "checkpoint_id",
+                "id",
             )
             if any(
                 getattr(current, field) != getattr(reevaluated, field)
@@ -681,12 +729,15 @@ class AgentManager:
                 )
             except AgentOperationBlockedError as error:
                 raise AgentHandoffError(str(error)) from error
+            if _aware_datetime(current.expires_at) <= _aware_datetime(self._clock()):
+                raise AgentHandoffError("failover decision is expired")
             self.store.consume_failover_decision(
                 decision_id,
                 expected_generation=current.operation_generation,
                 consumed_at=self._clock(),
             )
         assert original.incoming_provider_id is not None
+        assert original.checkpoint_id is not None
         return self._perform_handoff(
             instance_id,
             original.incoming_provider_id,
@@ -696,6 +747,9 @@ class AgentManager:
             reason="controlled_failover",
             authorization_already_proven=True,
             reserved_operation=reserved_operation,
+            persisted_checkpoint=self.store.load_agent_checkpoint(
+                original.checkpoint_id
+            ),
         )
 
     def _has_active_transition(self, instance_id: str) -> bool:
@@ -721,6 +775,7 @@ class AgentManager:
             reason="manual_handoff",
             authorization_already_proven=False,
             reserved_operation=None,
+            persisted_checkpoint=None,
         )
 
     def _perform_handoff(
@@ -734,6 +789,7 @@ class AgentManager:
         reason: str,
         authorization_already_proven: bool,
         reserved_operation: AgentOperationReservation | None,
+        persisted_checkpoint: AgentCheckpoint | None,
     ) -> DriverEpoch:
         if reserved_operation is None:
             self._raise_transition_required(
@@ -786,7 +842,18 @@ class AgentManager:
             self.operations.verify_quiescent(operation)
         except AgentOperationBlockedError as error:
             raise AgentHandoffError(str(error)) from error
-        checkpoint = self._collect_checkpoint(instance_id, outgoing)
+        if persisted_checkpoint is None:
+            checkpoint = self._collect_checkpoint(instance_id, outgoing)
+        else:
+            checkpoint = self.store.load_agent_checkpoint(persisted_checkpoint.id)
+            if checkpoint != persisted_checkpoint:
+                raise AgentHandoffError("failover checkpoint record changed")
+            if (
+                checkpoint.instance_id != instance_id
+                or checkpoint.driver_epoch_id != outgoing.id
+                or checkpoint.session_id != outgoing.session_id
+            ):
+                raise AgentHandoffError("failover checkpoint binding changed")
         self._validate_checkpoint_for_handoff(checkpoint)
         incoming_driver = self.registry.driver_for_provider(
             incoming_provider_id,

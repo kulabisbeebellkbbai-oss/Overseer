@@ -79,6 +79,28 @@ handoff pipeline with reason `controlled_failover`.
   follows the existing paused/reconcile/rollback workflow; it is never replayed.
 - Behavioral tests were added after evaluator code began, as disclosed above.
 
+## Independent review hardening
+
+All seven review findings were resolved:
+
+1. expiry is checked again under the final immediate transaction after the
+   coordinator reservation is acquired and immediately before CAS consumption;
+2. failover transfers the exact immutable checkpoint bound into its decision,
+   reloads and verifies it after drain, and never captures a replacement;
+3. persisted healthy evidence is combined with non-executing live adapter and
+   executable readiness, whose privacy-safe resolved-path digest is decision
+   evidence and is re-evaluated at execution;
+4. failover contracts enforce enum instances, strict booleans, positive
+   integers, unique ordered identifiers, a closed ordered blocker vocabulary,
+   aware timestamps, and secret-safe references;
+5. evaluation and execution API parsers reject every unknown request field;
+6. chronology uses aware datetime instants rather than timestamp text ordering;
+7. the pure evaluator rejects foreign policy, health, risk, and checkpoint
+   evidence instead of filtering or recording it.
+
+Hardening verification: 134 focused tests passed. Final full suite: 754 passed,
+1 skipped. Compileall and diff-check passed.
+
 ## Commit
 
 `c10b231` — `Add controlled primary driver failover`.

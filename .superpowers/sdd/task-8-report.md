@@ -28,6 +28,8 @@ failed at the first new dashboard assertion:
 - Second-review full suite: `706 passed in 102.52s`
 - Third-review focused API/UI/workflow suite: `52 passed in 12.86s`
 - Third-review full suite: `706 passed in 102.47s`
+- Final failover-logic focused suite: `52 passed in 12.85s`
+- Final failover-logic full suite: `706 passed in 102.68s`
 - Node v24 executed the extracted production `providerGate` and
   `validatedTransferPayload` functions against ready, unavailable, unknown,
   required-capability, valid-payload, and missing-approval cases.
@@ -67,6 +69,10 @@ effective-mode state, reduced motion, action wiring, and capability gating.
   fallback destinations. Failover also verifies approved-fallback membership.
 - Instance status includes policy readiness/blocker, current checkpoint ID, and
   current transition state using persisted records only.
+- Current-driver readiness is separate from failover-policy readiness. An
+  unavailable outgoing provider is failover context and does not block a
+  healthy compatible approved fallback; missing controlled-failover policy has
+  deterministic precedence and fails closed.
 - Cancellation is a disabled non-action because no backend route exists, and is
   intentionally omitted from normal workflow metadata.
 - `/agent-usage` performs no provider calls and reports the configured source,
@@ -94,3 +100,5 @@ Review correction: `7c7e3764a591a34a7a7d734bc431a3e5f3b4ad1f`
 Second review correction: `f5864158b1cb6594d28ba935e4be151ce122c30a`
 
 Third review correction: `6746640cdd513a19045dda4756643304dfbe46fa`
+
+Final failover-logic correction: `b701656a8b3161dcf8e04104648c47e6cb75ab29`

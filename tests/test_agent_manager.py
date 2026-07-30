@@ -258,10 +258,15 @@ def _registry(
                     {
                         "id": provider_id,
                         "adapter": provider_id,
-                        "transport": "interactive_cli",
+                        "transport": (
+                            "noninteractive_cli"
+                            if provider_id == "claude"
+                            else "interactive_cli"
+                        ),
                         "executable": provider_id,
                         "capabilities": {
-                            "interactive_dispatch": True,
+                            "interactive_dispatch": provider_id == "codex",
+                            "noninteractive_dispatch": provider_id == "claude",
                             "session_resume": True,
                             "checkpoints": True,
                             "handoff_import": True,
@@ -671,6 +676,42 @@ def test_repeated_idempotency_key_returns_recorded_result_without_redispatch(
 
     assert second == first
     assert drivers["codex"].dispatch_calls == 1
+
+
+def test_disposable_codex_claude_codex_handoff_does_not_replay_completed_work(
+    manager: tuple[AgentManager, OverseerStore, dict[str, FakeDriver], list[str]],
+) -> None:
+    value, _, drivers, _ = manager
+    value.activate("overseer.default", initiated_by="operator")
+    completed = value.dispatch(
+        "overseer.default",
+        "complete operation once",
+        "completed-before-handoff",
+    )
+
+    claude_epoch = value.manual_handoff(
+        "overseer.default",
+        "claude",
+        "operator",
+        "approval.to-claude",
+    )
+    assert claude_epoch.provider_id == "claude"
+    codex_epoch = value.manual_handoff(
+        "overseer.default",
+        "codex",
+        "operator",
+        "approval.back-to-codex",
+    )
+    replay = value.dispatch(
+        "overseer.default",
+        "attempt to replay completed operation",
+        "completed-before-handoff",
+    )
+
+    assert codex_epoch.provider_id == "codex"
+    assert replay == completed
+    assert drivers["codex"].dispatch_calls == 1
+    assert drivers["claude"].dispatch_calls == 0
 
 
 def test_provider_evidence_cannot_override_manager_recorded_result_state(

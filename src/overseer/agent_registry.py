@@ -33,7 +33,7 @@ _ALLOWED_ADAPTERS = frozenset(
 )
 _ADAPTER_COMBINATIONS = {
     "codex": (AgentTransport.INTERACTIVE_CLI, "codex"),
-    "claude": (AgentTransport.INTERACTIVE_CLI, "claude"),
+    "claude": (AgentTransport.NONINTERACTIVE_CLI, "claude"),
     "qwen_code": (AgentTransport.INTERACTIVE_CLI, "qwen"),
     "mistral_vibe": (AgentTransport.INTERACTIVE_CLI, "vibe"),
     "antigravity": (AgentTransport.GATEWAY, None),

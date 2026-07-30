@@ -20,9 +20,20 @@
     {
       "id": "claude",
       "adapter": "claude",
-      "transport": "interactive_cli",
+      "transport": "noninteractive_cli",
       "executable": "claude",
-      "capabilities": {}
+      "capabilities": {
+        "session_discovery": false,
+        "session_resume": true,
+        "interactive_dispatch": false,
+        "noninteractive_dispatch": true,
+        "structured_events": true,
+        "checkpoints": false,
+        "cancellation": false,
+        "delegated_workers": false,
+        "usage_observation": false,
+        "handoff_import": true
+      }
     },
     {
       "id": "qwen-code",

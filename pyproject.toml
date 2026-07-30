@@ -24,3 +24,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+markers = [
+  "live_agent: opt-in disposable live provider checks",
+]

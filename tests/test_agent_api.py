@@ -125,13 +125,10 @@ def test_agent_provider_inventory(api: LocalAPI) -> None:
         "unavailable_reason": None,
     } == providers["codex"]
     assert providers["claude"]["configured"] is True
-    assert providers["claude"]["installed"] is False
-    assert providers["claude"]["available"] is False
-    assert providers["claude"]["readiness"] == "unavailable"
-    assert providers["claude"]["unavailable_reason"] == {
-        "type": "adapter_not_installed",
-        "adapter_id": "claude",
-    }
+    assert providers["claude"]["installed"] is True
+    assert providers["claude"]["available"] is True
+    assert providers["claude"]["readiness"] == "available"
+    assert providers["claude"]["unavailable_reason"] is None
 
 
 def test_agent_inventory_uses_existing_api_authentication(tmp_path: Path) -> None:

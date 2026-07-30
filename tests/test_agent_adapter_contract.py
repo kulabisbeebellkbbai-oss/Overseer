@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -8,6 +10,8 @@ from typing import Callable
 import pytest
 
 from overseer.agent_adapters.codex import CodexDriver
+from overseer.agent_adapters.claude import ClaudeDriver
+from overseer.agent_adapters.base_cli import CliCommandRunner
 from overseer.agent_contracts import (
     AgentCapabilities,
     AgentDispatchRequest,
@@ -16,6 +20,7 @@ from overseer.agent_contracts import (
     AgentInstanceProfile,
     AgentOperationState,
     AgentProvider,
+    AgentSession,
     AgentTransport,
     PrimaryDriver,
 )
@@ -51,6 +56,68 @@ class RecordingRunner:
 
 
 AdapterFactory = Callable[[str], PrimaryDriver]
+
+
+@pytest.fixture
+def fake_claude(tmp_path: Path) -> Path:
+    executable = tmp_path / "claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "mode = os.environ.get('FAKE_CLAUDE_MODE', 'success')\n"
+        "prompt = sys.stdin.read()\n"
+        "if mode == 'nonzero':\n"
+        " print('authentication failed', file=sys.stderr); raise SystemExit(2)\n"
+        "if mode == 'malformed': print('{bad json'); raise SystemExit(0)\n"
+        "if mode == 'oversized': print('x' * 70000); raise SystemExit(0)\n"
+        "if mode == 'json_error':\n"
+        " print(json.dumps({'is_error': True, 'result': 'request rejected', "
+        "'session_id': 'provider-session-error'})); raise SystemExit(0)\n"
+        "print(json.dumps({'type': 'result', 'subtype': 'success', "
+        "'is_error': False, 'result': 'private transcript must not persist', "
+        "'session_id': 'provider-session-1', 'duration_ms': 10, "
+        "'num_turns': 1, 'prompt_echo': prompt}))\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def _claude_adapter(
+    fake_claude: Path,
+    workspace: Path,
+    *,
+    mode: str = "success",
+    external_session_id: str | None = None,
+) -> ClaudeDriver:
+    capabilities = AgentCapabilities(
+        session_resume=True,
+        noninteractive_dispatch=True,
+        structured_events=True,
+        handoff_import=True,
+    )
+    provider = AgentProvider(
+        id="claude",
+        adapter_id="claude",
+        capabilities=capabilities,
+        transports=(AgentTransport.NONINTERACTIVE_CLI,),
+        executable_allowlist=(str(fake_claude),),
+    )
+    profile = AgentInstanceProfile(
+        id="overseer.default",
+        primary_provider_id="claude",
+        primary_adapter_id="claude",
+        transport=AgentTransport.NONINTERACTIVE_CLI,
+        workspace=str(workspace),
+        external_session_id=external_session_id,
+        declared_capabilities=capabilities,
+    )
+    runner = CliCommandRunner(
+        executable_path=fake_claude,
+        executable_allowlist=(str(fake_claude),),
+        environment={**os.environ, "FAKE_CLAUDE_MODE": mode},
+    )
+    return ClaudeDriver(provider, profile, runner=runner)
 
 
 @pytest.fixture
@@ -412,3 +479,183 @@ def test_required_external_session_does_not_fall_through_to_workspace_match(
     assert result.error_category is AgentErrorCategory.SESSION_NOT_FOUND
     assert result.external_session_id is None
     assert runner.commands == []
+
+
+def test_claude_dispatch_is_bounded_confined_and_privacy_safe(
+    fake_claude: Path, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace)
+    request = AgentDispatchRequest(
+        id="dispatch.claude.1",
+        instance_id="overseer.default",
+        session_id="session.overseer.default.claude.1",
+        driver_epoch_id="epoch.claude.1",
+        idempotency_key="key.claude.1",
+        prompt="Continue the approved task.",
+    )
+
+    result = adapter.dispatch(request)
+
+    assert result.state is AgentOperationState.SUCCEEDED
+    assert result.request_id == request.id
+    assert result.instance_id == request.instance_id
+    assert result.session_id == request.session_id
+    assert result.driver_epoch_id == request.driver_epoch_id
+    assert result.external_session_id == "provider-session-1"
+    assert result.evidence == {
+        "result_type": "result",
+        "result_subtype": "success",
+        "provider_session_id": "provider-session-1",
+    }
+    assert "private transcript" not in repr(result)
+    assert adapter.last_invocation.cwd == str(workspace.resolve())
+    assert adapter.last_invocation.input_text == request.prompt
+    assert "--permission-mode" in adapter.last_invocation.argv
+    assert "plan" in adapter.last_invocation.argv
+    assert "--max-budget-usd" in adapter.last_invocation.argv
+    assert "--session-id" in adapter.last_invocation.argv
+    assert not {
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "bypassPermissions",
+    }.intersection(adapter.last_invocation.argv)
+
+
+@pytest.mark.parametrize(
+    ("mode", "category"),
+    [
+        ("json_error", AgentErrorCategory.DISPATCH_REJECTED),
+        ("nonzero", AgentErrorCategory.PROVIDER_UNAVAILABLE),
+        ("malformed", AgentErrorCategory.PROVIDER_PROTOCOL_ERROR),
+        ("oversized", AgentErrorCategory.PROVIDER_PROTOCOL_ERROR),
+    ],
+)
+def test_claude_normalizes_provider_failures_without_raw_output(
+    fake_claude: Path,
+    tmp_path: Path,
+    mode: str,
+    category: AgentErrorCategory,
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace, mode=mode)
+    request = AgentDispatchRequest(
+        id=f"dispatch.claude.{mode}",
+        instance_id="overseer.default",
+        session_id="session.claude.1",
+        driver_epoch_id="epoch.claude.1",
+        idempotency_key=f"key.claude.{mode}",
+        prompt="bounded prompt",
+    )
+
+    result = adapter.dispatch(request)
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_category is category
+    assert "authentication failed" not in repr(result)
+    assert "request rejected" not in repr(result)
+
+
+def test_claude_resume_requires_proven_external_identity(
+    fake_claude: Path, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace)
+    session = AgentSession(
+        id="session.claude.1",
+        provider_id="claude",
+        external_session_id="provider-session-existing",
+        workspace=str(workspace),
+        transport=AgentTransport.NONINTERACTIVE_CLI,
+        capabilities=adapter.provider.capabilities,
+        instance_id="overseer.default",
+    )
+
+    result = adapter.resume(session)
+
+    assert result.state is AgentOperationState.SUCCEEDED
+    resume_index = adapter.last_invocation.argv.index("--resume")
+    assert adapter.last_invocation.argv[resume_index + 1] == "provider-session-existing"
+    assert result.session_id == session.id
+
+
+def test_claude_handoff_prompt_contains_only_normalized_identifiers(
+    fake_claude: Path, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace)
+    package = AgentHandoffPackage(
+        id="handoff.claude.1",
+        instance_id="overseer.default",
+        outgoing_epoch_id="epoch.codex.1",
+        incoming_provider_id="claude",
+        objective="Continue the approved objective.",
+        checkpoint_id="checkpoint.safe.1",
+        evidence={
+            "incoming_session_id": "session.claude.2",
+            "incoming_epoch_id": "epoch.claude.2",
+            "secret_payload": "must-never-appear",
+        },
+    )
+
+    result = adapter.import_handoff(adapter.profile, package)
+
+    assert result.session_id == "session.claude.2"
+    assert result.driver_epoch_id == "epoch.claude.2"
+    assert "Continue the approved objective." in adapter.last_invocation.input_text
+    assert "checkpoint.safe.1" in adapter.last_invocation.input_text
+    assert "handoff.claude.1" in adapter.last_invocation.input_text
+    assert "must-never-appear" not in adapter.last_invocation.input_text
+
+
+def test_claude_unsupported_operations_do_not_scrape_or_emulate(
+    fake_claude: Path, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "trusted"
+    workspace.mkdir()
+    adapter = _claude_adapter(fake_claude, workspace)
+    session = AgentSession(
+        id="session.claude.1",
+        provider_id="claude",
+        external_session_id=None,
+        workspace=str(workspace),
+        transport=AgentTransport.NONINTERACTIVE_CLI,
+        capabilities=adapter.provider.capabilities,
+        instance_id="overseer.default",
+    )
+
+    assert adapter.discover() == ()
+    assert adapter.resolve("anything") is None
+    assert adapter.checkpoint(session).evidence["unsupported_capability"] == "checkpoints"
+    assert adapter.cancel(session).error_category is AgentErrorCategory.UNSUPPORTED_CAPABILITY
+
+
+@pytest.mark.live_agent
+def test_live_claude_disposable_structured_dispatch(tmp_path: Path) -> None:
+    if os.environ.get("OVERSEER_LIVE_AGENT_PROVIDER") != "claude":
+        pytest.skip("live Claude disabled: OVERSEER_LIVE_AGENT_PROVIDER is not claude")
+    if os.environ.get("OVERSEER_LIVE_AGENT_AUTH_VERIFIED") != "1":
+        pytest.skip("live Claude disabled: authentication was not verified non-mutatingly")
+    executable_name = shutil.which("claude")
+    if executable_name is None:
+        pytest.skip("live Claude disabled: executable is unavailable")
+    workspace = tmp_path / "disposable-claude-workspace"
+    workspace.mkdir()
+    adapter = _claude_adapter(Path(executable_name), workspace)
+    request = AgentDispatchRequest(
+        id="dispatch.claude.live",
+        instance_id="overseer.default",
+        session_id="session.claude.live",
+        driver_epoch_id="epoch.claude.live",
+        idempotency_key="key.claude.live",
+        prompt="Reply with the single word READY. Do not modify files or use tools.",
+    )
+
+    result = adapter.dispatch(request)
+
+    assert result.state is AgentOperationState.SUCCEEDED
+    assert result.external_session_id

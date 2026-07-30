@@ -43,6 +43,7 @@ class CliCommandRunner:
         argv: Sequence[str],
         input_text: str | None = None,
         timeout_seconds: float = 30,
+        cwd: str | Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
             raise TypeError("argv must be a Sequence[str], not a shell command string")
@@ -59,6 +60,14 @@ class CliCommandRunner:
             or timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be positive")
+        working_directory = None
+        if cwd is not None:
+            configured_cwd = Path(cwd)
+            if not configured_cwd.is_absolute():
+                raise ValueError("cwd must be absolute")
+            working_directory = str(configured_cwd.resolve(strict=True))
+            if not Path(working_directory).is_dir():
+                raise ValueError("cwd must be a directory")
         return subprocess.run(
             (self.executable_path, *command[1:]),
             input=input_text,
@@ -68,4 +77,5 @@ class CliCommandRunner:
             env=dict(self.environment),
             shell=False,
             check=False,
+            cwd=working_directory,
         )

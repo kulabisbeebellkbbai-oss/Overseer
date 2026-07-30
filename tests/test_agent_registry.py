@@ -26,7 +26,9 @@ def _provider(
     return {
         "id": provider_id,
         "adapter": "codex" if provider_id == "codex" else "claude",
-        "transport": "interactive_cli",
+        "transport": (
+            "interactive_cli" if provider_id == "codex" else "noninteractive_cli"
+        ),
         "executable": executable or provider_id,
         "capabilities": capabilities or {"session_resume": True, "handoff_import": True},
     }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from dataclasses import replace
 from pathlib import Path
 
@@ -683,3 +685,57 @@ def test_agent_transaction_rolls_back_all_lifecycle_writes(tmp_path: Path) -> No
 
         assert store.list_agent_checkpoints() == ()
         assert store.list_agent_handoffs() == ()
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_store_hardens_new_database_and_sqlite_sidecars_under_public_umask(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    previous = os.umask(0o022)
+    try:
+        with OverseerStore(path) as store:
+            store.save_agent_checkpoint(_checkpoint("checkpoint.mode", "epoch.mode"))
+            assert _mode(path) == 0o600
+            assert Path(f"{path}-wal").exists()
+            assert Path(f"{path}-shm").exists()
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = Path(f"{path}{suffix}")
+                if sidecar.exists():
+                    assert _mode(sidecar) == 0o600
+    finally:
+        os.umask(previous)
+
+
+def test_store_reopen_hardens_legacy_database_without_touching_other_files(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    unrelated = tmp_path / "unrelated.txt"
+    sqlite3.connect(path).close()
+    path.chmod(0o644)
+    unrelated.write_text("keep", encoding="utf-8")
+    unrelated.chmod(0o644)
+
+    with OverseerStore(path):
+        assert _mode(path) == 0o600
+
+    assert _mode(unrelated) == 0o644
+
+
+def test_store_rejects_symlink_database_without_chmodding_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.sqlite3"
+    sqlite3.connect(target).close()
+    target.chmod(0o644)
+    link = tmp_path / "state.sqlite3"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular file"):
+        OverseerStore(link)
+
+    assert _mode(target) == 0o644

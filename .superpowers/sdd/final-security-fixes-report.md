@@ -36,3 +36,19 @@ calling live providers, services, or credential resolvers.
 - Static security checks confirmed no unbounded Codex facade default, no
   `capture_output=True` seam in the Codex adapter/facade, and no handoff
   signature references in public API, CLI, or client modules.
+
+## HMAC Key-at-Rest Follow-up
+
+- SQLite databases are atomically precreated with mode `0600`. Existing paths
+  are opened without following symlinks, verified as owner-held regular files,
+  and tightened to `0600` before SQLite connects.
+- Database, WAL, SHM, and rollback-journal artifacts are rehardened after
+  connection setup, schema initialization, commits, checkpoints, and close.
+  The implementation does not alter process umask or parent-directory modes.
+- Filesystem RED evidence reproduced permissive `0644` creation/reopen behavior
+  and symlink acceptance. Focused GREEN evidence verifies a new database plus
+  real WAL/SHM files under umask `0022`, legacy-mode tightening, symlink
+  rejection, and no chmod of an unrelated file.
+- The secure-open path also rechecks device and inode identity immediately
+  after SQLite connects, before PRAGMAs or schema writes. The final fresh full
+  suite passed with `788 passed, 1 skipped`; compileall and diff checks passed.

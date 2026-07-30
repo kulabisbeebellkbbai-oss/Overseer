@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import sqlite3
+import stat
 from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -178,16 +180,94 @@ class AgentActivationReservation:
 
 
 class SQLiteStore:
-    """Small JSON-payload SQLite store for early durable state."""
+    """Small JSON-payload SQLite store with owner-only database artifacts.
+
+    The database and SQLite-created sidecars are restricted to mode ``0600``.
+    The containing directory's existing permissions are never broadened or
+    otherwise changed.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        expected_identity = self._prepare_database_file()
         self._connection = sqlite3.connect(self.path, timeout=30.0)
+        self._verify_database_identity(expected_identity)
         self._connection.row_factory = sqlite3.Row
         self._agent_transaction_depth = 0
         self._configure_connection()
         self.initialize()
+        self._harden_database_files()
+
+    def _prepare_database_file(self) -> tuple[int, int]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except FileExistsError:
+            status = self._harden_regular_owner_file(self.path)
+            if status is None:
+                raise FileNotFoundError(self.path)
+            return status.st_dev, status.st_ino
+        else:
+            try:
+                status = os.fstat(descriptor)
+                os.fchmod(descriptor, 0o600)
+                return status.st_dev, status.st_ino
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _harden_regular_owner_file(
+        path: Path, *, missing_ok: bool = False
+    ) -> os.stat_result | None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        except OSError as error:
+            raise ValueError(f"SQLite artifact must be an owned regular file: {path}") from error
+        try:
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode):
+                raise ValueError(f"SQLite artifact must be an owned regular file: {path}")
+            if hasattr(os, "geteuid") and status.st_uid != os.geteuid():
+                raise PermissionError(f"SQLite artifact is not owned by this process: {path}")
+            os.fchmod(descriptor, 0o600)
+            return status
+        finally:
+            os.close(descriptor)
+
+    def _verify_database_identity(self, expected: tuple[int, int]) -> None:
+        try:
+            status = self.path.lstat()
+        except FileNotFoundError:
+            self._connection.close()
+            raise ValueError("SQLite database path changed during secure open")
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or (status.st_dev, status.st_ino) != expected
+        ):
+            self._connection.close()
+            raise ValueError("SQLite database path changed during secure open")
+
+    def _harden_database_files(self, *, database_missing_ok: bool = False) -> None:
+        self._harden_regular_owner_file(
+            self.path, missing_ok=database_missing_ok
+        )
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{self.path}{suffix}")
+            try:
+                sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            self._harden_regular_owner_file(sidecar, missing_ok=True)
 
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA busy_timeout = 30000")
@@ -195,9 +275,22 @@ class SQLiteStore:
             self._connection.execute("PRAGMA journal_mode = WAL")
         except sqlite3.OperationalError:
             pass
+        self._harden_database_files()
 
     def close(self) -> None:
-        self._connection.close()
+        try:
+            try:
+                self._connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass
+            self._harden_database_files(database_missing_ok=True)
+        finally:
+            self._connection.close()
+            self._harden_database_files(database_missing_ok=True)
+
+    def _commit(self) -> None:
+        self._connection.commit()
+        self._harden_database_files()
 
     def __enter__(self) -> SQLiteStore:
         return self
@@ -655,11 +748,11 @@ class SQLiteStore:
         else:
             self._agent_transaction_depth -= 1
             if outermost:
-                self._connection.commit()
+                self._commit()
 
     def _commit_agent_mutation(self) -> None:
         if self._agent_transaction_depth == 0:
-            self._connection.commit()
+            self._commit()
 
     def _record_schema_migration(self, version: int, description: str) -> None:
         self._connection.execute(
@@ -833,7 +926,7 @@ class SQLiteStore:
                 observed_at,
             ),
         )
-        self._connection.commit()
+        self._commit()
         return cursor.rowcount == 1
 
     def load_agent_activation(
@@ -1584,7 +1677,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO usage_limits (id, resource_id, payload) VALUES (?, ?, ?)",
             (usage_limit.id, usage_limit.resource_id, _dump(usage_limit)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_usage_limit(self, usage_limit_id: str) -> UsageLimit:
         return _load_dataclass(UsageLimit, self._get_payload("usage_limits", usage_limit_id))
@@ -1600,7 +1693,7 @@ class SQLiteStore:
             """,
             (request.id, request.limit_id, request.resource_id, _dump(request)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_usage_continuation_request(self, request_id: str) -> UsageContinuationRequest:
         return _load_dataclass(UsageContinuationRequest, self._get_payload("usage_continuation_requests", request_id))
@@ -1619,7 +1712,7 @@ class SQLiteStore:
             """,
             (dispatch.id, dispatch.request_id, _dump(dispatch)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_usage_continuation_dispatch(self, dispatch_id: str) -> UsageContinuationDispatch:
         return _load_dataclass(
@@ -1638,7 +1731,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO health_evidence (id, resource_id, payload) VALUES (?, ?, ?)",
             (evidence.id, evidence.resource_id, _dump(evidence)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_health_evidence(self, evidence_id: str) -> HealthEvidence:
         return _load_dataclass(HealthEvidence, self._get_payload("health_evidence", evidence_id))
@@ -1648,7 +1741,7 @@ class SQLiteStore:
 
     def delete_health_evidence(self, evidence_id: str) -> None:
         self._connection.execute("DELETE FROM health_evidence WHERE id = ?", (evidence_id,))
-        self._connection.commit()
+        self._commit()
 
     def prune_health_evidence(self, retain_per_target: int) -> int:
         if retain_per_target < 1:
@@ -1662,7 +1755,7 @@ class SQLiteStore:
             for stale in ordered[retain_per_target:]:
                 self._connection.execute("DELETE FROM health_evidence WHERE id = ?", (stale.id,))
                 deleted += 1
-        self._connection.commit()
+        self._commit()
         return deleted
 
     def save_health_target(self, target: HealthTarget) -> None:
@@ -1670,7 +1763,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO health_targets (id, resource_id, payload) VALUES (?, ?, ?)",
             (target.id, target.resource_id, _dump(target)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_health_target(self, target_id: str) -> HealthTarget:
         return _load_dataclass(HealthTarget, self._get_payload("health_targets", target_id))
@@ -1683,7 +1776,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO physical_identities (stable_id, payload) VALUES (?, ?)",
             (identity.stable_id, _dump(identity)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_physical_identity(self, stable_id: str) -> PhysicalIdentity:
         row = self._connection.execute(
@@ -1708,7 +1801,7 @@ class SQLiteStore:
                 "INSERT OR REPLACE INTO decisions (claim_id, payload) VALUES (?, ?)",
                 (claim.id, _dump(decision)),
             )
-        self._connection.commit()
+        self._commit()
 
     def load_claim(self, claim_id: str) -> Claim:
         return _load_dataclass(Claim, self._get_payload("claims", claim_id))
@@ -1727,7 +1820,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO approvals (id, subject_id, payload) VALUES (?, ?, ?)",
             (approval.id, approval.subject_id, _dump(approval)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_approval(self, approval_id: str) -> ApprovalRequest:
         return _load_dataclass(ApprovalRequest, self._get_payload("approvals", approval_id))
@@ -1783,7 +1876,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO admin_executions (id, plan_id, payload) VALUES (?, ?, ?)",
             (result.id, result.plan_id, _dump(result)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_admin_execution(self, result_id: str) -> AdminExecutionResult:
         return _load_dataclass(AdminExecutionResult, self._get_payload("admin_executions", result_id))
@@ -1796,7 +1889,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO admin_history_archives (id, plan_id, payload) VALUES (?, ?, ?)",
             (archive.id, archive.plan_id, _dump(archive)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_admin_history_archive(self, archive_id: str) -> AdminHistoryArchiveRecord:
         return _load_dataclass(AdminHistoryArchiveRecord, self._get_payload("admin_history_archives", archive_id))
@@ -1809,7 +1902,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO host_security_source_reviews (id, remote_address, payload) VALUES (?, ?, ?)",
             (review.id, review.remote_address, _dump(review)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_host_security_source_review(self, review_id: str) -> HostSecuritySourceReview:
         return _load_dataclass(HostSecuritySourceReview, self._get_payload("host_security_source_reviews", review_id))
@@ -1822,7 +1915,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO host_security_ids_review_packages (id, plan_id, payload) VALUES (?, ?, ?)",
             (package.id, package.plan_id, _dump(package)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_host_security_ids_review_package(self, package_id: str) -> HostSecurityIDSReviewPackage:
         return _load_dataclass(HostSecurityIDSReviewPackage, self._get_payload("host_security_ids_review_packages", package_id))
@@ -1842,7 +1935,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO crew_messages (id, owner_domain, payload) VALUES (?, ?, ?)",
             (message.id, message.owner_domain.value, _dump(message)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_crew_message(self, message_id: str) -> CrewMessage:
         return _load_dataclass(CrewMessage, self._get_payload("crew_messages", message_id))
@@ -1858,7 +1951,7 @@ class SQLiteStore:
             """,
             (record.id, record.kind.value, record.owner_domain.value, record.status.value, _dump(record)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_operation_record(self, record_id: str) -> OperationRecord:
         return _load_dataclass(OperationRecord, self._get_payload("operation_records", record_id))
@@ -1892,7 +1985,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO maintenance_schedules (id, target, payload) VALUES (?, ?, ?)",
             (schedule.id, schedule.target, _dump(schedule)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_maintenance_schedule(self, schedule_id: str) -> MaintenanceSchedule:
         return _load_dataclass(MaintenanceSchedule, self._get_payload("maintenance_schedules", schedule_id))
@@ -1917,7 +2010,7 @@ class SQLiteStore:
             """,
             (request.id, request.provider_id, request.status.value, _dump(request)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_key_broker_token_request(self, request_id: str) -> KeyBrokerTokenRequest:
         return _load_dataclass(KeyBrokerTokenRequest, self._get_payload("key_broker_token_requests", request_id))
@@ -1936,7 +2029,7 @@ class SQLiteStore:
             """,
             (grant.id, grant.request_id, grant.provider_id, grant.status.value, _dump(grant)),
         )
-        self._connection.commit()
+        self._commit()
 
     def load_key_broker_token_grant(self, grant_id: str) -> KeyBrokerTokenGrant:
         return _load_dataclass(KeyBrokerTokenGrant, self._get_payload("key_broker_token_grants", grant_id))

@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import json
 import re
+import secrets
 from typing import Callable, Protocol
 from uuid import uuid4
 
@@ -24,6 +29,8 @@ from .agent_contracts import (
 MAX_HANDOFF_DEPTH = 8
 MAX_HANDOFF_ITEMS = 256
 MAX_HANDOFF_STRING_LENGTH = 4096
+_EPHEMERAL_ATTESTATION_KEY = secrets.token_bytes(32)
+_EPHEMERAL_PACKAGES: dict[str, AgentHandoffPackage] = {}
 
 
 def evaluate_failover_evidence(
@@ -206,6 +213,14 @@ class AgentHandoffStore(Protocol):
 
     def save_agent_handoff(self, handoff: AgentHandoffPackage) -> None: ...
 
+    def sign_and_save_agent_handoff(
+        self, handoff: AgentHandoffPackage
+    ) -> AgentHandoffPackage: ...
+
+    def verify_agent_handoff_attestation(
+        self, handoff: AgentHandoffPackage
+    ) -> bool: ...
+
 
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:token|cookie|authorization|password|private[_\s-]?key|bearer|"
@@ -264,8 +279,15 @@ class AgentHandoffService:
             evidence=evidence,
             created_at=self._clock(),
         )
-        if self.store is not None:
-            self.store.save_agent_handoff(package)
+        if self.store is not None and hasattr(
+            self.store, "sign_and_save_agent_handoff"
+        ):
+            package = self.store.sign_and_save_agent_handoff(package)
+        else:
+            package = _attest_handoff(package, _EPHEMERAL_ATTESTATION_KEY)
+            _EPHEMERAL_PACKAGES[package.id] = package
+            if self.store is not None:
+                self.store.save_agent_handoff(package)
         return package
 
     def build_from_store(
@@ -315,11 +337,55 @@ class AgentHandoffService:
         _validate_handoff_bounds(package.evidence)
         _reject_sensitive_material(package.objective, key="objective")
         _reject_sensitive_material(package.evidence)
+        if self.store is not None and hasattr(
+            self.store, "verify_agent_handoff_attestation"
+        ):
+            attested = self.store.verify_agent_handoff_attestation(package)
+        else:
+            attested = (
+                _EPHEMERAL_PACKAGES.get(package.id) == package
+                and _verify_handoff(package, _EPHEMERAL_ATTESTATION_KEY)
+            )
+        if not attested:
+            raise ValueError("handoff attestation is missing or invalid")
         if not incoming_capabilities.handoff_import:
             raise ValueError("incoming provider lacks handoff_import capability")
         if not incoming_capabilities.supports(package.required_capabilities):
             raise ValueError("incoming provider lacks required capabilities")
         return package
+
+
+def canonical_handoff_bytes(package: AgentHandoffPackage) -> bytes:
+    from .serialization import to_jsonable
+
+    payload = to_jsonable(replace(package, signature=None))
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _attest_handoff(
+    package: AgentHandoffPackage, key: bytes
+) -> AgentHandoffPackage:
+    versioned = replace(
+        package, attestation_version="hmac-sha256-v1", signature=None
+    )
+    signature = hmac.new(
+        key, canonical_handoff_bytes(versioned), hashlib.sha256
+    ).hexdigest()
+    return replace(versioned, signature=signature)
+
+
+def _verify_handoff(package: AgentHandoffPackage, key: bytes) -> bool:
+    if (
+        package.attestation_version != "hmac-sha256-v1"
+        or package.signature is None
+    ):
+        return False
+    expected = hmac.new(
+        key, canonical_handoff_bytes(package), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, package.signature)
 
 
 def _validate_handoff_bounds(value: object, *, depth: int = 0) -> None:

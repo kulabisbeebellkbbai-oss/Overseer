@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from typing import Mapping
 import uuid
 
 from ..agent_contracts import (
@@ -36,6 +37,28 @@ _DANGEROUS_ARGUMENTS = frozenset(
         "bypassPermissions",
     }
 )
+# Provider subprocesses inherit only process-location and locale state. HOME is
+# required by the CLI for its own configuration directory, PATH locates child
+# runtime tools, and the locale variables keep text decoding deterministic.
+# Credential references remain opaque locators and are deliberately not copied.
+_CLAUDE_PROCESS_ENVIRONMENT_KEYS = (
+    "HOME",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+)
+
+
+def _minimal_claude_environment(
+    source: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        key: source[key]
+        for key in _CLAUDE_PROCESS_ENVIRONMENT_KEYS
+        if key in source and source[key]
+    }
 
 
 @dataclass(frozen=True)
@@ -95,7 +118,7 @@ class ClaudeDriver:
             runner = CliCommandRunner(
                 executable_path=executable_path,
                 executable_allowlist=provider.executable_allowlist,
-                environment=dict(os.environ),
+                environment=_minimal_claude_environment(os.environ),
             )
         self.runner = runner
         self.last_invocation: ClaudeInvocation | None = None

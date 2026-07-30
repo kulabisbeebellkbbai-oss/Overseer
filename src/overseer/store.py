@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import re
+import secrets
 import sqlite3
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -62,6 +65,7 @@ AGENT_DRIVER_SCHEMA_V5 = "agent_driver_v5"
 AGENT_DRIVER_SCHEMA_V6 = "agent_driver_v6"
 AGENT_DRIVER_SCHEMA_V7 = "agent_driver_v7"
 AGENT_DRIVER_SCHEMA_V8 = "agent_driver_v8"
+AGENT_DRIVER_SCHEMA_V9 = "agent_driver_v9"
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
         AgentTransitionState.IMPORT_ACKNOWLEDGED,
@@ -424,6 +428,18 @@ class SQLiteStore:
             )
             self._connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS agent_private_metadata (
+                    key TEXT PRIMARY KEY,
+                    value BLOB NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO agent_private_metadata(key, value) VALUES (?, ?)",
+                ("handoff_hmac_sha256_v1", secrets.token_bytes(32)),
+            )
+            self._connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS agent_activation_reservations (
                     instance_id TEXT PRIMARY KEY,
                     reservation_id TEXT NOT NULL,
@@ -545,6 +561,10 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V8,
                 "persist crash-safe provider recovery attempts and outcomes",
+            )
+            self._record_agent_schema_migration(
+                AGENT_DRIVER_SCHEMA_V9,
+                "attest new handoffs; legacy unsigned packages remain fail-safe invalid",
             )
 
     def _migrate_agent_activation_leases(self) -> None:
@@ -1194,6 +1214,57 @@ class SQLiteStore:
                 "incoming_provider_id": handoff.incoming_provider_id,
             },
         )
+
+    def sign_and_save_agent_handoff(
+        self, handoff: AgentHandoffPackage
+    ) -> AgentHandoffPackage:
+        from dataclasses import replace
+        from .agent_handoff import canonical_handoff_bytes
+
+        with self.agent_transaction():
+            versioned = replace(
+                handoff, attestation_version="hmac-sha256-v1", signature=None
+            )
+            signature = hmac.new(
+                self._handoff_attestation_key(),
+                canonical_handoff_bytes(versioned),
+                hashlib.sha256,
+            ).hexdigest()
+            signed = replace(versioned, signature=signature)
+            self.save_agent_handoff(signed)
+        return signed
+
+    def verify_agent_handoff_attestation(
+        self, handoff: AgentHandoffPackage
+    ) -> bool:
+        from .agent_handoff import canonical_handoff_bytes
+
+        if (
+            handoff.attestation_version != "hmac-sha256-v1"
+            or handoff.signature is None
+        ):
+            return False
+        try:
+            persisted = self.load_agent_handoff(handoff.id)
+        except KeyError:
+            return False
+        if persisted != handoff:
+            return False
+        expected = hmac.new(
+            self._handoff_attestation_key(),
+            canonical_handoff_bytes(handoff),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, handoff.signature)
+
+    def _handoff_attestation_key(self) -> bytes:
+        row = self._connection.execute(
+            "SELECT value FROM agent_private_metadata WHERE key = ?",
+            ("handoff_hmac_sha256_v1",),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("handoff attestation key is unavailable")
+        return bytes(row["value"])
 
     def load_agent_handoff(self, handoff_id: str) -> AgentHandoffPackage:
         return _load_dataclass(

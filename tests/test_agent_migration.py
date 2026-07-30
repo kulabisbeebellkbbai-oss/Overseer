@@ -58,6 +58,18 @@ class LegacyRunner:
             return subprocess.CompletedProcess(command, 1, "", "missing")
         return subprocess.CompletedProcess(command, 0, "started", "")
 
+    def run_bounded(
+        self,
+        command: list[str],
+        input_text: str | None = None,
+        timeout_seconds: float = 30,
+        cwd: str | Path | None = None,
+        *,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return self(command, input=input_text)
+
 
 def _codex_csv(tmp_path: Path) -> Path:
     registry = tmp_path / "codex-projects.csv"

@@ -26,6 +26,7 @@ from overseer.agent_contracts import (
     AgentProvider,
     AgentSession,
     AgentTransport,
+    CredentialReference,
     PrimaryDriver,
 )
 from overseer.agent_operations import AgentOperationCoordinator
@@ -192,6 +193,38 @@ class RecordingRunner:
             return subprocess.CompletedProcess(command, 0, output, "")
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
+    def run_bounded(
+        self,
+        command: list[str],
+        input_text: str | None = None,
+        timeout_seconds: float = 30,
+        cwd: str | Path | None = None,
+        *,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+    ) -> subprocess.CompletedProcess[str]:
+        assert stdout_limit_bytes == 65_536
+        assert stderr_limit_bytes == 65_536
+        return self(command, input=input_text)
+
+
+class OversizedBoundedRunner(RecordingRunner):
+    def run_bounded(
+        self,
+        command: list[str],
+        input_text: str | None = None,
+        timeout_seconds: float = 30,
+        cwd: str | Path | None = None,
+        *,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+    ) -> subprocess.CompletedProcess[str]:
+        self.commands.append(tuple(command))
+        assert timeout_seconds == 30
+        assert stdout_limit_bytes == 65_536
+        assert stderr_limit_bytes == 65_536
+        raise CliOutputLimitExceeded("oversized private output")
+
 
 AdapterFactory = Callable[[str], PrimaryDriver]
 
@@ -270,6 +303,53 @@ def _claude_adapter(
         environment={**os.environ, "FAKE_CLAUDE_MODE": mode},
     )
     return ClaudeDriver(provider, profile, runner=runner)
+
+
+def test_claude_default_environment_is_minimal_and_does_not_resolve_references(
+    fake_claude: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("DATABASE_PASSWORD", "database-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
+    capabilities = AgentCapabilities(
+        session_resume=True,
+        noninteractive_dispatch=True,
+        handoff_import=True,
+    )
+    provider = AgentProvider(
+        id="claude",
+        adapter_id="claude",
+        capabilities=capabilities,
+        transports=(AgentTransport.NONINTERACTIVE_CLI,),
+        executable_allowlist=(str(fake_claude),),
+        required_secret_references=("provider",),
+    )
+    profile = AgentInstanceProfile(
+        id="overseer.default",
+        primary_provider_id="claude",
+        primary_adapter_id="claude",
+        transport=AgentTransport.NONINTERACTIVE_CLI,
+        workspace=str(tmp_path),
+        credential_references={
+            "provider": CredentialReference("secret://overseer/claude")
+        },
+    )
+
+    adapter = ClaudeDriver(provider, profile)
+
+    assert set(adapter.runner.environment) <= {
+        "HOME", "LANG", "LC_ALL", "LC_CTYPE", "PATH", "TMPDIR"
+    }
+    assert adapter.runner.environment["HOME"] == str(tmp_path)
+    assert adapter.runner.environment["PATH"] == "/usr/local/bin:/usr/bin"
+    assert adapter.runner.environment["LANG"] == "C.UTF-8"
+    assert adapter.runner.environment["LC_ALL"] == "C.UTF-8"
+    assert "secret://overseer/claude" not in adapter.runner.environment.values()
 
 
 @pytest.fixture
@@ -399,6 +479,43 @@ def test_dispatch_preserves_request_bindings_and_exact_tmux_sequence(
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
     ]
     assert runner.inputs[3] == request.prompt
+
+
+def test_codex_all_tmux_operations_use_bounded_capture_and_normalized_failures(
+    codex_csv: Path,
+) -> None:
+    runner = OversizedBoundedRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+    )
+    session = adapter.discover()[0]
+    assert runner.commands == []
+
+    inspect = adapter.inspect(session)
+    resume = adapter.resume(session)
+    dispatch = adapter.dispatch(
+        AgentDispatchRequest(
+            id="dispatch.oversized",
+            instance_id="overseer.default",
+            session_id=session.id,
+            driver_epoch_id="epoch.1",
+            idempotency_key="oversized.1",
+            prompt="continue",
+        )
+    )
+
+    assert inspect.error_category is AgentErrorCategory.PROVIDER_PROTOCOL_ERROR
+    assert resume.error_category is AgentErrorCategory.PROVIDER_UNAVAILABLE
+    assert dispatch.error_category is AgentErrorCategory.PROVIDER_UNAVAILABLE
+    assert "oversized private output" not in json.dumps(
+        [dict(inspect.evidence), dict(resume.evidence), dict(dispatch.evidence)]
+    )
+    assert all(command[0] == "/tmp/tmux" for command in runner.commands)
 
 
 def test_dispatch_reports_codex_rejection_without_losing_request_bindings(

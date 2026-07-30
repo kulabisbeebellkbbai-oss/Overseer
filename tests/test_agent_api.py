@@ -242,6 +242,64 @@ def test_dispatch_requires_idempotency_key(api: LocalAPI) -> None:
     assert response.json()["error"] == "idempotency_key is required"
 
 
+@pytest.mark.parametrize(
+    ("path", "payload", "unknown"),
+    (
+        (
+            "/agent-sessions/discover",
+            {"provider_id": "codex", "instance_id": "overseer.default", "typo": True},
+            "unknown agent session discovery fields",
+        ),
+        (
+            "/agent-dispatches",
+            {
+                "instance_id": "overseer.default",
+                "prompt": "inspect health",
+                "idempotency_key": "dispatch.1",
+                "dry_run": True,
+            },
+            "unknown agent dispatch fields",
+        ),
+        (
+            "/agent-checkpoints",
+            {"instance_id": "overseer.default", "approval_id": "unsupported"},
+            "unknown agent checkpoint fields",
+        ),
+        (
+            "/agent-recovery",
+            {"session_id": "session.1", "initiated_by": "operator", "typo": True},
+            "unknown agent recovery fields",
+        ),
+        (
+            "/agent-handoffs",
+            {
+                "instance_id": "overseer.default",
+                "incoming_provider_id": "claude",
+                "initiated_by": "operator",
+                "approval_id": "approval.1",
+                "dry_run": True,
+            },
+            "unknown agent handoff fields",
+        ),
+    ),
+)
+def test_agent_routes_reject_unknown_fields_before_mutation(
+    api: LocalAPI, path: str, payload: dict[str, object], unknown: str
+) -> None:
+    with patch("overseer.api.dispatch_agent_goal_status") as dispatch, patch(
+        "overseer.api.checkpoint_agent_status"
+    ) as checkpoint, patch("overseer.api.recover_agent_status") as recovery, patch(
+        "overseer.api.handoff_agent_status"
+    ) as handoff, patch("overseer.api.discover_agent_sessions_status") as discovery:
+        response = api.post_json(path, payload)
+    assert response.status_code == 400
+    assert response.json()["error"].startswith(unknown)
+    assert not any(
+        mutation.called
+        for mutation in (dispatch, checkpoint, recovery, handoff, discovery)
+    )
+
+
 def test_failover_requires_persisted_decision_and_explicit_approval(api: LocalAPI) -> None:
     missing_decision = api.post_json(
         "/agent-failover",

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-import subprocess
 
 from .agent_adapters.codex import (
     DEFAULT_CODEX_MEMORY_SESSION,
@@ -64,7 +63,7 @@ class CodexProjectThreadAdapter:
         registry_path: str | Path = DEFAULT_CODEX_PROJECTS_REGISTRY,
         tmux_path: str | Path = DEFAULT_TMUX,
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
-        runner=subprocess.run,
+        runner=None,
     ) -> None:
         self.registry_path = Path(registry_path)
         self.tmux_path = Path(tmux_path)

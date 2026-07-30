@@ -408,6 +408,12 @@ class _FakeCodexProjectRunner:
             return subprocess.CompletedProcess(command, 1, "", "missing")
         return subprocess.CompletedProcess(command, 0, "resumed", "")
 
+    def run_bounded(
+        self, command, input_text=None, timeout_seconds=30, cwd=None,
+        *, stdout_limit_bytes, stderr_limit_bytes
+    ):
+        return self(command, input=input_text)
+
 
 class LocalHttpServer:
     def __enter__(self):
@@ -8748,6 +8754,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
                 return UsageContinuationRequestTests._Completed(returncode=1, stderr="no session")
             return UsageContinuationRequestTests._Completed(returncode=0, stdout="started")
 
+        def run_bounded(
+            self, command, input_text=None, timeout_seconds=30, cwd=None,
+            *, stdout_limit_bytes, stderr_limit_bytes
+        ):
+            return self(command)
+
     def test_codex_project_thread_adapter_resumes_registry_thread_detached(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "codex-projects.csv"
@@ -8791,6 +8803,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
                     )
                 return UsageContinuationRequestTests._Completed()
 
+            def run_bounded(
+                self, command, input_text=None, timeout_seconds=30, cwd=None,
+                *, stdout_limit_bytes, stderr_limit_bytes
+            ):
+                return self(command, input=input_text)
+
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "codex-projects.csv"
             registry.write_text(
@@ -8826,6 +8844,12 @@ class UsageContinuationRequestTests(unittest.TestCase):
                         stdout="Message exceeds maximum length allowed (old prompt)\nCodex ready",
                     )
                 return UsageContinuationRequestTests._Completed()
+
+            def run_bounded(
+                self, command, input_text=None, timeout_seconds=30, cwd=None,
+                *, stdout_limit_bytes, stderr_limit_bytes
+            ):
+                return self(command, input=input_text)
 
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "codex-projects.csv"
@@ -10310,7 +10334,7 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(len(migrations), 9)
+        self.assertEqual(len(migrations), 10)
         self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
         self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
         self.assertEqual(migrations[1].version, "agent_driver_v1")

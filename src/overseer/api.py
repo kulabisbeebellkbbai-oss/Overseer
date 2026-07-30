@@ -1601,6 +1601,11 @@ def _required_agent_string(payload: dict[str, Any], name: str) -> str:
 
 
 def _agent_session_discovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload,
+        {"provider_id", "instance_id", "codex_projects_registry"},
+        "agent session discovery",
+    )
     return {
         "provider_id": _required_agent_string(payload, "provider_id"),
         "instance_id": _required_agent_string(payload, "instance_id"),
@@ -1613,6 +1618,11 @@ def _agent_session_discovery_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _agent_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload,
+        {"instance_id", "prompt", "idempotency_key", "requested_by"},
+        "agent dispatch",
+    )
     return {
         "instance_id": _required_agent_string(payload, "instance_id"),
         "prompt": _required_agent_string(payload, "prompt"),
@@ -1624,10 +1634,14 @@ def _agent_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _agent_checkpoint_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(payload, {"instance_id"}, "agent checkpoint")
     return {"instance_id": _required_agent_string(payload, "instance_id")}
 
 
 def _agent_recovery_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload, {"session_id", "initiated_by"}, "agent recovery"
+    )
     return {
         "session_id": _required_agent_string(payload, "session_id"),
         "initiated_by": _required_agent_string(payload, "initiated_by"),
@@ -1635,6 +1649,11 @@ def _agent_recovery_args(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _agent_handoff_args(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_unknown_agent_fields(
+        payload,
+        {"instance_id", "incoming_provider_id", "initiated_by", "approval_id"},
+        "agent handoff",
+    )
     return {
         "instance_id": _required_agent_string(payload, "instance_id"),
         "incoming_provider_id": _required_agent_string(
@@ -1643,6 +1662,14 @@ def _agent_handoff_args(payload: dict[str, Any]) -> dict[str, Any]:
         "initiated_by": _required_agent_string(payload, "initiated_by"),
         "approval_id": _required_agent_string(payload, "approval_id"),
     }
+
+
+def _reject_unknown_agent_fields(
+    payload: dict[str, Any], allowed: set[str], route_name: str
+) -> None:
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"unknown {route_name} fields: {sorted(unknown)}")
 
 
 def _agent_failover_evaluation_args(payload: dict[str, Any]) -> dict[str, Any]:

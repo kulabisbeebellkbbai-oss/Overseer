@@ -1237,8 +1237,9 @@ class AgentManager:
                 raise AgentHandoffError(
                     f"agent instance {instance_id} transition is already active"
                 )
-            self.store.save_agent_handoff(package)
+            package = self.store.sign_and_save_agent_handoff(package)
             self.store.save_driver_epoch(incoming)
+        self.handoffs.validate(package, incoming_driver.provider.capabilities)
         try:
             result = incoming_driver.import_handoff(incoming_profile, package)
         except Exception:
@@ -1277,6 +1278,7 @@ class AgentManager:
             },
         )
         package = self.store.load_agent_handoff(handoff_id)
+        self._validate_persisted_handoff(package)
         transition = self.store.load_agent_transition(package.instance_id)
         if (
             transition.handoff_id != package.id
@@ -1340,7 +1342,7 @@ class AgentManager:
                 package,
                 evidence={**package.evidence, "status": "reconciling"},
             )
-            self.store.save_agent_handoff(package)
+            package = self.store.sign_and_save_agent_handoff(package)
         incoming, failure = self._complete_handoff(
             package, outgoing, incoming, result, invalid_state="quarantined"
         )
@@ -1362,6 +1364,7 @@ class AgentManager:
             },
         )
         package = self.store.load_agent_handoff(handoff_id)
+        self._validate_persisted_handoff(package)
         transition = self.store.load_agent_transition(package.instance_id)
         if (
             transition.handoff_id != handoff_id
@@ -1392,7 +1395,7 @@ class AgentManager:
             )
             with self.store.agent_transaction():
                 self.store.save_driver_epoch(blocked)
-                self.store.save_agent_handoff(
+                self.store.sign_and_save_agent_handoff(
                     replace(
                         package,
                         evidence={
@@ -1428,7 +1431,7 @@ class AgentManager:
                 reason="handoff_rolled_back",
             )
             self.store.save_driver_epoch(outgoing)
-            self.store.save_agent_handoff(
+            self.store.sign_and_save_agent_handoff(
                 replace(
                     package,
                     evidence={**package.evidence, "status": "rolled_back"},
@@ -1495,7 +1498,7 @@ class AgentManager:
                     reason=f"handoff_failed:{failure.value}",
                 )
                 self.store.save_driver_epoch(incoming)
-                self.store.save_agent_handoff(
+                self.store.sign_and_save_agent_handoff(
                     replace(
                         package,
                         evidence={
@@ -1555,7 +1558,7 @@ class AgentManager:
                     "incoming_external_session_id": external_session_id,
                 },
             )
-            self.store.save_agent_handoff(package)
+            package = self.store.sign_and_save_agent_handoff(package)
             transition = self.store.load_agent_transition(package.instance_id)
             self.store.save_agent_transition(
                 replace(
@@ -1572,6 +1575,7 @@ class AgentManager:
         package: AgentHandoffPackage,
     ) -> DriverEpoch:
         package = self.store.load_agent_handoff(package.id)
+        self._validate_persisted_handoff(package)
         transition = self.store.load_agent_transition(package.instance_id)
         if transition.state is not AgentTransitionState.IMPORT_ACKNOWLEDGED:
             raise AgentHandoffError("handoff import is not durably acknowledged")
@@ -1606,7 +1610,7 @@ class AgentManager:
             raise AgentHandoffError("durable import result binding mismatch")
         with self.store.agent_transaction():
             incoming = replace(incoming, state=AgentOperationState.RUNNING)
-            self.store.save_agent_handoff(
+            self.store.sign_and_save_agent_handoff(
                 replace(
                     package,
                     evidence={**package.evidence, "status": "acknowledged"},
@@ -1847,6 +1851,15 @@ class AgentManager:
         ):
             raise AgentHandoffError("handoff operation reservation binding mismatch")
         return operation
+
+    def _validate_persisted_handoff(
+        self, package: AgentHandoffPackage
+    ) -> None:
+        driver = self.registry.driver_for_provider(
+            package.incoming_provider_id,
+            instance_id=package.instance_id,
+        )
+        self.handoffs.validate(package, driver.provider.capabilities)
 
     def _durable_incoming_session(
         self,

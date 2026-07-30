@@ -829,6 +829,8 @@ class AgentHandoffPackage:
     required_capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     evidence: Mapping[str, object] = field(default_factory=dict)
     created_at: str | None = None
+    attestation_version: str | None = None
+    signature: str | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.id, "handoff id")
@@ -838,6 +840,10 @@ class AgentHandoffPackage:
         if not isinstance(self.objective, str) or not self.objective.strip():
             raise ValueError("handoff objective must be non-empty")
         _validate_optional_identifier(self.checkpoint_id, "checkpoint id")
+        if self.attestation_version is not None and self.attestation_version != "hmac-sha256-v1":
+            raise ValueError("unsupported handoff attestation version")
+        if self.signature is not None and not re.fullmatch(r"[0-9a-f]{64}", self.signature):
+            raise ValueError("handoff signature must be a lowercase SHA-256 HMAC")
         object.__setattr__(self, "evidence", _freeze_mapping(self.evidence))
 
 

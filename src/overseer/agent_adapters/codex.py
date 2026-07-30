@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Callable
+from typing import Protocol
 
 from ..agent_contracts import (
     AgentCapabilities,
@@ -26,7 +26,7 @@ from ..agent_contracts import (
     AgentTransport,
 )
 from ..core import OwnerDomain, Resource, ResourceState, ResourceType, RiskLevel
-from .base_cli import CliCommandRunner
+from .base_cli import CliCommandRunner, CliOutputLimitExceeded
 
 
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
@@ -49,7 +49,23 @@ _CODEX_CAPABILITIES = AgentCapabilities(
     handoff_import=True,
 )
 
-SubprocessRunner = Callable[..., subprocess.CompletedProcess[str]]
+CODEX_COMMAND_TIMEOUT_SECONDS = 30
+CODEX_OUTPUT_LIMIT_BYTES = 65_536
+
+
+class BoundedCommandRunner(Protocol):
+    executable_path: str | Path
+
+    def run_bounded(
+        self,
+        argv: list[str],
+        input_text: str | None = None,
+        timeout_seconds: float = 30,
+        cwd: str | Path | None = None,
+        *,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+    ) -> subprocess.CompletedProcess[str]: ...
 
 
 @dataclass(frozen=True)
@@ -83,7 +99,7 @@ class CodexDriver:
         registry_path: str | Path = DEFAULT_CODEX_PROJECTS_REGISTRY,
         tmux_path: str | Path = DEFAULT_TMUX,
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
-        runner: CliCommandRunner | SubprocessRunner | None = None,
+        runner: BoundedCommandRunner | None = None,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
             raise ValueError("CodexDriver requires the codex provider and adapter")
@@ -113,11 +129,13 @@ class CodexDriver:
         self.registry_path = Path(registry_path)
         self.tmux_path = Path(tmux_path)
         self.codex_memory_session_path = Path(codex_memory_session_path)
-        self.runner = runner or CliCommandRunner(
+        self.runner: BoundedCommandRunner = runner or CliCommandRunner(
             executable_path=self.tmux_path,
             executable_allowlist=(self.tmux_path.name, str(self.tmux_path)),
             environment=dict(os.environ),
         )
+        if not callable(getattr(self.runner, "run_bounded", None)):
+            raise TypeError("Codex runner must implement bounded command capture")
         self._legacy_resume_details: dict[str, LegacyResumeDetails] = {}
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
 
@@ -859,16 +877,22 @@ class CodexDriver:
         *,
         input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if isinstance(self.runner, CliCommandRunner):
-            return self.runner.run(command, input_text=input_text)
-        if input_text is None:
-            return self.runner(command, text=True, capture_output=True)
-        return self.runner(
-            command,
-            input=input_text,
-            text=True,
-            capture_output=True,
-        )
+        try:
+            return self.runner.run_bounded(
+                command,
+                input_text=input_text,
+                timeout_seconds=CODEX_COMMAND_TIMEOUT_SECONDS,
+                stdout_limit_bytes=CODEX_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes=CODEX_OUTPUT_LIMIT_BYTES,
+            )
+        except CliOutputLimitExceeded:
+            return subprocess.CompletedProcess(
+                command, 125, "", "provider output exceeded configured limit"
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                command, 124, "", "provider command timed out"
+            )
 
 
 def codex_adapter_factory(

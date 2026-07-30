@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,52 @@ def test_handoff_build_from_store_persists_safe_bounded_package(tmp_path: Path) 
         assert package.checkpoint_id == checkpoint.id
         assert package.evidence["checkpoint_id"] == checkpoint.id
         assert package.evidence["status"] == "ready"
+        assert package.attestation_version == "hmac-sha256-v1"
+        assert package.signature
+
+
+def test_handoff_attestation_survives_restart_and_rejects_forgery(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path) as store:
+        service = AgentHandoffService(store=store)
+        package = service.build(
+            instance_id="overseer.default",
+            outgoing_epoch_id="epoch.1",
+            incoming_provider_id="claude",
+            objective="continue",
+            evidence={"status": "ready"},
+            required_capabilities=AgentCapabilities(handoff_import=True),
+        )
+        assert service.validate(package, AgentCapabilities(handoff_import=True)) == package
+
+    with OverseerStore(path) as reopened:
+        service = AgentHandoffService(store=reopened)
+        assert service.validate(package, AgentCapabilities(handoff_import=True)) == package
+        for forged in (
+            replace(package, objective="tampered"),
+            replace(package, signature="0" * 64),
+            replace(package, signature=None),
+            replace(package, attestation_version=None),
+        ):
+            with pytest.raises(ValueError, match="attestation"):
+                service.validate(forged, AgentCapabilities(handoff_import=True))
+
+
+def test_handoff_attestation_rejects_foreign_and_unpersisted_packages(tmp_path: Path) -> None:
+    with OverseerStore(tmp_path / "one.sqlite3") as first:
+        package = AgentHandoffService(store=first).build(
+            instance_id="overseer.default",
+            outgoing_epoch_id="epoch.1",
+            incoming_provider_id="claude",
+            objective="continue",
+            evidence={"status": "ready"},
+            required_capabilities=AgentCapabilities(handoff_import=True),
+        )
+    with OverseerStore(tmp_path / "two.sqlite3") as second:
+        with pytest.raises(ValueError, match="attestation"):
+            AgentHandoffService(store=second).validate(
+                package, AgentCapabilities(handoff_import=True)
+            )
 
 
 def test_handoff_validation_requires_import_and_declared_capabilities() -> None:

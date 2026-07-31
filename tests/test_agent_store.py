@@ -702,8 +702,7 @@ def test_store_hardens_new_database_and_sqlite_sidecars_under_public_umask(
         with OverseerStore(path) as store:
             store.save_agent_checkpoint(_checkpoint("checkpoint.mode", "epoch.mode"))
             assert _mode(path) == 0o600
-            assert Path(f"{path}-wal").exists()
-            assert Path(f"{path}-shm").exists()
+            assert store._connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
             for suffix in ("-wal", "-shm", "-journal"):
                 sidecar = Path(f"{path}{suffix}")
                 if sidecar.exists():
@@ -796,7 +795,9 @@ def test_store_rejects_replaced_sidecar_without_touching_replacement(
     path = tmp_path / "state.sqlite3"
     store = OverseerStore(path)
     sidecar = Path(f"{path}{suffix}")
-    assert sidecar.exists()
+    sidecar.write_bytes(b"owned sqlite sidecar")
+    sidecar.chmod(0o600)
+    store._harden_database_files()
     replacement = tmp_path / f"replacement{suffix}"
     replacement.write_text("unrelated sidecar", encoding="utf-8")
     replacement.chmod(0o644)
@@ -809,3 +810,19 @@ def test_store_rejects_replaced_sidecar_without_touching_replacement(
 
     assert sidecar.read_text(encoding="utf-8") == "unrelated sidecar"
     assert _mode(sidecar) == 0o644
+
+
+def test_store_accepts_owner_only_sidecar_rotation_from_nested_connection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    outer = OverseerStore(path)
+    with OverseerStore(path) as nested:
+        nested.save_agent_checkpoint(_checkpoint("checkpoint.nested", "epoch.nested"))
+
+    outer.save_agent_checkpoint(_checkpoint("checkpoint.outer", "epoch.outer"))
+    outer.close()
+
+    with OverseerStore(path) as reopened:
+        assert reopened.load_agent_checkpoint("checkpoint.nested").id == "checkpoint.nested"
+        assert reopened.load_agent_checkpoint("checkpoint.outer").id == "checkpoint.outer"

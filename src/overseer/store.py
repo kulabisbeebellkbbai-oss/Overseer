@@ -247,6 +247,7 @@ class SQLiteStore:
         *,
         expected: tuple[int, int] | None = None,
         missing_ok: bool = False,
+        allow_secure_replacement: bool = False,
     ) -> tuple[int, int] | None:
         flags = os.O_RDONLY | os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
@@ -268,7 +269,9 @@ class SQLiteStore:
             cls._validate_artifact_status(path, status)
             identity = (status.st_dev, status.st_ino)
             if expected is not None and identity != expected:
-                raise ValueError(f"SQLite artifact identity changed: {path}")
+                replacement_is_owner_only = stat.S_IMODE(status.st_mode) == 0o600
+                if not (allow_secure_replacement and replacement_is_owner_only):
+                    raise ValueError(f"SQLite artifact identity changed: {path}")
             os.fchmod(descriptor, 0o600)
             return identity
         finally:
@@ -291,12 +294,18 @@ class SQLiteStore:
                     sidecar,
                     expected=self._sidecar_identities.get(suffix),
                     missing_ok=True,
+                    # SQLite may remove and recreate WAL/SHM sidecars when
+                    # another legitimate connection checkpoints or closes.
+                    # Accept that lifecycle only when the replacement is
+                    # already an owner-only regular file. Never relax the
+                    # pinned identity of the database itself.
+                    allow_secure_replacement=True,
                 )
             except (ValueError, PermissionError):
                 self._compromised_sidecars.add(suffix)
                 raise
             if identity is not None:
-                self._sidecar_identities.setdefault(suffix, identity)
+                self._sidecar_identities[suffix] = identity
         return True
 
     def _stash_compromised_sidecars(self) -> list[tuple[Path, Path]]:
@@ -317,7 +326,11 @@ class SQLiteStore:
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA busy_timeout = 30000")
         try:
-            self._connection.execute("PRAGMA journal_mode = WAL")
+            # Overseer has a long-lived coordinator and API plus short-lived
+            # CLI writers. Rollback journaling avoids WAL/SHM lifecycle races
+            # between those processes while the busy timeout serializes
+            # concurrent writes.
+            self._connection.execute("PRAGMA journal_mode = DELETE")
         except sqlite3.OperationalError:
             pass
         self._harden_database_files()
@@ -2182,6 +2195,7 @@ class SQLiteStore:
         immutable_fields: tuple[str, ...],
         indexed_values: dict[str, object],
     ) -> None:
+        self._harden_database_files()
         payload = _dump_agent_record(record)
         sanitized_record = _load_dataclass(record_type, payload)
         row = self._connection.execute(

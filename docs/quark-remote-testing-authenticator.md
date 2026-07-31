@@ -16,6 +16,10 @@ Remote testing accounts are service accounts owned by Quark and monitored by Odo
 
 Accounts are read-only by default. Odo records token issue, use, denial, revocation, expiry, source or scope violation, and mutation attempts. Scope violations can disable the account automatically.
 
+Each account also records an explicit `gateway_principal`. Protected Service
+Gateway may establish backend identity only from that validated account field;
+it must not infer a Roadex user from the project, worker, lease, or request.
+
 ## Token Model
 
 Quark token grants are bound to:
@@ -38,6 +42,10 @@ Read-only is the default. Mutating tokens require `mutates=true`, an exact mutat
 ## Gateway Scope
 
 The model is not tied to Overseer. A token can be issued for any current or future app/web page served through the Protected Service Gateway by granting the exact service path and routes needed for that test. The gateway itself can be represented as its own service path, such as `/_gateway`, with route-specific read-only checks unless a specific mutation is approved.
+
+For `roadex.authenticated_session_prompt`, Quark must issue the token before enqueueing and scope it to project `Roadex`, service path `/Roadex`, the protected gateway origin, `GET /api/bootstrap`, and the exact `POST /api/sessions/:sessionId/prompts` mutation. Overseer rejects the queue operation when the grant is missing, inactive, assigned to another lease or project, outside the gateway scope, or read-only.
+
+Protected Service Gateway validates every `qrt_` bearer request through Overseer's loopback authorization bridge using the actual method and path. It creates only an in-memory Roadex session context for CSRF continuity and removes the bearer header before proxying to Roadex. Revocation and expiry therefore take effect on the next request.
 
 ## Security Risks And Mitigations
 

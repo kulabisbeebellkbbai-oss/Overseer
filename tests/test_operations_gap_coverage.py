@@ -1666,6 +1666,7 @@ exit 0
                 "lease.roadex.auth",
                 "protected_gateway.request_sequence",
                 project="Roadex",
+                base_url="https://roadex.home.arpa:9443",
                 gateway_path="/Roadex",
                 auth_token_id=str(token["token"]["token_id"]),
             )
@@ -1722,6 +1723,94 @@ exit 0
         self.assertEqual(lease["lease"]["job_types"], ["roadex.project_creation_flow"])
         self.assertEqual(job["job"]["lease_id"], "lease.roadex")
         self.assertTrue(job["job"]["mutates"])
+
+    def test_remote_testing_queues_approved_roadex_managed_session_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease = request_remote_testing_lease_status(
+                root,
+                "lease.roadex.prompt",
+                "Roadex",
+                "run an approved managed-session prompt through Tank",
+                job_types=("roadex.authenticated_session_prompt",),
+            )
+            token = issue_remote_testing_token_status(
+                root,
+                lease_id="lease.roadex.prompt",
+                project="Roadex",
+                service_paths=("/Roadex",),
+                gateway_origins=("https://roadex.home.arpa:9443",),
+                allowed_methods=("GET", "POST"),
+                allowed_routes=("/api/bootstrap", "/api/sessions/:sessionId/prompts"),
+                mutates=True,
+                mutation_scope={
+                    "allowed_methods": ["POST"],
+                    "allowed_routes": ["/api/sessions/:sessionId/prompts"],
+                },
+            )
+            job = enqueue_remote_test_job_status(
+                root,
+                "lease.roadex.prompt",
+                "roadex.authenticated_session_prompt",
+                project="Roadex",
+                params={
+                    "allow_mutation": True,
+                    "require_explicit_user_approval": True,
+                    "mutation_authorization": {
+                        "scope": "roadex_protected_gateway_active_development",
+                        "approval_source": "roadex_console",
+                        "human_console_approval": True,
+                        "odo_approved": True,
+                        "issued_by": "quark",
+                        "active_development_target": True,
+                    },
+                    "prompt_path": "/Roadex/api/sessions/safe-session-id/prompts",
+                },
+                base_url="https://roadex.home.arpa:9443",
+                ui_path="/Roadex",
+                gateway_path="/Roadex",
+                auth_token_id=token["token"]["token_id"],
+                mutates=True,
+            )
+
+        self.assertEqual(lease["lease"]["job_types"], ["roadex.authenticated_session_prompt"])
+        self.assertEqual(job["job"]["lease_id"], "lease.roadex.prompt")
+        self.assertTrue(job["job"]["mutates"])
+        self.assertEqual(job["job"]["auth_token_id"], token["token"]["token_id"])
+
+    def test_remote_testing_rejects_roadex_managed_session_prompt_without_scoped_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_remote_testing_lease_status(
+                root,
+                "lease.roadex.prompt",
+                "Roadex",
+                "run an approved managed-session prompt through Tank",
+                job_types=("roadex.authenticated_session_prompt",),
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires a Quark-issued auth_token_id"):
+                enqueue_remote_test_job_status(
+                    root,
+                    "lease.roadex.prompt",
+                    "roadex.authenticated_session_prompt",
+                    project="Roadex",
+                    params={
+                        "allow_mutation": True,
+                        "require_explicit_user_approval": True,
+                        "mutation_authorization": {
+                            "scope": "roadex_protected_gateway_active_development",
+                            "approval_source": "roadex_console",
+                            "human_console_approval": True,
+                            "odo_approved": True,
+                            "issued_by": "quark",
+                            "active_development_target": True,
+                        },
+                    },
+                    base_url="https://roadex.home.arpa:9443",
+                    gateway_path="/Roadex",
+                    mutates=True,
+                )
 
     def test_remote_testing_rejects_unapproved_roadex_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

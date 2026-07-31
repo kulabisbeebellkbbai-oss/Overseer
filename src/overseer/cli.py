@@ -10099,6 +10099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     remote_testing_account_parser.add_argument("--allowed-project", action="append")
     remote_testing_account_parser.add_argument("--allowed-service-path", action="append")
     remote_testing_account_parser.add_argument("--allowed-gateway-origin", action="append")
+    remote_testing_account_parser.add_argument("--gateway-principal", default="owner")
     remote_testing_account_parser.add_argument("--disabled", action="store_true")
     remote_testing_account_parser.add_argument("--recorded-by", default="quark")
     remote_testing_token_parser = subparsers.add_parser("issue-remote-testing-token", help="issue a scoped Quark remote-testing token grant")
@@ -11517,6 +11518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     tuple(args.allowed_project or ["*"]),
                     tuple(args.allowed_service_path or ["*"]),
                     tuple(args.allowed_gateway_origin or ["*"]),
+                    args.gateway_principal,
                     not args.disabled,
                     args.recorded_by,
                 ),

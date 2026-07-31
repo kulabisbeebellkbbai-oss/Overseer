@@ -159,6 +159,7 @@ from overseer.client import OverseerApiClient
 from overseer.host import run_read_only_command
 from overseer.remote_testing import (
     enqueue_remote_test_job_status,
+    issue_remote_testing_token_status,
     request_remote_testing_lease_status,
 )
 from overseer.key_broker import KeyBrokerRequestStatus, KeyBrokerGrantStatus
@@ -3288,6 +3289,7 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("function stateTone(value)", html)
             self.assertIn(".pill.pending", html)
             self.assertIn("/operator-dashboard", html)
+
             self.assertIn("crewMessages: \"/crew/messages\"", html)
             self.assertIn("Crew Queue", html)
             self.assertIn("Dispatch Blocks", html)
@@ -3377,6 +3379,50 @@ class OverseerApiTests(unittest.TestCase):
             self.assertIn("data-action=\"discover-listeners\"", html)
             self.assertIn("data-action=\"run-health-probes\"", html)
             self.assertEqual(error.exception.code, 401)
+
+    def test_loopback_api_authorizes_gateway_target_with_admin_mediated_remote_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path = root / "state" / "overseer.sqlite3"
+            store_path.parent.mkdir()
+            request_remote_testing_lease_status(
+                root,
+                "lease.roadex.prompt",
+                "Roadex",
+                "managed session prompt",
+                job_types=("roadex.authenticated_session_prompt",),
+            )
+            issued = issue_remote_testing_token_status(
+                root,
+                lease_id="lease.roadex.prompt",
+                project="Roadex",
+                service_paths=("/Roadex",),
+                gateway_origins=("https://roadex.home.arpa:9443",),
+                allowed_methods=("GET", "POST"),
+                allowed_routes=("/api/bootstrap", "/api/sessions/:sessionId/prompts"),
+                mutates=True,
+                mutation_scope={
+                    "allowed_methods": ["POST"],
+                    "allowed_routes": ["/api/sessions/:sessionId/prompts"],
+                },
+            )
+            raw_token = Path(issued["token_path"]).read_text(encoding="utf-8").strip()
+
+            with LocalOverseerApiServer(store_path, auth_token="local-secret") as server:
+                authorized = server.post(
+                    "/usage/remote-testing/authorize",
+                    {
+                        "token": raw_token,
+                        "method": "POST",
+                        "raw_path": "/Roadex/api/sessions/safe-session-id/prompts",
+                        "normalized_path": "/api/sessions/safe-session-id/prompts",
+                    },
+                )
+
+            self.assertTrue(authorized["authorized"])
+            self.assertEqual(authorized["auth_type"], "remote_testing_token")
+            self.assertEqual(authorized["token_id"], issued["token"]["token_id"])
+            self.assertEqual(authorized["gateway_principal"], "owner")
 
     def test_loopback_api_reports_runtime_status(self):
         with tempfile.TemporaryDirectory() as directory:

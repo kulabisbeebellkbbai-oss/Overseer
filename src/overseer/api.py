@@ -623,6 +623,23 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             route = urlsplit(self.path)
             raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
+            if path == "/usage/remote-testing/authorize":
+                header = self.headers.get("authorization", "")
+                prefix = "Bearer "
+                if auth_token is None or not header.startswith(prefix) or not secrets.compare_digest(header[len(prefix) :], auth_token):
+                    self._write_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                self._handle_json(
+                    lambda payload: validate_remote_testing_token(
+                        _project_path_for_store(store_path),
+                        str(payload.get("token", "")),
+                        str(payload.get("method", "")),
+                        str(payload.get("raw_path", "")),
+                        str(payload.get("normalized_path", "")),
+                    )
+                    or {"authorized": False, "auth_type": "unknown", "reason": "invalid_token"}
+                )
+                return
             auth_context = self._authorize_request("POST", raw_path, path)
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
@@ -1452,6 +1469,7 @@ def _remote_testing_account_args(payload: dict[str, Any]) -> dict[str, Any]:
         "allowed_projects": tuple(_list_payload(payload.get("allowed_projects"), ["*"])),
         "allowed_service_paths": tuple(_list_payload(payload.get("allowed_service_paths"), ["*"])),
         "allowed_gateway_origins": tuple(_list_payload(payload.get("allowed_gateway_origins"), ["*"])),
+        "gateway_principal": str(payload.get("gateway_principal", "owner")),
         "enabled": bool(payload.get("enabled", True)),
         "recorded_by": str(payload.get("recorded_by", "quark")),
     }

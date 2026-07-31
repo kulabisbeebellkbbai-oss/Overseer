@@ -29,7 +29,11 @@ SUPPORTED_JOB_TYPES = (
     "overseer.performance_regression",
     "protected_gateway.request_sequence",
     "tank.local_facility_request",
+    "roadex.authenticated_session_prompt",
     "roadex.project_creation_flow",
+)
+SCOPED_TOKEN_REQUIRED_JOB_TYPES = (
+    "roadex.authenticated_session_prompt",
 )
 SENSITIVE_KEY_PARTS = (
     "token",
@@ -100,6 +104,7 @@ def record_remote_testing_account_status(
     allowed_projects: tuple[str, ...] | list[str] = ("*",),
     allowed_service_paths: tuple[str, ...] | list[str] = ("*",),
     allowed_gateway_origins: tuple[str, ...] | list[str] = ("*",),
+    gateway_principal: str = "owner",
     enabled: bool = True,
     recorded_by: str = "quark",
 ) -> dict[str, object]:
@@ -120,6 +125,7 @@ def record_remote_testing_account_status(
         "allowed_projects": _normalized_scope_list(allowed_projects, allow_wildcard=True),
         "allowed_service_paths": _normalized_service_paths(allowed_service_paths, allow_wildcard=True),
         "allowed_gateway_origins": _normalized_scope_list(allowed_gateway_origins, allow_wildcard=True),
+        "gateway_principal": _required_id(gateway_principal, "gateway_principal"),
         "mutation_policy": "deny_by_default; exact job grant required",
         "monitoring": {
             "owner": "odo",
@@ -330,6 +336,7 @@ def validate_remote_testing_token(
         "project": grant.get("project"),
         "thread_id": grant.get("thread_id"),
         "mutates": bool(grant.get("mutates", False)),
+        "gateway_principal": str(account.get("gateway_principal", "")),
     }
 
 
@@ -461,12 +468,22 @@ def enqueue_remote_test_job_status(
         raise ValueError("job_type is not allowed by lease")
     if mutates and not _fixture_allows_mutation(params or {}):
         raise ValueError("mutating remote test jobs require an explicit disposable fixture")
+    if job_type in SCOPED_TOKEN_REQUIRED_JOB_TYPES and not auth_token_id:
+        raise ValueError(f"{job_type} requires a Quark-issued auth_token_id")
     if auth_token_id:
         grant = state.get("test_tokens", {}).get(auth_token_id)
         if not grant or str(grant.get("status")) != "active":
             raise ValueError("auth_token_id is not active")
         if grant.get("lease_id") and grant.get("lease_id") != lease_id:
             raise ValueError("auth_token_id is not scoped to this lease")
+        if str(grant.get("project")) != project:
+            raise ValueError("auth_token_id is not scoped to this project")
+        if not _path_matches_service_scope(gateway_path, grant.get("service_paths", [])):
+            raise ValueError("auth_token_id is not scoped to this gateway path")
+        if base_url not in set(grant.get("gateway_origins", [])) and "*" not in set(grant.get("gateway_origins", [])):
+            raise ValueError("auth_token_id is not scoped to this gateway origin")
+        if mutates and not grant.get("mutates", False):
+            raise ValueError("auth_token_id does not authorize mutation")
         token_source = f"remote-testing-token:{auth_token_id}"
     queue_root = _queue_root(root)
     for subdir in ("pending", "claimed", "done", "failed"):
@@ -626,6 +643,7 @@ def _redacted_account_status(account: dict[str, Any]) -> dict[str, object]:
         "allowed_projects": account.get("allowed_projects", []),
         "allowed_service_paths": account.get("allowed_service_paths", []),
         "allowed_gateway_origins": account.get("allowed_gateway_origins", []),
+        "gateway_principal": account.get("gateway_principal"),
         "mutation_policy": account.get("mutation_policy"),
         "monitoring": account.get("monitoring", {}),
         "recorded_by": account.get("recorded_by"),
@@ -733,6 +751,10 @@ def _route_allowed(normalized_path: str, allowed_routes: list[str]) -> bool:
     for route in allowed_routes:
         if route.endswith("/*") and normalized_path.startswith(route[:-1]):
             return True
+        if ":" in route:
+            pattern = re.sub(r":[A-Za-z][A-Za-z0-9_]*", r"[^/]+", re.escape(route).replace(r"\:", ":"))
+            if re.fullmatch(pattern, normalized_path):
+                return True
         if normalized_path == route:
             return True
     return False
@@ -744,7 +766,8 @@ def _mutation_scope_allowed(grant: dict[str, Any], method: str, raw_path: str, n
         return False
     methods = _normalized_scope_list(scope.get("allowed_methods", scope.get("methods", [])), allow_wildcard=False)
     routes = _normalized_routes(scope.get("allowed_routes", scope.get("routes", [])))
-    service_paths = _normalized_service_paths(scope.get("service_paths", []), allow_wildcard=False)
+    raw_service_paths = scope.get("service_paths", [])
+    service_paths = _normalized_service_paths(raw_service_paths, allow_wildcard=False) if raw_service_paths else []
     if method.upper() not in set(methods):
         return False
     if routes and not _route_allowed(normalized_path, routes):
@@ -923,7 +946,7 @@ def _assert_redacted_safe(value: object, path: str = "params") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             lowered = str(key).lower()
-            if any(part in lowered for part in SENSITIVE_KEY_PARTS):
+            if lowered != "mutation_authorization" and any(part in lowered for part in SENSITIVE_KEY_PARTS):
                 raise ValueError(f"{path}.{key} may contain secret material and cannot be queued")
             _assert_redacted_safe(item, f"{path}.{key}")
         return

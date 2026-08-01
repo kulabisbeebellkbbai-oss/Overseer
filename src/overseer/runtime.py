@@ -106,7 +106,7 @@ class OverseerRuntime:
         return RuntimeTick(
             resources=len(self.store.list_resources()),
             usage_limits=len(self.store.list_usage_limits()),
-            health_targets=len(self.store.list_health_targets()),
+            health_targets=sum(1 for target in self.store.list_health_targets() if target.enabled),
             audit_events=self.store.count_audit_events(),
             health_evidence=len(self.store.list_health_evidence()),
             physical_identities=len(self.store.list_physical_identities()),
@@ -142,7 +142,7 @@ class OverseerRuntime:
     def _probe_health_targets(self) -> int:
         if not self.probe_health_targets:
             return 0
-        targets = self.store.list_health_targets()
+        targets = tuple(target for target in self.store.list_health_targets() if target.enabled)
         for target in targets:
             self.store.save_health_evidence(self.health_probe_adapter.probe(target))
         self.store.prune_health_evidence(self.health_evidence_retention_per_target)

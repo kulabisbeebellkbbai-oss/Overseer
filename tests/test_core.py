@@ -108,6 +108,7 @@ from overseer import (
     UsageLimit,
     CrewMessage,
     CrewMessageStatus,
+    CrewReviewStatus,
     EfivarEntry,
     FirmwarePreflightAdapter,
     FirmwarePreflightSnapshot,
@@ -251,7 +252,7 @@ from overseer.cli import request_claim_cleanup_status
 from overseer.cli import request_claim_status
 from overseer.cli import request_daemon_migration_status
 from overseer.cli import record_usage_limit_status
-from overseer.cli import crew_messages_status, dispatch_crew_messages_status, record_crew_message_status
+from overseer.cli import crew_messages_status, decide_crew_message_status, dispatch_crew_messages_status, reconcile_crew_reviews_status, record_crew_message_status, resubmit_crew_message_status
 from overseer.cli import _advance_admin_plan_after_dispatch
 from overseer.cli import request_usage_continuation_status
 from overseer.cli import dispatch_host_security_ids_review_package_status
@@ -262,6 +263,8 @@ from overseer.cli import runtime_status
 from overseer.cli import security_summary_status
 from overseer.cli import submit_host_security_ids_review_package_status
 from overseer.cli import service_status
+from overseer.cli import skiller_effectiveness_status
+from overseer.cli import skiller_guidance_adherence_status
 from overseer.cli import unarchive_admin_history_status
 from overseer.cli import seed_config_status
 from overseer.cli import usage_summary_status
@@ -1220,6 +1223,30 @@ class LiveHealthProbeTests(unittest.TestCase):
             self.assertEqual(store.list_health_evidence()[0].observed_status, HealthStatus.HEALTHY)
             store.close()
 
+    def test_probe_stored_health_status_skips_suspended_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.stored.suspended",
+                    resource_id="svc.stored.suspended",
+                    name="Suspended Process",
+                    probe_type=ProbeType.PROCESS,
+                    target="pid:99999999",
+                    enabled=False,
+                    suspension_reason="service intentionally stopped",
+                )
+            )
+            store.close()
+
+            status = probe_stored_health_status(store_path)
+
+        self.assertEqual(status["targets"], 0)
+        self.assertEqual(status["suspended"], 1)
+        self.assertEqual(status["unhealthy"], 0)
+        self.assertEqual(status["evidence"], [])
+
 
 class PackageInspectionTests(unittest.TestCase):
     def test_parse_apt_upgradable_extracts_versions(self):
@@ -1572,6 +1599,165 @@ LENOVO 80VR
 
 
 class HealthSummaryTests(unittest.TestCase):
+    def test_skiller_guidance_adherence_status_redacts_sensitive_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "recommendation_events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "event.1",
+                        "created_at": "2026-07-31T12:00:00+00:00",
+                        "thread_id": "thread.1",
+                        "turn_id": "turn.1",
+                        "task_description": "private task text",
+                        "recommendations": [{"skill_name": "skiller-mcp", "reason": "private reason"}],
+                        "guidance_learning_ids": ["learning.1"],
+                        "guardrails": ["private guardrail"],
+                        "known_failure_paths": ["private failure"],
+                        "memory_record_ids": ["memory.private"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (data_dir / "guidance_findings.jsonl").write_text(
+                "not-json\n"
+                + json.dumps(
+                    {
+                        "id": "finding.1",
+                        "created_at": "2026-07-31T12:05:00+00:00",
+                        "thread_id": "thread.1",
+                        "recommendation_event_id": "event.1",
+                        "status": "violated",
+                        "confidence": 0.85,
+                        "action_summary": "secret action",
+                        "matched_skill_names": ["skiller-mcp"],
+                        "missing_skill_names": ["overseer-local-coordination"],
+                        "matched_guidance_learning_ids": ["learning.1"],
+                        "ignored_guidance_learning_ids": [],
+                        "violations": [{"severity": "high", "guardrail": "private", "evidence": "private"}],
+                        "known_failure_paths": ["private failure"],
+                        "notes": "private notes",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            status = skiller_guidance_adherence_status(data_dir)
+
+        self.assertTrue(status["available"])
+        self.assertTrue(status["sensitive_fields_redacted"])
+        self.assertEqual(status["status_counts"]["violated"], 1)
+        self.assertEqual(status["high_violations"], 1)
+        self.assertEqual(status["malformed_records"], 1)
+        self.assertEqual(status["thread_status"][0]["recommended_skills"], "skiller-mcp")
+        serialized = json.dumps(status)
+        for sensitive in ("private task text", "private reason", "private guardrail", "secret action", "private notes"):
+            self.assertNotIn(sensitive, serialized)
+
+    def test_skiller_guidance_adherence_status_uses_worst_finding_and_latest_thread_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            events = [
+                {"id": "event.old", "created_at": "2026-07-31T10:00:00+00:00", "thread_id": "thread.1", "recommendations": []},
+                {"id": "event.new", "created_at": "2026-07-31T11:00:00+00:00", "thread_id": "thread.1", "recommendations": []},
+            ]
+            findings = [
+                {"id": "finding.followed", "created_at": "2026-07-31T11:01:00+00:00", "thread_id": "thread.1", "recommendation_event_id": "event.new", "status": "followed"},
+                {"id": "finding.ignored", "created_at": "2026-07-31T11:02:00+00:00", "thread_id": "thread.1", "recommendation_event_id": "event.new", "status": "ignored"},
+            ]
+            (data_dir / "recommendation_events.jsonl").write_text("\n".join(map(json.dumps, events)) + "\n", encoding="utf-8")
+            (data_dir / "guidance_findings.jsonl").write_text("\n".join(map(json.dumps, findings)) + "\n", encoding="utf-8")
+
+            status = skiller_guidance_adherence_status(data_dir)
+
+        self.assertEqual(status["threads"], 1)
+        self.assertEqual(status["thread_status"][0]["id"], "event.new")
+        self.assertEqual(status["thread_status"][0]["status"], "ignored")
+
+    def test_skiller_effectiveness_status_reads_latest_review_and_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "effectiveness_reviews.jsonl").write_text(
+                "\n".join(
+                    (
+                        json.dumps({"generated_at": "2026-07-31T10:00:00+00:00", "schedule_mode": "record_based"}),
+                        "not-json",
+                        json.dumps(
+                            {
+                                "generated_at": "2026-07-31T11:00:00+00:00",
+                                "schedule_mode": "time_based",
+                                "attributed_runs": 2,
+                                "guidance_worked": 1,
+                                "guidance_regressed": 1,
+                                "pitfalls_avoided": 1,
+                                "unattributed_runs": 3,
+                                "recurring_pitfalls": ["Skipped approval"],
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            status = skiller_effectiveness_status(data_dir)
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["review_count"], 2)
+        self.assertEqual(status["latest"]["schedule_mode"], "time_based")
+        self.assertEqual(status["recurring_pitfalls"], [{"pitfall": "Skipped approval", "status": "recurred"}])
+        self.assertIn("regressed guidance", status["next_step"])
+
+    def test_skiller_effectiveness_status_handles_missing_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = skiller_effectiveness_status(directory)
+
+        self.assertFalse(status["available"])
+        self.assertEqual(status["history"], [])
+
+    def test_summarizes_disabled_target_as_suspended_without_recovery(self):
+        target = HealthTarget(
+            id="health.suspended",
+            resource_id="svc.suspended",
+            name="Suspended",
+            probe_type=ProbeType.JSON,
+            target="http://127.0.0.1:1/health",
+            enabled=False,
+            suspension_reason="service intentionally stopped",
+        )
+
+        summary = summarize_health_targets((target,), ())[0]
+
+        self.assertEqual(summary.latest_status, HealthStatus.SUSPENDED)
+        self.assertFalse(summary.recovery_required)
+        self.assertFalse(summary.enabled)
+        self.assertEqual(summary.suspension_reason, "service intentionally stopped")
+
+    def test_health_summary_excludes_suspended_target_from_unhealthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.suspended",
+                    resource_id="svc.suspended",
+                    name="Suspended",
+                    probe_type=ProbeType.JSON,
+                    target="http://127.0.0.1:1/health",
+                    enabled=False,
+                    suspension_reason="service intentionally stopped",
+                )
+            )
+            store.close()
+
+            status = health_summary_status(store_path)
+
+        self.assertEqual(status["unhealthy"], 0)
+        self.assertEqual(status["suspended"], 1)
+        self.assertEqual(status["summaries"][0]["status"], HealthStatus.SUSPENDED.value)
+
     def test_summarizes_missing_evidence_as_unknown(self):
         target = HealthTarget(
             id="health.missing",
@@ -5739,6 +5925,57 @@ class HostInspectionTests(unittest.TestCase):
         self.assertEqual(target.target, "systemd:user:overseer-api.service")
         self.assertEqual(snapshots[0].id, "host.test.services")
 
+    def test_discover_user_services_suspends_stale_target_and_reenables_active_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_health_target(
+                HealthTarget(
+                    id="health.systemd-user.retired",
+                    resource_id="svc.systemd-user.retired",
+                    name="Retired process",
+                    probe_type=ProbeType.PROCESS,
+                    target="systemd:user:retired.service",
+                )
+            )
+            store.save_health_target(
+                HealthTarget(
+                    id="health.systemd-user.overseer-api",
+                    resource_id="svc.systemd-user.overseer-api",
+                    name="Overseer API process",
+                    probe_type=ProbeType.PROCESS,
+                    target="systemd:user:overseer-api.service",
+                    enabled=False,
+                    suspension_reason="previously stopped",
+                )
+            )
+            store.close()
+            snapshot = HostInspectionSnapshot(
+                id="host.test.reconcile",
+                captured_at="2026-07-31T12:00:00+00:00",
+                hostname="test-host",
+                os_release={"ID": "debian"},
+                observations=(
+                    HostCommandObservation(
+                        name="systemctl",
+                        command=("systemctl", "--user", "list-units", "--type=service", "--state=running", "--no-pager"),
+                        exit_code=0,
+                        stdout="overseer-api.service loaded active running Overseer localhost API\n",
+                    ),
+                ),
+            )
+
+            status = discover_user_services_status(store_path, snapshot=snapshot)
+            store = SQLiteStore(store_path)
+            retired = store.load_health_target("health.systemd-user.retired")
+            active = store.load_health_target("health.systemd-user.overseer-api")
+            store.close()
+
+        self.assertEqual(status["suspended_health_targets"], 1)
+        self.assertFalse(retired.enabled)
+        self.assertTrue(active.enabled)
+        self.assertEqual(active.suspension_reason, "")
+
     def test_alerts_summary_reports_only_alert_audit_events(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -9232,6 +9469,317 @@ class UsageContinuationRequestTests(unittest.TestCase):
             self.assertEqual(status["items"][0]["status"], "dispatched")
             self.assertIn("Tank pickup", status["items"][0]["reason"])
 
+    def test_dispatches_dax_read_only_advisory_without_resource_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.DAX.value,
+                "Read-only loopback inventory",
+                "Read-only advisory only. Identify an unconflicted loopback port candidate.",
+                RiskLevel.MEDIUM.value,
+                requested_by="Roadex-controlled-runner",
+                message_id="crew.dax.read-only-advisory",
+                related_resource_id="roadex.controlled-runner",
+            )
+
+            with patch(
+                "overseer.cli.discover_virtual_listeners_status",
+                return_value={"listeners": 0, "host_mutation_performed": False},
+            ) as discover:
+                status = dispatch_crew_messages_status(
+                    store_path,
+                    message_id="crew.dax.read-only-advisory",
+                    dispatched_at="2026-07-31T20:30:00+00:00",
+                )
+
+            self.assertEqual(status["processed"], 1)
+            self.assertEqual(status["acknowledged"], 1)
+            self.assertEqual(status["blocked"], 0)
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertIn("read-only advisory", status["items"][0]["reason"])
+            self.assertEqual(status["items"][0]["review_status"], CrewReviewStatus.APPROVED.value)
+            discover.assert_called_once_with(store_path)
+
+    def test_acknowledged_crew_message_receives_terminal_dispatch_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(store_path, OwnerDomain.JULIAN.value, "Check service", "Probe service health.", message_id="crew.julian.review")
+            dispatch_crew_messages_status(store_path, message_id="crew.julian.review")
+            item = crew_messages_status(store_path)["items"][0]
+            self.assertEqual(item["status"], CrewMessageStatus.ACKNOWLEDGED.value)
+            self.assertEqual(item["review_status"], CrewReviewStatus.APPROVED.value)
+
+    def test_successful_registered_dispatcher_terminalizes_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.JULIAN.value,
+                "Health result",
+                "Return the bounded service health result.",
+                message_id="crew.julian.terminal-result",
+            )
+            with patch(
+                "overseer.cli._dispatch_crew_message",
+                return_value={
+                    "message_id": "crew.julian.terminal-result",
+                    "owner_domain": OwnerDomain.JULIAN.value,
+                    "dispatcher": OwnerDomain.JULIAN.value,
+                    "status": "dispatched",
+                    "reason": "Julian completed the bounded health workflow",
+                    "actions": [],
+                },
+            ):
+                status = dispatch_crew_messages_status(
+                    store_path,
+                    message_id="crew.julian.terminal-result",
+                )
+
+            item = crew_messages_status(store_path, message_id="crew.julian.terminal-result")["items"][0]
+            self.assertEqual(status["approved"], 1)
+            self.assertEqual(item["status"], CrewMessageStatus.ACKNOWLEDGED.value)
+            self.assertEqual(item["review_status"], CrewReviewStatus.APPROVED.value)
+
+    def test_blocked_dispatch_terminalizes_as_correction_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.EZRI.value,
+                "Unsupported request",
+                "Attempt the registered workflow.",
+                message_id="crew.ezri.blocked-terminal",
+            )
+            with patch(
+                "overseer.cli._dispatch_crew_message",
+                return_value={
+                    "message_id": "crew.ezri.blocked-terminal",
+                    "owner_domain": OwnerDomain.EZRI.value,
+                    "dispatcher": OwnerDomain.EZRI.value,
+                    "status": "blocked",
+                    "reason": "no safe dispatcher is available",
+                    "actions": [],
+                },
+            ):
+                status = dispatch_crew_messages_status(
+                    store_path,
+                    message_id="crew.ezri.blocked-terminal",
+                )
+
+            item = crew_messages_status(store_path, message_id="crew.ezri.blocked-terminal")["items"][0]
+            self.assertEqual(status["blocked"], 1)
+            self.assertEqual(item["status"], CrewMessageStatus.ACKNOWLEDGED.value)
+            self.assertEqual(item["review_status"], CrewReviewStatus.CORRECTION_REQUESTED.value)
+            self.assertIn("no safe dispatcher", item["correction_request"])
+
+    def test_sisko_exact_admin_plan_waits_at_explicit_human_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            plan_admin_change_status(
+                store_path,
+                "admin.human-boundary.test",
+                AdminChangeKind.USER_SERVICE_RESTART.value,
+                "example.service",
+                "test explicit human boundary",
+                "active",
+            )
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.SISKO.value,
+                "Approval decision required",
+                "Hold this exact plan for human approval.",
+                message_id="crew.sisko.human-boundary",
+                related_plan_id="admin.human-boundary.test",
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                message_id="crew.sisko.human-boundary",
+            )
+
+            item = crew_messages_status(store_path, message_id="crew.sisko.human-boundary")["items"][0]
+            self.assertEqual(status["approved"], 0)
+            self.assertEqual(item["status"], CrewMessageStatus.ACKNOWLEDGED.value)
+            self.assertEqual(item["review_status"], "waiting_human_approval")
+            self.assertIn("human approval", item["decision_reason"].lower())
+
+    def test_obrien_storage_request_is_not_misrouted_to_package_maintenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.OBRIEN.value,
+                "Execute bounded storage handoff",
+                "Use the approved storage facility.",
+                message_id="crew.obrien.storage-handoff",
+                related_resource_id="storage.review.example",
+                request_evidence_ids=("crew.kira.storage-approved",),
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                message_id="crew.obrien.storage-handoff",
+            )
+
+            item = crew_messages_status(store_path, message_id="crew.obrien.storage-handoff")["items"][0]
+            self.assertEqual(status["correction_requested"], 1)
+            self.assertEqual(item["review_status"], CrewReviewStatus.CORRECTION_REQUESTED.value)
+            self.assertIn("storage", item["correction_request"].lower())
+            self.assertIn("adapter", item["correction_request"].lower())
+
+    def test_correction_requested_message_can_be_resubmitted_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(store_path, OwnerDomain.KIRA.value, "Storage advisory", "Review storage.", message_id="crew.kira.storage")
+            dispatch_crew_messages_status(store_path, message_id="crew.kira.storage")
+            decide_crew_message_status(
+                store_path,
+                "crew.kira.storage",
+                CrewReviewStatus.CORRECTION_REQUESTED.value,
+                "kira",
+                "Storage target is missing.",
+                ("evidence.storage-review",),
+                "Provide a typed storage target.",
+            ) if crew_messages_status(store_path)["items"][0]["review_status"] == CrewReviewStatus.PENDING.value else None
+            first = resubmit_crew_message_status(store_path, "crew.kira.storage", "Storage advisory revised", "Review storage target storage.backup.", "Roadex", "crew.kira.storage.r2")
+            second = resubmit_crew_message_status(store_path, "crew.kira.storage", "ignored", "ignored", "Roadex", "crew.kira.storage.r3")
+            self.assertTrue(first["mutation_performed"])
+            self.assertFalse(second["mutation_performed"])
+            self.assertEqual(first["message"]["supersedes_message_id"], "crew.kira.storage")
+            self.assertEqual(second["message"]["id"], "crew.kira.storage.r2")
+
+    def test_reconcile_requests_correction_for_unlinked_ids_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            record_crew_message_status(store_path, OwnerDomain.ODO_IDS.value, "IDS advisory", "Review staged route.", message_id="crew.odo-ids.unlinked")
+            dispatch_crew_messages_status(store_path, message_id="crew.odo-ids.unlinked")
+            result = reconcile_crew_reviews_status(store_path, "crew.odo-ids.unlinked")
+            item = crew_messages_status(store_path)["items"][0]
+            self.assertEqual(result["reviewed"], 0)
+            self.assertEqual(item["review_status"], CrewReviewStatus.CORRECTION_REQUESTED.value)
+            self.assertIn("related admin plan", item["correction_request"])
+
+    def test_dispatches_structured_kira_storage_advisory_as_approved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(Resource(
+                id="storage.backup-vault",
+                name="Backup vault",
+                type=ResourceType.PHYSICAL_ASSET,
+                owner_domain=OwnerDomain.KIRA,
+                risk_level=RiskLevel.MEDIUM,
+            ))
+            store.close()
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.KIRA.value,
+                "Read-only storage advisory",
+                "Review the typed backup target without mounting or writing.",
+                message_id="crew.kira.typed-storage",
+                related_resource_id="storage.backup-vault",
+                acceptance_criteria=("capacity is sufficient", "access boundary is protected", "outside the primary failure domain"),
+                request_evidence_ids=("evidence.storage.inventory",),
+            )
+            status = dispatch_crew_messages_status(store_path, message_id="crew.kira.typed-storage")
+            item = crew_messages_status(store_path)["items"][0]
+            self.assertEqual(status["approved"], 1)
+            self.assertEqual(item["review_status"], CrewReviewStatus.APPROVED.value)
+            self.assertIn("evidence.storage.inventory", item["decision_evidence_ids"])
+
+    def test_dispatches_structured_kira_storage_decision_without_magic_review_words(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(Resource(
+                id="storage.review.donuthole-protected-backup",
+                name="DonutHole protected backup",
+                type=ResourceType.PHYSICAL_ASSET,
+                owner_domain=OwnerDomain.KIRA,
+                risk_level=RiskLevel.MEDIUM,
+            ))
+            store.close()
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.KIRA.value,
+                "Corrected exact DonutHole storage decision",
+                "Decide the development-continuity facility and perform no mutation.",
+                message_id="crew.kira.donuthole-corrected-decision",
+                related_resource_id="storage.review.donuthole-protected-backup",
+                acceptance_criteria=(
+                    "capacity is sufficient",
+                    "access boundary is protected",
+                    "failure domain is documented",
+                ),
+                request_evidence_ids=("evidence.donuthole.storage",),
+            )
+
+            status = dispatch_crew_messages_status(
+                store_path,
+                message_id="crew.kira.donuthole-corrected-decision",
+            )
+            item = crew_messages_status(store_path, message_id="crew.kira.donuthole-corrected-decision")["items"][0]
+
+            self.assertEqual(status["approved"], 1)
+            self.assertEqual(item["review_status"], CrewReviewStatus.APPROVED.value)
+            self.assertIn("evidence.donuthole.storage", item["decision_evidence_ids"])
+
+    def test_reconciles_keyword_free_structured_kira_storage_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            store = SQLiteStore(store_path)
+            store.save_resource(Resource(
+                id="storage.review.donuthole-protected-backup",
+                name="DonutHole protected backup",
+                type=ResourceType.PHYSICAL_ASSET,
+                owner_domain=OwnerDomain.KIRA,
+                risk_level=RiskLevel.MEDIUM,
+            ))
+            store.close()
+            record_crew_message_status(
+                store_path,
+                OwnerDomain.KIRA.value,
+                "Corrected exact DonutHole storage decision",
+                "Decide the development-continuity facility and perform no mutation.",
+                message_id="crew.kira.donuthole-reconcile-decision",
+                related_resource_id="storage.review.donuthole-protected-backup",
+                acceptance_criteria=(
+                    "capacity is sufficient",
+                    "access boundary is protected",
+                    "failure domain is documented",
+                ),
+                request_evidence_ids=("evidence.donuthole.storage",),
+            )
+            dispatch_crew_messages_status(
+                store_path,
+                message_id="crew.kira.donuthole-reconcile-decision",
+            )
+            store = SQLiteStore(store_path)
+            message = store.load_crew_message("crew.kira.donuthole-reconcile-decision")
+            store.save_crew_message(replace(
+                message,
+                review_status=CrewReviewStatus.PENDING,
+                decision_reason=None,
+                correction_request=None,
+                decision_evidence_ids=(),
+                decided_by=None,
+                decided_at=None,
+            ))
+            store.close()
+
+            status = reconcile_crew_reviews_status(
+                store_path,
+                message_id="crew.kira.donuthole-reconcile-decision",
+            )
+            item = crew_messages_status(store_path, message_id="crew.kira.donuthole-reconcile-decision")["items"][0]
+
+            self.assertEqual(status["reviewed"], 1)
+            self.assertEqual(status["approved"], 1)
+            self.assertFalse(status["host_mutation_performed"])
+            self.assertEqual(item["review_status"], CrewReviewStatus.APPROVED.value)
+            self.assertIn("evidence.donuthole.storage", item["decision_evidence_ids"])
+
     def test_crew_message_summary_reports_blocked_dispatch_history(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
@@ -9255,13 +9803,14 @@ class UsageContinuationRequestTests(unittest.TestCase):
 
             self.assertEqual(status["processed"], 1)
             self.assertEqual(status["blocked"], 1)
-            self.assertEqual(summary["summary"]["open"], 1)
+            self.assertEqual(summary["summary"]["open"], 0)
+            self.assertEqual(summary["summary"]["correction_requested"], 1)
             self.assertEqual(summary["summary"]["blocked_dispatches"], 1)
             self.assertEqual(summary["by_owner_domain"]["quark"]["blocked_dispatches"], 1)
             self.assertEqual(summary["recent_dispatches"][0]["event_type"], AuditEventType.BLOCKED.value)
             self.assertIn("limit.missing", summary["recent_dispatches"][0]["reason"])
 
-    def test_dispatches_sisko_exact_plan_approval(self):
+    def test_dispatches_sisko_exact_plan_to_human_approval_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             plan_admin_change_status(
@@ -9290,9 +9839,11 @@ class UsageContinuationRequestTests(unittest.TestCase):
             readiness = admin_execution_readiness_status(store_path)
 
             self.assertEqual(status["processed"], 1)
-            self.assertEqual(status["items"][0]["status"], "dispatched")
-            approved = next(item for item in readiness["items"] if item["id"] == "admin.restart.dispatch-test")
-            self.assertTrue(approved["approved"])
+            self.assertEqual(status["items"][0]["status"], "human_approval_required")
+            pending = next(item for item in readiness["items"] if item["id"] == "admin.restart.dispatch-test")
+            self.assertFalse(pending["approved"])
+            message = crew_messages_status(store_path, message_id="crew.sisko.approve-restart")["items"][0]
+            self.assertEqual(message["review_status"], CrewReviewStatus.WAITING_HUMAN_APPROVAL.value)
 
     def test_dispatching_odo_stages_exact_sisko_and_ids_review_requests(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -62,7 +62,7 @@ from .agent_registry import AgentRegistry
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
-from .crew import CrewMessageStatus, build_crew_message, crew_message_status
+from .crew import CrewMessageStatus, CrewReviewStatus, build_crew_message, crew_message_status
 from .documents import (
     documents_config_status,
     documents_list_notes_status,
@@ -1049,9 +1049,10 @@ def probe_config_status(
     timeout_seconds: float = 5.0,
 ) -> dict[str, object]:
     config = load_config(config_path)
+    active_targets = tuple(target for target in config.health_targets if target.enabled)
     evidence_items = [
         health_probe_adapter_for(target, timeout_seconds=timeout_seconds).probe(target)
-        for target in config.health_targets
+        for target in active_targets
     ]
     if store_path is not None:
         store = SQLiteStore(store_path)
@@ -1062,7 +1063,8 @@ def probe_config_status(
             store.close()
     status = {
         "config": str(Path(config_path)),
-        "targets": len(config.health_targets),
+        "targets": len(active_targets),
+        "suspended": len(config.health_targets) - len(active_targets),
         "healthy": sum(1 for evidence in evidence_items if evidence.observed_status.value == "healthy"),
         "evidence": [
             {
@@ -1088,7 +1090,8 @@ def probe_stored_health_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
-        targets = store.list_health_targets()
+        all_targets = store.list_health_targets()
+        targets = tuple(target for target in all_targets if target.enabled)
         evidence_items = [
             health_probe_adapter_for(target, timeout_seconds=timeout_seconds).probe(target)
             for target in targets
@@ -1100,6 +1103,7 @@ def probe_stored_health_status(
         return {
             "store": str(store.path),
             "targets": len(targets),
+            "suspended": len(all_targets) - len(targets),
             "healthy": sum(1 for evidence in evidence_items if evidence.observed_status == HealthStatus.HEALTHY),
             "unhealthy": sum(1 for evidence in evidence_items if evidence.observed_status != HealthStatus.HEALTHY),
             "evidence": [_health_evidence_item_status(evidence) for evidence in evidence_items],
@@ -1119,7 +1123,10 @@ def record_health_target_status(
     expected_status: int | None = None,
     expected_content_type: str | None = None,
     latency_warn_ms: int | None = None,
+    enabled: bool = True,
+    suspension_reason: str = "",
 ) -> dict[str, object]:
+    suspension_reason = "" if enabled else (suspension_reason or "monitoring suspended by operator")
     health_target = HealthTarget(
         id=target_id,
         resource_id=resource_id,
@@ -1130,6 +1137,8 @@ def record_health_target_status(
         expected_status=expected_status,
         expected_content_type=expected_content_type,
         latency_warn_ms=latency_warn_ms,
+        enabled=enabled,
+        suspension_reason=suspension_reason,
     )
     store = SQLiteStore(store_path)
     try:
@@ -1149,6 +1158,8 @@ def record_health_target_status(
             "expected_status": health_target.expected_status,
             "expected_content_type": health_target.expected_content_type,
             "latency_warn_ms": health_target.latency_warn_ms,
+            "enabled": health_target.enabled,
+            "suspension_reason": health_target.suspension_reason,
             "mutation_performed": True,
             "host_mutation_performed": False,
         }
@@ -2119,8 +2130,11 @@ def health_efficiency_summary_status(store_path: str | Path) -> dict[str, object
             "evidence_records": len(evidence),
             "healthy": sum(1 for summary in summaries if summary.latest_status == HealthStatus.HEALTHY),
             "unhealthy": len(latest_failures),
+            "suspended": sum(1 for summary in summaries if summary.latest_status == HealthStatus.SUSPENDED),
             "recovered": sum(1 for summary in summaries if summary.latest_status == HealthStatus.RECOVERED),
-            "missing_evidence": sum(1 for summary in summaries if summary.latest_evidence_id is None),
+            "missing_evidence": sum(
+                1 for summary in summaries if summary.enabled and summary.latest_evidence_id is None
+            ),
             "recovery_required": sum(1 for summary in summaries if summary.recovery_required),
             "by_status": {
                 status.value: sum(1 for summary in summaries if summary.latest_status == status)
@@ -2887,6 +2901,18 @@ def discover_user_services_status(
     store = SQLiteStore(store_path)
     try:
         store.save_host_snapshot(observed)
+        active_resource_ids = {resource.id for resource in resources}
+        suspended_targets: list[str] = []
+        for target in store.list_health_targets():
+            if target.resource_id.startswith("svc.systemd-user.") and target.resource_id not in active_resource_ids and target.enabled:
+                store.save_health_target(
+                    replace(
+                        target,
+                        enabled=False,
+                        suspension_reason="service not active in latest user-service discovery",
+                    )
+                )
+                suspended_targets.append(target.id)
         for resource in resources:
             store.save_resource(resource)
             unit = resource.identifiers.get("unit")
@@ -2899,6 +2925,8 @@ def discover_user_services_status(
                         probe_type=ProbeType.PROCESS,
                         target=f"systemd:user:{unit}",
                         owner_domain=OwnerDomain.JULIAN,
+                        enabled=True,
+                        suspension_reason="",
                     )
                 )
         return {
@@ -2906,6 +2934,8 @@ def discover_user_services_status(
             "snapshot_id": observed.id,
             "count": len(resources),
             "health_targets": len(resources),
+            "suspended_health_targets": len(suspended_targets),
+            "suspended_target_ids": suspended_targets,
             "items": [discovered_service_resource_status(resource) for resource in resources],
         }
     finally:
@@ -6552,6 +6582,7 @@ def health_summary_status(store_path: str | Path) -> dict[str, object]:
             "targets": len(summaries),
             "healthy": sum(1 for summary in summaries if summary.latest_status == HealthStatus.HEALTHY),
             "unhealthy": len(unhealthy),
+            "suspended": sum(1 for summary in summaries if summary.latest_status == HealthStatus.SUSPENDED),
             "summaries": [
                 {
                     "target_id": summary.target_id,
@@ -6564,12 +6595,176 @@ def health_summary_status(store_path: str | Path) -> dict[str, object]:
                     "latest_captured_at": summary.latest_captured_at,
                     "recovery_required": summary.recovery_required,
                     "error": summary.error,
+                    "enabled": summary.enabled,
+                    "suspension_reason": summary.suspension_reason,
                 }
                 for summary in summaries
             ],
         }
     finally:
         store.close()
+
+
+def skiller_effectiveness_status(data_dir: str | Path | None = None) -> dict[str, object]:
+    default_root = Path.home() / "Documents" / "Codex Workspace" / "Skiller" / "data"
+    root = Path(data_dir) if data_dir is not None else Path(os.environ.get("SKILLER_DATA_DIR", default_root))
+    review_path = root / "effectiveness_reviews.jsonl"
+    reviews: list[dict[str, object]] = []
+    if review_path.exists():
+        for line in review_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                reviews.append(item)
+    latest = reviews[-1] if reviews else {}
+    recurring = latest.get("recurring_pitfalls") if isinstance(latest.get("recurring_pitfalls"), list) else []
+    available = bool(latest)
+    regressions = int(latest.get("guidance_regressed") or 0)
+    unattributed = int(latest.get("unattributed_runs") or 0)
+    if not available:
+        next_step = "run the Skiller adaptive review to establish effectiveness evidence"
+    elif regressions:
+        next_step = "review regressed guidance and recurring pitfalls before the next skill iteration"
+    elif unattributed:
+        next_step = "attach guidance learning IDs and avoided pitfalls to new skill runs"
+    else:
+        next_step = "continue adaptive monitoring and review any new recurring pitfalls"
+    return {
+        "available": available,
+        "review_count": len(reviews),
+        "latest": latest,
+        "recurring_pitfalls": [{"pitfall": str(item), "status": "recurred"} for item in recurring],
+        "history": list(reversed(reviews[-12:])),
+        "next_step": next_step,
+    }
+
+
+def skiller_guidance_adherence_status(data_dir: str | Path | None = None) -> dict[str, object]:
+    """Return a redacted, read-only dashboard projection of Skiller guidance audit records."""
+
+    default_root = Path.home() / "Documents" / "Codex Workspace" / "Skiller" / "data"
+    root = Path(data_dir) if data_dir is not None else Path(os.environ.get("SKILLER_DATA_DIR", default_root))
+
+    def read_records(name: str) -> tuple[list[dict[str, object]], int]:
+        path = root / name
+        records: list[dict[str, object]] = []
+        malformed = 0
+        if not path.exists():
+            return records, malformed
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+            else:
+                malformed += 1
+        return records, malformed
+
+    events, malformed_events = read_records("recommendation_events.jsonl")
+    findings, malformed_findings = read_records("guidance_findings.jsonl")
+    status_priority = {"followed": 0, "unknown": 1, "ignored": 2, "violated": 3}
+    findings_by_event: dict[str, list[dict[str, object]]] = {}
+    safe_findings: list[dict[str, object]] = []
+    for finding in findings:
+        event_id = str(finding.get("recommendation_event_id") or "")
+        if event_id:
+            findings_by_event.setdefault(event_id, []).append(finding)
+        violations = finding.get("violations") if isinstance(finding.get("violations"), list) else []
+        high_violations = sum(
+            1 for item in violations if isinstance(item, dict) and item.get("severity") == "high"
+        )
+        safe_findings.append(
+            {
+                "id": str(finding.get("id") or ""),
+                "created_at": str(finding.get("created_at") or ""),
+                "thread_id": str(finding.get("thread_id") or "unassigned"),
+                "recommendation_event_id": event_id,
+                "status": str(finding.get("status") or "unknown"),
+                "confidence": finding.get("confidence"),
+                "matched_skills": ", ".join(str(item) for item in finding.get("matched_skill_names", []) if item),
+                "missing_skills": ", ".join(str(item) for item in finding.get("missing_skill_names", []) if item),
+                "matched_guidance": len(finding.get("matched_guidance_learning_ids", [])),
+                "ignored_guidance": len(finding.get("ignored_guidance_learning_ids", [])),
+                "violations": len(violations),
+                "high_violations": high_violations,
+                "known_failure_paths": len(finding.get("known_failure_paths", [])),
+            }
+        )
+
+    safe_events: list[dict[str, object]] = []
+    for event in events:
+        event_id = str(event.get("id") or "")
+        event_findings = findings_by_event.get(event_id, [])
+        statuses = [str(item.get("status") or "unknown") for item in event_findings]
+        aggregate_status = max(statuses, key=lambda item: status_priority.get(item, 1)) if statuses else "not_evaluated"
+        recommendations = event.get("recommendations") if isinstance(event.get("recommendations"), list) else []
+        skill_names = [
+            str(item.get("skill_name"))
+            for item in recommendations
+            if isinstance(item, dict) and item.get("skill_name")
+        ]
+        safe_events.append(
+            {
+                "id": event_id,
+                "created_at": str(event.get("created_at") or ""),
+                "thread_id": str(event.get("thread_id") or "unassigned"),
+                "turn_id": str(event.get("turn_id") or ""),
+                "status": aggregate_status,
+                "recommended_skills": ", ".join(skill_names),
+                "recommended_skill_count": len(skill_names),
+                "linked_learnings": len(event.get("guidance_learning_ids", [])),
+                "guardrails": len(event.get("guardrails", [])),
+                "known_failure_paths": len(event.get("known_failure_paths", [])),
+                "memory_references": len(event.get("memory_record_ids", [])),
+                "finding_count": len(event_findings),
+                "latest_finding_at": str(event_findings[-1].get("created_at") or "") if event_findings else "",
+            }
+        )
+
+    latest_by_thread: dict[str, dict[str, object]] = {}
+    for event in safe_events:
+        key = str(event["thread_id"] if event["thread_id"] != "unassigned" else event["id"])
+        current = latest_by_thread.get(key)
+        if current is None or str(event["created_at"]) >= str(current["created_at"]):
+            latest_by_thread[key] = event
+    thread_rows = sorted(latest_by_thread.values(), key=lambda item: str(item["created_at"]), reverse=True)
+    status_counts = {
+        status: sum(1 for item in thread_rows if item["status"] == status)
+        for status in ("followed", "ignored", "violated", "unknown", "not_evaluated")
+    }
+    if status_counts["violated"]:
+        next_step = "review violated guidance and high-severity findings before enforcement decisions"
+    elif status_counts["ignored"]:
+        next_step = "review ignored recommendations and determine whether guidance was applicable"
+    elif status_counts["not_evaluated"]:
+        next_step = "evaluate threads with recommendation events that do not yet have findings"
+    else:
+        next_step = "continue monitoring new guidance recommendation and adherence records"
+    return {
+        "available": (root / "recommendation_events.jsonl").exists() or (root / "guidance_findings.jsonl").exists(),
+        "source": "read_only_jsonl_fallback",
+        "sensitive_fields_redacted": True,
+        "recommendation_events": len(events),
+        "findings": len(findings),
+        "threads": len(thread_rows),
+        "evaluated_threads": sum(1 for item in thread_rows if item["status"] != "not_evaluated"),
+        "status_counts": status_counts,
+        "high_violations": sum(int(item["high_violations"]) for item in safe_findings),
+        "malformed_records": malformed_events + malformed_findings,
+        "thread_status": thread_rows[:50],
+        "recent_recommendations": list(reversed(safe_events[-50:])),
+        "recent_findings": list(reversed(safe_findings[-50:])),
+        "next_step": next_step,
+    }
 
 
 def usage_summary_status(store_path: str | Path) -> dict[str, object]:
@@ -6699,6 +6894,8 @@ def crew_messages_status(
     store_path: str | Path,
     owner_domain: str | None = None,
     status: str | None = None,
+    requested_by: str | None = None,
+    message_id: str | None = None,
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
@@ -6711,6 +6908,13 @@ def crew_messages_status(
         if status:
             selected_status = CrewMessageStatus(status)
             messages = [message for message in messages if message.status == selected_status]
+        if requested_by:
+            requester_aliases = {requested_by}
+            if requested_by == "Roadex-controlled-runner":
+                requester_aliases.add("Roadex")
+            messages = [message for message in messages if message.requested_by in requester_aliases]
+        if message_id:
+            messages = [message for message in messages if message.id == message_id]
         messages = sorted(messages, key=lambda message: message.created_at or message.id, reverse=True)
         all_dispatch_history = crew_dispatch_history(audit_events)
         dispatch_history = crew_dispatch_history(audit_events, owner_domain=owner_domain)
@@ -6724,11 +6928,20 @@ def crew_messages_status(
                 "open": sum(1 for message in all_messages if message.status == CrewMessageStatus.OPEN),
                 "acknowledged": sum(1 for message in all_messages if message.status == CrewMessageStatus.ACKNOWLEDGED),
                 "closed": sum(1 for message in all_messages if message.status == CrewMessageStatus.CLOSED),
+                "review_pending": sum(1 for message in all_messages if message.review_status == CrewReviewStatus.PENDING),
+                "waiting_human_approval": sum(1 for message in all_messages if message.review_status == CrewReviewStatus.WAITING_HUMAN_APPROVAL),
+                "approved": sum(1 for message in all_messages if message.review_status == CrewReviewStatus.APPROVED),
+                "correction_requested": sum(1 for message in all_messages if message.review_status == CrewReviewStatus.CORRECTION_REQUESTED),
+                "rejected": sum(1 for message in all_messages if message.review_status == CrewReviewStatus.REJECTED),
                 "blocked_dispatches": len([item for item in all_dispatch_history if item["event_type"] == AuditEventType.BLOCKED.value]),
             },
             "by_status": {
                 item.value: sum(1 for message in messages if message.status == item)
                 for item in CrewMessageStatus
+            },
+            "by_review_status": {
+                item.value: sum(1 for message in messages if message.review_status == item)
+                for item in CrewReviewStatus
             },
             "by_owner_domain": by_owner,
             "recent_dispatches": dispatch_history,
@@ -6736,6 +6949,8 @@ def crew_messages_status(
             "filters": {
                 "owner_domain": owner_domain,
                 "status": status,
+                "requested_by": requested_by,
+                "message_id": message_id,
             },
         }
     finally:
@@ -6755,6 +6970,11 @@ def crew_message_counts_by_owner(messages, audit_events) -> dict[str, dict[str, 
             "open": sum(1 for message in messages if message.owner_domain == owner and message.status == CrewMessageStatus.OPEN),
             "acknowledged": sum(1 for message in messages if message.owner_domain == owner and message.status == CrewMessageStatus.ACKNOWLEDGED),
             "closed": sum(1 for message in messages if message.owner_domain == owner and message.status == CrewMessageStatus.CLOSED),
+            "review_pending": sum(1 for message in messages if message.owner_domain == owner and message.review_status == CrewReviewStatus.PENDING),
+            "waiting_human_approval": sum(1 for message in messages if message.owner_domain == owner and message.review_status == CrewReviewStatus.WAITING_HUMAN_APPROVAL),
+            "approved": sum(1 for message in messages if message.owner_domain == owner and message.review_status == CrewReviewStatus.APPROVED),
+            "correction_requested": sum(1 for message in messages if message.owner_domain == owner and message.review_status == CrewReviewStatus.CORRECTION_REQUESTED),
+            "rejected": sum(1 for message in messages if message.owner_domain == owner and message.review_status == CrewReviewStatus.REJECTED),
             "dispatches": sum(1 for event in dispatch_events if event.owner_domain == owner),
             "blocked_dispatches": sum(1 for event in dispatch_events if event.owner_domain == owner and event.event_type == AuditEventType.BLOCKED),
         }
@@ -6802,6 +7022,9 @@ def record_crew_message_status(
     related_resource_id: str | None = None,
     related_plan_id: str | None = None,
     related_limit_id: str | None = None,
+    supersedes_message_id: str | None = None,
+    acceptance_criteria: Sequence[str] = (),
+    request_evidence_ids: Sequence[str] = (),
 ) -> dict[str, object]:
     crew_message = build_crew_message(
         owner_domain=owner_domain,
@@ -6814,6 +7037,9 @@ def record_crew_message_status(
         related_resource_id=related_resource_id,
         related_plan_id=related_plan_id,
         related_limit_id=related_limit_id,
+        supersedes_message_id=supersedes_message_id,
+        acceptance_criteria=tuple(item.strip() for item in acceptance_criteria if item.strip()),
+        request_evidence_ids=tuple(item.strip() for item in request_evidence_ids if item.strip()),
     )
     store = SQLiteStore(store_path)
     try:
@@ -6838,6 +7064,336 @@ def record_crew_message_status(
         }
     finally:
         store.close()
+
+
+def decide_crew_message_status(
+    store_path: str | Path,
+    message_id: str,
+    review_status: str,
+    decided_by: str,
+    reason: str,
+    evidence_ids: Sequence[str] = (),
+    correction_request: str | None = None,
+    decided_at: str | None = None,
+) -> dict[str, object]:
+    decision = CrewReviewStatus(review_status)
+    if decision == CrewReviewStatus.PENDING:
+        raise ValueError("a crew review decision cannot return to pending")
+    if not decided_by.strip():
+        raise ValueError("decided_by is required")
+    if not reason.strip():
+        raise ValueError("decision reason is required")
+    evidence = tuple(item.strip() for item in evidence_ids if item.strip())
+    if decision in {CrewReviewStatus.APPROVED, CrewReviewStatus.WAITING_HUMAN_APPROVAL} and not evidence:
+        raise ValueError("approval or human boundary requires at least one evidence id")
+    correction = (correction_request or "").strip() or None
+    if decision in {CrewReviewStatus.CORRECTION_REQUESTED, CrewReviewStatus.REJECTED} and correction is None:
+        raise ValueError("correction or rejection requires correction_request")
+    now = decided_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    store = SQLiteStore(store_path)
+    try:
+        message = store.load_crew_message(message_id)
+        if message.status != CrewMessageStatus.ACKNOWLEDGED:
+            raise ValueError("only acknowledged crew messages can be decided")
+        if message.review_status not in {CrewReviewStatus.PENDING, CrewReviewStatus.WAITING_HUMAN_APPROVAL}:
+            raise ValueError("crew message already has a review decision")
+        if message.review_status == CrewReviewStatus.WAITING_HUMAN_APPROVAL and decision == CrewReviewStatus.WAITING_HUMAN_APPROVAL:
+            raise ValueError("crew message is already waiting for human approval")
+        updated = replace(
+            message,
+            review_status=decision,
+            decision_reason=reason.strip(),
+            correction_request=correction,
+            decision_evidence_ids=evidence,
+            decided_by=decided_by.strip(),
+            decided_at=now,
+            updated_at=now,
+        )
+        store.save_crew_message(updated)
+        event_type = (
+            AuditEventType.APPROVED
+            if decision == CrewReviewStatus.APPROVED
+            else AuditEventType.REQUESTED
+            if decision == CrewReviewStatus.WAITING_HUMAN_APPROVAL
+            else AuditEventType.REJECTED
+        )
+        event = AuditEvent(
+            id=f"audit.{message.id}.review.{_status_id(now)}",
+            event_type=event_type,
+            owner_domain=message.owner_domain,
+            subject_id=message.id,
+            summary=f"crew review {decision.value}: {reason.strip()}",
+            risk_level=message.priority,
+            evidence_ids=evidence,
+            occurred_at=now,
+        )
+        store.save_audit_event(event)
+        return {
+            "store": str(store.path),
+            "message": crew_message_status(updated),
+            "audit_event": audit_event_status(event),
+            "mutation_performed": True,
+            "host_mutation_performed": False,
+        }
+    finally:
+        store.close()
+
+
+def resubmit_crew_message_status(
+    store_path: str | Path,
+    message_id: str,
+    subject: str,
+    message: str,
+    requested_by: str,
+    new_message_id: str | None = None,
+    created_at: str | None = None,
+    expected_requesters: Sequence[str] = (),
+    related_resource_id: str | None = None,
+    related_plan_id: str | None = None,
+    related_limit_id: str | None = None,
+    acceptance_criteria: Sequence[str] = (),
+    request_evidence_ids: Sequence[str] = (),
+) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        original = store.load_crew_message(message_id)
+        allowed_requesters = {item.strip() for item in expected_requesters if item.strip()}
+        if allowed_requesters and original.requested_by not in allowed_requesters:
+            raise ValueError("crew message does not belong to the expected requester")
+        if original.review_status not in {CrewReviewStatus.CORRECTION_REQUESTED, CrewReviewStatus.REJECTED}:
+            raise ValueError("only correction-requested or rejected crew messages can be resubmitted")
+        if original.superseded_by_message_id:
+            existing = store.load_crew_message(original.superseded_by_message_id)
+            return {
+                "store": str(store.path),
+                "message": crew_message_status(existing),
+                "original": crew_message_status(original),
+                "mutation_performed": False,
+                "host_mutation_performed": False,
+            }
+    finally:
+        store.close()
+    result = record_crew_message_status(
+        store_path,
+        original.owner_domain.value,
+        subject,
+        message,
+        original.priority.value,
+        requested_by,
+        new_message_id,
+        created_at,
+        related_resource_id if related_resource_id is not None else original.related_resource_id,
+        related_plan_id if related_plan_id is not None else original.related_plan_id,
+        related_limit_id if related_limit_id is not None else original.related_limit_id,
+        supersedes_message_id=original.id,
+        acceptance_criteria=acceptance_criteria or original.acceptance_criteria,
+        request_evidence_ids=request_evidence_ids or original.request_evidence_ids,
+    )
+    replacement_id = str(result["message"]["id"])
+    store = SQLiteStore(store_path)
+    try:
+        latest = store.load_crew_message(original.id)
+        closed = replace(
+            latest,
+            status=CrewMessageStatus.CLOSED,
+            superseded_by_message_id=replacement_id,
+            updated_at=str(result["message"]["created_at"]),
+        )
+        store.save_crew_message(closed)
+    finally:
+        store.close()
+    result["original"] = crew_message_status(closed)
+    return result
+
+
+def reconcile_crew_reviews_status(
+    store_path: str | Path,
+    message_id: str | None = None,
+    reconciled_by: str = "sisko",
+    reconciled_at: str | None = None,
+) -> dict[str, object]:
+    now = reconciled_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    store = SQLiteStore(store_path)
+    try:
+        messages = [
+            item for item in store.list_crew_messages()
+            if item.status == CrewMessageStatus.ACKNOWLEDGED
+            and item.review_status == CrewReviewStatus.PENDING
+            and (message_id is None or item.id == message_id)
+        ]
+        dispatch_evidence_by_message = {
+            message.id: next(
+                (
+                    event.id
+                    for event in sorted(
+                        store.list_audit_events(
+                            subject_prefix=message.id,
+                            event_type=AuditEventType.EXECUTED,
+                        ),
+                        key=lambda item: item.occurred_at or item.id,
+                        reverse=True,
+                    )
+                    if event.subject_id == message.id
+                ),
+                None,
+            )
+            for message in messages
+        }
+        packages = list(store.list_host_security_ids_review_packages())
+    finally:
+        store.close()
+    pending_decisions: list[tuple[object, CrewReviewStatus, str, tuple[str, ...], str | None]] = []
+    for message in messages:
+        dispatch_evidence = dispatch_evidence_by_message.get(message.id)
+        decision: tuple[CrewReviewStatus, str, tuple[str, ...], str | None] | None = None
+        text = f"{message.subject}\n{message.message}".lower()
+        read_only = any(marker in text for marker in ("read-only", "read only", "advisory", "inventory", "review"))
+        if message.owner_domain == OwnerDomain.DAX and read_only and dispatch_evidence:
+            decision = (
+                CrewReviewStatus.APPROVED,
+                "Dax completed the bounded read-only inventory review without reserving or mutating a resource",
+                (dispatch_evidence,),
+                None,
+            )
+        elif message.owner_domain == OwnerDomain.KIRA:
+            complete, validation_reason = _kira_storage_review_complete(store_path, message)
+            if complete and dispatch_evidence:
+                decision = (
+                    CrewReviewStatus.APPROVED,
+                    "Kira validated the typed storage criteria and durable evidence without host mutation",
+                    tuple(dict.fromkeys((*message.request_evidence_ids, dispatch_evidence))),
+                    None,
+                )
+            else:
+                reason = "Kira discovery is not a storage approval; resubmit with a typed storage target, capacity requirement, access boundary, and durable evidence reference"
+                if validation_reason:
+                    reason = f"{reason}: {validation_reason}"
+                decision = (
+                    CrewReviewStatus.CORRECTION_REQUESTED,
+                    reason,
+                    tuple(filter(None, (dispatch_evidence,))),
+                    reason,
+                )
+        elif message.owner_domain == OwnerDomain.ODO_IDS:
+            if not message.related_plan_id:
+                reason = "IDS approval requires a related admin plan and accepted advisory package; resubmit with related_plan_id"
+                decision = (CrewReviewStatus.CORRECTION_REQUESTED, reason, tuple(filter(None, (dispatch_evidence,))), reason)
+            else:
+                linked = [package for package in packages if package.plan_id == message.related_plan_id]
+                accepted = next((package for package in linked if package.status == IDSReviewPackageStatus.ACCEPTED), None)
+                revision = next((package for package in linked if package.status == IDSReviewPackageStatus.REVISION_REQUIRED), None)
+                if accepted and accepted.advisory_result:
+                    decision = (
+                        CrewReviewStatus.APPROVED,
+                        accepted.advisory_result,
+                        (accepted.id, accepted.plan_id),
+                        None,
+                    )
+                elif revision and revision.advisory_result:
+                    decision = (
+                        CrewReviewStatus.CORRECTION_REQUESTED,
+                        revision.advisory_result,
+                        (revision.id, revision.plan_id),
+                        revision.advisory_result,
+                    )
+                else:
+                    reason = "IDS advisory has no accepted or revision-required result; resubmit after authoritative advisory evidence is recorded"
+                    decision = (
+                        CrewReviewStatus.CORRECTION_REQUESTED,
+                        reason,
+                        tuple(filter(None, (dispatch_evidence, *(package.id for package in linked)))),
+                        reason,
+                    )
+        elif message.owner_domain == OwnerDomain.SISKO and message.related_plan_id:
+            decision = (
+                CrewReviewStatus.WAITING_HUMAN_APPROVAL,
+                f"Human approval is required for exact admin plan {message.related_plan_id}",
+                tuple(dict.fromkeys((message.related_plan_id, *tuple(filter(None, (dispatch_evidence,)))))),
+                None,
+            )
+        elif message.owner_domain == OwnerDomain.OBRIEN and (message.related_resource_id or "").startswith("storage."):
+            reason = "O'Brien package maintenance cannot execute a storage request; provide an approved bounded storage execution adapter or exact admin plan"
+            decision = (
+                CrewReviewStatus.CORRECTION_REQUESTED,
+                reason,
+                tuple(filter(None, (dispatch_evidence,))),
+                reason,
+            )
+        elif dispatch_evidence:
+            decision = (
+                CrewReviewStatus.APPROVED,
+                f"{message.owner_domain.value} completed the registered bounded crew workflow",
+                tuple(dict.fromkeys((*message.request_evidence_ids, dispatch_evidence))),
+                None,
+            )
+        else:
+            reason = "No completed dispatcher evidence exists; correct the request linkage or registered crew adapter before resubmitting"
+            decision = (CrewReviewStatus.CORRECTION_REQUESTED, reason, (), reason)
+        if decision is None:
+            continue
+        status, reason, evidence, correction = decision
+        pending_decisions.append((message, status, reason, evidence, correction))
+    results: list[dict[str, object]] = []
+    store = SQLiteStore(store_path)
+    try:
+        with store.agent_transaction():
+            for message, status, reason, evidence, correction in pending_decisions:
+                latest = store.load_crew_message(message.id)
+                if latest.review_status != CrewReviewStatus.PENDING:
+                    continue
+                decided_by = (
+                    reconciled_by
+                    if latest.owner_domain not in {OwnerDomain.DAX, OwnerDomain.KIRA, OwnerDomain.ODO_IDS}
+                    else latest.owner_domain.value
+                )
+                updated = replace(
+                    latest,
+                    review_status=status,
+                    decision_reason=reason,
+                    correction_request=correction,
+                    decision_evidence_ids=evidence,
+                    decided_by=decided_by,
+                    decided_at=now,
+                    updated_at=now,
+                )
+                store.save_crew_message(updated)
+                event_type = (
+                    AuditEventType.APPROVED
+                    if status == CrewReviewStatus.APPROVED
+                    else AuditEventType.REQUESTED
+                    if status == CrewReviewStatus.WAITING_HUMAN_APPROVAL
+                    else AuditEventType.REJECTED
+                )
+                event = AuditEvent(
+                    id=f"audit.{latest.id}.review.{_status_id(now)}",
+                    event_type=event_type,
+                    owner_domain=latest.owner_domain,
+                    subject_id=latest.id,
+                    summary=f"crew review {status.value}: {reason}",
+                    risk_level=latest.priority,
+                    evidence_ids=evidence,
+                    occurred_at=now,
+                )
+                store.save_audit_event(event)
+                results.append({
+                    "store": str(store.path),
+                    "message": crew_message_status(updated),
+                    "audit_event": audit_event_status(event),
+                    "mutation_performed": True,
+                    "host_mutation_performed": False,
+                })
+    finally:
+        store.close()
+    return {
+        "store": str(Path(store_path)),
+        "reviewed": len(results),
+        "approved": sum(1 for item in results if item["message"]["review_status"] == CrewReviewStatus.APPROVED.value),
+        "correction_requested": sum(1 for item in results if item["message"]["review_status"] == CrewReviewStatus.CORRECTION_REQUESTED.value),
+        "rejected": sum(1 for item in results if item["message"]["review_status"] == CrewReviewStatus.REJECTED.value),
+        "items": results,
+        "mutation_performed": bool(results),
+        "host_mutation_performed": False,
+    }
 
 
 def dispatch_crew_messages_status(
@@ -6876,15 +7432,17 @@ def dispatch_crew_messages_status(
                 "reason": str(error),
                 "actions": [],
             }
-            final_status = CrewMessageStatus.OPEN
+            final_status = CrewMessageStatus.ACKNOWLEDGED
         store = SQLiteStore(store_path)
         try:
-            updated = replace(message, status=final_status, updated_at=now)
+            dispatch_audit_id = f"audit.{message.id}.dispatch.{_status_id(now)}"
+            review = _automatic_crew_review(store_path, message, result, final_status, dispatch_audit_id, dispatched_by, now)
+            updated = replace(message, status=final_status, updated_at=now, **review)
             store.save_crew_message(updated)
             store.save_audit_event(
                 AuditEvent(
-                    id=f"audit.{message.id}.dispatch.{_status_id(now)}",
-                    event_type=AuditEventType.EXECUTED if final_status == CrewMessageStatus.ACKNOWLEDGED else AuditEventType.BLOCKED,
+                    id=dispatch_audit_id,
+                    event_type=AuditEventType.BLOCKED if result.get("status") == "blocked" else AuditEventType.EXECUTED,
                     owner_domain=message.owner_domain,
                     subject_id=message.id,
                     summary=f"{message.owner_domain.value} dispatch {result['status']}: {result['reason']}",
@@ -6893,9 +7451,12 @@ def dispatch_crew_messages_status(
                 )
             )
             result["message_status"] = updated.status.value
+            result["review_status"] = updated.review_status.value
+            result["decision_reason"] = updated.decision_reason
             results.append(result)
         finally:
             store.close()
+    reconciliation = reconcile_crew_reviews_status(store_path, reconciled_by=dispatched_by, reconciled_at=now)
     return {
         "store": str(Path(store_path)),
         "requested_owner_domain": owner_domain,
@@ -6904,11 +7465,126 @@ def dispatch_crew_messages_status(
         "dispatched_at": now,
         "processed": len(results),
         "acknowledged": sum(1 for result in results if result["message_status"] == CrewMessageStatus.ACKNOWLEDGED.value),
-        "blocked": sum(1 for result in results if result["message_status"] == CrewMessageStatus.OPEN.value),
+        "blocked": sum(1 for result in results if result.get("status") == "blocked"),
+        "approved": sum(1 for result in results if result["review_status"] == CrewReviewStatus.APPROVED.value),
+        "correction_requested": sum(1 for result in results if result["review_status"] == CrewReviewStatus.CORRECTION_REQUESTED.value),
         "items": results,
+        "review_reconciliation": reconciliation,
         "mutation_performed": bool(results),
         "host_mutation_performed": any(_crew_dispatch_result_mutated_host(result) for result in results),
     }
+
+
+def _automatic_crew_review(store_path, message, result, delivery_status, evidence_id: str, decided_by: str, decided_at: str) -> dict[str, object]:
+    if delivery_status != CrewMessageStatus.ACKNOWLEDGED:
+        return {}
+    text = f"{message.subject}\n{message.message}".lower()
+    read_only = any(marker in text for marker in ("read-only", "read only", "advisory", "inventory", "review"))
+    if result.get("status") in {"skipped", "blocked"}:
+        reason = str(result.get("reason") or "dispatcher could not complete the requested review")
+        return {
+            "review_status": CrewReviewStatus.CORRECTION_REQUESTED,
+            "decision_reason": reason,
+            "correction_request": reason,
+            "decision_evidence_ids": (evidence_id,),
+            "decided_by": decided_by,
+            "decided_at": decided_at,
+        }
+    if message.owner_domain == OwnerDomain.DAX and read_only and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
+        return {
+            "review_status": CrewReviewStatus.APPROVED,
+            "decision_reason": "Dax completed the bounded read-only inventory review without reserving or mutating a resource",
+            "decision_evidence_ids": (evidence_id,),
+            "decided_by": OwnerDomain.DAX.value,
+            "decided_at": decided_at,
+        }
+    if message.owner_domain == OwnerDomain.KIRA:
+        complete, validation_reason = _kira_storage_review_complete(store_path, message)
+        if complete and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
+            return {
+                "review_status": CrewReviewStatus.APPROVED,
+                "decision_reason": "Kira validated the typed storage advisory criteria and refreshed read-only storage evidence without mutation",
+                "decision_evidence_ids": tuple(dict.fromkeys((*message.request_evidence_ids, evidence_id))),
+                "decided_by": OwnerDomain.KIRA.value,
+                "decided_at": decided_at,
+            }
+        reason = "Kira discovery completed, but approval requires a typed storage target, capacity requirement, access boundary, and durable evidence reference"
+        if validation_reason:
+            reason = f"{reason}: {validation_reason}"
+        return {
+            "review_status": CrewReviewStatus.CORRECTION_REQUESTED,
+            "decision_reason": reason,
+            "correction_request": reason,
+            "decision_evidence_ids": (evidence_id,),
+            "decided_by": OwnerDomain.KIRA.value,
+            "decided_at": decided_at,
+        }
+    if message.owner_domain == OwnerDomain.ODO_IDS and not message.related_plan_id:
+        reason = "IDS approval requires a related admin plan and its accepted advisory package; resubmit with related_plan_id"
+        return {
+            "review_status": CrewReviewStatus.CORRECTION_REQUESTED,
+            "decision_reason": reason,
+            "correction_request": reason,
+            "decision_evidence_ids": (evidence_id,),
+            "decided_by": OwnerDomain.ODO_IDS.value,
+            "decided_at": decided_at,
+        }
+    if message.owner_domain == OwnerDomain.SISKO and result.get("status") == "human_approval_required":
+        evidence = tuple(dict.fromkeys((*message.request_evidence_ids, *tuple(filter(None, (message.related_plan_id, evidence_id))))))
+        return {
+            "review_status": CrewReviewStatus.WAITING_HUMAN_APPROVAL,
+            "decision_reason": str(result.get("reason") or "human approval required"),
+            "decision_evidence_ids": evidence,
+            "decided_by": OwnerDomain.SISKO.value,
+            "decided_at": decided_at,
+        }
+    if message.owner_domain == OwnerDomain.ODO_IDS:
+        reason = "IDS advisory was dispatched but no accepted or revision-required result is recorded; resubmit after authoritative advisory evidence exists"
+        return {
+            "review_status": CrewReviewStatus.CORRECTION_REQUESTED,
+            "decision_reason": reason,
+            "correction_request": reason,
+            "decision_evidence_ids": (evidence_id,),
+            "decided_by": OwnerDomain.ODO_IDS.value,
+            "decided_at": decided_at,
+        }
+    if result.get("status") == "dispatched":
+        return {
+            "review_status": CrewReviewStatus.APPROVED,
+            "decision_reason": f"{message.owner_domain.value} completed the registered bounded crew workflow",
+            "decision_evidence_ids": tuple(dict.fromkeys((*message.request_evidence_ids, evidence_id))),
+            "decided_by": message.owner_domain.value,
+            "decided_at": decided_at,
+        }
+    reason = str(result.get("reason") or "crew dispatcher returned no terminal outcome")
+    return {
+        "review_status": CrewReviewStatus.CORRECTION_REQUESTED,
+        "decision_reason": reason,
+        "correction_request": reason,
+        "decision_evidence_ids": (evidence_id,),
+        "decided_by": message.owner_domain.value,
+        "decided_at": decided_at,
+    }
+
+
+def _kira_storage_review_complete(store_path: str | Path, message) -> tuple[bool, str]:
+    resource_id = (message.related_resource_id or "").strip()
+    if not resource_id.startswith("storage."):
+        return False, "related_resource_id must identify a registered storage.* resource"
+    store = SQLiteStore(store_path)
+    try:
+        store.load_resource(resource_id)
+    except KeyError:
+        return False, "the typed storage resource is not registered"
+    finally:
+        store.close()
+    criteria = "\n".join(message.acceptance_criteria).lower()
+    missing = [term for term in ("capacity", "access", "failure domain") if term not in criteria]
+    if missing:
+        return False, f"acceptance criteria missing {', '.join(missing)}"
+    if not message.request_evidence_ids:
+        return False, "at least one durable request evidence id is required"
+    return True, ""
 
 
 def _dispatch_crew_message(
@@ -6934,15 +7610,16 @@ def _dispatch_crew_message(
 
 
 def _dispatch_sisko_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
-    if message.related_plan_id and message.related_plan_id != "all" and _message_mentions(message, "approve", "approval", "approved"):
-        approval = approve_admin_change_status(store_path, message.related_plan_id, "sisko", dispatched_at)
-        actions: list[dict[str, object]] = [approval]
-        execution = _execute_obrien_package_plan_if_ready(store_path, message.related_plan_id)
-        if execution is not None:
-            actions.append(execution)
-        return _crew_dispatch_result(message, "dispatched", f"Sisko approved plan {message.related_plan_id}", actions)
     if message.related_plan_id == "all":
         return _crew_dispatch_result(message, "skipped", "Sisko dispatch requires exact plan IDs; broad all-plan approval is not executed", [])
+    if message.related_plan_id:
+        readiness = _admin_plan_readiness_item(store_path, message.related_plan_id)
+        return _crew_dispatch_result(
+            message,
+            "human_approval_required",
+            f"Human approval is required for exact admin plan {message.related_plan_id}",
+            [readiness],
+        )
     return _crew_dispatch_result(message, "skipped", "Sisko acknowledged command request; no exact approval target was provided", [])
 
 
@@ -6953,6 +7630,13 @@ def _dispatch_kira_message(store_path: str | Path, message, dispatched_by: str, 
 
 
 def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if (message.related_resource_id or "").startswith("storage."):
+        return _crew_dispatch_result(
+            message,
+            "skipped",
+            "O'Brien package maintenance has no bounded storage execution adapter; provide an approved storage adapter or exact admin plan",
+            [],
+        )
     packages = (message.related_resource_id,) if message.related_resource_id else ()
     plan = plan_package_updates_status(store_path, captured_at=dispatched_at, packages=packages)
     actions: list[dict[str, object]] = [plan]
@@ -7764,6 +8448,26 @@ def _dispatch_quark_message(store_path: str | Path, message, dispatched_by: str,
 
 
 def _dispatch_dax_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    advisory_markers = (
+        "advisory",
+        "read-only",
+        "read only",
+        "inventory",
+        "discover",
+        "review",
+    )
+    advisory_request = any(
+        marker in f"{message.subject}\n{message.message}".lower()
+        for marker in advisory_markers
+    )
+    if advisory_request:
+        discovery = discover_virtual_listeners_status(store_path)
+        return _crew_dispatch_result(
+            message,
+            "dispatched",
+            "Dax refreshed virtual listener inventory for read-only advisory review",
+            [discovery],
+        )
     if message.related_resource_id:
         claim = request_claim_status(
             store_path,
@@ -9456,6 +10160,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_health_target_parser.add_argument("--expected-status", type=int)
     record_health_target_parser.add_argument("--expected-content-type")
     record_health_target_parser.add_argument("--latency-warn-ms", type=int)
+    enablement_group = record_health_target_parser.add_mutually_exclusive_group()
+    enablement_group.add_argument("--enabled", dest="enabled", action="store_true", default=True)
+    enablement_group.add_argument("--disabled", dest="enabled", action="store_false")
+    record_health_target_parser.add_argument("--suspension-reason", default="")
     service_evidence_parser = subparsers.add_parser("service-evidence", help="summarize Julian service detail evidence")
     service_evidence_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     service_evidence_parser.add_argument("--resource-id")
@@ -10196,6 +10904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     crew_messages_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     crew_messages_parser.add_argument("--owner-domain", choices=[item.value for item in OwnerDomain])
     crew_messages_parser.add_argument("--status", choices=[item.value for item in CrewMessageStatus])
+    crew_messages_parser.add_argument("--requested-by")
+    crew_messages_parser.add_argument("--message-id")
     record_crew_message_parser = subparsers.add_parser("record-crew-message", help="route an operator request to a crew domain")
     record_crew_message_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     record_crew_message_parser.add_argument("--owner-domain", required=True, choices=[item.value for item in OwnerDomain])
@@ -10208,12 +10918,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_crew_message_parser.add_argument("--related-resource-id")
     record_crew_message_parser.add_argument("--related-plan-id")
     record_crew_message_parser.add_argument("--related-limit-id")
+    record_crew_message_parser.add_argument("--acceptance-criterion", action="append", default=[])
+    record_crew_message_parser.add_argument("--request-evidence-id", action="append", default=[])
     dispatch_crew_parser = subparsers.add_parser("dispatch-crew-messages", help="dispatch open crew-scoped operator messages")
     dispatch_crew_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     dispatch_crew_parser.add_argument("--owner-domain", choices=[item.value for item in OwnerDomain])
     dispatch_crew_parser.add_argument("--message-id")
     dispatch_crew_parser.add_argument("--dispatched-by", default="sisko")
     dispatch_crew_parser.add_argument("--dispatched-at")
+    decide_crew_parser = subparsers.add_parser("decide-crew-message", help="record an approval, correction request, or rejection for an acknowledged crew message")
+    decide_crew_parser.add_argument("--store", required=True)
+    decide_crew_parser.add_argument("--message-id", required=True)
+    decide_crew_parser.add_argument("--review-status", required=True, choices=[item.value for item in CrewReviewStatus if item != CrewReviewStatus.PENDING])
+    decide_crew_parser.add_argument("--decided-by", required=True)
+    decide_crew_parser.add_argument("--reason", required=True)
+    decide_crew_parser.add_argument("--evidence-id", action="append", default=[])
+    decide_crew_parser.add_argument("--correction-request")
+    decide_crew_parser.add_argument("--decided-at")
+    resubmit_crew_parser = subparsers.add_parser("resubmit-crew-message", help="submit a corrected revision of a rejected or correction-requested crew message")
+    resubmit_crew_parser.add_argument("--store", required=True)
+    resubmit_crew_parser.add_argument("--message-id", required=True)
+    resubmit_crew_parser.add_argument("--subject", required=True)
+    resubmit_crew_parser.add_argument("--message", required=True)
+    resubmit_crew_parser.add_argument("--requested-by", required=True)
+    resubmit_crew_parser.add_argument("--new-message-id")
+    resubmit_crew_parser.add_argument("--created-at")
+    resubmit_crew_parser.add_argument("--expected-requester", action="append", default=[])
+    resubmit_crew_parser.add_argument("--related-resource-id")
+    resubmit_crew_parser.add_argument("--related-plan-id")
+    resubmit_crew_parser.add_argument("--related-limit-id")
+    resubmit_crew_parser.add_argument("--acceptance-criterion", action="append", default=[])
+    resubmit_crew_parser.add_argument("--request-evidence-id", action="append", default=[])
+    reconcile_crew_parser = subparsers.add_parser("reconcile-crew-reviews", help="advance acknowledged crew reviews from authoritative evidence")
+    reconcile_crew_parser.add_argument("--store", required=True)
+    reconcile_crew_parser.add_argument("--message-id")
+    reconcile_crew_parser.add_argument("--reconciled-by", default="sisko")
+    reconcile_crew_parser.add_argument("--reconciled-at")
     usage_continuation_plan_parser = subparsers.add_parser(
         "usage-continuation-plan",
         help="summarize persisted usage-limited continuation requests",
@@ -10537,6 +11277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.expected_status,
                     args.expected_content_type,
                     args.latency_warn_ms,
+                    args.enabled,
+                    args.suspension_reason,
                 ),
                 sort_keys=True,
             )
@@ -11689,7 +12431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "crew-messages":
-        print(json.dumps(crew_messages_status(args.store, args.owner_domain, args.status), sort_keys=True))
+        print(json.dumps(crew_messages_status(args.store, args.owner_domain, args.status, args.requested_by, args.message_id), sort_keys=True))
         return 0
 
     if args.command == "record-crew-message":
@@ -11707,6 +12449,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.related_resource_id,
                     args.related_plan_id,
                     args.related_limit_id,
+                    acceptance_criteria=args.acceptance_criterion,
+                    request_evidence_ids=args.request_evidence_id,
                 ),
                 sort_keys=True,
             )
@@ -11726,6 +12470,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "decide-crew-message":
+        print(json.dumps(decide_crew_message_status(args.store, args.message_id, args.review_status, args.decided_by, args.reason, args.evidence_id, args.correction_request, args.decided_at), sort_keys=True))
+        return 0
+
+    if args.command == "resubmit-crew-message":
+        print(json.dumps(resubmit_crew_message_status(args.store, args.message_id, args.subject, args.message, args.requested_by, args.new_message_id, args.created_at, args.expected_requester, args.related_resource_id, args.related_plan_id, args.related_limit_id, args.acceptance_criterion, args.request_evidence_id), sort_keys=True))
+        return 0
+
+    if args.command == "reconcile-crew-reviews":
+        print(json.dumps(reconcile_crew_reviews_status(args.store, args.message_id, args.reconciled_by, args.reconciled_at), sort_keys=True))
         return 0
 
     if args.command == "usage-continuation-plan":

@@ -182,7 +182,44 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         self.assertIn("data-layout-effective", OPERATOR_CONSOLE_HTML)
         self.assertIn("@media (prefers-reduced-motion: reduce)", OPERATOR_CONSOLE_HTML)
         self.assertIn('body[data-layout-effective="desktop"] .shell', OPERATOR_CONSOLE_HTML)
+        self.assertIn('body[data-layout-effective="desktop"] main { padding-top: 60px; }', OPERATOR_CONSOLE_HTML)
         self.assertIn('#driver .action-btn { min-height: 44px; }', OPERATOR_CONSOLE_HTML)
+
+    def test_operator_console_places_skiller_cards_on_health_and_knowledge_pages(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('skillerEffectiveness: "/health/skiller-effectiveness"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('skillerGuidanceAdherence: "/health/skiller-guidance-adherence"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Skiller Adaptive Review", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Skiller Guidance Quality", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Recurring Skiller Pitfalls", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Learning Effectiveness", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Effectiveness Review History", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Skiller Guidance Audit", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Thread Guidance Status", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Recent Guidance Findings", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Guidance Recommendation History", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Guidance Adherence History", OPERATOR_CONSOLE_HTML)
+
+    def test_operator_console_clears_a_rejected_stored_api_token(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn("err.status === 401", OPERATOR_CONSOLE_HTML)
+        self.assertIn('tokenStore.removeItem("overseerToken")', OPERATOR_CONSOLE_HTML)
+        self.assertIn("The stored Overseer API token is no longer valid", OPERATOR_CONSOLE_HTML)
+        self.assertIn('document.body.dataset.loadState = unauthorized ? "locked" : "failed"', OPERATOR_CONSOLE_HTML)
+
+    def test_operator_console_refreshes_visible_live_data_without_overlap(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn("const AUTO_REFRESH_MS = 30000", OPERATOR_CONSOLE_HTML)
+        self.assertIn("if (refreshPromise) return refreshPromise", OPERATOR_CONSOLE_HTML)
+        self.assertIn('window.addEventListener("focus"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('document.addEventListener("visibilitychange"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("if (!document.hidden && state.token) refresh()", OPERATOR_CONSOLE_HTML)
+        self.assertIn("auto refresh paused", OPERATOR_CONSOLE_HTML)
+        self.assertIn("auto refresh on", OPERATOR_CONSOLE_HTML)
+        self.assertIn('id="updated" class="muted" aria-live="polite"', OPERATOR_CONSOLE_HTML)
 
     def test_driver_actions_fail_closed_by_exact_capability_and_route(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
@@ -227,6 +264,8 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
     "/Overseer/operations/workflows",
             "/Overseer/health/service-evidence",
             "/Overseer/health/codex-usage",
+            "/Overseer/health/skiller-effectiveness",
+            "/Overseer/health/skiller-guidance-adherence",
             "/Overseer/observability/trends",
             "/Overseer/observability/metric-history",
             "/Overseer/observability/performance-history",

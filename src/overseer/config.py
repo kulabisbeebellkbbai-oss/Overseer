@@ -143,6 +143,8 @@ def _health_target_from_mapping(data: dict[str, Any]) -> HealthTarget:
         expected_status=int(data["expected_status"]) if "expected_status" in data else None,
         expected_content_type=data.get("expected_content_type"),
         latency_warn_ms=int(data["latency_warn_ms"]) if "latency_warn_ms" in data else None,
+        enabled=bool(data.get("enabled", True)),
+        suspension_reason=str(data.get("suspension_reason", "")),
     )
 
 

@@ -26,6 +26,7 @@ class HealthStatus(StrEnum):
     FAILED = "failed"
     UNKNOWN = "unknown"
     RECOVERED = "recovered"
+    SUSPENDED = "suspended"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class HealthTarget:
     expected_status: int | None = None
     expected_content_type: str | None = None
     latency_warn_ms: int | None = None
+    enabled: bool = True
+    suspension_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,8 @@ class HealthTargetSummary:
     latest_captured_at: str | None = None
     recovery_required: bool = False
     error: str = ""
+    enabled: bool = True
+    suspension_reason: str = ""
 
 
 def summarize_health_targets(
@@ -89,6 +94,21 @@ def summarize_health_targets(
         evidence_by_key.setdefault((evidence.resource_id, evidence.target), []).append(evidence)
     summaries: list[HealthTargetSummary] = []
     for target in targets:
+        if not target.enabled:
+            summaries.append(
+                HealthTargetSummary(
+                    target_id=target.id,
+                    resource_id=target.resource_id,
+                    name=target.name,
+                    target=target.target,
+                    latest_status=HealthStatus.SUSPENDED,
+                    owner_domain=target.owner_domain,
+                    recovery_required=False,
+                    enabled=False,
+                    suspension_reason=target.suspension_reason,
+                )
+            )
+            continue
         latest = _latest_evidence(evidence_by_key.get((target.resource_id, target.target), []))
         if latest is None:
             summaries.append(

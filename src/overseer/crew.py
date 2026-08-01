@@ -16,6 +16,14 @@ class CrewMessageStatus(StrEnum):
     CLOSED = "closed"
 
 
+class CrewReviewStatus(StrEnum):
+    PENDING = "pending"
+    WAITING_HUMAN_APPROVAL = "waiting_human_approval"
+    APPROVED = "approved"
+    CORRECTION_REQUESTED = "correction_requested"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True)
 class CrewMessage:
     id: str
@@ -30,6 +38,16 @@ class CrewMessage:
     related_resource_id: str | None = None
     related_plan_id: str | None = None
     related_limit_id: str | None = None
+    review_status: CrewReviewStatus = CrewReviewStatus.PENDING
+    decision_reason: str | None = None
+    correction_request: str | None = None
+    decision_evidence_ids: tuple[str, ...] = ()
+    decided_by: str | None = None
+    decided_at: str | None = None
+    supersedes_message_id: str | None = None
+    superseded_by_message_id: str | None = None
+    acceptance_criteria: tuple[str, ...] = ()
+    request_evidence_ids: tuple[str, ...] = ()
 
 
 def build_crew_message(
@@ -43,6 +61,9 @@ def build_crew_message(
     related_resource_id: str | None = None,
     related_plan_id: str | None = None,
     related_limit_id: str | None = None,
+    supersedes_message_id: str | None = None,
+    acceptance_criteria: tuple[str, ...] = (),
+    request_evidence_ids: tuple[str, ...] = (),
 ) -> CrewMessage:
     if not subject.strip():
         raise ValueError("subject is required")
@@ -62,6 +83,9 @@ def build_crew_message(
         related_resource_id=related_resource_id,
         related_plan_id=related_plan_id,
         related_limit_id=related_limit_id,
+        supersedes_message_id=supersedes_message_id,
+        acceptance_criteria=acceptance_criteria,
+        request_evidence_ids=request_evidence_ids,
     )
 
 
@@ -79,6 +103,16 @@ def crew_message_status(message: CrewMessage) -> dict[str, object]:
         "related_resource_id": message.related_resource_id,
         "related_plan_id": message.related_plan_id,
         "related_limit_id": message.related_limit_id,
+        "review_status": CrewReviewStatus(message.review_status).value,
+        "decision_reason": message.decision_reason,
+        "correction_request": message.correction_request,
+        "decision_evidence_ids": list(message.decision_evidence_ids),
+        "decided_by": message.decided_by,
+        "decided_at": message.decided_at,
+        "supersedes_message_id": message.supersedes_message_id,
+        "superseded_by_message_id": message.superseded_by_message_id,
+        "acceptance_criteria": list(message.acceptance_criteria),
+        "request_evidence_ids": list(message.request_evidence_ids),
     }
 
 

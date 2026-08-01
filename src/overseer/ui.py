@@ -680,6 +680,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     body[data-layout-effective="mobile"] .token { flex-wrap: wrap; }
     body[data-layout-effective="mobile"] .token input { width: 100%; flex-basis: 100%; }
     body[data-layout-effective="desktop"] .shell { grid-template-columns: 294px minmax(0, 1fr); }
+    body[data-layout-effective="desktop"] main { padding-top: 60px; }
     body[data-layout-effective="desktop"] aside {
       position: relative;
       border-right: 4px solid var(--lcars-amber);
@@ -737,7 +738,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <h2 id="view-title">Strategic Operations</h2>
           <div class="status-line">
             <span id="overall" class="pill">loading</span>
-            <span id="updated" class="muted">not refreshed</span>
+            <span id="updated" class="muted" aria-live="polite">not refreshed</span>
           </div>
         </div>
         <form id="token-form" class="token">
@@ -799,6 +800,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       healthSummary: "/health-summary",
       serviceEvidence: "/health/service-evidence",
       codexUsage: "/health/codex-usage",
+      skillerEffectiveness: "/health/skiller-effectiveness",
+      skillerGuidanceAdherence: "/health/skiller-guidance-adherence",
       observabilityTrends: "/observability/trends",
       metricHistory: "/observability/metric-history",
       performanceHistory: "/observability/performance-history",
@@ -835,9 +838,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       documentsFolder: "Overseer",
       documentsQuery: "Overseer",
       loadErrors: [],
-      lastAction: null
+      lastAction: null,
+      lastUpdatedAt: null
     };
     state.driverSelection = {};
+    const AUTO_REFRESH_MS = 30000;
+    const DATA_AGE_UPDATE_MS = 1000;
+    let refreshPromise = null;
     const LAYOUT_MODES = ["auto", "desktop", "tablet", "mobile"];
     function viewportLayout(width) {
       if (width <= 700) return "mobile";
@@ -873,6 +880,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     window.addEventListener("resize", () => {
       if (layoutMode === "auto") applyLayoutMode();
     });
+    window.addEventListener("focus", () => {
+      if (state.token) refresh();
+    });
+    document.addEventListener("visibilitychange", () => {
+      updateRefreshStatus();
+      if (!document.hidden && state.token) refresh();
+    });
+    window.setInterval(() => {
+      if (!document.hidden && state.token) refresh();
+    }, AUTO_REFRESH_MS);
+    window.setInterval(updateRefreshStatus, DATA_AGE_UPDATE_MS);
     applyLayoutMode();
     document.body.dataset.loadState = "locked";
     document.body.dataset.loadFailures = "0";
@@ -946,7 +964,14 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       document.getElementById("view-title").textContent = title(view);
       render();
     }
-    async function refresh() {
+    function refresh() {
+      if (refreshPromise) return refreshPromise;
+      refreshPromise = performRefresh().finally(() => {
+        refreshPromise = null;
+      });
+      return refreshPromise;
+    }
+    async function performRefresh() {
       const error = document.getElementById("error");
       document.body.dataset.loadState = "loading";
       document.body.dataset.loadFailures = "0";
@@ -957,17 +982,24 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       try {
         authPayload = await getJson(endpoints.auth);
       } catch (err) {
-        error.textContent = formatEndpointError({path: endpoints.auth, message: err.message});
-        document.body.dataset.loadState = "failed";
+        const unauthorized = err.status === 401;
+        if (unauthorized) {
+          state.token = "";
+          tokenInput.value = "";
+          tokenStore.removeItem("overseerToken");
+        }
+        error.textContent = unauthorized
+          ? "The stored Overseer API token is no longer valid. Enter the current token and select Unlock."
+          : formatEndpointError({path: endpoints.auth, message: err.message});
+        document.body.dataset.loadState = unauthorized ? "locked" : "failed";
         document.body.dataset.loadFailures = "1";
-        error.dataset.loadState = "failed";
+        error.dataset.loadState = document.body.dataset.loadState;
         error.dataset.loadFailures = "1";
         error.hidden = false;
         return;
       }
       state.data = {...state.data, auth: authPayload};
       state.loadErrors = [];
-      document.getElementById("updated").textContent = new Date().toLocaleString();
       const endpointEntries = Object.entries(endpoints)
         .filter(([key]) => !requiredEndpointKeys.has(key))
         .map(([key, path]) => [key, endpointPath(key, path)]);
@@ -991,7 +1023,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         error.hidden = false;
       }
       try {
-        document.getElementById("updated").textContent = new Date().toLocaleString();
+        state.lastUpdatedAt = new Date();
+        updateRefreshStatus();
         render();
         document.body.dataset.loadState = failures.length ? "partial" : "ready";
         error.dataset.loadState = document.body.dataset.loadState;
@@ -1003,6 +1036,16 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         error.dataset.loadFailures = document.body.dataset.loadFailures;
         error.hidden = false;
       }
+    }
+    function updateRefreshStatus() {
+      const updated = document.getElementById("updated");
+      if (!state.lastUpdatedAt) return;
+      const ageSeconds = Math.max(0, Math.floor((Date.now() - state.lastUpdatedAt.getTime()) / 1000));
+      const ageLabel = ageSeconds < 60
+        ? `${ageSeconds}s ago`
+        : `${Math.floor(ageSeconds / 60)}m ago`;
+      const pollingLabel = document.hidden ? "auto refresh paused" : "auto refresh on";
+      updated.textContent = `Updated ${state.lastUpdatedAt.toLocaleString()} · ${ageLabel} · ${pollingLabel}`;
     }
     function formatEndpointError(failure) {
       return `${failure.path}: ${failure.message}`;
@@ -1045,7 +1088,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       } catch (err) {
         throw new Error(`request failed at ${target}`);
       }
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
       return await response.json();
     }
     async function postJson(path, payload = {}) {
@@ -1129,6 +1176,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "record-usage-limit") return await recordUsageLimit();
       if (action === "send-crew-message") return await sendCrewMessage(source.dataset.role, source);
       if (action === "dispatch-crew-messages") return await dispatchCrewMessages(source?.dataset?.role || "");
+      if (action === "decide-crew-message") return await decideCrewMessage(source);
+      if (action === "resubmit-crew-message") return await resubmitCrewMessage(source);
+      if (action === "reconcile-crew-reviews") return await postJson("/crew/reconcile", {reconciled_by: "sisko"});
       if (action === "documents-list-notes") return await listDocumentsNotes();
       if (action === "documents-search") return await searchDocuments();
       if (action === "documents-write-note") return await writeDocumentNote();
@@ -1791,6 +1841,30 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (planId) payload.related_plan_id = planId;
       if (limitId) payload.related_limit_id = limitId;
       return await postJson("/crew/messages", payload);
+    }
+    async function decideCrewMessage(source) {
+      const prefix = source.dataset.prefix;
+      const status = source.dataset.reviewStatus;
+      const evidence = value(`${prefix}-decision-evidence`).split(",").map((item) => item.trim()).filter(Boolean);
+      const payload = {
+        message_id: value(`${prefix}-decision-id`),
+        review_status: status,
+        decided_by: value(`${prefix}-decision-by`) || "sisko",
+        reason: value(`${prefix}-decision-reason`),
+        evidence_ids: evidence
+      };
+      const correction = value(`${prefix}-correction-request`);
+      if (correction) payload.correction_request = correction;
+      return await postJson("/crew/messages/decide", payload);
+    }
+    async function resubmitCrewMessage(source) {
+      const prefix = source.dataset.prefix;
+      return await postJson("/crew/messages/resubmit", {
+        message_id: value(`${prefix}-resubmit-id`),
+        subject: value(`${prefix}-resubmit-subject`),
+        message: value(`${prefix}-resubmit-message`),
+        requested_by: value(`${prefix}-resubmit-by`) || "operator"
+      });
     }
     async function recordOperation() {
       const metadataText = value("op-metadata");
@@ -2909,6 +2983,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         }))
       );
       const codexAccount = codexUsage.account_usage || {};
+      const skiller = state.data.skillerEffectiveness || {};
+      const skillerLatest = skiller.latest || {};
+      const guidanceAudit = state.data.skillerGuidanceAdherence || {};
+      const guidanceCounts = guidanceAudit.status_counts || {};
       const journalAccess = serviceEvidence.journal_access || {};
       const observabilityTrends = state.data.observabilityTrends || {};
       const metricHistory = state.data.metricHistory || {};
@@ -2925,6 +3003,42 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Failures", health.latest_failures, "latest", "span-3", health.latest_failures ? "bad" : "good", "audit")}
           ${metric("Codex Capacity", codexUsage.minimum_remaining_percent, "% remaining", "span-3", codexUsage.posture === "critical" ? "bad" : codexUsage.posture === "conserve" ? "warn" : "good", "health")}
           ${metric("Codex Posture", codexUsage.posture, codexUsage.confidence || "unknown confidence", "span-3", codexUsage.available ? "good" : "bad", "health")}
+          ${metric("Skiller Review", skiller.available ? "online" : "missing", skillerLatest.schedule_mode || "no schedule evidence", "span-3", skiller.available ? "good" : "warn", "health")}
+          ${metric("Guidance Regressions", skillerLatest.guidance_regressed, "attributed runs", "span-3", skillerLatest.guidance_regressed ? "bad" : "good", "health")}
+          ${metric("Pitfalls Avoided", skillerLatest.pitfalls_avoided, "recorded outcomes", "span-3", skillerLatest.pitfalls_avoided ? "good" : "inactive", "ezri")}
+          ${metric("Attributed Runs", skillerLatest.attributed_runs, "guidance-linked", "span-3", skillerLatest.attributed_runs ? "good" : "warn", "ezri")}
+          ${metric("Guidance Threads", guidanceAudit.threads, "recommendation coverage", "span-3", guidanceAudit.available ? "good" : "warn", "health")}
+          ${metric("Guidance Followed", guidanceCounts.followed, "thread findings", "span-3", guidanceCounts.followed ? "good" : "inactive", "health")}
+          ${metric("Guidance Violated", guidanceCounts.violated, "requires review", "span-3", guidanceCounts.violated ? "bad" : "good", "health")}
+          ${metric("Awaiting Review", guidanceCounts.not_evaluated, "recommendations", "span-3", guidanceCounts.not_evaluated ? "warn" : "good", "health")}
+          <div class="panel span-6">${kv("Skiller Adaptive Review", {
+            generated_at: skillerLatest.generated_at,
+            schedule_mode: skillerLatest.schedule_mode,
+            recommended_check_minutes: skillerLatest.recommended_check_minutes,
+            new_learning_threshold: skillerLatest.recommended_new_learning_threshold,
+            maximum_age_hours: skillerLatest.recommended_max_age_hours,
+            next_step: skiller.next_step
+          })}</div>
+          <div class="panel span-6">${kv("Skiller Guidance Quality", {
+            effectiveness: skillerLatest.effectiveness,
+            guidance_worked: skillerLatest.guidance_worked,
+            guidance_regressed: skillerLatest.guidance_regressed,
+            unattributed_runs: skillerLatest.unattributed_runs,
+            recurring_pitfalls: (skiller.recurring_pitfalls || []).length
+          })}</div>
+          <div class="panel span-12">${table("Recurring Skiller Pitfalls", skiller.recurring_pitfalls || [], ["pitfall", "status"])}</div>
+          <div class="panel span-6">${kv("Skiller Guidance Audit", {
+            source: guidanceAudit.source,
+            findings: guidanceAudit.findings,
+            evaluated_threads: guidanceAudit.evaluated_threads,
+            ignored: guidanceCounts.ignored,
+            unknown: guidanceCounts.unknown,
+            high_violations: guidanceAudit.high_violations,
+            redacted: guidanceAudit.sensitive_fields_redacted,
+            next_step: guidanceAudit.next_step
+          })}</div>
+          <div class="panel span-6">${table("Thread Guidance Status", guidanceAudit.thread_status || [], ["created_at", "thread_id", "status", "recommended_skills", "linked_learnings", "guardrails", "finding_count"], {limit: 20})}</div>
+          <div class="panel span-12">${table("Recent Guidance Findings", guidanceAudit.recent_findings || [], ["created_at", "thread_id", "status", "confidence", "matched_skills", "missing_skills", "violations", "high_violations"], {limit: 20})}</div>
           <div class="panel span-6">${kv("Codex Usage Status", {
             available: codexUsage.available,
             observed_at: codexUsage.observed_at,
@@ -3221,6 +3335,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       ].filter((row) => row.url);
       const workflows = ezriWorkflowRows();
       const operations = state.data.operations || {};
+      const skiller = state.data.skillerEffectiveness || {};
+      const skillerLatest = skiller.latest || {};
+      const guidanceAudit = state.data.skillerGuidanceAdherence || {};
+      const guidanceCounts = guidanceAudit.status_counts || {};
       document.getElementById("ezri").innerHTML = `
         <div class="grid">
           ${stationIntro("Ezri", "Knowledge Base", "Operational notes, git state, event capture, runbooks, and vault search.", ["documents", "git", "runbooks"])}
@@ -3232,6 +3350,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           ${metric("Dirty Repos", gitAccount.dirty_count ?? 0, "account working trees", "span-3", gitAccount.dirty_count ? "warn" : "good", "ezri")}
           ${metric("Remote Repos", gitAccount.with_remote_count ?? 0, "linked to Git remotes", "span-3", gitAccount.with_remote_count ? "good" : "inactive", "ezri")}
           ${metric("Current Repo", gitRemote.repo || git.branch || "none", gitRemote.owner || "local only", "span-3", gitRemote.web_url ? "good" : gitTone, "ezri")}
+          ${metric("Skiller Learnings", skillerLatest.new_learnings_since_review, "since last review", "span-3", skiller.available ? "good" : "warn", "health")}
+          ${metric("Guidance Linked", skillerLatest.attributed_runs, "attributed runs", "span-3", skillerLatest.attributed_runs ? "good" : "warn", "health")}
+          ${metric("Recommendation Events", guidanceAudit.recommendation_events, "Skiller decisions", "span-3", guidanceAudit.available ? "good" : "warn", "ezri")}
+          ${metric("Evaluated Threads", guidanceAudit.evaluated_threads, "adherence findings", "span-3", guidanceAudit.evaluated_threads ? "good" : "inactive", "ezri")}
+          ${metric("Ignored Guidance", guidanceCounts.ignored, "needs applicability review", "span-3", guidanceCounts.ignored ? "warn" : "good", "ezri")}
+          ${metric("Failure Alerts", guidanceAudit.high_violations, "high severity", "span-3", guidanceAudit.high_violations ? "bad" : "good", "ezri")}
+          <div class="panel span-6">${kv("Learning Effectiveness", {
+            effectiveness: skillerLatest.effectiveness,
+            guidance_worked: skillerLatest.guidance_worked,
+            guidance_regressed: skillerLatest.guidance_regressed,
+            pitfalls_avoided: skillerLatest.pitfalls_avoided,
+            next_step: skiller.next_step
+          })}</div>
+          <div class="panel span-6">${table("Effectiveness Review History", skiller.history || [], ["generated_at", "schedule_mode", "attributed_runs", "guidance_worked", "guidance_regressed", "pitfalls_avoided"], {limit: 12})}</div>
+          <div class="panel span-12">${table("Guidance Recommendation History", guidanceAudit.recent_recommendations || [], ["created_at", "thread_id", "status", "recommended_skills", "linked_learnings", "guardrails", "known_failure_paths", "memory_references"], {limit: 20})}</div>
+          <div class="panel span-12">${table("Guidance Adherence History", guidanceAudit.recent_findings || [], ["created_at", "thread_id", "status", "confidence", "matched_skills", "missing_skills", "matched_guidance", "ignored_guidance", "violations"], {limit: 20})}</div>
           <div class="panel span-6">${kv("Documents Runtime", {
             service: status.service || "unavailable",
             status: status.available ? "online" : "offline",
@@ -3928,11 +4062,13 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const dispatches = (crewData.recent_dispatches || []).filter((item) => item.owner_domain === role);
       const blockedDispatches = dispatches.filter((item) => item.event_type === "blocked");
       return `<div class="panel span-12 officer-channel">
-        <div class="toolbar"><h3>${safe(officerName(role))} Channel</h3><div class="actions"><button class="action-btn" data-action="dispatch-crew-messages" data-role="${safe(role)}">Dispatch Open</button><button class="action-btn" data-action="send-crew-message" data-role="${safe(role)}" data-prefix="${safe(prefix)}">Send Request</button></div></div>
+        <div class="toolbar"><h3>${safe(officerName(role))} Channel</h3><div class="actions"><button class="action-btn" data-action="dispatch-crew-messages" data-role="${safe(role)}">Dispatch Open</button><button class="action-btn" data-action="reconcile-crew-reviews">Auto-process Reviews</button><button class="action-btn" data-action="send-crew-message" data-role="${safe(role)}" data-prefix="${safe(prefix)}">Send Request</button></div></div>
         <div class="mini-metrics">
           <span class="pill">${safe(crewCounts.open ?? 0)} open</span>
           <span class="pill">${safe(crewCounts.dispatches ?? 0)} dispatched</span>
           <span class="pill ${crewCounts.blocked_dispatches ? "warn" : "good"}">${safe(crewCounts.blocked_dispatches ?? 0)} blocked</span>
+          <span class="pill good">${safe(crewCounts.approved ?? 0)} approved</span>
+          <span class="pill ${crewCounts.correction_requested ? "warn" : ""}">${safe(crewCounts.correction_requested ?? 0)} corrections</span>
         </div>
         <div class="form-grid">
           <div class="field span-3"><label for="${prefix}-subject">Subject</label><input id="${prefix}-subject" value="${safe(subject)}"></div>
@@ -3945,7 +4081,17 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="field span-6">${table("Open Queue", openMessages, ["id", "priority", "subject", "created_at"])}</div>
           <div class="field span-6">${table("Dispatch History", dispatches, ["occurred_at", "event_type", "message_id", "reason"])}</div>
           <div class="field span-6">${table("Blocked Reasons", blockedDispatches, ["occurred_at", "message_id", "reason"])}</div>
-          <div class="field span-12">${table("Recent Requests", recentMessages, ["id", "priority", "status", "subject", "created_at"])}</div>
+          <div class="field span-12">${table("Recent Requests", recentMessages, ["id", "priority", "status", "review_status", "decision_reason", "subject", "created_at"])}</div>
+          <div class="field span-3"><label for="${prefix}-decision-id">Review request ID</label><input id="${prefix}-decision-id"></div>
+          <div class="field span-2"><label for="${prefix}-decision-by">Reviewer</label><input id="${prefix}-decision-by" value="${safe(role)}"></div>
+          <div class="field span-3"><label for="${prefix}-decision-evidence">Evidence IDs</label><input id="${prefix}-decision-evidence" placeholder="comma separated"></div>
+          <div class="field span-4"><label for="${prefix}-decision-reason">Decision reason</label><input id="${prefix}-decision-reason"></div>
+          <div class="field span-8"><label for="${prefix}-correction-request">Required correction</label><input id="${prefix}-correction-request"></div>
+          <div class="field span-4 actions"><button class="action-btn" data-action="decide-crew-message" data-prefix="${safe(prefix)}" data-review-status="approved">Approve</button><button class="action-btn" data-action="decide-crew-message" data-prefix="${safe(prefix)}" data-review-status="correction_requested">Request Correction</button><button class="action-btn" data-action="decide-crew-message" data-prefix="${safe(prefix)}" data-review-status="rejected">Reject</button></div>
+          <div class="field span-3"><label for="${prefix}-resubmit-id">Corrected request ID</label><input id="${prefix}-resubmit-id"></div>
+          <div class="field span-3"><label for="${prefix}-resubmit-subject">Corrected subject</label><input id="${prefix}-resubmit-subject"></div>
+          <div class="field span-4"><label for="${prefix}-resubmit-message">Corrected request</label><input id="${prefix}-resubmit-message"></div>
+          <div class="field span-2"><label for="${prefix}-resubmit-by">Requested by</label><input id="${prefix}-resubmit-by" value="operator"><button class="action-btn" data-action="resubmit-crew-message" data-prefix="${safe(prefix)}">Resubmit</button></div>
         </div>
       </div>`;
     }

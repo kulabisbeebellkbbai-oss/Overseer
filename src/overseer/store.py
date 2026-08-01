@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -195,16 +196,14 @@ class SQLiteStore:
         self._compromised_sidecars: set[str] = set()
         self._connection = sqlite3.connect(self.path, timeout=30.0)
         try:
-            self._inspect_and_harden(
-                self.path, expected=self._database_identity
-            )
+            self._harden_database_files()
         except Exception:
             self._connection.close()
             raise
         self._connection.row_factory = sqlite3.Row
         self._agent_transaction_depth = 0
         self._configure_connection()
-        self.initialize()
+        self._initialize_with_lock_retry()
         self._harden_database_files()
 
     def _prepare_database_file(self) -> tuple[int, int]:
@@ -216,10 +215,14 @@ class SQLiteStore:
         try:
             descriptor = os.open(self.path, flags, 0o600)
         except FileExistsError:
-            status = self._inspect_and_harden(self.path)
-            if status is None:
-                raise FileNotFoundError(self.path)
-            return status
+            status = self.path.lstat()
+            self._validate_artifact_status(self.path, status)
+            identity = (status.st_dev, status.st_ino)
+            os.chmod(self.path, 0o600, follow_symlinks=False)
+            hardened_status = self.path.lstat()
+            if (hardened_status.st_dev, hardened_status.st_ino) != identity:
+                raise ValueError(f"SQLite artifact identity changed: {self.path}")
+            return identity
         else:
             try:
                 status = os.fstat(descriptor)
@@ -240,73 +243,70 @@ class SQLiteStore:
                 f"SQLite artifact is not owned by this process: {path}"
             )
 
-    @classmethod
-    def _inspect_and_harden(
-        cls,
-        path: Path,
-        *,
-        expected: tuple[int, int] | None = None,
-        missing_ok: bool = False,
-        allow_secure_replacement: bool = False,
-    ) -> tuple[int, int] | None:
-        flags = os.O_RDONLY | os.O_NONBLOCK
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        try:
-            descriptor = os.open(path, flags)
-        except FileNotFoundError:
-            if missing_ok:
-                return None
-            raise
-        except OSError as error:
-            raise ValueError(
-                f"SQLite artifact must be an owned regular file: {path}"
-            ) from error
-        try:
-            status = os.fstat(descriptor)
-            cls._validate_artifact_status(path, status)
-            identity = (status.st_dev, status.st_ino)
-            if expected is not None and identity != expected:
-                replacement_is_owner_only = stat.S_IMODE(status.st_mode) == 0o600
-                if not (allow_secure_replacement and replacement_is_owner_only):
-                    raise ValueError(f"SQLite artifact identity changed: {path}")
-            os.fchmod(descriptor, 0o600)
-            return identity
-        finally:
-            os.close(descriptor)
-
     def _harden_database_files(
         self, *, database_missing_ok: bool = False
     ) -> bool:
-        database = self._inspect_and_harden(
-            self.path,
-            expected=self._database_identity,
-            missing_ok=database_missing_ok,
-        )
-        if database is None:
+        try:
+            database_status = self.path.lstat()
+        except FileNotFoundError:
+            if not database_missing_ok:
+                raise
             return False
+        self._validate_artifact_status(self.path, database_status)
+        if (database_status.st_dev, database_status.st_ino) != self._database_identity:
+            raise ValueError(f"SQLite artifact identity changed: {self.path}")
+        os.chmod(self.path, 0o600, follow_symlinks=False)
+        hardened_status = self.path.lstat()
+        if (hardened_status.st_dev, hardened_status.st_ino) != self._database_identity:
+            raise ValueError(f"SQLite artifact identity changed: {self.path}")
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(f"{self.path}{suffix}")
             try:
-                identity = self._inspect_and_harden(
-                    sidecar,
-                    expected=self._sidecar_identities.get(suffix),
-                    missing_ok=True,
-                    # SQLite may remove and recreate WAL/SHM sidecars when
-                    # another legitimate connection checkpoints or closes.
-                    # Accept that lifecycle only when the replacement is
-                    # already an owner-only regular file. Never relax the
-                    # pinned identity of the database itself.
-                    allow_secure_replacement=True,
-                )
+                identity = self._inspect_sidecar_and_harden(sidecar, suffix)
             except (ValueError, PermissionError):
                 self._compromised_sidecars.add(suffix)
                 raise
             if identity is not None:
                 self._sidecar_identities[suffix] = identity
         return True
+
+    def _inspect_sidecar_and_harden(
+        self, sidecar: Path, suffix: str
+    ) -> tuple[int, int] | None:
+        """Validate a sidecar without opening an auxiliary descriptor.
+
+        POSIX record locks are process-scoped: closing *any* descriptor for a
+        file can release locks acquired through another SQLite connection in
+        the process. Use no-follow path operations plus identity rechecks so
+        nested stores cannot disturb each other's locks.
+        """
+
+        expected = self._sidecar_identities.get(suffix)
+        try:
+            path_status = sidecar.lstat()
+        except FileNotFoundError:
+            return None
+        self._validate_artifact_status(sidecar, path_status)
+        path_identity = (path_status.st_dev, path_status.st_ino)
+        if expected == path_identity and stat.S_IMODE(path_status.st_mode) == 0o600:
+            return path_identity
+
+        status = sidecar.lstat()
+        self._validate_artifact_status(sidecar, status)
+        identity = (status.st_dev, status.st_ino)
+        if expected is not None and identity != expected:
+            if stat.S_IMODE(status.st_mode) != 0o600:
+                raise ValueError(f"SQLite artifact identity changed: {sidecar}")
+        try:
+            os.chmod(sidecar, 0o600, follow_symlinks=False)
+            hardened_status = sidecar.lstat()
+        except FileNotFoundError:
+            # WAL and rollback-journal files may disappear between inspection
+            # and hardening when another legitimate connection checkpoints.
+            return None
+        if (hardened_status.st_dev, hardened_status.st_ino) != identity:
+            raise ValueError(f"SQLite artifact identity changed: {sidecar}")
+        return identity
 
     def _stash_compromised_sidecars(self) -> list[tuple[Path, Path]]:
         stashed: list[tuple[Path, Path]] = []
@@ -327,26 +327,67 @@ class SQLiteStore:
         self._connection.execute("PRAGMA busy_timeout = 30000")
         try:
             # Overseer has a long-lived coordinator and API plus short-lived
-            # CLI writers. Rollback journaling avoids WAL/SHM lifecycle races
-            # between those processes while the busy timeout serializes
-            # concurrent writes.
-            self._connection.execute("PRAGMA journal_mode = DELETE")
+            # CLI writers. WAL keeps readers from blocking the coordinator's
+            # writes, while the busy timeout serializes competing writers.
+            # FULL synchronous durability is intentional for coordination
+            # state: a completed commit must survive an OS crash or power loss.
+            journal_mode = self._connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(journal_mode).lower() != "wal":
+                self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA synchronous = FULL")
         except sqlite3.OperationalError:
             pass
         self._harden_database_files()
+
+    def _initialize_with_lock_retry(self) -> None:
+        """Run idempotent schema setup despite transient WAL lock recovery.
+
+        SQLite can return ``SQLITE_PROTOCOL`` (reported by Python as
+        ``locking protocol``) when several fresh processes race to recover or
+        initialize the same WAL. Unlike ``SQLITE_BUSY``, busy_timeout does not
+        retry that result for us.
+        """
+
+        if self._schema_is_current():
+            return
+        for attempt in range(10):
+            try:
+                if self._schema_is_current():
+                    return
+                self.initialize()
+                return
+            except sqlite3.OperationalError as error:
+                self._connection.rollback()
+                if "locking protocol" not in str(error).lower() or attempt == 9:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+
+    def _schema_is_current(self) -> bool:
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('schema_migrations', 'agent_schema_migrations')"
+            ).fetchall()
+        }
+        if tables != {"schema_migrations", "agent_schema_migrations"}:
+            return False
+        schema_current = self._connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (CURRENT_SCHEMA_VERSION,),
+        ).fetchone()
+        agent_current = self._connection.execute(
+            "SELECT 1 FROM agent_schema_migrations WHERE version = ?",
+            (AGENT_DRIVER_SCHEMA_V9,),
+        ).fetchone()
+        return schema_current is not None and agent_current is not None
 
     def close(self) -> None:
         failure: Exception | None = None
         stashed: list[tuple[Path, Path]] = []
         try:
             try:
-                verified = self._harden_database_files(database_missing_ok=True)
-                if verified:
-                    try:
-                        self._connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except sqlite3.Error:
-                        pass
-                    self._harden_database_files(database_missing_ok=True)
+                self._harden_database_files(database_missing_ok=True)
             except (ValueError, PermissionError) as error:
                 failure = error
                 stashed = self._stash_compromised_sidecars()
@@ -2011,7 +2052,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO crew_messages (id, owner_domain, payload) VALUES (?, ?, ?)",
             (message.id, message.owner_domain.value, _dump(message)),
         )
-        self._commit()
+        self._commit_agent_mutation()
 
     def load_crew_message(self, message_id: str) -> CrewMessage:
         return _load_dataclass(CrewMessage, self._get_payload("crew_messages", message_id))

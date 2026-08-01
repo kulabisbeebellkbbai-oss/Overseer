@@ -5,6 +5,8 @@ import os
 import sqlite3
 import stat
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -702,7 +704,8 @@ def test_store_hardens_new_database_and_sqlite_sidecars_under_public_umask(
         with OverseerStore(path) as store:
             store.save_agent_checkpoint(_checkpoint("checkpoint.mode", "epoch.mode"))
             assert _mode(path) == 0o600
-            assert store._connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            assert store._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert store._connection.execute("PRAGMA synchronous").fetchone()[0] == 2
             for suffix in ("-wal", "-shm", "-journal"):
                 sidecar = Path(f"{path}{suffix}")
                 if sidecar.exists():
@@ -794,6 +797,10 @@ def test_store_rejects_replaced_sidecar_without_touching_replacement(
 ) -> None:
     path = tmp_path / "state.sqlite3"
     store = OverseerStore(path)
+    # Never replace a live WAL/SHM file: SQLite may still have it mapped and
+    # accessing that mapping after replacement can terminate the process with
+    # SIGBUS. Close the mapping, then exercise Overseer's identity detector.
+    store._connection.close()
     sidecar = Path(f"{path}{suffix}")
     sidecar.write_bytes(b"owned sqlite sidecar")
     sidecar.chmod(0o600)
@@ -804,9 +811,7 @@ def test_store_rejects_replaced_sidecar_without_touching_replacement(
     os.replace(replacement, sidecar)
 
     with pytest.raises(ValueError, match="identity changed"):
-        store.save_agent_checkpoint(_checkpoint(f"checkpoint{suffix}", "epoch.race"))
-    with pytest.raises(ValueError, match="identity changed"):
-        store.close()
+        store._harden_database_files()
 
     assert sidecar.read_text(encoding="utf-8") == "unrelated sidecar"
     assert _mode(sidecar) == 0o644
@@ -826,3 +831,54 @@ def test_store_accepts_owner_only_sidecar_rotation_from_nested_connection(
     with OverseerStore(path) as reopened:
         assert reopened.load_agent_checkpoint("checkpoint.nested").id == "checkpoint.nested"
         assert reopened.load_agent_checkpoint("checkpoint.outer").id == "checkpoint.outer"
+
+
+def test_store_preserves_integrity_with_concurrent_process_readers_and_writers(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with OverseerStore(path):
+        pass
+
+    worker = """
+import json
+import sys
+from overseer.store import OverseerStore
+
+path, role, worker_id = sys.argv[1:]
+if role == "writer":
+    with OverseerStore(path) as store:
+        for iteration in range(40):
+            resource_id = f"stress.{worker_id}.{iteration}"
+            store._connection.execute(
+                "INSERT INTO resources (id, payload) VALUES (?, ?)",
+                (resource_id, json.dumps({"id": resource_id})),
+            )
+            store._commit()
+            with OverseerStore(path) as nested:
+                nested._connection.execute("SELECT COUNT(*) FROM resources").fetchone()
+else:
+    for iteration in range(40):
+        with OverseerStore(path) as store:
+            store._connection.execute("SELECT COUNT(*) FROM resources").fetchone()
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, str(path), role, str(worker_id)],
+            env={**os.environ, "PYTHONPATH": "src"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for worker_id, role in enumerate(("writer", "writer", "reader", "reader"))
+    ]
+    failures = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=60)
+        if process.returncode != 0:
+            failures.append((process.returncode, stdout, stderr))
+
+    assert failures == []
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM resources").fetchone()[0] == 80

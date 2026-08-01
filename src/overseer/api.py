@@ -59,6 +59,7 @@ from .cli import (
     discover_agent_sessions_status,
     dispatch_agent_goal_status,
     dispatch_crew_messages_status,
+    decide_crew_message_status,
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
     daemon_migration_plan_status,
@@ -73,6 +74,8 @@ from .cli import (
     export_state_redacted_status,
     health_efficiency_summary_status,
     health_summary_status,
+    skiller_effectiveness_status,
+    skiller_guidance_adherence_status,
     host_security_findings_status,
     host_security_ids_review_packages_status,
     host_security_ids_review_summary_status,
@@ -103,6 +106,8 @@ from .cli import (
     probe_stored_health_status,
     record_resource_status,
     record_crew_message_status,
+    reconcile_crew_reviews_status,
+    resubmit_crew_message_status,
     record_health_target_status,
     record_key_provider_status,
     record_host_security_ids_review_result_status,
@@ -430,6 +435,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/health/codex-usage":
                 self._handle(codex_usage_health_status)
+                return
+            if path == "/health/skiller-effectiveness":
+                self._handle(skiller_effectiveness_status)
+                return
+            if path == "/health/skiller-guidance-adherence":
+                self._handle(skiller_guidance_adherence_status)
                 return
             if path == "/observability/trends":
                 self._handle(lambda: observability_trends_status(store_path))
@@ -1020,6 +1031,15 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/crew/dispatch":
                 self._handle_json(lambda payload: dispatch_crew_messages_status(store_path, **_crew_dispatch_args(payload)))
                 return
+            if path == "/crew/messages/decide":
+                self._handle_json(lambda payload: decide_crew_message_status(store_path, **_crew_decision_args(payload)))
+                return
+            if path == "/crew/messages/resubmit":
+                self._handle_json(lambda payload: resubmit_crew_message_status(store_path, **_crew_resubmit_args(payload)))
+                return
+            if path == "/crew/reconcile":
+                self._handle_json(lambda payload: reconcile_crew_reviews_status(store_path, **_crew_reconcile_args(payload)))
+                return
             if path == "/documents/search":
                 self._handle_json(lambda payload: documents_search_status(**_documents_search_args(payload)))
                 return
@@ -1301,6 +1321,8 @@ def _crew_message_args(payload: dict[str, Any]) -> dict[str, Any]:
         "related_resource_id": str(payload["related_resource_id"]) if payload.get("related_resource_id") else None,
         "related_plan_id": str(payload["related_plan_id"]) if payload.get("related_plan_id") else None,
         "related_limit_id": str(payload["related_limit_id"]) if payload.get("related_limit_id") else None,
+        "acceptance_criteria": tuple(str(item) for item in payload.get("acceptance_criteria", [])),
+        "request_evidence_ids": tuple(str(item) for item in payload.get("request_evidence_ids", [])),
     }
 
 
@@ -1310,6 +1332,43 @@ def _crew_dispatch_args(payload: dict[str, Any]) -> dict[str, Any]:
         "message_id": str(payload["message_id"]) if payload.get("message_id") else None,
         "dispatched_by": str(payload.get("dispatched_by", "sisko")),
         "dispatched_at": str(payload["dispatched_at"]) if payload.get("dispatched_at") else None,
+    }
+
+
+def _crew_decision_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": str(payload["message_id"]),
+        "review_status": str(payload["review_status"]),
+        "decided_by": str(payload["decided_by"]),
+        "reason": str(payload["reason"]),
+        "evidence_ids": tuple(str(item) for item in payload.get("evidence_ids", [])),
+        "correction_request": str(payload["correction_request"]) if payload.get("correction_request") else None,
+        "decided_at": str(payload["decided_at"]) if payload.get("decided_at") else None,
+    }
+
+
+def _crew_resubmit_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": str(payload["message_id"]),
+        "subject": str(payload["subject"]),
+        "message": str(payload["message"]),
+        "requested_by": str(payload["requested_by"]),
+        "new_message_id": str(payload["new_message_id"]) if payload.get("new_message_id") else None,
+        "created_at": str(payload["created_at"]) if payload.get("created_at") else None,
+        "expected_requesters": tuple(str(item) for item in payload.get("expected_requesters", [])),
+        "related_resource_id": str(payload["related_resource_id"]) if payload.get("related_resource_id") else None,
+        "related_plan_id": str(payload["related_plan_id"]) if payload.get("related_plan_id") else None,
+        "related_limit_id": str(payload["related_limit_id"]) if payload.get("related_limit_id") else None,
+        "acceptance_criteria": tuple(str(item) for item in payload.get("acceptance_criteria", [])),
+        "request_evidence_ids": tuple(str(item) for item in payload.get("request_evidence_ids", [])),
+    }
+
+
+def _crew_reconcile_args(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": str(payload["message_id"]) if payload.get("message_id") else None,
+        "reconciled_by": str(payload.get("reconciled_by", "sisko")),
+        "reconciled_at": str(payload["reconciled_at"]) if payload.get("reconciled_at") else None,
     }
 
 
@@ -2047,6 +2106,8 @@ def _health_target_args(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_status": int(payload["expected_status"]) if payload.get("expected_status") is not None else None,
         "expected_content_type": str(payload["expected_content_type"]) if payload.get("expected_content_type") else None,
         "latency_warn_ms": int(payload["latency_warn_ms"]) if payload.get("latency_warn_ms") is not None else None,
+        "enabled": bool(payload.get("enabled", True)),
+        "suspension_reason": str(payload.get("suspension_reason") or ""),
     }
 
 

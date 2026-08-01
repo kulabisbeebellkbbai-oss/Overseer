@@ -451,6 +451,50 @@ class OverseerApiClient:
             payload["dispatched_at"] = dispatched_at
         return self._post("/crew/dispatch", payload)
 
+    def decide_crew_message(
+        self,
+        message_id: str,
+        review_status: str,
+        decided_by: str,
+        reason: str,
+        evidence_ids: tuple[str, ...] = (),
+        correction_request: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "message_id": message_id,
+            "review_status": review_status,
+            "decided_by": decided_by,
+            "reason": reason,
+            "evidence_ids": list(evidence_ids),
+        }
+        if correction_request:
+            payload["correction_request"] = correction_request
+        return self._post("/crew/messages/decide", payload)
+
+    def resubmit_crew_message(
+        self,
+        message_id: str,
+        subject: str,
+        message: str,
+        requested_by: str,
+        new_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "message_id": message_id,
+            "subject": subject,
+            "message": message,
+            "requested_by": requested_by,
+        }
+        if new_message_id:
+            payload["new_message_id"] = new_message_id
+        return self._post("/crew/messages/resubmit", payload)
+
+    def reconcile_crew_reviews(self, message_id: str | None = None, reconciled_by: str = "sisko") -> dict[str, Any]:
+        payload: dict[str, Any] = {"reconciled_by": reconciled_by}
+        if message_id:
+            payload["message_id"] = message_id
+        return self._post("/crew/reconcile", payload)
+
     def documents_status(self) -> dict[str, Any]:
         return self._get("/documents/status")
 

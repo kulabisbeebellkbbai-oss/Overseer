@@ -105,7 +105,7 @@ from .core import (
     RiskLevel,
     decide_claim,
 )
-from .crew import CrewMessage, CrewMessageStatus, build_crew_message, crew_message_status
+from .crew import CrewMessage, CrewMessageStatus, CrewReviewStatus, build_crew_message, crew_message_status
 from .git import git_status_status
 from .health import (
     HealthEvidence,
@@ -339,6 +339,7 @@ __all__ = [
     "decide_claim",
     "CrewMessage",
     "CrewMessageStatus",
+    "CrewReviewStatus",
     "build_crew_message",
     "crew_message_status",
     "HealthEvidence",

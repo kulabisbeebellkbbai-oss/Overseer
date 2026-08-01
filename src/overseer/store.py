@@ -13,7 +13,7 @@ import stat
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -2112,7 +2112,8 @@ class SQLiteStore:
         self._commit()
 
     def load_storage_authorization(self, authorization_ref: str) -> StorageAuthorizationRecord:
-        return _load_dataclass(StorageAuthorizationRecord, self._get_payload("storage_authorizations", authorization_ref))
+        record=_load_dataclass(StorageAuthorizationRecord, self._get_payload("storage_authorizations", authorization_ref)); revoked=self._connection.execute("SELECT revoked_at FROM storage_authorization_revocations WHERE authorization_ref=?",(authorization_ref,)).fetchone() if self._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_authorization_revocations'").fetchone() else None
+        return replace(record,revoked_at=str(revoked["revoked_at"])) if revoked else record
 
     def save_storage_root_authorization(self, authorization: StorageRootAuthorizationRecord) -> None:
         existing=self._connection.execute("SELECT payload FROM storage_root_authorizations WHERE id=?",(authorization.authorization_ref,)).fetchone(); payload=_dump(authorization)
@@ -2120,7 +2121,8 @@ class SQLiteStore:
         self._connection.execute("INSERT OR IGNORE INTO storage_root_authorizations(id,project_id,root_id,status,payload) VALUES(?,?,?,?,?)",(authorization.authorization_ref,authorization.project_id,authorization.root_id,authorization.authorization_status,payload)); self._commit()
 
     def load_storage_root_authorization(self, authorization_ref: str) -> StorageRootAuthorizationRecord:
-        return _load_dataclass(StorageRootAuthorizationRecord,self._get_payload("storage_root_authorizations",authorization_ref))
+        record=_load_dataclass(StorageRootAuthorizationRecord,self._get_payload("storage_root_authorizations",authorization_ref)); revoked=self._connection.execute("SELECT revoked_at FROM storage_authorization_revocations WHERE authorization_ref=?",(authorization_ref,)).fetchone() if self._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_authorization_revocations'").fetchone() else None
+        return replace(record,revoked_at=str(revoked["revoked_at"])) if revoked else record
 
     def save_storage_dispatch_record(self, record: StorageDispatchRecord) -> None:
         self._connection.execute("INSERT OR REPLACE INTO storage_dispatch_records (id, request_id, status, payload) VALUES (?, ?, ?, ?)", (record.id, record.request_id, record.status, _dump(record)))

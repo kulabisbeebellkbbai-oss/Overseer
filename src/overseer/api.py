@@ -140,6 +140,7 @@ from .cli import (
 )
 from .agent_manager import AgentAuthorizationError, AgentManagerError
 from .storage_adapter import verify_storage_authorization_status, verify_storage_root_authorization_status
+from .storage_control import list_authorizations, stage_authorization_api, approve_authorization_api, materialize_authorization_api, revoke_authorization_api
 from .agent_registry import AgentAdapterUnavailableError
 from .documents import (
     documents_config_status,
@@ -324,6 +325,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
+            if path.startswith("/storage/control/") and auth_context.get("auth_type") != "admin_token":
+                self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
             if path == "/auth-check":
                 self._write_json(
                     {
@@ -335,6 +339,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                         "token_id": auth_context.get("token_id"),
                     }
                 )
+                return
+            if path == "/storage/control/authorizations":
+                self._handle(lambda: list_authorizations(store_path, _query_first(query, "kind")))
                 return
             if path == "/agent-providers":
                 self._handle(agent_providers_status)
@@ -656,11 +663,26 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
+            if path.startswith("/storage/control/") and auth_context.get("auth_type") != "admin_token":
+                self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
             if path == "/storage/authorizations/verify":
                 self._handle_json(lambda payload: verify_storage_authorization_status(store_path, payload))
                 return
             if path == "/storage/roots/verify":
                 self._handle_json(lambda payload: verify_storage_root_authorization_status(store_path, payload))
+                return
+            if path == "/storage/control/stage":
+                self._handle_json(lambda p: stage_authorization_api(store_path,p))
+                return
+            if path == "/storage/control/materialize":
+                self._handle_json(lambda p: materialize_authorization_api(store_path,p))
+                return
+            if path == "/storage/control/approve":
+                self._handle_json(lambda p: approve_authorization_api(store_path,p))
+                return
+            if path == "/storage/control/revoke":
+                self._handle_json(lambda p: revoke_authorization_api(store_path,p))
                 return
             if (
                 path.startswith("/usage/remote-testing/")

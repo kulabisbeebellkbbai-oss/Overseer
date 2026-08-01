@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, stage_plan_api as stage_backup_provisioning_plan_api
+
 from .codex_usage import CodexUsageTracker
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
@@ -140,7 +142,7 @@ from .cli import (
 )
 from .agent_manager import AgentAuthorizationError, AgentManagerError
 from .storage_adapter import verify_storage_authorization_status, verify_storage_root_authorization_status
-from .storage_control import list_authorizations, stage_authorization_api, approve_authorization_api, materialize_authorization_api, revoke_authorization_api
+from .storage_control import create_execution_request_api, list_authorizations, stage_authorization_api, approve_authorization_api, materialize_authorization_api, revoke_authorization_api
 from .agent_registry import AgentAdapterUnavailableError
 from .documents import (
     documents_config_status,
@@ -303,7 +305,7 @@ def _project_path_for_store(store_path: str) -> Path:
     return Path.cwd()
 
 
-def make_api_handler(store_path: str, auth_token: str | None = None):
+def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None):
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
 
@@ -636,6 +638,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if path == "/claims/cleanup-plan":
                 self._handle(lambda: claim_cleanup_plan_status(store_path, _query_first(query, "now")))
                 return
+            if path == "/backup-provisioning/plans":
+                self._handle(lambda: list_backup_provisioning_plans(store_path))
+                return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
@@ -663,8 +668,17 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            if path.startswith("/storage/control/") and auth_context.get("auth_type") != "admin_token":
+            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/")) and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
+            if path == "/backup-provisioning/stage":
+                self._handle_json(lambda payload: stage_backup_provisioning_plan_api(store_path, payload))
+                return
+            if path == "/backup-provisioning/approve":
+                self._handle_json(lambda payload: approve_backup_provisioning_plan_api(store_path, payload))
+                return
+            if path == "/backup-provisioning/execute":
+                self._handle_json(lambda payload: execute_backup_provisioning_plan_api(store_path, payload, backup_provisioning_adapter_factory))
                 return
             if path == "/storage/authorizations/verify":
                 self._handle_json(lambda payload: verify_storage_authorization_status(store_path, payload))
@@ -674,6 +688,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/storage/control/stage":
                 self._handle_json(lambda p: stage_authorization_api(store_path,p))
+                return
+            if path == "/storage/control/requests":
+                self._handle_json(lambda p: create_execution_request_api(store_path,p))
                 return
             if path == "/storage/control/materialize":
                 self._handle_json(lambda p: materialize_authorization_api(store_path,p))

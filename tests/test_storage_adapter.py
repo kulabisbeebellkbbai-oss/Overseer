@@ -21,6 +21,8 @@ from overseer.storage_adapter import (
     StorageExecutionRequest,
     StorageAuthorizationRecord,
     canonical_adapter_request_digest,
+    BACKUP_ENCRYPTION_PROFILE,
+    MCPBoundedStorageAdapterClient,
     verify_storage_authorization_status,
     StorageRootAuthorizationRecord,
     verify_storage_root_authorization_status,
@@ -132,3 +134,72 @@ def test_root_authorization_is_exact_redacted_and_immutable(tmp_path):
     assert result["ok"] and result["authorization"]["alias"]=="safe-alias" and "host_path" not in repr(result)
     payload["max_bytes"]=2048; rejected=verify_storage_root_authorization_status(str(path),payload,verified_at=now.isoformat())
     assert rejected["error"]["code"]=="AUTHORIZATION_MISMATCH"
+
+
+def backup_request(now: datetime, *, action: str = "backup.create"):
+    parameters = (
+        {"source_root_id": "project-source", "retention_count": 3, "encryption_profile": BACKUP_ENCRYPTION_PROFILE}
+        if action == "backup.create"
+        else {"artifact_id": "backup-fixture", "expected_artifact_digest": "sha256:" + "1" * 64, "expected_manifest_digest": "sha256:" + "2" * 64}
+    )
+    value = StorageExecutionRequest("backup-req", "storage-adapter.theunderdark", 1, "project.donuthole", "storage.donuthole", "backup-root", action, parameters, "1", "claim-1", "approval-1", "auth-1", "backup-idem", "project.donuthole", "approved encrypted backup", ("restore verified",), {"max_bytes": 1024, "max_items": 10}, (now + timedelta(minutes=5)).isoformat())
+    return value.with_digest()
+
+
+@pytest.mark.parametrize("action,tool", [("backup.create", "underdark_backup_create"), ("backup.verify_restore", "underdark_backup_verify_restore")])
+def test_backup_actions_are_registered_and_map_to_exact_mcp_tools(action, tool):
+    now = datetime.now(UTC); calls = []
+    client = MCPBoundedStorageAdapterClient(lambda name, payload: calls.append((name, payload)) or {"ok": True, "contract_version": "1.0", "request_id": "backup-req", "operation_id": "op-backup", "result": {"state": "accepted"}}, 1)
+    item = backup_request(now, action=action)
+    receipt = client.submit(item)
+    assert receipt.operation_id == "op-backup" and calls[0][0] == tool
+    assert set(client.capabilities()["actions"]) >= {"backup.create", "backup.verify_restore"}
+
+
+def test_backup_action_rejects_extra_parameters_and_nonpositive_limits():
+    now = datetime.now(UTC)
+    dispatcher = StorageDispatcher((StorageAdapterRegistration("storage-adapter.theunderdark", "loopback-service.theunderdark", "sha256:cap", frozenset({"backup.create"}), 1, status=StorageAdapterStatus.ENABLED, approved_revision=1, readiness_checks=REQUIRED_READINESS),), lambda _: Client())
+    item = backup_request(now)
+    bad_parameters = item.__class__(**{**item.__dict__, "parameters": {**item.parameters, "command": "tar /"}}).with_digest()
+    with pytest.raises(StorageAdapterError) as extra:
+        dispatcher.dispatch(bad_parameters, claim(now), approval(), now)
+    assert extra.value.code == "INVALID_ARGUMENT"
+    bad_limits = item.__class__(**{**item.__dict__, "limits": {"max_bytes": 0, "max_items": 10}}).with_digest()
+    with pytest.raises(StorageAdapterError) as limits:
+        dispatcher.dispatch(bad_limits, claim(now), approval(), now)
+    assert limits.value.code == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source_root_id", "source root"),
+    ("source_root_id", "source\nroot"),
+    ("source_root_id", "s" * 129),
+])
+def test_backup_create_rejects_nonopaque_source_root_ids(field, value):
+    now = datetime.now(UTC); item = backup_request(now)
+    changed = item.__class__(**{**item.__dict__, "parameters": {**item.parameters, field: value}}).with_digest()
+    client = MCPBoundedStorageAdapterClient(lambda *_: pytest.fail("invalid request reached MCP"), 1)
+    with pytest.raises(StorageAdapterError) as failure:
+        client.submit(changed)
+    assert failure.value.code == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize("artifact_id", ["backup bad", "backup-evil\nvalue", "backup-" + "x" * 122])
+def test_backup_verify_rejects_nonopaque_artifact_ids(artifact_id):
+    now = datetime.now(UTC); item = backup_request(now, action="backup.verify_restore")
+    changed = item.__class__(**{**item.__dict__, "parameters": {**item.parameters, "artifact_id": artifact_id}}).with_digest()
+    client = MCPBoundedStorageAdapterClient(lambda *_: pytest.fail("invalid request reached MCP"), 1)
+    with pytest.raises(StorageAdapterError) as failure:
+        client.submit(changed)
+    assert failure.value.code == "INVALID_ARGUMENT"
+
+
+def test_authoritative_verification_binds_backup_limits():
+    now = datetime.now(UTC); item = backup_request(now)
+    active_claim = Claim("claim-1", "storage.donuthole", ClaimType.LEASE, "project.donuthole", OwnerDomain.OBRIEN, "bounded storage", "backup.create", RiskLevel.HIGH, status=ClaimStatus.ACTIVE, expires_at=(now + timedelta(minutes=10)).isoformat())
+    approved = ApprovalRequest("approval-1", "backup-req", ApprovalLevel.HUMAN, "project.donuthole", OwnerDomain.OBRIEN, "exact backup", status=ApprovalStatus.APPROVED)
+    authorization = StorageAuthorizationRecord("auth-1", item.request_id, item.request_digest, item.project_id, item.root_id, item.action, item.policy_revision, active_claim.id, approved.id, canonical_adapter_request_digest(item), {"max_bytes": 2048, "max_items": 10}, now.isoformat(), (now + timedelta(minutes=5)).isoformat())
+    with pytest.raises(StorageAdapterError) as failure:
+        from overseer.storage_adapter import verify_storage_authorization
+        verify_storage_authorization(authorization, item, active_claim, approved, request_digest=canonical_adapter_request_digest(item), project_id=item.project_id, root_id=item.root_id, action=item.action, policy_revision=item.policy_revision, now=now)
+    assert failure.value.code == "AUTHORIZATION_MISMATCH"

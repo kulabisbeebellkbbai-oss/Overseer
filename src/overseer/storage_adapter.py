@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -17,8 +18,14 @@ from .core import Claim, ClaimStatus, ClaimType
 
 CONTRACT_VERSION = "1.0"
 ADAPTER_KIND = "bounded_storage_v1"
-ALLOWED_ACTIONS = frozenset({"directory.create", "file.write", "path.copy", "path.move", "path.delete"})
+ALLOWED_ACTIONS = frozenset({"directory.create", "file.write", "path.copy", "path.move", "path.delete", "backup.create", "backup.verify_restore"})
 REQUIRED_READINESS = frozenset({"durable_operation_journal", "descriptor_relative_containment", "strict_tool_schemas", "transport_verified"})
+BACKUP_ENCRYPTION_PROFILE = "gpg-symmetric-aes256-iterated-s2k"
+BACKUP_ACTION_PARAMETERS = {
+    "backup.create": frozenset({"source_root_id", "retention_count", "encryption_profile"}),
+    "backup.verify_restore": frozenset({"artifact_id", "expected_artifact_digest", "expected_manifest_digest"}),
+}
+BACKUP_LIMITS = frozenset({"max_bytes", "max_items"})
 
 
 class StorageAdapterStatus(StrEnum):
@@ -237,6 +244,42 @@ def canonical_adapter_request_digest(request: StorageExecutionRequest) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def validate_storage_execution_request(request: StorageExecutionRequest) -> None:
+    """Validate action-specific fields without accepting paths, commands, or secrets."""
+    expected = BACKUP_ACTION_PARAMETERS.get(request.action)
+    if expected is None:
+        return
+    parameters = dict(request.parameters)
+    if set(parameters) != expected:
+        raise StorageAdapterError("INVALID_ARGUMENT", "exact backup action parameters are required")
+    if request.action == "backup.create":
+        source_root_id = parameters.get("source_root_id")
+        retention_count = parameters.get("retention_count")
+        encryption_profile = parameters.get("encryption_profile")
+        if (
+            not _opaque_id(source_root_id)
+            or isinstance(retention_count, bool)
+            or retention_count != 3
+            or encryption_profile != BACKUP_ENCRYPTION_PROFILE
+        ):
+            raise StorageAdapterError("INVALID_ARGUMENT", "backup creation parameters are invalid")
+    else:
+        artifact_id = parameters.get("artifact_id")
+        if (
+            not _opaque_id(artifact_id)
+            or not str(artifact_id).startswith("backup-")
+            or not _sha256_digest(str(parameters.get("expected_artifact_digest")))
+            or not _sha256_digest(str(parameters.get("expected_manifest_digest")))
+        ):
+            raise StorageAdapterError("INVALID_ARGUMENT", "backup verification parameters are invalid")
+    limits = dict(request.limits)
+    if set(limits) != BACKUP_LIMITS or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in limits.values()
+    ):
+        raise StorageAdapterError("INVALID_ARGUMENT", "exact positive backup limits are required")
+
+
 def verify_storage_authorization(
     authorization: StorageAuthorizationRecord,
     request: StorageExecutionRequest,
@@ -258,6 +301,9 @@ def verify_storage_authorization(
         raise StorageAdapterError("AUTHORIZATION_MISMATCH", "storage authorization does not match the canonical request")
     if authorization.status != "approved" or authorization.revoked_at or _timestamp(authorization.expires_at) <= current:
         raise StorageAdapterError("AUTHORIZATION_INVALID", "storage authorization is inactive or expired")
+    validate_storage_execution_request(request)
+    if dict(authorization.limits) != dict(request.limits):
+        raise StorageAdapterError("AUTHORIZATION_MISMATCH", "storage authorization limits do not match")
     if request.project_id != project_id or request.root_id != root_id or request.action != action or request.policy_revision != policy_revision:
         raise StorageAdapterError("AUTHORIZATION_MISMATCH", "storage request fields do not match")
     if claim.id != authorization.claim_id or claim.id != request.claim_id or claim.resource_id != request.resource_id or claim.owner_thread != request.requested_by or claim.status not in {ClaimStatus.APPROVED, ClaimStatus.ACTIVE} or claim.claim_type not in {ClaimType.LEASE, ClaimType.LOCK, ClaimType.CHECKOUT, ClaimType.HOLD}:
@@ -331,6 +377,8 @@ class MCPBoundedStorageAdapterClient:
         "path.copy": "underdark_path_copy",
         "path.move": "underdark_path_move",
         "path.delete": "underdark_path_delete",
+        "backup.create": "underdark_backup_create",
+        "backup.verify_restore": "underdark_backup_verify_restore",
     }
 
     def __init__(self, call_tool: Callable[[str, Mapping[str, object]], Mapping[str, object]], adapter_revision: int):
@@ -344,6 +392,7 @@ class MCPBoundedStorageAdapterClient:
         return self._call_tool("underdark_health_get", {})
 
     def submit(self, request: StorageExecutionRequest) -> StorageExecutionReceipt:
+        validate_storage_execution_request(request)
         tool = self.TOOL_BY_ACTION.get(request.action)
         if not tool:
             raise StorageAdapterError("REQUEST_REJECTED", "unsupported storage action")
@@ -382,6 +431,7 @@ class StorageDispatcher:
 
     def dispatch(self, request: StorageExecutionRequest, claim: Claim, approval: ApprovalRequest, now: datetime | None = None) -> StorageDispatchRecord:
         current = now or datetime.now(UTC)
+        validate_storage_execution_request(request)
         if request.request_digest != request.canonical_digest():
             raise StorageAdapterError("REQUEST_REJECTED", "request digest mismatch")
         matches = [r for r in self.registrations if r.adapter_id == request.adapter_id and r.registration_revision == request.adapter_revision and r.accepts(request.resource_id, request.action, current)]
@@ -428,3 +478,7 @@ def _timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("timestamp must include timezone")
     return parsed.astimezone(UTC)
+
+
+def _opaque_id(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is not None

@@ -7,7 +7,7 @@ from typing import Mapping
 from .audit import ApprovalRequest,ApprovalStatus
 from .core import ApprovalLevel,OwnerDomain,ClaimStatus,ClaimType
 from .crew import CrewMessageStatus,CrewReviewStatus
-from .storage_adapter import StorageAuthorizationRecord,StorageRootAuthorizationRecord,canonical_adapter_request_digest
+from .storage_adapter import ALLOWED_ACTIONS,StorageAdapterError,StorageAuthorizationRecord,StorageExecutionRequest,StorageRootAuthorizationRecord,canonical_adapter_request_digest,validate_storage_execution_request
 from .store import SQLiteStore
 
 @dataclass(frozen=True)
@@ -59,8 +59,8 @@ def materialize_authorization(store_path:str,authorization_ref:str,materialized_
             record=StorageRootAuthorizationRecord(p["authorization_ref"],p["action"],p["project_id"],p["root_id"],p["policy_revision"],p["root_identity"],p["alias"],p["status"],p["max_bytes"],p["target_digest"],approval.id,approval.decided_at or now,p["expires_at"]); store.save_storage_root_authorization(record)
         else:
             request=store.load_storage_execution_request(p["request_id"]); claim=store.load_claim(p["claim_id"])
-            exact=(request.request_id,request.request_digest,request.project_id,request.root_id,request.action,request.policy_revision,request.claim_id,request.approval_id,request.authorization_ref,request.expires_at,canonical_adapter_request_digest(request))
-            staged=(p["request_id"],p["request_digest"],p["project_id"],p["root_id"],p["action"],p["policy_revision"],p["claim_id"],p["approval_id"],p["authorization_ref"],p["expires_at"],p["target_digest"])
+            exact=(request.request_id,request.request_digest,request.project_id,request.root_id,request.action,request.policy_revision,request.claim_id,request.approval_id,request.authorization_ref,request.expires_at,canonical_adapter_request_digest(request),dict(request.limits))
+            staged=(p["request_id"],p["request_digest"],p["project_id"],p["root_id"],p["action"],p["policy_revision"],p["claim_id"],p["approval_id"],p["authorization_ref"],p["expires_at"],p["target_digest"],dict(p["limits"]))
             if exact!=staged or approval.id!=request.approval_id or claim.id!=request.claim_id or claim.resource_id!=request.resource_id or claim.owner_thread!=request.requested_by or claim.status not in {ClaimStatus.APPROVED,ClaimStatus.ACTIVE} or claim.claim_type not in {ClaimType.LEASE,ClaimType.LOCK,ClaimType.CHECKOUT,ClaimType.HOLD} or not claim.expires_at or _time(claim.expires_at)<=_time(p["expires_at"]): raise ValueError("operation project, request, claim, approval, authorization, digest, or expiry does not match")
             record=StorageAuthorizationRecord(p["authorization_ref"],p["request_id"],p["request_digest"],p["project_id"],p["root_id"],p["action"],p["policy_revision"],p["claim_id"],approval.id,p["target_digest"],p["limits"],approval.decided_at or now,p["expires_at"]); store.save_storage_authorization(record)
     return {"ok":True,"authorization_ref":authorization_ref,"kind":stage["kind"],"status":"approved","mutation_performed":True,"host_mutation_performed":False}
@@ -86,6 +86,41 @@ def approve_authorization(store_path:str,authorization_ref:str,approved_by:str,a
         store.save_approval(replace(approval,status=ApprovalStatus.APPROVED,decided_by=approved_by,decided_at=now))
     return {"ok":True,"authorization_ref":authorization_ref,"approval_id":stage["approval_id"],"status":"approved","approved_by":approved_by,"mutation_performed":True,"host_mutation_performed":False}
 
+def create_execution_request(store_path:str,payload:Mapping[str,object],created_at:str|None=None)->Mapping[str,object]:
+    """Validate and durably store one exact approval-bound execution request."""
+    required={"request_id","adapter_id","adapter_revision","project_id","resource_id","root_id","action","parameters","policy_revision","claim_id","approval_id","authorization_ref","idempotency_key","requested_by","reason","acceptance_criteria","limits","expires_at"}
+    if set(payload)!=required: raise ValueError("execution request fields are not exact")
+    identifiers=("request_id","adapter_id","project_id","resource_id","root_id","action","policy_revision","claim_id","approval_id","authorization_ref","idempotency_key","requested_by")
+    if any(not isinstance(payload[name],str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",payload[name]) for name in identifiers): raise ValueError("execution request identifiers are invalid")
+    if payload["action"] not in ALLOWED_ACTIONS or not isinstance(payload["adapter_revision"],int) or isinstance(payload["adapter_revision"],bool) or payload["adapter_revision"]<1: raise ValueError("execution request adapter or action is invalid")
+    if payload["project_id"]!=payload["requested_by"] or not isinstance(payload["reason"],str) or not 1<=len(payload["reason"])<=512: raise ValueError("execution request owner or reason is invalid")
+    if not isinstance(payload["parameters"],Mapping) or not isinstance(payload["limits"],Mapping) or not payload["limits"] or any(not isinstance(v,int) or isinstance(v,bool) or v<1 for v in payload["limits"].values()): raise ValueError("execution request parameters or limits are invalid")
+    criteria=payload["acceptance_criteria"]
+    if not isinstance(criteria,(list,tuple)) or not criteria or any(not isinstance(item,str) or not item.strip() or len(item)>256 for item in criteria): raise ValueError("execution request acceptance criteria are invalid")
+    now=_time(created_at or datetime.now(UTC).isoformat()); expires=_time(payload["expires_at"])
+    if expires<=now: raise ValueError("execution request is expired")
+    request=StorageExecutionRequest(
+        str(payload["request_id"]),str(payload["adapter_id"]),int(payload["adapter_revision"]),str(payload["project_id"]),str(payload["resource_id"]),str(payload["root_id"]),str(payload["action"]),dict(payload["parameters"]),str(payload["policy_revision"]),str(payload["claim_id"]),str(payload["approval_id"]),str(payload["authorization_ref"]),str(payload["idempotency_key"]),str(payload["requested_by"]),str(payload["reason"]),tuple(criteria),dict(payload["limits"]),str(payload["expires_at"]),created_at=now.isoformat(),
+    ).with_digest()
+    expected_parameters={
+        "directory.create":{"relative_path","parents"},
+        "file.write":{"relative_path","content","content_digest","write_mode","content_encoding","expected_prior_digest"},
+        "path.copy":{"source_root_id","source_relative_path","relative_path","destination_mode"},
+        "path.move":{"source_relative_path","relative_path","expected_source_digest","expected_source_type","destination_mode"},
+        "path.delete":{"relative_path","expected_type","expected_digest","recursive"},
+    }.get(request.action)
+    if expected_parameters is not None and set(request.parameters)!=expected_parameters: raise ValueError("execution request action fields are invalid")
+    for name,value in request.parameters.items():
+        if name.endswith("path") and (not isinstance(value,str) or not value or value.startswith("/") or "\\" in value or any(part in {"",".",".."} for part in value.split("/"))): raise ValueError("execution request path is invalid")
+    try: validate_storage_execution_request(request)
+    except StorageAdapterError as error: raise ValueError("execution request action fields are invalid") from error
+    with SQLiteStore(store_path) as store:
+        claim=store.load_claim(request.claim_id); registration=store.load_storage_adapter_registration(request.adapter_id)
+        if claim.resource_id!=request.resource_id or claim.owner_thread!=request.requested_by or claim.requested_action!=request.action or claim.status not in {ClaimStatus.APPROVED,ClaimStatus.ACTIVE} or claim.claim_type not in {ClaimType.LEASE,ClaimType.LOCK,ClaimType.CHECKOUT,ClaimType.HOLD} or not claim.expires_at or _time(claim.expires_at)<=expires: raise ValueError("execution request claim does not match or cover expiry")
+        if registration.registration_revision!=request.adapter_revision or not registration.accepts(request.resource_id,request.action,now): raise ValueError("execution request adapter is not enabled for the exact action")
+        store.save_storage_execution_request(request)
+    return {"ok":True,"request_id":request.request_id,"request_digest":request.request_digest,"project_id":request.project_id,"root_id":request.root_id,"action":request.action,"claim_id":request.claim_id,"approval_id":request.approval_id,"authorization_ref":request.authorization_ref,"status":"stored","mutation_performed":True,"host_mutation_performed":False,"redactions_applied":True}
+
 def _materialized(store,stage):
     table="storage_root_authorizations" if stage["kind"]=="root" else "storage_authorizations"
     return store._connection.execute(f"SELECT 1 FROM {table} WHERE id=?",(stage["authorization_ref"],)).fetchone() is not None
@@ -102,6 +137,9 @@ def revoke_authorization_api(store_path:str,p:Mapping[str,object]):
 def approve_authorization_api(store_path:str,p:Mapping[str,object]):
     if set(p)!={"authorization_ref","approved_by"}: raise ValueError("exact approve fields are required")
     return approve_authorization(store_path,str(p["authorization_ref"]),str(p["approved_by"]))
+def create_execution_request_api(store_path:str,p:Mapping[str,object]):
+    if set(p)!={"payload"} or not isinstance(p.get("payload"),Mapping): raise ValueError("exact execution request envelope is required")
+    return create_execution_request(store_path,p["payload"])
 
 def _require_crew(store,evidence_id,owner):
     message=store.load_crew_message(evidence_id)

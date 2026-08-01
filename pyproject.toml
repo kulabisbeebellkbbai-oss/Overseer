@@ -23,6 +23,7 @@ test = [
 overseer = "overseer.cli:main"
 overseer-codex-usage-mcp = "overseer.codex_usage_mcp:main"
 overseer-quark-scheduler = "overseer.quark_scheduler_cli:main"
+overseer-backup-provisioning = "overseer.backup_provisioning_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

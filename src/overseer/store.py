@@ -56,7 +56,7 @@ from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .source_review import HostSecuritySourceReview
-from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRecord, StorageDispatchRecord, StorageExecutionRequest, StorageExecutionResult
+from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRecord, StorageRootAuthorizationRecord, StorageDispatchRecord, StorageExecutionRequest, StorageExecutionResult
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
@@ -526,6 +526,7 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS storage_dispatch_records (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS storage_execution_results (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS storage_authorizations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS storage_root_authorizations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, root_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS maintenance_schedules (
                 id TEXT PRIMARY KEY,
                 target TEXT NOT NULL,
@@ -2112,6 +2113,14 @@ class SQLiteStore:
 
     def load_storage_authorization(self, authorization_ref: str) -> StorageAuthorizationRecord:
         return _load_dataclass(StorageAuthorizationRecord, self._get_payload("storage_authorizations", authorization_ref))
+
+    def save_storage_root_authorization(self, authorization: StorageRootAuthorizationRecord) -> None:
+        existing=self._connection.execute("SELECT payload FROM storage_root_authorizations WHERE id=?",(authorization.authorization_ref,)).fetchone(); payload=_dump(authorization)
+        if existing is not None and str(existing["payload"])!=payload: raise ValueError("storage root authorization reference is immutable")
+        self._connection.execute("INSERT OR IGNORE INTO storage_root_authorizations(id,project_id,root_id,status,payload) VALUES(?,?,?,?,?)",(authorization.authorization_ref,authorization.project_id,authorization.root_id,authorization.authorization_status,payload)); self._commit()
+
+    def load_storage_root_authorization(self, authorization_ref: str) -> StorageRootAuthorizationRecord:
+        return _load_dataclass(StorageRootAuthorizationRecord,self._get_payload("storage_root_authorizations",authorization_ref))
 
     def save_storage_dispatch_record(self, record: StorageDispatchRecord) -> None:
         self._connection.execute("INSERT OR REPLACE INTO storage_dispatch_records (id, request_id, status, payload) VALUES (?, ?, ?, ?)", (record.id, record.request_id, record.status, _dump(record)))

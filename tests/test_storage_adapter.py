@@ -22,6 +22,8 @@ from overseer.storage_adapter import (
     StorageAuthorizationRecord,
     canonical_adapter_request_digest,
     verify_storage_authorization_status,
+    StorageRootAuthorizationRecord,
+    verify_storage_root_authorization_status,
 )
 from overseer.store import SQLiteStore
 from overseer.api import make_api_handler
@@ -119,3 +121,14 @@ def test_storage_verification_route_requires_api_authentication(tmp_path):
         assert response.status==200 and json.load(response)["error"]["code"]=="INVALID_ARGUMENT"
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
+def test_root_authorization_is_exact_redacted_and_immutable(tmp_path):
+    now=datetime.now(UTC); path=tmp_path/"state.sqlite3"; approval_record=ApprovalRequest("approval-root","root-auth",ApprovalLevel.HUMAN,"operator",OwnerDomain.OBRIEN,"exact root",status=ApprovalStatus.APPROVED)
+    record=StorageRootAuthorizationRecord("root-auth","root.register","project","root","1","sha256:"+"1"*64,"safe-alias","active",1024,"sha256:"+"2"*64,approval_record.id,now.isoformat(),(now+timedelta(minutes=5)).isoformat())
+    with SQLiteStore(path) as store: store.save_approval(approval_record); store.save_storage_root_authorization(record)
+    payload={name:getattr(record,name) for name in ("authorization_ref","action","project_id","root_id","policy_revision","root_identity","alias","status","max_bytes","target_digest")}
+    result=verify_storage_root_authorization_status(str(path),payload,verified_at=now.isoformat())
+    assert result["ok"] and result["authorization"]["alias"]=="safe-alias" and "host_path" not in repr(result)
+    payload["max_bytes"]=2048; rejected=verify_storage_root_authorization_status(str(path),payload,verified_at=now.isoformat())
+    assert rejected["error"]["code"]=="AUTHORIZATION_MISMATCH"

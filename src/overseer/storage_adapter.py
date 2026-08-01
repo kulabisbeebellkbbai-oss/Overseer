@@ -172,6 +172,50 @@ class StorageAuthorizationRecord:
     revoked_at: str | None = None
 
 
+@dataclass(frozen=True)
+class StorageRootAuthorizationRecord:
+    authorization_ref: str
+    action: str
+    project_id: str
+    root_id: str
+    policy_revision: str
+    root_identity: str
+    alias: str
+    status: str
+    max_bytes: int
+    target_digest: str
+    approval_id: str
+    approved_at: str
+    expires_at: str
+    authorization_status: str = "approved"
+    revoked_at: str | None = None
+
+
+def verify_storage_root_authorization_status(store_path: str, payload: Mapping[str, object], *, verified_at: str | None = None) -> Mapping[str, object]:
+    from .store import SQLiteStore
+    required={"authorization_ref","action","project_id","root_id","policy_revision","root_identity","alias","status","max_bytes","target_digest"}
+    if set(payload)!=required or any(name!="max_bytes" and (not isinstance(payload[name],str) or not payload[name]) for name in required) or not isinstance(payload["max_bytes"],int) or isinstance(payload["max_bytes"],bool) or int(payload["max_bytes"])<1 or payload["action"] not in {"root.register","root.transition"} or payload["status"] not in {"active","suspended","retired"} or not _sha256_digest(str(payload["root_identity"])) or not _sha256_digest(str(payload["target_digest"])):
+        return {"ok":False,"error":{"code":"INVALID_ARGUMENT","message":"exact root verification fields are required"},"redactions_applied":True}
+    try:
+        with SQLiteStore(store_path) as store:
+            record=store.load_storage_root_authorization(str(payload["authorization_ref"])); approval=store.load_approval(record.approval_id)
+        exact=(record.action,record.project_id,record.root_id,record.policy_revision,record.root_identity,record.alias,record.status,record.max_bytes,record.target_digest)
+        supplied=tuple(payload[name] for name in ("action","project_id","root_id","policy_revision","root_identity","alias","status","max_bytes","target_digest"))
+        now=_timestamp(verified_at) if verified_at else datetime.now(UTC)
+        if exact!=supplied: raise StorageAdapterError("AUTHORIZATION_MISMATCH","root authorization does not match")
+        if record.authorization_status!="approved" or record.revoked_at or _timestamp(record.approved_at)>now or _timestamp(record.expires_at)<=now: raise StorageAdapterError("AUTHORIZATION_INVALID","root authorization is inactive")
+        if approval.id!=record.approval_id or approval.subject_id!=record.authorization_ref or approval.status!=ApprovalStatus.APPROVED: raise StorageAdapterError("AUTHORIZATION_INVALID","root approval does not match")
+        return {"ok":True,"contract_version":CONTRACT_VERSION,"authorization":{"approval_id":record.approval_id,"action":record.action,"project_id":record.project_id,"root_id":record.root_id,"policy_revision":record.policy_revision,"root_identity":record.root_identity,"alias":record.alias,"status":record.status,"max_bytes":record.max_bytes,"target_digest":record.target_digest,"approved_at":record.approved_at,"expires_at":record.expires_at,"redactions_applied":True}}
+    except KeyError:
+        return {"ok":False,"error":{"code":"AUTHORIZATION_REQUIRED","message":"authoritative root records are unavailable"},"redactions_applied":True}
+    except (StorageAdapterError,ValueError) as error:
+        return {"ok":False,"error":{"code":error.code if isinstance(error,StorageAdapterError) else "AUTHORIZATION_INVALID","message":"authoritative root verification failed"},"redactions_applied":True}
+
+
+def _sha256_digest(value: str) -> bool:
+    return value.startswith("sha256:") and len(value) == 71 and all(character in "0123456789abcdef" for character in value[7:])
+
+
 def canonical_adapter_request_digest(request: StorageExecutionRequest) -> str:
     """Digest the exact mutation payload TheUnderdark receives over MCP."""
     payload = {

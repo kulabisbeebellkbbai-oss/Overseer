@@ -139,7 +139,7 @@ from .cli import (
     virtual_summary_status,
 )
 from .agent_manager import AgentAuthorizationError, AgentManagerError
-from .storage_adapter import verify_storage_authorization_status
+from .storage_adapter import verify_storage_authorization_status, verify_storage_root_authorization_status
 from .agent_registry import AgentAdapterUnavailableError
 from .documents import (
     documents_config_status,
@@ -658,6 +658,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None):
                 return
             if path == "/storage/authorizations/verify":
                 self._handle_json(lambda payload: verify_storage_authorization_status(store_path, payload))
+                return
+            if path == "/storage/roots/verify":
+                self._handle_json(lambda payload: verify_storage_root_authorization_status(store_path, payload))
                 return
             if (
                 path.startswith("/usage/remote-testing/")

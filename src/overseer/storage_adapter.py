@@ -153,6 +153,119 @@ class StorageDispatchRecord:
     result: StorageExecutionResult | None = None
 
 
+@dataclass(frozen=True)
+class StorageAuthorizationRecord:
+    authorization_ref: str
+    request_id: str
+    request_digest: str
+    project_id: str
+    root_id: str
+    action: str
+    policy_revision: str
+    claim_id: str
+    approval_id: str
+    target_digest: str
+    limits: Mapping[str, int]
+    approved_at: str
+    expires_at: str
+    status: str = "approved"
+    revoked_at: str | None = None
+
+
+def canonical_adapter_request_digest(request: StorageExecutionRequest) -> str:
+    """Digest the exact mutation payload TheUnderdark receives over MCP."""
+    payload = {
+        "project_id": request.project_id,
+        "root_id": request.root_id,
+        "request_id": request.request_id,
+        "idempotency_key": request.idempotency_key,
+        "authorization_ref": request.authorization_ref,
+        "policy_revision": request.policy_revision,
+        "reason": request.reason,
+        **dict(request.parameters),
+    }
+    encoded = json.dumps(
+        {"action": request.action, "request": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def verify_storage_authorization(
+    authorization: StorageAuthorizationRecord,
+    request: StorageExecutionRequest,
+    claim: Claim,
+    approval: ApprovalRequest,
+    *,
+    request_digest: str,
+    project_id: str,
+    root_id: str,
+    action: str,
+    policy_revision: str,
+    now: datetime | None = None,
+) -> Mapping[str, object]:
+    """Return a minimal TheUnderdark snapshot after exact authoritative checks."""
+    current = now or datetime.now(UTC)
+    exact = (authorization.request_id, authorization.target_digest, authorization.project_id, authorization.root_id, authorization.action, authorization.policy_revision)
+    supplied = (request.request_id, request_digest, project_id, root_id, action, policy_revision)
+    if exact != supplied or request.request_digest != authorization.request_digest or request.canonical_digest() != authorization.request_digest or canonical_adapter_request_digest(request) != request_digest:
+        raise StorageAdapterError("AUTHORIZATION_MISMATCH", "storage authorization does not match the canonical request")
+    if authorization.status != "approved" or authorization.revoked_at or _timestamp(authorization.expires_at) <= current:
+        raise StorageAdapterError("AUTHORIZATION_INVALID", "storage authorization is inactive or expired")
+    if request.project_id != project_id or request.root_id != root_id or request.action != action or request.policy_revision != policy_revision:
+        raise StorageAdapterError("AUTHORIZATION_MISMATCH", "storage request fields do not match")
+    if claim.id != authorization.claim_id or claim.id != request.claim_id or claim.resource_id != request.resource_id or claim.owner_thread != request.requested_by or claim.status not in {ClaimStatus.APPROVED, ClaimStatus.ACTIVE} or claim.claim_type not in {ClaimType.LEASE, ClaimType.LOCK, ClaimType.CHECKOUT, ClaimType.HOLD}:
+        raise StorageAdapterError("CLAIM_INVALID", "storage claim does not match or is inactive")
+    if not claim.expires_at or _timestamp(claim.expires_at) <= _timestamp(authorization.expires_at):
+        raise StorageAdapterError("CLAIM_INVALID", "storage claim does not cover authorization expiry")
+    if approval.id != authorization.approval_id or approval.id != request.approval_id or approval.subject_id != request.request_id or approval.status != ApprovalStatus.APPROVED:
+        raise StorageAdapterError("AUTHORIZATION_INVALID", "storage approval does not match or is inactive")
+    return {
+        "authorization_ref": authorization.authorization_ref,
+        "request_id": authorization.request_id,
+        "project_id": authorization.project_id,
+        "root_id": authorization.root_id,
+        "action": authorization.action,
+        "target_digest": authorization.target_digest,
+        "policy_revision": authorization.policy_revision,
+        "claim_id": authorization.claim_id,
+        "approval_id": authorization.approval_id,
+        "approved_at": authorization.approved_at,
+        "expires_at": authorization.expires_at,
+        "limits": dict(authorization.limits),
+        "redactions_applied": True,
+    }
+
+
+def verify_storage_authorization_status(store_path: str, payload: Mapping[str, object], *, verified_at: str | None = None) -> Mapping[str, object]:
+    """Authenticated API/callable boundary; returns no raw approval or claim payload."""
+    from .store import SQLiteStore
+    required = {"authorization_ref", "request_digest", "project_id", "root_id", "action", "policy_revision"}
+    if set(payload) != required or not all(isinstance(payload[name], str) and payload[name] for name in required):
+        return {"ok": False, "error": {"code": "INVALID_ARGUMENT", "message": "exact storage verification fields are required"}, "redactions_applied": True}
+    try:
+        with SQLiteStore(store_path) as store:
+            authorization = store.load_storage_authorization(str(payload["authorization_ref"]))
+            request = store.load_storage_execution_request(authorization.request_id)
+            claim = store.load_claim(authorization.claim_id)
+            approval = store.load_approval(authorization.approval_id)
+        snapshot = verify_storage_authorization(
+            authorization, request, claim, approval,
+            request_digest=str(payload["request_digest"]), project_id=str(payload["project_id"]),
+            root_id=str(payload["root_id"]), action=str(payload["action"]),
+            policy_revision=str(payload["policy_revision"]),
+            now=_timestamp(verified_at) if verified_at else None,
+        )
+        return {"ok": True, "contract_version": CONTRACT_VERSION, "authorization": snapshot}
+    except KeyError:
+        return {"ok": False, "error": {"code": "AUTHORIZATION_REQUIRED", "message": "authoritative storage records are unavailable"}, "redactions_applied": True}
+    except (StorageAdapterError, ValueError) as error:
+        code = error.code if isinstance(error, StorageAdapterError) else "AUTHORIZATION_INVALID"
+        return {"ok": False, "error": {"code": code, "message": "authoritative storage verification failed"}, "redactions_applied": True}
+
+
 class StorageAdapterError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)

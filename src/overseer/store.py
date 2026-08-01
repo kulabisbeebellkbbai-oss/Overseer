@@ -56,6 +56,7 @@ from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
 from .serialization import dataclass_from_jsonable, to_jsonable
 from .source_review import HostSecuritySourceReview
+from .storage_adapter import StorageAdapterRegistration, StorageDispatchRecord, StorageExecutionRequest, StorageExecutionResult
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
@@ -520,6 +521,10 @@ class SQLiteStore:
                 status TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS storage_adapter_registrations (id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS storage_execution_requests (id TEXT PRIMARY KEY, adapter_id TEXT NOT NULL, project_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(adapter_id, project_id, idempotency_key));
+            CREATE TABLE IF NOT EXISTS storage_dispatch_records (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS storage_execution_results (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS maintenance_schedules (
                 id TEXT PRIMARY KEY,
                 target TEXT NOT NULL,
@@ -2072,6 +2077,44 @@ class SQLiteStore:
 
     def load_operation_record(self, record_id: str) -> OperationRecord:
         return _load_dataclass(OperationRecord, self._get_payload("operation_records", record_id))
+
+    def save_storage_adapter_registration(self, registration: StorageAdapterRegistration) -> None:
+        self._connection.execute("INSERT OR REPLACE INTO storage_adapter_registrations (id, status, payload) VALUES (?, ?, ?)", (registration.adapter_id, registration.status.value, _dump(registration)))
+        self._commit()
+
+    def load_storage_adapter_registration(self, adapter_id: str) -> StorageAdapterRegistration:
+        return _load_dataclass(StorageAdapterRegistration, self._get_payload("storage_adapter_registrations", adapter_id))
+
+    def list_storage_adapter_registrations(self) -> tuple[StorageAdapterRegistration, ...]:
+        return tuple(_load_dataclass(StorageAdapterRegistration, payload) for payload in self._list_payloads("storage_adapter_registrations"))
+
+    def save_storage_execution_request(self, request: StorageExecutionRequest) -> None:
+        existing = self._connection.execute("SELECT payload FROM storage_execution_requests WHERE adapter_id = ? AND project_id = ? AND idempotency_key = ?", (request.adapter_id, request.project_id, request.idempotency_key)).fetchone()
+        if existing is not None:
+            prior = _load_dataclass(StorageExecutionRequest, str(existing["payload"]))
+            if prior.request_digest != request.request_digest:
+                raise ValueError("storage idempotency key already belongs to another request")
+            return
+        self._connection.execute("INSERT INTO storage_execution_requests (id, adapter_id, project_id, idempotency_key, payload) VALUES (?, ?, ?, ?, ?)", (request.request_id, request.adapter_id, request.project_id, request.idempotency_key, _dump(request)))
+        self._commit()
+
+    def load_storage_execution_request(self, request_id: str) -> StorageExecutionRequest:
+        return _load_dataclass(StorageExecutionRequest, self._get_payload("storage_execution_requests", request_id))
+
+    def save_storage_dispatch_record(self, record: StorageDispatchRecord) -> None:
+        self._connection.execute("INSERT OR REPLACE INTO storage_dispatch_records (id, request_id, status, payload) VALUES (?, ?, ?, ?)", (record.id, record.request_id, record.status, _dump(record)))
+        self._commit()
+
+    def load_storage_dispatch_record(self, record_id: str) -> StorageDispatchRecord:
+        return _load_dataclass(StorageDispatchRecord, self._get_payload("storage_dispatch_records", record_id))
+
+    def save_storage_execution_result(self, result: StorageExecutionResult) -> None:
+        record_id = f"{result.request_id}:{result.operation_id}"
+        self._connection.execute("INSERT OR REPLACE INTO storage_execution_results (id, request_id, status, payload) VALUES (?, ?, ?, ?)", (record_id, result.request_id, result.status.value, _dump(result)))
+        self._commit()
+
+    def load_storage_execution_result(self, request_id: str, operation_id: str) -> StorageExecutionResult:
+        return _load_dataclass(StorageExecutionResult, self._get_payload("storage_execution_results", f"{request_id}:{operation_id}"))
 
     def list_operation_records(
         self,

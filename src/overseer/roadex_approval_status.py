@@ -43,6 +43,7 @@ class RoadexApprovalProjectionError(ValueError):
 
 
 _OPAQUE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_ROAD_EX_EVIDENCE_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _ROAD_EX_APPROVAL_BINDING_FIELDS = (
     "approval_ref",
     "source_kind",
@@ -500,6 +501,8 @@ def project_decision(
         )
     if status in {ProvisioningStatus.APPROVED, ProvisioningStatus.EXECUTED}:
         _require_roadex_approved_plan_evidence(store, source_plan)
+        if status == ProvisioningStatus.APPROVED and source_plan.evidence_digest is not None:
+            raise ValueError("roadex source approved evidence is malformed")
         if (
             source_plan.decided_by is not None
             or source_plan.decided_at is not None
@@ -603,6 +606,7 @@ def _require_initial_source_state(source_kind: str, source: object) -> None:
                 "admin binding source must not be canceled for initial projection binding"
             )
         _require_admin_pending_plan_evidence(source_plan)
+        _require_admin_archive_state(source_plan)
         return
     if source_kind == "roadex-human-decision":
         source_plan = _require_roadex_plan(source)
@@ -858,6 +862,12 @@ def _require_admin_canceled_plan_evidence(plan: AdminChangePlan) -> None:
 
 def _require_admin_archive_state(plan: AdminChangePlan) -> None:
     if not plan.archived:
+        if (
+            plan.archived_by is not None
+            or plan.archived_at is not None
+            or plan.archive_record_id is not None
+        ):
+            raise ValueError("admin source archive metadata is malformed")
         return
     _require_truthy_str(plan.archived_by, "archived_by")
     _require_iso8601(plan.archived_at, "archived_at")
@@ -891,6 +901,8 @@ def _require_roadex_approved_plan_evidence(store, plan: DonutHoleBackupProvision
 
 def _require_roadex_execution_evidence(plan: DonutHoleBackupProvisioningPlan) -> None:
     _require_truthy_str(plan.evidence_digest, "evidence_digest")
+    if _ROAD_EX_EVIDENCE_DIGEST_PATTERN.fullmatch(plan.evidence_digest) is None:
+        raise ValueError("evidence_digest is malformed")
     _require_iso8601(plan.executed_at, "executed_at")
 
 

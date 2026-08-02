@@ -492,6 +492,99 @@ def test_stage_bound_roadex_approval_rejects_admin_source_with_pending_terminal_
         )
 
 
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (lambda source: replace(source, archived_by=None), "archived_by"),
+        (lambda source: replace(source, archived_at=None), "archived_at"),
+        (lambda source: replace(source, archive_record_id=None), "archive_record_id"),
+    ),
+)
+def test_stage_bound_roadex_approval_rejects_admin_pending_archived_source_with_malformed_archive_state(
+    tmp_path,
+    mutator,
+    expected,
+):
+    now = datetime.now(UTC).isoformat()
+    source = plan_user_service_restart(
+        "admin.roadex.archived-pending",
+        "roadex-test.service",
+        "Archived pending fixture",
+    )
+    archived = archive_admin_change_plan(
+        source,
+        "archive-record-archived-pending",
+        "operator",
+        now,
+    )
+    draft = _draft_for("admin.roadex.archived-pending")
+    with SQLiteStore(tmp_path / "admin.sqlite3") as store:
+        with pytest.raises(ValueError, match=expected):
+            stage_bound_roadex_approval(
+                store,
+                draft,
+                lambda: store.save_admin_change_plan(mutator(archived)),
+            )
+
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM admin_change_plans WHERE id=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (lambda source: replace(source, archived_by="operator"), "admin source archive metadata is malformed"),
+        (lambda source: replace(source, archived_at=datetime.now(UTC).isoformat()), "admin source archive metadata is malformed"),
+        (lambda source: replace(source, archive_record_id="archive-record-leftover"), "admin source archive metadata is malformed"),
+    ),
+)
+def test_stage_bound_roadex_approval_rejects_admin_pending_unarchived_source_with_archive_metadata(
+    tmp_path,
+    mutator,
+    expected,
+):
+    source = plan_user_service_restart(
+        "admin.roadex.unarchived-pending",
+        "roadex-test.service",
+        "Unarchived pending fixture",
+    )
+    draft = _draft_for("admin.roadex.unarchived-pending")
+    with SQLiteStore(tmp_path / "admin.sqlite3") as store:
+        with pytest.raises(ValueError, match=expected):
+            stage_bound_roadex_approval(
+                store,
+                draft,
+                lambda: store.save_admin_change_plan(mutator(source)),
+            )
+
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM admin_change_plans WHERE id=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+
+
 def test_stage_bound_roadex_approval_rejects_roadex_source_with_staged_terminal_metadata(tmp_path):
     path, source = seeded(tmp_path / "backups")
     with SQLiteStore(path) as store:
@@ -1123,6 +1216,123 @@ def test_admin_terminal_state_projection_requires_complete_evidence(
             roadex_approval_status(str(store.path), "admin.roadex.evidence")
 
 
+@pytest.mark.parametrize(
+    ("terminal_status", "expected"),
+    (
+        ("pending", "pending"),
+        ("approved", "approved"),
+        ("canceled", "rejected"),
+    ),
+)
+def test_admin_archive_state_projection_allows_valid_archived_terminal_statuses(
+    tmp_path,
+    terminal_status,
+    expected,
+):
+    now = datetime.now(UTC).isoformat()
+    plan = plan_user_service_restart(
+        "admin.roadex.archived",
+        "roadex-test.service",
+        "Archived projection fixture",
+    )
+    if terminal_status == "pending":
+        terminal = plan
+    elif terminal_status == "approved":
+        terminal = approve_admin_change_plan(plan, "operator", now)
+    else:
+        terminal = cancel_admin_change_plan(
+            approve_admin_change_plan(plan, "operator", now),
+            "operator",
+            "Withdrawn",
+            now,
+        )
+
+    archived = archive_admin_change_plan(terminal, "archive-record-1", "operator", now)
+    draft = _draft_for("admin.roadex.archived")
+    with SQLiteStore(tmp_path / "admin.sqlite3") as store:
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(plan),
+        )
+        store.save_admin_change_plan(archived)
+        projection = roadex_approval_status(str(store.path), "admin.roadex.archived")
+
+    assert projection["decision"] == expected
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (lambda plan: replace(plan, archived_by="operator"), "admin source archive metadata is malformed"),
+        (lambda plan: replace(plan, archived_at=datetime.now(UTC).isoformat()), "admin source archive metadata is malformed"),
+        (lambda plan: replace(plan, archive_record_id="archive-record-1"), "admin source archive metadata is malformed"),
+    ),
+)
+def test_admin_plan_without_archive_flag_rejects_leftover_archive_metadata(
+    tmp_path,
+    mutator,
+    expected,
+):
+    path = "admin.roadex.pending"
+    plan = plan_user_service_restart(
+        path,
+        "roadex-test.service",
+        "Archived metadata fixture",
+    )
+    draft = _draft_for(path)
+    with SQLiteStore(tmp_path / "admin.sqlite3") as store:
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(plan),
+        )
+        store.save_admin_change_plan(mutator(plan))
+
+    with pytest.raises(ValueError, match=expected):
+        roadex_approval_status(str(tmp_path / "admin.sqlite3"), path)
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (lambda plan: replace(plan, archived_by=None), "archived_by"),
+        (lambda plan: replace(plan, archived_at=None), "archived_at"),
+        (lambda plan: replace(plan, archive_record_id=None), "archive_record_id"),
+    ),
+)
+def test_admin_archive_state_requires_metadata_for_archived_plan(
+    tmp_path,
+    mutator,
+    expected,
+):
+    now = datetime.now(UTC).isoformat()
+    archived = archive_admin_change_plan(
+        plan_user_service_restart(
+            "admin.roadex.archived",
+            "roadex-test.service",
+            "Archived metadata fixture",
+        ),
+        "archive-record-2",
+        "operator",
+        now,
+    )
+    draft = _draft_for("admin.roadex.archived")
+    with SQLiteStore(tmp_path / "admin.sqlite3") as store:
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(plan_user_service_restart(
+                "admin.roadex.archived",
+                "roadex-test.service",
+                "Archived metadata fixture",
+            )),
+        )
+        store.save_admin_change_plan(mutator(archived))
+        with pytest.raises(ValueError, match=expected):
+            roadex_approval_status(str(store.path), "admin.roadex.archived")
+
+
 def test_admin_plan_projection_statuses_are_expected(tmp_path):
     with SQLiteStore(tmp_path / "admin.sqlite3") as store:
         plan = plan_user_service_restart(
@@ -1433,8 +1643,18 @@ def test_roadex_human_projection_uses_parsed_offset_times(tmp_path):
             "must be independent",
         ),
         (
+            ProvisioningStatus.APPROVED,
+            lambda plan, _now: replace(plan, evidence_digest="sha256:bad"),
+            "roadex source approved evidence is malformed",
+        ),
+        (
             ProvisioningStatus.EXECUTED,
             lambda plan, _now: replace(plan, evidence_digest=None),
+            "evidence_digest",
+        ),
+        (
+            ProvisioningStatus.EXECUTED,
+            lambda plan, _now: replace(plan, evidence_digest="Bearer_SECRET_NOT_A_DIGEST"),
             "evidence_digest",
         ),
         (
@@ -1468,6 +1688,26 @@ def test_roadex_human_projection_uses_parsed_offset_times(tmp_path):
             "approved_at",
         ),
         (
+            ProvisioningStatus.FAILED,
+            lambda plan, _now: replace(plan, decided_by="sisko"),
+            "roadex source failed decision fields are malformed",
+        ),
+        (
+            ProvisioningStatus.FAILED,
+            lambda plan, _now: replace(plan, decided_at="bad-time"),
+            "roadex source failed decision fields are malformed",
+        ),
+        (
+            ProvisioningStatus.FAILED,
+            lambda plan, _now: replace(plan, decision_reason="Failed"),
+            "roadex source failed decision fields are malformed",
+        ),
+        (
+            ProvisioningStatus.FAILED,
+            lambda plan, _now: replace(plan, evidence_digest="Bearer_SECRET_NOT_A_DIGEST"),
+            "evidence_digest",
+        ),
+        (
             ProvisioningStatus.ROLLED_BACK,
             lambda plan, _now: replace(plan, failed_operation=None),
             "failed_operation",
@@ -1481,6 +1721,26 @@ def test_roadex_human_projection_uses_parsed_offset_times(tmp_path):
             ProvisioningStatus.ROLLED_BACK,
             lambda plan, _now: replace(plan, approved_by="sisko"),
             "must be independent",
+        ),
+        (
+            ProvisioningStatus.ROLLED_BACK,
+            lambda plan, _now: replace(plan, decided_by="sisko"),
+            "roadex source failed decision fields are malformed",
+        ),
+        (
+            ProvisioningStatus.ROLLED_BACK,
+            lambda plan, _now: replace(plan, decided_at="bad-time"),
+            "roadex source failed decision fields are malformed",
+        ),
+        (
+            ProvisioningStatus.ROLLED_BACK,
+            lambda plan, _now: replace(plan, decision_reason="Rolled back"),
+            "roadex source failed decision fields are malformed",
+        ),
+        (
+            ProvisioningStatus.ROLLED_BACK,
+            lambda plan, _now: replace(plan, evidence_digest="Bearer_SECRET_NOT_A_DIGEST"),
+            "evidence_digest",
         ),
     ),
 )

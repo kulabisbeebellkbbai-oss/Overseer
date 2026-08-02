@@ -10,6 +10,13 @@ from datetime import UTC, datetime
 from typing import Callable, Mapping, Literal
 
 from .admin import AdminChangePlan
+from .backup_provisioning import (
+    DonutHoleBackupProvisioningPlan,
+    PLAN_KIND,
+    _load as load_roadex_plan,
+    _require_terminal_evidence,
+    _validate_plan,
+)
 from .serialization import to_jsonable
 
 
@@ -60,7 +67,13 @@ def stage_bound_roadex_approval(
         save_source()
         source = load_source_from_draft(store, draft)
         source_digest = exact_source_evidence_digest(source)
-        binding = binding_from_draft(draft, source_digest)
+        existing_binding: RoadexApprovalBinding | None = None
+        try:
+            existing_binding = store.load_roadex_approval_binding(draft.approval_ref)
+        except KeyError:
+            pass
+        created_at = existing_binding.created_at if existing_binding is not None else None
+        binding = binding_from_draft(draft, source_digest, created_at=created_at)
         binding = store.save_roadex_approval_binding(binding)
     return binding
 
@@ -78,9 +91,11 @@ def roadex_approval_status(
         except KeyError:
             raise KeyError("bound Roadex approval")
         source = load_exact_bound_source(store, binding)
+        if binding.source_kind == "admin-plan":
+            _validate_source(source, binding)
         source_digest = exact_source_evidence_digest(source)
         verify_scope_digest(binding, source_digest)
-        decision, source_status, updated_at = project_decision(binding, source)
+        decision, source_status, updated_at = project_decision(store, binding, source)
         decision_version = project_decision_version(
             binding, source_status, decision, updated_at
         )
@@ -90,8 +105,8 @@ def roadex_approval_status(
 def load_exact_bound_source(store, binding: RoadexApprovalBinding):
     if binding.source_kind == "admin-plan":
         source = store.load_admin_change_plan(binding.source_id)
-        if binding.source_id != binding.approval_ref:
-            raise ValueError("admin-plan source_id must match approval_ref")
+        if source.id != binding.source_id:
+            raise ValueError("admin source id must match source payload")
         return source
     if binding.source_kind == "roadex-human-decision":
         return load_roadex_human_plan(store, binding.source_id)
@@ -99,11 +114,14 @@ def load_exact_bound_source(store, binding: RoadexApprovalBinding):
 
 
 def project_decision(
+    store,
     binding: RoadexApprovalBinding,
     source: object,
 ) -> tuple[str, str, str]:
     if binding.source_kind == "admin-plan":
         source_plan = _require_admin_plan(source)
+        if source_plan.id != binding.source_id:
+            raise ValueError("admin source id must match source payload")
         if source_plan.canceled:
             return (
                 "rejected",
@@ -119,27 +137,38 @@ def project_decision(
         return ("pending", "pending", binding.created_at)
 
     source_plan = _require_roadex_plan(source)
-    status = str(source_plan["status"])
+    status = str(source_plan.status)
     if status == "staged":
         return (
             "pending",
             status,
             _newest_time(
-                source_plan.get("proposed_at"),
-                source_plan.get("approved_at"),
-                source_plan.get("decided_at"),
-                source_plan.get("executed_at"),
+                source_plan.approved_at,
+                source_plan.decided_at,
+                source_plan.executed_at,
                 binding.created_at,
             ),
         )
-    if status == "approved" or status == "executed":
+    if status in {"approved", "executed"}:
         return (
             "approved",
             status,
             _newest_time(
-                source_plan.get("approved_at"),
-                source_plan.get("executed_at"),
-                source_plan.get("decided_at"),
+                source_plan.approved_at,
+                source_plan.executed_at,
+                source_plan.decided_at,
+                binding.created_at,
+            ),
+        )
+    if status == "failed" or status == "rolled_back":
+        _require_terminal_evidence(store, source_plan)
+        return (
+            "approved",
+            status,
+            _newest_time(
+                source_plan.approved_at,
+                source_plan.executed_at,
+                source_plan.decided_at,
                 binding.created_at,
             ),
         )
@@ -148,9 +177,9 @@ def project_decision(
             "rejected",
             status,
             _newest_time(
-                source_plan.get("decided_at"),
-                source_plan.get("approved_at"),
-                source_plan.get("executed_at"),
+                source_plan.decided_at,
+                source_plan.approved_at,
+                source_plan.executed_at,
                 binding.created_at,
             ),
         )
@@ -159,9 +188,9 @@ def project_decision(
             "changes-requested",
             status,
             _newest_time(
-                source_plan.get("decided_at"),
-                source_plan.get("approved_at"),
-                source_plan.get("executed_at"),
+                source_plan.decided_at,
+                source_plan.approved_at,
+                source_plan.executed_at,
                 binding.created_at,
             ),
         )
@@ -213,22 +242,11 @@ def load_source_from_draft(store, draft: RoadexApprovalBindingDraft):
     raise ValueError("unsupported source_kind")
 
 
-def load_roadex_human_plan(store, source_id: str) -> Mapping[str, object]:
-    row = store._connection.execute(
-        "SELECT payload FROM backup_provisioning_plans WHERE id=?",
-        (source_id,),
-    ).fetchone()
-    if row is None:
-        raise KeyError(source_id)
-    payload = json.loads(str(row["payload"]))
-    if not isinstance(payload, dict):
-        raise ValueError("roadex-human source is invalid")
-    return payload
-
-
 def binding_from_draft(
     draft: RoadexApprovalBindingDraft,
     source_digest: str,
+    *,
+    created_at: str | None = None,
 ) -> RoadexApprovalBinding:
     return RoadexApprovalBinding(
         approval_ref=draft.approval_ref,
@@ -240,7 +258,7 @@ def binding_from_draft(
         authority_class=draft.authority_class,
         subject=draft.subject,
         scope_digest=scope_digest(draft, source_digest),
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=created_at or datetime.now(UTC).isoformat(),
     )
 
 
@@ -251,8 +269,8 @@ def source_evidence_digest(source: object) -> str:
 def exact_source_evidence_digest(source: object) -> str:
     if isinstance(source, AdminChangePlan):
         return source_digest_from_admin_plan(source)
-    if isinstance(source, Mapping):
-        return source_digest_from_roadex_plan(source)
+    if isinstance(source, DonutHoleBackupProvisioningPlan):
+        return source.plan_digest
     return _digest(to_jsonable(source))
 
 
@@ -284,26 +302,6 @@ def source_digest_from_admin_plan(plan: AdminChangePlan) -> str:
     return _digest(payload)
 
 
-def source_digest_from_roadex_plan(plan: Mapping[str, object]) -> str:
-    mutable = (
-        "status",
-        "decision_reason",
-        "decided_by",
-        "decided_at",
-        "approved_by",
-        "approved_at",
-        "executed_at",
-        "evidence_digest",
-        "failed_operation",
-        "error_code",
-        "error_detail",
-    )
-    payload = dict(plan)
-    for field in mutable:
-        payload.pop(field, None)
-    return _digest(payload)
-
-
 def scope_digest(
     draft: RoadexApprovalBindingDraft,
     source_digest: str,
@@ -316,13 +314,13 @@ def _scope_payload(
     source_digest: str,
 ) -> dict[str, object]:
     return {
-        "approval_ref": draft.approval_ref,
-        "source_kind": draft.source_kind,
-        "source_id": draft.source_id,
-        "project_id": draft.project_id,
-        "workspace_id": draft.workspace_id,
-        "resource_ref": draft.resource_ref,
-        "authority_class": draft.authority_class,
+        "approvalRef": draft.approval_ref,
+        "sourceKind": draft.source_kind,
+        "sourceId": draft.source_id,
+        "projectId": draft.project_id,
+        "workspaceId": draft.workspace_id,
+        "resourceRef": draft.resource_ref,
+        "authorityClass": draft.authority_class,
         "subject": draft.subject,
         "sourceEvidenceDigest": source_digest,
     }
@@ -347,10 +345,44 @@ def _require_admin_plan(source: object) -> AdminChangePlan:
     return source
 
 
+def _validate_source(source: object, binding: RoadexApprovalBinding) -> None:
+    if binding.source_kind == "admin-plan":
+        if source.id != binding.source_id:
+            raise ValueError("admin source id must match source payload")
+    elif binding.source_kind == "roadex-human-decision":
+        _require_roadex_plan(source)
+
+
 def _require_roadex_plan(source: object) -> Mapping[str, object]:
-    if not isinstance(source, Mapping):
+    if not isinstance(source, DonutHoleBackupProvisioningPlan):
         raise ValueError("roadex-human source must be a provisioning plan")
+    if source.kind != PLAN_KIND:
+        raise ValueError("exact kind must be preserved")
+    if source.decision_source != "Roadex":
+        raise ValueError("Roadex decision source must be preserved")
+    _validate_plan(source)
     return source
+
+
+def load_roadex_human_plan(store, source_id: str) -> DonutHoleBackupProvisioningPlan:
+    row = store._connection.execute(
+        "SELECT payload FROM backup_provisioning_plans WHERE id=?",
+        (source_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(source_id)
+    plan = load_roadex_plan(str(row["payload"]))
+    if plan.plan_id != source_id:
+        raise ValueError("source id must match approval source")
+    if plan.kind != PLAN_KIND:
+        raise ValueError("exact kind must be preserved")
+    if plan.decision_source != "Roadex":
+        raise ValueError("Roadex decision source must be preserved")
+    try:
+        _validate_plan(plan)
+    except ValueError as error:
+        raise ValueError("plan digest") from error
+    return plan
 
 
 def _digest(value: object) -> str:

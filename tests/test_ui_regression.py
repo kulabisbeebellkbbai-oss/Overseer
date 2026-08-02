@@ -447,12 +447,31 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
                         "admin.legacy",
                         "roadex-test.service",
                         "Legacy approval fixture",
+                        )
                     )
+                before_master = store._connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                ).fetchall()
+                before_binding_rows = (
+                    store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
+                    if before_master
+                    else None
                 )
             with LocalApiHarness(store_path) as server:
                 with self.assertRaises(HTTPError) as legacy:
                     server.get_json("/Overseer/roadex/approval-status?approval_ref=admin.legacy")
                 self.assertEqual(legacy.exception.code, 404)
+            with SQLiteStore(store_path) as store:
+                after_master = store._connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                ).fetchall()
+                after_binding_rows = (
+                    store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
+                    if after_master
+                    else None
+                )
+            self.assertEqual(before_master, after_master)
+            self.assertEqual(before_binding_rows, after_binding_rows)
 
     def test_roadex_approval_status_route_has_no_mutation(self):
         draft = RoadexApprovalBindingDraft(
@@ -480,15 +499,22 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
                     ),
                 )
                 before_binding = store.load_roadex_approval_binding(draft.approval_ref)
+                before_master = store._connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                ).fetchall()
                 before_rows = store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
             with LocalApiHarness(store_path) as server:
                 server.get_json("/roadex/approval-status?approval_ref=admin.roadex.test")
             with SQLiteStore(store_path) as store:
                 after_binding = store.load_roadex_approval_binding(draft.approval_ref)
+                after_master = store._connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                ).fetchall()
                 after_rows = store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
 
         self.assertEqual(before_rows, after_rows)
         self.assertEqual(before_binding, after_binding)
+        self.assertEqual(before_master, after_master)
 
 
 if __name__ == "__main__":

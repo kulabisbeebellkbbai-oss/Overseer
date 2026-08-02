@@ -2020,7 +2020,6 @@ class SQLiteStore:
 
     def _roadex_binding_fingerprint(self, payload: str) -> tuple[str, str, str, str, str, str, str, str, str]:
         data = json.loads(payload)
-        data.pop("created_at", None)
         return (
             str(data["approval_ref"]),
             str(data["source_kind"]),
@@ -2031,6 +2030,7 @@ class SQLiteStore:
             str(data["authority_class"]),
             str(data["subject"]),
             str(data["scope_digest"]),
+            str(data["created_at"]),
         )
 
     def save_roadex_approval_binding(self, binding) -> None:
@@ -2057,7 +2057,11 @@ class SQLiteStore:
     def load_roadex_approval_binding(self, approval_ref: str) -> object:
         from .roadex_approval_status import RoadexApprovalBinding
 
-        self._ensure_roadex_approval_bindings()
+        existing_schema = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+        ).fetchone()
+        if not existing_schema:
+            raise KeyError(approval_ref)
         row = self._connection.execute(
             "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
             (approval_ref,),

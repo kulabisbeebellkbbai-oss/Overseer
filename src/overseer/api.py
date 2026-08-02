@@ -650,7 +650,10 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 if len(refs) != 1 or not refs[0]:
                     self._write_json({"error": "approval_ref_required"}, HTTPStatus.BAD_REQUEST)
                     return
-                self._handle(lambda: roadex_approval_status(store_path, refs[0]))
+                self._handle(
+                    lambda: roadex_approval_status(store_path, refs[0]),
+                    redact_projection_errors=True,
+                )
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1169,13 +1172,19 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return False
             return secrets.compare_digest(header[len(prefix) :], auth_token)
 
-        def _handle(self, handler) -> None:
+        def _handle(self, handler, *, redact_projection_errors: bool = False) -> None:
             try:
                 self._write_json(handler())
             except KeyError as error:
                 self._write_json({"error": f"missing record: {error.args[0]}"}, HTTPStatus.NOT_FOUND)
             except ValueError as error:
-                self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                if redact_projection_errors:
+                    self._write_json(
+                        {"error": "malformed_source", "code": "ROAD_EX_APPROVAL_SOURCE_MALFORMED"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                else:
+                    self._write_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             except AgentAuthorizationError as error:
                 self._write_json({"error": str(error)}, HTTPStatus.FORBIDDEN)
             except (AgentManagerError, AgentAdapterUnavailableError) as error:

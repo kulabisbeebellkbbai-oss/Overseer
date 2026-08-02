@@ -442,36 +442,108 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             with SQLiteStore(store_path) as store:
-                store.save_admin_change_plan(
-                    plan_user_service_restart(
-                        "admin.legacy",
-                        "roadex-test.service",
-                        "Legacy approval fixture",
+                draft = RoadexApprovalBindingDraft(
+                    approval_ref="admin.roadex.legacy",
+                    source_kind="admin-plan",
+                    source_id="admin.roadex.legacy",
+                    project_id="project.test",
+                    workspace_id="workspace.test",
+                    resource_ref="service.test",
+                    authority_class="privileged-operation",
+                    subject="Restart test service",
+                )
+                stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.roadex.legacy",
+                            "roadex-test.service",
+                            "Legacy approval fixture",
                         )
-                    )
-                before_master = store._connection.execute(
-                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                    ),
+                )
+                store._connection.execute("DROP INDEX IF EXISTS idx_roadex_approval_bindings_source_kind")
+                store._connection.execute("DROP INDEX IF EXISTS idx_roadex_approval_bindings_source_id")
+                store._connection.execute("DROP TABLE IF EXISTS roadex_approval_bindings")
+                store._connection.commit()
+                pre_get_schema = store._connection.execute(
+                    "SELECT type, name, sql FROM sqlite_master WHERE name='roadex_approval_bindings' OR name='idx_roadex_approval_bindings_source_kind' OR name='idx_roadex_approval_bindings_source_id' ORDER BY name"
                 ).fetchall()
-                before_binding_rows = (
+                pre_get_rows = (
                     store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
-                    if before_master
+                    if store._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'").fetchone()
                     else None
                 )
             with LocalApiHarness(store_path) as server:
                 with self.assertRaises(HTTPError) as legacy:
-                    server.get_json("/Overseer/roadex/approval-status?approval_ref=admin.legacy")
+                    server.get_json("/Overseer/roadex/approval-status?approval_ref=admin.roadex.legacy")
                 self.assertEqual(legacy.exception.code, 404)
             with SQLiteStore(store_path) as store:
-                after_master = store._connection.execute(
-                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                post_get_schema = store._connection.execute(
+                    "SELECT type, name, sql FROM sqlite_master WHERE name='roadex_approval_bindings' OR name='idx_roadex_approval_bindings_source_kind' OR name='idx_roadex_approval_bindings_source_id' ORDER BY name"
                 ).fetchall()
-                after_binding_rows = (
+                post_get_rows = (
                     store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
-                    if after_master
+                    if store._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'").fetchone()
                     else None
                 )
-            self.assertEqual(before_master, after_master)
-            self.assertEqual(before_binding_rows, after_binding_rows)
+            self.assertEqual(pre_get_schema, post_get_schema)
+            self.assertEqual(pre_get_rows, post_get_rows)
+            self.assertIsNone(pre_get_rows)
+            self.assertIsNone(post_get_rows)
+
+    def test_roadex_approval_status_route_does_not_return_malformed_source_secret(self):
+        secret = "ROADEX_SOURCE_SECRET_ABC123"
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            with SQLiteStore(store_path) as store:
+                draft = RoadexApprovalBindingDraft(
+                    approval_ref="admin.roadex.test",
+                    source_kind="admin-plan",
+                    source_id="admin.roadex.test",
+                    project_id="project.test",
+                    workspace_id="workspace.test",
+                    resource_ref="service.test",
+                    authority_class="privileged-operation",
+                    subject="Restart test service",
+                )
+                stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.roadex.test",
+                            "roadex-test.service",
+                            "Approval projection fixture",
+                        )
+                    ),
+                )
+                payload = json.loads(
+                    store._connection.execute(
+                        "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+                        (draft.approval_ref,),
+                    ).fetchone()["payload"]
+                )
+                payload["source_id"] = secret
+                store._connection.execute(
+                    "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+                    (json.dumps(payload), draft.approval_ref),
+                )
+                store._connection.commit()
+
+            with LocalApiHarness(store_path) as server:
+                request = Request(f"{server.url}/Overseer/roadex/approval-status?approval_ref=admin.roadex.test")
+                request.add_header("Authorization", f"Bearer {server.auth_token}")
+                with self.assertRaises(HTTPError) as malformed:
+                    urlopen(request, timeout=5)
+                body = malformed.exception.read().decode("utf-8")
+
+            self.assertEqual(malformed.exception.code, 400)
+            self.assertNotIn(secret, body)
+            parsed = json.loads(body)
+            self.assertEqual(parsed["error"], "malformed_source")
+            self.assertEqual(parsed["code"], "ROAD_EX_APPROVAL_SOURCE_MALFORMED")
 
     def test_roadex_approval_status_route_has_no_mutation(self):
         draft = RoadexApprovalBindingDraft(

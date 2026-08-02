@@ -2018,23 +2018,23 @@ class SQLiteStore:
             "CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id)"
         )
 
-    def _roadex_binding_fingerprint(self, payload: str) -> tuple[str, str, str, str, str, str, str, str, str]:
+    def _roadex_binding_fingerprint(self, payload: str) -> str:
         data = json.loads(payload)
-        return (
-            str(data["approval_ref"]),
-            str(data["source_kind"]),
-            str(data["source_id"]),
-            str(data["project_id"]),
-            str(data["workspace_id"]),
-            str(data["resource_ref"]),
-            str(data["authority_class"]),
-            str(data["subject"]),
-            str(data["scope_digest"]),
-            str(data["created_at"]),
+        if not isinstance(data, dict):
+            raise ValueError("Roadex approval binding payload must be a JSON object")
+        return json.dumps(
+            data,
+            sort_keys=True,
+            separators=(",", ":"),
         )
 
     def save_roadex_approval_binding(self, binding) -> None:
         from .roadex_approval_status import RoadexApprovalBinding
+        from .roadex_approval_status import _validate_binding_object_types
+
+        if not isinstance(binding, RoadexApprovalBinding):
+            raise ValueError("Roadex approval binding must be exact RoadexApprovalBinding")
+        _validate_binding_object_types(binding)
 
         self._ensure_roadex_approval_bindings()
         payload = _dump(binding)
@@ -2043,7 +2043,7 @@ class SQLiteStore:
             (binding.approval_ref,),
         ).fetchone()
         if existing is not None:
-            if self._roadex_binding_fingerprint(str(existing["payload"])) != self._roadex_binding_fingerprint(payload):
+            if str(existing["payload"]) != self._roadex_binding_fingerprint(payload):
                 raise ValueError("Roadex approval binding is immutable")
             self._commit_agent_mutation()
             return _load_dataclass(RoadexApprovalBinding, str(existing["payload"]))

@@ -2,7 +2,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, approve_plan, build_plan, execute_plan, execute_plan_api, list_plans, stage_plan
+from overseer.backup_host_operations import RedactedHostOperationError
+from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, stage_plan
 from overseer.core import OwnerDomain, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
@@ -28,6 +29,53 @@ def test_stage_is_immutable_and_binds_all_terminal_evidence(tmp_path):
     changed = build_plan(plan.plan_id, "sha256:" + "b" * 64, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
     with pytest.raises(ValueError, match="immutable"):
         stage_plan(path, changed)
+
+
+def test_roadex_human_decision_card_lists_only_exact_ready_plan(tmp_path):
+    path, plan = seeded(tmp_path); stage_plan(path, plan)
+    result = list_roadex_human_decisions(path)
+    assert result["pending_count"] == 1
+    item = result["items"][0]
+    assert item["source"] == "Roadex" and item["owner"] == "Sisko"
+    assert item["plan_id"] == plan.plan_id and item["plan_digest"] == plan.plan_digest
+    assert item["human_approval_required"] is True and item["ready"] is True
+    assert item["impact"] and item["risks"] and item["rollback"]
+
+
+@pytest.mark.parametrize(("decision", "status"), (("deny", "denied"), ("request_revision", "revision_requested")))
+def test_roadex_human_denial_and_revision_are_terminal_without_host_mutation(tmp_path, decision, status):
+    path, plan = seeded(tmp_path); stage_plan(path, plan)
+    result = decide_roadex_human_plan(path, plan.plan_id, decision, "human-user", "Needs a safer revision")
+    assert result["action_status"] == status
+    assert result["host_mutation_performed"] is False
+    assert list_plans(path)["items"][0]["status"] == status
+
+
+def test_roadex_human_approval_executes_exact_plan_to_terminal_evidence(tmp_path):
+    path, plan = seeded(tmp_path); stage_plan(path, plan); calls = []
+    def factory(exact_plan):
+        assert exact_plan.plan_id == plan.plan_id
+        return DedicatedProvisioningAdapter({step.operation: (lambda _args, name=step.operation: calls.append(name) or {"ok": True}) for step in exact_plan.steps})
+    result = decide_roadex_human_plan(path, plan.plan_id, "approve", "human-user", "", factory)
+    assert result["action_status"] == "executed" and result["host_mutation_performed"] is True
+    assert calls == [step.operation for step in plan.steps]
+    assert list_plans(path)["items"][0]["evidence_digest"].startswith("sha256:")
+
+
+def test_roadex_approval_fails_closed_before_approval_without_host_adapter(tmp_path):
+    path, plan = seeded(tmp_path); stage_plan(path, plan)
+    with pytest.raises(ValueError, match="adapter"):
+        decide_roadex_human_plan(path, plan.plan_id, "approve", "human-user", "")
+    assert list_plans(path)["items"][0]["status"] == "staged"
+
+
+def test_roadex_approval_stays_staged_when_host_adapter_construction_fails(tmp_path):
+    path, plan = seeded(tmp_path); stage_plan(path, plan)
+    def unavailable(_plan):
+        raise PermissionError("host adapter unavailable")
+    with pytest.raises(PermissionError, match="unavailable"):
+        decide_roadex_human_plan(path, plan.plan_id, "approve", "human-user", "", unavailable)
+    assert list_plans(path)["items"][0]["status"] == "staged"
 
 
 def test_plan_requires_exact_live_authority_inputs_and_registers_before_start(tmp_path):
@@ -173,14 +221,25 @@ def test_partial_failure_uses_declared_dependency_safe_rollback_order_and_record
     def operation(name):
         def run(_args):
             calls.append(name)
-            if name == "ensure_system_user": raise RuntimeError("secret failure detail")
+            if name == "ensure_system_user": raise RedactedHostOperationError("PRIVATE_STATE_INVALID")
             return {"ok": True, "detail": "secret result"}
         return run
     adapter = DedicatedProvisioningAdapter({name: operation(name) for name in forward | rollback})
     with pytest.raises(RuntimeError): execute_plan(path, plan.plan_id, adapter)
     item = list_plans(path)["items"][0]
-    assert item["status"] == "rolled_back" and "secret failure detail" not in repr(item) and "secret result" not in repr(item)
+    assert item["status"] == "rolled_back" and item["failed_operation"] == "ensure_system_user" and item["error_code"] == "PRIVATE_STATE_INVALID"
+    assert "secret failure detail" not in repr(item) and "secret result" not in repr(item)
     assert calls[-len(plan.rollback_steps):] == [step.operation for step in plan.rollback_steps]
     names = [step.operation for step in plan.rollback_steps]
     assert names.index("remove_read_only_acl") < names.index("remove_system_user_if_unused")
     assert names.index("remove_directory_if_empty") < names.index("remove_system_user_if_unused")
+
+
+def test_unstructured_failure_records_only_generic_redacted_code(tmp_path):
+    path, plan = seeded(tmp_path); stage_plan(path, plan); approve_plan(path, plan.plan_id, "operator-human")
+    def fail(_args): raise RuntimeError("token=private path=/secret")
+    operations = {step.operation: (fail if step.operation == "verify_endpoint_migration_ready" else lambda _args: {"ok": True}) for step in (*plan.steps, *plan.rollback_steps)}
+    with pytest.raises(RuntimeError): execute_plan(path, plan.plan_id, DedicatedProvisioningAdapter(operations))
+    item = list_plans(path)["items"][0]
+    assert item["failed_operation"] == "verify_endpoint_migration_ready" and item["error_code"] == "OPERATION_FAILED"
+    assert "token=private" not in repr(item) and "/secret" not in repr(item)

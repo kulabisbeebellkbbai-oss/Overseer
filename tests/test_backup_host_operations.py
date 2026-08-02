@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from overseer.backup_host_operations import ConcreteHostProvisioningAdapter,EXPECTED_BACKUP_TOOL_SCHEMAS,PRIVILEGED_CONFIRMATION,capability_digest,runtime_digest
+from overseer.backup_host_operations import ConcreteHostProvisioningAdapter,EXPECTED_BACKUP_TOOL_SCHEMAS,PRIVILEGED_CONFIRMATION,RedactedHostOperationError,capability_digest,runtime_digest
 from overseer.backup_provisioning import ProvisioningStep
 
 class Result:
@@ -32,11 +32,12 @@ def test_failed_process_exposes_only_validated_redacted_error_code():
     safe=json.dumps({"ok":False,"error":{"code":"PRIVATE_STATE_INVALID"},"redactions_applied":True}).encode()
     with pytest.raises(RuntimeError,match=r"PRIVATE_STATE_INVALID") as failure:
         adapter([step],lambda *_a,**_k:Result(returncode=2,stdout=b"",stderr=safe)).execute(step)
+    assert isinstance(failure.value,RedactedHostOperationError) and failure.value.code=="PRIVATE_STATE_INVALID"
     assert "private diagnostic" not in str(failure.value)
 
     with pytest.raises(RuntimeError,match=r"PROCESS_FAILED") as failure:
         adapter([step],lambda *_a,**_k:Result(returncode=2,stdout=b"",stderr=b'{"error":{"code":"TOKEN_LEAK"}}')).execute(step)
-    assert "TOKEN_LEAK" not in str(failure.value)
+    assert failure.value.code=="PROCESS_FAILED" and "TOKEN_LEAK" not in str(failure.value)
 
 def test_changed_arguments_and_unknown_operations_are_denied_before_runner():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"}); calls=[]; host=adapter([step],lambda *args,**kwargs:calls.append(args) or Result())

@@ -261,6 +261,19 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     .panel.bad::before { background: var(--bad); }
     .panel.pending::before { background: var(--pending); }
     .panel.inactive::before { background: var(--inactive); }
+    .human-decision-card {
+      grid-column: span 12;
+      border-color: rgba(242, 184, 75, 0.72);
+      box-shadow: inset 7px 0 0 var(--lcars-amber), 0 18px 40px rgba(0, 0, 0, 0.3);
+    }
+    .decision-copy { display: grid; gap: 10px; margin-top: 10px; }
+    .decision-list { margin: 0; padding-left: 22px; color: var(--muted); }
+    .decision-list li + li { margin-top: 5px; }
+    .decision-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-top: 14px; }
+    .decision-actions .field { flex: 1 1 320px; }
+    .decision-actions .action-btn { min-height: 44px; }
+    .action-btn.deny { background: var(--bad); color: #050506; }
+    .action-btn.revision { background: var(--lcars-lavender); color: #050506; }
     .span-3 { grid-column: span 3; }
     .span-4 { grid-column: span 4; }
     .span-6 { grid-column: span 6; }
@@ -826,6 +839,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       ,agentSessions: "/agent-sessions"
       ,agentDispatches: "/agent-dispatches"
       ,agentUsage: "/agent-usage"
+      ,roadexHumanDecisions: "/roadex/human-decisions"
     };
     const requiredEndpointKeys = new Set(["auth"]);
     const protectedGatewayPath = window.location.pathname === "/Overseer" || window.location.pathname.startsWith("/Overseer/");
@@ -1109,6 +1123,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       status.textContent = "Running action...";
       try {
         const result = await actionRequest(action, source);
+        if (result?.ok === false) {
+          await refresh();
+          throw new Error(`${action} ended ${result.action_status || "failed"}; review terminal evidence`);
+        }
         applyActionResult(action, result);
         state.lastAction = {action, result, at: new Date().toLocaleString()};
         await refresh();
@@ -1179,6 +1197,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "decide-crew-message") return await decideCrewMessage(source);
       if (action === "resubmit-crew-message") return await resubmitCrewMessage(source);
       if (action === "reconcile-crew-reviews") return await postJson("/crew/reconcile", {reconciled_by: "sisko"});
+      if (action === "decide-roadex-human") return await decideRoadexHuman(source);
       if (action === "documents-list-notes") return await listDocumentsNotes();
       if (action === "documents-search") return await searchDocuments();
       if (action === "documents-write-note") return await writeDocumentNote();
@@ -1239,6 +1258,22 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       return await postJson("/agent-sessions/discover", {
         provider_id: value("agent-provider-id"),
         instance_id: value("agent-instance-id")
+      });
+    }
+    async function decideRoadexHuman(source) {
+      const planId = source.dataset.planId;
+      const decision = source.dataset.decision;
+      const digest = source.dataset.planDigest;
+      const reason = value(`roadex-decision-reason-${planId}`);
+      if (!planId || !["approve", "deny", "request_revision"].includes(decision)) throw new Error("exact Roadex decision target is required");
+      if (decision !== "approve" && !reason) throw new Error("A reason is required to deny or request a revision");
+      const verb = decision === "approve" ? "approve and execute" : decision === "deny" ? "deny" : "request revision of";
+      if (!window.confirm(`Confirm ${verb} ${planId}\n\nExact digest: ${digest}`)) throw new Error("Human decision cancelled");
+      return await postJson("/roadex/human-decisions/decide", {
+        plan_id: planId,
+        decision,
+        decided_by: "human-user",
+        reason
       });
     }
     async function resumeAgentSession() {
@@ -2140,6 +2175,35 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const detail = result.count ?? result.targets ?? result.resources ?? result.plans ?? result.status ?? "complete";
       status.innerHTML = `<div class="toolbar"><h3>${safe(labelize(state.lastAction.action))}</h3><span class="pill good">${safe(detail)}</span></div><p class="muted">${safe(state.lastAction.at)}</p>`;
     }
+    function roadexHumanDecisionCard(item) {
+      const pending = item.human_approval_required === true;
+      const ready = item.ready === true;
+      const disabled = pending && ready ? "" : " disabled";
+      const reasonId = `roadex-decision-reason-${item.plan_id}`;
+      const action = (decision, label, className = "") => `<button type="button" class="action-btn ${className}" data-action="decide-roadex-human" data-decision="${decision}" data-plan-id="${safe(item.plan_id)}" data-plan-digest="${safe(item.plan_digest)}"${disabled}>${label}</button>`;
+      const impact = (item.impact || []).map((entry) => `<li>${safe(entry)}</li>`).join("");
+      const risks = (item.risks || []).map((entry) => `<li>${safe(entry)}</li>`).join("");
+      const blockers = (item.blockers || []).map((entry) => `<li>${safe(entry)}</li>`).join("");
+      return `<article class="panel human-decision-card ${ready ? "warn" : pending ? "bad" : "good"}" aria-labelledby="decision-title-${safe(item.plan_id)}">
+        <div class="toolbar"><div><h3>Roadex final human decision</h3><h2 id="decision-title-${safe(item.plan_id)}">${safe(item.title)}</h2></div><span class="pill ${ready ? "warn" : pending ? "bad" : "good"}">${safe(item.status)}</span></div>
+        <div class="decision-copy">
+          <p>${safe(item.decision)}</p>
+          <p class="muted">${safe(item.explanation)}</p>
+          <p><strong>Exact target:</strong> ${safe(item.plan_id)}</p>
+          <p class="muted"><strong>Immutable digest:</strong> ${safe(item.plan_digest)}</p>
+          <div><h3>What approval does</h3><ul class="decision-list">${impact}</ul></div>
+          <div><h3>Risks and safeguards</h3><ul class="decision-list">${risks}</ul></div>
+          ${blockers ? `<div><h3>Blocking evidence</h3><ul class="decision-list">${blockers}</ul></div>` : ""}
+          ${item.decision_reason ? `<p><strong>Decision reason:</strong> ${safe(item.decision_reason)}</p>` : ""}
+        </div>
+        ${pending ? `<div class="decision-actions">
+          <div class="field"><label for="${reasonId}">Reason or requested revision</label><textarea id="${reasonId}" placeholder="Required for denial or revision; optional approval note"></textarea></div>
+          ${action("approve", "Approve and complete")}
+          ${action("deny", "Deny", "deny")}
+          ${action("request_revision", "Request revision", "revision")}
+        </div>` : ""}
+      </article>`;
+    }
     function renderOverview() {
       const focus = (state.data.dashboard || {}).role_focus || {};
       const attention = (state.data.dashboard || {}).attention || {};
@@ -2150,9 +2214,11 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const templates = operationWorkflows.templates || [];
       const crewSummary = (state.data.crewMessages || {}).summary || {};
       const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
+      const humanDecisions = (state.data.roadexHumanDecisions || {}).items || [];
       document.getElementById("overview").innerHTML = `
         <div class="grid">
           ${stationIntro("Sisko", "Strategic Operations", "Command routing, runtime cadence, and crew dispatch.", ["authorizations", "crew queue", "runtime"])}
+          ${humanDecisions.length ? humanDecisions.map(roadexHumanDecisionCard).join("") : `<div class="panel span-12 good"><div class="toolbar"><h3>Roadex final human decisions</h3><span class="pill good">clear</span></div><p class="muted">No Roadex decisions currently require independent human action.</p></div>`}
           ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3", attention.pending_authorizations ? "warn" : "good", "admin")}
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good", "security")}
           ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good", "health")}
@@ -3436,6 +3502,10 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Transition an operations record", page: "Overview", owner: "Sisko", action: "transition-operation", source, query: "Transition an operations record"},
         {workflow: "Dispatch open crew requests", page: "Overview", owner: "Sisko", action: "dispatch-crew-messages", source, query: "Dispatch open crew requests"},
         {workflow: "Send a crew request", page: "Any", owner: "Sisko", action: "send-crew-message", source, query: "Send a crew request"},
+        {workflow: "Review and reconcile crew decisions", page: "Any", owner: "Sisko", action: "decide-crew-message", source, query: "Review and reconcile crew decisions"},
+        {workflow: "Review and reconcile crew decisions", page: "Any", owner: "Sisko", action: "resubmit-crew-message", source, query: "Review and reconcile crew decisions"},
+        {workflow: "Review and reconcile crew decisions", page: "Any", owner: "Sisko", action: "reconcile-crew-reviews", source, query: "Review and reconcile crew decisions"},
+        {workflow: "Complete a Roadex final human decision", page: "Overview", owner: "Sisko", action: "decide-roadex-human", source, query: "Complete a Roadex final human decision"},
         {workflow: "Approve a pending admin request", page: "Admin", owner: "Sisko", action: "approve-admin-change", source, query: "Approve a pending admin request"},
         {workflow: "Approve and implement an admin request", page: "Admin", owner: "Sisko / O'Brien", action: "approve-and-execute-admin-change", source, query: "Approve and implement an admin request"},
         {workflow: "Request changes for a plan", page: "Admin", owner: "Sisko", action: "cancel-admin-change", source, query: "Request changes for a plan"},

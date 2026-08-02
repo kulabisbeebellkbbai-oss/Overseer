@@ -92,6 +92,42 @@ execution.
 5. Click Send Request.
 6. Click Dispatch Open or wait for Sisko dispatch.
 
+### Review And Reconcile Crew Decisions
+
+Use this to approve, reject, request corrections for, or resubmit an exact crew
+review without confusing acknowledgement with approval.
+
+1. Open the owning crew member's Channel panel.
+2. Select the exact review request and read its evidence and decision reason.
+3. Approve, reject, or request a correction using the matching control.
+4. If corrected, resubmit the closed request with its exact resource and plan
+   references.
+5. Use Auto-process Reviews only for authoritative reviews already eligible for
+   deterministic reconciliation.
+6. Confirm the final review state and evidence in Audit.
+
+### Complete A Roadex Final Human Decision
+
+Use this only for a Roadex-originated decision that explicitly requires an
+independent human decision.
+
+1. Open Overview and locate the Roadex Final Human Decision card on Sisko's
+   page.
+2. Read the exact target and immutable digest, plain-language explanation,
+   impact, risks, safeguards, blockers, and rollback operations.
+3. Choose Approve and complete only when the exact action should run through
+   terminal verification. Confirm the digest in the final prompt.
+4. Choose Deny to close the exact decision without host execution; provide a
+   reason.
+5. Choose Request revision to return the exact plan for correction without host
+   execution; describe the required change.
+6. After approval, wait for the card to report executed, rolled back, or failed.
+   An acknowledgement or intermediate approved state is not completion.
+7. For a rolled-back or failed provisioning plan, inspect `failed_operation`
+   and `error_code` in the plan result. These fields contain only the immutable
+   operation name and a validated stable code; raw process output remains
+   intentionally unavailable.
+
 ## Admin: Sisko And O'Brien
 
 ### Approve A Pending Admin Request

@@ -29,6 +29,12 @@ EXPECTED_BACKUP_TOOL_SCHEMAS={
 }
 RUNTIME_EXCLUDED={".git",".venv",".codex",".agents","__pycache__",".pytest_cache","tests","docs"}
 
+class RedactedHostOperationError(RuntimeError):
+    """A stable diagnostic safe to persist outside the privileged adapter."""
+    def __init__(self,code:str)->None:
+        self.code=code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",code) else "PROCESS_FAILED"
+        super().__init__(f"allowlisted host operation failed ({self.code})")
+
 class ConcreteHostProvisioningAdapter:
     def __init__(self,plan:DonutHoleBackupProvisioningPlan,*,privileged_confirmation:str,runner:Callable[...,object]=subprocess.run,euid_provider:Callable[[],int]=os.geteuid,username_provider:Callable[[int],str]=lambda uid:pwd.getpwuid(uid).pw_name,mcp_tool_loader:Callable[[str],list[Mapping[str,object]]]|None=None)->None:
         uid=euid_provider()
@@ -52,7 +58,7 @@ class ConcreteHostProvisioningAdapter:
                 candidate=diagnostic.get("error",{}).get("code") if diagnostic.get("redactions_applied") is True else None
                 if isinstance(candidate,str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",candidate): code=candidate
             except Exception: pass
-            raise RuntimeError(f"allowlisted host operation failed ({code})")
+            raise RedactedHostOperationError(code)
         return result
     def _sudo(self,argv:list[str],*,user:str|None=None,acceptable=(0,)):
         prefix=["/usr/bin/sudo"]+(["-u",user] if user else [])+["--"]
@@ -190,4 +196,4 @@ def _unit(p):
     return "[Service]\nUser="+p["user"]+"\nExecStart="+" ".join(_sd_quote(value) for value in p["exec_start"])+"\nUMask="+p["umask"]+"\nPrivateTmp=yes\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nReadOnlyPaths="+" ".join(_sd_quote(value) for value in p["read_only_paths"])+"\nReadWritePaths="+" ".join(_sd_quote(value) for value in p["read_write_paths"])+"\nRestrictAddressFamilies="+" ".join(p["restrict_address_families"])+"\n[Install]\nWantedBy=multi-user.target\n"
 def _sd_quote(value): return '"'+str(value).replace("\\","\\\\").replace('"','\\"')+'"'
 
-__all__=["ConcreteHostProvisioningAdapter","EXPECTED_BACKUP_TOOL_SCHEMAS","PRIVILEGED_CONFIRMATION","RUNTIME_EXCLUDED","capability_digest","runtime_digest"]
+__all__=["ConcreteHostProvisioningAdapter","EXPECTED_BACKUP_TOOL_SCHEMAS","PRIVILEGED_CONFIRMATION","RUNTIME_EXCLUDED","RedactedHostOperationError","capability_digest","runtime_digest"]

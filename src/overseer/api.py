@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, stage_plan_api as stage_backup_provisioning_plan_api
+from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, decide_roadex_human_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, list_roadex_human_decisions, stage_plan_api as stage_backup_provisioning_plan_api
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
@@ -305,7 +305,7 @@ def _project_path_for_store(store_path: str) -> Path:
     return Path.cwd()
 
 
-def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None):
+def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None, roadex_decision_adapter_factory=None):
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
 
@@ -641,6 +641,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             if path == "/backup-provisioning/plans":
                 self._handle(lambda: list_backup_provisioning_plans(store_path))
                 return
+            if path == "/roadex/human-decisions":
+                self._handle(lambda: list_roadex_human_decisions(store_path))
+                return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
@@ -668,7 +671,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/")) and auth_context.get("auth_type") != "admin_token":
+            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path == "/roadex/human-decisions/decide") and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
                 return
             if path == "/backup-provisioning/stage":
@@ -679,6 +682,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if path == "/backup-provisioning/execute":
                 self._handle_json(lambda payload: execute_backup_provisioning_plan_api(store_path, payload, backup_provisioning_adapter_factory))
+                return
+            if path == "/roadex/human-decisions/decide":
+                self._handle_json(lambda payload: decide_roadex_human_plan_api(store_path, payload, roadex_decision_adapter_factory))
                 return
             if path == "/storage/authorizations/verify":
                 self._handle_json(lambda payload: verify_storage_authorization_status(store_path, payload))
@@ -1257,7 +1263,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
 def run_api_server(store_path: str, host: str = "127.0.0.1", port: int = 8766, auth_token: str | None = None) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
-    server = ThreadingHTTPServer((host, port), make_api_handler(store_path, auth_token))
+    from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
+    decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
+    server = ThreadingHTTPServer((host, port), make_api_handler(store_path, auth_token, roadex_decision_adapter_factory=decision_factory))
     try:
         server.serve_forever()
     finally:

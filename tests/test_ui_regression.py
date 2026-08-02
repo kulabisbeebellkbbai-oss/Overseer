@@ -12,15 +12,16 @@ from overseer.api import make_api_handler
 
 
 class LocalApiHarness:
-    def __init__(self, store_path: Path, auth_token: str = "test-secret") -> None:
+    def __init__(self, store_path: Path, auth_token: str = "test-secret", roadex_decision_adapter_factory=None) -> None:
         self.store_path = store_path
         self.auth_token = auth_token
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.url = ""
+        self.roadex_decision_adapter_factory = roadex_decision_adapter_factory
 
     def __enter__(self):
-        handler = make_api_handler(str(self.store_path), self.auth_token)
+        handler = make_api_handler(str(self.store_path), self.auth_token, roadex_decision_adapter_factory=self.roadex_decision_adapter_factory)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         host, port = self.server.server_address
         self.url = f"http://{host}:{port}"
@@ -184,6 +185,49 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         self.assertIn('body[data-layout-effective="desktop"] .shell', OPERATOR_CONSOLE_HTML)
         self.assertIn('body[data-layout-effective="desktop"] main { padding-top: 60px; }', OPERATOR_CONSOLE_HTML)
         self.assertIn('#driver .action-btn { min-height: 44px; }', OPERATOR_CONSOLE_HTML)
+
+    def test_sisko_page_has_roadex_final_human_decision_card(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('roadexHumanDecisions: "/roadex/human-decisions"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Roadex final human decision", OPERATOR_CONSOLE_HTML)
+        self.assertIn("What approval does", OPERATOR_CONSOLE_HTML)
+        self.assertIn("Risks and safeguards", OPERATOR_CONSOLE_HTML)
+        self.assertIn('data-action="decide-roadex-human"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('action("approve", "Approve and complete")', OPERATOR_CONSOLE_HTML)
+        self.assertIn('action("deny", "Deny", "deny")', OPERATOR_CONSOLE_HTML)
+        self.assertIn('action("request_revision", "Request revision", "revision")', OPERATOR_CONSOLE_HTML)
+        self.assertIn('postJson("/roadex/human-decisions/decide"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("Approve and complete", OPERATOR_CONSOLE_HTML)
+        self.assertIn("min-height: 44px", OPERATOR_CONSOLE_HTML)
+
+    def test_roadex_human_decision_route_requires_admin_auth_and_records_denial(self):
+        from overseer.backup_provisioning import stage_plan
+        from tests.test_backup_provisioning import seeded
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path, plan = seeded(Path(directory))
+            stage_plan(store_path, plan)
+            with LocalApiHarness(Path(store_path)) as server:
+                queue = server.get_json("/Overseer/roadex/human-decisions")
+                with self.assertRaises(HTTPError) as error:
+                    server.post_json("/Overseer/roadex/human-decisions/decide", {
+                        "plan_id": plan.plan_id,
+                        "decision": "deny",
+                        "decided_by": "human-user",
+                        "reason": "Revise the recovery boundary",
+                    }, authenticated=False)
+                denied = server.post_json("/Overseer/roadex/human-decisions/decide", {
+                    "plan_id": plan.plan_id,
+                    "decision": "deny",
+                    "decided_by": "human-user",
+                    "reason": "Revise the recovery boundary",
+                })
+
+        self.assertEqual(error.exception.code, 401)
+        self.assertEqual(queue["pending_count"], 1)
+        self.assertEqual(denied["action_status"], "denied")
+        self.assertFalse(denied["host_mutation_performed"])
 
     def test_operator_console_places_skiller_cards_on_health_and_knowledge_pages(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML

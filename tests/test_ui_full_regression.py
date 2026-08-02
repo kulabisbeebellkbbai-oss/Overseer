@@ -23,7 +23,7 @@ EXPECTED_VIEWS = {
     },
     "overview": {
         "title": "Strategic Operations",
-        "actions": {"dispatch-crew-messages", "send-crew-message"},
+        "actions": {"dispatch-crew-messages", "send-crew-message", "decide-roadex-human"},
         "officers": {"Sisko", "Kira", "O'Brien", "Odo", "Quark", "Dax", "Julian"},
     },
     "admin": {
@@ -198,6 +198,7 @@ ACTION_ROUTES = {
     "discover-user-services": ("POST", "/services/discover-user"),
     "dispatch-crew-messages": ("POST", "/crew/dispatch"),
     "decide-crew-message": ("POST", "/crew/messages/decide"),
+    "decide-roadex-human": ("POST", "/roadex/human-decisions/decide"),
     "resubmit-crew-message": ("POST", "/crew/messages/resubmit"),
     "reconcile-crew-reviews": ("POST", "/crew/reconcile"),
     "dispatch-ids-review-package": ("POST", "/host/security/ids-review-packages/dispatch"),

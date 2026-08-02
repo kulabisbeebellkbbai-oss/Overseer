@@ -48,6 +48,8 @@ OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 class ProvisioningStatus(StrEnum):
     STAGED = "staged"
     APPROVED = "approved"
+    DENIED = "denied"
+    REVISION_REQUESTED = "revision_requested"
     EXECUTED = "executed"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
@@ -97,6 +99,12 @@ class DonutHoleBackupProvisioningPlan:
     approved_at: str | None = None
     executed_at: str | None = None
     evidence_digest: str | None = None
+    failed_operation: str | None = None
+    error_code: str | None = None
+    decision_source: str = "Roadex"
+    decision_reason: str | None = None
+    decided_by: str | None = None
+    decided_at: str | None = None
 
 
 class ProvisioningAdapter(Protocol):
@@ -241,6 +249,100 @@ def list_plans(store_path: str) -> Mapping[str, object]:
     return {"ok": True, "items": [_public(plan, mutation=False) for plan in plans], "mutation_performed": False, "host_mutation_performed": False}
 
 
+def list_roadex_human_decisions(store_path: str) -> Mapping[str, object]:
+    """Return final human decisions originating in the Roadex workflow."""
+    with SQLiteStore(store_path) as store:
+        _initialize(store)
+        plans = [_load(str(row["payload"])) for row in store._connection.execute("SELECT payload FROM backup_provisioning_plans ORDER BY id DESC")]
+        items = []
+        seen_kinds: set[str] = set()
+        for plan in plans:
+            if plan.kind in seen_kinds:
+                continue
+            seen_kinds.add(plan.kind)
+            if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
+                continue
+            failures: list[str] = []
+            try:
+                _require_terminal_evidence(store, plan)
+            except (KeyError, ValueError) as exc:
+                failures.append(str(exc))
+            items.append({
+                "id": f"roadex-human-decision.{plan.plan_id}",
+                "source": "Roadex",
+                "owner": "Sisko",
+                "human_approval_required": True,
+                "plan_id": plan.plan_id,
+                "plan_digest": plan.plan_digest,
+                "kind": plan.kind,
+                "title": "Provision the DonutHole encrypted backup service",
+                "decision": "Approve or reject the exact immutable TheUnderdark provisioning plan for DonutHole.",
+                "explanation": "Approval installs a sandboxed system service, registers only the authorized DonutHole backup root, creates private encryption material, and verifies the service and restore policy before reporting completion.",
+                "impact": [
+                    f"Install the verified runtime under {ADAPTER_SOURCE_PATH} into /opt/theunderdark.",
+                    f"Create locked service identity {SYSTEM_USER} with read-only source access.",
+                    f"Store encrypted artifacts under {BACKUP_PATH} and listen only on {LISTEN_HOST}:{LISTEN_PORT}.",
+                    "Replace the user service with the sandboxed system service after readiness checks.",
+                ],
+                "risks": [
+                    "TheUnderdark may be briefly unavailable during service migration.",
+                    "Privileged files, an ACL, credentials, and a system service are created.",
+                    "Any failed verification triggers the declared dependency-safe rollback.",
+                ],
+                "rollback": [step.operation for step in plan.rollback_steps],
+                "status": plan.status.value,
+                "ready": not failures,
+                "blockers": failures,
+                "decision_reason": plan.decision_reason,
+                "decided_by": plan.decided_by or plan.approved_by,
+                "decided_at": plan.decided_at or plan.approved_at,
+                "evidence_digest": plan.evidence_digest,
+            })
+    return {"ok": True, "source": "Roadex", "items": items, "pending_count": sum(item["human_approval_required"] for item in items), "mutation_performed": False, "host_mutation_performed": False}
+
+
+def decide_roadex_human_plan(
+    store_path: str,
+    plan_id: str,
+    decision: str,
+    decided_by: str,
+    reason: str,
+    adapter_factory: Callable[[DonutHoleBackupProvisioningPlan], ProvisioningAdapter] | None = None,
+) -> Mapping[str, object]:
+    if decision not in {"approve", "deny", "request_revision"}:
+        raise ValueError("decision must be approve, deny, or request_revision")
+    if not decided_by.strip():
+        raise ValueError("independent human identity is required")
+    if decision in {"deny", "request_revision"} and not reason.strip():
+        raise ValueError("a reason is required for denial or revision")
+    with SQLiteStore(store_path) as store:
+        plan = _stored(store, plan_id)
+        if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
+            raise ValueError("an exact staged Roadex human decision is required")
+        _require_terminal_evidence(store, plan)
+        if decision != "approve":
+            status = ProvisioningStatus.DENIED if decision == "deny" else ProvisioningStatus.REVISION_REQUESTED
+            decided = replace(plan, status=status, decision_reason=reason.strip(), decided_by=decided_by.strip(), decided_at=datetime.now(UTC).isoformat())
+            store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(decided), plan_id)); store._commit()
+            return {"ok": True, "decision": decision, "action_status": status.value, "plan": _public(decided, mutation=True), "mutation_performed": True, "host_mutation_performed": False}
+    if adapter_factory is None:
+        raise ValueError("privileged host adapter is not configured")
+    adapter = adapter_factory(plan)
+    approved = approve_plan(store_path, plan_id, decided_by.strip())
+    try:
+        executed = execute_plan(store_path, plan_id, adapter)
+        return {"ok": True, "decision": decision, "action_status": executed["status"], "plan": executed, "approval": approved, "mutation_performed": True, "host_mutation_performed": True}
+    except Exception as exc:
+        current = next(item for item in list_plans(store_path)["items"] if item["plan_id"] == plan_id)
+        return {"ok": False, "decision": decision, "action_status": current["status"], "plan": current, "error": type(exc).__name__, "mutation_performed": True, "host_mutation_performed": current["status"] in {"failed", "rolled_back"}}
+
+
+def decide_roadex_human_plan_api(store_path: str, payload: Mapping[str, object], adapter_factory=None) -> Mapping[str, object]:
+    if set(payload) != {"plan_id", "decision", "decided_by", "reason"}:
+        raise ValueError("exact Roadex human decision fields are required")
+    return decide_roadex_human_plan(store_path, str(payload["plan_id"]), str(payload["decision"]), str(payload["decided_by"]), str(payload["reason"]), adapter_factory)
+
+
 def approve_plan(store_path: str, plan_id: str, approved_by: str, approved_at: str | None = None) -> Mapping[str, object]:
     now = approved_at or datetime.now(UTC).isoformat(); _time(now)
     with SQLiteStore(store_path) as store:
@@ -265,11 +367,20 @@ def execute_plan(store_path: str, plan_id: str, adapter: ProvisioningAdapter | N
         if plan.status != ProvisioningStatus.APPROVED or not plan.approved_by or not plan.approved_at:
             raise ValueError("the exact provisioning plan requires independent human approval")
         evidence = []
+        failed_operation = None
+        error_code = None
         try:
             for expected in plan.steps:
-                result = adapter.execute(expected)
+                try:
+                    result = adapter.execute(expected)
+                except Exception as exc:
+                    failed_operation = expected.operation
+                    error_code = _redacted_error_code(exc)
+                    raise
                 evidence.append({"operation": expected.operation, "ok": result.get("ok") is True})
                 if result.get("ok") is not True:
+                    failed_operation = expected.operation
+                    error_code = "OPERATION_REPORTED_FAILURE"
                     raise ValueError("provisioning step failed")
         except Exception:
             rollback_evidence = []
@@ -284,7 +395,7 @@ def execute_plan(store_path: str, plan_id: str, adapter: ProvisioningAdapter | N
                     rollback_evidence.append({"operation": rollback.operation, "ok": False})
             rolled_back = all(item["ok"] for item in rollback_evidence)
             digest = "sha256:" + hashlib.sha256(json.dumps({"execute": evidence, "rollback": rollback_evidence}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            failed = replace(plan, status=ProvisioningStatus.ROLLED_BACK if rolled_back else ProvisioningStatus.FAILED, executed_at=now, evidence_digest=digest)
+            failed = replace(plan, status=ProvisioningStatus.ROLLED_BACK if rolled_back else ProvisioningStatus.FAILED, executed_at=now, evidence_digest=digest, failed_operation=failed_operation, error_code=error_code)
             store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(failed), plan_id)); store._commit()
             raise
         evidence_digest = "sha256:" + hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -359,7 +470,7 @@ def _validate_plan(plan: DonutHoleBackupProvisioningPlan) -> None:
 
 
 def _plan_digest(plan: DonutHoleBackupProvisioningPlan) -> str:
-    payload = asdict(plan); payload.pop("plan_digest"); payload.pop("status"); payload.pop("approved_by"); payload.pop("approved_at"); payload.pop("executed_at"); payload.pop("evidence_digest")
+    payload = asdict(plan); payload.pop("plan_digest"); payload.pop("status"); payload.pop("approved_by"); payload.pop("approved_at"); payload.pop("executed_at"); payload.pop("evidence_digest"); payload.pop("failed_operation"); payload.pop("error_code"); payload.pop("decision_source"); payload.pop("decision_reason"); payload.pop("decided_by"); payload.pop("decided_at")
     return "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -385,12 +496,17 @@ def _dump(plan: DonutHoleBackupProvisioningPlan) -> str:
 
 
 def _load(payload: str) -> DonutHoleBackupProvisioningPlan:
-    data = json.loads(payload); data["status"] = ProvisioningStatus(data["status"]); data["steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["steps"]); data["rollback_steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["rollback_steps"]); data["read_only_paths"] = tuple(data["read_only_paths"]); data["read_write_paths"] = tuple(data["read_write_paths"])
+    data = json.loads(payload); data.setdefault("failed_operation", None); data.setdefault("error_code", None); data["status"] = ProvisioningStatus(data["status"]); data["steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["steps"]); data["rollback_steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["rollback_steps"]); data["read_only_paths"] = tuple(data["read_only_paths"]); data["read_write_paths"] = tuple(data["read_write_paths"])
     return DonutHoleBackupProvisioningPlan(**data)
 
 
 def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutation: bool = False) -> Mapping[str, object]:
-    return {"ok": True, "plan_id": plan.plan_id, "kind": plan.kind, "plan_digest": plan.plan_digest, "status": plan.status.value, "approval_required": plan.status == ProvisioningStatus.STAGED, "approved_by": plan.approved_by, "evidence_ids": dict(plan.evidence_ids), "evidence_digest": plan.evidence_digest, "rollback_operations": [step.operation for step in plan.rollback_steps], "redactions_applied": True, "mutation_performed": mutation, "host_mutation_performed": host_mutation}
+    return {"ok": True, "plan_id": plan.plan_id, "kind": plan.kind, "plan_digest": plan.plan_digest, "status": plan.status.value, "approval_required": plan.status == ProvisioningStatus.STAGED, "approved_by": plan.approved_by, "evidence_ids": dict(plan.evidence_ids), "evidence_digest": plan.evidence_digest, "failed_operation": plan.failed_operation, "error_code": plan.error_code, "rollback_operations": [step.operation for step in plan.rollback_steps], "redactions_applied": True, "mutation_performed": mutation, "host_mutation_performed": host_mutation}
+
+
+def _redacted_error_code(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "OPERATION_FAILED"
 
 
 def _digest(value: object) -> bool:

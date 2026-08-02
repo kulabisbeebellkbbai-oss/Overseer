@@ -13,6 +13,8 @@ from overseer.api import make_api_handler
 from overseer.admin import plan_user_service_restart
 from overseer.roadex_approval_status import RoadexApprovalBindingDraft, stage_bound_roadex_approval
 from overseer.store import SQLiteStore
+from tests.test_backup_provisioning import seeded
+from tests.test_roadex_approval_status import _write_roadex_plan
 
 
 class LocalApiHarness:
@@ -500,6 +502,138 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
             post_get_dump = database_dump_bytes(store_path)
             self.assertEqual(pre_get_dump, post_get_dump)
 
+    def test_roadex_approval_status_route_rejects_malformed_roadex_source_payload_without_connection_abort(self):
+        def mutate_source_payload(variant: str, payload: dict[str, object]) -> str:
+            if variant == "missing_field":
+                payload.pop("decision_reason")
+            else:
+                payload["evidence_ids"] = []
+            return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+        for variant in ("missing_field", "bad_evidence_ids"):
+            with tempfile.TemporaryDirectory() as directory:
+                store_path, source = seeded(Path(directory) / "source")
+                draft = RoadexApprovalBindingDraft(
+                    approval_ref="admin.roadex.human",
+                    source_kind="roadex-human-decision",
+                    source_id=source.plan_id,
+                    project_id="project.test",
+                    workspace_id="workspace.test",
+                    resource_ref="service.test",
+                    authority_class="privileged-operation",
+                    subject="Restart test service",
+                )
+                with SQLiteStore(store_path) as store:
+                    _write_roadex_plan(store, source)
+                    stage_bound_roadex_approval(
+                        store,
+                        draft,
+                        lambda: None,
+                    )
+                    source_payload = json.loads(
+                        store._connection.execute(
+                            "SELECT payload FROM backup_provisioning_plans WHERE id=?",
+                            (source.plan_id,),
+                        ).fetchone()["payload"]
+                    )
+                    updated_source = mutate_source_payload(variant, source_payload)
+                    store._connection.execute(
+                        "UPDATE backup_provisioning_plans SET payload=? WHERE id=?",
+                        (updated_source, source.plan_id),
+                    )
+                    store._connection.commit()
+
+                with LocalApiHarness(store_path) as server:
+                    request = Request(
+                        f"{server.url}/Overseer/roadex/approval-status?approval_ref={draft.approval_ref}"
+                    )
+                    request.add_header("Authorization", f"Bearer {server.auth_token}")
+                    with self.assertRaises(HTTPError) as malformed:
+                        urlopen(request, timeout=5)
+                    body = malformed.exception.read().decode("utf-8")
+
+                parsed = json.loads(body)
+                self.assertEqual(malformed.exception.code, 400)
+                self.assertEqual(parsed["error"], "malformed_source")
+                self.assertEqual(parsed["code"], "ROAD_EX_APPROVAL_SOURCE_MALFORMED")
+
+    def test_roadex_approval_status_route_rejects_malformed_binding_created_at_for_terminal_statuses(self):
+        for status in (
+            "approved",
+            "executed",
+            "failed",
+            "rolled_back",
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                store_path, source = seeded(Path(directory) / "source")
+                malformed = "NOT_A_TIMESTAMP_SECRET"
+                draft = RoadexApprovalBindingDraft(
+                    approval_ref=f"admin.roadex.{status}",
+                    source_kind="roadex-human-decision",
+                    source_id=source.plan_id,
+                    project_id="project.test",
+                    workspace_id="workspace.test",
+                    resource_ref="service.test",
+                    authority_class="privileged-operation",
+                    subject="Restart test service",
+                )
+                with SQLiteStore(store_path) as store:
+                    _write_roadex_plan(store, source)
+                    stage_bound_roadex_approval(
+                        store,
+                        draft,
+                        lambda: None,
+                    )
+                    source_payload = json.loads(
+                        store._connection.execute(
+                            "SELECT payload FROM backup_provisioning_plans WHERE id=?",
+                            (source.plan_id,),
+                        ).fetchone()["payload"]
+                    )
+                    source_payload["status"] = status
+                    source_payload["approved_by"] = "human-user"
+                    source_payload["approved_at"] = "2026-08-02T00:00:00+00:00"
+                    source_payload["executed_at"] = "2026-08-02T00:01:00+00:00"
+                    source_payload["evidence_digest"] = "sha256:" + "3" * 64
+                    source_payload["failed_operation"] = "step.backup"
+                    source_payload["error_code"] = "ROAD_EX_ERROR"
+                    store._connection.execute(
+                        "UPDATE backup_provisioning_plans SET payload=? WHERE id=?",
+                        (
+                            json.dumps(source_payload, sort_keys=True, separators=(",", ":")),
+                            source.plan_id,
+                        ),
+                    )
+                    store._connection.commit()
+                    binding_payload = json.loads(
+                        store._connection.execute(
+                            "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+                            (draft.approval_ref,),
+                        ).fetchone()["payload"]
+                    )
+                    binding_payload["created_at"] = malformed
+                    store._connection.execute(
+                        "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+                        (
+                            json.dumps(binding_payload, sort_keys=True, separators=(",", ":")),
+                            draft.approval_ref,
+                        ),
+                    )
+                    store._connection.commit()
+
+                with LocalApiHarness(store_path) as server:
+                    request = Request(
+                        f"{server.url}/Overseer/roadex/approval-status?approval_ref={draft.approval_ref}"
+                    )
+                    request.add_header("Authorization", f"Bearer {server.auth_token}")
+                    with self.assertRaises(HTTPError) as malformed:
+                        urlopen(request, timeout=5)
+                    body = malformed.exception.read().decode("utf-8")
+
+                parsed = json.loads(body)
+                self.assertEqual(malformed.exception.code, 400)
+                self.assertEqual(parsed["error"], "malformed_source")
+                self.assertEqual(parsed["code"], "ROAD_EX_APPROVAL_SOURCE_MALFORMED")
     def test_roadex_approval_status_route_does_not_return_malformed_source_secret(self):
         secret = "ROADEX_SOURCE_SECRET_ABC123"
         with tempfile.TemporaryDirectory() as directory:

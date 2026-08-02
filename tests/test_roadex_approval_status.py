@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from overseer.admin import approve_admin_change_plan, cancel_admin_change_plan, plan_user_service_restart
+from overseer.admin import archive_admin_change_plan, approve_admin_change_plan, cancel_admin_change_plan, plan_user_service_restart
 from overseer.backup_provisioning import (
     DedicatedProvisioningAdapter,
     ProvisioningStatus,
@@ -46,6 +46,17 @@ def _draft_for(approval_ref: str, source_kind: str = "admin-plan", source_id: st
 
 def _roadex_payload(plan) -> str:
     return json.dumps(to_jsonable(plan), sort_keys=True, separators=(",", ":"))
+
+
+def _admin_source_payload(store_path: str, plan_id: str) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        payload = store._connection.execute(
+            "SELECT payload FROM admin_change_plans WHERE id=?",
+            (plan_id,),
+        ).fetchone()
+    if payload is None:
+        raise KeyError(plan_id)
+    return json.loads(str(payload["payload"]))
 
 
 def _binding_for_validation(ref: str) -> RoadexApprovalBinding:
@@ -127,6 +138,17 @@ def _roadex_plan_payload(store: SQLiteStore, plan_id: str) -> dict[str, object]:
     if row is None:
         raise KeyError(plan_id)
     return json.loads(str(row["payload"]))
+
+
+def _roadex_source_payload(store_path: str, plan_id: str) -> dict[str, object]:
+    with SQLiteStore(store_path) as store:
+        payload = store._connection.execute(
+            "SELECT payload FROM backup_provisioning_plans WHERE id=?",
+            (plan_id,),
+        ).fetchone()
+    if payload is None:
+        raise KeyError(plan_id)
+    return json.loads(str(payload["payload"]))
 
 
 def _roadex_adapter_for_plan(
@@ -664,6 +686,181 @@ def test_load_roadex_approval_binding_rejects_malformed_payload_variants(tmp_pat
             store.load_roadex_approval_binding(draft.approval_ref)
 
 
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (lambda payload: payload.__delitem__("decision_reason"), "missing fields"),
+        (lambda payload: payload.__setitem__("evidence_ids", []), "must be an object"),
+    ),
+)
+def test_roadex_human_source_projection_rejects_malformed_exact_payload(tmp_path, mutator, expected):
+    path, source = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=source.plan_id,
+    )
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, source)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, source),
+        )
+        payload = _roadex_plan_payload(store, source.plan_id)
+        mutator(payload)
+        store._connection.execute(
+            "UPDATE backup_provisioning_plans SET payload=? WHERE id=?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), source.plan_id),
+        )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match=expected):
+        roadex_approval_status(path, draft.approval_ref)
+
+
+def _mutate_nested_payload_with_extra_field(payload: dict[str, object]) -> None:
+    payload["steps"][0]["unexpected_field"] = "nested-secret"
+
+
+def _mutate_nested_payload_missing_field(payload: dict[str, object]) -> None:
+    payload["steps"][0].pop("arguments")
+
+
+def _mutate_nested_payload_bad_type(payload: dict[str, object]) -> None:
+    payload["steps"][0]["arguments"] = "nested-secret"
+
+
+def _mutate_nested_payload_wrong_container(payload: dict[str, object]) -> None:
+    payload["steps"] = {"malformed": "value"}
+
+
+def _mutate_admin_nested_payload_missing_field(payload: dict[str, object]) -> None:
+    payload["steps"][0].pop("command")
+
+
+def _mutate_admin_nested_payload_bad_type(payload: dict[str, object]) -> None:
+    payload["steps"][0]["command"] = 42
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (_mutate_nested_payload_with_extra_field, "extra fields"),
+        (_mutate_nested_payload_missing_field, "missing fields"),
+        (_mutate_nested_payload_bad_type, "must be an object"),
+        (_mutate_nested_payload_wrong_container, "must be a list"),
+    ),
+)
+def test_roadex_human_source_projection_rejects_nested_payload_variants(tmp_path, mutator, expected):
+    path, source = seeded(tmp_path / "backups")
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, source)
+        draft = _draft_for(
+            "admin.roadex.human",
+            source_kind="roadex-human-decision",
+            source_id=source.plan_id,
+        )
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, source),
+        )
+        payload = _roadex_source_payload(path, source.plan_id)
+        mutator(payload)
+        store._connection.execute(
+            "INSERT OR REPLACE INTO backup_provisioning_plans (id, payload) VALUES (?, ?)",
+            (source.plan_id, _roadex_payload(payload)),
+        )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match=expected):
+        roadex_approval_status(path, draft.approval_ref)
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    (
+        (_mutate_nested_payload_with_extra_field, "extra fields"),
+        (_mutate_admin_nested_payload_missing_field, "missing fields"),
+        (_mutate_admin_nested_payload_bad_type, "command must be a list"),
+        (_mutate_nested_payload_wrong_container, "must be a list"),
+    ),
+)
+def test_admin_source_projection_rejects_nested_payload_variants(tmp_path, mutator, expected):
+    with SQLiteStore(tmp_path / "state.sqlite3") as store:
+        source = plan_user_service_restart(
+            "admin.roadex.nested",
+            "roadex-test.service",
+            "Nested payload variant fixture",
+        )
+        draft = _draft_for("admin.roadex.nested")
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(source),
+        )
+        payload = _admin_source_payload(str(store.path), source.id)
+        mutator(payload)
+        store._connection.execute(
+            "INSERT OR REPLACE INTO admin_change_plans (id, payload) VALUES (?, ?)",
+            (source.id, _roadex_payload(payload)),
+        )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match=expected):
+        roadex_approval_status(str(store.path), draft.approval_ref)
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        ProvisioningStatus.APPROVED,
+        ProvisioningStatus.EXECUTED,
+        ProvisioningStatus.FAILED,
+        ProvisioningStatus.ROLLED_BACK,
+    ),
+)
+def test_roadex_human_projection_rejects_malformed_binding_created_at_in_terminal_status(
+    tmp_path,
+    status,
+):
+    path, source = seeded(tmp_path / "backups")
+    malformed_created_at = "NOT_A_TIMESTAMP_SECRET"
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, source)
+        draft = _draft_for(
+            "admin.roadex.human",
+            source_kind="roadex-human-decision",
+            source_id=source.plan_id,
+        )
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, source),
+        )
+        projected = _roadex_plan_with_status(source, status, datetime.now(UTC).isoformat())
+        _write_roadex_plan(store, projected)
+        payload = json.loads(
+            store._connection.execute(
+                "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["payload"]
+        )
+        payload["created_at"] = malformed_created_at
+        store._connection.execute(
+            "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                draft.approval_ref,
+            ),
+        )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match="created_at"):
+        roadex_approval_status(path, draft.approval_ref)
+
+
 def test_source_save_exception_rolls_back_binding(tmp_path):
     with SQLiteStore(tmp_path / "state.sqlite3") as store:
         draft = _draft_for("admin.roadex.test")
@@ -767,7 +964,9 @@ def test_binding_created_at_is_immutable(tmp_path):
         )
         original = store.load_roadex_approval_binding(draft.approval_ref)
         with pytest.raises(ValueError, match="immutable"):
-            store.save_roadex_approval_binding(replace(original, created_at="2000-01-01T00:00:00"))
+            store.save_roadex_approval_binding(
+                replace(original, created_at="2000-01-01T00:00:00+00:00")
+            )
 
 
 @pytest.mark.parametrize(

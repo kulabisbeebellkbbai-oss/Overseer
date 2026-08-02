@@ -318,7 +318,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             route = urlsplit(self.path)
             raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
-            query = parse_qs(route.query)
+            query = parse_qs(route.query, keep_blank_values=True)
             if path == "/health":
                 self._write_json({"ok": True, "service": "overseer-api"})
                 return
@@ -1192,7 +1192,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     )
                 else:
                     self._write_json({"error": f"missing record: {error.args[0]}"}, HTTPStatus.NOT_FOUND)
-            except (TypeError, JSONDecodeError, ValueError, EOFError) as error:
+            except (TypeError, JSONDecodeError, ValueError, EOFError, AttributeError) as error:
                 if redact_projection_errors:
                     self._write_json(
                         {

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -44,7 +45,14 @@ class ConcreteHostProvisioningAdapter:
     def _run(self,argv:list[str],*,acceptable=(0,))->object:
         if not argv or any(not isinstance(value,str) or "\x00" in value for value in argv): raise ValueError("invalid process argument vector")
         result=self._run_process(argv,shell=False,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
-        if getattr(result,"returncode",1) not in acceptable: raise RuntimeError("allowlisted host operation failed")
+        if getattr(result,"returncode",1) not in acceptable:
+            code="PROCESS_FAILED"
+            try:
+                diagnostic=json.loads(getattr(result,"stderr",b"").decode())
+                candidate=diagnostic.get("error",{}).get("code") if diagnostic.get("redactions_applied") is True else None
+                if isinstance(candidate,str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",candidate): code=candidate
+            except Exception: pass
+            raise RuntimeError(f"allowlisted host operation failed ({code})")
         return result
     def _sudo(self,argv:list[str],*,user:str|None=None,acceptable=(0,)):
         prefix=["/usr/bin/sudo"]+(["-u",user] if user else [])+["--"]

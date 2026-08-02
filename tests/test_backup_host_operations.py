@@ -7,7 +7,7 @@ from overseer.backup_host_operations import ConcreteHostProvisioningAdapter,EXPE
 from overseer.backup_provisioning import ProvisioningStep
 
 class Result:
-    def __init__(self,returncode=0,stdout=b""): self.returncode=returncode; self.stdout=stdout; self.stderr=b"private diagnostic"
+    def __init__(self,returncode=0,stdout=b"",stderr=b"private diagnostic"): self.returncode=returncode; self.stdout=stdout; self.stderr=stderr
 
 def adapter(steps,runner,**kwargs):
     commit="a"*40
@@ -26,6 +26,17 @@ def test_exact_plan_step_uses_argv_without_shell_and_redacts_process_output():
     assert calls==[(["/usr/bin/git","-C","/approved/source","rev-parse","HEAD"],{"shell":False,"stdin":-3,"stdout":-1,"stderr":-1,"check":False})]
     assert result=={"ok":True,"operation":"verify_published_adapter_source","changed":False,"redactions_applied":True}
     assert "private diagnostic" not in repr(result)
+
+def test_failed_process_exposes_only_validated_redacted_error_code():
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    safe=json.dumps({"ok":False,"error":{"code":"PRIVATE_STATE_INVALID"},"redactions_applied":True}).encode()
+    with pytest.raises(RuntimeError,match=r"PRIVATE_STATE_INVALID") as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=2,stdout=b"",stderr=safe)).execute(step)
+    assert "private diagnostic" not in str(failure.value)
+
+    with pytest.raises(RuntimeError,match=r"PROCESS_FAILED") as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=2,stdout=b"",stderr=b'{"error":{"code":"TOKEN_LEAK"}}')).execute(step)
+    assert "TOKEN_LEAK" not in str(failure.value)
 
 def test_changed_arguments_and_unknown_operations_are_denied_before_runner():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"}); calls=[]; host=adapter([step],lambda *args,**kwargs:calls.append(args) or Result())

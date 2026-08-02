@@ -252,7 +252,7 @@ def test_registration_runs_as_config_owner_and_codex_step_is_read_only():
     def runner(argv,**kwargs): calls.append(argv); return Result(stdout=json.dumps({"transport":{"url":"http://127.0.0.1:8799/mcp"}}).encode())
     host=adapter([register,verify],runner); host.execute(register); result=host.execute(verify)
     assert calls[0][:5]==["/usr/bin/sudo","-u","donuthole-backup","--","/opt/theunderdark/.venv/bin/theunderdark-production"]
-    assert calls[1][:5]==["/home/god/.local/bin/codex","mcp","get","TheUnderdark","--json"] and result["changed"] is False
+    assert calls[1][:5]==["/home/god/.local/bin/codex","mcp","get","theunderdark","--json"] and result["changed"] is False
 
 def test_token_copy_rejects_symlink_and_permissive_source(tmp_path):
     destination=tmp_path/"destination"; source=tmp_path/"token"; source.write_text("token"); source.chmod(0o644)

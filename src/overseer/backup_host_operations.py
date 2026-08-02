@@ -136,7 +136,7 @@ class ConcreteHostProvisioningAdapter:
         if normalized!=expected or capability_digest(self.plan.adapter_commit,normalized)!=a["capability_digest"]: raise RuntimeError("MCP capability verification failed")
         return False
     def _verify_codex_url(self,a):
-        result=self._run(["/home/god/.local/bin/codex","mcp","get","TheUnderdark","--json"])
+        result=self._run(["/home/god/.local/bin/codex","mcp","get","theunderdark","--json"])
         try: value=json.loads(getattr(result,"stdout",b"").decode())
         except Exception as exc: raise RuntimeError("Codex MCP configuration is unreadable") from exc
         configured=value.get("transport",{}).get("url") or value.get("url")

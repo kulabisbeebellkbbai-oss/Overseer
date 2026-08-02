@@ -2124,6 +2124,10 @@ class SQLiteStore:
         record=_load_dataclass(StorageRootAuthorizationRecord,self._get_payload("storage_root_authorizations",authorization_ref)); revoked=self._connection.execute("SELECT revoked_at FROM storage_authorization_revocations WHERE authorization_ref=?",(authorization_ref,)).fetchone() if self._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_authorization_revocations'").fetchone() else None
         return replace(record,revoked_at=str(revoked["revoked_at"])) if revoked else record
 
+    def list_storage_root_authorizations(self) -> tuple[StorageRootAuthorizationRecord, ...]:
+        identifiers = [str(row["id"]) for row in self._connection.execute("SELECT id FROM storage_root_authorizations ORDER BY id")]
+        return tuple(self.load_storage_root_authorization(identifier) for identifier in identifiers)
+
     def save_storage_dispatch_record(self, record: StorageDispatchRecord) -> None:
         self._connection.execute("INSERT OR REPLACE INTO storage_dispatch_records (id, request_id, status, payload) VALUES (?, ?, ?, ?)", (record.id, record.request_id, record.status, _dump(record)))
         self._commit()

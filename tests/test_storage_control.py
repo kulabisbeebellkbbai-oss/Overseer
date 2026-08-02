@@ -3,7 +3,7 @@ from dataclasses import replace
 import json
 import sqlite3
 from overseer.audit import ApprovalStatus
-from overseer.storage_control import stage_authorization,list_authorizations,materialize_authorization,revoke_authorization
+from overseer.storage_control import resolve_current_root_authorization, stage_authorization,list_authorizations,materialize_authorization,revoke_authorization
 from overseer.storage_control import approve_authorization
 from overseer.store import SQLiteStore
 from tests.test_storage_adapter import request, claim
@@ -28,6 +28,38 @@ def test_root_stage_approve_materialize_list_revoke(tmp_path):
     assert list_authorizations(str(path))["items"][0]["materialized"] is True
     crew(path,"crew.obrien.revoke","obrien",now); revoke_authorization(str(path),"root-auth","operator","crew.obrien.revoke",now.isoformat())
     with SQLiteStore(path) as store: assert store.load_storage_root_authorization("root-auth").revoked_at==now.isoformat()
+
+def test_current_root_authorization_resolves_newest_exact_approved_record(tmp_path):
+    path=tmp_path/"state.sqlite3"; now=datetime.now(UTC); identity="sha256:"+"1"*64; target="sha256:"+"2"*64
+    crew(path,"crew.kira.current-root","kira",now)
+    for index,ref in enumerate(("root-auth-old","root-auth-current")):
+        approved_at=now+timedelta(seconds=index)
+        payload={**root_payload(now),"authorization_ref":ref,"root_identity":identity,"target_digest":target,"expires_at":(now+timedelta(minutes=10)).isoformat()}
+        stage_authorization(str(path),"root",payload,"crew.kira.current-root","kira",now.isoformat())
+        approve_authorization(str(path),ref,"human",approved_at.isoformat())
+        materialize_authorization(str(path),ref,approved_at.isoformat())
+    result=resolve_current_root_authorization(str(path),"project","root","1",identity,"safe","active",1024,target,(now+timedelta(seconds=2)).isoformat())
+    assert result["authorization_ref"]=="root-auth-current"
+    assert result["host_mutation_performed"] is False
+
+def test_current_root_authorization_rejects_identity_without_exact_approval(tmp_path):
+    path=tmp_path/"state.sqlite3"; now=datetime.now(UTC); payload=root_payload(now); crew(path,"crew.kira.current-root","kira",now)
+    stage_authorization(str(path),"root",payload,"crew.kira.current-root","kira",now.isoformat())
+    approve_authorization(str(path),"root-auth","human",now.isoformat()); materialize_authorization(str(path),"root-auth",now.isoformat())
+    try: resolve_current_root_authorization(str(path),"project","root","1","sha256:"+"9"*64,"safe","active",1024,payload["target_digest"],now.isoformat())
+    except ValueError as error: assert "no current exact" in str(error)
+    else: raise AssertionError("mismatched root identity resolved")
+
+def test_current_root_authorization_api_returns_authoritative_reference(tmp_path):
+    path=tmp_path/"state.sqlite3"; now=datetime.now(UTC); payload=root_payload(now); crew(path,"crew.kira.current-root","kira",now)
+    stage_authorization(str(path),"root",payload,"crew.kira.current-root","kira",now.isoformat())
+    approve_authorization(str(path),"root-auth","human",now.isoformat()); materialize_authorization(str(path),"root-auth",now.isoformat())
+    request_payload={name:payload[name] for name in ("project_id","root_id","policy_revision","root_identity","alias","status","max_bytes","target_digest")}
+    with LocalAPI(path,auth_token="admin-token") as api:
+        response=api.post_json("/storage/control/root-authorizations/current",request_payload,authenticated=True)
+    assert response.status_code==200
+    assert response.json()["authorization_ref"]=="root-auth"
+    assert response.json()["mutation_performed"] is False
 
 def test_stage_is_immutable_and_materialize_requires_approval(tmp_path):
     path=tmp_path/"state.sqlite3"; now=datetime.now(UTC); payload=root_payload(now); crew(path,"crew.kira.review","kira",now); stage_authorization(str(path),"root",payload,"crew.kira.review","kira",now.isoformat())

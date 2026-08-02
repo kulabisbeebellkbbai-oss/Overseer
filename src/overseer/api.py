@@ -142,7 +142,7 @@ from .cli import (
 )
 from .agent_manager import AgentAuthorizationError, AgentManagerError
 from .storage_adapter import verify_storage_authorization_status, verify_storage_root_authorization_status
-from .storage_control import create_execution_request_api, list_authorizations, stage_authorization_api, approve_authorization_api, materialize_authorization_api, revoke_authorization_api
+from .storage_control import create_execution_request_api, list_authorizations, stage_authorization_api, approve_authorization_api, materialize_authorization_api, resolve_current_root_authorization_api, revoke_authorization_api
 from .agent_registry import AgentAdapterUnavailableError
 from .documents import (
     documents_config_status,
@@ -694,6 +694,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if path == "/storage/control/stage":
                 self._handle_json(lambda p: stage_authorization_api(store_path,p))
+                return
+            if path == "/storage/control/root-authorizations/current":
+                self._handle_json(lambda p: resolve_current_root_authorization_api(store_path,p))
                 return
             if path == "/storage/control/requests":
                 self._handle_json(lambda p: create_execution_request_api(store_path,p))

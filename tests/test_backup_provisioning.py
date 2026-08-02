@@ -1,13 +1,14 @@
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from overseer.backup_host_operations import RedactedHostOperationError
-from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, stage_plan
-from overseer.core import OwnerDomain, RiskLevel
+from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, stage_plan
+from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
+from overseer.storage_control import approve_authorization, current_root_identity, materialize_authorization, stage_authorization
 
 
 ROLES = {"kira": OwnerDomain.KIRA, "obrien": OwnerDomain.OBRIEN, "security": OwnerDomain.ODO_IDS, "sisko": OwnerDomain.SISKO}
@@ -30,6 +31,27 @@ def test_stage_is_immutable_and_binds_all_terminal_evidence(tmp_path):
     changed = build_plan(plan.plan_id, "sha256:" + "b" * 64, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
     with pytest.raises(ValueError, match="immutable"):
         stage_plan(path, changed)
+
+
+def test_kira_review_rejects_superseded_root_authorization(tmp_path):
+    store_path=str(tmp_path/"state.sqlite3"); root=tmp_path/"donuthole"; root.mkdir(); now=datetime.now(UTC)-timedelta(seconds=5); identity=current_root_identity(str(root)); target="sha256:"+"e"*64
+    evidence={role:f"crew.{role}.current-root-review" for role in ROLES}
+    with SQLiteStore(store_path) as store:
+        store.save_resource(Resource("storage.donuthole","DonutHole storage",ResourceType.VIRTUAL_ASSET,OwnerDomain.KIRA,RiskLevel.HIGH))
+        store.save_crew_message(CrewMessage("crew.kira.root-authorization",OwnerDomain.KIRA,"Root review","Approved root",RiskLevel.HIGH,CrewMessageStatus.ACKNOWLEDGED,review_status=CrewReviewStatus.APPROVED,decided_by="kira",decided_at=now.isoformat()))
+        for role,domain in ROLES.items():
+            store.save_crew_message(CrewMessage(evidence[role],domain,"Plan review","Pending",RiskLevel.HIGH,CrewMessageStatus.OPEN,related_plan_id="backup-provision.current-root-review"))
+    refs=[]
+    for index,ref in enumerate(("root-auth-old","root-auth-current")):
+        payload={"authorization_ref":ref,"action":"root.register","project_id":"project.donuthole","root_id":"backup-root","policy_revision":"1","root_identity":identity,"alias":"donuthole-source","status":"active","max_bytes":1073741824,"target_digest":target,"expires_at":(now+timedelta(minutes=10)).isoformat()}
+        stage_authorization(store_path,"root",payload,"crew.kira.root-authorization","kira",now.isoformat())
+        approved_at=(now+timedelta(seconds=index)).isoformat(); approve_authorization(store_path,ref,"human",approved_at); materialize_authorization(store_path,ref,approved_at); refs.append(ref)
+    registration={"project_id":"project.donuthole","root_id":"backup-root","policy_revision":"1","host_path":str(root),"alias":"donuthole-source","max_bytes":1073741824,"authorization_ref":refs[0]}
+    plan=build_plan("backup-provision.current-root-review","sha256:"+"a"*64,"b"*40,"sha256:"+"d"*64,"sha256:"+"c"*64,{target:refs[0]},(registration,),"/run/user/1000/overseer-api-token","/etc/codex-development-backups/keys/overseer.token","/etc/codex-development-backups/keys/cursor.key",evidence)
+    stage_plan(store_path,plan)
+    result=review_plan(store_path,plan.plan_id,"kira")
+    assert result["ok"] is False
+    assert any("current exact root authorization" in failure for failure in result["failures"])
 
 
 def test_roadex_human_decision_card_lists_only_exact_ready_plan(tmp_path):

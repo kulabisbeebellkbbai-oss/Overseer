@@ -1,6 +1,6 @@
 """Supported, approval-gated storage authorization lifecycle."""
 from __future__ import annotations
-import hashlib,json,re
+import hashlib,json,re,stat
 from dataclasses import dataclass,replace
 from datetime import UTC,datetime
 from typing import Mapping
@@ -43,6 +43,45 @@ def list_authorizations(store_path:str,kind:str|None=None)->Mapping[str,object]:
             stage=json.loads(row["payload"]); approval=store.load_approval(stage["approval_id"]); revoked=store._connection.execute("SELECT revoked_at,evidence_id FROM storage_authorization_revocations WHERE authorization_ref=?",(stage["authorization_ref"],)).fetchone()
             items.append({"stage_id":stage["stage_id"],"kind":stage["kind"],"authorization_ref":stage["authorization_ref"],"payload_digest":stage["payload_digest"],"approval_id":stage["approval_id"],"approval_status":approval.status.value,"crew_evidence_id":stage["crew_evidence_id"],"materialized":_materialized(store,stage),"revoked":bool(revoked)})
     return {"ok":True,"items":items,"mutation_performed":False,"host_mutation_performed":False}
+
+def current_root_identity(host_path:str)->str:
+    from pathlib import Path
+    supplied=Path(host_path)
+    if not supplied.is_absolute(): raise ValueError("root path must be absolute")
+    try:
+        raw=supplied.lstat()
+        if stat.S_ISLNK(raw.st_mode): raise ValueError("root path cannot be a symlink")
+        resolved=supplied.resolve(strict=True); info=resolved.stat(follow_symlinks=False)
+    except OSError as exc: raise ValueError("root path is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode): raise ValueError("root path must be a directory")
+    return "sha256:"+hashlib.sha256(f"{info.st_dev}:{info.st_ino}".encode()).hexdigest()
+
+def resolve_current_root_authorization(store_path:str,project_id:str,root_id:str,policy_revision:str,root_identity:str,alias:str,status:str,max_bytes:int,target_digest:str,resolved_at:str|None=None)->Mapping[str,object]:
+    if any(not isinstance(value,str) or not value for value in (project_id,root_id,policy_revision,root_identity,alias,status,target_digest)) or status!="active" or not isinstance(max_bytes,int) or isinstance(max_bytes,bool) or max_bytes<1 or not _digest(root_identity) or not _digest(target_digest):
+        raise ValueError("exact current root authorization fields are required")
+    now=_time(resolved_at or datetime.now(UTC).isoformat())
+    with SQLiteStore(store_path) as store:
+        candidates=[]
+        for record in store.list_storage_root_authorizations():
+            exact=(record.action,record.project_id,record.root_id,record.policy_revision,record.root_identity,record.alias,record.status,record.max_bytes,record.target_digest)
+            supplied=("root.register",project_id,root_id,policy_revision,root_identity,alias,status,max_bytes,target_digest)
+            if exact!=supplied or record.authorization_status!="approved" or record.revoked_at or _time(record.approved_at)>now or _time(record.expires_at)<=now:
+                continue
+            approval=store.load_approval(record.approval_id)
+            if approval.id!=record.approval_id or approval.subject_id!=record.authorization_ref or approval.status!=ApprovalStatus.APPROVED:
+                continue
+            candidates.append(record)
+    if not candidates: raise ValueError("no current exact root authorization exists")
+    candidates.sort(key=lambda record:(_time(record.approved_at),record.authorization_ref),reverse=True)
+    if len(candidates)>1 and _time(candidates[0].approved_at)==_time(candidates[1].approved_at):
+        raise ValueError("current root authorization is ambiguous")
+    record=candidates[0]
+    return {"ok":True,"authorization_ref":record.authorization_ref,"approval_id":record.approval_id,"project_id":record.project_id,"root_id":record.root_id,"policy_revision":record.policy_revision,"root_identity":record.root_identity,"alias":record.alias,"status":record.status,"max_bytes":record.max_bytes,"target_digest":record.target_digest,"approved_at":record.approved_at,"expires_at":record.expires_at,"mutation_performed":False,"host_mutation_performed":False,"redactions_applied":True}
+
+def resolve_current_root_authorization_api(store_path:str,p:Mapping[str,object]):
+    required={"project_id","root_id","policy_revision","root_identity","alias","status","max_bytes","target_digest"}
+    if set(p)!=required: raise ValueError("exact current root authorization fields are required")
+    return resolve_current_root_authorization(store_path,str(p["project_id"]),str(p["root_id"]),str(p["policy_revision"]),str(p["root_identity"]),str(p["alias"]),str(p["status"]),p["max_bytes"],str(p["target_digest"]))
 
 def materialize_authorization(store_path:str,authorization_ref:str,materialized_at:str|None=None)->Mapping[str,object]:
     now=materialized_at or datetime.now(UTC).isoformat()

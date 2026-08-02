@@ -16,6 +16,7 @@ from typing import Callable, Mapping, Protocol
 from .crew import CrewMessageStatus, CrewReviewStatus
 from .core import OwnerDomain
 from .store import SQLiteStore
+from .storage_control import current_root_identity, resolve_current_root_authorization
 
 PLAN_KIND = "donuthole_encrypted_backup_provisioning_v1"
 SYSTEM_USER = "donuthole-backup"
@@ -442,14 +443,18 @@ def review_plan(store_path: str, plan_id: str, reviewer: str) -> Mapping[str, ob
         try:
             registration = plan.root_registrations[0]
             authorization_ref = str(registration["authorization_ref"])
-            with SQLiteStore(store_path) as store:
-                authorization = store.load_storage_root_authorization(authorization_ref)
-                resource = store.load_resource("storage.donuthole")
-            if authorization.project_id != registration["project_id"] or authorization.root_id != registration["root_id"] or authorization.target_digest not in plan.root_authorization_refs or plan.root_authorization_refs[authorization.target_digest] != authorization_ref or authorization.authorization_status != "approved":
+            identity=current_root_identity(str(registration["host_path"]))
+            with SQLiteStore(store_path) as store: resource = store.load_resource("storage.donuthole")
+            target_digests=[digest for digest,reference in plan.root_authorization_refs.items() if reference==authorization_ref]
+            if len(target_digests)!=1:
                 failures.append("materialized root authorization does not match the exact registration")
+            else:
+                current=resolve_current_root_authorization(store_path,str(registration["project_id"]),str(registration["root_id"]),str(registration["policy_revision"]),identity,str(registration["alias"]),"active",int(registration["max_bytes"]),target_digests[0])
+                if current["authorization_ref"]!=authorization_ref:
+                    failures.append("plan does not use the current exact root authorization")
             if resource.id != "storage.donuthole" or resource.owner_domain != OwnerDomain.KIRA:
                 failures.append("typed DonutHole storage resource is not registered to Kira")
-        except (IndexError, KeyError, ValueError):
+        except (IndexError, KeyError, TypeError, ValueError):
             failures.append("materialized DonutHole root authorization or storage resource is missing")
     if reviewer == "security" and not failures:
         ordered = ("install_overseer_api_token", "generate_cursor_key", "install_private_config", "register_authorized_roots", "stop_disable_user_service", "install_systemd_unit", "start_enable_system_service", "verify_mcp_service")

@@ -441,6 +441,47 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
                 self.assertEqual(server.get_status("/roadex/approval-status"), 400)
                 self.assertEqual(server.get_status("/Overseer/roadex/approval-status?approval_ref=admin.roadex.test&approval_ref=admin.roadex.test"), 400)
 
+    def test_roadex_approval_status_route_rejects_duplicate_approval_ref_query_values(self):
+        paths = (
+            "/roadex/approval-status",
+            "/Overseer/roadex/approval-status",
+        )
+        queries = (
+            "approval_ref=admin.roadex.test&approval_ref=admin.roadex.test",
+            "approval_ref=&approval_ref=admin.roadex.test",
+            "approval_ref=admin.roadex.test&approval_ref=",
+        )
+        draft = RoadexApprovalBindingDraft(
+            approval_ref="admin.roadex.test",
+            source_kind="admin-plan",
+            source_id="admin.roadex.test",
+            project_id="project.test",
+            workspace_id="workspace.test",
+            resource_ref="service.test",
+            authority_class="privileged-operation",
+            subject="Restart test service",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteStore(Path(directory) / "overseer.sqlite3") as store:
+                stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.roadex.test",
+                            "roadex-test.service",
+                            "Approval projection fixture",
+                        )
+                    ),
+                )
+            with LocalApiHarness(Path(directory) / "overseer.sqlite3") as server:
+                for path in paths:
+                    for query in queries:
+                        with self.subTest(path=path, query=query):
+                            with self.assertRaises(HTTPError) as error:
+                                server.get_json(f"{path}?{query}", authenticated=True)
+                            self.assertEqual(error.exception.code, 400)
+
     def test_roadex_approval_status_route_missing_approval_is_not_revealed(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

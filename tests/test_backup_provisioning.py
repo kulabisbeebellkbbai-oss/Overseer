@@ -64,6 +64,27 @@ def test_roadex_human_decision_uses_latest_staged_plan_not_lexicographic_id(tmp_
     assert [item["plan_id"] for item in result["items"]] == [latest.plan_id]
 
 
+def test_roadex_human_decision_does_not_resurface_staged_predecessor(tmp_path):
+    path, template = seeded(tmp_path)
+
+    def plan_for(plan_id):
+        with SQLiteStore(path) as store:
+            for evidence_id in template.evidence_ids.values():
+                message = store.load_crew_message(evidence_id)
+                store.save_crew_message(replace(message, related_plan_id=plan_id))
+        return build_plan(plan_id, template.gpg_sha256, template.adapter_commit, template.runtime_digest, template.capability_digest, template.root_authorization_refs, template.root_registrations, template.overseer_token_source_file, template.overseer_token_file, template.cursor_key_file, template.evidence_ids)
+
+    predecessor = plan_for("backup-provision.donuthole.v12.20260802")
+    stage_plan(path, predecessor)
+    successor = plan_for("backup-provision.donuthole.v13.20260802")
+    stage_plan(path, successor)
+    decide_roadex_human_plan(path, successor.plan_id, "deny", "human-user", "Terminal successor")
+
+    result = list_roadex_human_decisions(path)
+    assert result["pending_count"] == 0
+    assert result["items"] == []
+
+
 @pytest.mark.parametrize(("decision", "status"), (("deny", "denied"), ("request_revision", "revision_requested")))
 def test_roadex_human_denial_and_revision_are_terminal_without_host_mutation(tmp_path, decision, status):
     path, plan = seeded(tmp_path); stage_plan(path, plan)

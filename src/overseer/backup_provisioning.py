@@ -257,11 +257,13 @@ def list_roadex_human_decisions(store_path: str) -> Mapping[str, object]:
         items = []
         seen_kinds: set[str] = set()
         for plan in plans:
-            if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
+            if plan.decision_source != "Roadex":
                 continue
             if plan.kind in seen_kinds:
                 continue
             seen_kinds.add(plan.kind)
+            if plan.status != ProvisioningStatus.STAGED:
+                continue
             failures: list[str] = []
             try:
                 _require_terminal_evidence(store, plan)

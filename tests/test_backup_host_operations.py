@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import json
+import urllib.error
 
 import pytest
 
@@ -143,8 +144,30 @@ def test_mcp_verification_requires_exact_strict_backup_tool_schemas():
     tools=[{"name":name,"inputSchema":schema} for name,schema in EXPECTED_BACKUP_TOOL_SCHEMAS.items()]
     result=adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=lambda url:tools).execute(step)
     assert result["ok"] and result["changed"] is False
-    altered=[dict(tools[0]),tools[1]]; altered[0]["inputSchema"]={**altered[0]["inputSchema"],"additionalProperties":True}
-    with pytest.raises((ValueError,RuntimeError)): adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=lambda url:altered).execute(step)
+    altered=[dict(tools[0]),tools[1]]; altered[0]["inputSchema"]={**altered[0]["inputSchema"],"additionalProperties":True}; calls=[]
+    with pytest.raises((ValueError,RuntimeError)): adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=lambda url:calls.append(url) or altered,mcp_retry_delays=(0,0),sleep=lambda _delay:None).execute(step)
+    assert calls==[step.arguments["url"]]
+
+def test_mcp_verification_retries_only_transport_startup_failures():
+    commit="a"*40; digest=capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)
+    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)})
+    tools=[{"name":name,"inputSchema":schema} for name,schema in EXPECTED_BACKUP_TOOL_SCHEMAS.items()]; calls=[]; sleeps=[]
+    def loader(url):
+        calls.append(url)
+        if len(calls)<3: raise urllib.error.URLError("not listening")
+        return tools
+    result=adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=loader,mcp_retry_delays=(0.1,0.2),sleep=sleeps.append).execute(step)
+    assert result["ok"] and result["changed"] is False
+    assert calls==[step.arguments["url"]]*3 and sleeps==[0.1,0.2]
+
+def test_mcp_verification_reports_stable_redacted_readiness_exhaustion():
+    commit="a"*40; digest=capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)
+    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)}); calls=[]; sleeps=[]
+    def loader(url): calls.append(url); raise ConnectionRefusedError("private endpoint detail")
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=loader,mcp_retry_delays=(0.1,0.2),sleep=sleeps.append).execute(step)
+    assert failure.value.code=="MCP_SERVICE_NOT_READY" and "private endpoint detail" not in str(failure.value)
+    assert calls==[step.arguments["url"]]*3 and sleeps==[0.1,0.2]
 
 def test_default_mcp_loader_initializes_session_then_lists_tools(monkeypatch):
     import json

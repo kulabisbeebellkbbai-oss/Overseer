@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import stat
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import pwd
 from pathlib import Path
@@ -45,10 +48,11 @@ class RedactedHostOperationError(RuntimeError):
         super().__init__(f"allowlisted host operation failed ({self.code})")
 
 class ConcreteHostProvisioningAdapter:
-    def __init__(self,plan:DonutHoleBackupProvisioningPlan,*,privileged_confirmation:str,runner:Callable[...,object]=subprocess.run,euid_provider:Callable[[],int]=os.geteuid,username_provider:Callable[[int],str]=lambda uid:pwd.getpwuid(uid).pw_name,mcp_tool_loader:Callable[[str],list[Mapping[str,object]]]|None=None)->None:
+    def __init__(self,plan:DonutHoleBackupProvisioningPlan,*,privileged_confirmation:str,runner:Callable[...,object]=subprocess.run,euid_provider:Callable[[],int]=os.geteuid,username_provider:Callable[[int],str]=lambda uid:pwd.getpwuid(uid).pw_name,mcp_tool_loader:Callable[[str],list[Mapping[str,object]]]|None=None,mcp_retry_delays:tuple[float,...]=(0.25,0.5,1.0,2.0,2.0),sleep:Callable[[float],None]=time.sleep)->None:
         uid=euid_provider()
         if privileged_confirmation!=PRIVILEGED_CONFIRMATION or uid==0 or username_provider(uid)!=OPERATOR_USER: raise PermissionError("explicit god-operator provisioning construction is required")
-        self.plan=plan; self._allowed=tuple((*plan.steps,*plan.rollback_steps)); self._run_process=runner; self._mcp_tool_loader=mcp_tool_loader or _load_mcp_tools
+        if any(isinstance(delay,bool) or not isinstance(delay,(int,float)) or not math.isfinite(delay) or delay<0 for delay in mcp_retry_delays): raise ValueError("MCP retry delays must be finite non-negative numbers")
+        self.plan=plan; self._allowed=tuple((*plan.steps,*plan.rollback_steps)); self._run_process=runner; self._mcp_tool_loader=mcp_tool_loader or _load_mcp_tools; self._mcp_retry_delays=tuple(float(delay) for delay in mcp_retry_delays); self._sleep=sleep
 
     def execute(self,step:ProvisioningStep)->Mapping[str,object]:
         if step not in self._allowed: raise ValueError("host provisioning step is not an exact approved plan step")
@@ -120,7 +124,15 @@ class ConcreteHostProvisioningAdapter:
     def _install_systemd_unit(self,a): self._install_bytes(a["path"],_unit(a["properties"]).encode(),0o644,"root"); self._sudo(["/usr/bin/systemctl","daemon-reload"]); return True
     def _remove_systemd_unit(self,a): return self._unlink(a["path"],daemon_reload=True)
     def _verify_mcp_service(self,a):
-        tools=self._mcp_tool_loader(a["url"]); normalized={str(tool.get("name")):_normalize_schema(tool.get("inputSchema")) for tool in tools if tool.get("name") in a["required_tools"]}; expected={name:EXPECTED_BACKUP_TOOL_SCHEMAS[name] for name in a["required_tools"]}
+        for delay in (*self._mcp_retry_delays,None):
+            try:
+                tools=self._mcp_tool_loader(a["url"])
+                break
+            except (urllib.error.URLError,TimeoutError,ConnectionError) as error:
+                if isinstance(error,urllib.error.HTTPError): raise
+                if delay is None: raise RedactedHostOperationError("MCP_SERVICE_NOT_READY") from None
+                self._sleep(delay)
+        normalized={str(tool.get("name")):_normalize_schema(tool.get("inputSchema")) for tool in tools if tool.get("name") in a["required_tools"]}; expected={name:EXPECTED_BACKUP_TOOL_SCHEMAS[name] for name in a["required_tools"]}
         if normalized!=expected or capability_digest(self.plan.adapter_commit,normalized)!=a["capability_digest"]: raise RuntimeError("MCP capability verification failed")
         return False
     def _verify_codex_url(self,a):

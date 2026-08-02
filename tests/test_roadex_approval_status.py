@@ -311,6 +311,42 @@ def test_scope_digest_uses_exact_contract_for_admin_source(tmp_path):
     assert binding.scope_digest == EXPECTED_ADMIN_SCOPE_DIGEST
 
 
+def test_stage_bound_roadex_approval_rejects_invalid_approval_ref_without_writing_source_or_binding(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path) as store:
+        draft = _draft_for("admin.roadex invalid")
+        called = {"count": 0}
+
+        def save_source() -> None:
+            called["count"] += 1
+            store.save_admin_change_plan(
+                plan_user_service_restart(
+                    "admin.roadex invalid",
+                    "roadex-test.service",
+                    "Approval projection fixture",
+                )
+            )
+
+        with pytest.raises(ValueError, match="opaque identifier"):
+            stage_bound_roadex_approval(store, draft, save_source)
+
+        assert called["count"] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM admin_change_plans WHERE id=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+
+
 def test_legacy_unbound_source_fails_closed(tmp_path):
     path = tmp_path / "state.sqlite3"
     with SQLiteStore(path) as store:
@@ -418,6 +454,81 @@ def test_stage_bound_roadex_approval_rejects_non_staged_initial_binding(tmp_path
                 draft,
                 lambda: _write_roadex_plan(store, source),
             )
+
+
+def test_stage_bound_roadex_approval_rejects_admin_source_with_pending_terminal_metadata(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path) as store:
+        source = replace(
+            plan_user_service_restart(
+                "admin.roadex.pending-terminal",
+                "roadex-test.service",
+                "Malformed pending fixture",
+            ),
+            approved_by="operator",
+        )
+        draft = _draft_for("admin.roadex.pending-terminal")
+
+        with pytest.raises(ValueError, match="mutable"):
+            stage_bound_roadex_approval(
+                store,
+                draft,
+                lambda: store.save_admin_change_plan(source),
+            )
+
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM admin_change_plans WHERE id=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
+
+
+def test_stage_bound_roadex_approval_rejects_roadex_source_with_staged_terminal_metadata(tmp_path):
+    path, source = seeded(tmp_path / "backups")
+    with SQLiteStore(path) as store:
+        store._connection.execute(
+            "CREATE TABLE IF NOT EXISTS backup_provisioning_plans (id TEXT PRIMARY KEY, payload TEXT NOT NULL)",
+        )
+        draft = _draft_for(
+            "admin.roadex.roadex-staged-terminal",
+            source_kind="roadex-human-decision",
+            source_id=source.plan_id,
+        )
+        malformed = replace(source, approved_by="human-user")
+
+        with pytest.raises(ValueError, match="staged evidence"):
+            stage_bound_roadex_approval(
+                store,
+                draft,
+                lambda: store._connection.execute(
+                    "INSERT OR REPLACE INTO backup_provisioning_plans (id, payload) VALUES (?, ?)",
+                    (malformed.plan_id, _roadex_payload(malformed)),
+                ),
+            )
+
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM backup_provisioning_plans WHERE id=?",
+                (source.plan_id,),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["count"]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(

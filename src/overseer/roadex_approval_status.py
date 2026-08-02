@@ -440,17 +440,11 @@ def project_decision(
                     binding.created_at,
                 ),
             )
-        if (
-            source_plan.approved
-            or source_plan.approved_by is not None
-            or source_plan.approved_at is not None
-            or source_plan.canceled_by is not None
-            or source_plan.canceled_at is not None
-            or source_plan.cancellation_reason is not None
-        ):
-            raise ValueError("admin source mutable fields are malformed")
         _require_admin_pending_plan_evidence(source_plan)
         return ("pending", "pending", binding.created_at)
+
+    if binding.source_kind != "roadex-human-decision":
+        raise ValueError("unsupported source_kind")
 
     source_plan = _require_roadex_plan(source)
     status = source_plan.status
@@ -458,18 +452,7 @@ def project_decision(
         _require_terminal_evidence(store, source_plan)
 
     if status == ProvisioningStatus.STAGED:
-        if (
-            source_plan.approved_by is not None
-            or source_plan.approved_at is not None
-            or source_plan.decided_by is not None
-            or source_plan.decided_at is not None
-            or source_plan.decision_reason is not None
-            or source_plan.evidence_digest is not None
-            or source_plan.executed_at is not None
-            or source_plan.failed_operation is not None
-            or source_plan.error_code is not None
-        ):
-            raise ValueError("roadex source staged evidence is malformed")
+        _require_roadex_staged_plan_evidence(source_plan)
         return (
             "pending",
             status.value,
@@ -564,6 +547,7 @@ def _validate_approval_binding_draft(draft: object) -> None:
     if not isinstance(draft, RoadexApprovalBindingDraft):
         raise ValueError("binding draft must be exact RoadexApprovalBindingDraft")
     _require_truthy_str(draft.approval_ref, "approval_ref")
+    validate_opaque_ref(draft.approval_ref)
     _require_enum(
         draft.source_kind,
         {"admin-plan", "roadex-human-decision"},
@@ -618,6 +602,7 @@ def _require_initial_source_state(source_kind: str, source: object) -> None:
             raise ValueError(
                 "admin binding source must not be canceled for initial projection binding"
             )
+        _require_admin_pending_plan_evidence(source_plan)
         return
     if source_kind == "roadex-human-decision":
         source_plan = _require_roadex_plan(source)
@@ -625,6 +610,7 @@ def _require_initial_source_state(source_kind: str, source: object) -> None:
             raise ValueError(
                 "roadex binding source must be staged for initial projection binding"
             )
+        _require_roadex_staged_plan_evidence(source_plan)
         return
     raise ValueError("unsupported source_kind")
 
@@ -834,7 +820,29 @@ def _digest(value: object) -> str:
 
 
 def _require_admin_pending_plan_evidence(plan: AdminChangePlan) -> None:
-    return
+    if (
+        plan.approved_by is not None
+        or plan.approved_at is not None
+        or plan.canceled_by is not None
+        or plan.canceled_at is not None
+        or plan.cancellation_reason is not None
+    ):
+        raise ValueError("admin source mutable fields are malformed")
+
+
+def _require_roadex_staged_plan_evidence(plan: DonutHoleBackupProvisioningPlan) -> None:
+    if (
+        plan.approved_by is not None
+        or plan.approved_at is not None
+        or plan.decided_by is not None
+        or plan.decided_at is not None
+        or plan.decision_reason is not None
+        or plan.evidence_digest is not None
+        or plan.executed_at is not None
+        or plan.failed_operation is not None
+        or plan.error_code is not None
+    ):
+        raise ValueError("roadex source staged evidence is malformed")
 
 
 def _require_admin_approved_plan_evidence(plan: AdminChangePlan) -> None:

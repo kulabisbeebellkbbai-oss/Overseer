@@ -28,6 +28,7 @@ EXPECTED_BACKUP_TOOL_SCHEMAS={
     "underdark_backup_verify_restore":{"properties":{**COMMON_SCHEMA,"artifact_id":{"type":"string"},"expected_artifact_digest":{"type":"string"},"expected_manifest_digest":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"artifact_id","expected_artifact_digest","expected_manifest_digest")),"additionalProperties":False},
 }
 RUNTIME_EXCLUDED={".git",".venv",".codex",".agents","__pycache__",".pytest_cache","tests","docs"}
+MAX_REDACTED_DIAGNOSTIC_LINE_BYTES=4096
 
 class RedactedHostOperationError(RuntimeError):
     """A stable diagnostic safe to persist outside the privileged adapter."""
@@ -52,13 +53,7 @@ class ConcreteHostProvisioningAdapter:
         if not argv or any(not isinstance(value,str) or "\x00" in value for value in argv): raise ValueError("invalid process argument vector")
         result=self._run_process(argv,shell=False,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
         if getattr(result,"returncode",1) not in acceptable:
-            code="PROCESS_FAILED"
-            try:
-                diagnostic=json.loads(getattr(result,"stderr",b"").decode())
-                candidate=diagnostic.get("error",{}).get("code") if diagnostic.get("redactions_applied") is True else None
-                if isinstance(candidate,str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",candidate): code=candidate
-            except Exception: pass
-            raise RedactedHostOperationError(code)
+            raise RedactedHostOperationError(_redacted_child_error_code(getattr(result,"stderr",b"")))
         return result
     def _sudo(self,argv:list[str],*,user:str|None=None,acceptable=(0,)):
         prefix=["/usr/bin/sudo"]+(["-u",user] if user else [])+["--"]
@@ -155,6 +150,17 @@ class ConcreteHostProvisioningAdapter:
         self._sudo(["/usr/bin/rm","-f","--",path])
         if daemon_reload: self._sudo(["/usr/bin/systemctl","daemon-reload"])
         return present
+
+def _redacted_child_error_code(stderr):
+    """Extract only a bounded final structured diagnostic emitted by a child."""
+    if not isinstance(stderr,(bytes,bytearray)): return "PROCESS_FAILED"
+    lines=bytes(stderr).splitlines(); final=next((line for line in reversed(lines) if line.strip()),b"")
+    if not final or len(final)>MAX_REDACTED_DIAGNOSTIC_LINE_BYTES: return "PROCESS_FAILED"
+    try: diagnostic=json.loads(final.decode("utf-8","strict"))
+    except (UnicodeDecodeError,json.JSONDecodeError): return "PROCESS_FAILED"
+    if not isinstance(diagnostic,dict) or diagnostic.get("redactions_applied") is not True: return "PROCESS_FAILED"
+    error=diagnostic.get("error"); candidate=error.get("code") if isinstance(error,dict) else None
+    return candidate if isinstance(candidate,str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",candidate) else "PROCESS_FAILED"
 
 def _digest_file(path):
     digest=hashlib.sha256()

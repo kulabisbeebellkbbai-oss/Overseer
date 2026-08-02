@@ -39,6 +39,28 @@ def test_failed_process_exposes_only_validated_redacted_error_code():
         adapter([step],lambda *_a,**_k:Result(returncode=2,stdout=b"",stderr=b'{"error":{"code":"TOKEN_LEAK"}}')).execute(step)
     assert failure.value.code=="PROCESS_FAILED" and "TOKEN_LEAK" not in str(failure.value)
 
+def test_failed_process_preserves_final_redacted_child_code_after_sudo_diagnostic():
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    child=json.dumps({"ok":False,"error":{"code":"AUTHORIZATION_MISMATCH"},"redactions_applied":True}).encode()
+    wrapped=b"sudo: wrapper diagnostic\n"+child+b"\n"
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=2,stderr=wrapped)).execute(step)
+    assert failure.value.code=="AUTHORIZATION_MISMATCH"
+    assert "sudo" not in str(failure.value) and "wrapper" not in str(failure.value)
+
+@pytest.mark.parametrize("stderr",[
+    json.dumps({"ok":False,"error":{"code":"AUTHORIZATION_MISMATCH"},"redactions_applied":True}).encode()+b"\nprivate trailing output\n",
+    b"prefix\n"+b"x"*4097,
+    b"prefix\n"+json.dumps({"ok":False,"error":{"code":"not-allowlisted"},"redactions_applied":True}).encode(),
+    b"prefix\n\xff\n",
+])
+def test_failed_process_rejects_unsafe_or_nonfinal_child_diagnostics(stderr):
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=2,stderr=stderr)).execute(step)
+    assert failure.value.code=="PROCESS_FAILED"
+    assert "private" not in str(failure.value) and "not-allowlisted" not in str(failure.value)
+
 def test_changed_arguments_and_unknown_operations_are_denied_before_runner():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"}); calls=[]; host=adapter([step],lambda *args,**kwargs:calls.append(args) or Result())
     with pytest.raises(ValueError,match="exact approved"): host.execute(ProvisioningStep("ensure_system_user",{**step.arguments,"name":"root"}))

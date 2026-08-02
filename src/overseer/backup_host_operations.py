@@ -76,7 +76,8 @@ class ConcreteHostProvisioningAdapter:
         if runtime_digest(a["source"],a["commit"])!=a["runtime_digest"]: raise RuntimeError("published runtime artifact digest mismatch")
         excludes=[f"--exclude={name}" for name in sorted(RUNTIME_EXCLUDED)]
         self._sudo(["/usr/bin/install","-d","-m","0755",a["destination"]]); self._sudo(["/usr/bin/rsync","-a","--delete",*excludes,a["source"].rstrip("/")+"/",a["destination"].rstrip("/")+"/"])
-        self._sudo(["/usr/bin/python3","-m","venv",a["destination"]+"/.venv"]); self._sudo([a["destination"]+"/.venv/bin/pip","install","--no-deps",a["destination"]])
+        self._sudo(["/usr/bin/python3","-m","venv",a["destination"]+"/.venv"]); self._sudo([a["destination"]+"/.venv/bin/pip","install",a["destination"]])
+        self._sudo([a["destination"]+"/.venv/bin/python","-c","import theunderdark.production_cli"])
         if runtime_digest(a["destination"],a["commit"])!=a["runtime_digest"]: raise RuntimeError("installed runtime digest mismatch")
         return True
     def _verify_endpoint_migration_ready(self,a): self._run(["/usr/bin/systemctl","--user","is-active","theunderdark-mcp.service"],acceptable=(0,3,4)); return False

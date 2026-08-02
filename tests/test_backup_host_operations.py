@@ -169,6 +169,10 @@ def test_install_excludes_local_environments_and_caches(monkeypatch):
     adapter([step],lambda argv,**kwargs:calls.append(argv) or Result()).execute(step)
     rsync=next(argv for argv in calls if "/usr/bin/rsync" in argv)
     assert {"--exclude=.git","--exclude=.venv","--exclude=.codex","--exclude=.agents","--exclude=__pycache__","--exclude=.pytest_cache","--exclude=tests","--exclude=docs"}<=set(rsync)
+    pip=next(argv for argv in calls if argv[-2:]==["install","/installed"])
+    assert "--no-deps" not in pip
+    import_check=next(argv for argv in calls if argv[-2:]==["-c","import theunderdark.production_cli"])
+    assert calls.index(pip)<calls.index(import_check)
 
 def test_runtime_digest_excludes_agent_metadata_tests_and_docs(tmp_path):
     for directory in (".codex",".agents","tests","docs"):

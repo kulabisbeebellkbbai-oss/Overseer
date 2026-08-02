@@ -29,6 +29,14 @@ EXPECTED_BACKUP_TOOL_SCHEMAS={
 }
 RUNTIME_EXCLUDED={".git",".venv",".codex",".agents","__pycache__",".pytest_cache","tests","docs"}
 MAX_REDACTED_DIAGNOSTIC_LINE_BYTES=4096
+MAX_WRAPPER_DIAGNOSTIC_BYTES=8192
+WRAPPER_ERROR_PATTERNS=(
+    (re.compile(r"^sudo: a password is required$"),"SUDO_AUTH_REQUIRED"),
+    (re.compile(r"^sudo: unknown user .{1,128}$"),"SUDO_TARGET_USER_INVALID"),
+    (re.compile(r"^sudo: unable to execute .{1,2048}: Permission denied$"),"SUDO_EXEC_PERMISSION_DENIED"),
+    (re.compile(r"^sudo: unable to execute .{1,2048}: No such file or directory$"),"SUDO_EXEC_NOT_FOUND"),
+    (re.compile(r"^sudo: (?:account validation failure, is your account locked\?|PAM account management error: .{1,512})$"),"SUDO_ACCOUNT_REJECTED"),
+)
 
 class RedactedHostOperationError(RuntimeError):
     """A stable diagnostic safe to persist outside the privileged adapter."""
@@ -53,7 +61,7 @@ class ConcreteHostProvisioningAdapter:
         if not argv or any(not isinstance(value,str) or "\x00" in value for value in argv): raise ValueError("invalid process argument vector")
         result=self._run_process(argv,shell=False,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
         if getattr(result,"returncode",1) not in acceptable:
-            raise RedactedHostOperationError(_redacted_child_error_code(getattr(result,"stderr",b"")))
+            raise RedactedHostOperationError(_redacted_process_error_code(getattr(result,"stderr",b"")))
         return result
     def _sudo(self,argv:list[str],*,user:str|None=None,acceptable=(0,)):
         prefix=["/usr/bin/sudo"]+(["-u",user] if user else [])+["--"]
@@ -161,6 +169,16 @@ def _redacted_child_error_code(stderr):
     if not isinstance(diagnostic,dict) or diagnostic.get("redactions_applied") is not True: return "PROCESS_FAILED"
     error=diagnostic.get("error"); candidate=error.get("code") if isinstance(error,dict) else None
     return candidate if isinstance(candidate,str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}",candidate) else "PROCESS_FAILED"
+
+def _redacted_process_error_code(stderr):
+    child=_redacted_child_error_code(stderr)
+    if child!="PROCESS_FAILED": return child
+    if not isinstance(stderr,(bytes,bytearray)) or len(stderr)>MAX_WRAPPER_DIAGNOSTIC_BYTES: return "PROCESS_FAILED"
+    try: lines=bytes(stderr).decode("utf-8","strict").splitlines()
+    except UnicodeDecodeError: return "PROCESS_FAILED"
+    final=next((line.strip() for line in reversed(lines) if line.strip()),"")
+    if not final or len(final.encode())>MAX_REDACTED_DIAGNOSTIC_LINE_BYTES: return "PROCESS_FAILED"
+    return next((code for pattern,code in WRAPPER_ERROR_PATTERNS if pattern.fullmatch(final)),"PROCESS_FAILED")
 
 def _digest_file(path):
     digest=hashlib.sha256()

@@ -61,6 +61,34 @@ def test_failed_process_rejects_unsafe_or_nonfinal_child_diagnostics(stderr):
     assert failure.value.code=="PROCESS_FAILED"
     assert "private" not in str(failure.value) and "not-allowlisted" not in str(failure.value)
 
+@pytest.mark.parametrize(("stderr","expected"),[
+    (b"sudo: a password is required\n","SUDO_AUTH_REQUIRED"),
+    (b"sudo: unknown user bounded-service\n","SUDO_TARGET_USER_INVALID"),
+    (b"sudo: unable to execute /approved/tool: Permission denied\n","SUDO_EXEC_PERMISSION_DENIED"),
+    (b"sudo: unable to execute /approved/tool: No such file or directory\n","SUDO_EXEC_NOT_FOUND"),
+    (b"sudo: account validation failure, is your account locked?\n","SUDO_ACCOUNT_REJECTED"),
+    (b"sudo: PAM account management error: bounded failure class\n","SUDO_ACCOUNT_REJECTED"),
+])
+def test_failed_process_maps_only_allowlisted_final_wrapper_class(stderr,expected):
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=1,stderr=stderr)).execute(step)
+    assert failure.value.code==expected
+    assert stderr.decode().strip() not in str(failure.value)
+
+@pytest.mark.parametrize("stderr",[
+    b"sudo: arbitrary private diagnostic\n",
+    b"sudo: unable to execute /approved/tool: Operation not permitted\n",
+    b"sudo: unable to execute /approved/tool: Permission denied\nprivate trailing output\n",
+    b"x"*8193,
+])
+def test_failed_process_rejects_unallowlisted_or_oversized_wrapper_output(stderr):
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=1,stderr=stderr)).execute(step)
+    assert failure.value.code=="PROCESS_FAILED"
+    assert "private" not in str(failure.value) and "/approved/tool" not in str(failure.value)
+
 def test_changed_arguments_and_unknown_operations_are_denied_before_runner():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"}); calls=[]; host=adapter([step],lambda *args,**kwargs:calls.append(args) or Result())
     with pytest.raises(ValueError,match="exact approved"): host.execute(ProvisioningStep("ensure_system_user",{**step.arguments,"name":"root"}))

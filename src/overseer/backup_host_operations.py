@@ -26,6 +26,7 @@ EXPECTED_BACKUP_TOOL_SCHEMAS={
     "underdark_backup_create":{"properties":{**COMMON_SCHEMA,"source_root_id":{"type":"string"},"retention_count":{"type":"integer"},"encryption_profile":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"source_root_id","retention_count","encryption_profile")),"additionalProperties":False},
     "underdark_backup_verify_restore":{"properties":{**COMMON_SCHEMA,"artifact_id":{"type":"string"},"expected_artifact_digest":{"type":"string"},"expected_manifest_digest":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"artifact_id","expected_artifact_digest","expected_manifest_digest")),"additionalProperties":False},
 }
+RUNTIME_EXCLUDED={".git",".venv",".codex",".agents","__pycache__",".pytest_cache","tests","docs"}
 
 class ConcreteHostProvisioningAdapter:
     def __init__(self,plan:DonutHoleBackupProvisioningPlan,*,privileged_confirmation:str,runner:Callable[...,object]=subprocess.run,euid_provider:Callable[[],int]=os.geteuid,username_provider:Callable[[int],str]=lambda uid:pwd.getpwuid(uid).pw_name,mcp_tool_loader:Callable[[str],list[Mapping[str,object]]]|None=None)->None:
@@ -56,7 +57,8 @@ class ConcreteHostProvisioningAdapter:
         return False
     def _install_runtime(self,a):
         if runtime_digest(a["source"],a["commit"])!=a["runtime_digest"]: raise RuntimeError("published runtime artifact digest mismatch")
-        self._sudo(["/usr/bin/install","-d","-m","0755",a["destination"]]); self._sudo(["/usr/bin/rsync","-a","--delete","--exclude=.git","--exclude=.venv","--exclude=__pycache__","--exclude=.pytest_cache",a["source"].rstrip("/")+"/",a["destination"].rstrip("/")+"/"])
+        excludes=[f"--exclude={name}" for name in sorted(RUNTIME_EXCLUDED)]
+        self._sudo(["/usr/bin/install","-d","-m","0755",a["destination"]]); self._sudo(["/usr/bin/rsync","-a","--delete",*excludes,a["source"].rstrip("/")+"/",a["destination"].rstrip("/")+"/"])
         self._sudo(["/usr/bin/python3","-m","venv",a["destination"]+"/.venv"]); self._sudo([a["destination"]+"/.venv/bin/pip","install","--no-deps",a["destination"]])
         if runtime_digest(a["destination"],a["commit"])!=a["runtime_digest"]: raise RuntimeError("installed runtime digest mismatch")
         return True
@@ -149,7 +151,7 @@ def runtime_digest(path,commit):
     root=Path(path); files=[]
     for item in sorted(root.rglob("*")):
         relative=item.relative_to(root)
-        if any(part in {".git",".venv","__pycache__",".pytest_cache"} for part in relative.parts): continue
+        if any(part in RUNTIME_EXCLUDED for part in relative.parts): continue
         if item.is_symlink() or (not item.is_file() and not item.is_dir()): raise ValueError("runtime tree contains unsupported entries")
         if item.is_file(): files.append({"path":relative.as_posix(),"mode":item.stat().st_mode&0o777,"sha256":_digest_file(item)})
     return _object_digest({"version":1,"commit":commit,"files":files})
@@ -180,4 +182,4 @@ def _unit(p):
     return "[Service]\nUser="+p["user"]+"\nExecStart="+" ".join(_sd_quote(value) for value in p["exec_start"])+"\nUMask="+p["umask"]+"\nPrivateTmp=yes\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=read-only\nReadOnlyPaths="+" ".join(_sd_quote(value) for value in p["read_only_paths"])+"\nReadWritePaths="+" ".join(_sd_quote(value) for value in p["read_write_paths"])+"\nRestrictAddressFamilies="+" ".join(p["restrict_address_families"])+"\n[Install]\nWantedBy=multi-user.target\n"
 def _sd_quote(value): return '"'+str(value).replace("\\","\\\\").replace('"','\\"')+'"'
 
-__all__=["ConcreteHostProvisioningAdapter","EXPECTED_BACKUP_TOOL_SCHEMAS","PRIVILEGED_CONFIRMATION","capability_digest","runtime_digest"]
+__all__=["ConcreteHostProvisioningAdapter","EXPECTED_BACKUP_TOOL_SCHEMAS","PRIVILEGED_CONFIRMATION","RUNTIME_EXCLUDED","capability_digest","runtime_digest"]

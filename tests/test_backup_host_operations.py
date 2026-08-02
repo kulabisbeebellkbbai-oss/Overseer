@@ -82,7 +82,16 @@ def test_install_excludes_local_environments_and_caches(monkeypatch):
     monkeypatch.setattr(host,"runtime_digest",lambda path,revision:expected)
     adapter([step],lambda argv,**kwargs:calls.append(argv) or Result()).execute(step)
     rsync=next(argv for argv in calls if "/usr/bin/rsync" in argv)
-    assert {"--exclude=.git","--exclude=.venv","--exclude=__pycache__","--exclude=.pytest_cache"}<=set(rsync)
+    assert {"--exclude=.git","--exclude=.venv","--exclude=.codex","--exclude=.agents","--exclude=__pycache__","--exclude=.pytest_cache","--exclude=tests","--exclude=docs"}<=set(rsync)
+
+def test_runtime_digest_excludes_agent_metadata_tests_and_docs(tmp_path):
+    for directory in (".codex",".agents","tests","docs"):
+        target=tmp_path/directory; target.mkdir(); (target/"local.txt").write_text("local-only")
+    (tmp_path/"src").mkdir(); (tmp_path/"src"/"runtime.py").write_text("value=1\n")
+    before=runtime_digest(tmp_path,"a"*40)
+    for directory in (".codex",".agents","tests","docs"):
+        (tmp_path/directory/"local.txt").write_text("changed")
+    assert runtime_digest(tmp_path,"a"*40)==before
 
 def test_registration_runs_as_config_owner_and_codex_step_is_read_only():
     registration={"project_id":"project.donuthole","root_id":"backup-root","policy_revision":"1","host_path":"/source","alias":"source","max_bytes":10,"authorization_ref":"approval"}

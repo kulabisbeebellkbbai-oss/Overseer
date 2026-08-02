@@ -9,6 +9,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from overseer.api import make_api_handler
+from overseer.admin import plan_user_service_restart
+from overseer.roadex_approval_status import RoadexApprovalBindingDraft, stage_bound_roadex_approval
+from overseer.store import SQLiteStore
 
 
 class LocalApiHarness:
@@ -371,6 +374,121 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
 
         self.assertTrue(message["mutation_performed"])
         self.assertEqual(message["message"]["owner_domain"], "julian")
+
+    def test_roadex_approval_status_route_supports_direct_and_gateway_paths(self):
+        draft = RoadexApprovalBindingDraft(
+            approval_ref="admin.roadex.test",
+            source_kind="admin-plan",
+            source_id="admin.roadex.test",
+            project_id="project.test",
+            workspace_id="workspace.test",
+            resource_ref="service.test",
+            authority_class="privileged-operation",
+            subject="Restart test service",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "overseer.sqlite3"
+            with SQLiteStore(path) as store:
+                stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.roadex.test",
+                            "roadex-test.service",
+                            "Approval projection fixture",
+                        )
+                    ),
+                )
+            with LocalApiHarness(path) as server:
+                direct = server.get_json("/roadex/approval-status?approval_ref=admin.roadex.test")
+                prefixed = server.get_json("/Overseer/roadex/approval-status?approval_ref=admin.roadex.test")
+
+        self.assertEqual(direct, prefixed)
+        self.assertEqual(direct["approvalRef"], "admin.roadex.test")
+
+    def test_roadex_approval_status_route_authentication_and_query_validation(self):
+        draft = RoadexApprovalBindingDraft(
+            approval_ref="admin.roadex.test",
+            source_kind="admin-plan",
+            source_id="admin.roadex.test",
+            project_id="project.test",
+            workspace_id="workspace.test",
+            resource_ref="service.test",
+            authority_class="privileged-operation",
+            subject="Restart test service",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteStore(Path(directory) / "overseer.sqlite3") as store:
+                stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.roadex.test",
+                            "roadex-test.service",
+                            "Approval projection fixture",
+                        )
+                    ),
+                )
+            with LocalApiHarness(Path(directory) / "overseer.sqlite3") as server:
+                with self.assertRaises(HTTPError) as unauth:
+                    server.get_json("/roadex/approval-status?approval_ref=admin.roadex.test", authenticated=False)
+                self.assertEqual(unauth.exception.code, 401)
+                self.assertEqual(server.get_status("/roadex/approval-status"), 400)
+                self.assertEqual(server.get_status("/Overseer/roadex/approval-status?approval_ref=admin.roadex.test&approval_ref=admin.roadex.test"), 400)
+
+    def test_roadex_approval_status_route_reports_no_exact_binding_for_legacy_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            with SQLiteStore(store_path) as store:
+                store.save_admin_change_plan(
+                    plan_user_service_restart(
+                        "admin.legacy",
+                        "roadex-test.service",
+                        "Legacy approval fixture",
+                    )
+                )
+            with LocalApiHarness(store_path) as server:
+                with self.assertRaises(HTTPError) as legacy:
+                    server.get_json("/Overseer/roadex/approval-status?approval_ref=admin.legacy")
+                self.assertEqual(legacy.exception.code, 404)
+
+    def test_roadex_approval_status_route_has_no_mutation(self):
+        draft = RoadexApprovalBindingDraft(
+            approval_ref="admin.roadex.test",
+            source_kind="admin-plan",
+            source_id="admin.roadex.test",
+            project_id="project.test",
+            workspace_id="workspace.test",
+            resource_ref="service.test",
+            authority_class="privileged-operation",
+            subject="Restart test service",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            with SQLiteStore(store_path) as store:
+                stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.roadex.test",
+                            "roadex-test.service",
+                            "Approval projection fixture",
+                        )
+                    ),
+                )
+                before_binding = store.load_roadex_approval_binding(draft.approval_ref)
+                before_rows = store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
+            with LocalApiHarness(store_path) as server:
+                server.get_json("/roadex/approval-status?approval_ref=admin.roadex.test")
+            with SQLiteStore(store_path) as store:
+                after_binding = store.load_roadex_approval_binding(draft.approval_ref)
+                after_rows = store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
+
+        self.assertEqual(before_rows, after_rows)
+        self.assertEqual(before_binding, after_binding)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, decide_roadex_human_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, list_roadex_human_decisions, stage_plan_api as stage_backup_provisioning_plan_api
+from .roadex_approval_status import roadex_approval_status
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
@@ -643,6 +644,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if path == "/roadex/human-decisions":
                 self._handle(lambda: list_roadex_human_decisions(store_path))
+                return
+            if path == "/roadex/approval-status":
+                refs = query.get("approval_ref", [])
+                if len(refs) != 1 or not refs[0]:
+                    self._write_json({"error": "approval_ref_required"}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._handle(lambda: roadex_approval_status(store_path, refs[0]))
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

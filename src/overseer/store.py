@@ -499,6 +499,12 @@ class SQLiteStore:
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
+                approval_ref TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS host_security_source_reviews (
                 id TEXT PRIMARY KEY,
                 remote_address TEXT NOT NULL,
@@ -549,6 +555,8 @@ class SQLiteStore:
                 status TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_kind ON roadex_approval_bindings (source_kind);
+            CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id);
             """
         )
         with self._connection:
@@ -1991,6 +1999,75 @@ class SQLiteStore:
 
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
+
+    def _ensure_roadex_approval_bindings(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
+                approval_ref TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_kind ON roadex_approval_bindings (source_kind)"
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id)"
+        )
+
+    def _roadex_binding_fingerprint(self, payload: str) -> tuple[str, str, str, str, str, str, str, str, str]:
+        data = json.loads(payload)
+        data.pop("created_at", None)
+        return (
+            str(data["approval_ref"]),
+            str(data["source_kind"]),
+            str(data["source_id"]),
+            str(data["project_id"]),
+            str(data["workspace_id"]),
+            str(data["resource_ref"]),
+            str(data["authority_class"]),
+            str(data["subject"]),
+            str(data["scope_digest"]),
+        )
+
+    def save_roadex_approval_binding(self, binding) -> None:
+        from .roadex_approval_status import RoadexApprovalBinding
+
+        self._ensure_roadex_approval_bindings()
+        payload = _dump(binding)
+        existing = self._connection.execute(
+            "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+            (binding.approval_ref,),
+        ).fetchone()
+        if existing is not None:
+            if self._roadex_binding_fingerprint(str(existing["payload"])) != self._roadex_binding_fingerprint(payload):
+                raise ValueError("Roadex approval binding is immutable")
+            self._commit_agent_mutation()
+            return _load_dataclass(RoadexApprovalBinding, str(existing["payload"]))
+        self._connection.execute(
+            "INSERT INTO roadex_approval_bindings (approval_ref, source_kind, source_id, payload) VALUES (?, ?, ?, ?)",
+            (binding.approval_ref, binding.source_kind, binding.source_id, payload),
+        )
+        self._commit_agent_mutation()
+        return _load_dataclass(RoadexApprovalBinding, payload)
+
+    def load_roadex_approval_binding(self, approval_ref: str) -> object:
+        from .roadex_approval_status import RoadexApprovalBinding
+
+        self._ensure_roadex_approval_bindings()
+        row = self._connection.execute(
+            "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+            (approval_ref,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(approval_ref)
+        return _load_dataclass(
+            RoadexApprovalBinding,
+            str(row["payload"]),
+        )
 
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))

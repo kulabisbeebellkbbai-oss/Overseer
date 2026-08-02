@@ -173,12 +173,17 @@ def _redacted_child_error_code(stderr):
 def _redacted_process_error_code(stderr):
     child=_redacted_child_error_code(stderr)
     if child!="PROCESS_FAILED": return child
-    if not isinstance(stderr,(bytes,bytearray)) or len(stderr)>MAX_WRAPPER_DIAGNOSTIC_BYTES: return "PROCESS_FAILED"
+    if not isinstance(stderr,(bytes,bytearray)): return "PROCESS_OUTPUT_TYPE_INVALID"
+    if len(stderr)>MAX_WRAPPER_DIAGNOSTIC_BYTES: return "PROCESS_STDERR_OVERSIZED"
     try: lines=bytes(stderr).decode("utf-8","strict").splitlines()
-    except UnicodeDecodeError: return "PROCESS_FAILED"
-    final=next((line.strip() for line in reversed(lines) if line.strip()),"")
-    if not final or len(final.encode())>MAX_REDACTED_DIAGNOSTIC_LINE_BYTES: return "PROCESS_FAILED"
-    return next((code for pattern,code in WRAPPER_ERROR_PATTERNS if pattern.fullmatch(final)),"PROCESS_FAILED")
+    except UnicodeDecodeError: return "PROCESS_STDERR_ENCODING_INVALID"
+    nonempty=[line.strip() for line in lines if line.strip()]
+    if not nonempty: return "PROCESS_STDERR_EMPTY"
+    final=nonempty[-1]
+    if len(final.encode())>MAX_REDACTED_DIAGNOSTIC_LINE_BYTES: return "PROCESS_STDERR_FINAL_LINE_OVERSIZED"
+    wrapper=next((code for pattern,code in WRAPPER_ERROR_PATTERNS if pattern.fullmatch(final)),None)
+    if wrapper: return wrapper
+    return "PROCESS_STDERR_SINGLE_LINE_UNCLASSIFIED" if len(nonempty)==1 else "PROCESS_STDERR_MULTILINE_UNCLASSIFIED"
 
 def _digest_file(path):
     digest=hashlib.sha256()

@@ -35,9 +35,9 @@ def test_failed_process_exposes_only_validated_redacted_error_code():
     assert isinstance(failure.value,RedactedHostOperationError) and failure.value.code=="PRIVATE_STATE_INVALID"
     assert "private diagnostic" not in str(failure.value)
 
-    with pytest.raises(RuntimeError,match=r"PROCESS_FAILED") as failure:
+    with pytest.raises(RuntimeError,match=r"PROCESS_STDERR_SINGLE_LINE_UNCLASSIFIED") as failure:
         adapter([step],lambda *_a,**_k:Result(returncode=2,stdout=b"",stderr=b'{"error":{"code":"TOKEN_LEAK"}}')).execute(step)
-    assert failure.value.code=="PROCESS_FAILED" and "TOKEN_LEAK" not in str(failure.value)
+    assert failure.value.code=="PROCESS_STDERR_SINGLE_LINE_UNCLASSIFIED" and "TOKEN_LEAK" not in str(failure.value)
 
 def test_failed_process_preserves_final_redacted_child_code_after_sudo_diagnostic():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
@@ -48,17 +48,17 @@ def test_failed_process_preserves_final_redacted_child_code_after_sudo_diagnosti
     assert failure.value.code=="AUTHORIZATION_MISMATCH"
     assert "sudo" not in str(failure.value) and "wrapper" not in str(failure.value)
 
-@pytest.mark.parametrize("stderr",[
-    json.dumps({"ok":False,"error":{"code":"AUTHORIZATION_MISMATCH"},"redactions_applied":True}).encode()+b"\nprivate trailing output\n",
-    b"prefix\n"+b"x"*4097,
-    b"prefix\n"+json.dumps({"ok":False,"error":{"code":"not-allowlisted"},"redactions_applied":True}).encode(),
-    b"prefix\n\xff\n",
+@pytest.mark.parametrize(("stderr","expected"),[
+    (json.dumps({"ok":False,"error":{"code":"AUTHORIZATION_MISMATCH"},"redactions_applied":True}).encode()+b"\nprivate trailing output\n","PROCESS_STDERR_MULTILINE_UNCLASSIFIED"),
+    (b"prefix\n"+b"x"*4097,"PROCESS_STDERR_FINAL_LINE_OVERSIZED"),
+    (b"prefix\n"+json.dumps({"ok":False,"error":{"code":"not-allowlisted"},"redactions_applied":True}).encode(),"PROCESS_STDERR_MULTILINE_UNCLASSIFIED"),
+    (b"prefix\n\xff\n","PROCESS_STDERR_ENCODING_INVALID"),
 ])
-def test_failed_process_rejects_unsafe_or_nonfinal_child_diagnostics(stderr):
+def test_failed_process_rejects_unsafe_or_nonfinal_child_diagnostics(stderr,expected):
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
     with pytest.raises(RedactedHostOperationError) as failure:
         adapter([step],lambda *_a,**_k:Result(returncode=2,stderr=stderr)).execute(step)
-    assert failure.value.code=="PROCESS_FAILED"
+    assert failure.value.code==expected
     assert "private" not in str(failure.value) and "not-allowlisted" not in str(failure.value)
 
 @pytest.mark.parametrize(("stderr","expected"),[
@@ -86,8 +86,32 @@ def test_failed_process_rejects_unallowlisted_or_oversized_wrapper_output(stderr
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
     with pytest.raises(RedactedHostOperationError) as failure:
         adapter([step],lambda *_a,**_k:Result(returncode=1,stderr=stderr)).execute(step)
-    assert failure.value.code=="PROCESS_FAILED"
+    expected="PROCESS_STDERR_OVERSIZED" if len(stderr)>8192 else ("PROCESS_STDERR_SINGLE_LINE_UNCLASSIFIED" if len(stderr.splitlines())==1 else "PROCESS_STDERR_MULTILINE_UNCLASSIFIED")
+    assert failure.value.code==expected
     assert "private" not in str(failure.value) and "/approved/tool" not in str(failure.value)
+
+@pytest.mark.parametrize(("stderr","expected"),[
+    (b"","PROCESS_STDERR_EMPTY"),
+    (b"\n \t\n","PROCESS_STDERR_EMPTY"),
+    (b"\xff","PROCESS_STDERR_ENCODING_INVALID"),
+    (b"x"*4097,"PROCESS_STDERR_FINAL_LINE_OVERSIZED"),
+    (b"private single line","PROCESS_STDERR_SINGLE_LINE_UNCLASSIFIED"),
+    (b"private first line\nprivate final line\n","PROCESS_STDERR_MULTILINE_UNCLASSIFIED"),
+])
+def test_failed_process_reports_only_structural_stderr_class(stderr,expected):
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=1,stderr=stderr)).execute(step)
+    assert failure.value.code==expected
+    assert "private" not in str(failure.value)
+
+def test_failed_process_reports_invalid_output_type_without_rendering_it():
+    step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
+    opaque=object()
+    with pytest.raises(RedactedHostOperationError) as failure:
+        adapter([step],lambda *_a,**_k:Result(returncode=1,stderr=opaque)).execute(step)
+    assert failure.value.code=="PROCESS_OUTPUT_TYPE_INVALID"
+    assert repr(opaque) not in str(failure.value)
 
 def test_changed_arguments_and_unknown_operations_are_denied_before_runner():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"}); calls=[]; host=adapter([step],lambda *args,**kwargs:calls.append(args) or Result())

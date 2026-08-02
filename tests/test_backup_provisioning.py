@@ -88,6 +88,18 @@ def test_sisko_and_security_dispatch_recognize_exact_backup_plan_without_admin_d
     assert sisko_automatic["review_status"] == CrewReviewStatus.APPROVED
     assert sisko_result["actions"][0]["independent_human_approval_required"] is True
 
+def test_kira_and_obrien_route_exact_backup_plan_without_discovery_or_packages(monkeypatch):
+    from types import SimpleNamespace
+    import overseer.cli as cli
+    plan={"ok":True,"kind":"donuthole_encrypted_backup_provisioning_v1","plan_id":"backup-provision.donuthole","plan_digest":"sha256:"+"a"*64,"host_mutation_performed":False}
+    monkeypatch.setattr(cli,"_backup_provisioning_review_item",lambda *_args,**_kwargs:dict(plan))
+    message=SimpleNamespace(related_plan_id="backup-provision.donuthole",related_resource_id="storage.donuthole",id="crew.review",owner_domain=OwnerDomain.KIRA)
+    kira=cli._dispatch_kira_message("unused",message,"dispatcher",datetime.now(UTC).isoformat())
+    message.owner_domain=OwnerDomain.OBRIEN
+    obrien=cli._dispatch_obrien_message("unused",message,"dispatcher",datetime.now(UTC).isoformat())
+    assert kira["status"]==obrien["status"]=="dispatched"
+    assert kira["actions"]==obrien["actions"]==[plan]
+
 
 def test_approval_must_be_independent_and_execution_requires_adapter(tmp_path):
     path, plan = seeded(tmp_path); stage_plan(path, plan)

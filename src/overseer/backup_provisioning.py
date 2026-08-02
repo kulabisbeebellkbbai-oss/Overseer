@@ -313,7 +313,7 @@ def execute_plan_api(store_path: str, payload: Mapping[str, object], adapter_fac
 
 def review_plan(store_path: str, plan_id: str, reviewer: str) -> Mapping[str, object]:
     """Deterministically review the immutable staged target without mutation."""
-    if reviewer not in {"sisko", "security"}: raise ValueError("unsupported backup provisioning reviewer")
+    if reviewer not in {"kira", "obrien", "sisko", "security"}: raise ValueError("unsupported backup provisioning reviewer")
     with SQLiteStore(store_path) as store: plan = _stored(store, plan_id)
     failures: list[str] = []
     try: _validate_plan(plan)
@@ -322,6 +322,19 @@ def review_plan(store_path: str, plan_id: str, reviewer: str) -> Mapping[str, ob
     names = [step.operation for step in plan.steps]
     required = {"verify_published_adapter_source", "install_runtime", "install_overseer_api_token", "generate_cursor_key", "install_private_config", "register_authorized_roots", "stop_disable_user_service", "install_systemd_unit", "start_enable_system_service", "verify_mcp_service", "verify_gpg_identity", "verify_backup_policy"}
     if not required <= set(names): failures.append("required exact provisioning steps are missing")
+    if reviewer == "kira" and not failures:
+        try:
+            registration = plan.root_registrations[0]
+            authorization_ref = str(registration["authorization_ref"])
+            with SQLiteStore(store_path) as store:
+                authorization = store.load_storage_root_authorization(authorization_ref)
+                resource = store.load_resource("storage.donuthole")
+            if authorization.project_id != registration["project_id"] or authorization.root_id != registration["root_id"] or authorization.target_digest not in plan.root_authorization_refs or plan.root_authorization_refs[authorization.target_digest] != authorization_ref or authorization.authorization_status != "approved":
+                failures.append("materialized root authorization does not match the exact registration")
+            if resource.id != "storage.donuthole" or resource.owner_domain != OwnerDomain.KIRA:
+                failures.append("typed DonutHole storage resource is not registered to Kira")
+        except (IndexError, KeyError, ValueError):
+            failures.append("materialized DonutHole root authorization or storage resource is missing")
     if reviewer == "security" and not failures:
         ordered = ("install_overseer_api_token", "generate_cursor_key", "install_private_config", "register_authorized_roots", "stop_disable_user_service", "install_systemd_unit", "start_enable_system_service", "verify_mcp_service")
         if [names.index(name) for name in ordered] != sorted(names.index(name) for name in ordered): failures.append("credential, registration, migration, or verification ordering is invalid")

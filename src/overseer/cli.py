@@ -7490,6 +7490,15 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             "decided_by": decided_by,
             "decided_at": decided_at,
         }
+    backup_review = any(isinstance(action, dict) and action.get("kind") == "donuthole_encrypted_backup_provisioning_v1" and action.get("ok") is True for action in result.get("actions", []))
+    if message.owner_domain in {OwnerDomain.KIRA, OwnerDomain.OBRIEN, OwnerDomain.SISKO, OwnerDomain.ODO_IDS} and backup_review and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
+        return {
+            "review_status": CrewReviewStatus.APPROVED,
+            "decision_reason": str(result.get("reason") or "exact backup provisioning review passed"),
+            "decision_evidence_ids": tuple(dict.fromkeys((*message.request_evidence_ids, message.related_plan_id, evidence_id))),
+            "decided_by": message.owner_domain.value,
+            "decided_at": decided_at,
+        }
     if message.owner_domain == OwnerDomain.DAX and read_only and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
         return {
             "review_status": CrewReviewStatus.APPROVED,
@@ -7527,15 +7536,6 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             "correction_request": reason,
             "decision_evidence_ids": (evidence_id,),
             "decided_by": OwnerDomain.ODO_IDS.value,
-            "decided_at": decided_at,
-        }
-    backup_review = any(isinstance(action, dict) and action.get("kind") == "donuthole_encrypted_backup_provisioning_v1" and action.get("ok") is True for action in result.get("actions", []))
-    if message.owner_domain in {OwnerDomain.SISKO, OwnerDomain.ODO_IDS} and backup_review and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
-        return {
-            "review_status": CrewReviewStatus.APPROVED,
-            "decision_reason": str(result.get("reason") or "exact backup provisioning review passed"),
-            "decision_evidence_ids": tuple(dict.fromkeys((*message.request_evidence_ids, message.related_plan_id, evidence_id))),
-            "decided_by": message.owner_domain.value,
             "decided_at": decided_at,
         }
     if message.owner_domain == OwnerDomain.SISKO and result.get("status") == "human_approval_required":
@@ -7647,12 +7647,22 @@ def _dispatch_sisko_message(store_path: str | Path, message, dispatched_by: str,
 
 
 def _dispatch_kira_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_plan_id:
+        backup_plan = _backup_provisioning_review_item(store_path, message.related_plan_id, reviewer="kira")
+        if backup_plan:
+            if backup_plan["ok"]: return _crew_dispatch_result(message, "dispatched", f"Kira validated exact registered-root backup plan {message.related_plan_id}", [backup_plan])
+            return _crew_dispatch_result(message, "skipped", "; ".join(backup_plan["failures"]), [backup_plan])
     physical = discover_physical_status(("/dev/serial/by-id", "/dev/serial/by-path"), store_path)
     storage = discover_storage_status(store_path=store_path)
     return _crew_dispatch_result(message, "dispatched", "Kira refreshed physical device and storage inventories", [physical, storage])
 
 
 def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
+    if message.related_plan_id:
+        backup_plan = _backup_provisioning_review_item(store_path, message.related_plan_id, reviewer="obrien")
+        if backup_plan:
+            if backup_plan["ok"]: return _crew_dispatch_result(message, "dispatched", f"O'Brien validated exact published-source and rollback plan {message.related_plan_id}", [backup_plan])
+            return _crew_dispatch_result(message, "skipped", "; ".join(backup_plan["failures"]), [backup_plan])
     if (message.related_resource_id or "").startswith("storage."):
         return _crew_dispatch_result(
             message,

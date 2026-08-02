@@ -4,25 +4,47 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass, fields
 import re
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Callable, Iterable, Literal, Mapping, cast
+from types import UnionType
+from typing import Any, Callable, Iterable, Literal, Mapping, Union, get_args, get_origin, cast
 
 from .admin import AdminChangePlan
 from .backup_provisioning import (
     DonutHoleBackupProvisioningPlan,
     PLAN_KIND,
     ProvisioningStatus,
+    _load as load_roadex_plan_payload,
     _load as load_roadex_plan,
     _require_terminal_evidence,
     _validate_plan,
 )
 from .core import OwnerDomain
-from .serialization import to_jsonable
+from .serialization import dataclass_from_jsonable, to_jsonable
+
+
+class MissingRoadexApprovalError(KeyError):
+    pass
+
+
+class RoadexApprovalProjectionError(ValueError):
+    pass
 
 
 _OPAQUE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_ROAD_EX_APPROVAL_BINDING_FIELDS = (
+    "approval_ref",
+    "source_kind",
+    "source_id",
+    "project_id",
+    "workspace_id",
+    "resource_ref",
+    "authority_class",
+    "subject",
+    "scope_digest",
+    "created_at",
+)
 _ROADEX_EVIDENCE_REQUESTERS = frozenset(
     {
         OwnerDomain.KIRA.value,
@@ -56,6 +78,12 @@ def _require_iso8601(value: object, field: str) -> str:
     return text
 
 
+def _require_optional_iso8601(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return _require_iso8601(value, field)
+
+
 def _require_optional_str(value: object, field: str) -> str | None:
     if value is None:
         return None
@@ -73,6 +101,204 @@ def _require_enum(value: object, enum_values: set[str], field: str) -> str:
 def _require_exact_type(value: object, expected_type: type[object], field: str) -> None:
     if not isinstance(value, expected_type):
         raise ValueError(f"{field} must be {expected_type.__name__}")
+
+
+def _require_canonical_json(payload: str, label: str) -> dict[str, object]:
+    try:
+        data = json.loads(payload)
+    except ValueError as error:
+        raise ValueError(f"{label} payload must be valid JSON") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} payload must be a JSON object")
+    normalized = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    if payload != normalized:
+        raise ValueError(f"{label} payload is not canonical JSON")
+    return data
+
+
+def _normalize_payload(payload: object) -> str:
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, Mapping):
+        raise ValueError("payload must be an object")
+    try:
+        return json.dumps(dict(payload), sort_keys=True, separators=(",", ":"))
+    except TypeError as error:
+        raise ValueError("payload contains unsupported values") from error
+
+
+def _check_exact_fields(data: Mapping[str, object], expected: Iterable[str], label: str) -> None:
+    expected_fields = tuple(expected)
+    missing = [field for field in expected_fields if field not in data]
+    extra = [field for field in data if field not in set(expected_fields)]
+    if missing and extra:
+        raise ValueError(f"{label} payload has missing and extra fields")
+    if missing:
+        raise ValueError(f"{label} payload is missing fields")
+    if extra:
+        raise ValueError(f"{label} payload has extra fields")
+
+
+def _check_strict_types(value: object, annotation: Any, field: str) -> None:
+    if isinstance(annotation, str):
+        annotation = {
+            "str": str,
+            "bytes": bytes,
+            "bool": bool,
+            "int": int,
+            "float": float,
+            "object": object,
+            "Any": Any,
+        }.get(annotation, annotation)
+    if annotation is str or annotation is bytes:
+        if type(value) is not str:
+            raise ValueError(f"{field} must be a string")
+        return
+    if annotation is bool:
+        if type(value) is not bool:
+            raise ValueError(f"{field} must be a boolean")
+        return
+    if annotation is int:
+        if type(value) is not int:
+            raise ValueError(f"{field} must be an int")
+        return
+    if annotation is float:
+        if type(value) is not float:
+            raise ValueError(f"{field} must be a float")
+        return
+    if annotation is object or annotation is Any:
+        return
+
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if annotation is type(None):
+        if value is not None:
+            raise ValueError(f"{field} must be null")
+        return
+    if origin is Union or origin is UnionType:
+        for part in args:
+            if part is type(None):
+                if value is None:
+                    return
+                continue
+            try:
+                _check_strict_types(value, part, field)
+                return
+            except ValueError:
+                pass
+        raise ValueError(f"{field} has invalid value type")
+
+    if origin is Literal:
+        if value not in args:
+            joined = ",".join(str(item) for item in args)
+            raise ValueError(f"{field} must be one of: {joined}")
+        return
+
+    if origin is list:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list")
+        item_type = args[0] if args else object
+        for item in value:
+            _check_strict_types(item, item_type, f"{field} item")
+        return
+
+    if origin is tuple:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list")
+        if not args:
+            return
+        if len(args) == 2 and args[1] is Ellipsis:
+            item_type = args[0]
+        else:
+            item_type = args[0]
+        for item in value:
+            _check_strict_types(item, item_type, f"{field} item")
+        return
+
+    if origin is Mapping:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{field} must be an object")
+        if len(args) == 2:
+            for key, item in value.items():
+                _check_strict_types(key, args[0], f"{field} key")
+                _check_strict_types(item, args[1], f"{field} value")
+        return
+
+    if isinstance(annotation, type) and hasattr(annotation, "__members__"):
+        if type(value) is not str:
+            raise ValueError(f"{field} must be a string")
+        if value not in annotation._value2member_map_:
+            joined = ",".join(sorted(annotation._value2member_map_.keys()))
+            raise ValueError(f"{field} must be one of: {joined}")
+        return
+
+    if isinstance(annotation, type) and getattr(annotation, "__dataclass_fields__", None) is not None:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{field} must be an object")
+        _check_exact_fields(value, tuple(field.name for field in fields(annotation)), field)
+        for nested in fields(annotation):
+            _check_strict_types(value[nested.name], nested.type, f"{field}::{nested.name}")
+        return
+
+    if isinstance(annotation, type):
+        if not isinstance(value, annotation):
+            raise ValueError(f"{field} has invalid value type")
+
+
+def _decode_dataclass_payload(payload: str, dataclass_type: type[Any], label: str):
+    data = _require_canonical_json(payload, label)
+    _check_exact_fields(data, tuple(field.name for field in fields(dataclass_type)), label)
+    for field in fields(dataclass_type):
+        _check_strict_types(data[field.name], field.type, f"{label}::{field.name}")
+    if dataclass_type is AdminChangePlan:
+        try:
+            return dataclass_from_jsonable(AdminChangePlan, data)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} payload is invalid") from error
+    if dataclass_type is DonutHoleBackupProvisioningPlan:
+        try:
+            return load_roadex_plan_payload(_normalize_payload(data))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} payload is invalid") from error
+    raise ValueError(f"unsupported payload type {dataclass_type}")
+
+
+def _decode_roadex_binding_payload(payload: str) -> RoadexApprovalBinding:
+    data = _require_canonical_json(payload, "binding")
+    _check_exact_fields(data, _ROAD_EX_APPROVAL_BINDING_FIELDS, "binding")
+    for field in fields(RoadexApprovalBinding):
+        if field.name == "scope_digest":
+            _check_strict_types(data[field.name], str, f"binding::{field.name}")
+            _require_truthy_str(data[field.name], field.name)
+        elif field.name == "source_kind":
+            _require_enum(data[field.name], {"admin-plan", "roadex-human-decision"}, "source_kind")
+            continue
+        elif field.name == "authority_class":
+            _require_enum(data[field.name], {"privileged-operation", "project-workflow"}, "authority_class")
+            continue
+        elif field.name in {
+            "approval_ref",
+            "source_id",
+            "project_id",
+            "workspace_id",
+            "resource_ref",
+            "subject",
+            "created_at",
+        }:
+            _require_truthy_str(data[field.name], field.name)
+        else:
+            _check_strict_types(data[field.name], field.type, f"binding::{field.name}")
+
+    return RoadexApprovalBinding(**{field.name: data[field.name] for field in fields(RoadexApprovalBinding)})
+
+
+def _decode_admin_plan_payload(payload: str) -> AdminChangePlan:
+    return _decode_dataclass_payload(payload, AdminChangePlan, "admin source")
+
+
+def _decode_roadex_plan_payload(payload: str) -> DonutHoleBackupProvisioningPlan:
+    return _decode_dataclass_payload(payload, DonutHoleBackupProvisioningPlan, "roadex source")
 
 
 @dataclass(frozen=True)
@@ -130,9 +356,13 @@ def roadex_approval_status(
     from .store import SQLiteStore
 
     with SQLiteStore(store_path) as store:
-        binding = store.load_roadex_approval_binding(approval_ref)
+        try:
+            binding = store.load_roadex_approval_binding(approval_ref)
+        except KeyError as error:
+            raise MissingRoadexApprovalError(approval_ref) from error
         source = load_exact_bound_source(store, binding)
         _validate_source(source, binding)
+        _validate_roadex_source_state(binding.source_kind, source)
         source_digest = exact_source_evidence_digest(source)
         verify_scope_digest(binding, source_digest)
         decision, source_status, updated_at = project_decision(store, binding, source)
@@ -148,11 +378,17 @@ def roadex_approval_status(
 def load_exact_bound_source(store, binding: RoadexApprovalBinding):
     try:
         if binding.source_kind == "admin-plan":
-            return store.load_admin_change_plan(binding.source_id)
+            row = store._connection.execute(
+                "SELECT payload FROM admin_change_plans WHERE id=?",
+                (binding.source_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(binding.source_id)
+            return _decode_admin_plan_payload(str(row["payload"]))
         if binding.source_kind == "roadex-human-decision":
             return load_roadex_human_plan(store, binding.source_id)
     except KeyError as error:
-        raise ValueError("source reference is malformed") from error
+        raise RoadexApprovalProjectionError("source reference is malformed") from error
     raise ValueError("unsupported source_kind")
 
 
@@ -168,6 +404,8 @@ def project_decision(
             raise ValueError("admin source must not be archived")
         if source_plan.canceled:
             _require_admin_canceled_plan_evidence(source_plan)
+            if source_plan.approved_by is not None or source_plan.approved_at is not None:
+                raise ValueError("admin source canceled evidence is malformed")
             return (
                 "rejected",
                 "canceled",
@@ -179,6 +417,8 @@ def project_decision(
             )
         if source_plan.approved:
             _require_admin_approved_plan_evidence(source_plan)
+            if source_plan.canceled_by is not None or source_plan.canceled_at is not None or source_plan.cancellation_reason is not None:
+                raise ValueError("admin source approved evidence is malformed")
             return (
                 "approved",
                 "approved",
@@ -188,6 +428,15 @@ def project_decision(
                     binding.created_at,
                 ),
             )
+        if (
+            source_plan.approved
+            or source_plan.approved_by is not None
+            or source_plan.approved_at is not None
+            or source_plan.canceled_by is not None
+            or source_plan.canceled_at is not None
+            or source_plan.cancellation_reason is not None
+        ):
+            raise ValueError("admin source mutable fields are malformed")
         _require_admin_pending_plan_evidence(source_plan)
         return ("pending", "pending", binding.created_at)
 
@@ -197,6 +446,18 @@ def project_decision(
         _require_terminal_evidence(store, source_plan)
 
     if status == ProvisioningStatus.STAGED:
+        if (
+            source_plan.approved_by is not None
+            or source_plan.approved_at is not None
+            or source_plan.decided_by is not None
+            or source_plan.decided_at is not None
+            or source_plan.decision_reason is not None
+            or source_plan.evidence_digest is not None
+            or source_plan.executed_at is not None
+            or source_plan.failed_operation is not None
+            or source_plan.error_code is not None
+        ):
+            raise ValueError("roadex source staged evidence is malformed")
         return (
             "pending",
             status.value,
@@ -209,25 +470,51 @@ def project_decision(
         )
     if status == ProvisioningStatus.DENIED:
         _require_roadex_decision_plan_evidence(store, source_plan)
+        _require_roadex_approver_independent(
+            store,
+            str(source_plan.decided_by),
+            source_plan.evidence_ids,
+            "decided_by",
+        )
+        if (
+            source_plan.approved_by is not None
+            or source_plan.approved_at is not None
+            or source_plan.evidence_digest is not None
+            or source_plan.executed_at is not None
+            or source_plan.failed_operation is not None
+            or source_plan.error_code is not None
+        ):
+            raise ValueError("roadex source approved evidence is malformed")
         return (
             "rejected",
             status.value,
             _newest_time(
                 source_plan.decided_at,
-                source_plan.approved_at,
-                source_plan.executed_at,
                 binding.created_at,
             ),
         )
     if status == ProvisioningStatus.REVISION_REQUESTED:
         _require_roadex_decision_plan_evidence(store, source_plan)
+        _require_roadex_approver_independent(
+            store,
+            str(source_plan.decided_by),
+            source_plan.evidence_ids,
+            "decided_by",
+        )
+        if (
+            source_plan.approved_by is not None
+            or source_plan.approved_at is not None
+            or source_plan.evidence_digest is not None
+            or source_plan.executed_at is not None
+            or source_plan.failed_operation is not None
+            or source_plan.error_code is not None
+        ):
+            raise ValueError("roadex source approved evidence is malformed")
         return (
             "changes-requested",
             status.value,
             _newest_time(
                 source_plan.decided_at,
-                source_plan.approved_at,
-                source_plan.executed_at,
                 binding.created_at,
             ),
         )
@@ -235,6 +522,13 @@ def project_decision(
         _require_roadex_approved_plan_evidence(store, source_plan)
         if status == ProvisioningStatus.EXECUTED:
             _require_roadex_execution_evidence(source_plan)
+        if (
+            source_plan.failed_operation is not None
+            or source_plan.error_code is not None
+            or (status == ProvisioningStatus.APPROVED and source_plan.executed_at is not None)
+            or (status == ProvisioningStatus.EXECUTED and source_plan.executed_at is None)
+        ):
+            raise ValueError("roadex source approved evidence is malformed")
         return (
             "approved",
             status.value,
@@ -253,8 +547,8 @@ def project_decision(
             status.value,
             _newest_time(
                 source_plan.approved_at,
-                source_plan.executed_at,
                 source_plan.decided_at,
+                source_plan.executed_at,
                 binding.created_at,
             ),
         )
@@ -541,12 +835,12 @@ def _require_admin_pending_plan_evidence(plan: AdminChangePlan) -> None:
 
 def _require_admin_approved_plan_evidence(plan: AdminChangePlan) -> None:
     _require_truthy_str(plan.approved_by, "approved_by")
-    _require_iso8601(plan.approved_at, "approved_at")
+    _require_optional_iso8601(plan.approved_at, "approved_at")
 
 
 def _require_admin_canceled_plan_evidence(plan: AdminChangePlan) -> None:
     _require_truthy_str(plan.canceled_by, "canceled_by")
-    _require_iso8601(plan.canceled_at, "canceled_at")
+    _require_optional_iso8601(plan.canceled_at, "canceled_at")
     _require_truthy_str(plan.cancellation_reason, "cancellation_reason")
 
 
@@ -558,12 +852,6 @@ def _require_roadex_decision_plan_evidence(store, plan: DonutHoleBackupProvision
     _require_truthy_str(plan.decision_reason, "decision_reason")
     _require_truthy_str(plan.decided_by, "decided_by")
     _require_iso8601(plan.decided_at, "decided_at")
-    _require_roadex_approver_independent(
-        store,
-        str(plan.decided_by),
-        plan.evidence_ids,
-        "decided_by",
-    )
 
 
 def _require_roadex_approved_plan_evidence(store, plan: DonutHoleBackupProvisioningPlan) -> None:
@@ -626,7 +914,7 @@ def _require_roadex_approver_independent(
 def _newest_time(*values: str | None) -> str:
     candidates = [value for value in values if isinstance(value, str) and value]
     if not candidates:
-        return datetime.now(UTC).isoformat()
+        raise ValueError("updated time is unavailable")
     return max(candidates)
 
 
@@ -651,6 +939,14 @@ def _validate_binding_object_types(binding: RoadexApprovalBinding) -> None:
     _require_truthy_str(binding.subject, "subject")
     _require_truthy_str(binding.scope_digest, "scope_digest")
     _require_truthy_str(binding.created_at, "created_at")
+
+
+def _validate_roadex_source_state(source_kind: str, source: object) -> None:
+    if source_kind == "admin-plan":
+        return
+    if source_kind == "roadex-human-decision":
+        return
+    raise ValueError("unsupported source_kind")
 
 
 __all__ = [

@@ -374,7 +374,7 @@ def test_roadex_approval_binding_rejects_tampered_stored_payload(tmp_path):
         store._connection.commit()
 
     with SQLiteStore(path) as store:
-        with pytest.raises(ValueError, match="immutable"):
+        with pytest.raises(ValueError, match="project_id must be a non-empty string"):
             stage_bound_roadex_approval(
                 store,
                 draft,
@@ -392,12 +392,130 @@ def test_roadex_approval_binding_rejects_tampered_stored_payload(tmp_path):
         )
         store._connection.commit()
 
-        with pytest.raises(ValueError, match="immutable"):
+        with pytest.raises(ValueError, match="extra fields"):
             stage_bound_roadex_approval(
                 store,
                 draft,
                 lambda: _write_roadex_plan(store, source),
             )
+
+
+def test_load_roadex_approval_binding_rejects_noncanonical_payload(tmp_path):
+    draft = _draft_for("admin.roadex.test")
+    with SQLiteStore(tmp_path / "state.sqlite3") as store:
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(
+                plan_user_service_restart(
+                    "admin.roadex.test",
+                    "roadex-test.service",
+                    "Approval projection fixture",
+                )
+            ),
+        )
+        payload = str(
+            store._connection.execute(
+                "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["payload"]
+        )
+        binding_payload = json.loads(payload)
+        canonical = json.dumps(binding_payload)
+
+        store._connection.execute(
+            "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+            (canonical, draft.approval_ref),
+        )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match="canonical JSON"):
+        with SQLiteStore(tmp_path / "state.sqlite3") as store:
+            store.load_roadex_approval_binding(draft.approval_ref)
+
+
+def test_load_roadex_approval_binding_rejects_identity_mismatch_with_row_columns(tmp_path):
+    draft = _draft_for("admin.roadex.test")
+    with SQLiteStore(tmp_path / "state.sqlite3") as store:
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(
+                plan_user_service_restart(
+                    "admin.roadex.test",
+                    "roadex-test.service",
+                    "Approval projection fixture",
+                )
+            ),
+        )
+        payload = json.loads(
+            store._connection.execute(
+                "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+                (draft.approval_ref,),
+            ).fetchone()["payload"]
+        )
+        payload["source_id"] = "admin.roadex.attacker"
+        store._connection.execute(
+            "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+            (_roadex_payload(payload), draft.approval_ref),
+        )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        with SQLiteStore(tmp_path / "state.sqlite3") as store:
+            store.load_roadex_approval_binding(draft.approval_ref)
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected"),
+    (
+        ("missing_field", "missing fields"),
+        ("extra_field", "extra fields"),
+        ("invalid_enum", "one of"),
+        ("invalid_json", "valid JSON"),
+    ),
+)
+def test_load_roadex_approval_binding_rejects_malformed_payload_variants(tmp_path, variant, expected):
+    draft = _draft_for("admin.roadex.test")
+    with SQLiteStore(tmp_path / "state.sqlite3") as store:
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(
+                plan_user_service_restart(
+                    "admin.roadex.test",
+                    "roadex-test.service",
+                    "Approval projection fixture",
+                )
+            ),
+        )
+        row_payload = store._connection.execute(
+            "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+            (draft.approval_ref,),
+        ).fetchone()["payload"]
+        payload = json.loads(row_payload)
+        if variant == "invalid_json":
+            malformed = "{bad"
+            store._connection.execute(
+                "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+                (malformed, draft.approval_ref),
+            )
+        else:
+            if variant == "missing_field":
+                del payload["source_kind"]
+            elif variant == "extra_field":
+                payload["unexpected_field"] = "bad"
+            elif variant == "invalid_enum":
+                payload["source_kind"] = "manual"
+            store._connection.execute(
+                "UPDATE roadex_approval_bindings SET payload=? WHERE approval_ref=?",
+                (_roadex_payload(payload), draft.approval_ref),
+            )
+        store._connection.commit()
+
+    with pytest.raises(ValueError, match=expected):
+        with SQLiteStore(tmp_path / "state.sqlite3") as store:
+            store.load_roadex_approval_binding(draft.approval_ref)
 
 
 def test_source_save_exception_rolls_back_binding(tmp_path):

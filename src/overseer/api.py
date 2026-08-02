@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from json import JSONDecodeError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,7 +13,10 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, decide_roadex_human_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, list_roadex_human_decisions, stage_plan_api as stage_backup_provisioning_plan_api
-from .roadex_approval_status import roadex_approval_status
+from .roadex_approval_status import (
+    MissingRoadexApprovalError,
+    roadex_approval_status,
+)
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
@@ -1176,11 +1180,25 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             try:
                 self._write_json(handler())
             except KeyError as error:
-                self._write_json({"error": f"missing record: {error.args[0]}"}, HTTPStatus.NOT_FOUND)
-            except ValueError as error:
+                if redact_projection_errors and isinstance(error, MissingRoadexApprovalError):
+                    self._write_json({"error": "missing record"}, HTTPStatus.NOT_FOUND)
+                elif redact_projection_errors:
+                    self._write_json(
+                        {
+                            "error": "malformed_source",
+                            "code": "ROAD_EX_APPROVAL_SOURCE_MALFORMED",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                else:
+                    self._write_json({"error": f"missing record: {error.args[0]}"}, HTTPStatus.NOT_FOUND)
+            except (TypeError, JSONDecodeError, ValueError, EOFError) as error:
                 if redact_projection_errors:
                     self._write_json(
-                        {"error": "malformed_source", "code": "ROAD_EX_APPROVAL_SOURCE_MALFORMED"},
+                        {
+                            "error": "malformed_source",
+                            "code": "ROAD_EX_APPROVAL_SOURCE_MALFORMED",
+                        },
                         HTTPStatus.BAD_REQUEST,
                     )
                 else:

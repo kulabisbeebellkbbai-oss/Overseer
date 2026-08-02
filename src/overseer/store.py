@@ -2056,6 +2056,7 @@ class SQLiteStore:
 
     def load_roadex_approval_binding(self, approval_ref: str) -> object:
         from .roadex_approval_status import RoadexApprovalBinding
+        from .roadex_approval_status import _decode_roadex_binding_payload
 
         existing_schema = self._connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
@@ -2063,15 +2064,21 @@ class SQLiteStore:
         if not existing_schema:
             raise KeyError(approval_ref)
         row = self._connection.execute(
-            "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+            "SELECT source_kind, source_id, payload FROM roadex_approval_bindings WHERE approval_ref=?",
             (approval_ref,),
         ).fetchone()
         if row is None:
             raise KeyError(approval_ref)
-        return _load_dataclass(
-            RoadexApprovalBinding,
-            str(row["payload"]),
-        )
+        binding = _decode_roadex_binding_payload(str(row["payload"]))
+        if str(row["source_id"]) != binding.source_id:
+            raise ValueError("roadex approval binding source_id is inconsistent")
+        if str(row["source_kind"]) != binding.source_kind:
+            raise ValueError("roadex approval binding source_kind is inconsistent")
+        if binding.approval_ref != approval_ref:
+            raise ValueError("roadex approval binding approval_ref is inconsistent")
+        if not isinstance(binding, RoadexApprovalBinding):
+            raise ValueError("roadex approval binding is malformed")
+        return binding
 
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))

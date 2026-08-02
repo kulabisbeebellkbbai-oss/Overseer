@@ -194,7 +194,7 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         ProvisioningStep("install_systemd_unit", {"path": UNIT_PATH, "unit": UNIT_NAME, "properties": unit, "unit_digest": unit_digest}),
         ProvisioningStep("start_enable_system_service", {"unit": UNIT_NAME, "scope": "system"}),
         ProvisioningStep("verify_mcp_service", {"url": f"http://{LISTEN_HOST}:{LISTEN_PORT}/mcp", "capability_digest": capability_digest, "required_tools": ("underdark_backup_create", "underdark_backup_verify_restore")}),
-        ProvisioningStep("update_codex_url_if_changed", {"url": f"http://{LISTEN_HOST}:{LISTEN_PORT}/mcp", "only_if_changed": True}),
+        ProvisioningStep("verify_codex_url", {"url": f"http://{LISTEN_HOST}:{LISTEN_PORT}/mcp"}),
         ProvisioningStep("verify_gpg_identity", {"path": GPG_PATH, "sha256": gpg_sha256}),
         ProvisioningStep("verify_backup_policy", {"retention": RETENTION_COUNT, "plaintext_archive": False, "restore_required": True}),
     )
@@ -224,8 +224,8 @@ def stage_plan(store_path: str, plan: DonutHoleBackupProvisioningPlan) -> Mappin
         _initialize(store)
         for role, domain in REQUIRED_EVIDENCE.items():
             message = store.load_crew_message(plan.evidence_ids[role])
-            if message.owner_domain != domain or message.status != CrewMessageStatus.ACKNOWLEDGED or message.review_status != CrewReviewStatus.APPROVED or message.decided_by != domain.value or not message.decided_at:
-                raise ValueError(f"terminal approved {role} evidence is required")
+            if message.owner_domain != domain or message.related_plan_id != plan.plan_id:
+                raise ValueError(f"correctly owned {role} evidence is required")
         payload = _dump(plan)
         existing = store._connection.execute("SELECT payload FROM backup_provisioning_plans WHERE id=?", (plan.plan_id,)).fetchone()
         if existing and str(existing["payload"]) != payload:
@@ -245,8 +245,10 @@ def approve_plan(store_path: str, plan_id: str, approved_by: str, approved_at: s
     now = approved_at or datetime.now(UTC).isoformat(); _time(now)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id)
+        _require_terminal_evidence(store, plan)
         evidence_actors = set(REQUIRED_EVIDENCE) | {domain.value for domain in REQUIRED_EVIDENCE.values()}
-        if plan.status != ProvisioningStatus.STAGED or not approved_by.strip() or approved_by in evidence_actors:
+        evidence_requesters = {store.load_crew_message(message_id).requested_by for message_id in plan.evidence_ids.values()}
+        if plan.status != ProvisioningStatus.STAGED or not approved_by.strip() or approved_by in evidence_actors or approved_by in evidence_requesters:
             raise ValueError("independent human approval is required")
         approved = replace(plan, status=ProvisioningStatus.APPROVED, approved_by=approved_by, approved_at=now)
         store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(approved), plan_id)); store._commit()
@@ -259,6 +261,7 @@ def execute_plan(store_path: str, plan_id: str, adapter: ProvisioningAdapter | N
     now = executed_at or datetime.now(UTC).isoformat(); _time(now)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
+        _require_terminal_evidence(store, plan)
         if plan.status != ProvisioningStatus.APPROVED or not plan.approved_by or not plan.approved_at:
             raise ValueError("the exact provisioning plan requires independent human approval")
         evidence = []
@@ -308,6 +311,31 @@ def execute_plan_api(store_path: str, payload: Mapping[str, object], adapter_fac
     return execute_plan(store_path, plan.plan_id, adapter_factory(plan))
 
 
+def review_plan(store_path: str, plan_id: str, reviewer: str) -> Mapping[str, object]:
+    """Deterministically review the immutable staged target without mutation."""
+    if reviewer not in {"sisko", "security"}: raise ValueError("unsupported backup provisioning reviewer")
+    with SQLiteStore(store_path) as store: plan = _stored(store, plan_id)
+    failures: list[str] = []
+    try: _validate_plan(plan)
+    except ValueError: failures.append("immutable plan kind or digest does not match")
+    if plan.status != ProvisioningStatus.STAGED: failures.append("plan is not at the staged review gate")
+    names = [step.operation for step in plan.steps]
+    required = {"verify_published_adapter_source", "install_runtime", "install_overseer_api_token", "generate_cursor_key", "install_private_config", "register_authorized_roots", "stop_disable_user_service", "install_systemd_unit", "start_enable_system_service", "verify_mcp_service", "verify_gpg_identity", "verify_backup_policy"}
+    if not required <= set(names): failures.append("required exact provisioning steps are missing")
+    if reviewer == "security" and not failures:
+        ordered = ("install_overseer_api_token", "generate_cursor_key", "install_private_config", "register_authorized_roots", "stop_disable_user_service", "install_systemd_unit", "start_enable_system_service", "verify_mcp_service")
+        if [names.index(name) for name in ordered] != sorted(names.index(name) for name in ordered): failures.append("credential, registration, migration, or verification ordering is invalid")
+        unit = next(step for step in plan.steps if step.operation == "install_systemd_unit").arguments["properties"]
+        expected_ro = (plan.source_path, plan.config_path, plan.key_path, plan.overseer_token_file, plan.cursor_key_file)
+        if tuple(unit.get("read_only_paths", ())) != expected_ro or tuple(unit.get("read_write_paths", ())) != plan.read_write_paths or unit.get("umask") != "0077" or unit.get("protect_system") != "strict" or unit.get("protect_home") != "read-only" or unit.get("private_tmp") is not True or unit.get("no_new_privileges") is not True or tuple(unit.get("restrict_address_families", ())) != ("AF_UNIX", "AF_INET"):
+            failures.append("systemd loopback, filesystem, or sandbox boundary is invalid")
+        registration = next(step for step in plan.steps if step.operation == "register_authorized_roots")
+        if registration.arguments.get("tool") != "underdark_root_register" or not plan.root_registrations: failures.append("exact authorized root registration is missing")
+        rollback_names = [step.operation for step in plan.rollback_steps]
+        if not {"stop_disable_system_service", "restore_enable_user_service", "remove_secret_file_if_no_backups", "remove_overseer_api_token", "remove_cursor_key_if_unreferenced"} <= set(rollback_names): failures.append("required rollback protections are missing")
+    return {"ok": not failures, "plan_id": plan.plan_id, "kind": plan.kind, "plan_digest": plan.plan_digest, "status": plan.status.value, "reviewer": reviewer, "failures": failures, "independent_human_approval_required": True, "mutation_performed": False, "host_mutation_performed": False}
+
+
 def _validate_plan(plan: DonutHoleBackupProvisioningPlan) -> None:
     rebuilt = build_plan(plan.plan_id, plan.gpg_sha256, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
     if plan.kind != PLAN_KIND or plan.plan_digest != rebuilt.plan_digest or _plan_digest(plan) != plan.plan_digest:
@@ -327,6 +355,13 @@ def _stored(store: SQLiteStore, plan_id: str) -> DonutHoleBackupProvisioningPlan
     _initialize(store); row = store._connection.execute("SELECT payload FROM backup_provisioning_plans WHERE id=?", (plan_id,)).fetchone()
     if not row: raise KeyError(plan_id)
     return _load(str(row["payload"]))
+
+
+def _require_terminal_evidence(store: SQLiteStore, plan: DonutHoleBackupProvisioningPlan) -> None:
+    for role, domain in REQUIRED_EVIDENCE.items():
+        message = store.load_crew_message(plan.evidence_ids[role])
+        if message.owner_domain != domain or message.related_plan_id != plan.plan_id or message.status != CrewMessageStatus.ACKNOWLEDGED or message.review_status != CrewReviewStatus.APPROVED or message.decided_by != domain.value or not message.decided_at:
+            raise ValueError(f"terminal approved {role} evidence is required")
 
 
 def _dump(plan: DonutHoleBackupProvisioningPlan) -> str:
@@ -363,4 +398,4 @@ def _time(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-__all__ = ["DonutHoleBackupProvisioningPlan", "DedicatedProvisioningAdapter", "AllowlistedHostProvisioningAdapter", "ProvisioningStep", "ProvisioningStatus", "build_plan", "stage_plan", "list_plans", "approve_plan", "execute_plan", "stage_plan_api", "approve_plan_api", "execute_plan_api"]
+__all__ = ["DonutHoleBackupProvisioningPlan", "DedicatedProvisioningAdapter", "AllowlistedHostProvisioningAdapter", "ProvisioningStep", "ProvisioningStatus", "build_plan", "stage_plan", "list_plans", "approve_plan", "execute_plan", "stage_plan_api", "approve_plan_api", "execute_plan_api", "review_plan"]

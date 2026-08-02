@@ -16,7 +16,7 @@ def seeded(tmp_path):
     with SQLiteStore(path) as store:
         for role, domain in ROLES.items():
             identifier = f"crew.{role}.backup"; evidence[role] = identifier
-            store.save_crew_message(CrewMessage(identifier, domain, "Backup review", "Approved exact provisioning plan", RiskLevel.HIGH, CrewMessageStatus.ACKNOWLEDGED, domain.value, now, now, review_status=CrewReviewStatus.APPROVED, decided_by=domain.value, decided_at=now))
+            store.save_crew_message(CrewMessage(identifier, domain, "Backup review", "Approved exact provisioning plan", RiskLevel.HIGH, CrewMessageStatus.ACKNOWLEDGED, domain.value, now, now, related_plan_id="backup-provision.donuthole", review_status=CrewReviewStatus.APPROVED, decided_by=domain.value, decided_at=now))
     registration = {"project_id": "project.donuthole", "root_id": "backup-root", "policy_revision": "1", "host_path": "/home/god/Documents/Codex Workspace/DonutHole", "alias": "donuthole-source", "max_bytes": 1073741824, "authorization_ref": "root-auth.donuthole"}
     return str(path), build_plan("backup-provision.donuthole", "sha256:" + "a" * 64, "b" * 40, "sha256:" + "d" * 64, "sha256:" + "c" * 64, {"sha256:" + "e" * 64: "root-auth.donuthole"}, (registration,), "/run/user/1000/overseer-api-token", "/etc/codex-development-backups/keys/overseer.token", "/etc/codex-development-backups/keys/cursor.key", evidence)
 
@@ -48,19 +48,53 @@ def test_plan_requires_exact_live_authority_inputs_and_registers_before_start(tm
         build_plan(plan.plan_id, plan.gpg_sha256, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, {}, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
 
 
-def test_stage_rejects_nonterminal_or_wrong_owner_evidence(tmp_path):
+def test_stage_allows_pending_review_but_approval_requires_terminal_evidence(tmp_path):
     path, plan = seeded(tmp_path)
     with SQLiteStore(path) as store:
         item = store.load_crew_message(plan.evidence_ids["security"])
         store.save_crew_message(item.__class__(**{**item.__dict__, "review_status": CrewReviewStatus.PENDING, "decided_by": None, "decided_at": None}))
+    assert stage_plan(path, plan)["status"] == "staged"
     with pytest.raises(ValueError, match="security"):
-        stage_plan(path, plan)
+        approve_plan(path, plan.plan_id, "operator-human")
+
+
+def test_execution_rechecks_terminal_evidence_after_approval(tmp_path):
+    path, plan = seeded(tmp_path); stage_plan(path, plan); approve_plan(path, plan.plan_id, "operator-human")
+    with SQLiteStore(path) as store:
+        item = store.load_crew_message(plan.evidence_ids["kira"])
+        store.save_crew_message(item.__class__(**{**item.__dict__, "review_status": CrewReviewStatus.CORRECTION_REQUESTED}))
+    with pytest.raises(ValueError, match="kira"):
+        execute_plan(path, plan.plan_id, DedicatedProvisioningAdapter({}))
+
+
+def test_sisko_and_security_dispatch_recognize_exact_backup_plan_without_admin_dispatch(tmp_path):
+    from overseer.cli import _automatic_crew_review, _dispatch_odo_ids_message, _dispatch_sisko_message
+    path, plan = seeded(tmp_path); stage_plan(path, plan); now = datetime.now(UTC).isoformat()
+    with SQLiteStore(path) as store:
+        sisko = store.load_crew_message(plan.evidence_ids["sisko"])
+        security = store.load_crew_message(plan.evidence_ids["security"])
+    sisko = sisko.__class__(**{**sisko.__dict__, "related_plan_id": plan.plan_id})
+    security = security.__class__(**{**security.__dict__, "related_plan_id": plan.plan_id})
+    sisko_result = _dispatch_sisko_message(path, sisko, "dispatcher", now)
+    security_result = _dispatch_odo_ids_message(path, security, "dispatcher", now)
+    assert sisko_result["status"] == "dispatched" and "admin plan" not in sisko_result["reason"]
+    assert security_result["status"] == "dispatched" and "admin plan" not in security_result["reason"]
+    assert sisko_result["actions"][0]["kind"] == "donuthole_encrypted_backup_provisioning_v1"
+    assert security_result["actions"][0]["plan_digest"] == plan.plan_digest
+    automatic = _automatic_crew_review(path, security, security_result, CrewMessageStatus.ACKNOWLEDGED, "dispatch.security", "dispatcher", now)
+    assert automatic["review_status"] == CrewReviewStatus.APPROVED
+    assert automatic["decided_by"] == OwnerDomain.ODO_IDS.value
+    sisko_automatic = _automatic_crew_review(path, sisko, sisko_result, CrewMessageStatus.ACKNOWLEDGED, "dispatch.sisko", "dispatcher", now)
+    assert sisko_automatic["review_status"] == CrewReviewStatus.APPROVED
+    assert sisko_result["actions"][0]["independent_human_approval_required"] is True
 
 
 def test_approval_must_be_independent_and_execution_requires_adapter(tmp_path):
     path, plan = seeded(tmp_path); stage_plan(path, plan)
     with pytest.raises(ValueError, match="independent"):
         approve_plan(path, plan.plan_id, "sisko")
+    with pytest.raises(ValueError, match="independent"):
+        approve_plan(path, plan.plan_id, "kira")
     approve_plan(path, plan.plan_id, "operator-human")
     with pytest.raises(ValueError, match="adapter"):
         execute_plan(path, plan.plan_id)

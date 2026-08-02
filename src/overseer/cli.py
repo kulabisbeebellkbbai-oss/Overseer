@@ -7529,6 +7529,15 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             "decided_by": OwnerDomain.ODO_IDS.value,
             "decided_at": decided_at,
         }
+    backup_review = any(isinstance(action, dict) and action.get("kind") == "donuthole_encrypted_backup_provisioning_v1" and action.get("ok") is True for action in result.get("actions", []))
+    if message.owner_domain in {OwnerDomain.SISKO, OwnerDomain.ODO_IDS} and backup_review and result.get("status") == "dispatched" and not _crew_dispatch_result_mutated_host(result):
+        return {
+            "review_status": CrewReviewStatus.APPROVED,
+            "decision_reason": str(result.get("reason") or "exact backup provisioning review passed"),
+            "decision_evidence_ids": tuple(dict.fromkeys((*message.request_evidence_ids, message.related_plan_id, evidence_id))),
+            "decided_by": message.owner_domain.value,
+            "decided_at": decided_at,
+        }
     if message.owner_domain == OwnerDomain.SISKO and result.get("status") == "human_approval_required":
         evidence = tuple(dict.fromkeys((*message.request_evidence_ids, *tuple(filter(None, (message.related_plan_id, evidence_id))))))
         return {
@@ -7536,6 +7545,15 @@ def _automatic_crew_review(store_path, message, result, delivery_status, evidenc
             "decision_reason": str(result.get("reason") or "human approval required"),
             "decision_evidence_ids": evidence,
             "decided_by": OwnerDomain.SISKO.value,
+            "decided_at": decided_at,
+        }
+    if message.owner_domain == OwnerDomain.ODO_IDS and result.get("status") == "review_required":
+        evidence = tuple(dict.fromkeys((*message.request_evidence_ids, *tuple(filter(None, (message.related_plan_id, evidence_id))))))
+        return {
+            "review_status": CrewReviewStatus.WAITING_HUMAN_APPROVAL,
+            "decision_reason": str(result.get("reason") or "exact security review is required"),
+            "decision_evidence_ids": evidence,
+            "decided_by": OwnerDomain.ODO_IDS.value,
             "decided_at": decided_at,
         }
     if message.owner_domain == OwnerDomain.ODO_IDS:
@@ -7613,6 +7631,11 @@ def _dispatch_sisko_message(store_path: str | Path, message, dispatched_by: str,
     if message.related_plan_id == "all":
         return _crew_dispatch_result(message, "skipped", "Sisko dispatch requires exact plan IDs; broad all-plan approval is not executed", [])
     if message.related_plan_id:
+        backup_plan = _backup_provisioning_review_item(store_path, message.related_plan_id)
+        if backup_plan:
+            if backup_plan["ok"]:
+                return _crew_dispatch_result(message, "dispatched", f"Sisko validated exact staged backup provisioning plan {message.related_plan_id}; separate independent human approval remains required", [backup_plan])
+            return _crew_dispatch_result(message, "skipped", "; ".join(backup_plan["failures"]), [backup_plan])
         readiness = _admin_plan_readiness_item(store_path, message.related_plan_id)
         return _crew_dispatch_result(
             message,
@@ -7775,6 +7798,12 @@ def _dispatch_odo_message(store_path: str | Path, message, dispatched_by: str, d
 
 def _dispatch_odo_ids_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:
     if message.related_plan_id:
+        backup_plan = _backup_provisioning_review_item(store_path, message.related_plan_id)
+        if backup_plan:
+            security_review = _backup_provisioning_review_item(store_path, message.related_plan_id, reviewer="security")
+            if security_review["ok"]:
+                return _crew_dispatch_result(message, "dispatched", f"Odo IDS validated exact sandboxed backup provisioning plan {message.related_plan_id}", [security_review])
+            return _crew_dispatch_result(message, "skipped", "; ".join(security_review["failures"]), [security_review])
         try:
             package = _ensure_ids_review_package_for_plan(store_path, message.related_plan_id, dispatched_at)
             return _crew_dispatch_result(
@@ -7792,6 +7821,14 @@ def _dispatch_odo_ids_message(store_path: str | Path, message, dispatched_by: st
         "Odo IDS reviewed advisory package queue and reported current gate status",
         [summary],
     )
+
+
+def _backup_provisioning_review_item(store_path: str | Path, plan_id: str, reviewer: str = "sisko") -> dict[str, object] | None:
+    from .backup_provisioning import list_plans, review_plan
+    for item in list_plans(str(store_path))["items"]:
+        if item.get("plan_id") == plan_id:
+            return dict(review_plan(str(store_path), plan_id, reviewer))
+    return None
 
 
 def _dispatch_odo_firewall_message(store_path: str | Path, message, dispatched_by: str, dispatched_at: str) -> dict[str, object]:

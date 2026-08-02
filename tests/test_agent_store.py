@@ -27,7 +27,7 @@ from overseer.agent_contracts import (
     CredentialReference,
     DriverEpoch,
 )
-from overseer.store import OverseerStore
+from overseer.store import CURRENT_SCHEMA_VERSION, OverseerStore
 
 
 def _provider(provider_id: str = "claude", **overrides: object) -> AgentProvider:
@@ -555,7 +555,7 @@ def test_agent_migration_rolls_back_cleanly_and_retries(tmp_path: Path) -> None:
 
     with OverseerStore(path) as store:
         assert [row.version for row in store.list_schema_migrations()] == [
-            1,
+            CURRENT_SCHEMA_VERSION,
             "agent_driver_v1",
             "agent_driver_v2",
             "agent_driver_v3",

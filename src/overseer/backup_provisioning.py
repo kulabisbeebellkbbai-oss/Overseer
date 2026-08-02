@@ -232,7 +232,10 @@ def stage_plan(store_path: str, plan: DonutHoleBackupProvisioningPlan) -> Mappin
     with SQLiteStore(store_path) as store:
         _initialize(store)
         for role, domain in REQUIRED_EVIDENCE.items():
-            message = store.load_crew_message(plan.evidence_ids[role])
+            try:
+                message = store.load_crew_message(plan.evidence_ids[role])
+            except KeyError:
+                continue
             if message.owner_domain != domain or message.related_plan_id != plan.plan_id:
                 raise ValueError(f"correctly owned {role} evidence is required")
         payload = _dump(plan)

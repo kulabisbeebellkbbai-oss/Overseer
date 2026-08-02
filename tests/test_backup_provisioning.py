@@ -171,6 +171,21 @@ def test_stage_allows_pending_review_but_approval_requires_terminal_evidence(tmp
         approve_plan(path, plan.plan_id, "operator-human")
 
 
+def test_stage_allows_missing_reviews_so_plan_precedes_dispatchable_messages(tmp_path):
+    path, plan = seeded(tmp_path)
+    with SQLiteStore(path) as store:
+        store._connection.execute("DELETE FROM crew_messages")
+        store._commit()
+
+    result = stage_plan(path, plan)
+
+    assert result["status"] == "staged"
+    queue = list_roadex_human_decisions(path)
+    assert queue["pending_count"] == 1
+    assert queue["items"][0]["ready"] is False
+    assert queue["items"][0]["blockers"]
+
+
 def test_execution_rechecks_terminal_evidence_after_approval(tmp_path):
     path, plan = seeded(tmp_path); stage_plan(path, plan); approve_plan(path, plan.plan_id, "operator-human")
     with SQLiteStore(path) as store:

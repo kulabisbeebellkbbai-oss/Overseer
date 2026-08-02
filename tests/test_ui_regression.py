@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -452,6 +453,10 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
             self.assertNotIn("admin.roadex.missing", body)
 
     def test_roadex_approval_status_route_reports_no_exact_binding_for_legacy_source(self):
+        def database_dump_bytes(path: Path) -> bytes:
+            with sqlite3.connect(path) as connection:
+                return "\n".join(connection.iterdump()).encode("utf-8")
+
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"
             with SQLiteStore(store_path) as store:
@@ -480,33 +485,20 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
                 store._connection.execute("DROP INDEX IF EXISTS idx_roadex_approval_bindings_source_id")
                 store._connection.execute("DROP TABLE IF EXISTS roadex_approval_bindings")
                 store._connection.commit()
-                pre_get_schema = store._connection.execute(
-                    "SELECT type, name, sql FROM sqlite_master WHERE name='roadex_approval_bindings' OR name='idx_roadex_approval_bindings_source_kind' OR name='idx_roadex_approval_bindings_source_id' ORDER BY name"
-                ).fetchall()
-                pre_get_rows = (
-                    store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
-                    if store._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'").fetchone()
-                    else None
+                self.assertIsNone(
+                    store._connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+                    ).fetchone()
                 )
+                pre_get_dump = database_dump_bytes(store_path)
             with LocalApiHarness(store_path) as server:
                 with self.assertRaises(HTTPError) as legacy:
                     server.get_json("/Overseer/roadex/approval-status?approval_ref=admin.roadex.legacy")
                 body = legacy.exception.read().decode("utf-8")
                 self.assertEqual(legacy.exception.code, 404)
                 self.assertEqual(json.loads(body), {"error": "missing record"})
-            with SQLiteStore(store_path) as store:
-                post_get_schema = store._connection.execute(
-                    "SELECT type, name, sql FROM sqlite_master WHERE name='roadex_approval_bindings' OR name='idx_roadex_approval_bindings_source_kind' OR name='idx_roadex_approval_bindings_source_id' ORDER BY name"
-                ).fetchall()
-                post_get_rows = (
-                    store._connection.execute("SELECT COUNT(*) AS count FROM roadex_approval_bindings").fetchone()["count"]
-                    if store._connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'").fetchone()
-                    else None
-                )
-            self.assertEqual(pre_get_schema, post_get_schema)
-            self.assertEqual(pre_get_rows, post_get_rows)
-            self.assertIsNone(pre_get_rows)
-            self.assertIsNone(post_get_rows)
+            post_get_dump = database_dump_bytes(store_path)
+            self.assertEqual(pre_get_dump, post_get_dump)
 
     def test_roadex_approval_status_route_does_not_return_malformed_source_secret(self):
         secret = "ROADEX_SOURCE_SECRET_ABC123"

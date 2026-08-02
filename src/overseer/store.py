@@ -60,7 +60,7 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"

@@ -1,6 +1,7 @@
 from datetime import UTC,datetime,timedelta
 from dataclasses import replace
 import json
+import sqlite3
 from overseer.audit import ApprovalStatus
 from overseer.storage_control import stage_authorization,list_authorizations,materialize_authorization,revoke_authorization
 from overseer.storage_control import approve_authorization
@@ -57,3 +58,16 @@ def test_control_post_requires_admin_token_before_handler(tmp_path):
         else: raise AssertionError("remote testing token reached storage control handler")
         admin=api.post_json("/storage/control/stage",{},authenticated=True)
         assert admin.status_code==400 and "exact stage fields" in repr(admin.json())
+
+def test_legacy_store_runs_storage_authorization_schema_migration(tmp_path):
+    path=tmp_path/"legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+        CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,description TEXT NOT NULL,applied_at TEXT NOT NULL);
+        CREATE TABLE agent_schema_migrations(version TEXT PRIMARY KEY,description TEXT NOT NULL,applied_at TEXT NOT NULL);
+        INSERT INTO schema_migrations VALUES(1,'bootstrap JSON payload store','2026-01-01T00:00:00+00:00');
+        INSERT INTO agent_schema_migrations VALUES('agent_driver_v9','agent driver','2026-01-01T00:00:00+00:00');
+        """)
+    with SQLiteStore(path) as store:
+        tables={row[0] for row in store._connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"storage_authorizations","storage_root_authorizations"} <= tables

@@ -253,15 +253,15 @@ def list_roadex_human_decisions(store_path: str) -> Mapping[str, object]:
     """Return final human decisions originating in the Roadex workflow."""
     with SQLiteStore(store_path) as store:
         _initialize(store)
-        plans = [_load(str(row["payload"])) for row in store._connection.execute("SELECT payload FROM backup_provisioning_plans ORDER BY id DESC")]
+        plans = [_load(str(row["payload"])) for row in store._connection.execute("SELECT payload FROM backup_provisioning_plans ORDER BY rowid DESC")]
         items = []
         seen_kinds: set[str] = set()
         for plan in plans:
+            if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
+                continue
             if plan.kind in seen_kinds:
                 continue
             seen_kinds.add(plan.kind)
-            if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
-                continue
             failures: list[str] = []
             try:
                 _require_terminal_evidence(store, plan)

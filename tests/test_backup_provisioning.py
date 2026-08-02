@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -40,6 +41,27 @@ def test_roadex_human_decision_card_lists_only_exact_ready_plan(tmp_path):
     assert item["plan_id"] == plan.plan_id and item["plan_digest"] == plan.plan_digest
     assert item["human_approval_required"] is True and item["ready"] is True
     assert item["impact"] and item["risks"] and item["rollback"]
+
+
+def test_roadex_human_decision_uses_latest_staged_plan_not_lexicographic_id(tmp_path):
+    path, template = seeded(tmp_path)
+
+    def plan_for(plan_id):
+        with SQLiteStore(path) as store:
+            for evidence_id in template.evidence_ids.values():
+                message = store.load_crew_message(evidence_id)
+                store.save_crew_message(replace(message, related_plan_id=plan_id))
+        return build_plan(plan_id, template.gpg_sha256, template.adapter_commit, template.runtime_digest, template.capability_digest, template.root_authorization_refs, template.root_registrations, template.overseer_token_source_file, template.overseer_token_file, template.cursor_key_file, template.evidence_ids)
+
+    older = plan_for("backup-provision.donuthole.v9.20260802")
+    stage_plan(path, older)
+    decide_roadex_human_plan(path, older.plan_id, "deny", "human-user", "Superseded")
+    latest = plan_for("backup-provision.donuthole.v11.20260802")
+    stage_plan(path, latest)
+
+    result = list_roadex_human_decisions(path)
+    assert result["pending_count"] == 1
+    assert [item["plan_id"] for item in result["items"]] == [latest.plan_id]
 
 
 @pytest.mark.parametrize(("decision", "status"), (("deny", "denied"), ("request_revision", "revision_requested")))

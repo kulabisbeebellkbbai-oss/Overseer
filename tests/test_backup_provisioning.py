@@ -167,7 +167,7 @@ def test_execute_api_requires_exact_confirmation_and_configured_host_adapter(tmp
         execute_plan_api(path, {"plan_id": plan.plan_id, "privileged_confirmation": "execute-exact-donuthole-backup-provisioning-plan"})
 
 
-def test_partial_failure_rolls_back_in_reverse_and_records_redacted_terminal_state(tmp_path):
+def test_partial_failure_uses_declared_dependency_safe_rollback_order_and_records_redacted_terminal_state(tmp_path):
     path, plan = seeded(tmp_path); stage_plan(path, plan); approve_plan(path, plan.plan_id, "operator-human")
     calls = []; forward = {step.operation for step in plan.steps}; rollback = {step.operation for step in plan.rollback_steps}
     def operation(name):
@@ -180,4 +180,7 @@ def test_partial_failure_rolls_back_in_reverse_and_records_redacted_terminal_sta
     with pytest.raises(RuntimeError): execute_plan(path, plan.plan_id, adapter)
     item = list_plans(path)["items"][0]
     assert item["status"] == "rolled_back" and "secret failure detail" not in repr(item) and "secret result" not in repr(item)
-    assert calls[-len(plan.rollback_steps):] == [step.operation for step in reversed(plan.rollback_steps)]
+    assert calls[-len(plan.rollback_steps):] == [step.operation for step in plan.rollback_steps]
+    names = [step.operation for step in plan.rollback_steps]
+    assert names.index("remove_read_only_acl") < names.index("remove_system_user_if_unused")
+    assert names.index("remove_directory_if_empty") < names.index("remove_system_user_if_unused")

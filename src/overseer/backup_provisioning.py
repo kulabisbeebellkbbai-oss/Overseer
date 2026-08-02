@@ -273,7 +273,10 @@ def execute_plan(store_path: str, plan_id: str, adapter: ProvisioningAdapter | N
                     raise ValueError("provisioning step failed")
         except Exception:
             rollback_evidence = []
-            for rollback in reversed(plan.rollback_steps):
+            # rollback_steps are declared in dependency-safe execution order:
+            # revoke service access and ACLs before deleting the service user,
+            # then remove the unreferenced runtime last.
+            for rollback in plan.rollback_steps:
                 try:
                     result = adapter.execute(rollback)
                     rollback_evidence.append({"operation": rollback.operation, "ok": result.get("ok") is True})

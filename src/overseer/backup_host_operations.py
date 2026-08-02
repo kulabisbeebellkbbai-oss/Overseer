@@ -118,7 +118,10 @@ class ConcreteHostProvisioningAdapter:
             self._sudo(["/opt/theunderdark/.venv/bin/theunderdark-production","register-root","--config","/etc/codex-development-backups/donuthole.json","--project-id",item["project_id"],"--root-id",item["root_id"],"--policy-revision",item["policy_revision"],"--host-path",item["host_path"],"--alias",item["alias"],"--max-bytes",str(item["max_bytes"]),"--authorization-ref",item["authorization_ref"]],user="donuthole-backup")
         return True
     def _stop_disable_user_service(self,a): self._run(["/usr/bin/systemctl","--user","disable","--now",a["unit"]],acceptable=(0,1,5)); return True
-    def _start_enable_system_service(self,a): self._sudo(["/usr/bin/systemctl","enable","--now",a["unit"]]); return True
+    def _start_enable_system_service(self,a):
+        self._sudo(["/usr/bin/systemctl","enable",a["unit"]])
+        self._sudo(["/usr/bin/systemctl","restart",a["unit"]])
+        return True
     def _stop_disable_system_service(self,a): self._sudo(["/usr/bin/systemctl","disable","--now",a["unit"]],acceptable=(0,1,5)); return True
     def _restore_enable_user_service(self,a): self._run(["/usr/bin/systemctl","--user","enable","--now",a["unit"]]); return True
     def _install_systemd_unit(self,a): self._install_bytes(a["path"],_unit(a["properties"]).encode(),0o644,"root"); self._sudo(["/usr/bin/systemctl","daemon-reload"]); return True

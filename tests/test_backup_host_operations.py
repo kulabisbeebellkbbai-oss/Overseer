@@ -126,6 +126,25 @@ def test_secret_generation_uses_os_file_api_and_never_returns_secret(tmp_path):
     assert calls==[["/usr/bin/sudo","--","/usr/bin/openssl","rand","-hex","-out",str(secret),"24"],["/usr/bin/sudo","--","/usr/bin/chmod","0600",str(secret)],["/usr/bin/sudo","--","/usr/bin/chown","backup:backup",str(secret)]]
     assert "secret" not in result and "private" not in repr(result)
 
+def test_system_service_start_enable_operation_refreshed_after_enable():
+    step=ProvisioningStep("start_enable_system_service",{"unit":"overseer-api.service","scope":"system"})
+    calls=[]
+    result=adapter([step],lambda argv,**kwargs:calls.append((argv,kwargs)) or Result()).execute(step)
+    assert result["changed"] is True and result["redactions_applied"] is True
+    assert calls==[
+        (["/usr/bin/sudo","--","/usr/bin/systemctl","enable","overseer-api.service"],{"shell":False,"stdin":-3,"stdout":-1,"stderr":-1,"check":False}),
+        (["/usr/bin/sudo","--","/usr/bin/systemctl","restart","overseer-api.service"],{"shell":False,"stdin":-3,"stdout":-1,"stderr":-1,"check":False}),
+    ]
+    assert "--now" not in calls[0][0] and "--now" not in calls[1][0]
+
+def test_start_enable_system_service_preserves_exact_allowlisted_step_contract():
+    step=ProvisioningStep("start_enable_system_service",{"unit":"overseer-api.service","scope":"system"})
+    calls=[]
+    host=adapter([step],lambda argv,**kwargs:calls.append((argv,kwargs)) or Result())
+    with pytest.raises(ValueError,match="exact approved"): host.execute(ProvisioningStep("start_enable_system_service",{"unit":"other.service","scope":"system"}))
+    with pytest.raises(ValueError,match="exact approved"): host.execute(ProvisioningStep("start_enable_system_service",{"unit":"overseer-api.service","scope":"system","extra":"flag"}))
+    assert calls==[]
+
 def test_rollback_file_removal_crosses_only_exact_sudo_argv(tmp_path):
     target=tmp_path/"config"; target.write_text("private"); step=ProvisioningStep("remove_private_config",{"path":str(target)})
     calls=[]; host=adapter([step],lambda argv,**kwargs:calls.append(argv) or Result())

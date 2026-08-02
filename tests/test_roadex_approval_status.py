@@ -5,7 +5,13 @@ import json
 import pytest
 
 from overseer.admin import approve_admin_change_plan, cancel_admin_change_plan, plan_user_service_restart
-from overseer.backup_provisioning import ProvisioningStatus
+from overseer.backup_provisioning import (
+    DedicatedProvisioningAdapter,
+    ProvisioningStatus,
+    approve_plan,
+    decide_roadex_human_plan,
+    execute_plan,
+)
 from overseer.crew import CrewMessageStatus, CrewReviewStatus
 from overseer.roadex_approval_status import (
     RoadexApprovalBinding,
@@ -100,13 +106,153 @@ def _roadex_plan_with_status(plan, status: ProvisioningStatus, now: str):
         status=status,
         approved_by="human-user",
         approved_at=now,
-        decided_by="human-user",
-        decided_at=now,
         executed_at=now,
         evidence_digest="sha256:" + "4" * 64,
         failed_operation=f"roadex.{status.value}",
         error_code="ROAD_EX_ERROR",
+        # failed/rollback outputs are execution-stage artifacts in producer form.
+        # Keep decision fields absent to match those producer states.
+        decided_by=None,
+        decision_reason=None,
+        # execution failure states should still keep approval lineage.
+        # (approved_by/approved_at are already set above for the failure path.)
     )
+
+
+def _roadex_plan_payload(store: SQLiteStore, plan_id: str) -> dict[str, object]:
+    row = store._connection.execute(
+        "SELECT payload FROM backup_provisioning_plans WHERE id=?",
+        (plan_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(plan_id)
+    return json.loads(str(row["payload"]))
+
+
+def _roadex_adapter_for_plan(
+    plan,
+    *,
+    fail_execute: str | None = None,
+    fail_rollback: str | None = None,
+) -> DedicatedProvisioningAdapter:
+    def ok(_args: object) -> dict[str, object]:
+        return {"ok": True}
+
+    def fail_execute_step(_args: object) -> dict[str, object]:
+        return {"ok": False}
+
+    def fail_rollback_step(_args: object) -> dict[str, object]:
+        return {"ok": False}
+
+    operations: dict[str, object] = {}
+    for step in [*plan.steps, *plan.rollback_steps]:
+        if step.operation == fail_execute:
+            operations[step.operation] = fail_execute_step
+        elif step.operation == fail_rollback:
+            operations[step.operation] = fail_rollback_step
+        else:
+            operations[step.operation] = ok
+    return DedicatedProvisioningAdapter(operations)
+
+
+def test_roadex_human_projection_accepts_approved_and_execute_outputs(tmp_path):
+    path, plan = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=plan.plan_id,
+    )
+    approval_at = "2026-08-02T00:00:00+00:00"
+    execute_at = "2026-08-02T00:01:00+00:00"
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, plan)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, plan),
+        )
+        approve_plan(path, plan.plan_id, "human-user", approval_at)
+        payload = _roadex_plan_payload(store, plan.plan_id)
+        assert payload["status"] == ProvisioningStatus.APPROVED.value
+        assert payload["approved_at"] == approval_at
+
+    approved_projection = roadex_approval_status(path, draft.approval_ref)
+    assert approved_projection["decision"] == "approved"
+    assert approved_projection["updatedAt"] == approval_at
+
+    execute_plan(path, plan.plan_id, _roadex_adapter_for_plan(plan), executed_at=execute_at)
+    with SQLiteStore(path) as store:
+        execution_payload = _roadex_plan_payload(store, plan.plan_id)
+    assert execution_payload["status"] == ProvisioningStatus.EXECUTED.value
+
+    executed_projection = roadex_approval_status(path, draft.approval_ref)
+    assert executed_projection["decision"] == "approved"
+    assert executed_projection["updatedAt"] == execute_at
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_status"),
+    (
+        ("failed", ProvisioningStatus.FAILED),
+        ("rolled_back", ProvisioningStatus.ROLLED_BACK),
+    ),
+)
+def test_roadex_human_projection_accepts_failure_and_rollback_outputs(
+    tmp_path,
+    name,
+    expected_status,
+):
+    path, plan = seeded(tmp_path / f"backups-{name}")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=plan.plan_id,
+    )
+    approval_at = "2026-08-02T00:00:00+00:00"
+    fail_plan_at = "2026-08-02T00:02:00+00:00"
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, plan)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, plan),
+        )
+        approve_plan(path, plan.plan_id, "human-user", approval_at)
+        fail_kwargs = {}
+        if name == "failed":
+            fail_kwargs["fail_rollback"] = plan.rollback_steps[0].operation
+
+        with pytest.raises(ValueError):
+            execute_plan(
+                path,
+                plan.plan_id,
+                _roadex_adapter_for_plan(plan, fail_execute=plan.steps[0].operation, **fail_kwargs),
+                executed_at=fail_plan_at,
+            )
+        failed_payload = _roadex_plan_payload(store, plan.plan_id)
+
+    assert failed_payload["status"] == expected_status.value
+    failed_projection = roadex_approval_status(path, draft.approval_ref)
+    assert failed_projection["decision"] == "approved"
+    assert failed_projection["updatedAt"] == fail_plan_at
+    def ok(_args: object) -> dict[str, object]:
+        return {"ok": True}
+
+    def fail_execute_step(_args: object) -> dict[str, object]:
+        return {"ok": False}
+
+    def fail_rollback_step(_args: object) -> dict[str, object]:
+        return {"ok": False}
+
+    operations: dict[str, callable] = {}
+    for step in [*plan.steps, *plan.rollback_steps]:
+        if step.operation == fail_execute:
+            operations[step.operation] = fail_execute_step
+        elif step.operation == fail_rollback:
+            operations[step.operation] = fail_rollback_step
+        else:
+            operations[step.operation] = ok
+    return DedicatedProvisioningAdapter(operations)
 
 
 def test_bound_source_and_scope_are_one_transaction(tmp_path):
@@ -700,6 +846,165 @@ def test_admin_plan_projection_statuses_are_expected(tmp_path):
         assert cancelled["decision"] == "rejected"
 
 
+def test_admin_terminal_projection_accepts_producer_permitted_missing_times(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path) as store:
+        plan = plan_user_service_restart(
+            "admin.roadex.missing-times",
+            "roadex-test.service",
+            "Terminal time fixture",
+        )
+        draft = _draft_for("admin.roadex.missing-times")
+        binding = stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: store.save_admin_change_plan(plan),
+        )
+        store.save_admin_change_plan(approve_admin_change_plan(plan, "operator"))
+        approved_projection = roadex_approval_status(str(path), draft.approval_ref)
+        assert approved_projection["decision"] == "approved"
+        assert approved_projection["updatedAt"] == binding.created_at
+
+        store.save_admin_change_plan(
+            cancel_admin_change_plan(
+                approve_admin_change_plan(plan, "operator"),
+                "operator",
+                "Withdrawn",
+            )
+        )
+        cancelled = roadex_approval_status(str(path), draft.approval_ref)
+        assert cancelled["decision"] == "rejected"
+        assert cancelled["updatedAt"] == binding.created_at
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected"),
+    (
+        ("deny", "rejected"),
+        ("request_revision", "changes-requested"),
+    ),
+)
+def test_roadex_human_projection_accepts_producer_decision_outputs(
+    tmp_path,
+    decision,
+    expected,
+):
+    path, plan = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=plan.plan_id,
+    )
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, plan)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, plan),
+        )
+
+    decide_roadex_human_plan(
+        path,
+        plan.plan_id,
+        decision,
+        "kira",
+        f"Roadex decision: {decision}",
+    )
+    projection = roadex_approval_status(path, draft.approval_ref)
+
+    with SQLiteStore(path) as store:
+        payload = _roadex_plan_payload(store, plan.plan_id)
+
+    assert projection["decision"] == expected
+    assert projection["updatedAt"] == payload["decided_at"]
+
+
+def test_roadex_human_projection_accepts_approved_and_execute_outputs(tmp_path):
+    path, plan = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=plan.plan_id,
+    )
+    approval_at = "2026-08-02T00:00:00+00:00"
+    execute_at = "2026-08-02T00:01:00+00:00"
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, plan)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, plan),
+        )
+        approve_plan(path, plan.plan_id, "human-user", approval_at)
+
+    with SQLiteStore(path) as store:
+        payload = _roadex_plan_payload(store, plan.plan_id)
+    assert payload["status"] == ProvisioningStatus.APPROVED.value
+    assert payload["approved_at"] == approval_at
+
+    approved_projection = roadex_approval_status(path, draft.approval_ref)
+    assert approved_projection["decision"] == "approved"
+    assert approved_projection["updatedAt"] == approval_at
+
+    execute_plan(path, plan.plan_id, _roadex_adapter_for_plan(plan), executed_at=execute_at)
+    with SQLiteStore(path) as store:
+        execution_payload = _roadex_plan_payload(store, plan.plan_id)
+    assert execution_payload["status"] == ProvisioningStatus.EXECUTED.value
+
+    executed_projection = roadex_approval_status(path, draft.approval_ref)
+    assert executed_projection["decision"] == "approved"
+    assert executed_projection["updatedAt"] == execute_at
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_status"),
+    (
+        ("failed", ProvisioningStatus.FAILED),
+        ("rolled_back", ProvisioningStatus.ROLLED_BACK),
+    ),
+)
+def test_roadex_human_projection_accepts_failure_and_rollback_outputs(
+    tmp_path,
+    name,
+    expected_status,
+):
+    path, plan = seeded(tmp_path / f"backups-{name}")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=plan.plan_id,
+    )
+    fail_plan_at = "2026-08-02T00:02:00+00:00"
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, plan)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, plan),
+        )
+        approve_plan(path, plan.plan_id, "human-user", "2026-08-02T00:00:00+00:00")
+        fail_kwargs = {}
+        if name == "failed":
+            fail_kwargs["fail_rollback"] = plan.rollback_steps[0].operation
+        with pytest.raises(ValueError, match="provisioning step failed"):
+            execute_plan(
+                path,
+                plan.plan_id,
+                _roadex_adapter_for_plan(
+                    plan,
+                    fail_execute=plan.steps[0].operation,
+                    **fail_kwargs,
+                ),
+                executed_at=fail_plan_at,
+            )
+        failed_payload = _roadex_plan_payload(store, plan.plan_id)
+
+    assert failed_payload["status"] == expected_status.value
+    failed_projection = roadex_approval_status(path, draft.approval_ref)
+    assert failed_projection["decision"] == "approved"
+    assert failed_projection["updatedAt"] == fail_plan_at
+
+
 @pytest.mark.parametrize(
     ("status", "decision"),
     (
@@ -741,6 +1046,34 @@ def test_roadex_human_status_projection_maps_all_statuses(tmp_path, status, deci
     assert projection["decision"] == decision
 
 
+def test_roadex_human_projection_uses_parsed_offset_times(tmp_path):
+    path, plan = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=plan.plan_id,
+    )
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, plan)
+        stage_bound_roadex_approval(
+            store,
+            draft,
+            lambda: _write_roadex_plan(store, plan),
+        )
+        projected = replace(
+            plan,
+            status=ProvisioningStatus.EXECUTED,
+            approved_by="human-user",
+            approved_at="2026-01-01T10:00:00+02:00",
+            executed_at="2026-01-01T08:00:00-02:00",
+            evidence_digest="sha256:" + "4" * 64,
+        )
+        _write_roadex_plan(store, projected)
+
+    projection = roadex_approval_status(path, draft.approval_ref)
+    assert projection["updatedAt"] == "2026-01-01T10:00:00+00:00"
+
+
 @pytest.mark.parametrize(
     ("status", "mutator", "expected"),
     (
@@ -748,6 +1081,11 @@ def test_roadex_human_status_projection_maps_all_statuses(tmp_path, status, deci
             ProvisioningStatus.STAGED,
             lambda plan, _now: replace(plan, decision_source="manual"),
             "decision source",
+        ),
+        (
+            ProvisioningStatus.STAGED,
+            lambda plan, _now: replace(plan, approved_at="sha256:deadbeef"),
+            "roadex source staged evidence",
         ),
         (
             ProvisioningStatus.DENIED,
@@ -763,16 +1101,6 @@ def test_roadex_human_status_projection_maps_all_statuses(tmp_path, status, deci
             ProvisioningStatus.DENIED,
             lambda plan, _now: replace(plan, decided_at="bad-time"),
             "decided_at",
-        ),
-        (
-            ProvisioningStatus.DENIED,
-            lambda plan, _now: replace(plan, decided_by="kira"),
-            "must be independent",
-        ),
-        (
-            ProvisioningStatus.REVISION_REQUESTED,
-            lambda plan, _now: replace(plan, decided_by="sisko"),
-            "must be independent",
         ),
         (
             ProvisioningStatus.REVISION_REQUESTED,

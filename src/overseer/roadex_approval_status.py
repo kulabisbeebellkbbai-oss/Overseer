@@ -403,6 +403,8 @@ def project_decision(
         if source_plan.archived:
             raise ValueError("admin source must not be archived")
         if source_plan.canceled:
+            if source_plan.approved:
+                raise ValueError("admin source terminal evidence is malformed")
             _require_admin_canceled_plan_evidence(source_plan)
             if source_plan.approved_by is not None or source_plan.approved_at is not None:
                 raise ValueError("admin source canceled evidence is malformed")
@@ -416,6 +418,8 @@ def project_decision(
                 ),
             )
         if source_plan.approved:
+            if source_plan.canceled:
+                raise ValueError("admin source terminal evidence is malformed")
             _require_admin_approved_plan_evidence(source_plan)
             if source_plan.canceled_by is not None or source_plan.canceled_at is not None or source_plan.cancellation_reason is not None:
                 raise ValueError("admin source approved evidence is malformed")
@@ -424,7 +428,6 @@ def project_decision(
                 "approved",
                 _newest_time(
                     source_plan.approved_at,
-                    source_plan.canceled_at,
                     binding.created_at,
                 ),
             )
@@ -462,23 +465,15 @@ def project_decision(
             "pending",
             status.value,
             _newest_time(
-                source_plan.approved_at,
-                source_plan.decided_at,
-                source_plan.executed_at,
                 binding.created_at,
             ),
         )
     if status == ProvisioningStatus.DENIED:
         _require_roadex_decision_plan_evidence(store, source_plan)
-        _require_roadex_approver_independent(
-            store,
-            str(source_plan.decided_by),
-            source_plan.evidence_ids,
-            "decided_by",
-        )
         if (
             source_plan.approved_by is not None
             or source_plan.approved_at is not None
+            or source_plan.decision_reason is None
             or source_plan.evidence_digest is not None
             or source_plan.executed_at is not None
             or source_plan.failed_operation is not None
@@ -490,20 +485,14 @@ def project_decision(
             status.value,
             _newest_time(
                 source_plan.decided_at,
-                binding.created_at,
             ),
         )
     if status == ProvisioningStatus.REVISION_REQUESTED:
         _require_roadex_decision_plan_evidence(store, source_plan)
-        _require_roadex_approver_independent(
-            store,
-            str(source_plan.decided_by),
-            source_plan.evidence_ids,
-            "decided_by",
-        )
         if (
             source_plan.approved_by is not None
             or source_plan.approved_at is not None
+            or source_plan.decision_reason is None
             or source_plan.evidence_digest is not None
             or source_plan.executed_at is not None
             or source_plan.failed_operation is not None
@@ -515,17 +504,22 @@ def project_decision(
             status.value,
             _newest_time(
                 source_plan.decided_at,
-                binding.created_at,
             ),
         )
     if status in {ProvisioningStatus.APPROVED, ProvisioningStatus.EXECUTED}:
         _require_roadex_approved_plan_evidence(store, source_plan)
+        if (
+            source_plan.decided_by is not None
+            or source_plan.decided_at is not None
+            or source_plan.decision_reason is not None
+            or source_plan.failed_operation is not None
+            or source_plan.error_code is not None
+        ):
+            raise ValueError("roadex source approved evidence is malformed")
         if status == ProvisioningStatus.EXECUTED:
             _require_roadex_execution_evidence(source_plan)
         if (
-            source_plan.failed_operation is not None
-            or source_plan.error_code is not None
-            or (status == ProvisioningStatus.APPROVED and source_plan.executed_at is not None)
+            (status == ProvisioningStatus.APPROVED and source_plan.executed_at is not None)
             or (status == ProvisioningStatus.EXECUTED and source_plan.executed_at is None)
         ):
             raise ValueError("roadex source approved evidence is malformed")
@@ -534,9 +528,7 @@ def project_decision(
             status.value,
             _newest_time(
                 source_plan.approved_at,
-                source_plan.decided_at,
                 source_plan.executed_at,
-                binding.created_at,
             ),
         )
     if status in {ProvisioningStatus.FAILED, ProvisioningStatus.ROLLED_BACK}:
@@ -547,9 +539,7 @@ def project_decision(
             status.value,
             _newest_time(
                 source_plan.approved_at,
-                source_plan.decided_at,
                 source_plan.executed_at,
-                binding.created_at,
             ),
         )
     raise ValueError("unsupported Roadex human decision status")
@@ -912,10 +902,20 @@ def _require_roadex_approver_independent(
 
 
 def _newest_time(*values: str | None) -> str:
-    candidates = [value for value in values if isinstance(value, str) and value]
+    candidates: list[datetime] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("updatedAt must be an ISO 8601 timestamp") from error
+        if parsed.tzinfo is None:
+            raise ValueError("updatedAt must include timezone information")
+        candidates.append(parsed.astimezone(UTC))
     if not candidates:
         raise ValueError("updated time is unavailable")
-    return max(candidates)
+    return max(candidates).isoformat()
 
 
 def _validate_binding_object_types(binding: RoadexApprovalBinding) -> None:

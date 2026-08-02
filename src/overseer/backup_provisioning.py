@@ -220,7 +220,7 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         ProvisioningStep("remove_directory_if_empty", {"path": STATE_PATH}),
         ProvisioningStep("remove_directory_if_empty", {"path": ARTIFACT_PATH}),
         ProvisioningStep("remove_directory_if_empty", {"path": BACKUP_PATH}),
-        ProvisioningStep("remove_system_user_if_unused", {"name": SYSTEM_USER}),
+        ProvisioningStep("remove_system_user_if_unused", {"name": SYSTEM_USER, "retained_path": BACKUP_PATH}),
         ProvisioningStep("remove_runtime_if_unreferenced", {"path": "/opt/theunderdark", "runtime_digest": runtime_digest}),
     )
     plan = DonutHoleBackupProvisioningPlan(plan_id, gpg_sha256, adapter_commit, runtime_digest, capability_digest, dict(root_authorization_refs), tuple(dict(item) for item in root_registrations), overseer_token_source_file, overseer_token_file, cursor_key_file, dict(evidence_ids), steps, rollback, "", config_digest, unit_digest, read_only_paths=(SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file))

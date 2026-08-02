@@ -158,7 +158,13 @@ class ConcreteHostProvisioningAdapter:
         return self._unlink(a["path"])
     def _remove_directory_if_empty(self,a):
         result=self._sudo(["/usr/bin/rmdir",a["path"]],acceptable=(0,1)); return getattr(result,"returncode",1)==0
-    def _remove_system_user_if_unused(self,a): self._sudo(["/usr/sbin/userdel",a["name"]],acceptable=(0,6)); return True
+    def _remove_system_user_if_unused(self,a):
+        present=self._sudo(["/usr/bin/test","-e",a["retained_path"]],acceptable=(0,1)).returncode==0
+        if present:
+            retained=self._sudo(["/usr/bin/find",a["retained_path"],"-mindepth","1","-print","-quit"])
+            if getattr(retained,"stdout",b"").strip(): return False
+        removed=self._sudo(["/usr/sbin/userdel",a["name"]],acceptable=(0,6))
+        return getattr(removed,"returncode",1)==0
     def _remove_runtime_if_unreferenced(self,a): self._sudo(["/usr/bin/rm","-r","--one-file-system",a["path"]],acceptable=(0,1)); return True
     def _install_bytes(self,path,data,mode,owner):
         fd,name=tempfile.mkstemp(prefix="overseer-provision-"); staging=Path(name)

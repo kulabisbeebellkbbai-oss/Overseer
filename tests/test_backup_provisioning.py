@@ -252,6 +252,8 @@ def test_plan_has_exact_boundaries_sandbox_rollback_and_retention(tmp_path):
     assert key.arguments["owner"] == "donuthole-backup" and key.arguments["mode"] == 0o600
     binding = config.arguments["config"]["backup_bindings"][0]
     assert binding["passphrase_file"] == plan.key_path and binding["source_root"] == plan.source_path
+    remove_user = next(step for step in plan.rollback_steps if step.operation == "remove_system_user_if_unused")
+    assert remove_user.arguments == {"name": "donuthole-backup", "retained_path": plan.backup_path}
     assert set(config.arguments["config"]) == {"host", "port", "state_dir", "journal_path", "admission_path", "pagination_path", "registry_path", "overseer_authorization_endpoint", "overseer_root_endpoint", "overseer_token_file", "cursor_key_file", "root_authorization_refs", "limits", "backup_bindings"}
     assert plan.retention_count == 3 and len(plan.rollback_steps) == 14
 

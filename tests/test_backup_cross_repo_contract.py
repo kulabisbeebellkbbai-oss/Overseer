@@ -54,6 +54,7 @@ def test_theunderdark_registration_keeps_root_owned_config_immutable_and_writes_
         OverseerRootControlVerifier.verify=lambda _self,action,payload,digest:ControlPlaneApproval('approval.storage.root.donuthole',action,payload['project_id'],payload['root_id'],payload['policy_revision'],digest,'approved','2099-01-01T00:00:00+00:00')
         try:
             assert register_approved_root(config_path,authorization_ref=authorization_ref,**registration)==target_digest
+            assert register_approved_root(config_path,authorization_ref=authorization_ref,**registration)==target_digest
             assert config_path.read_bytes()==original
             with build_runtime(config_path) as runtime: assert runtime.registry.root_ids('project.donuthole')==('backup-root',)
         finally: config_dir.chmod(0o700)

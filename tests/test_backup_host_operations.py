@@ -132,6 +132,45 @@ def test_rollback_file_removal_crosses_only_exact_sudo_argv(tmp_path):
     assert host.execute(step)["changed"] is True
     assert calls==[["/usr/bin/sudo","--","/usr/bin/test","-e",str(target)],["/usr/bin/sudo","--","/usr/bin/rm","-f","--",str(target)]]
 
+def test_rollback_retains_service_identity_while_mutable_backup_state_remains():
+    step=ProvisioningStep("remove_system_user_if_unused",{"name":"donuthole-backup","retained_path":"/var/lib/codex-development-backups/donuthole"}); calls=[]
+    def runner(argv,**kwargs):
+        calls.append((argv,kwargs))
+        return Result(stdout=b"/var/lib/codex-development-backups/donuthole/state/registry.sqlite3\n" if argv[2]=="/usr/bin/find" else b"")
+    result=adapter([step],runner).execute(step)
+    assert result=={"ok":True,"operation":"remove_system_user_if_unused","changed":False,"redactions_applied":True}
+    assert calls==[
+        (["/usr/bin/sudo","--","/usr/bin/test","-e","/var/lib/codex-development-backups/donuthole"],{"shell":False,"stdin":-3,"stdout":-1,"stderr":-1,"check":False}),
+        (["/usr/bin/sudo","--","/usr/bin/find","/var/lib/codex-development-backups/donuthole","-mindepth","1","-print","-quit"],{"shell":False,"stdin":-3,"stdout":-1,"stderr":-1,"check":False}),
+    ]
+    assert "registry.sqlite3" not in repr(result)
+
+def test_rollback_deletes_unused_service_identity_with_exact_argv_when_no_state_remains():
+    step=ProvisioningStep("remove_system_user_if_unused",{"name":"donuthole-backup","retained_path":"/var/lib/codex-development-backups/donuthole"}); calls=[]
+    def runner(argv,**kwargs):
+        calls.append(argv)
+        return Result(returncode=1 if argv[2]=="/usr/bin/test" else 0,stdout=b"")
+    result=adapter([step],runner).execute(step)
+    assert result["changed"] is True and result["redactions_applied"] is True
+    assert calls==[
+        ["/usr/bin/sudo","--","/usr/bin/test","-e","/var/lib/codex-development-backups/donuthole"],
+        ["/usr/bin/sudo","--","/usr/sbin/userdel","donuthole-backup"],
+    ]
+
+def test_rollback_never_deletes_service_identity_when_retained_path_inspection_fails():
+    step=ProvisioningStep("remove_system_user_if_unused",{"name":"donuthole-backup","retained_path":"/var/lib/codex-development-backups/donuthole"}); calls=[]
+    def runner(argv,**kwargs):
+        calls.append(argv)
+        if argv[2]=="/usr/bin/find": return Result(returncode=1,stderr=b"private filesystem diagnostic")
+        return Result()
+    with pytest.raises(RedactedHostOperationError) as failure: adapter([step],runner).execute(step)
+    assert failure.value.code=="PROCESS_STDERR_SINGLE_LINE_UNCLASSIFIED"
+    assert calls==[
+        ["/usr/bin/sudo","--","/usr/bin/test","-e","/var/lib/codex-development-backups/donuthole"],
+        ["/usr/bin/sudo","--","/usr/bin/find","/var/lib/codex-development-backups/donuthole","-mindepth","1","-print","-quit"],
+    ]
+    assert "private" not in str(failure.value)
+
 def test_runtime_digest_is_commit_tree_and_mode_bound(tmp_path):
     (tmp_path/"src").mkdir(); target=tmp_path/"src"/"module.py"; target.write_text("value=1\n"); target.chmod(0o600)
     first=runtime_digest(tmp_path,"a"*40)

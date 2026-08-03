@@ -499,6 +499,12 @@ class SQLiteStore:
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
+                approval_ref TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS host_security_source_reviews (
                 id TEXT PRIMARY KEY,
                 remote_address TEXT NOT NULL,
@@ -549,6 +555,8 @@ class SQLiteStore:
                 status TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_kind ON roadex_approval_bindings (source_kind);
+            CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id);
             """
         )
         with self._connection:
@@ -1991,6 +1999,86 @@ class SQLiteStore:
 
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
+
+    def _ensure_roadex_approval_bindings(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
+                approval_ref TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_kind ON roadex_approval_bindings (source_kind)"
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id)"
+        )
+
+    def _roadex_binding_fingerprint(self, payload: str) -> str:
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise ValueError("Roadex approval binding payload must be a JSON object")
+        return json.dumps(
+            data,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def save_roadex_approval_binding(self, binding) -> None:
+        from .roadex_approval_status import RoadexApprovalBinding
+        from .roadex_approval_status import _validate_binding_object_types
+
+        if not isinstance(binding, RoadexApprovalBinding):
+            raise ValueError("Roadex approval binding must be exact RoadexApprovalBinding")
+        _validate_binding_object_types(binding)
+
+        self._ensure_roadex_approval_bindings()
+        payload = _dump(binding)
+        existing = self._connection.execute(
+            "SELECT payload FROM roadex_approval_bindings WHERE approval_ref=?",
+            (binding.approval_ref,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload"]) != self._roadex_binding_fingerprint(payload):
+                raise ValueError("Roadex approval binding is immutable")
+            self._commit_agent_mutation()
+            return _load_dataclass(RoadexApprovalBinding, str(existing["payload"]))
+        self._connection.execute(
+            "INSERT INTO roadex_approval_bindings (approval_ref, source_kind, source_id, payload) VALUES (?, ?, ?, ?)",
+            (binding.approval_ref, binding.source_kind, binding.source_id, payload),
+        )
+        self._commit_agent_mutation()
+        return _load_dataclass(RoadexApprovalBinding, payload)
+
+    def load_roadex_approval_binding(self, approval_ref: str) -> object:
+        from .roadex_approval_status import RoadexApprovalBinding
+        from .roadex_approval_status import _decode_roadex_binding_payload
+
+        existing_schema = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadex_approval_bindings'"
+        ).fetchone()
+        if not existing_schema:
+            raise KeyError(approval_ref)
+        row = self._connection.execute(
+            "SELECT source_kind, source_id, payload FROM roadex_approval_bindings WHERE approval_ref=?",
+            (approval_ref,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(approval_ref)
+        binding = _decode_roadex_binding_payload(str(row["payload"]))
+        if str(row["source_id"]) != binding.source_id:
+            raise ValueError("roadex approval binding source_id is inconsistent")
+        if str(row["source_kind"]) != binding.source_kind:
+            raise ValueError("roadex approval binding source_kind is inconsistent")
+        if binding.approval_ref != approval_ref:
+            raise ValueError("roadex approval binding approval_ref is inconsistent")
+        if not isinstance(binding, RoadexApprovalBinding):
+            raise ValueError("roadex approval binding is malformed")
+        return binding
 
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))

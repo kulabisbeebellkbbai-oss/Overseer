@@ -1,5 +1,13 @@
 # DonutHole Provisioning Reliability Design
 
+> **2026-08-03 extension:** Post-design implementation added Overseer's exact
+> source-bound Roadex approval projection and Roadex's durable approval
+> continuation and default-off publication requester. The expanded RCA in
+> [2026-08-03-donuthole-reusable-approval-facility-analysis.md](2026-08-03-donuthole-reusable-approval-facility-analysis.md)
+> is authoritative for the implemented baseline and remaining integration gap.
+> No production source-creation path currently creates the required binding, so
+> the projection is secure but operationally inert for new raw DonutHole plans.
+
 ## Purpose
 
 Prevent future approval-gated provisioning work from using the live protected
@@ -106,9 +114,11 @@ The builder resolves and validates:
 - protected paths, service identity, dependencies, ports, canonical MCP name,
   endpoint, and rollback prerequisites.
 
-The plan and its review-message outbox are committed atomically. Dispatch reads
-only committed outbox entries, so no reviewer can observe a message for a plan
-that does not exist. Review results remain independent immutable records.
+The plan, exact `RoadexApprovalBinding`, preflight, bundle, and review-message
+outbox are committed atomically. Binding must be prospective: a pre-existing
+unbound source is never backfilled. Dispatch reads only committed outbox
+entries, so no reviewer can observe a message for a plan that does not exist.
+Review results remain independent immutable records.
 
 Preflight is read-only and produces a digest-bound report. Final human approval
 is unavailable until the report passes and all terminal crew evidence matches
@@ -153,7 +163,9 @@ behavior acceptance pass.
 
 ### Capability D: Human Lifecycle UI and Operations
 
-Update the Roadex human-decision surface to represent lifecycle states
+Compose the implemented exact Roadex approval projection into the human-decision
+surface; do not create a second approval table or projector. Update the surface
+to represent lifecycle states
 accurately: staged, awaiting reviews, ready for approval, approved, executing,
 acceptance failed, rolled back, successor required, and acceptance passed.
 
@@ -172,14 +184,17 @@ tests use the same lifecycle fixtures as the backend.
 2. Overseer resolves source and authorization state and builds the immutable
    bundle.
 3. Overseer runs deterministic read-only preflight.
-4. A passing bundle and its review-message outbox are committed atomically.
+4. A passing source, exact approval binding, bundle, and review-message outbox
+   are committed atomically.
 5. The dispatcher releases committed messages to the required crew reviewers.
 6. Overseer verifies terminal evidence against the exact bundle digest.
-7. The UI enables independent human approval.
-8. The phased executor materializes, registers, activates, and attests state.
-9. The acceptance harness exercises the live candidate through its real MCP
+7. The UI enables independent human approval and Roadex observes the exact
+   digest-versioned projection.
+8. Roadex resumes the same paused managed thread once within the exact scope.
+9. The phased executor materializes, registers, activates, and attests state.
+10. The acceptance harness exercises the live candidate through its real MCP
    behavior.
-10. Overseer records terminal success only when attestation and acceptance pass;
+11. Overseer records terminal success only when attestation and acceptance pass;
     otherwise it records a checkpointed failure or rollback with a successor
     requirement.
 
@@ -234,6 +249,14 @@ Mocks remain appropriate for failure injection, but a mock cannot be the sole
 test of a cross-repository or service-lifecycle contract.
 
 ## Delivery Decomposition and Dependencies
+
+The post-design approval projection and Roadex continuation are implemented
+baseline components. They do not complete Capability B because the authoritative
+producer does not yet create a binding, and they do not complete Capability D
+because approval status is only one input to the broader execution/acceptance
+lifecycle. Follow the delta plan in
+`docs/superpowers/plans/2026-08-03-donuthole-reusable-approval-facility-remediation.md`
+before resuming the original capability sequence.
 
 The capability plans are delivered in this order:
 

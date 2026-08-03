@@ -1,5 +1,12 @@
 # DonutHole Provisioning Reliability Program Implementation Plan
 
+> **2026-08-03 delta:** Apply
+> [2026-08-03-donuthole-reusable-approval-facility-remediation.md](2026-08-03-donuthole-reusable-approval-facility-remediation.md)
+> as the authoritative integration overlay at the dependency points named in
+> that plan. It incorporates the exact approval projection, durable Roadex
+> continuation, publication requester, DonutHole follow-up guidance, and the
+> missing production binding handoff discovered after this plan was approved.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prevent future DonutHole provisioning changes from reaching human approval before their cross-repository contracts, host prerequisites, active runtime, and real storage behavior are deterministically verifiable.
@@ -23,6 +30,9 @@
 
 ## Plan Set
 
+- [Delta: Reusable Approval Facility Integration](2026-08-03-donuthole-reusable-approval-facility-remediation.md)
+- [Separate: Protected App Publication Workflow](2026-08-03-protected-app-publication-workflow.md)
+
 - [Capability A: Contract and Acceptance Harness](2026-08-02-donuthole-contract-acceptance-harness.md)
 - [Capability B: Typed Bundle and Deterministic Preflight](2026-08-02-donuthole-typed-bundle-preflight.md)
 - [Capability C: Resumable Execution and Runtime Attestation](2026-08-02-donuthole-resumable-execution-attestation.md)
@@ -31,13 +41,25 @@
 ## Dependency Graph
 
 ```text
-Capability A: executable contract and disposable acceptance harness
+Implemented baseline: exact approval projection + durable Roadex continuation
     |
-    +--> Capability B: authoritative bundle, preflight, and review outbox
+    +--> Delta Task 0: freeze approval-source conformance fixture
+    |
+    +--> Delta Task 2: extract allowlisted source adapters
+    |
+    +--> Capability A: real disposable storage contract and acceptance harness
+    |
+    +--> Capability B Task 3 + Delta Task 1: atomic bound bundle
+    |
+    +--> Delta Tasks 3 and 4: Roadex and DonutHole typed consumers
     |
     +--> Capability C: checkpoints, runtime attestation, and acceptance
-             |
-             +--> Capability D: lifecycle projection, UI, and operations
+    |
+    +--> Capability D + Delta Task 5: composed lifecycle and UI
+    |
+    +--> Delta Task 6: real cross-repository acceptance
+
+Delta Task 7: publication semantics becomes a separate default-off plan.
 ```
 
 Capabilities B and C may use separate worktrees after Capability A is reviewed,
@@ -84,7 +106,10 @@ Record the reviewed Overseer and TheUnderdark commits as planning inputs for Cap
 
 **Interfaces:**
 - Consumes: Capability A contract version, schemas, digest algorithms, and reviewed source commits.
-- Produces: typed intent, authoritative server-side bundle, read-only preflight, atomic plan/outbox staging, and idempotent review materialization.
+- Produces: typed intent, authoritative server-side bundle, read-only preflight,
+  atomic source/binding/plan/outbox staging, and idempotent review
+  materialization. Reuse the existing `RoadexApprovalBinding`; never create a
+  competing approval identity or retroactively bind a legacy source.
 
 - [ ] **Step 1: Confirm the Capability A contract is unchanged**
 
@@ -145,8 +170,12 @@ Do not install the runtime, restart services, or execute a provisioning plan. Th
 - Follow exactly: `docs/superpowers/plans/2026-08-02-donuthole-lifecycle-ui-operations.md`
 
 **Interfaces:**
-- Consumes: Capability B bundle/preflight/review records and Capability C execution/checkpoint/attestation/acceptance records.
-- Produces: pure lifecycle projection, read-only lifecycle API, accurate approval actions, responsive UI state rendering, and operator documentation.
+- Consumes: the existing exact Roadex approval projection, Capability B
+  bundle/preflight/review records, and Capability C
+  execution/checkpoint/attestation/acceptance records.
+- Produces: pure lifecycle projection that composes rather than duplicates
+  approval status, read-only lifecycle API, accurate approval actions,
+  responsive UI state rendering, and operator documentation.
 
 - [ ] **Step 1: Freeze the B/C read-model fixtures**
 

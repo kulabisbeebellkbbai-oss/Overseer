@@ -14,7 +14,12 @@
 - Roadex and DonutHole submit bounded intent only; they cannot submit raw plan steps, digests, authorization references, protected paths, crew owners, evidence IDs, or commands.
 - Public staging accepts typed intent plus expected preflight and bundle digests and rebuilds the bundle authoritatively before persistence.
 - Preflight is read-only and performs no control-store or host mutation.
-- The plan, preflight report, bundle, and four review-outbox rows are committed atomically.
+- The source plan, existing exact `RoadexApprovalBinding`, preflight report,
+  bundle, and four review-outbox rows are committed atomically.
+- Reuse `RoadexApprovalBindingDraft`, `RoadexApprovalBinding`, and
+  `stage_bound_roadex_approval()` from `src/overseer/roadex_approval_status.py`.
+  Never create a competing approval identity or retroactively bind a
+  pre-existing source.
 - Dispatch reads only committed pending outbox rows and is idempotent by outbox ID.
 - Review results remain independent immutable crew records.
 - Human approval remains bound to the exact immutable plan, bundle, preflight, and terminal crew evidence.
@@ -28,6 +33,9 @@
 - Create `src/overseer/provisioning_bundle.py`: typed intent, checks, preflight report, review outbox, bundle construction, canonical digests, authoritative rebuild, and atomic staging service.
 - Modify `src/overseer/store.py`: additive schema version 3 tables and transaction-aware bundle, report, plan, and outbox persistence methods.
 - Modify `src/overseer/backup_provisioning.py`: expose store-aware immutable plan persistence, preflight/bundle approval gating, and legacy staged-plan successor handling without changing legacy serialized plan digests.
+- Reuse `src/overseer/roadex_approval_status.py`: prospective exact approval
+  binding and scope digest; extend through the allowlisted adapter registry in
+  the 2026-08-03 delta plan rather than hard-coding another projector.
 - Modify `src/overseer/cli.py`: provisioning-outbox materialization and exact dispatch status functions.
 - Modify `src/overseer/api.py`: authenticated preflight, authoritative stage, bundle status, and exact outbox-dispatch routes.
 - Modify `src/overseer/backup_provisioning_cli.py`: `bundle-preflight`, `bundle-stage`, `bundle-status`, and `review-dispatch` commands; retain legacy list/approve/execute behavior with typed successor enforcement.
@@ -268,7 +276,7 @@ git add src/overseer/provisioning_bundle.py tests/test_provisioning_bundle.py te
 git commit -m "Add deterministic provisioning preflight"
 ```
 
-### Task 3: Schema Version 3 and Atomic Bundle Persistence
+### Task 3: Schema Version 3 and Atomic Source, Binding, and Bundle Persistence
 
 **Files:**
 - Modify: `src/overseer/store.py`
@@ -279,18 +287,18 @@ git commit -m "Add deterministic provisioning preflight"
 
 **Interfaces:**
 - Consumes: `ProvisioningBundleV1` from Task 1 and `SQLiteStore.agent_transaction()`.
-- Produces: `SQLiteStore.save_provisioning_bundle()`, `load_provisioning_bundle(store, plan_id) -> ProvisioningBundleV1`, `save_provisioning_preflight_report()`, `save_provisioning_review_outbox()`, `load_provisioning_review_outbox_payload()`, `list_provisioning_review_outbox_payloads()`, `save_backup_provisioning_plan_payload()`, and `stage_authoritative_bundle()`.
+- Produces: `SQLiteStore.save_provisioning_bundle()`, `load_provisioning_bundle(store, plan_id) -> ProvisioningBundleV1`, `save_provisioning_preflight_report()`, `save_provisioning_review_outbox()`, `load_provisioning_review_outbox_payload()`, `list_provisioning_review_outbox_payloads()`, `save_backup_provisioning_plan_payload()`, and `stage_authoritative_bundle()`; consumes the existing exact binding primitive in the same transaction.
 
 - [ ] **Step 1: Write failing migration, rollback, and idempotency tests**
 
 ```python
-def test_atomic_stage_rolls_back_plan_report_bundle_and_outbox_on_failure(tmp_path, monkeypatch):
+def test_atomic_stage_rolls_back_source_binding_report_bundle_and_outbox_on_failure(tmp_path, monkeypatch):
     store_path = str(tmp_path / "state.sqlite3")
     bundle = bundle_fixture()
     monkeypatch.setattr(SQLiteStore, "save_provisioning_review_outbox", fail_on_second_outbox())
     with pytest.raises(RuntimeError, match="injected outbox failure"):
         stage_authoritative_bundle(store_path, bundle)
-    assert persisted_bundle_rows(store_path) == {"plans": 0, "reports": 0, "bundles": 0, "outbox": 0, "crew": 0}
+    assert persisted_bundle_rows(store_path) == {"plans": 0, "bindings": 0, "reports": 0, "bundles": 0, "outbox": 0, "crew": 0}
 
 def test_atomic_stage_is_exactly_idempotent_and_rejects_changed_bytes(tmp_path):
     store_path = str(tmp_path / "state.sqlite3")
@@ -338,20 +346,32 @@ def save_provisioning_review_outbox(self, entry_id: str, plan_id: str, owner_dom
 def stage_authoritative_bundle(store_path: str, bundle: ProvisioningBundleV1) -> Mapping[str, object]:
     validate_bundle(bundle)
     with SQLiteStore(store_path) as store:
-        existing = store.load_provisioning_bundle_payload_or_none(bundle.intent.plan_id)
         serialized = dump_bundle(bundle)
-        if existing is not None:
-            if existing != serialized:
-                raise ValueError("provisioning bundle ID is immutable")
-            return public_bundle_status(bundle, mutation=False)
-        with store.agent_transaction():
+
+        def save_source_and_bundle() -> None:
             store.save_backup_provisioning_plan_payload(bundle.plan.plan_id, dump_plan(bundle.plan))
             store.save_provisioning_preflight_report(bundle.preflight.report_id, bundle.plan.plan_id, bundle.preflight.report_digest, dump_report(bundle.preflight))
             store.save_provisioning_bundle(bundle.intent.plan_id, bundle.plan.plan_id, bundle.bundle_digest, serialized)
             for entry in bundle.outbox:
                 store.save_provisioning_review_outbox(entry.id, entry.plan_id, entry.owner_domain.value, entry.state, dump_outbox(entry))
-    return public_bundle_status(bundle, mutation=True)
+
+        # stage_bound_roadex_approval owns the one transaction. Its callback
+        # persists source, report, bundle, and outbox before the binding row.
+        # Exact binding replay does not invoke the callback.
+        binding = stage_bound_roadex_approval(
+            store,
+            binding_draft_for_bundle(bundle),
+            save_source_and_bundle,
+        )
+        mutation = verify_exact_persisted_bundle_set(store, bundle, binding)
+    return public_bundle_status(bundle, binding=binding, mutation=mutation)
 ```
+
+`stage_bundle_api()` must perform its authoritative bundle rebuild and second
+current-root resolution before calling this persistence function on every
+attempt, including replay. `verify_exact_persisted_bundle_set()` then proves
+the persisted source, binding, report, bundle, and outbox all exist and match;
+it rejects partial or changed replay without writing.
 
 - [ ] **Step 5: Run store, migration, and provisioning tests**
 
@@ -362,7 +382,7 @@ Expected: all selected tests pass and schema assertions report version `3`.
 - [ ] **Step 6: Commit the atomic persistence slice**
 
 ```bash
-git add src/overseer/store.py src/overseer/backup_provisioning.py src/overseer/provisioning_bundle.py tests/test_provisioning_bundle.py tests/test_core.py
+git add src/overseer/store.py src/overseer/backup_provisioning.py src/overseer/provisioning_bundle.py tests/test_provisioning_bundle.py tests/test_roadex_approval_status.py tests/test_core.py
 git commit -m "Persist provisioning bundles atomically"
 ```
 
@@ -552,7 +572,8 @@ git commit -m "Dispatch provisioning reviews from atomic outbox"
 - Modify: `docs/superpowers/specs/2026-08-02-donuthole-provisioning-reliability-design.md`
 
 **Interfaces:**
-- Consumes: persisted bundle, passing preflight report, dispatched outbox, and exact terminal crew evidence.
+- Consumes: persisted exact approval binding, bundle, passing preflight report,
+  dispatched outbox, and exact terminal crew evidence.
 - Produces: `_require_bundle_preflight_and_reviews(store, plan)`, stable `TYPED_BUNDLE_REQUIRED`, `PREFLIGHT_NOT_CURRENT`, and `SUCCESSOR_REQUIRED` errors, plus Roadex readiness blockers.
 
 - [ ] **Step 1: Write failing approval and compatibility tests**
@@ -604,6 +625,8 @@ Compatibility policy to encode in tests and documentation:
 ```text
 Terminal legacy plans remain listable and auditable with their original digest.
 Legacy staged plans without a typed bundle cannot receive new approval and require a successor.
+Legacy sources without a prospective exact approval binding cannot be
+retroactively projected and require a successor.
 Existing approved plans are not rewritten; deployment must explicitly decide whether to execute or supersede each one.
 The raw /backup-provisioning/stage route returns TYPED_BUNDLE_REQUIRED for new requests after feature enablement.
 Non-provisioning crew dispatch remains unchanged.

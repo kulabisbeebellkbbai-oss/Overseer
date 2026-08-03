@@ -6,6 +6,11 @@
 
 **Architecture:** Add a pure lifecycle projection over the authoritative Capability B bundle/preflight/review records and Capability C execution/checkpoint/attestation/acceptance records. Expose it through a read-only lifecycle API, keep the existing Roadex decision route as the exact human mutation boundary, and render the same projection in the responsive Overseer UI. Historical plans remain inspectable, while only the latest authoritative successor may expose decision actions.
 
+The existing `GET /roadex/approval-status` projection and
+`RoadexApprovalBinding` are the authoritative approval-status input. Capability
+D must compose them into the broader lifecycle; it must not create another
+approval table, binding, status projector, or decision-version algorithm.
+
 **Tech Stack:** Python 3.11+, frozen dataclasses and `StrEnum`, SQLite JSON records supplied by Capabilities B and C, Overseer's authenticated local HTTP API, embedded vanilla JavaScript UI, pytest/unittest API harnesses, responsive UI fixtures, Markdown operator documentation.
 
 ## Global Constraints
@@ -20,6 +25,9 @@
 - Latest-plan selection uses explicit successor links and authoritative chronology, never lexicographic plan-ID ordering.
 - A terminal successor suppresses stale predecessor actions but does not delete predecessor history.
 - Existing `/roadex/human-decisions` and `/roadex/human-decisions/decide` clients remain compatible for one migration cycle.
+- Existing `/roadex/approval-status` response fields and no-mutation behavior
+  remain compatible. Lifecycle output references its `approvalRef`,
+  `scopeDigest`, and `decisionVersion`.
 - Protected provisioning mutation routes continue requiring the admin token. Tokens and secrets never enter lifecycle payloads, markup, logs, fixtures, or examples.
 - Raw subprocess output and private configuration remain unavailable. Expose stable codes, safe summaries, timestamps, and digests only.
 - Capability D does not deploy, restart Overseer, mutate protected-host state, provision DonutHole, or authorize route, firewall, storage, or service changes.
@@ -61,6 +69,7 @@ from overseer.provisioning_bundle import (
     ProvisioningPreflightReport,
     ProvisioningReviewOutboxEntry,
 )
+from overseer.roadex_approval_status import RoadexApprovalProjection
 
 
 @dataclass(frozen=True)
@@ -76,6 +85,7 @@ class LifecycleSnapshot:
     acceptance: BehaviorAcceptance | None
     successor_required: bool
     successor_reason: str | None
+    approval_projection: RoadexApprovalProjection
 
 
 @dataclass(frozen=True)
@@ -283,6 +293,8 @@ POST /roadex/human-decisions/decide
 ```
 
 Assert head-first ordering, exact filtering, unknown-plan empty result, redaction, prefix equivalence, and unauthenticated decision rejection.
+Also assert that lifecycle approval fields exactly match
+`/roadex/approval-status` and that neither GET mutates binding or source state.
 
 - [ ] **Step 2: Verify route absence**
 
@@ -542,6 +554,8 @@ Report source SHA, focused/full tests, responsive/accessibility evidence, and de
 ## Final Acceptance Checklist
 
 - [ ] Every lifecycle state comes from authoritative Capability B/C records.
+- [ ] Approval identity and decision version come from the existing exact
+  Roadex approval projection, with no duplicate approval store or projector.
 - [ ] Only server-derived `ready_for_approval` enables approval.
 - [ ] Approval, execution, attestation, and acceptance remain distinct.
 - [ ] Only `acceptance_passed` is success.

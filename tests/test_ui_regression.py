@@ -565,11 +565,10 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
                     subject="Restart test service",
                 )
                 with SQLiteStore(store_path) as store:
-                    _write_roadex_plan(store, source)
                     stage_bound_roadex_approval(
                         store,
                         draft,
-                        lambda: None,
+                        lambda: _write_roadex_plan(store, source),
                     )
                     source_payload = json.loads(
                         store._connection.execute(
@@ -619,11 +618,10 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
                     subject="Restart test service",
                 )
                 with SQLiteStore(store_path) as store:
-                    _write_roadex_plan(store, source)
                     stage_bound_roadex_approval(
                         store,
                         draft,
-                        lambda: None,
+                        lambda: _write_roadex_plan(store, source),
                     )
                     source_payload = json.loads(
                         store._connection.execute(

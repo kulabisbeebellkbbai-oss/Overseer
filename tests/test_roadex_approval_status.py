@@ -82,7 +82,7 @@ def _write_roadex_plan(store: SQLiteStore, plan) -> None:
         "INSERT OR REPLACE INTO backup_provisioning_plans (id, payload) VALUES (?, ?)",
         (plan.plan_id, _roadex_payload(plan)),
     )
-    store._connection.commit()
+    store._commit_agent_mutation()
 
 
 def _roadex_plan_with_status(plan, status: ProvisioningStatus, now: str):
@@ -187,7 +187,6 @@ def test_roadex_human_projection_accepts_approved_and_execute_outputs(tmp_path):
     approval_at = "2026-08-02T00:00:00+00:00"
     execute_at = "2026-08-02T00:01:00+00:00"
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -233,7 +232,6 @@ def test_roadex_human_projection_accepts_failure_and_rollback_outputs(
     approval_at = "2026-08-02T00:00:00+00:00"
     fail_plan_at = "2026-08-02T00:02:00+00:00"
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -361,6 +359,52 @@ def test_legacy_unbound_source_fails_closed(tmp_path):
         roadex_approval_status(str(path), "admin.legacy")
 
 
+def test_stage_bound_roadex_approval_rejects_preexisting_unbound_admin_source(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    draft = _draft_for("admin.legacy")
+    callback_calls = {"count": 0}
+    with SQLiteStore(path) as store:
+        store.save_admin_change_plan(
+            plan_user_service_restart(
+                draft.source_id,
+                "roadex-test.service",
+                "Legacy approval fixture",
+            )
+        )
+
+        def backfill_attempt() -> None:
+            callback_calls["count"] += 1
+
+        with pytest.raises(ValueError, match="preexisting source cannot be bound"):
+            stage_bound_roadex_approval(store, draft, backfill_attempt)
+
+        assert callback_calls["count"] == 0
+        with pytest.raises(KeyError, match=draft.approval_ref):
+            store.load_roadex_approval_binding(draft.approval_ref)
+
+
+def test_stage_bound_roadex_approval_rejects_preexisting_unbound_roadex_source(tmp_path):
+    path, source = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=source.plan_id,
+    )
+    callback_calls = {"count": 0}
+    with SQLiteStore(path) as store:
+        _write_roadex_plan(store, source)
+
+        def backfill_attempt() -> None:
+            callback_calls["count"] += 1
+
+        with pytest.raises(ValueError, match="preexisting source cannot be bound"):
+            stage_bound_roadex_approval(store, draft, backfill_attempt)
+
+        assert callback_calls["count"] == 0
+        with pytest.raises(KeyError, match=draft.approval_ref):
+            store.load_roadex_approval_binding(draft.approval_ref)
+
+
 def test_stage_bound_roadex_approval_is_idempotent_for_identical_replay(tmp_path):
     path = tmp_path / "state.sqlite3"
     with SQLiteStore(path) as store:
@@ -395,7 +439,6 @@ def test_stage_bound_roadex_approval_replay_does_not_reinvoke_source(tmp_path, s
     calls = {"count": 0}
 
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",
@@ -442,7 +485,6 @@ def test_stage_bound_roadex_approval_rejects_non_staged_initial_binding(tmp_path
     source = _roadex_plan_with_status(source, status, now)
 
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",
@@ -730,7 +772,6 @@ def test_roadex_approval_binding_rejects_tampered_stored_payload(tmp_path):
         source_id=source.plan_id,
     )
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -905,7 +946,6 @@ def test_roadex_human_source_projection_rejects_malformed_exact_payload(tmp_path
         source_id=source.plan_id,
     )
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -959,7 +999,6 @@ def _mutate_admin_nested_payload_bad_type(payload: dict[str, object]) -> None:
 def test_roadex_human_source_projection_rejects_nested_payload_variants(tmp_path, mutator, expected):
     path, source = seeded(tmp_path / "backups")
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",
@@ -1032,7 +1071,6 @@ def test_roadex_human_projection_rejects_malformed_binding_created_at_in_termina
     path, source = seeded(tmp_path / "backups")
     malformed_created_at = "NOT_A_TIMESTAMP_SECRET"
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",
@@ -1086,6 +1124,28 @@ def test_source_save_exception_rolls_back_binding(tmp_path):
             store.load_roadex_approval_binding(draft.approval_ref)
 
 
+def test_roadex_source_save_exception_rolls_back_source_and_binding(tmp_path):
+    path, source = seeded(tmp_path / "backups")
+    draft = _draft_for(
+        "admin.roadex.human",
+        source_kind="roadex-human-decision",
+        source_id=source.plan_id,
+    )
+    with SQLiteStore(path) as store:
+        def save_and_fail() -> None:
+            _write_roadex_plan(store, source)
+            raise ValueError("source staging failed")
+
+        with pytest.raises(ValueError, match="source staging failed"):
+            stage_bound_roadex_approval(store, draft, save_and_fail)
+
+        assert store._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backup_provisioning_plans'"
+        ).fetchone() is None
+        with pytest.raises(KeyError, match=draft.approval_ref):
+            store.load_roadex_approval_binding(draft.approval_ref)
+
+
 def test_source_evidence_fails_closed_when_binding_created_without_source_match(tmp_path):
     path = tmp_path / "state.sqlite3"
     draft = _draft_for("admin.roadex.test")
@@ -1114,7 +1174,6 @@ def test_source_evidence_fails_closed_when_binding_created_without_source_match(
 def test_roadex_human_scope_and_source_evidence_digest_use_exact_contract(tmp_path):
     path, plan = seeded(tmp_path / "backups")
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         draft = _draft_for("admin.roadex.human", source_kind="roadex-human-decision", source_id=plan.plan_id)
         binding = stage_bound_roadex_approval(
             store,
@@ -1416,7 +1475,6 @@ def test_roadex_human_projection_accepts_producer_decision_outputs(
         source_id=plan.plan_id,
     )
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -1449,7 +1507,6 @@ def test_roadex_human_projection_accepts_approved_and_execute_outputs(tmp_path):
     approval_at = "2026-08-02T00:00:00+00:00"
     execute_at = "2026-08-02T00:01:00+00:00"
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -1496,7 +1553,6 @@ def test_roadex_human_projection_accepts_failure_and_rollback_outputs(
     )
     fail_plan_at = "2026-08-02T00:02:00+00:00"
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -1540,7 +1596,6 @@ def test_roadex_human_projection_accepts_failure_and_rollback_outputs(
 def test_roadex_human_status_projection_maps_all_statuses(tmp_path, status, decision):
     path, plan = seeded(tmp_path / "backups")
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         now = datetime.now(UTC).isoformat()
 
         draft = _draft_for(
@@ -1574,7 +1629,6 @@ def test_roadex_human_projection_uses_parsed_offset_times(tmp_path):
         source_id=plan.plan_id,
     )
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         stage_bound_roadex_approval(
             store,
             draft,
@@ -1760,7 +1814,6 @@ def test_roadex_human_status_projection_rejects_malformed_evidence(
         template = _roadex_plan_with_status(source, status, now)
 
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, template)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",
@@ -1790,7 +1843,6 @@ def test_roadex_human_status_projection_rejects_malformed_evidence(
 def test_roadex_human_terminal_status_without_approved_evidence_is_rejected(tmp_path, status):
     path, plan = seeded(tmp_path / "backups")
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, plan)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",
@@ -1870,7 +1922,6 @@ def test_roadex_approval_projection_is_public_and_exact(tmp_path):
 def test_roadex_human_plan_contract_validation_rejects_bad_source_records(tmp_path, mutator, expected):
     path, source = seeded(tmp_path / "backups")
     with SQLiteStore(path) as store:
-        _write_roadex_plan(store, source)
         draft = _draft_for(
             "admin.roadex.human",
             source_kind="roadex-human-decision",

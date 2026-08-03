@@ -357,12 +357,35 @@ def stage_bound_roadex_approval(
             _validate_replayed_binding(existing, draft, source)
             return existing
 
+        if _source_exists_for_draft(store, draft):
+            raise ValueError("preexisting source cannot be bound")
+
         save_source()
         source = load_source_from_draft(store, draft)
         _require_initial_source_state(draft.source_kind, source)
         source_digest = exact_source_evidence_digest(source)
         binding = binding_from_draft(draft, source_digest)
         return store.save_roadex_approval_binding(binding)
+
+
+def _source_exists_for_draft(store, draft: RoadexApprovalBindingDraft) -> bool:
+    table = {
+        "admin-plan": "admin_change_plans",
+        "roadex-human-decision": "backup_provisioning_plans",
+    }[draft.source_kind]
+    table_exists = store._connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    if table_exists is None:
+        return False
+    return (
+        store._connection.execute(
+            f"SELECT 1 FROM {table} WHERE id=?",
+            (draft.source_id,),
+        ).fetchone()
+        is not None
+    )
 
 
 def roadex_approval_status(

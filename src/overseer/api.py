@@ -804,7 +804,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/roadex/approval-stage",
             } and route.query:
                 self._write_bundle_error(
-                    "INVALID_BUNDLE_PREFLIGHT_REQUEST"
+                    "INVALID_ROADEX_APPROVAL_STAGE_REQUEST"
+                    if path == "/roadex/approval-stage"
+                    else "INVALID_BUNDLE_PREFLIGHT_REQUEST"
                     if path.endswith("/preflight")
                     else "INVALID_BUNDLE_STAGE_REQUEST"
                     if path.endswith("/stage")

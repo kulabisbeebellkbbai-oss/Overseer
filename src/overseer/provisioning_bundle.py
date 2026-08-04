@@ -232,15 +232,51 @@ def _write_snapshot(snapshot_fd: int, snapshot: bytes) -> None:
 
 def _require_authority_schema(connection: sqlite3.Connection) -> None:
     required = {
-        "storage_root_authorizations": (("id", "project_id", "root_id", "status", "payload"), ()),
-        "approvals": (("id", "subject_id", "payload"), ()),
-        "crew_messages": (("id", "owner_domain", "payload"), ()),
+        "storage_root_authorizations": (
+            ("id", "project_id", "root_id", "status", "payload"),
+            (),
+            "CREATE TABLE storage_root_authorizations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, root_id TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL)",
+        ),
+        "approvals": (
+            ("id", "subject_id", "payload"),
+            (),
+            """CREATE TABLE approvals (
+                id TEXT PRIMARY KEY,
+                subject_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )""",
+        ),
+        "crew_messages": (
+            ("id", "owner_domain", "payload"),
+            (),
+            """CREATE TABLE crew_messages (
+                id TEXT PRIMARY KEY,
+                owner_domain TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )""",
+        ),
         "storage_authorization_revocations": (
             ("id", "kind", "authorization_ref", "revoked_by", "revoked_at", "evidence_id"),
             (("authorization_ref", 2),),
+            "CREATE TABLE storage_authorization_revocations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,authorization_ref TEXT NOT NULL UNIQUE,revoked_by TEXT NOT NULL,revoked_at TEXT NOT NULL,evidence_id TEXT NOT NULL)",
         ),
     }
-    for table, (columns, unique_columns) in required.items():
+    for table, (columns, unique_columns, canonical_sql) in required.items():
+        schema_rows = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=? AND tbl_name=?",
+            (table, table),
+        ).fetchall()
+        if (
+            len(schema_rows) != 1
+            or len(schema_rows[0]) != 1
+            or type(schema_rows[0][0]) is not str
+            or " ".join(schema_rows[0][0].split()) != " ".join(canonical_sql.split())
+            or connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name=? LIMIT 1",
+                (table,),
+            ).fetchone() is not None
+        ):
+            raise ValueError("root authorization schema is unavailable")
         expected_columns = tuple(
             (position, column, "TEXT", 0 if position == 0 else 1, None, 1 if position == 0 else 0, 0)
             for position, column in enumerate(columns)

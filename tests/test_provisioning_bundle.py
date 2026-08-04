@@ -884,6 +884,49 @@ def test_default_authority_resolution_rejects_constraint_free_lookalike_schema(t
     assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
 
 
+@pytest.mark.parametrize(
+    "schema",
+    (
+        """CREATE TABLE approvals (
+            id TEXT PRIMARY KEY,
+            subject_id TEXT NOT NULL CHECK(length(subject_id)>0) /* private schema detail */,
+            payload TEXT NOT NULL
+        )""",
+        """CREATE TABLE approvals (
+            id TEXT PRIMARY KEY ON CONFLICT REPLACE /* private schema detail */,
+            subject_id TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )""",
+        """CREATE TABLE approvals (
+            id TEXT PRIMARY KEY,
+            subject_id TEXT COLLATE NOCASE NOT NULL /* private schema detail */,
+            payload TEXT NOT NULL
+        )""",
+    ),
+    ids=("check-clause", "primary-key-conflict-policy", "column-collation"),
+)
+def test_default_authority_resolution_rejects_noncanonical_schema_clauses(tmp_path, schema):
+    store_path = seeded_authority_store(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute("ALTER TABLE approvals RENAME TO approvals_canonical")
+        connection.execute(schema)
+        connection.execute(
+            "INSERT INTO approvals (id,subject_id,payload) "
+            "SELECT id,subject_id,payload FROM approvals_canonical"
+        )
+        connection.execute("DROP TABLE approvals_canonical")
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert "private schema detail" not in repr(report)
+    assert "CHECK(length" not in repr(report)
+
+
 @pytest.mark.parametrize("payload_kind", ("blob", "duplicate-key"))
 def test_default_authority_resolution_rejects_noncanonical_physical_payloads(tmp_path, payload_kind):
     store_path = seeded_authority_store(tmp_path)

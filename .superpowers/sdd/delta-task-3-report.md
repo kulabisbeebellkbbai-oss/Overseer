@@ -102,7 +102,7 @@ Required Roadex commands:
 
 ```text
 npm test -- tests/approvalLifecycleIntegration.test.ts tests/approvalStatusProvider.test.ts tests/approvalCoordinator.test.ts tests/approvalWorkflowMcp.test.ts
-4 files passed, 108 tests passed
+4 files passed, 109 tests passed
 
 npm run lint
 passed

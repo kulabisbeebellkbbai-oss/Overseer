@@ -206,6 +206,27 @@ if (!blockedFailover.includes(" disabled") || !blockedFailover.includes("Control
         self.assertIn('postJson("/roadex/human-decisions/decide"', OPERATOR_CONSOLE_HTML)
         self.assertIn("Approve and complete", OPERATOR_CONSOLE_HTML)
         self.assertIn("min-height: 44px", OPERATOR_CONSOLE_HTML)
+        self.assertIn("item.blocker_codes || []", OPERATOR_CONSOLE_HTML)
+        self.assertIn('class="roadex-readiness-blockers" role="status"', OPERATOR_CONSOLE_HTML)
+        self.assertIn('aria-live="polite" aria-atomic="true"', OPERATOR_CONSOLE_HTML)
+
+    def test_roadex_readiness_route_returns_server_codes_and_explanations(self):
+        from tests.test_backup_provisioning import _typed_bundle_with_reviews
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path, plan, _bundle = _typed_bundle_with_reviews(
+                Path(directory), review_count=3,
+            )
+            with LocalApiHarness(Path(store_path)) as server:
+                queue = server.get_json("/Overseer/roadex/human-decisions")
+
+        item = queue["items"][0]
+        self.assertEqual(item["plan_id"], plan.plan_id)
+        self.assertFalse(item["ready"])
+        self.assertEqual(
+            item["blocker_codes"], ["REVIEW_EVIDENCE_NOT_CURRENT"],
+        )
+        self.assertIn("all four exact provisioning reviews", item["blockers"][0].lower())
 
     def test_roadex_human_decision_route_requires_admin_auth_and_records_denial(self):
         from overseer.backup_provisioning import stage_plan

@@ -1,12 +1,17 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import json
+import sqlite3
+import threading
 
 import pytest
 
+from overseer import backup_provisioning as backup_provisioning_module
+from overseer import provisioning_bundle as provisioning_bundle_module
 from overseer.backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
 from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest
 from overseer.backup_host_operations import RedactedHostOperationError
-from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStatus, ProvisioningStep, _dump, _load, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, save_staged_plan_source, stage_plan
+from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStatus, ProvisioningStep, _dump, _load, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, save_staged_plan_source, stage_plan, stage_plan_api
 from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
@@ -24,6 +29,482 @@ def seeded(tmp_path):
             store.save_crew_message(CrewMessage(identifier, domain, "Backup review", "Approved exact provisioning plan", RiskLevel.HIGH, CrewMessageStatus.ACKNOWLEDGED, domain.value, now, now, related_plan_id="backup-provision.donuthole", review_status=CrewReviewStatus.APPROVED, decided_by=domain.value, decided_at=now))
     registration = {"project_id": "project.donuthole", "root_id": "backup-root", "policy_revision": "1", "host_path": "/home/god/Documents/Codex Workspace/DonutHole", "alias": "donuthole-source", "max_bytes": 1073741824, "authorization_ref": "root-auth.donuthole"}
     return str(path), build_plan("backup-provision.donuthole", "sha256:" + "a" * 64, "b" * 40, "sha256:" + "d" * 64, "sha256:" + "c" * 64, {"sha256:" + "e" * 64: "root-auth.donuthole"}, (registration,), "/run/user/1000/overseer-api-token", "/etc/codex-development-backups/keys/overseer.token", "/etc/codex-development-backups/keys/cursor.key", evidence)
+
+
+def _typed_bundle_with_reviews(tmp_path, review_count=4, correction_index=None):
+    from tests.test_provisioning_bundle import (
+        _task5_forge_claimed_terminal,
+        _task5_record_terminal_dispatch,
+        authoritative_bundle_fixture,
+        stage_expected_bundle,
+    )
+
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    for index, entry in enumerate(bundle.outbox[:review_count]):
+        decided_at = f"2026-08-02T12:0{index}:00+00:00"
+        if index == correction_index:
+            _task5_forge_claimed_terminal(
+                store_path,
+                entry,
+                review_status=CrewReviewStatus.CORRECTION_REQUESTED,
+                claim_at=decided_at,
+                decided_at=decided_at,
+                audit_summary=(
+                    f"{entry.owner_domain.value} dispatch skipped: "
+                    "exact immutable provisioning review passed"
+                ),
+            )
+            provisioning_bundle_module._complete_review_outbox_dispatch(
+                store_path, entry.id,
+            )
+            continue
+        provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+        _entry, _message, claimed = (
+            provisioning_bundle_module._claim_review_outbox_dispatch(
+                store_path,
+                entry.id,
+                "independent-dispatcher",
+                decided_at,
+            )
+        )
+        assert claimed is True
+        _task5_record_terminal_dispatch(
+            store_path, entry, decided_at,
+        )
+        provisioning_bundle_module._complete_review_outbox_dispatch(
+            store_path, entry.id,
+        )
+    return store_path, bundle.plan, bundle
+
+
+def _plan_row_exists(store_path, plan_id):
+    connection = sqlite3.connect(store_path)
+    try:
+        return connection.execute(
+            "SELECT 1 FROM backup_provisioning_plans WHERE id=?", (plan_id,),
+        ).fetchone() is not None
+    finally:
+        connection.close()
+
+
+def _raw_stage_payload(plan):
+    return {
+        "plan_id": plan.plan_id,
+        "gpg_sha256": plan.gpg_sha256,
+        "adapter_commit": plan.adapter_commit,
+        "runtime_digest": plan.runtime_digest,
+        "capability_digest": plan.capability_digest,
+        "root_authorization_refs": dict(plan.root_authorization_refs),
+        "root_registrations": [dict(item) for item in plan.root_registrations],
+        "overseer_token_source_file": plan.overseer_token_source_file,
+        "overseer_token_file": plan.overseer_token_file,
+        "cursor_key_file": plan.cursor_key_file,
+        "evidence_ids": dict(plan.evidence_ids),
+    }
+
+
+def _approval_control_rows(store_path):
+    connection = sqlite3.connect(store_path)
+    try:
+        return tuple(
+            (
+                table,
+                tuple(connection.execute(
+                    f"SELECT * FROM {table} ORDER BY 1"
+                ).fetchall()),
+            )
+            for table in (
+                "backup_provisioning_plans",
+                "roadex_approval_bindings",
+                "provisioning_preflight_reports",
+                "provisioning_bundles",
+                "provisioning_review_outbox",
+                "crew_messages",
+                "audit_events",
+            )
+        )
+    finally:
+        connection.close()
+
+
+def test_unknown_approval_blocker_does_not_expose_internal_exception_text():
+    secret = "/private/path?token=fake-secret"
+
+    code, explanation = backup_provisioning_module._approval_blocker(
+        KeyError(secret),
+    )
+
+    assert code == "REVIEW_EVIDENCE_NOT_CURRENT"
+    assert secret not in explanation
+    assert "current VERIFIED completion receipts" in explanation
+
+
+def test_typed_human_approval_requires_all_exact_completion_receipts(tmp_path):
+    store_path, plan, bundle = _typed_bundle_with_reviews(
+        tmp_path, review_count=3,
+    )
+    before = _approval_control_rows(store_path)
+
+    with pytest.raises(ValueError, match="^REVIEW_EVIDENCE_NOT_CURRENT$"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+    assert _approval_control_rows(store_path) == before
+    assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
+    assert all(entry.state == "pending" for entry in bundle.outbox)
+
+
+@pytest.mark.parametrize("corruption", ("missing", "digest"))
+def test_typed_human_approval_rejects_missing_or_stale_preflight(
+    tmp_path, corruption,
+):
+    store_path, plan, bundle = _typed_bundle_with_reviews(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        if corruption == "missing":
+            connection.execute(
+                "DELETE FROM provisioning_preflight_reports WHERE id=?",
+                (bundle.preflight.report_id,),
+            )
+        else:
+            connection.execute(
+                "UPDATE provisioning_preflight_reports SET report_digest=? WHERE id=?",
+                ("sha256:" + "f" * 64, bundle.preflight.report_id),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    before = _approval_control_rows(store_path)
+
+    with pytest.raises(ValueError, match="^PREFLIGHT_NOT_CURRENT$"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+    assert _approval_control_rows(store_path) == before
+
+
+def test_typed_human_approval_rejects_forged_completion_receipt(tmp_path):
+    store_path, plan, bundle = _typed_bundle_with_reviews(tmp_path)
+    completion_id = (
+        f"audit.{bundle.outbox[0].message_id}."
+        "provisioning-review-dispatch-complete"
+    )
+    connection = sqlite3.connect(store_path)
+    try:
+        payload = json.loads(connection.execute(
+            "SELECT payload FROM audit_events WHERE id=?", (completion_id,),
+        ).fetchone()[0])
+        payload["summary"] = "forged completion"
+        connection.execute(
+            "UPDATE audit_events SET payload=? WHERE id=?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), completion_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="^REVIEW_EVIDENCE_NOT_CURRENT$"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+
+def test_typed_human_approval_maps_legitimate_correction_to_stable_blocker(
+    tmp_path,
+):
+    store_path, plan, _bundle = _typed_bundle_with_reviews(
+        tmp_path, correction_index=0,
+    )
+
+    with pytest.raises(ValueError, match="^REVIEW_EVIDENCE_NOT_CURRENT$"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+    queue = list_roadex_human_decisions(store_path)
+    assert queue["items"][0]["blocker_codes"] == [
+        "REVIEW_EVIDENCE_NOT_CURRENT",
+    ]
+    assert "all four exact provisioning reviews" in (
+        queue["items"][0]["blockers"][0].lower()
+    )
+
+
+def test_exact_typed_human_approval_is_read_only_until_atomic_plan_update(tmp_path):
+    store_path, plan, bundle = _typed_bundle_with_reviews(tmp_path)
+    outbox_before = tuple(
+        provisioning_bundle_module._dump_review_outbox_entry(entry)
+        for entry in bundle.outbox
+    )
+
+    result = approve_plan(store_path, plan.plan_id, "independent-human")
+
+    assert result["status"] == ProvisioningStatus.APPROVED.value
+    with SQLiteStore(store_path) as store:
+        assert tuple(record[4] for record in (
+            store.list_provisioning_review_outbox_records(plan.plan_id)
+        )) == outbox_before
+
+
+def test_roadex_readiness_is_server_derived_and_has_zero_data_mutation(tmp_path):
+    store_path, plan, _bundle = _typed_bundle_with_reviews(tmp_path)
+    before = _approval_control_rows(store_path)
+
+    queue = list_roadex_human_decisions(store_path)
+
+    assert queue["mutation_performed"] is False
+    assert queue["items"][0]["plan_id"] == plan.plan_id
+    assert queue["items"][0]["ready"] is True
+    assert queue["items"][0]["blocker_codes"] == []
+    assert queue["items"][0]["blockers"] == []
+    assert _approval_control_rows(store_path) == before
+
+
+def test_roadex_readiness_uses_one_consistent_read_snapshot(
+    tmp_path, monkeypatch,
+):
+    store_path, plan, bundle = _typed_bundle_with_reviews(tmp_path)
+    verifier_reached = threading.Event()
+    writer_finished = threading.Event()
+    real_verify = (
+        provisioning_bundle_module.verify_exact_completed_review_outbox_set
+    )
+    completion_id = (
+        f"audit.{bundle.outbox[0].message_id}."
+        "provisioning-review-dispatch-complete"
+    )
+
+    def delete_completion():
+        assert verifier_reached.wait(timeout=10)
+        connection = sqlite3.connect(store_path, timeout=10)
+        try:
+            connection.execute("DELETE FROM audit_events WHERE id=?", (completion_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        writer_finished.set()
+
+    def verify_after_writer(store, exact_bundle):
+        verifier_reached.set()
+        assert writer_finished.wait(timeout=10)
+        return real_verify(store, exact_bundle)
+
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "verify_exact_completed_review_outbox_set",
+        verify_after_writer,
+    )
+    writer = threading.Thread(target=delete_completion)
+    writer.start()
+    first = list_roadex_human_decisions(store_path)
+    writer.join(timeout=10)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "verify_exact_completed_review_outbox_set",
+        real_verify,
+    )
+
+    assert not writer.is_alive()
+    assert first["items"][0]["plan_id"] == plan.plan_id
+    assert first["items"][0]["ready"] is True
+    second = list_roadex_human_decisions(store_path)
+    assert second["items"][0]["ready"] is False
+    assert second["items"][0]["blocker_codes"] == [
+        "REVIEW_EVIDENCE_NOT_CURRENT",
+    ]
+
+
+def test_enabled_store_legacy_staged_plan_requires_nontransferring_successor(
+    tmp_path,
+):
+    store_path, _typed_plan, _bundle = _typed_bundle_with_reviews(tmp_path)
+    legacy_path, legacy = seeded(tmp_path)
+    assert legacy_path == store_path
+    stage_plan(store_path, legacy)
+    legacy_evidence = tuple(legacy.evidence_ids.values())
+
+    with pytest.raises(ValueError, match="^SUCCESSOR_REQUIRED$"):
+        approve_plan(store_path, legacy.plan_id, "independent-human")
+
+    assert _task6_plan(store_path, legacy.plan_id).status == ProvisioningStatus.STAGED
+    assert tuple(legacy.evidence_ids.values()) == legacy_evidence
+
+
+def test_legacy_approved_plan_remains_listable_and_executable_after_activation(
+    tmp_path,
+):
+    store_path, plan = seeded(tmp_path)
+    stage_plan(store_path, plan)
+    approve_plan(store_path, plan.plan_id, "independent-human")
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(
+            "INSERT INTO provisioning_preflight_reports VALUES (?,?,?,?)",
+            (
+                "preflight.feature-boundary",
+                "plan.future",
+                "sha256:" + "f" * 64,
+                "{}",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    listed = list_plans(store_path)
+
+    assert listed["items"][0]["plan_id"] == plan.plan_id
+    assert listed["items"][0]["status"] == ProvisioningStatus.APPROVED.value
+    handlers = {
+        step.operation: (lambda _arguments: {"ok": True})
+        for step in plan.steps
+    }
+    executed = execute_plan(
+        store_path,
+        plan.plan_id,
+        DedicatedProvisioningAdapter(handlers),
+    )
+    assert executed["status"] == ProvisioningStatus.EXECUTED.value
+
+
+def test_raw_stage_is_allowed_before_and_blocked_after_persisted_feature_boundary(
+    tmp_path,
+):
+    legacy_path, legacy = seeded(tmp_path / "legacy-open")
+    assert stage_plan_api(legacy_path, _raw_stage_payload(legacy))["status"] == "staged"
+
+    store_path, _typed_plan, _bundle = _typed_bundle_with_reviews(tmp_path / "enabled")
+    _path, blocked = seeded(tmp_path / "enabled")
+    assert _path == store_path
+    with pytest.raises(ValueError, match="^TYPED_BUNDLE_REQUIRED$"):
+        stage_plan_api(store_path, _raw_stage_payload(blocked))
+    assert _plan_row_exists(store_path, blocked.plan_id) is False
+
+
+@pytest.mark.parametrize(
+    "artifact_sql",
+    (
+        "INSERT INTO provisioning_preflight_reports VALUES "
+        "('preflight.partial','plan.partial','sha256:" + "a" * 64 + "','{}')",
+        "INSERT INTO provisioning_bundles VALUES "
+        "('plan.partial','plan.partial','sha256:" + "b" * 64 + "','{}')",
+        "INSERT INTO provisioning_review_outbox VALUES "
+        "('outbox.partial','plan.partial','kira','pending','{}')",
+        "INSERT INTO roadex_approval_bindings VALUES "
+        "('approval.donuthole.partial','roadex-human-decision','plan.partial','{}')",
+    ),
+)
+def test_any_partial_typed_artifact_fails_closed_for_raw_stage(
+    tmp_path, artifact_sql,
+):
+    store_path, plan = seeded(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(artifact_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="^TYPED_BUNDLE_REQUIRED$"):
+        stage_plan_api(store_path, _raw_stage_payload(plan))
+
+
+def test_concurrent_first_bundle_commit_closes_raw_stage_before_insert(
+    tmp_path, monkeypatch,
+):
+    from tests.test_provisioning_bundle import (
+        authoritative_bundle_fixture,
+        stage_expected_bundle,
+    )
+
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    _path, raw_plan = seeded(tmp_path)
+    assert _path == store_path
+    raw_validated = threading.Event()
+    resume_raw = threading.Event()
+    real_validate = backup_provisioning_module._validate_plan
+    outcome: dict[str, object] = {}
+
+    def paused_validate(plan):
+        real_validate(plan)
+        if plan.plan_id == raw_plan.plan_id:
+            raw_validated.set()
+            assert resume_raw.wait(timeout=10)
+
+    def raw_stage():
+        try:
+            outcome["result"] = stage_plan_api(
+                store_path, _raw_stage_payload(raw_plan),
+            )
+        except Exception as error:
+            outcome["error"] = error
+
+    monkeypatch.setattr(backup_provisioning_module, "_validate_plan", paused_validate)
+    thread = threading.Thread(target=raw_stage)
+    thread.start()
+    assert raw_validated.wait(timeout=10)
+    stage_expected_bundle(store_path, bundle)
+    resume_raw.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert str(outcome.get("error")) == "TYPED_BUNDLE_REQUIRED"
+    assert "result" not in outcome
+    assert _plan_row_exists(store_path, raw_plan.plan_id) is False
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_status"),
+    (("approve", ProvisioningStatus.APPROVED), ("deny", ProvisioningStatus.DENIED)),
+)
+def test_gate_and_human_plan_update_are_one_locked_transaction(
+    tmp_path, monkeypatch, operation, expected_status,
+):
+    store_path, plan, _bundle = _typed_bundle_with_reviews(tmp_path)
+    gate_reached = threading.Event()
+    writer_attempting = threading.Event()
+    writer_finished = threading.Event()
+    finished_before_gate_return: list[bool] = []
+    writer_observed_status: list[ProvisioningStatus] = []
+    real_require = backup_provisioning_module._require_terminal_evidence
+    evidence_id = plan.evidence_ids["obrien"]
+
+    def paused_gate(store, exact_plan):
+        real_require(store, exact_plan)
+        gate_reached.set()
+        assert writer_attempting.wait(timeout=10)
+        finished_before_gate_return.append(writer_finished.wait(timeout=0.5))
+
+    def competing_writer():
+        assert gate_reached.wait(timeout=10)
+        writer_attempting.set()
+        with SQLiteStore(store_path) as store:
+            message = store.load_crew_message(evidence_id)
+            store.save_crew_message(replace(
+                message,
+                decision_reason="concurrent replacement",
+            ))
+            writer_observed_status.append(
+                backup_provisioning_module._stored(store, plan.plan_id).status
+            )
+        writer_finished.set()
+
+    monkeypatch.setattr(
+        backup_provisioning_module, "_require_terminal_evidence", paused_gate,
+    )
+    writer = threading.Thread(target=competing_writer)
+    writer.start()
+    if operation == "approve":
+        approve_plan(store_path, plan.plan_id, "independent-human")
+    else:
+        decide_roadex_human_plan(
+            store_path, plan.plan_id, "deny", "independent-human", "deny",
+        )
+    writer.join(timeout=10)
+
+    assert finished_before_gate_return == [False]
+    assert writer_observed_status == [expected_status]
+    assert not writer.is_alive()
+
+
+def _task6_plan(store_path, plan_id):
+    with SQLiteStore(store_path) as store:
+        return backup_provisioning_module._stored(store, plan_id)
 
 
 def test_stage_is_immutable_and_binds_all_terminal_evidence(tmp_path):

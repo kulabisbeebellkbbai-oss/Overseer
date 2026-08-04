@@ -124,6 +124,32 @@ Preflight is read-only and produces a digest-bound report. Final human approval
 is unavailable until the report passes and all terminal crew evidence matches
 the exact bundle digest.
 
+Implemented interfaces: `ProvisioningIntentV1`, digest-bound preflight preview,
+authoritative intent rebuild at stage time, atomic bundle and review outbox, and
+exact idempotent outbox dispatch. Terminal legacy plans remain auditable;
+legacy staged plans require a typed successor. Bundle staging and review
+dispatch mutate only Overseer control state. Independent human approval,
+service deployment, and privileged provisioning remain separate gates.
+
+The feature boundary is persisted data, not table availability: the first
+dedicated DonutHole preflight, bundle, pending outbox, or prospective Roadex
+binding closes the raw staging API in the same SQLite write transaction. Any
+partial dedicated artifact fails closed. After that boundary, an untyped staged
+plan returns `SUCCESSOR_REQUIRED`; neither its approval nor any review, report,
+digest, or evidence transfers to the successor. Terminal legacy records remain
+listable and keep their original payloads. Existing approved legacy plans are
+not rewritten or silently revoked by this feature; execution or supersession
+remains a separate deployment decision.
+
+Approval, denial, and revision decisions verify the exact bundle, prospective
+binding, registered source, current passing preflight, immutable digests, all
+four code-owned dispatch audits, and all four `VERIFIED` completion receipts in
+the same locked transaction as the plan update. Immutable outbox rows remain
+permanently `pending`; readiness is derived without materializing messages or
+rewriting evidence. The Roadex projection performs the same verification in
+one read snapshot and returns server-owned `blocker_codes` with fixed,
+human-readable `blockers`; the browser only renders those fields.
+
 ### Capability C: Resumable Execution, Runtime Attestation, and Evidence
 
 Replace the single all-or-nothing execution flow with explicit phases:

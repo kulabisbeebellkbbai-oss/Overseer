@@ -3007,6 +3007,31 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_raw_provisioning_stage_api_fails_closed_after_typed_activation(self):
+        from tests.test_backup_provisioning import (
+            _raw_stage_payload,
+            _typed_bundle_with_reviews,
+            seeded,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store_path, _typed_plan, _bundle = _typed_bundle_with_reviews(root)
+            same_path, raw_plan = seeded(root)
+            self.assertEqual(same_path, store_path)
+            with LocalOverseerApiServer(
+                store_path, auth_token="bundle-secret",
+            ) as server:
+                with self.assertRaises(HTTPError) as error:
+                    server.post(
+                        "/backup-provisioning/stage",
+                        _raw_stage_payload(raw_plan),
+                    )
+
+        self.assertEqual(error.exception.code, 400)
+        body = json.loads(error.exception.read().decode("utf-8"))
+        self.assertEqual(body, {"error": "TYPED_BUNDLE_REQUIRED"})
+
     def test_bundle_post_rejects_transfer_encoding_and_trailer_before_helper(self):
         calls = []
         original = overseer_api.preflight_bundle_api

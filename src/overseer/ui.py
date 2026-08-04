@@ -2183,7 +2183,8 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const action = (decision, label, className = "") => `<button type="button" class="action-btn ${className}" data-action="decide-roadex-human" data-decision="${decision}" data-plan-id="${safe(item.plan_id)}" data-plan-digest="${safe(item.plan_digest)}"${disabled}>${label}</button>`;
       const impact = (item.impact || []).map((entry) => `<li>${safe(entry)}</li>`).join("");
       const risks = (item.risks || []).map((entry) => `<li>${safe(entry)}</li>`).join("");
-      const blockers = (item.blockers || []).map((entry) => `<li>${safe(entry)}</li>`).join("");
+      const blockerCodes = item.blocker_codes || [];
+      const blockers = (item.blockers || []).map((entry, index) => `<li><code>${safe(blockerCodes[index] || "BLOCKED")}</code> ${safe(entry)}</li>`).join("");
       return `<article class="panel human-decision-card ${ready ? "warn" : pending ? "bad" : "good"}" aria-labelledby="decision-title-${safe(item.plan_id)}">
         <div class="toolbar"><div><h3>Roadex final human decision</h3><h2 id="decision-title-${safe(item.plan_id)}">${safe(item.title)}</h2></div><span class="pill ${ready ? "warn" : pending ? "bad" : "good"}">${safe(item.status)}</span></div>
         <div class="decision-copy">
@@ -2193,7 +2194,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <p class="muted"><strong>Immutable digest:</strong> ${safe(item.plan_digest)}</p>
           <div><h3>What approval does</h3><ul class="decision-list">${impact}</ul></div>
           <div><h3>Risks and safeguards</h3><ul class="decision-list">${risks}</ul></div>
-          ${blockers ? `<div><h3>Blocking evidence</h3><ul class="decision-list">${blockers}</ul></div>` : ""}
+          ${blockers ? `<div class="roadex-readiness-blockers" role="status" aria-live="polite" aria-atomic="true" aria-labelledby="decision-blockers-${safe(item.plan_id)}"><h3 id="decision-blockers-${safe(item.plan_id)}">Blocking evidence</h3><ul class="decision-list">${blockers}</ul></div>` : ""}
           ${item.decision_reason ? `<p><strong>Decision reason:</strong> ${safe(item.decision_reason)}</p>` : ""}
         </div>
         ${pending ? `<div class="decision-actions">

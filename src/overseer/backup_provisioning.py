@@ -238,22 +238,29 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
 
 
 def stage_plan(store_path: str, plan: DonutHoleBackupProvisioningPlan) -> Mapping[str, object]:
-    _validate_plan(plan)
     with SQLiteStore(store_path) as store:
-        _initialize(store)
-        for role, domain in REQUIRED_EVIDENCE.items():
-            try:
-                message = store.load_crew_message(plan.evidence_ids[role])
-            except KeyError:
-                continue
-            if message.owner_domain != domain or message.related_plan_id != plan.plan_id:
-                raise ValueError(f"correctly owned {role} evidence is required")
-        payload = _dump(plan)
-        existing = store._connection.execute("SELECT payload FROM backup_provisioning_plans WHERE id=?", (plan.plan_id,)).fetchone()
-        if existing and str(existing["payload"]) != payload:
-            raise ValueError("provisioning plan ID is immutable")
-        store._connection.execute("INSERT OR IGNORE INTO backup_provisioning_plans VALUES (?,?)", (plan.plan_id, payload)); store._commit()
+        with store.agent_transaction():
+            _stage_plan_locked(store, plan)
     return _public(plan, mutation=True)
+
+
+def _stage_plan_locked(
+    store: SQLiteStore,
+    plan: DonutHoleBackupProvisioningPlan,
+    *,
+    validated: bool = False,
+) -> None:
+    if not validated:
+        _validate_plan(plan)
+    _initialize(store)
+    for role, domain in REQUIRED_EVIDENCE.items():
+        try:
+            message = store.load_crew_message(plan.evidence_ids[role])
+        except KeyError:
+            continue
+        if message.owner_domain != domain or message.related_plan_id != plan.plan_id:
+            raise ValueError(f"correctly owned {role} evidence is required")
+    store.save_backup_provisioning_plan_payload(plan.plan_id, _dump(plan))
 
 
 def list_plans(store_path: str) -> Mapping[str, object]:
@@ -267,23 +274,28 @@ def list_roadex_human_decisions(store_path: str) -> Mapping[str, object]:
     """Return final human decisions originating in the Roadex workflow."""
     with SQLiteStore(store_path) as store:
         _initialize(store)
-        plans = [_load(str(row["payload"])) for row in store._connection.execute("SELECT payload FROM backup_provisioning_plans ORDER BY rowid DESC")]
-        items = []
-        seen_kinds: set[str] = set()
-        for plan in plans:
-            if plan.decision_source != "Roadex":
-                continue
-            if plan.kind in seen_kinds:
-                continue
-            seen_kinds.add(plan.kind)
-            if plan.status != ProvisioningStatus.STAGED:
-                continue
-            failures: list[str] = []
-            try:
-                _require_terminal_evidence(store, plan)
-            except (KeyError, ValueError) as exc:
-                failures.append(str(exc))
-            items.append({
+        store._connection.execute("BEGIN")
+        try:
+            plans = [_load(str(row["payload"])) for row in store._connection.execute("SELECT payload FROM backup_provisioning_plans ORDER BY rowid DESC")]
+            items = []
+            seen_kinds: set[str] = set()
+            for plan in plans:
+                if plan.decision_source != "Roadex":
+                    continue
+                if plan.kind in seen_kinds:
+                    continue
+                seen_kinds.add(plan.kind)
+                if plan.status != ProvisioningStatus.STAGED:
+                    continue
+                blocker_codes: list[str] = []
+                failures: list[str] = []
+                try:
+                    _require_approval_readiness(store, plan)
+                except (KeyError, ValueError) as exc:
+                    code, explanation = _approval_blocker(exc)
+                    blocker_codes.append(code)
+                    failures.append(explanation)
+                items.append({
                 "id": f"roadex-human-decision.{plan.plan_id}",
                 "source": "Roadex",
                 "owner": "Sisko",
@@ -308,12 +320,15 @@ def list_roadex_human_decisions(store_path: str) -> Mapping[str, object]:
                 "rollback": [step.operation for step in plan.rollback_steps],
                 "status": plan.status.value,
                 "ready": not failures,
+                "blocker_codes": blocker_codes,
                 "blockers": failures,
                 "decision_reason": plan.decision_reason,
                 "decided_by": plan.decided_by or plan.approved_by,
                 "decided_at": plan.decided_at or plan.approved_at,
                 "evidence_digest": plan.evidence_digest,
-            })
+                })
+        finally:
+            store._connection.rollback()
     return {"ok": True, "source": "Roadex", "items": items, "pending_count": sum(item["human_approval_required"] for item in items), "mutation_performed": False, "host_mutation_performed": False}
 
 
@@ -332,15 +347,16 @@ def decide_roadex_human_plan(
     if decision in {"deny", "request_revision"} and not reason.strip():
         raise ValueError("a reason is required for denial or revision")
     with SQLiteStore(store_path) as store:
-        plan = _stored(store, plan_id)
-        if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
-            raise ValueError("an exact staged Roadex human decision is required")
-        _require_terminal_evidence(store, plan)
-        if decision != "approve":
-            status = ProvisioningStatus.DENIED if decision == "deny" else ProvisioningStatus.REVISION_REQUESTED
-            decided = replace(plan, status=status, decision_reason=reason.strip(), decided_by=decided_by.strip(), decided_at=datetime.now(UTC).isoformat())
-            store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(decided), plan_id)); store._commit()
-            return {"ok": True, "decision": decision, "action_status": status.value, "plan": _public(decided, mutation=True), "mutation_performed": True, "host_mutation_performed": False}
+        with store.agent_transaction():
+            plan = _stored(store, plan_id)
+            if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
+                raise ValueError("an exact staged Roadex human decision is required")
+            _require_approval_readiness(store, plan)
+            if decision != "approve":
+                status = ProvisioningStatus.DENIED if decision == "deny" else ProvisioningStatus.REVISION_REQUESTED
+                decided = replace(plan, status=status, decision_reason=reason.strip(), decided_by=decided_by.strip(), decided_at=datetime.now(UTC).isoformat())
+                store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(decided), plan_id))
+                return {"ok": True, "decision": decision, "action_status": status.value, "plan": _public(decided, mutation=True), "mutation_performed": True, "host_mutation_performed": False}
     if adapter_factory is None:
         raise ValueError("privileged host adapter is not configured")
     adapter = adapter_factory(plan)
@@ -362,14 +378,15 @@ def decide_roadex_human_plan_api(store_path: str, payload: Mapping[str, object],
 def approve_plan(store_path: str, plan_id: str, approved_by: str, approved_at: str | None = None) -> Mapping[str, object]:
     now = approved_at or datetime.now(UTC).isoformat(); _time(now)
     with SQLiteStore(store_path) as store:
-        plan = _stored(store, plan_id)
-        _require_terminal_evidence(store, plan)
-        evidence_actors = set(REQUIRED_EVIDENCE) | {domain.value for domain in REQUIRED_EVIDENCE.values()}
-        evidence_requesters = {store.load_crew_message(message_id).requested_by for message_id in plan.evidence_ids.values()}
-        if plan.status != ProvisioningStatus.STAGED or not approved_by.strip() or approved_by in evidence_actors or approved_by in evidence_requesters:
-            raise ValueError("independent human approval is required")
-        approved = replace(plan, status=ProvisioningStatus.APPROVED, approved_by=approved_by, approved_at=now)
-        store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(approved), plan_id)); store._commit()
+        with store.agent_transaction():
+            plan = _stored(store, plan_id)
+            _require_approval_readiness(store, plan)
+            evidence_actors = set(REQUIRED_EVIDENCE) | {domain.value for domain in REQUIRED_EVIDENCE.values()}
+            evidence_requesters = {store.load_crew_message(message_id).requested_by for message_id in plan.evidence_ids.values()}
+            if plan.status != ProvisioningStatus.STAGED or not approved_by.strip() or approved_by in evidence_actors or approved_by in evidence_requesters:
+                raise ValueError("independent human approval is required")
+            approved = replace(plan, status=ProvisioningStatus.APPROVED, approved_by=approved_by, approved_at=now)
+            store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(approved), plan_id))
     return _public(approved, mutation=True)
 
 
@@ -425,7 +442,13 @@ def stage_plan_api(store_path: str, payload: Mapping[str, object]) -> Mapping[st
     if set(payload) != required or not isinstance(payload.get("root_authorization_refs"), Mapping) or not isinstance(payload.get("root_registrations"), list) or not isinstance(payload.get("evidence_ids"), Mapping):
         raise ValueError("exact backup provisioning stage fields are required")
     plan = build_plan(str(payload["plan_id"]), str(payload["gpg_sha256"]), str(payload["adapter_commit"]), str(payload["runtime_digest"]), str(payload["capability_digest"]), payload["root_authorization_refs"], tuple(payload["root_registrations"]), str(payload["overseer_token_source_file"]), str(payload["overseer_token_file"]), str(payload["cursor_key_file"]), payload["evidence_ids"])
-    return stage_plan(store_path, plan)
+    _validate_plan(plan)
+    with SQLiteStore(store_path) as store:
+        with store.agent_transaction():
+            if _typed_bundle_feature_enabled_locked(store):
+                raise ValueError("TYPED_BUNDLE_REQUIRED")
+            _stage_plan_locked(store, plan, validated=True)
+    return _public(plan, mutation=True)
 
 
 def approve_plan_api(store_path: str, payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -506,7 +529,8 @@ def _plan_digest(plan: DonutHoleBackupProvisioningPlan) -> str:
 
 
 def _initialize(store: SQLiteStore) -> None:
-    store._connection.execute("CREATE TABLE IF NOT EXISTS backup_provisioning_plans(id TEXT PRIMARY KEY,payload TEXT NOT NULL)"); store._commit()
+    store._connection.execute("CREATE TABLE IF NOT EXISTS backup_provisioning_plans(id TEXT PRIMARY KEY,payload TEXT NOT NULL)")
+    store._commit_agent_mutation()
 
 
 def _stored(store: SQLiteStore, plan_id: str) -> DonutHoleBackupProvisioningPlan:
@@ -520,6 +544,99 @@ def _require_terminal_evidence(store: SQLiteStore, plan: DonutHoleBackupProvisio
         message = store.load_crew_message(plan.evidence_ids[role])
         if message.owner_domain != domain or message.related_plan_id != plan.plan_id or message.status != CrewMessageStatus.ACKNOWLEDGED or message.review_status != CrewReviewStatus.APPROVED or message.decided_by != domain.value or not message.decided_at:
             raise ValueError(f"terminal approved {role} evidence is required")
+
+
+def _typed_bundle_feature_enabled_locked(store: SQLiteStore) -> bool:
+    """Fail closed once any dedicated typed provisioning artifact exists."""
+    checks = (
+        "SELECT 1 FROM provisioning_preflight_reports LIMIT 1",
+        "SELECT 1 FROM provisioning_bundles LIMIT 1",
+        "SELECT 1 FROM provisioning_review_outbox LIMIT 1",
+        "SELECT 1 FROM roadex_approval_bindings "
+        "WHERE approval_ref LIKE 'approval.donuthole.%' LIMIT 1",
+    )
+    return any(store._connection.execute(sql).fetchone() is not None for sql in checks)
+
+
+def _require_bundle_preflight_and_reviews(
+    store: SQLiteStore,
+    plan: DonutHoleBackupProvisioningPlan,
+) -> None:
+    """Prove the exact persisted typed approval set without mutation."""
+    from . import provisioning_bundle
+
+    try:
+        bundle = provisioning_bundle.load_provisioning_bundle(store, plan.plan_id)
+    except KeyError as error:
+        raise ValueError("SUCCESSOR_REQUIRED") from error
+    except ValueError as error:
+        raise ValueError("TYPED_BUNDLE_REQUIRED") from error
+    if (
+        bundle.plan.plan_digest != plan.plan_digest
+        or dump_staged_plan_payload(bundle.plan) != dump_staged_plan_payload(plan)
+    ):
+        raise ValueError("TYPED_BUNDLE_REQUIRED")
+    try:
+        draft = provisioning_bundle.binding_draft_for_bundle(bundle)
+        binding = store.load_roadex_approval_binding(draft.approval_ref)
+    except KeyError as error:
+        raise ValueError("SUCCESSOR_REQUIRED") from error
+    try:
+        report = provisioning_bundle._load_exact_preflight_report(store, bundle)
+    except (KeyError, ValueError) as error:
+        raise ValueError("PREFLIGHT_NOT_CURRENT") from error
+    if not report.passed or report != bundle.preflight:
+        raise ValueError("PREFLIGHT_NOT_CURRENT")
+    try:
+        provisioning_bundle.verify_exact_persisted_bundle_set(
+            store, bundle, binding,
+        )
+    except (KeyError, ValueError) as error:
+        raise ValueError("TYPED_BUNDLE_REQUIRED") from error
+    try:
+        provisioning_bundle.verify_exact_completed_review_outbox_set(
+            store, bundle,
+        )
+    except (KeyError, ValueError) as error:
+        raise ValueError("REVIEW_EVIDENCE_NOT_CURRENT") from error
+    try:
+        _require_terminal_evidence(store, plan)
+    except (KeyError, ValueError) as error:
+        raise ValueError("REVIEW_EVIDENCE_NOT_CURRENT") from error
+
+
+def _require_approval_readiness(
+    store: SQLiteStore,
+    plan: DonutHoleBackupProvisioningPlan,
+) -> None:
+    if _typed_bundle_feature_enabled_locked(store):
+        _require_bundle_preflight_and_reviews(store, plan)
+    else:
+        _require_terminal_evidence(store, plan)
+
+
+_APPROVAL_BLOCKER_EXPLANATIONS = {
+    "TYPED_BUNDLE_REQUIRED": (
+        "An exact immutable typed provisioning bundle is required."
+    ),
+    "PREFLIGHT_NOT_CURRENT": (
+        "The exact persisted provisioning preflight must be current and passing."
+    ),
+    "SUCCESSOR_REQUIRED": (
+        "This staged plan requires a new typed successor; legacy evidence does not transfer."
+    ),
+    "REVIEW_EVIDENCE_NOT_CURRENT": (
+        "All four exact provisioning reviews must be approved with current VERIFIED completion receipts."
+    ),
+}
+
+
+def _approval_blocker(error: Exception) -> tuple[str, str]:
+    raw = str(error)
+    if raw in _APPROVAL_BLOCKER_EXPLANATIONS:
+        return raw, _APPROVAL_BLOCKER_EXPLANATIONS[raw]
+    code = "REVIEW_EVIDENCE_NOT_CURRENT"
+    return code, _APPROVAL_BLOCKER_EXPLANATIONS[code]
 
 
 def _dump(plan: DonutHoleBackupProvisioningPlan) -> str:

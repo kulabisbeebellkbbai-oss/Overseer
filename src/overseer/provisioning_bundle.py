@@ -3113,6 +3113,24 @@ def _review_outbox_state_locked(
     return "dispatched"
 
 
+def verify_exact_completed_review_outbox_set(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+) -> None:
+    """Read-only proof that every exact review has a VERIFIED completion."""
+    entries = _load_exact_outbox(store, bundle)
+    for entry in entries:
+        try:
+            message = store.load_crew_message(entry.message_id)
+        except KeyError as error:
+            raise ProvisioningBundleError(
+                "REVIEW_OUTBOX_MESSAGE_MISMATCH"
+            ) from error
+        _verify_review_message_request(store, message, entry)
+        if _review_outbox_state_locked(store, entry, message) != "dispatched":
+            raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+
+
 def _public_review_outbox_status(
     entry: ProvisioningReviewOutboxEntry,
     message: CrewMessage,

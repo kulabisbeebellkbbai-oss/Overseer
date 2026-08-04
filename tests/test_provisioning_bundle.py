@@ -8,16 +8,23 @@ import math
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 from types import MappingProxyType
+from types import SimpleNamespace
 
 import pytest
 
 from overseer.backup_provisioning import build_plan
-from overseer.backup_host_operations import capability_digest as reviewed_capability_digest
+from overseer.backup_host_operations import (
+    capability_digest as reviewed_capability_digest,
+    runtime_digest as reviewed_runtime_digest,
+)
 from overseer.core import OwnerDomain, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.provisioning_bundle import (
@@ -216,6 +223,47 @@ def deterministic_dependencies(
         canonical_boundaries_valid=lambda: canonical_boundaries_valid,
         rollback_prerequisites_valid=lambda: rollback_prerequisites_valid,
     )
+
+
+def disposable_adapter_repository(tmp_path: Path) -> tuple[Path, str]:
+    repository = tmp_path / "adapter"
+    repository.mkdir()
+    source = repository / "adapter.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    source.chmod(0o644)
+    executable = repository / "adapter-tool"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (repository / "docs").mkdir()
+    (repository / "docs" / "ignored.md").write_text("ignored\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git", "-C", str(repository),
+            "-c", "user.name=Disposable Test",
+            "-c", "user.email=test@example.invalid",
+            "commit", "-q", "-m", "fixture",
+        ),
+        check=True,
+    )
+    revision = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return repository, revision
+
+
+def stat_projection(info: os.stat_result, **changes: int) -> SimpleNamespace:
+    names = (
+        "st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid",
+        "st_size", "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
+    )
+    values = {name: getattr(info, name) for name in names}
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 def authoritative_bundle_fixture(
@@ -608,9 +656,17 @@ def test_trusted_boundary_production_factory_uses_exact_persisted_chain_read_onl
     dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
     predecessor = dependencies.predecessor_lookup(preview.plan.plan_id)
     tip = dependencies.authoritative_chain_tip(preview.plan.plan_id)
+    second_root = intent_fixture(
+        request_id="request.factory-second-root",
+        plan_id="backup-provision.factory-second-root",
+    )
+    distinct_root = replace(second_root, resource_id="storage.donuthole.distinct")
 
     assert predecessor == preview
     assert tip == preview.plan.plan_id
+    assert dependencies.root_scope_allowed(preview.intent) is True
+    assert dependencies.root_scope_allowed(second_root) is False
+    assert dependencies.root_scope_allowed(distinct_root) is True
     assert dependencies.source_path == "/home/god/Documents/Codex Workspace/TheUnderdark"
     assert dependencies.root_path == "/home/god/Documents/Codex Workspace/DonutHole"
     with pytest.raises(ValueError, match="source path"):
@@ -636,6 +692,303 @@ def test_trusted_boundary_production_factory_uses_exact_persisted_chain_read_onl
     with pytest.raises(ValueError, match="persisted provisioning chain is unavailable"):
         provisioning_bundle_module.production_preflight_dependencies(store_path)
     assert observed() == corrupted
+
+
+def test_production_runtime_digest_uses_named_git_tree_not_dirty_worktree(
+    tmp_path, monkeypatch,
+):
+    repository, revision = disposable_adapter_repository(tmp_path)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(repository))
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+    expected = reviewed_runtime_digest(repository, revision)
+
+    assert dependencies.source_head(str(repository)) == revision
+    assert dependencies.runtime_digest(str(repository), revision) == expected
+
+    (repository / "adapter.py").write_text("VALUE = 'dirty'\n", encoding="utf-8")
+    (repository / "untracked.py").write_text("UNTRACKED = True\n", encoding="utf-8")
+
+    assert dependencies.source_head(str(repository)) == revision
+    assert dependencies.runtime_digest(str(repository), revision) == expected
+
+
+def test_production_git_boundary_rejects_symlinked_source_root(tmp_path, monkeypatch):
+    repository, revision = disposable_adapter_repository(tmp_path)
+    linked = tmp_path / "linked-adapter"
+    linked.symlink_to(repository, target_is_directory=True)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(linked))
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(linked))
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(linked), revision)
+
+
+def test_production_git_boundary_rejects_repository_identity_race(tmp_path, monkeypatch):
+    repository, _revision = disposable_adapter_repository(tmp_path)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(repository))
+    calls = {"count": 0}
+
+    def race_on_final_check(*_arguments):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise ValueError("repository identity changed")
+
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "_verify_production_repository_identity",
+        race_on_final_check,
+        raising=False,
+    )
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+
+@pytest.mark.parametrize(
+    "tree_output",
+    (
+        b"malformed\0",
+        b"120000 blob " + b"a" * 40 + b"\tsymlink\0",
+        b"160000 commit " + b"a" * 40 + b"\tsubmodule\0",
+        b"040000 tree " + b"a" * 40 + b"\tunsupported\0",
+    ),
+)
+def test_production_runtime_digest_rejects_malformed_or_unsupported_git_tree(
+    tmp_path, monkeypatch, tree_output,
+):
+    repository, revision = disposable_adapter_repository(tmp_path)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(repository))
+
+    def forged_git_output(_descriptor, arguments, _limit):
+        if "rev-parse" in arguments:
+            return (revision + "\n").encode()
+        if "ls-tree" in arguments:
+            return tree_output
+        return b"content"
+
+    monkeypatch.setattr(
+        provisioning_bundle_module, "_git_stdout", forged_git_output, raising=False,
+    )
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+def test_production_runtime_digest_rejects_oversized_output_and_missing_commit(
+    tmp_path, monkeypatch,
+):
+    repository, revision = disposable_adapter_repository(tmp_path)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(repository))
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), "f" * 40)
+
+    def oversized_git_output(_descriptor, arguments, limit):
+        if "rev-parse" in arguments:
+            return (revision + "\n").encode()
+        return b"x" * (limit + 1)
+
+    monkeypatch.setattr(
+        provisioning_bundle_module, "_git_stdout", oversized_git_output, raising=False,
+    )
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+    valid_record = b"100644 blob " + b"a" * 40 + b"\tadapter.py\0"
+
+    def oversized_blob(_descriptor, arguments, limit):
+        if "rev-parse" in arguments:
+            return (revision + "\n").encode()
+        if "ls-tree" in arguments:
+            return valid_record
+        return b"x" * (limit + 1)
+
+    monkeypatch.setattr(provisioning_bundle_module, "_git_stdout", oversized_blob)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+def test_production_gpg_digest_requires_noatime_and_preserves_metadata(tmp_path, monkeypatch):
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    executable.chmod(0o755)
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def recording_open(path, flags, *arguments, **keywords):
+        observed_flags.append(flags)
+        return real_open(path, flags, *arguments, **keywords)
+
+    monkeypatch.setattr(provisioning_bundle_module.os, "open", recording_open)
+    digest = provisioning_bundle_module._production_file_digest(str(executable))
+
+    assert digest == "sha256:" + hashlib.sha256(b"disposable-gpg").hexdigest()
+    assert observed_flags and observed_flags[0] & os.O_NOATIME
+
+
+def test_production_gpg_digest_fails_when_noatime_is_unavailable(tmp_path, monkeypatch):
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    monkeypatch.delattr(provisioning_bundle_module.os, "O_NOATIME")
+
+    with pytest.raises(ValueError, match="authoritative GPG executable is unavailable"):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+
+@pytest.mark.parametrize("drift_target", ("descriptor", "entry"))
+def test_production_gpg_digest_rejects_metadata_or_identity_drift(
+    tmp_path, monkeypatch, drift_target,
+):
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    executable.chmod(0o755)
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    if drift_target == "descriptor":
+        original = os.fstat
+        calls = {"count": 0}
+
+        def drifting_fstat(descriptor):
+            info = original(descriptor)
+            calls["count"] += 1
+            if calls["count"] > 1:
+                return stat_projection(info, st_atime_ns=info.st_atime_ns + 1)
+            return info
+
+        monkeypatch.setattr(provisioning_bundle_module.os, "fstat", drifting_fstat)
+    else:
+        original = os.stat
+        calls = {"count": 0}
+
+        def drifting_stat(path, *arguments, **keywords):
+            info = original(path, *arguments, **keywords)
+            if path == str(executable):
+                calls["count"] += 1
+                if calls["count"] > 1:
+                    return stat_projection(info, st_ino=info.st_ino + 1)
+            return info
+
+        monkeypatch.setattr(provisioning_bundle_module.os, "stat", drifting_stat)
+
+    with pytest.raises(ValueError, match="authoritative GPG executable is unavailable"):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+
+def test_production_gpg_digest_rejects_short_read(tmp_path, monkeypatch):
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    monkeypatch.setattr(provisioning_bundle_module.os, "pread", lambda *_args: b"")
+
+    with pytest.raises(ValueError, match="authoritative GPG executable is unavailable"):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+
+@pytest.mark.parametrize("close_error", (OSError("close failed"), AttributeError("close failed")))
+def test_production_gpg_digest_rejects_owned_descriptor_close_failure(
+    tmp_path, monkeypatch, close_error,
+):
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    original_close = os.close
+
+    def failing_close(descriptor):
+        original_close(descriptor)
+        raise close_error
+
+    monkeypatch.setattr(provisioning_bundle_module.os, "close", failing_close)
+    with pytest.raises(ValueError, match="authoritative GPG executable is unavailable"):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+
+def test_production_gpg_digest_propagates_baseexception_from_close(tmp_path, monkeypatch):
+    class AbortCleanup(BaseException):
+        pass
+
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    original_close = os.close
+
+    def aborting_close(descriptor):
+        original_close(descriptor)
+        raise AbortCleanup()
+
+    monkeypatch.setattr(provisioning_bundle_module.os, "close", aborting_close)
+    with pytest.raises(AbortCleanup):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+
+def test_locked_chain_rejects_second_same_scope_root_and_allows_distinct_scope(tmp_path):
+    store_path, first = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, first)
+    second_intent = intent_fixture(
+        request_id="request.bundle-second-root",
+        plan_id="backup-provision.donuthole.second-root",
+    )
+    second = build_provisioning_bundle(
+        store_path, second_intent, deterministic_dependencies(),
+    )
+
+    with pytest.raises(ProvisioningBundleError, match="CHAIN_ROOT_EXISTS"):
+        stage_expected_bundle(store_path, second)
+
+    distinct_intent = intent_fixture(
+        request_id="request.bundle-distinct-root",
+        plan_id="backup-provision.donuthole.distinct-root",
+        resource_id="storage.donuthole.distinct",
+    )
+    distinct = build_provisioning_bundle(
+        store_path, distinct_intent, deterministic_dependencies(),
+    )
+    result = stage_expected_bundle(store_path, distinct)
+
+    assert result["mutation_performed"] is True
+    assert persisted_bundle_rows(store_path, second.plan.plan_id)["bundles"] == 0
+    assert persisted_bundle_rows(store_path, distinct.plan.plan_id)["bundles"] == 1
+
+
+def test_concurrent_same_scope_root_attempts_commit_at_most_one(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    intents = (
+        intent_fixture(request_id="request.concurrent-a", plan_id="backup.concurrent-a"),
+        intent_fixture(request_id="request.concurrent-b", plan_id="backup.concurrent-b"),
+    )
+    bundles = tuple(
+        build_provisioning_bundle(store_path, intent, deterministic_dependencies())
+        for intent in intents
+    )
+    barrier = Barrier(2)
+
+    def attempt(bundle):
+        barrier.wait()
+        try:
+            stage_expected_bundle(store_path, bundle)
+        except Exception as error:
+            return error
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(attempt, bundles))
+
+    assert sum(result is None for result in results) == 1
+    assert sum(result is not None for result in results) == 1
+    assert sum(
+        persisted_bundle_rows(store_path, bundle.plan.plan_id)["bundles"]
+        for bundle in bundles
+    ) == 1
 
 
 def test_atomic_stage_is_exactly_idempotent_and_does_not_reenter_source_callback(tmp_path, monkeypatch):

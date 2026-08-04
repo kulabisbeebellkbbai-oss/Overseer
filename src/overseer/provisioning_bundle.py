@@ -14,10 +14,12 @@ import json
 import math
 import os
 import re
+import selectors
 import sqlite3
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -25,8 +27,8 @@ from typing import Callable, Mapping
 
 from .backup_host_operations import (
     EXPECTED_BACKUP_TOOL_SCHEMAS,
+    RUNTIME_EXCLUDED,
     capability_digest as reviewed_capability_digest,
-    runtime_digest as reviewed_runtime_digest,
 )
 from .backup_provisioning import (
     ADAPTER_SOURCE_PATH, GPG_PATH, SOURCE_PATH, DonutHoleBackupProvisioningPlan,
@@ -83,6 +85,11 @@ _OVERSEER_TOKEN_FILE = "/etc/codex-development-backups/keys/overseer.token"
 _CURSOR_KEY_FILE = "/etc/codex-development-backups/keys/cursor.key"
 _BUNDLE_WORKSPACE_ID = "workspace.donuthole"
 _BUNDLE_BINDING_SUBJECT = "Review exact DonutHole provisioning bundle"
+_MAX_GIT_TREE_BYTES = 8 * 1024 * 1024
+_MAX_GIT_BLOB_BYTES = 64 * 1024 * 1024
+_MAX_GIT_RUNTIME_BYTES = 256 * 1024 * 1024
+_MAX_GIT_TREE_ENTRIES = 10_000
+_MAX_GIT_PATH_BYTES = 4096
 
 
 class ProvisioningBundleError(ValueError):
@@ -251,6 +258,23 @@ def _read_current_root_authorization_from_connection(
 
 def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _exact_file_metadata(
+    info: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_atime_ns,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
 
 
 def _close_authority_descriptors(*descriptors: int | None) -> None:
@@ -590,6 +614,10 @@ def _always_true() -> bool:
     return True
 
 
+def _always_root_scope_allowed(_intent: ProvisioningIntentV1) -> bool:
+    return True
+
+
 class _FrozenMapping(Mapping[str, object]):
     """An immutable mapping that remains compatible with dataclass snapshots."""
 
@@ -811,44 +839,350 @@ class _PreflightDependencies:
     rollback_prerequisites_valid: Callable[[], bool] = _always_true
     predecessor_lookup: Callable[[str], ProvisioningBundleV1 | None] | None = None
     authoritative_chain_tip: Callable[[str], str | None] | None = None
+    root_scope_allowed: Callable[[ProvisioningIntentV1], bool] = _always_root_scope_allowed
+
+
+def _repository_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid)
+
+
+def _open_production_repository(
+    path: str,
+) -> tuple[int, int, tuple[str, str, tuple[int, int, int, int, int], tuple[int, int, int, int, int]]]:
+    """Open the fixed repository by descriptor without following path symlinks."""
+    if path != ADAPTER_SOURCE_PATH:
+        raise ValueError("authoritative source path is fixed")
+    candidate = Path(path)
+    if not candidate.is_absolute() or candidate.name in {"", ".", ".."}:
+        raise ValueError("authoritative source repository is unavailable")
+    parent_fd: int | None = None
+    repository_fd: int | None = None
+    child_fd: int | None = None
+    try:
+        parent_fd = os.open(
+            "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        for component in candidate.parts[1:-1]:
+            child_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = child_fd
+            child_fd = None
+        repository_fd = os.open(
+            candidate.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        repository_info = os.fstat(repository_fd)
+        entry_info = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
+        parent_info = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(repository_info.st_mode)
+            or _repository_identity(repository_info) != _repository_identity(entry_info)
+        ):
+            raise ValueError("authoritative source repository is unavailable")
+    except Exception:
+        _close_authority_descriptors(repository_fd, child_fd, parent_fd)
+        raise ValueError("authoritative source repository is unavailable") from None
+    identity = (
+        str(candidate),
+        candidate.name,
+        _repository_identity(repository_info),
+        _repository_identity(parent_info),
+    )
+    return repository_fd, parent_fd, identity
+
+
+def _reopen_production_repository_identity(path: str) -> tuple[int, int, int, int, int]:
+    """Retraverse every absolute path component without following symlinks."""
+    candidate = Path(path)
+    current_fd: int | None = None
+    child_fd: int | None = None
+    result: tuple[int, int, int, int, int] | None = None
+    failed = False
+    try:
+        current_fd = os.open(
+            "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        for component in candidate.parts[1:]:
+            child_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = child_fd
+            child_fd = None
+        result = _repository_identity(os.fstat(current_fd))
+    except Exception:
+        failed = True
+    finally:
+        for descriptor in (child_fd, current_fd):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except Exception:
+                failed = True
+    if failed or result is None:
+        raise ValueError("authoritative source repository is unavailable")
+    return result
+
+
+def _verify_production_repository_identity(
+    repository_fd: int,
+    parent_fd: int,
+    identity: tuple[
+        str,
+        str,
+        tuple[int, int, int, int, int],
+        tuple[int, int, int, int, int],
+    ],
+) -> None:
+    path, name, repository_identity, parent_identity = identity
+    entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        _repository_identity(os.fstat(repository_fd)) != repository_identity
+        or _repository_identity(entry_info) != repository_identity
+        or _repository_identity(os.fstat(parent_fd)) != parent_identity
+        or _reopen_production_repository_identity(path) != repository_identity
+        or not stat.S_ISDIR(entry_info.st_mode)
+    ):
+        raise ValueError("authoritative source repository changed during read")
+
+
+def _git_stdout(repository_fd: int, arguments: tuple[str, ...], limit: int) -> bytes:
+    """Read one Git result through the pinned directory with a strict byte cap."""
+    if (
+        type(repository_fd) is not int
+        or not isinstance(arguments, tuple)
+        or not arguments
+        or any(type(argument) is not str or not argument for argument in arguments)
+        or type(limit) is not int
+        or limit <= 0
+    ):
+        raise ValueError("authoritative Git read is unavailable")
+    process: subprocess.Popen[bytes] | None = None
+    output = b""
+    failed = False
+    try:
+        environment = {
+            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        }
+        environment.update({
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        process = subprocess.Popen(
+            ("/usr/bin/git", "-C", f"/proc/self/fd/{repository_fd}", *arguments),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(repository_fd,),
+            env=environment,
+        )
+        if process.stdout is None:
+            raise ValueError("authoritative Git read is unavailable")
+        chunks: list[bytes] = []
+        total = 0
+        deadline = time.monotonic() + 10
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("authoritative Git read is unavailable")
+                if not selector.select(remaining):
+                    raise ValueError("authoritative Git read is unavailable")
+                chunk = os.read(process.stdout.fileno(), min(64 * 1024, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError("authoritative Git read is unavailable")
+        output = b"".join(chunks)
+        if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+            raise ValueError("authoritative Git read is unavailable")
+    except Exception:
+        failed = True
+    finally:
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=10)
+                if process.stdout is not None:
+                    process.stdout.close()
+            except Exception:
+                failed = True
+    if failed:
+        raise ValueError("authoritative Git read is unavailable")
+    return output
+
+
+def _read_production_revision(repository_fd: int, revision: str) -> str:
+    if revision != "HEAD" and _COMMIT.fullmatch(revision) is None:
+        raise ValueError("authoritative Git revision is unavailable")
+    resolved = _git_stdout(
+        repository_fd,
+        ("rev-parse", "--verify", f"{revision}^{{commit}}"),
+        64,
+    )
+    try:
+        decoded = resolved.decode("ascii")
+    except UnicodeDecodeError:
+        raise ValueError("authoritative Git revision is unavailable") from None
+    if not decoded.endswith("\n") or decoded.count("\n") != 1:
+        raise ValueError("authoritative Git revision is unavailable")
+    commit = decoded[:-1]
+    if _COMMIT.fullmatch(commit) is None or (revision != "HEAD" and commit != revision):
+        raise ValueError("authoritative Git revision is unavailable")
+    return commit
+
+
+def _with_production_repository(path: str, reader: Callable[[int], str], label: str) -> str:
+    repository_fd: int | None = None
+    parent_fd: int | None = None
+    value: str | None = None
+    failed = False
+    try:
+        repository_fd, parent_fd, identity = _open_production_repository(path)
+        _verify_production_repository_identity(repository_fd, parent_fd, identity)
+        value = reader(repository_fd)
+        _verify_production_repository_identity(repository_fd, parent_fd, identity)
+    except Exception:
+        failed = True
+    finally:
+        for descriptor in (repository_fd, parent_fd):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except Exception:
+                failed = True
+    if failed or value is None:
+        raise ValueError(f"{label} is unavailable")
+    return value
 
 
 def _production_source_head(path: str) -> str:
-    """Resolve the reviewed adapter revision without accepting a caller path."""
+    """Resolve HEAD from the exact reviewed repository descriptor."""
     if path != ADAPTER_SOURCE_PATH:
         raise ValueError("authoritative source path is fixed")
-    result = subprocess.run(
-        ("/usr/bin/git", "-C", ADAPTER_SOURCE_PATH, "rev-parse", "HEAD"),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        timeout=10,
-        check=False,
+    return _with_production_repository(
+        path,
+        lambda repository_fd: _read_production_revision(repository_fd, "HEAD"),
+        "authoritative source revision",
     )
-    revision = result.stdout.strip()
-    if result.returncode != 0 or _COMMIT.fullmatch(revision) is None:
-        raise ValueError("authoritative source revision is unavailable")
-    return revision
+
+
+def _runtime_tree_records(repository_fd: int, commit: str) -> list[dict[str, object]]:
+    resolved = _read_production_revision(repository_fd, commit)
+    tree = _git_stdout(
+        repository_fd,
+        ("ls-tree", "-rz", "--full-tree", resolved),
+        _MAX_GIT_TREE_BYTES,
+    )
+    if len(tree) > _MAX_GIT_TREE_BYTES:
+        raise ValueError("authoritative runtime tree is oversized")
+    if tree and not tree.endswith(b"\0"):
+        raise ValueError("authoritative runtime tree is malformed")
+    raw_records = tree[:-1].split(b"\0") if tree else []
+    if len(raw_records) > _MAX_GIT_TREE_ENTRIES:
+        raise ValueError("authoritative runtime tree is malformed")
+    files: list[dict[str, object]] = []
+    seen: set[str] = set()
+    total_blob_bytes = 0
+    for raw_record in raw_records:
+        try:
+            metadata, encoded_path = raw_record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split(b" ", 2)
+            path = encoded_path.decode("utf-8", "strict")
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError("authoritative runtime tree is malformed") from None
+        components = path.split("/")
+        if (
+            not path
+            or len(encoded_path) > _MAX_GIT_PATH_BYTES
+            or path.startswith("/")
+            or any(component in {"", ".", ".."} for component in components)
+            or path in seen
+        ):
+            raise ValueError("authoritative runtime tree is malformed")
+        seen.add(path)
+        if any(component in RUNTIME_EXCLUDED for component in components):
+            continue
+        if (
+            mode not in {b"100644", b"100755"}
+            or object_type != b"blob"
+            or re.fullmatch(rb"[0-9a-f]{40}", object_id) is None
+        ):
+            raise ValueError("authoritative runtime tree contains unsupported entries")
+        blob = _git_stdout(
+            repository_fd,
+            ("cat-file", "blob", object_id.decode("ascii")),
+            _MAX_GIT_BLOB_BYTES,
+        )
+        if len(blob) > _MAX_GIT_BLOB_BYTES:
+            raise ValueError("authoritative runtime tree is oversized")
+        total_blob_bytes += len(blob)
+        if total_blob_bytes > _MAX_GIT_RUNTIME_BYTES:
+            raise ValueError("authoritative runtime tree is oversized")
+        files.append({
+            "path": path,
+            "mode": 0o644 if mode == b"100644" else 0o755,
+            "sha256": "sha256:" + hashlib.sha256(blob).hexdigest(),
+        })
+    files.sort(key=lambda item: str(item["path"]))
+    return files
+
+
+def _production_runtime_digest(path: str, commit: str) -> str:
+    """Digest immutable blobs from the named Git object tree, never worktree bytes."""
+    try:
+        return _with_production_repository(
+            path,
+            lambda repository_fd: "sha256:" + hashlib.sha256(json.dumps(
+                {
+                    "version": 1,
+                    "commit": commit,
+                    "files": _runtime_tree_records(repository_fd, commit),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "authoritative runtime tree",
+        )
+    except Exception:
+        raise ValueError("authoritative runtime tree is unavailable") from None
 
 
 def _production_file_digest(path: str) -> str:
     """Digest only the reviewed GPG executable through a stable descriptor."""
     if path != GPG_PATH:
         raise ValueError("authoritative GPG path is fixed")
+    noatime = getattr(os, "O_NOATIME", 0)
+    if not noatime:
+        raise ValueError("authoritative GPG executable is unavailable")
     descriptor: int | None = None
+    digest_value: str | None = None
+    failed = False
     try:
         descriptor = os.open(
             GPG_PATH,
-            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | os.O_NOFOLLOW | noatime | getattr(os, "O_CLOEXEC", 0),
         )
         before = os.fstat(descriptor)
-        entry = os.stat(GPG_PATH, follow_symlinks=False)
+        entry_before = os.stat(GPG_PATH, follow_symlinks=False)
         if (
             not stat.S_ISREG(before.st_mode)
-            or _file_identity(before)[:2] != _file_identity(entry)[:2]
+            or _exact_file_metadata(before) != _exact_file_metadata(entry_before)
         ):
             raise ValueError("authoritative GPG executable is unavailable")
         digest = hashlib.sha256()
@@ -859,17 +1193,26 @@ def _production_file_digest(path: str) -> str:
                 raise ValueError("authoritative GPG executable is unavailable")
             digest.update(chunk)
             offset += len(chunk)
-        if _file_identity(os.fstat(descriptor)) != _file_identity(before):
+        after = os.fstat(descriptor)
+        entry_after = os.stat(GPG_PATH, follow_symlinks=False)
+        if (
+            _exact_file_metadata(after) != _exact_file_metadata(before)
+            or _exact_file_metadata(entry_after) != _exact_file_metadata(entry_before)
+            or _exact_file_metadata(after) != _exact_file_metadata(entry_after)
+        ):
             raise ValueError("authoritative GPG executable changed during digest")
-        return "sha256:" + digest.hexdigest()
-    except (OSError, ValueError):
-        raise ValueError("authoritative GPG executable is unavailable") from None
+        digest_value = "sha256:" + digest.hexdigest()
+    except Exception:
+        failed = True
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
+            except Exception:
+                failed = True
+    if failed or digest_value is None:
+        raise ValueError("authoritative GPG executable is unavailable")
+    return digest_value
 
 
 def _production_executable_exists(path: str) -> bool:
@@ -989,19 +1332,11 @@ def _persisted_chain_tip(
     predecessor = by_id.get(predecessor_plan_id)
     if predecessor is None or len(by_id) != len(bundles):
         return None
-    scope = (
-        predecessor.intent.kind,
-        predecessor.intent.project_id,
-        predecessor.intent.resource_id,
-    )
+    scope = _intent_scope(predecessor.intent)
     scoped = {
         plan_id: bundle
         for plan_id, bundle in by_id.items()
-        if (
-            bundle.intent.kind,
-            bundle.intent.project_id,
-            bundle.intent.resource_id,
-        ) == scope
+        if _intent_scope(bundle.intent) == scope
     }
     referenced: set[str] = set()
     for bundle in scoped.values():
@@ -1024,6 +1359,29 @@ def _persisted_chain_tip(
     return tip if visited == set(scoped) else None
 
 
+def _intent_scope(intent: ProvisioningIntentV1) -> tuple[str, str, str, str, str, str]:
+    """Return the code-owned typed identity for one provisioning history."""
+    return (
+        intent.kind,
+        intent.project_id,
+        _BUNDLE_WORKSPACE_ID,
+        intent.resource_id,
+        intent.root_id,
+        intent.policy_revision,
+    )
+
+
+def _production_root_scope_allowed(
+    bundles: tuple[ProvisioningBundleV1, ...], intent: ProvisioningIntentV1,
+) -> bool:
+    matching = tuple(
+        bundle for bundle in bundles if _intent_scope(bundle.intent) == _intent_scope(intent)
+    )
+    return not matching or (
+        len(matching) == 1 and matching[0].plan.plan_id == intent.plan_id
+    )
+
+
 def production_preflight_dependencies(store_path: str) -> _PreflightDependencies:
     """Construct the sole production-owned authoritative preflight boundary."""
     bundles = _load_persisted_bundles_read_only(store_path)
@@ -1031,7 +1389,7 @@ def production_preflight_dependencies(store_path: str) -> _PreflightDependencies
     return _PreflightDependencies(
         source_path=ADAPTER_SOURCE_PATH,
         source_head=_production_source_head,
-        runtime_digest=reviewed_runtime_digest,
+        runtime_digest=_production_runtime_digest,
         capability_digest=reviewed_capability_digest,
         file_digest=_production_file_digest,
         executable_exists=_production_executable_exists,
@@ -1042,6 +1400,7 @@ def production_preflight_dependencies(store_path: str) -> _PreflightDependencies
         rollback_prerequisites_valid=_production_rollback_prerequisites_valid,
         predecessor_lookup=lambda plan_id: by_id.get(plan_id),
         authoritative_chain_tip=lambda plan_id: _persisted_chain_tip(bundles, plan_id),
+        root_scope_allowed=lambda intent: _production_root_scope_allowed(bundles, intent),
     )
 
 
@@ -1368,6 +1727,11 @@ def _authoritative_predecessor(
     intent: ProvisioningIntentV1, dependencies: _PreflightDependencies,
 ) -> ProvisioningBundleV1 | None:
     if not intent.supersedes_plan_id:
+        allowed, available = _safe_read(dependencies.root_scope_allowed, intent)
+        if not available:
+            raise ProvisioningBundleError("CHAIN_SCOPE_UNAVAILABLE")
+        if allowed is not True:
+            raise ProvisioningBundleError("CHAIN_ROOT_EXISTS")
         return None
     if dependencies.predecessor_lookup is None or dependencies.authoritative_chain_tip is None:
         raise ProvisioningBundleError("PREDECESSOR_UNAVAILABLE")
@@ -1682,6 +2046,61 @@ def _recheck_current_root_authority_locked(
         raise ValueError("STALE_PREVIEW")
 
 
+def _load_persisted_bundles_locked(store: SQLiteStore) -> tuple[ProvisioningBundleV1, ...]:
+    rows = store._connection.execute(
+        "SELECT plan_id FROM provisioning_bundles ORDER BY plan_id"
+    ).fetchall()
+    if any(len(row) != 1 or type(row[0]) is not str for row in rows):
+        raise ProvisioningBundleError("CHAIN_SCOPE_UNAVAILABLE")
+    try:
+        return tuple(load_provisioning_bundle(store, row[0]) for row in rows)
+    except Exception:
+        raise ProvisioningBundleError("CHAIN_SCOPE_UNAVAILABLE") from None
+
+
+def _recheck_provisioning_chain_locked(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+) -> None:
+    """Revalidate exact history while BEGIN IMMEDIATE excludes competing roots."""
+    bundles = _load_persisted_bundles_locked(store)
+    scoped = tuple(
+        candidate
+        for candidate in bundles
+        if _intent_scope(candidate.intent) == _intent_scope(bundle.intent)
+    )
+    existing = next(
+        (candidate for candidate in scoped if candidate.plan.plan_id == bundle.plan.plan_id),
+        None,
+    )
+    if bundle.supersedes_plan_id is None:
+        if any(candidate.plan.plan_id != bundle.plan.plan_id for candidate in scoped):
+            raise ProvisioningBundleError("CHAIN_ROOT_EXISTS")
+        return
+    predecessor = next(
+        (
+            candidate
+            for candidate in scoped
+            if candidate.plan.plan_id == bundle.supersedes_plan_id
+        ),
+        None,
+    )
+    if predecessor is None:
+        raise ProvisioningBundleError("PREDECESSOR_UNAVAILABLE")
+    actual_tip = _persisted_chain_tip(bundles, predecessor.plan.plan_id)
+    expected_tip = bundle.plan.plan_id if existing is not None else predecessor.plan.plan_id
+    if actual_tip != expected_tip:
+        raise ProvisioningBundleError("PREDECESSOR_NOT_CURRENT")
+
+
+def _recheck_locked_authority_and_chain(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+) -> None:
+    _recheck_current_root_authority_locked(store, bundle)
+    _recheck_provisioning_chain_locked(store, bundle)
+
+
 def binding_draft_for_bundle(bundle: ProvisioningBundleV1) -> RoadexApprovalBindingDraft:
     """Derive the one code-owned prospective approval binding for a bundle."""
     _validate_staged_bundle(bundle)
@@ -1885,7 +2304,7 @@ def _stage_authoritative_bundle_with_dependencies(
             store,
             binding_draft,
             save_source_and_bundle,
-            validate_locked=lambda: _recheck_current_root_authority_locked(store, bundle),
+            validate_locked=lambda: _recheck_locked_authority_and_chain(store, bundle),
             verify_bound=lambda candidate: verify_exact_persisted_bundle_set(
                 store, bundle, candidate,
             ),

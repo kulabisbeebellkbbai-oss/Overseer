@@ -144,3 +144,63 @@ verification:
 - `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
   tests/test_core.py tests/test_agent_store.py -k 'schema or migration or atomic
   or idempotent or provisioning or correction'` — 158 passed, 413 deselected.
+
+## Final production-hardening correction
+
+The final production review identified three remaining fail-closed gaps. First,
+the production runtime digest used live worktree bytes under a Git HEAD label.
+Production now opens the fixed adapter repository without following any path
+component symlink, pins its directory descriptor, securely retraverses the full
+path before and after each read, and invokes read-only Git commands through the
+descriptor. The runtime evidence is reconstructed from the named commit's
+bounded object tree and blobs using the reviewed exclusions, canonical paths,
+0644/0755 modes, per-blob SHA-256 values, and deterministic version-1 payload.
+Dirty tracked and untracked worktree bytes are never evidence. Malformed,
+oversized, missing, symlink, submodule, unsupported, duplicate, unsafe-path, and
+object-read cases fail with redacted errors. Git output, member count, path,
+individual blob, aggregate bytes, and elapsed reads are bounded; ambient Git
+environment overrides are removed and optional locks are disabled.
+
+Second, the exact GPG digest now requires `O_NOATIME` and compares complete
+descriptor and path-entry metadata before and after every bounded read. The
+digest is retained locally until the owned descriptor closes successfully.
+Ordinary open, read, metadata, and close failures return only the redacted
+unavailable error; `BaseException` cleanup signals continue to propagate.
+
+Third, the chain scope is now derived only from typed code-owned identity:
+kind, project, fixed workspace, resource, root, and policy revision. Production
+preview rejects a new empty-predecessor root when that exact scope already has a
+different root. The same rule and successor-tip topology are rechecked from
+exact persisted bundles after `BEGIN IMMEDIATE`, closing the preview/write race.
+Exact replay remains allowed, a distinct typed scope may start a root, and two
+concurrent same-scope attempts commit at most one bundle.
+
+Production-hardening RED evidence:
+
+- `pytest -q tests/test_provisioning_bundle.py -k 'production_runtime_digest or
+  production_git_boundary or production_gpg_digest or locked_chain or
+  concurrent_same_scope'` — 16 failed, 2 passed, 118 deselected. Failures proved
+  dirty tracked/untracked influence; symlink and repository-identity-race
+  acceptance; malformed, symlink, submodule, tree, oversized, and missing-object
+  Git acceptance; absent `O_NOATIME`; descriptor and entry metadata drift;
+  swallowed or leaked ordinary close errors; sequential second roots; and two
+  concurrent roots committing. The existing short-read rejection and
+  `BaseException` propagation controls were already green.
+
+Production-hardening GREEN verification:
+
+- The exact RED selection — 18 passed, 118 deselected.
+- `pytest -q tests/test_provisioning_bundle.py` — 136 passed.
+- Broad schema, migration, atomic, idempotent, provisioning, correction, Git,
+  GPG, locked-chain, and concurrent-root selection — 176 passed, 413 deselected.
+- Correction, atomic, binding, replay, rollback, trusted-boundary, locked-chain,
+  and concurrent-root selection — 77 passed, 223 deselected.
+- Full Task 3 touched suite excluding only the documented Roadex digest fixture
+  assertion — 724 passed, 1 deselected.
+- `python3 -m compileall -q src/overseer/provisioning_bundle.py
+  tests/test_provisioning_bundle.py` and `git diff --check` — passed.
+
+Disposable cross-repository acceptance was not runnable: the `mcp` package,
+`THEUNDERDARK_PYTHON`, and `THEUNDERDARK_SOURCE` were all absent. No live source
+checkout, production database, service, gateway, remote host, approval,
+dispatch, provisioning, deployment, restart, or push action was performed.

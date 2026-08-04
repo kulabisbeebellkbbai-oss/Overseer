@@ -1,4 +1,4 @@
-# Delta Task 3 implementation report
+# Delta Task 3 implementation and correction report
 
 ## Scope and ownership
 
@@ -155,3 +155,86 @@ worktrees.
 3. The two source worktrees were clean after their implementation commits;
    this report is the requested follow-up documentation change in the
    Overseer worktree.
+
+## Delta Task 3 correction update
+
+The rejected implementation was corrected under
+`.superpowers/sdd/delta-task-3-correction-brief.md` across the pinned isolated
+worktrees. The correction preserves the established Roadex
+`approvalStatusProvider.ts`, `approvalCoordinator.ts`, and
+`approvalContinuation.ts` paths and adds no parallel lifecycle or decision
+store.
+
+### Correction evidence
+
+- Roadex now accepts only the exact closed `ProvisioningIntentV1` wire schema:
+  all twelve fields are required, extra fields and invalid types are rejected,
+  schema/kind/source-commit/string-trimming rules are enforced, and no
+  authority, evidence, crew, approval, execution, or source-status field can
+  be projected through the MCP boundary.
+- Roadex now composes a bounded production transport to exactly
+  `http://127.0.0.1:8766/roadex/approval-stage`, using the existing root-owned
+  Overseer token reader. It sends exactly `{intent}`, validates authentication,
+  HTTP status/framing/content length/size, exact locator shape and scope,
+  aborts on timeout, and returns only redacted failures.
+- The workflow host passes an `AbortSignal` through staging and checks the
+  timed-out/settled guard immediately before durable wait registration. A
+  staging promise released after timeout registers zero waits.
+- Startup composition now passes the real staging transport to the host; the
+  composition test constructs this path without starting a service.
+- Overseer validates the exact intent at `/roadex/approval-stage`, rejects
+  query strings with `INVALID_ROADEX_APPROVAL_STAGE_REQUEST`, reconstructs
+  the locator from the persisted binding, and has a deterministic real-stage
+  test proving the returned reference is loadable from SQLite.
+
+### TDD and verification
+
+The focused Roadex RED run failed because the production transport and
+composition were absent and because late staging registered after timeout.
+After the minimal implementation, the focused correction suite passed:
+
+```text
+npm test -- --run tests/approvalWorkflowMcp.test.ts tests/overseerApprovalStageTransport.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalWorkflowHost.test.ts tests/sessionService.test.ts
+5 files passed, 117 tests passed
+
+npm test -- tests/approvalLifecycleIntegration.test.ts tests/approvalStatusProvider.test.ts tests/approvalCoordinator.test.ts tests/approvalWorkflowMcp.test.ts
+4 files passed, 108 tests passed
+
+npm test
+53 files passed, 540 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed (TypeScript build and Vite production build)
+```
+
+Focused Overseer verification passed the new API/projection/staging tests,
+including the deterministic real-stage test:
+
+```text
+python3 -m pytest -q tests/test_core.py -k 'roadex_stage_real_bundle_returns_sqlite_loadable_binding or roadex_stage_locator_is_derived_from_persisted_binding'
+2 passed
+
+python3 -m pytest -q tests/test_ui_regression.py -k 'roadex_typed_stage_rejects_caller_supplied_locator_fields'
+1 passed
+
+python3 -m pytest -q tests/test_core.py tests/test_ui_regression.py tests/test_roadex_approval_status.py tests/test_approval_source_cross_repo_contract.py
+547 passed, 3 failed
+```
+
+The three failures remain the same pre-existing untouched projection failures
+from the original report: the exact human-scope/source-evidence digest case
+and the two `kira` independence cases for rejected/changes-requested
+producer decisions. No correction file is involved.
+
+### Correction commits and boundaries
+
+- Roadex source: `7369f59a6c5c7fdf611a9f9b839531603114bf18` — `fix: correct authoritative approval staging`
+- Overseer source: `10bc64417344de2d699b58d75e724144b455daf0` — `fix: harden Roadex approval staging API`
+
+No main checkout, DonutHole checkout, live store/service, approval,
+deployment, protected host, gateway, firewall/IDS, or push was touched. The
+report update is committed separately in the Overseer worktree after the
+source commits above.

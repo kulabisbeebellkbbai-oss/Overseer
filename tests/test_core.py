@@ -3054,8 +3054,23 @@ class OverseerApiTests(unittest.TestCase):
             ):
                 locator = overseer_api.stage_roadex_approval_api(
                     str(store_path),
-                    {"intent": {"operation": "typed-only"}},
+                    {"intent": {
+                        "schema_version": "1",
+                        "request_id": "request.test",
+                        "plan_id": "plan.test",
+                        "kind": "donuthole_encrypted_backup_provisioning_v1",
+                        "project_id": "project.persisted",
+                        "resource_id": "resource.persisted",
+                        "root_id": "root.test",
+                        "policy_revision": "policy.test",
+                        "source_commit": "a" * 40,
+                        "requested_by": "roadex-test",
+                        "reason": "Test persisted binding reconstruction",
+                        "supersedes_plan_id": "",
+                    }},
                 )
+                with SQLiteStore(store_path) as store:
+                    persisted = store.load_roadex_approval_binding(locator["approvalRef"])
 
         self.assertEqual(locator, {
             "provider": "overseer",
@@ -3066,6 +3081,45 @@ class OverseerApiTests(unittest.TestCase):
             "authorityClass": binding.authority_class,
             "scopeDigest": binding.scope_digest,
         })
+        self.assertEqual(persisted.approval_ref, locator["approvalRef"])
+        self.assertEqual(persisted.scope_digest, locator["scopeDigest"])
+
+    def test_roadex_stage_real_bundle_returns_sqlite_loadable_binding(self):
+        from tests.test_provisioning_bundle import authoritative_bundle_fixture, deterministic_dependencies
+        from overseer import provisioning_bundle as provisioning_bundle_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path, bundle = authoritative_bundle_fixture(Path(directory) / "fixture")
+            dependencies = deterministic_dependencies(source_head=bundle.intent.source_commit)
+            with patch.object(
+                provisioning_bundle_module,
+                "production_preflight_dependencies",
+                return_value=dependencies,
+            ):
+                locator = overseer_api.stage_roadex_approval_api(
+                    store_path,
+                    {"intent": {
+                        "schema_version": bundle.intent.schema_version,
+                        "request_id": bundle.intent.request_id,
+                        "plan_id": bundle.intent.plan_id,
+                        "kind": bundle.intent.kind,
+                        "project_id": bundle.intent.project_id,
+                        "resource_id": bundle.intent.resource_id,
+                        "root_id": bundle.intent.root_id,
+                        "policy_revision": bundle.intent.policy_revision,
+                        "source_commit": bundle.intent.source_commit,
+                        "requested_by": bundle.intent.requested_by,
+                        "reason": bundle.intent.reason,
+                        "supersedes_plan_id": bundle.intent.supersedes_plan_id,
+                    }},
+                )
+            with SQLiteStore(store_path) as store:
+                persisted = store.load_roadex_approval_binding(locator["approvalRef"])
+
+        self.assertEqual(locator["approvalRef"], persisted.approval_ref)
+        self.assertEqual(locator["projectId"], persisted.project_id)
+        self.assertEqual(locator["workspaceId"], persisted.workspace_id)
+        self.assertEqual(locator["resourceRef"], persisted.resource_ref)
 
     def test_raw_provisioning_stage_api_fails_closed_after_typed_activation(self):
         from tests.test_backup_provisioning import (

@@ -23,6 +23,7 @@ from .store import SQLiteStore
 from .provisioning_bundle import (
     ProvisioningBundleError,
     bundle_status,
+    parse_provisioning_intent,
     preflight_bundle_api,
     stage_bundle_api,
 )
@@ -346,6 +347,10 @@ def stage_roadex_approval_api(
     """Stage one typed intent and return only its persisted approval locator."""
     if type(payload) is not dict or set(payload) != {"intent"}:
         raise ProvisioningBundleError("INVALID_ROADEX_APPROVAL_STAGE_REQUEST")
+    try:
+        parse_provisioning_intent(payload["intent"])
+    except (TypeError, ValueError):
+        raise ProvisioningBundleError("INVALID_ROADEX_APPROVAL_STAGE_REQUEST") from None
 
     try:
         preview = preflight_bundle_api(store_path, payload)

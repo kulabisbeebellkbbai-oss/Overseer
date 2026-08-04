@@ -79,7 +79,7 @@ class ProtectedGatewayUiRegressionTests(unittest.TestCase):
             path = Path(directory) / "overseer.sqlite3"
             with LocalApiHarness(path) as server:
                 request = Request(
-                    f"{server.url}/roadex/approval-stage",
+                    f"{server.url}/roadex/approval-stage?unexpected=query",
                     data=json.dumps({
                         "intent": {"operation": "typed-only"},
                         "approvalRef": "caller.override",

@@ -245,3 +245,50 @@ source commits above.
 The follow-up query-rejection correction is committed in Overseer source as
 `556fddac47ee8ae5e80b94ddc847f1aaa8b0c13f`. The exact Roadex final source SHA
 remains `d370b3bdef797376170ff54988f969ebadf31913`.
+
+### Review-correction addendum: remaining registration timeout race
+
+Terra review identified a remaining Roadex race at the host-to-coordinator
+registration boundary: the host timeout aborted staging, but
+`ApprovalCoordinator.register` had no cancellation input and could complete
+delayed status, session-lock, or persistence work after the caller had already
+received `request_timeout`. That could leave an in-memory or durable wait.
+
+The follow-up Roadex source correction is committed as
+`27b315d6eb433234589e42a46807cc0c2a2d1cc9`. The existing final Overseer source
+SHA remains `556fddac47ee8ae5e80b94ddc847f1aaa8b0c13f`; no Overseer source was
+changed for this follow-up.
+
+Roadex now passes the host request `AbortSignal` through the registration
+boundary into `ApprovalCoordinator.register`. Registration fails closed after
+status I/O, wait-ID reservation, and session-lock acquisition, rechecks before
+in-memory insertion and persistence, and rolls back both the session/wait
+memory and persisted snapshot when cancellation is observed during or after
+persistence. The regression uses the real `ApprovalCoordinator`, production
+host composition, and a delayed status provider: the client receives
+`request_timeout`, then delayed registration leaves no wait and no session
+waiting state. Focused coordinator tests cover delayed status, delayed lock
+acquisition, and delayed persistence cancellation.
+
+Verification for the Roadex follow-up:
+
+```text
+npm test -- tests/approvalWorkflowHost.test.ts tests/approvalCoordinator.test.ts tests/approvalLifecycleIntegration.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalWorkflowTimeoutRace.test.ts
+5 files passed, 83 tests passed
+
+npm test
+54 files passed, 546 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed (TypeScript build and Vite production build)
+
+git diff --check
+passed
+```
+
+No main checkout, DonutHole checkout, live service/store, approval,
+deployment, gateway, firewall/IDS, or push was touched. The Roadex and
+Overseer worktrees were verified clean after their separate commits.

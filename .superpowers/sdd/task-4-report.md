@@ -57,12 +57,19 @@ run.
   access, `mode=ro&immutable=1`, query-only mode, zero busy timeout, and no
   sidecars. A realistic freshly-written-database test then correctly exposed
   that SQLite reopens the proc-fd target without `O_NOATIME` and changes source
-  atime. The proc-fd design was discarded. Replacement fixed-buffer streaming
-  tests produced 8 expected failures before the fallback was implemented.
+  atime. That direct-source proc-fd design was discarded; this diagnostic is
+  superseded by the final disposable pinned proc-fd plus actual-SQLite-fd audit.
+  Replacement fixed-buffer streaming tests produced 8 expected failures before
+  the fallback was implemented.
 - The final deadline/progress-cleanup selection produced 4 expected failures:
   the deadline was only 10 seconds, the progress handler was installed after
   PRAGMAs, and ordinary or BaseException progress-handler cleanup failure
   skipped connection close.
+- The final ownership/TOCTOU correction produced 3 expected focused failures:
+  SQLite opened the disposable by its visible `/tmp` pathname, deterministic
+  replacement changed the queried database, and a fail-once temp-descriptor
+  close during partial streaming lost ownership. Production code was unchanged
+  before this RED run.
 
 ## Outcome
 
@@ -79,15 +86,29 @@ function remains authoritative; mismatch is returned only as
 `AUTHORITATIVE_REBUILD_MISMATCH`, before persistence.
 
 `bundle_status()` validates one exact plan ID and opens the source once through
-the reviewed no-follow/no-sidecar `O_NOATIME` descriptor boundary. Because the
-platform's SQLite proc-fd reopen changes source atime, it uses the explicitly
-allowed fallback: a 1 MiB fixed-buffer stream into a private disposable file,
-with incremental SHA-256 while copying and a second incremental source hash
-after queries. It never creates a whole-database bytes object. The code-owned
-2 GiB database cap is above the current 778,797,056-byte authoritative store,
-and the 60-second aggregate deadline covers traversal, both streaming passes,
-temp write/fsync/open, queries, verification, close, and cleanup. The private
-SQLite connection is `mode=ro&immutable=1`, query-only, zero-busy-timeout, and
+the reviewed no-follow/no-sidecar `O_NOATIME` descriptor boundary. It streams
+the source in fixed 1 MiB buffers into a private disposable file, hashes while
+copying, and hashes the source again after queries without ever constructing a
+whole-database bytes object. One outer resource object exists before acquisition
+and owns every partial source fd, parent fd, temp fd/path, SQLite connection,
+read-only store, and audited SQLite database fd as each becomes available. The
+streaming helper accepts caller-owned resources and performs no cleanup.
+
+The disposable fd remains open and pinned through SQLite open. SQLite receives
+only `file:/proc/self/fd/<temp-fd>?mode=ro&immutable=1`. Descriptor snapshots
+before and after `sqlite3.connect` identify and record the actual SQLite DB fd
+whose device/inode/mode/size matches the pinned disposable. That exact fd is
+re-fstat'd after all status queries and before close, while the pinned bytes and
+identity are re-hashed and checked. Replacement before open, or replacement
+that is restored after SQLite opens it, therefore fails closed and cannot
+influence a returned status. An owned pathname is unlinked only when its current
+regular-file device/inode still matches the pinned snapshot; a different
+replacement inode is never removed as owned cleanup.
+
+The code-owned 2 GiB database cap is above the current 778,797,056-byte
+authoritative store, and the 60-second aggregate deadline covers traversal,
+both streaming passes, temp write/fsync/open, queries, verification, close, and
+cleanup. The private SQLite connection is query-only, zero-busy-timeout, and
 installs a deadline progress handler before PRAGMA/query work. It bypasses all
 `SQLiteStore` initialization, migration, hardening, and write lifecycle while
 reusing the exact Task 3 loader methods through a private read-only subclass.
@@ -99,11 +120,15 @@ distinct from incomplete or corrupt persisted sets: only a missing initial
 bundle row is `BUNDLE_NOT_FOUND`; every missing, malformed, or inconsistent
 persisted member is `BUNDLE_STATUS_INTEGRITY_ERROR`. Deadline, cap, progress,
 hash mismatch, sidecar, identity/metadata drift, close, or cleanup failures are
-the single `BUNDLE_STATUS_UNAVAILABLE` code. Temp cleanup is unconditional and
-the read-only SQLite connection must close successfully before return. The projection
-is stable and redacted, includes current exact review-outbox states, and reports
-both mutation flags false. The source database bytes, timestamps, and sidecar
-set remain unchanged on success and failure.
+the single `BUNDLE_STATUS_UNAVAILABLE` code. Cleanup independently attempts
+progress clear, SQLite close, temp-fd close, temp unlink, source-fd close, and
+parent-fd close; it retries each cleanup once and continues after ordinary or
+fatal failures. Persistent ordinary and fatal cleanup failures are retained
+separately: an earlier fatal primary is preserved, while fatal cleanup outranks
+an ordinary primary. The connection must close successfully before return. The
+projection is stable and redacted, includes current exact review-outbox states,
+and reports both mutation flags false. The source database bytes, timestamps,
+and sidecar set remain unchanged on success and failure.
 
 The loopback API exposes only authenticated admin-token POST preflight, POST
 stage, and exact GET status routes. Missing credentials, a server without an
@@ -171,18 +196,26 @@ Final reviewer correction verification:
 - Established four-file touched suite excluding the documented unrelated
   Roadex digest fixture: 777 passed, 1 deselected in 89.99 seconds.
 
-Configured disposable cross-repository acceptance was attempted with
-`pytest -q tests/test_donuthole_backup_acceptance.py`. It produced 2 passes and
-8 prerequisite failures because `mcp` is not installed and
-`THEUNDERDARK_PYTHON` plus `THEUNDERDARK_SOURCE` are unset. No dependency,
-environment, source checkout, live database, service, gateway, remote host,
-approval, dispatch, provisioning, deployment, restart, push, or host state was
-changed.
+Final ownership/TOCTOU correction verification:
 
-The configured acceptance was also rerun through the available TheUnderdark
-virtual environment with explicit `THEUNDERDARK_PYTHON` and
-`THEUNDERDARK_SOURCE`. It produced 3 passes and 7 failures. MCP discovery now
-passes; the seven disposable composition scenarios are blocked because the
-current TheUnderdark `tests/test_backup_production_integration.py` no longer
-exports the expected `build_real_service` builder. No checkout, dependency,
-environment, or external state was changed.
+- Focused status selection — 35 passed, 204 deselected.
+- Full provisioning suites — 267 passed.
+- Established four-file touched suite excluding the documented unrelated
+  Roadex digest fixture — 783 passed, 1 deselected in 89.85 seconds.
+- Python compilation and `git diff --check` are included in the final commit
+  gate.
+
+Earlier acceptance attempts with unset variables or the wrong TheUnderdark
+source root produced prerequisite/import failures; those results are retained
+only as superseded diagnostic history. The authoritative final configured
+disposable acceptance was:
+
+```bash
+THEUNDERDARK_PYTHON='/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python'
+THEUNDERDARK_SOURCE='/home/god/Documents/Codex Workspace/TheUnderdark/.worktrees/donuthole-contract-acceptance'
+'/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python' -m pytest -q tests/test_donuthole_backup_acceptance.py
+```
+
+Result: 10 passed in 6.58 seconds. No dependency, source checkout, live
+database, service, gateway, remote host, approval, dispatch, provisioning,
+deployment, restart, push, or external state was changed.

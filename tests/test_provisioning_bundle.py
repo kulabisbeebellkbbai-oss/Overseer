@@ -3366,7 +3366,7 @@ def test_bundle_status_uses_private_streamed_immutable_store_without_writable_li
     assert result["bundle_digest"] == bundle.bundle_digest
     assert len(opened) == 1
     uri, uses_uri, timeout = opened[0]
-    assert not uri.startswith("file:/proc/self/fd/")
+    assert uri.startswith("file:/proc/self/fd/")
     assert os.fspath(store_path) not in uri
     assert uri.endswith("?mode=ro&immutable=1")
     assert uses_uri is True
@@ -3375,6 +3375,279 @@ def test_bundle_status_uses_private_streamed_immutable_store_without_writable_li
     assert created
     assert all(not os.path.exists(path) for path in created)
     assert _exact_store_metadata_observation(store_path) == before
+
+
+def test_bundle_status_pinned_descriptor_ignores_replaced_snapshot_path(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _exact_store_metadata_observation(store_path)
+    real_open = provisioning_bundle_module._open_bundle_status_store
+    replacement_bytes: bytes | None = None
+    replaced_paths: list[str] = []
+
+    def replace_before_open(resources, deadline):
+        nonlocal replacement_bytes
+        database_path = resources.snapshot_path
+        assert database_path is not None
+        replacement = tmp_path / "attacker.sqlite3"
+        connection = sqlite3.connect(replacement)
+        try:
+            connection.execute("CREATE TABLE attacker_only (secret TEXT NOT NULL)")
+            connection.execute("INSERT INTO attacker_only(secret) VALUES ('private')")
+            connection.commit()
+        finally:
+            connection.close()
+        replacement_bytes = replacement.read_bytes()
+        os.replace(replacement, database_path)
+        replaced_paths.append(database_path)
+        return real_open(resources, deadline)
+
+    monkeypatch.setattr(
+        provisioning_bundle_module, "_open_bundle_status_store", replace_before_open,
+    )
+
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert replacement_bytes is not None
+    assert replaced_paths
+    assert Path(replaced_paths[0]).read_bytes() == replacement_bytes
+    Path(replaced_paths[0]).unlink()
+    assert _exact_store_metadata_observation(store_path) == before
+
+
+def test_bundle_status_rejects_replacement_restored_after_sqlite_open(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _exact_store_metadata_observation(store_path)
+    real_open = provisioning_bundle_module._open_bundle_status_store
+    real_connect = sqlite3.connect
+    state: dict[str, str] = {}
+
+    def prepare_restore_race(resources, deadline):
+        snapshot_path = resources.snapshot_path
+        assert snapshot_path is not None
+        original_link = str(tmp_path / "original-snapshot-link.sqlite3")
+        attacker_path = str(tmp_path / "attacker-restored.sqlite3")
+        os.link(snapshot_path, original_link)
+        attacker = real_connect(attacker_path)
+        try:
+            attacker.execute("CREATE TABLE attacker_only (secret TEXT NOT NULL)")
+            attacker.commit()
+        finally:
+            attacker.close()
+        state.update(
+            snapshot_path=snapshot_path,
+            original_link=original_link,
+            attacker_path=attacker_path,
+        )
+        return real_open(resources, deadline)
+
+    def replace_then_restore(database, *args, **kwargs):
+        if isinstance(database, str) and database.startswith("file:/proc/self/fd/"):
+            os.replace(state["attacker_path"], state["snapshot_path"])
+            try:
+                connection = real_connect(
+                    database.replace("?mode=ro&immutable=1", "?immutable=1"),
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                os.replace(state["original_link"], state["snapshot_path"])
+            return connection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        provisioning_bundle_module, "_open_bundle_status_store", prepare_restore_race,
+    )
+    monkeypatch.setattr(
+        provisioning_bundle_module.sqlite3, "connect", replace_then_restore,
+    )
+
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+            provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+        assert state
+        assert not os.path.exists(state["snapshot_path"])
+        assert not os.path.exists(state["original_link"])
+        assert _exact_store_metadata_observation(store_path) == before
+    finally:
+        for path in state.values():
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def test_bundle_status_outer_owner_retries_temp_close_after_partial_stream_failure(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    created: list[tuple[int, str]] = []
+    close_attempts: list[int] = []
+    real_mkstemp = tempfile.mkstemp
+    real_close = os.close
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        created.append((descriptor, path))
+        return descriptor, path
+
+    def fail_temp_close_once(descriptor):
+        if created and descriptor == created[0][0]:
+            close_attempts.append(descriptor)
+            if len(close_attempts) == 1:
+                raise OSError("injected first temp close failure")
+        return real_close(descriptor)
+
+    monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(provisioning_bundle_module.os, "close", fail_temp_close_once)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "_write_bundle_status_chunk",
+        lambda *_args: (_ for _ in ()).throw(OSError("injected stream failure")),
+    )
+
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+            provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+        assert created
+        descriptor, path = created[0]
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        assert close_attempts == [descriptor, descriptor]
+        assert not os.path.exists(path)
+    finally:
+        if created:
+            try:
+                real_close(created[0][0])
+            except OSError:
+                pass
+            try:
+                os.unlink(created[0][1])
+            except FileNotFoundError:
+                pass
+
+
+def test_bundle_status_cleanup_retries_fail_once_close_and_unlink(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before_descriptors = len(os.listdir("/proc/self/fd"))
+    created: list[str] = []
+    unlink_attempts: list[str] = []
+    close_attempts: list[bool] = []
+    real_mkstemp = tempfile.mkstemp
+    real_unlink = os.unlink
+    real_store_close = provisioning_bundle_module._BundleStatusReadOnlyStore.close
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return descriptor, path
+
+    def fail_unlink_through_first_cleanup_attempt(path, *args, **kwargs):
+        if created and os.fspath(path) == created[0]:
+            unlink_attempts.append(os.fspath(path))
+            if len(unlink_attempts) < 3:
+                raise OSError("injected transient unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    def fail_store_close_once(store):
+        close_attempts.append(True)
+        if len(close_attempts) == 1:
+            raise OSError("injected transient connection close failure")
+        return real_store_close(store)
+
+    monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(provisioning_bundle_module.os, "unlink", fail_unlink_through_first_cleanup_attempt)
+    monkeypatch.setattr(
+        provisioning_bundle_module._BundleStatusReadOnlyStore, "close", fail_store_close_once,
+    )
+
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert close_attempts == [True, True]
+    assert len(unlink_attempts) == 3
+    assert created and not os.path.exists(created[0])
+    assert len(os.listdir("/proc/self/fd")) == before_descriptors
+
+
+@pytest.mark.parametrize("primary_is_fatal", (False, True))
+def test_bundle_status_fatal_cleanup_priority_preserves_fatal_primary_and_continues(
+    tmp_path, monkeypatch, primary_is_fatal,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before_descriptors = len(os.listdir("/proc/self/fd"))
+    created: list[str] = []
+    real_mkstemp = tempfile.mkstemp
+    real_connect = sqlite3.connect
+    real_store_close = provisioning_bundle_module._BundleStatusReadOnlyStore.close
+
+    class PrimaryFatal(BaseException):
+        pass
+
+    class CleanupFatal(BaseException):
+        pass
+
+    primary = PrimaryFatal("primary fatal") if primary_is_fatal else OSError("primary ordinary")
+
+    class ProgressCleanupProxy:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def set_progress_handler(self, handler, opcodes):
+            if handler is None:
+                raise OSError("persistent ordinary progress cleanup failure")
+            return self.connection.set_progress_handler(handler, opcodes)
+
+        def close(self):
+            return self.connection.close()
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return descriptor, path
+
+    def proxied_connect(*args, **kwargs):
+        return ProgressCleanupProxy(real_connect(*args, **kwargs))
+
+    def fatal_close(store):
+        real_store_close(store)
+        raise CleanupFatal("persistent fatal connection cleanup failure")
+
+    monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(provisioning_bundle_module.sqlite3, "connect", proxied_connect)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "_bundle_status_from_store",
+        lambda *_args: (_ for _ in ()).throw(primary),
+    )
+    monkeypatch.setattr(
+        provisioning_bundle_module._BundleStatusReadOnlyStore, "close", fatal_close,
+    )
+
+    expected = PrimaryFatal if primary_is_fatal else CleanupFatal
+    with pytest.raises(expected) as raised:
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    if primary_is_fatal:
+        assert raised.value is primary
+    assert created and all(not os.path.exists(path) for path in created)
+    assert len(os.listdir("/proc/self/fd")) == before_descriptors
 
 
 def test_bundle_status_read_only_store_enforces_query_only_zero_busy_timeout_and_progress(
@@ -3387,12 +3660,20 @@ def test_bundle_status_read_only_store_enforces_query_only_zero_busy_timeout_and
     )
     clock = [100.0]
     monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
-    snapshot_path = None
+    resources = provisioning_bundle_module._BundleStatusResources(
+        database_fd=database_fd,
+        parent_fd=parent_fd,
+        identity=identity,
+    )
     try:
-        snapshot_path, _digest = provisioning_bundle_module._stream_bundle_status_database(
-            database_fd, parent_fd, identity, 101.0,
+        snapshot_fd, snapshot_path = tempfile.mkstemp()
+        resources.snapshot_fd = snapshot_fd
+        resources.snapshot_path = snapshot_path
+        resources.snapshot_path_owned = True
+        _digest = provisioning_bundle_module._stream_bundle_status_database(
+            resources, database_fd, parent_fd, identity, 101.0,
         )
-        store = provisioning_bundle_module._open_bundle_status_store(snapshot_path, 101.0)
+        store = provisioning_bundle_module._open_bundle_status_store(resources, 101.0)
         assert isinstance(store, SQLiteStore)
         assert store._connection.execute("PRAGMA query_only").fetchone()[0] == 1
         assert store._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 0
@@ -3420,11 +3701,10 @@ def test_bundle_status_read_only_store_enforces_query_only_zero_busy_timeout_and
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n"
             ).fetchone()
         provisioning_bundle_module._close_bundle_status_store(store)
+        resources.store = None
+        resources.connection = None
     finally:
-        if snapshot_path is not None and os.path.exists(snapshot_path):
-            os.unlink(snapshot_path)
-        os.close(database_fd)
-        os.close(parent_fd)
+        provisioning_bundle_module._cleanup_bundle_status_resources(resources)
 
 
 def test_bundle_status_installs_progress_handler_before_sqlite_pragma_queries(
@@ -3432,6 +3712,15 @@ def test_bundle_status_installs_progress_handler_before_sqlite_pragma_queries(
 ):
     database_path = tmp_path / "private.sqlite3"
     database_path.write_bytes(b"private")
+    database_path.chmod(0o600)
+    descriptor = os.open(database_path, os.O_RDONLY)
+    identity = provisioning_bundle_module._file_identity(os.fstat(descriptor))
+    resources = provisioning_bundle_module._BundleStatusResources(
+        snapshot_fd=descriptor,
+        snapshot_path=str(database_path),
+        snapshot_path_owned=True,
+        snapshot_identity=identity,
+    )
     actions: list[str] = []
 
     class Cursor:
@@ -3442,7 +3731,9 @@ def test_bundle_status_installs_progress_handler_before_sqlite_pragma_queries(
             return (self.value,)
 
     class FakeConnection:
-        row_factory = None
+        def __init__(self):
+            self.row_factory = None
+            self.descriptor = os.dup(descriptor)
 
         def set_progress_handler(self, _handler, _opcodes):
             actions.append("progress")
@@ -3453,6 +3744,7 @@ def test_bundle_status_installs_progress_handler_before_sqlite_pragma_queries(
 
         def close(self):
             actions.append("close")
+            os.close(self.descriptor)
 
     monkeypatch.setattr(
         provisioning_bundle_module.sqlite3,
@@ -3461,11 +3753,14 @@ def test_bundle_status_installs_progress_handler_before_sqlite_pragma_queries(
     )
 
     store = provisioning_bundle_module._open_bundle_status_store(
-        str(database_path), time.monotonic() + 1,
+        resources, time.monotonic() + 1,
     )
 
     assert actions[0] == "progress"
     provisioning_bundle_module._close_bundle_status_store(store)
+    resources.store = None
+    resources.connection = None
+    os.close(descriptor)
 
 
 @pytest.mark.parametrize("failure_type", (OSError, KeyboardInterrupt))
@@ -3498,7 +3793,7 @@ def test_bundle_status_base_exception_close_failure_still_cleans_temp_and_descri
     before_descriptors = len(os.listdir("/proc/self/fd"))
     created: list[str] = []
     real_mkstemp = tempfile.mkstemp
-    real_close = provisioning_bundle_module._close_bundle_status_store
+    real_close = provisioning_bundle_module._BundleStatusReadOnlyStore.close
 
     class StatusCloseInterrupted(BaseException):
         pass
@@ -3514,7 +3809,7 @@ def test_bundle_status_base_exception_close_failure_still_cleans_temp_and_descri
 
     monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
     monkeypatch.setattr(
-        provisioning_bundle_module, "_close_bundle_status_store", interrupted_close,
+        provisioning_bundle_module._BundleStatusReadOnlyStore, "close", interrupted_close,
     )
 
     with pytest.raises(StatusCloseInterrupted):
@@ -3541,7 +3836,7 @@ def test_bundle_status_deadline_and_close_failures_are_unavailable_without_sourc
     real_open = provisioning_bundle_module._open_bundle_status_store
     real_load = provisioning_bundle_module._bundle_status_from_store
     real_verify = provisioning_bundle_module._verify_authority_snapshot
-    real_close = provisioning_bundle_module._close_bundle_status_store
+    real_close = provisioning_bundle_module._BundleStatusReadOnlyStore.close
 
     if failure_stage == "stream":
         monkeypatch.setattr(
@@ -3567,7 +3862,9 @@ def test_bundle_status_deadline_and_close_failures_are_unavailable_without_sourc
         def failing_close(store):
             real_close(store)
             raise OSError("private close failure")
-        monkeypatch.setattr(provisioning_bundle_module, "_close_bundle_status_store", failing_close)
+        monkeypatch.setattr(
+            provisioning_bundle_module._BundleStatusReadOnlyStore, "close", failing_close,
+        )
     else:
         monkeypatch.setattr(
             provisioning_bundle_module,

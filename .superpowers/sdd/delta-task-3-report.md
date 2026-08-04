@@ -239,3 +239,9 @@ No main checkout, DonutHole checkout, live store/service, approval,
 deployment, protected host, gateway, firewall/IDS, or push was touched. The
 report update is committed separately in the Overseer worktree after the
 source commits above.
+
+### Correction addendum
+
+The follow-up query-rejection correction is committed in Overseer source as
+`556fddac47ee8ae5e80b94ddc847f1aaa8b0c13f`. The exact Roadex final source SHA
+remains `d370b3bdef797376170ff54988f969ebadf31913`.

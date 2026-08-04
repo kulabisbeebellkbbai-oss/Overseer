@@ -1,23 +1,27 @@
 """Frozen, bounded contracts for DonutHole provisioning bundles.
 
-This module deliberately contains no preflight, persistence, dispatch, or host
-operation behavior.  It defines only the immutable values that later slices
-will build and persist authoritatively.
+This module contains read-only preflight and immutable bundle construction. It
+deliberately contains no persistence, dispatch, or host-operation behavior.
 """
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
 import json
 import math
 import re
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
-from .backup_provisioning import DonutHoleBackupProvisioningPlan, ProvisioningStep
+from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
+from .backup_provisioning import (
+    ADAPTER_SOURCE_PATH, GPG_PATH, SOURCE_PATH, DonutHoleBackupProvisioningPlan,
+    ProvisioningStep, build_plan,
+)
 from .core import OwnerDomain
+from .storage_control import current_root_identity, resolve_current_root_authorization
 
 
 INTENT_FIELDS = frozenset({
@@ -42,6 +46,25 @@ _REVIEW_OWNERS = (
     ("security", OwnerDomain.ODO_IDS),
     ("sisko", OwnerDomain.SISKO),
 )
+REQUIRED_PREFLIGHT_CODES = (
+    "INTENT_VALID", "SOURCE_COMMIT_MATCH", "RUNTIME_DIGEST_VALID",
+    "CAPABILITY_DIGEST_VALID", "GPG_DIGEST_VALID", "ROOT_AUTHORIZATION_CURRENT",
+    "DEPENDENCIES_AVAILABLE", "CANONICAL_BOUNDARIES_VALID", "ROLLBACK_PREREQUISITES_VALID",
+)
+_ROOT_ALIAS = "donuthole-development"
+_ROOT_STATUS = "active"
+_ROOT_MAX_BYTES = 1073741824
+_OVERSEER_TOKEN_SOURCE_FILE = "/home/god/.local/share/overseer/project/state/api-token"
+_OVERSEER_TOKEN_FILE = "/etc/codex-development-backups/keys/overseer.token"
+_CURSOR_KEY_FILE = "/etc/codex-development-backups/keys/cursor.key"
+
+
+class ProvisioningBundleError(ValueError):
+    """A bounded bundle cannot be built from the authoritative read snapshot."""
+
+
+def _always_true() -> bool:
+    return True
 
 
 class _FrozenMapping(Mapping[str, object]):
@@ -235,6 +258,25 @@ def parse_provisioning_intent(payload: Mapping[str, object]) -> ProvisioningInte
 
 
 @dataclass(frozen=True)
+class PreflightDependencies:
+    """Read-only dependencies needed to resolve one deterministic preflight."""
+
+    source_path: str
+    source_head: Callable[[str], str]
+    runtime_digest: Callable[[str, str], str]
+    capability_digest: Callable[[str, Mapping[str, object]], str]
+    file_digest: Callable[[str], str]
+    executable_exists: Callable[[str], bool]
+    root_path: str = SOURCE_PATH
+    root_identity: Callable[[str], str] = current_root_identity
+    resolve_root_authorization: Callable[..., Mapping[str, object]] = resolve_current_root_authorization
+    canonical_boundaries_valid: Callable[[], bool] = _always_true
+    rollback_prerequisites_valid: Callable[[], bool] = _always_true
+    predecessor_lookup: Callable[[str], ProvisioningBundleV1 | None] | None = None
+    authoritative_chain_tip: Callable[[], str | None] | None = None
+
+
+@dataclass(frozen=True)
 class PreflightCheck:
     code: str
     status: str
@@ -267,6 +309,118 @@ class ProvisioningPreflightReport:
         if not isinstance(self.passed, bool) or self.passed != all(check.status == "passed" for check in self.checks):
             raise ValueError("preflight passed state must match checks")
         _digest(self.report_digest, "preflight report digest")
+
+
+def canonical_root_target_digest(root_identity: str) -> str:
+    """Return the versioned, code-owned root target binding for an identity."""
+    return canonical_digest({"version": "1", "root_identity": _digest(root_identity, "root identity")})
+
+
+def _check(code: str, passed: bool, evidence: Mapping[str, object], summary: str) -> PreflightCheck:
+    return PreflightCheck(code, "passed" if passed else "failed", canonical_digest(evidence), summary)
+
+
+def _safe_read(callback: Callable[..., object], *arguments: object) -> tuple[object | None, bool]:
+    try:
+        return callback(*arguments), True
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None, False
+
+
+def _valid_digest(value: object) -> bool:
+    return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
+
+
+def _valid_commit(value: object) -> bool:
+    return isinstance(value, str) and _COMMIT.fullmatch(value) is not None
+
+
+def _resolved_digest(value: object) -> str:
+    return value if _valid_digest(value) else ""
+
+
+def _resolved_commit(value: object) -> str:
+    return value if _valid_commit(value) else ""
+
+
+def _resolved_authorization_ref(value: object) -> str:
+    return value if isinstance(value, str) and value and value == value.strip() else ""
+
+
+def run_provisioning_preflight(
+    store_path: str, intent: ProvisioningIntentV1, dependencies: PreflightDependencies,
+) -> ProvisioningPreflightReport:
+    """Resolve the fixed authority inputs without changing store or host state."""
+    source_head, source_available = _safe_read(dependencies.source_head, dependencies.source_path)
+    runtime, runtime_available = _safe_read(
+        dependencies.runtime_digest, dependencies.source_path, intent.source_commit,
+    )
+    capability, capability_available = _safe_read(
+        dependencies.capability_digest, intent.source_commit, EXPECTED_BACKUP_TOOL_SCHEMAS,
+    )
+    gpg, gpg_available = _safe_read(dependencies.file_digest, GPG_PATH)
+    executable, executable_available = _safe_read(dependencies.executable_exists, GPG_PATH)
+    identity, identity_available = _safe_read(dependencies.root_identity, dependencies.root_path)
+    identity_value = _resolved_digest(identity)
+    target = canonical_root_target_digest(identity_value) if identity_value else ""
+    authority: object | None = None
+    authority_available = False
+    if identity_value and target:
+        authority, authority_available = _safe_read(
+            dependencies.resolve_root_authorization,
+            store_path, intent.project_id, intent.root_id, intent.policy_revision,
+            identity_value, _ROOT_ALIAS, _ROOT_STATUS, _ROOT_MAX_BYTES, target,
+        )
+    authorization_ref = _resolved_authorization_ref(
+        authority.get("authorization_ref") if isinstance(authority, Mapping) else None
+    )
+    boundaries, boundaries_available = _safe_read(dependencies.canonical_boundaries_valid)
+    rollback, rollback_available = _safe_read(dependencies.rollback_prerequisites_valid)
+
+    intent_valid = type(intent) is ProvisioningIntentV1
+    source_match = source_available and _valid_commit(source_head) and source_head == intent.source_commit
+    runtime_valid = runtime_available and _valid_digest(runtime)
+    capability_valid = capability_available and _valid_digest(capability)
+    gpg_valid = gpg_available and _valid_digest(gpg)
+    authority_current = authority_available and bool(authorization_ref)
+    dependencies_available = all((
+        source_available, runtime_available, capability_available, gpg_available,
+        executable_available, identity_available, authority_available,
+    )) and executable is True
+    boundaries_valid = (
+        boundaries_available and boundaries is True and dependencies.source_path == ADAPTER_SOURCE_PATH
+        and dependencies.root_path == SOURCE_PATH
+    )
+    rollback_valid = rollback_available and rollback is True
+    checks = (
+        _check("INTENT_VALID", intent_valid, {"valid": intent_valid}, "The bounded intent is valid."),
+        _check("SOURCE_COMMIT_MATCH", source_match, {"available": source_available, "matched": source_match}, "The authoritative source commit matches the bounded intent."),
+        _check("RUNTIME_DIGEST_VALID", runtime_valid, {"available": runtime_available, "valid": runtime_valid}, "The authoritative runtime digest is valid."),
+        _check("CAPABILITY_DIGEST_VALID", capability_valid, {"available": capability_available, "valid": capability_valid}, "The authoritative capability digest is valid."),
+        _check("GPG_DIGEST_VALID", gpg_valid, {"available": gpg_available, "valid": gpg_valid}, "The authoritative GPG digest is valid."),
+        _check("ROOT_AUTHORIZATION_CURRENT", authority_current, {"available": authority_available, "current": authority_current}, "The exact root authorization is current."),
+        _check("DEPENDENCIES_AVAILABLE", dependencies_available, {"available": dependencies_available}, "Required read dependencies are available."),
+        _check("CANONICAL_BOUNDARIES_VALID", boundaries_valid, {"available": boundaries_available, "valid": boundaries_valid}, "Canonical boundaries are valid."),
+        _check("ROLLBACK_PREREQUISITES_VALID", rollback_valid, {"available": rollback_available, "valid": rollback_valid}, "Rollback prerequisites are valid."),
+    )
+    resolved_inputs = {
+        "source_commit": _resolved_commit(source_head),
+        "runtime_digest": _resolved_digest(runtime),
+        "capability_digest": _resolved_digest(capability),
+        "gpg_sha256": _resolved_digest(gpg),
+        "root_identity": identity_value,
+        "target_digest": target,
+        "authorization_ref": authorization_ref,
+    }
+    report_id = f"preflight.{intent.plan_id}"
+    report_digest = canonical_digest({
+        "report_id": report_id, "plan_id": intent.plan_id, "resolved_inputs": resolved_inputs,
+        "checks": [asdict(item) for item in checks],
+    })
+    return ProvisioningPreflightReport(
+        report_id, intent.plan_id, resolved_inputs, checks,
+        all(item.status == "passed" for item in checks), report_digest,
+    )
 
 
 @dataclass(frozen=True)
@@ -345,11 +499,136 @@ class ProvisioningBundleV1:
         object.__setattr__(self, "changed_immutable_inputs", _string_tuple(self.changed_immutable_inputs, "changed immutable inputs"))
 
 
+def _canonical_root_registration(intent: ProvisioningIntentV1, resolved_inputs: Mapping[str, object]) -> Mapping[str, object]:
+    return {
+        "project_id": intent.project_id,
+        "root_id": intent.root_id,
+        "policy_revision": intent.policy_revision,
+        "host_path": SOURCE_PATH,
+        "alias": _ROOT_ALIAS,
+        "max_bytes": _ROOT_MAX_BYTES,
+        "authorization_ref": str(resolved_inputs["authorization_ref"]),
+    }
+
+
+def _review_outbox(
+    intent: ProvisioningIntentV1,
+    plan: DonutHoleBackupProvisioningPlan,
+    report: ProvisioningPreflightReport,
+    bundle_digest_value: str,
+) -> tuple[ProvisioningReviewOutboxEntry, ...]:
+    evidence_ids = (plan.plan_digest, report.report_digest, bundle_digest_value)
+    return tuple(
+        ProvisioningReviewOutboxEntry(
+            id=f"outbox.{intent.plan_id}.{role}",
+            message_id=f"crew.{owner.value}.review-{intent.plan_id}",
+            plan_id=intent.plan_id,
+            bundle_digest=bundle_digest_value,
+            role=role,
+            owner_domain=owner,
+            related_resource_id=intent.resource_id,
+            subject="Review exact DonutHole provisioning bundle",
+            message="Review the immutable plan and preflight evidence only.",
+            acceptance_criteria=("Review the exact immutable evidence.",),
+            evidence_ids=evidence_ids,
+        )
+        for role, owner in _REVIEW_OWNERS
+    )
+
+
+def _immutable_inputs(
+    plan: DonutHoleBackupProvisioningPlan, report: ProvisioningPreflightReport,
+) -> Mapping[str, object]:
+    return {
+        "plan_digest": plan.plan_digest,
+        "gpg_sha256": plan.gpg_sha256,
+        "adapter_commit": plan.adapter_commit,
+        "runtime_digest": plan.runtime_digest,
+        "capability_digest": plan.capability_digest,
+        "root_authorization_refs": plan.root_authorization_refs,
+        "root_registrations": plan.root_registrations,
+        "resolved_preflight": report.resolved_inputs,
+    }
+
+
+def changed_immutable_inputs(
+    previous: ProvisioningBundleV1 | None,
+    plan: DonutHoleBackupProvisioningPlan,
+    report: ProvisioningPreflightReport,
+) -> tuple[str, ...]:
+    """Return sorted immutable differences for a supplied authoritative predecessor."""
+    if previous is None:
+        return ()
+    previous_values = _immutable_inputs(previous.plan, previous.preflight)
+    current_values = _immutable_inputs(plan, report)
+    return tuple(sorted(
+        field for field in current_values if _canonical_value(current_values[field]) != _canonical_value(previous_values[field])
+    ))
+
+
+def _authoritative_predecessor(
+    intent: ProvisioningIntentV1, dependencies: PreflightDependencies,
+) -> ProvisioningBundleV1 | None:
+    if not intent.supersedes_plan_id:
+        return None
+    if dependencies.predecessor_lookup is None or dependencies.authoritative_chain_tip is None:
+        raise ProvisioningBundleError("PREDECESSOR_UNAVAILABLE")
+    predecessor, available = _safe_read(dependencies.predecessor_lookup, intent.supersedes_plan_id)
+    if not available or type(predecessor) is not ProvisioningBundleV1:
+        raise ProvisioningBundleError("PREDECESSOR_UNAVAILABLE")
+    tip, tip_available = _safe_read(dependencies.authoritative_chain_tip)
+    if not tip_available or tip != intent.supersedes_plan_id:
+        raise ProvisioningBundleError("PREDECESSOR_NOT_CURRENT")
+    if predecessor.plan.plan_id != intent.supersedes_plan_id or predecessor.supersedes_plan_id == intent.plan_id:
+        raise ProvisioningBundleError("PREDECESSOR_INVALID")
+    return predecessor
+
+
+def build_provisioning_bundle(
+    store_path: str, intent: ProvisioningIntentV1, dependencies: PreflightDependencies,
+) -> ProvisioningBundleV1:
+    """Build one immutable, read-only review bundle from the preflight snapshot."""
+    report = run_provisioning_preflight(store_path, intent, dependencies)
+    if not report.passed:
+        raise ProvisioningBundleError("PREFLIGHT_FAILED")
+    predecessor = _authoritative_predecessor(intent, dependencies)
+    evidence_ids = {
+        role: f"crew.{owner.value}.review-{intent.plan_id}"
+        for role, owner in _REVIEW_OWNERS
+    }
+    plan = build_plan(
+        intent.plan_id,
+        str(report.resolved_inputs["gpg_sha256"]),
+        intent.source_commit,
+        str(report.resolved_inputs["runtime_digest"]),
+        str(report.resolved_inputs["capability_digest"]),
+        {str(report.resolved_inputs["target_digest"]): str(report.resolved_inputs["authorization_ref"])},
+        (_canonical_root_registration(intent, report.resolved_inputs),),
+        _OVERSEER_TOKEN_SOURCE_FILE,
+        _OVERSEER_TOKEN_FILE,
+        _CURSOR_KEY_FILE,
+        evidence_ids,
+    )
+    changed = changed_immutable_inputs(predecessor, plan, report)
+    placeholder_digest = "sha256:" + "0" * 64
+    provisional = ProvisioningBundleV1(
+        "1", intent, plan, report,
+        _review_outbox(intent, plan, report, placeholder_digest),
+        placeholder_digest, intent.supersedes_plan_id or None, changed,
+    )
+    digest = bundle_digest(provisional)
+    outbox = _review_outbox(intent, plan, report, digest)
+    return ProvisioningBundleV1(
+        "1", intent, plan, report, outbox, digest,
+        intent.supersedes_plan_id or None, changed,
+    )
+
+
 def canonical_bundle_payload(bundle: ProvisioningBundleV1) -> Mapping[str, object]:
     """Return immutable bundle fields, omitting mutable and derived outbox state.
 
-    An entry's ``bundle_digest`` is the self-referential copy of this result,
-    so it too is derived rather than an independent immutable input.
+    An entry's ``bundle_digest`` and matching copy in ``evidence_ids`` are
+    self-referential derived values, not independent immutable inputs.
     """
     if type(bundle) is not ProvisioningBundleV1:
         raise ValueError("bundle digest requires an exact provisioning bundle")
@@ -369,7 +648,10 @@ def canonical_bundle_payload(bundle: ProvisioningBundleV1) -> Mapping[str, objec
                 "subject": entry.subject,
                 "message": entry.message,
                 "acceptance_criteria": entry.acceptance_criteria,
-                "evidence_ids": entry.evidence_ids,
+                "evidence_ids": tuple(
+                    evidence_id for evidence_id in entry.evidence_ids
+                    if evidence_id != entry.bundle_digest
+                ),
             }
             for entry in bundle.outbox
         ),
@@ -389,8 +671,10 @@ def bundle_digest(bundle: ProvisioningBundleV1) -> str:
 
 
 __all__ = [
-    "INTENT_FIELDS", "PreflightCheck", "ProvisioningBundleV1", "ProvisioningIntentV1",
-    "ProvisioningPreflightReport", "ProvisioningReviewOutboxEntry", "bundle_digest",
-    "canonical_bundle_bytes", "canonical_bundle_payload", "canonical_digest",
-    "parse_provisioning_intent",
+    "INTENT_FIELDS", "REQUIRED_PREFLIGHT_CODES", "PreflightCheck", "PreflightDependencies",
+    "ProvisioningBundleError", "ProvisioningBundleV1", "ProvisioningIntentV1",
+    "ProvisioningPreflightReport", "ProvisioningReviewOutboxEntry", "build_provisioning_bundle",
+    "bundle_digest", "canonical_bundle_bytes", "canonical_bundle_payload", "canonical_digest",
+    "canonical_root_target_digest", "changed_immutable_inputs", "parse_provisioning_intent",
+    "run_provisioning_preflight",
 ]

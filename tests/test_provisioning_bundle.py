@@ -4,22 +4,38 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import asdict, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
 from overseer.backup_provisioning import build_plan
-from overseer.core import OwnerDomain
+from overseer.core import OwnerDomain, RiskLevel
+from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.provisioning_bundle import (
+    PreflightDependencies,
     PreflightCheck,
     ProvisioningBundleV1,
+    ProvisioningBundleError,
     ProvisioningIntentV1,
     ProvisioningPreflightReport,
     ProvisioningReviewOutboxEntry,
+    REQUIRED_PREFLIGHT_CODES,
+    build_provisioning_bundle,
     bundle_digest,
+    canonical_root_target_digest,
     canonical_digest,
+    changed_immutable_inputs,
     parse_provisioning_intent,
+    run_provisioning_preflight,
 )
+from overseer.storage_control import (
+    approve_authorization,
+    materialize_authorization,
+    stage_authorization,
+)
+from overseer.store import SQLiteStore
 
 
 def intent_payload(**changes: object) -> dict[str, object]:
@@ -134,6 +150,183 @@ def bundle_fixture(*, outbox_state: str = "pending") -> ProvisioningBundleV1:
         bundle_digest="sha256:" + "0" * 64,
         supersedes_plan_id=None,
         changed_immutable_inputs=(),
+    )
+
+
+def seeded_authority_store(tmp_path, *, root_identity: str = "sha256:" + "e" * 64) -> str:
+    store_path = str(tmp_path / "state.sqlite3")
+    now = datetime.now(UTC)
+    with SQLiteStore(store_path) as store:
+        store.save_crew_message(CrewMessage(
+            "crew.kira.root-review", OwnerDomain.KIRA, "Root review", "Approved root",
+            RiskLevel.HIGH, CrewMessageStatus.ACKNOWLEDGED,
+            review_status=CrewReviewStatus.APPROVED, decided_by="kira", decided_at=now.isoformat(),
+        ))
+    payload = {
+        "authorization_ref": "root-auth.current", "action": "root.register",
+        "project_id": "project.donuthole", "root_id": "backup-root", "policy_revision": "1",
+        "root_identity": root_identity, "alias": "donuthole-development", "status": "active",
+        "max_bytes": 1073741824, "target_digest": canonical_root_target_digest(root_identity),
+        "expires_at": (now + timedelta(days=1)).isoformat(),
+    }
+    stage_authorization(store_path, "root", payload, "crew.kira.root-review", "kira", now.isoformat())
+    approve_authorization(store_path, "root-auth.current", "human", now.isoformat())
+    materialize_authorization(store_path, "root-auth.current", now.isoformat())
+    return store_path
+
+
+def deterministic_dependencies(
+    *, source_head: str = "b" * 40, root_identity: str = "sha256:" + "e" * 64,
+    executable_available: bool = True, canonical_boundaries_valid: bool = True,
+    rollback_prerequisites_valid: bool = True,
+) -> PreflightDependencies:
+    return PreflightDependencies(
+        source_path="/home/god/Documents/Codex Workspace/TheUnderdark",
+        source_head=lambda _path: source_head,
+        runtime_digest=lambda _path, _commit: "sha256:" + "d" * 64,
+        capability_digest=lambda _commit, _schemas: "sha256:" + "c" * 64,
+        file_digest=lambda _path: "sha256:" + "a" * 64,
+        executable_exists=lambda _path: executable_available,
+        root_identity=lambda _path: root_identity,
+        canonical_boundaries_valid=lambda: canonical_boundaries_valid,
+        rollback_prerequisites_valid=lambda: rollback_prerequisites_valid,
+    )
+
+
+def test_canonical_root_target_digest_is_versioned_and_deterministic():
+    identity = "sha256:" + "e" * 64
+
+    assert canonical_root_target_digest(identity) == canonical_root_target_digest(identity)
+    assert canonical_root_target_digest(identity) != canonical_root_target_digest("sha256:" + "f" * 64)
+
+
+def test_preflight_resolves_authoritative_inputs_without_mutation(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert report.passed is True
+    assert [check.code for check in report.checks] == list(REQUIRED_PREFLIGHT_CODES)
+    assert report.resolved_inputs["authorization_ref"] == "root-auth.current"
+    assert Path(store_path).read_bytes() == before
+
+
+def test_preflight_fails_closed_on_changed_source_or_authority(tmp_path):
+    dependencies = deterministic_dependencies(source_head="f" * 40)
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), dependencies)
+
+    assert report.passed is False
+    assert next(check for check in report.checks if check.status == "failed").code == "SOURCE_COMMIT_MATCH"
+    assert "private" not in repr(report)
+    assert Path(store_path).read_bytes() == before
+
+
+def test_preflight_fails_closed_on_changed_root_authority_without_mutation(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+
+    report = run_provisioning_preflight(
+        store_path, intent_fixture(), deterministic_dependencies(root_identity="sha256:" + "f" * 64),
+    )
+
+    assert report.passed is False
+    assert next(check for check in report.checks if check.status == "failed").code == "ROOT_AUTHORIZATION_CURRENT"
+    assert Path(store_path).read_bytes() == before
+
+
+def test_preflight_redacts_unavailable_dependency_exceptions(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+    dependencies = replace(
+        deterministic_dependencies(),
+        file_digest=lambda _path: (_ for _ in ()).throw(RuntimeError("private token material")),
+    )
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), dependencies)
+
+    assert report.passed is False
+    assert next(check for check in report.checks if check.code == "GPG_DIGEST_VALID").status == "failed"
+    assert "private" not in repr(report)
+    assert "token" not in repr(report)
+    assert Path(store_path).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "code"),
+    (
+        (deterministic_dependencies(executable_available=False), "DEPENDENCIES_AVAILABLE"),
+        (deterministic_dependencies(canonical_boundaries_valid=False), "CANONICAL_BOUNDARIES_VALID"),
+        (deterministic_dependencies(rollback_prerequisites_valid=False), "ROLLBACK_PREREQUISITES_VALID"),
+    ),
+)
+def test_preflight_returns_all_stable_checks_when_a_prerequisite_fails(tmp_path, dependencies, code):
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), dependencies)
+
+    assert [check.code for check in report.checks] == list(REQUIRED_PREFLIGHT_CODES)
+    assert next(check for check in report.checks if check.code == code).status == "failed"
+    assert Path(store_path).read_bytes() == before
+
+
+def test_authoritative_bundle_is_deterministic_and_does_not_mutate_store(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+
+    first = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    second = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert first.bundle_digest == second.bundle_digest == bundle_digest(first)
+    assert tuple(entry.role for entry in first.outbox) == ("kira", "obrien", "security", "sisko")
+    assert all(entry.evidence_ids == (first.plan.plan_digest, first.preflight.report_digest, first.bundle_digest) for entry in first.outbox)
+    assert Path(store_path).read_bytes() == before
+
+
+def test_bundle_rejects_missing_non_tip_and_superseded_predecessors_without_mutation(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    before = Path(store_path).read_bytes()
+    predecessor = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    successor = intent_fixture(
+        plan_id="backup-provision.donuthole.v21.20260802",
+        supersedes_plan_id=predecessor.plan.plan_id,
+    )
+
+    with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_UNAVAILABLE"):
+        build_provisioning_bundle(store_path, successor, deterministic_dependencies())
+    with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_NOT_CURRENT"):
+        build_provisioning_bundle(
+            store_path, successor,
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: predecessor, authoritative_chain_tip=lambda: "other-plan"),
+        )
+    superseded_predecessor = replace(
+        predecessor,
+        intent=replace(predecessor.intent, supersedes_plan_id=successor.plan_id),
+        supersedes_plan_id=successor.plan_id,
+    )
+    with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
+        build_provisioning_bundle(
+            store_path, successor,
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: superseded_predecessor, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+        )
+    assert Path(store_path).read_bytes() == before
+
+
+def test_changed_immutable_inputs_are_sorted_and_limited_to_immutable_values(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    previous = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    changed_plan = replace(previous.plan, gpg_sha256="sha256:" + "f" * 64)
+    changed_report = replace(
+        previous.preflight,
+        resolved_inputs={**previous.preflight.resolved_inputs, "authorization_ref": "root-auth.replaced"},
+    )
+
+    assert changed_immutable_inputs(previous, changed_plan, changed_report) == (
+        "gpg_sha256", "resolved_preflight",
     )
 
 

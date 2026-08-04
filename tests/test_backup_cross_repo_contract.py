@@ -66,6 +66,7 @@ def test_provisioning_contract_fixture_is_canonical_complete_and_matches_current
     }
     assert FIXTURE.read_bytes() == canonical_contract_bytes(contract.raw)
     assert contract.raw["mcp_tools"] == EXPECTED_BACKUP_TOOL_SCHEMAS
+    assert all(schema.get("type") == "object" for schema in contract.raw["mcp_tools"].values())
     assert contract.raw["acceptance_requests"]["backup_create"]["parameters"]["encryption_profile"] == BACKUP_ENCRYPTION_PROFILE
     assert [scenario["name"] for scenario in contract.raw["scenarios"]] == [
         "clean_install",
@@ -209,6 +210,26 @@ def test_runtime_artifact_identity_is_deterministic_and_schema_bound():
     altered = copy.deepcopy(EXPECTED_BACKUP_TOOL_SCHEMAS)
     altered["underdark_backup_create"]["properties"]["retention_count"] = {"type": "number"}
     assert identity != runtime_artifact_identity("a" * 40, altered)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "case"),
+    [
+        (lambda schema: schema.pop("type"), "missing_type"),
+        (lambda schema: schema.__setitem__("type", "array"), "wrong_type"),
+        (lambda schema: schema.__setitem__("$defs", {"helper": {"type": "string"}}), "unexpected_defs"),
+        (lambda schema: schema.__setitem__("allOf", [{"minProperties": 1}]), "unexpected_all_of"),
+        (lambda schema: schema.__setitem__("minProperties", 1), "unexpected_min_properties"),
+    ],
+)
+def test_provisioning_contract_rejects_missing_wrong_or_unreviewed_top_level_tool_schema_keywords(tmp_path, mutation, case):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    mutation(raw["mcp_tools"]["underdark_backup_create"])
+    path = tmp_path / "invalid-tool-schema.json"
+    path.write_bytes(canonical_contract_bytes(raw))
+
+    with pytest.raises(ValueError):
+        load_provisioning_contract(path)
 
 
 def test_partial_external_theunderdark_contract_config_fails_clearly(monkeypatch) -> None:

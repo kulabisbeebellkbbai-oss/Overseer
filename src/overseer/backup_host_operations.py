@@ -27,8 +27,8 @@ PRIVILEGED_CONFIRMATION="execute-exact-donuthole-backup-provisioning-plan"
 OPERATOR_USER="god"
 COMMON_SCHEMA={name:{"type":"string"} for name in ("project_id","root_id","request_id","idempotency_key","authorization_ref","policy_revision","reason")}
 EXPECTED_BACKUP_TOOL_SCHEMAS={
-    "underdark_backup_create":{"properties":{**COMMON_SCHEMA,"source_root_id":{"type":"string"},"retention_count":{"type":"integer"},"encryption_profile":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"source_root_id","retention_count","encryption_profile")),"additionalProperties":False},
-    "underdark_backup_verify_restore":{"properties":{**COMMON_SCHEMA,"artifact_id":{"type":"string"},"expected_artifact_digest":{"type":"string"},"expected_manifest_digest":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"artifact_id","expected_artifact_digest","expected_manifest_digest")),"additionalProperties":False},
+    "underdark_backup_create":{"type":"object","properties":{**COMMON_SCHEMA,"source_root_id":{"type":"string"},"retention_count":{"type":"integer"},"encryption_profile":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"source_root_id","retention_count","encryption_profile")),"additionalProperties":False},
+    "underdark_backup_verify_restore":{"type":"object","properties":{**COMMON_SCHEMA,"artifact_id":{"type":"string"},"expected_artifact_digest":{"type":"string"},"expected_manifest_digest":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"artifact_id","expected_artifact_digest","expected_manifest_digest")),"additionalProperties":False},
 }
 RUNTIME_EXCLUDED={".git",".venv",".codex",".agents","__pycache__",".pytest_cache","tests","docs"}
 MAX_REDACTED_DIAGNOSTIC_LINE_BYTES=4096
@@ -223,9 +223,15 @@ def runtime_digest(path,commit):
 def capability_digest(commit,schemas): return _object_digest({"version":1,"commit":commit,"tools":schemas})
 def _object_digest(value): return "sha256:"+hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
 def _normalize_schema(value):
-    if not isinstance(value,Mapping) or value.get("additionalProperties") is not False or not isinstance(value.get("properties"),Mapping) or not isinstance(value.get("required"),list): raise ValueError("tool schema is not strict")
-    properties={str(name):{"type":definition.get("type")} for name,definition in value["properties"].items() if isinstance(definition,Mapping)}
-    return {"properties":properties,"required":sorted(str(name) for name in value["required"]),"additionalProperties":False}
+    if not isinstance(value,Mapping) or value.get("type")!="object" or value.get("additionalProperties") is not False or not isinstance(value.get("properties"),Mapping) or not isinstance(value.get("required"),list): raise ValueError("tool schema is not strict")
+    return _normalize_schema_value(value)
+def _normalize_schema_value(value):
+    if isinstance(value,Mapping):
+        normalized={str(name):_normalize_schema_value(child) for name,child in value.items() if name!="title"}
+        if isinstance(normalized.get("required"),list): normalized["required"]=sorted(normalized["required"])
+        return normalized
+    if isinstance(value,list): return [_normalize_schema_value(child) for child in value]
+    return value
 def _load_mcp_tools(url):
     session=None
     def post(payload):

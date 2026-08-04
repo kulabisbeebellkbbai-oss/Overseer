@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from overseer.backup_host_operations import ConcreteHostProvisioningAdapter,EXPECTED_BACKUP_TOOL_SCHEMAS,PRIVILEGED_CONFIRMATION,RedactedHostOperationError,capability_digest,runtime_digest
+from overseer.backup_host_operations import ConcreteHostProvisioningAdapter,EXPECTED_BACKUP_TOOL_SCHEMAS,PRIVILEGED_CONFIRMATION,RedactedHostOperationError,_normalize_schema,capability_digest,runtime_digest
 from overseer.backup_provisioning import ProvisioningStep
 
 class Result:
@@ -206,6 +206,30 @@ def test_mcp_verification_requires_exact_strict_backup_tool_schemas():
     with pytest.raises((ValueError,RuntimeError)): adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=lambda url:calls.append(url) or altered,mcp_retry_delays=(0,0),sleep=lambda _delay:None).execute(step)
     assert calls==[step.arguments["url"]]
 
+
+def test_mcp_schema_normalization_removes_only_titles_and_preserves_semantics():
+    schema = {
+        "title": "Backup create",
+        "type": "object",
+        "additionalProperties": False,
+        "minProperties": 2,
+        "properties": {
+            "request_id": {"title": "Request Id", "type": "string", "minLength": 1},
+        },
+        "required": ["request_id", "project_id"],
+        "$defs": {"digest": {"title": "Digest", "type": "string", "pattern": "^sha256:"}},
+        "allOf": [{"title": "Tighten", "minProperties": 2}],
+    }
+
+    assert _normalize_schema(schema) == {
+        "type": "object",
+        "additionalProperties": False,
+        "minProperties": 2,
+        "properties": {"request_id": {"type": "string", "minLength": 1}},
+        "required": ["project_id", "request_id"],
+        "$defs": {"digest": {"type": "string", "pattern": "^sha256:"}},
+        "allOf": [{"minProperties": 2}],
+    }
 def test_mcp_verification_retries_only_transport_startup_failures():
     commit="a"*40; digest=capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)
     step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)})

@@ -104,22 +104,20 @@ def _read_current_root_authorization(
         revocations = _validated_revocations(connection)
         if _read_authority_snapshot(database_fd, parent_fd, identity) != snapshot:
             raise ValueError("root authorization read is unavailable")
-    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+    except Exception:
         failed = True
     finally:
         for cleanup in (
-            (connection.close if connection is not None else None),
+            (lambda: connection.close() if connection is not None else None),
             (lambda: os.close(snapshot_fd) if snapshot_fd is not None else None),
             (lambda: os.unlink(snapshot_path) if snapshot_path is not None else None),
             (lambda: _verify_authority_snapshot(parent_fd, identity)),
             (lambda: os.close(database_fd)),
             (lambda: os.close(parent_fd)),
         ):
-            if cleanup is None:
-                continue
             try:
                 cleanup()
-            except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            except Exception:
                 failed = True
     if failed:
         raise ValueError("root authorization read is unavailable")
@@ -160,6 +158,17 @@ def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _close_authority_descriptors(*descriptors: int | None) -> None:
+    """Attempt every owned descriptor close so the caller can fail closed."""
+    for descriptor in descriptors:
+        if descriptor is None:
+            continue
+        try:
+            os.close(descriptor)
+        except Exception:
+            continue
+
+
 def _open_authority_snapshot(store_path: str) -> tuple[int, int, tuple[str, tuple[int, int, int, int, int, int], tuple[int, int, int, int, int, int]]]:
     """Open the database once, without following links, and bind its identity."""
     path = Path(store_path)
@@ -167,12 +176,14 @@ def _open_authority_snapshot(store_path: str) -> tuple[int, int, tuple[str, tupl
         raise ValueError("root authorization read is unavailable")
     parent_fd: int | None = None
     database_fd: int | None = None
+    child_fd: int | None = None
     try:
         parent_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         for component in path.parts[1:-1]:
             child_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
             os.close(parent_fd)
             parent_fd = child_fd
+            child_fd = None
         noatime = getattr(os, "O_NOATIME", 0)
         if not noatime:
             raise OSError("metadata-preserving access is unavailable")
@@ -180,19 +191,15 @@ def _open_authority_snapshot(store_path: str) -> tuple[int, int, tuple[str, tupl
         database_info = os.fstat(database_fd)
         entry_info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         parent_info = os.fstat(parent_fd)
-    except OSError:
-        if database_fd is not None:
-            os.close(database_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
+    except Exception:
+        _close_authority_descriptors(database_fd, child_fd, parent_fd)
         raise ValueError("root authorization read is unavailable") from None
     if (
         not stat.S_ISREG(database_info.st_mode)
         or _file_identity(database_info)[:2] != _file_identity(entry_info)[:2]
         or _authority_sidecars_present(parent_fd, path.name)
     ):
-        os.close(database_fd)
-        os.close(parent_fd)
+        _close_authority_descriptors(database_fd, parent_fd)
         raise ValueError("root authorization read is unavailable")
     return database_fd, parent_fd, (path.name, _file_identity(database_info), _file_identity(parent_info))
 

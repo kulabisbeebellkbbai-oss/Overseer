@@ -497,6 +497,82 @@ def test_default_authority_snapshot_cleans_up_each_partial_failure(tmp_path, mon
         assert list(tmp_path.glob("private-authority-temp*.sqlite3")) == []
 
 
+def test_default_authority_snapshot_fails_closed_after_unexpected_query_wrapper_exception(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    store_path = seeded_authority_store(tmp_path)
+    real_connect = sqlite3.connect
+
+    class QueryFailure:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *arguments, **keywords):
+            if arguments[0] == "PRAGMA query_only=ON":
+                raise AttributeError("unexpected query wrapper failure")
+            return self.connection.execute(*arguments, **keywords)
+
+        def close(self):
+            self.connection.close()
+
+    monkeypatch.setattr(
+        bundle_module.sqlite3,
+        "connect",
+        lambda *arguments, **keywords: QueryFailure(real_connect(*arguments, **keywords)),
+    )
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert "unexpected query wrapper failure" not in repr(report)
+
+
+def test_default_authority_snapshot_continues_cleanup_after_unexpected_connection_close_failure(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    store_path = seeded_authority_store(tmp_path)
+    real_connect = sqlite3.connect
+    real_unlink = os.unlink
+    real_close = os.close
+    cleanup_events: list[str] = []
+
+    class ClosingFailure:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *arguments, **keywords):
+            return self.connection.execute(*arguments, **keywords)
+
+        def close(self):
+            cleanup_events.append("connection-close")
+            self.connection.close()
+            raise AttributeError("unexpected connection close failure")
+
+    def recording_unlink(path, *arguments, **keywords):
+        cleanup_events.append("unlink")
+        return real_unlink(path, *arguments, **keywords)
+
+    def recording_close(fd):
+        cleanup_events.append("descriptor-close")
+        return real_close(fd)
+
+    monkeypatch.setattr(
+        bundle_module.sqlite3,
+        "connect",
+        lambda *arguments, **keywords: ClosingFailure(real_connect(*arguments, **keywords)),
+    )
+    monkeypatch.setattr(bundle_module.os, "unlink", recording_unlink)
+    monkeypatch.setattr(bundle_module.os, "close", recording_close)
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    close_index = cleanup_events.index("connection-close")
+    assert "unlink" in cleanup_events[close_index + 1:]
+    assert cleanup_events[close_index + 1:].count("descriptor-close") >= 2
+    assert "unexpected connection close failure" not in repr(report)
+
+
 def test_default_authority_resolution_rejects_blob_revocation_security_fields(tmp_path):
     store_path = seeded_authority_store(tmp_path)
     connection = sqlite3.connect(store_path)
@@ -538,6 +614,46 @@ def test_default_authority_snapshot_uses_noatime_and_rejects_symlinked_ancestor(
     linked.symlink_to(nested, target_is_directory=True)
     report = run_provisioning_preflight(str(linked / "state.sqlite3"), intent_fixture(), deterministic_dependencies())
     assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+def test_default_authority_snapshot_closes_opened_child_after_unexpected_ancestor_close_failure(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    store_path = seeded_authority_store(nested)
+    real_open = os.open
+    real_close = os.close
+    opened_fds: list[int] = []
+    close_attempts: list[int] = []
+    root_fd: int | None = None
+    failed_once = False
+
+    def recording_open(path, flags, *arguments, **keywords):
+        nonlocal root_fd
+        fd = real_open(path, flags, *arguments, **keywords)
+        opened_fds.append(fd)
+        if path == "/":
+            root_fd = fd
+        return fd
+
+    def fail_root_close_once(fd):
+        nonlocal failed_once
+        close_attempts.append(fd)
+        if fd == root_fd and not failed_once:
+            failed_once = True
+            raise AttributeError("unexpected ancestor close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(bundle_module.os, "open", recording_open)
+    monkeypatch.setattr(bundle_module.os, "close", fail_root_close_once)
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert failed_once is True
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert set(opened_fds).issubset(close_attempts)
+    assert "unexpected ancestor close failure" not in repr(report)
 
 
 def test_default_authority_snapshot_closes_descriptors_after_post_open_stat_failure(tmp_path, monkeypatch):

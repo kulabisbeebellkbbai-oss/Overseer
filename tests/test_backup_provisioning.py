@@ -3,8 +3,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from overseer.backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
+from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest
 from overseer.backup_host_operations import RedactedHostOperationError
-from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, stage_plan
+from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, _dump, _load, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, stage_plan
 from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
@@ -31,6 +33,45 @@ def test_stage_is_immutable_and_binds_all_terminal_evidence(tmp_path):
     changed = build_plan(plan.plan_id, "sha256:" + "b" * 64, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
     with pytest.raises(ValueError, match="immutable"):
         stage_plan(path, changed)
+
+
+def test_plan_derives_contract_and_runtime_artifact_identity_from_reviewed_inputs(tmp_path):
+    _, plan = seeded(tmp_path)
+
+    assert plan.provisioning_contract_version == PROVISIONING_CONTRACT_VERSION
+    assert plan.runtime_artifact_identity == runtime_artifact_identity(
+        plan.adapter_commit,
+        EXPECTED_BACKUP_TOOL_SCHEMAS,
+    )
+    assert plan.capability_digest == capability_digest(
+        plan.adapter_commit,
+        EXPECTED_BACKUP_TOOL_SCHEMAS,
+        PROVISIONING_CONTRACT_VERSION,
+    )
+    assert plan.capability_digest != "sha256:" + "c" * 64
+
+
+def test_plan_rejects_changed_runtime_artifact_identity_before_staging(tmp_path):
+    path, plan = seeded(tmp_path)
+    changed = replace(plan, runtime_artifact_identity="sha256:" + "0" * 64)
+
+    with pytest.raises(ValueError, match="runtime artifact identity"):
+        stage_plan(path, changed)
+    with pytest.raises(ValueError, match="provisioning contract version"):
+        stage_plan(path, replace(plan, provisioning_contract_version="2"))
+
+
+def test_plan_decode_rejects_unbound_contract_identity_fields(tmp_path):
+    _, plan = seeded(tmp_path)
+    payload = _dump(plan)
+
+    decoded = _load(payload)
+    assert decoded.provisioning_contract_version == plan.provisioning_contract_version
+    assert decoded.runtime_artifact_identity == plan.runtime_artifact_identity
+    with pytest.raises(ValueError, match="provisioning contract version"):
+        _load(payload.replace('"provisioning_contract_version":"1",', ""))
+    with pytest.raises(ValueError, match="runtime artifact identity"):
+        _load(payload.replace('"runtime_artifact_identity":"' + plan.runtime_artifact_identity + '",', ""))
 
 
 def test_kira_review_rejects_superseded_root_authorization(tmp_path):

@@ -4,6 +4,7 @@ import urllib.error
 
 import pytest
 
+from overseer.backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
 from overseer.backup_host_operations import ConcreteHostProvisioningAdapter,EXPECTED_BACKUP_TOOL_SCHEMAS,PRIVILEGED_CONFIRMATION,RedactedHostOperationError,_normalize_schema,capability_digest,runtime_digest
 from overseer.backup_provisioning import ProvisioningStep
 
@@ -21,12 +22,41 @@ def test_construction_requires_explicit_confirmation_and_root():
     with pytest.raises(PermissionError): ConcreteHostProvisioningAdapter(plan,privileged_confirmation=PRIVILEGED_CONFIRMATION,euid_provider=lambda:1001,username_provider=lambda uid:"other")
 
 def test_exact_plan_step_uses_argv_without_shell_and_redacts_process_output():
-    commit="a"*40; step=ProvisioningStep("verify_published_adapter_source",{"path":"/approved/source","commit":commit,"capability_digest":capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)}); calls=[]
+    commit="a"*40; step=ProvisioningStep("verify_published_adapter_source",{"path":"/approved/source","commit":commit,"capability_digest":capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS),"provisioning_contract_version":PROVISIONING_CONTRACT_VERSION,"runtime_artifact_identity":runtime_artifact_identity(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)}); calls=[]
     def runner(argv,**kwargs): calls.append((argv,kwargs)); return Result(stdout=("a"*40+"\n").encode())
     result=adapter([step],runner).execute(step)
     assert calls==[(["/usr/bin/git","-C","/approved/source","rev-parse","HEAD"],{"shell":False,"stdin":-3,"stdout":-1,"stderr":-1,"check":False})]
     assert result=={"ok":True,"operation":"verify_published_adapter_source","changed":False,"redactions_applied":True}
     assert "private diagnostic" not in repr(result)
+
+
+def test_capability_digest_is_bound_to_provisioning_contract_version():
+    commit = "a" * 40
+
+    current = capability_digest(commit, EXPECTED_BACKUP_TOOL_SCHEMAS, PROVISIONING_CONTRACT_VERSION)
+    successor = capability_digest(commit, EXPECTED_BACKUP_TOOL_SCHEMAS, "2")
+
+    assert current != successor
+
+
+def test_published_source_rejects_contract_identity_mismatch_before_running_host_process():
+    commit = "a" * 40
+    step = ProvisioningStep(
+        "verify_published_adapter_source",
+        {
+            "path": "/approved/source",
+            "commit": commit,
+            "capability_digest": capability_digest(commit, EXPECTED_BACKUP_TOOL_SCHEMAS),
+            "provisioning_contract_version": "2",
+            "runtime_artifact_identity": runtime_artifact_identity(commit, EXPECTED_BACKUP_TOOL_SCHEMAS),
+        },
+    )
+    calls = []
+
+    with pytest.raises(RuntimeError, match="contract identity"):
+        adapter([step], lambda argv, **kwargs: calls.append(argv) or Result(stdout=(commit + "\n").encode())).execute(step)
+
+    assert calls == []
 
 def test_failed_process_exposes_only_validated_redacted_error_code():
     step=ProvisioningStep("ensure_system_user",{"name":"backup","home":"/nonexistent","shell":"/usr/sbin/nologin"})
@@ -198,7 +228,7 @@ def test_runtime_digest_is_commit_tree_and_mode_bound(tmp_path):
 
 def test_mcp_verification_requires_exact_strict_backup_tool_schemas():
     commit="a"*40; digest=capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)
-    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)})
+    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"provisioning_contract_version":PROVISIONING_CONTRACT_VERSION,"runtime_artifact_identity":runtime_artifact_identity(commit,EXPECTED_BACKUP_TOOL_SCHEMAS),"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)})
     tools=[{"name":name,"inputSchema":schema} for name,schema in EXPECTED_BACKUP_TOOL_SCHEMAS.items()]
     result=adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=lambda url:tools).execute(step)
     assert result["ok"] and result["changed"] is False
@@ -232,7 +262,7 @@ def test_mcp_schema_normalization_removes_only_titles_and_preserves_semantics():
     }
 def test_mcp_verification_retries_only_transport_startup_failures():
     commit="a"*40; digest=capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)
-    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)})
+    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"provisioning_contract_version":PROVISIONING_CONTRACT_VERSION,"runtime_artifact_identity":runtime_artifact_identity(commit,EXPECTED_BACKUP_TOOL_SCHEMAS),"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)})
     tools=[{"name":name,"inputSchema":schema} for name,schema in EXPECTED_BACKUP_TOOL_SCHEMAS.items()]; calls=[]; sleeps=[]
     def loader(url):
         calls.append(url)
@@ -244,7 +274,7 @@ def test_mcp_verification_retries_only_transport_startup_failures():
 
 def test_mcp_verification_reports_stable_redacted_readiness_exhaustion():
     commit="a"*40; digest=capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)
-    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)}); calls=[]; sleeps=[]
+    step=ProvisioningStep("verify_mcp_service",{"url":"http://127.0.0.1:8799/mcp","capability_digest":digest,"provisioning_contract_version":PROVISIONING_CONTRACT_VERSION,"runtime_artifact_identity":runtime_artifact_identity(commit,EXPECTED_BACKUP_TOOL_SCHEMAS),"required_tools":tuple(EXPECTED_BACKUP_TOOL_SCHEMAS)}); calls=[]; sleeps=[]
     def loader(url): calls.append(url); raise ConnectionRefusedError("private endpoint detail")
     with pytest.raises(RedactedHostOperationError) as failure:
         adapter([step],lambda *_a,**_k:Result(),mcp_tool_loader=loader,mcp_retry_delays=(0.1,0.2),sleep=sleeps.append).execute(step)

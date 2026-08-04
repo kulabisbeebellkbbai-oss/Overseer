@@ -21,15 +21,27 @@ import pwd
 from pathlib import Path
 from typing import Callable, Mapping
 
+from .backup_contract import (
+    PROVISIONING_CONTRACT_VERSION,
+    load_provisioning_contract,
+    runtime_artifact_identity,
+)
 from .backup_provisioning import DonutHoleBackupProvisioningPlan, ProvisioningStep
 
 PRIVILEGED_CONFIRMATION="execute-exact-donuthole-backup-provisioning-plan"
 OPERATOR_USER="god"
-COMMON_SCHEMA={name:{"type":"string"} for name in ("project_id","root_id","request_id","idempotency_key","authorization_ref","policy_revision","reason")}
-EXPECTED_BACKUP_TOOL_SCHEMAS={
-    "underdark_backup_create":{"type":"object","properties":{**COMMON_SCHEMA,"source_root_id":{"type":"string"},"retention_count":{"type":"integer"},"encryption_profile":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"source_root_id","retention_count","encryption_profile")),"additionalProperties":False},
-    "underdark_backup_verify_restore":{"type":"object","properties":{**COMMON_SCHEMA,"artifact_id":{"type":"string"},"expected_artifact_digest":{"type":"string"},"expected_manifest_digest":{"type":"string"}},"required":sorted((*COMMON_SCHEMA,"artifact_id","expected_artifact_digest","expected_manifest_digest")),"additionalProperties":False},
-}
+_CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "tests/fixtures/contracts/donuthole_backup_provisioning_v1.json"
+
+
+def _reviewed_backup_tool_schemas() -> dict[str, object]:
+    contract = load_provisioning_contract(_CONTRACT_FIXTURE)
+    tools = contract.raw["mcp_tools"]
+    if not isinstance(tools, Mapping):
+        raise RuntimeError("reviewed provisioning contract tool schemas are invalid")
+    return json.loads(json.dumps(tools, sort_keys=True, separators=(",", ":")))
+
+
+EXPECTED_BACKUP_TOOL_SCHEMAS = _reviewed_backup_tool_schemas()
 RUNTIME_EXCLUDED={".git",".venv",".codex",".agents","__pycache__",".pytest_cache","tests","docs"}
 MAX_REDACTED_DIAGNOSTIC_LINE_BYTES=4096
 MAX_WRAPPER_DIAGNOSTIC_BYTES=8192
@@ -72,9 +84,10 @@ class ConcreteHostProvisioningAdapter:
         return self._run(prefix+argv,acceptable=acceptable)
 
     def _verify_published_adapter_source(self,a):
+        _require_contract_identity(a)
         result=self._run(["/usr/bin/git","-C",a["path"],"rev-parse","HEAD"])
         if getattr(result,"stdout",b"").decode().strip()!=a["commit"]: raise RuntimeError("published adapter commit mismatch")
-        if capability_digest(a["commit"],EXPECTED_BACKUP_TOOL_SCHEMAS)!=a["capability_digest"]: raise RuntimeError("published capability digest mismatch")
+        if capability_digest(a["commit"],EXPECTED_BACKUP_TOOL_SCHEMAS,a["provisioning_contract_version"])!=a["capability_digest"]: raise RuntimeError("published capability digest mismatch")
         return False
     def _install_runtime(self,a):
         if runtime_digest(a["source"],a["commit"])!=a["runtime_digest"]: raise RuntimeError("published runtime artifact digest mismatch")
@@ -136,7 +149,7 @@ class ConcreteHostProvisioningAdapter:
                 if delay is None: raise RedactedHostOperationError("MCP_SERVICE_NOT_READY") from None
                 self._sleep(delay)
         normalized={str(tool.get("name")):_normalize_schema(tool.get("inputSchema")) for tool in tools if tool.get("name") in a["required_tools"]}; expected={name:EXPECTED_BACKUP_TOOL_SCHEMAS[name] for name in a["required_tools"]}
-        if normalized!=expected or capability_digest(self.plan.adapter_commit,normalized)!=a["capability_digest"]: raise RuntimeError("MCP capability verification failed")
+        if normalized!=expected or capability_digest(self.plan.adapter_commit,normalized,a["provisioning_contract_version"])!=a["capability_digest"]: raise RuntimeError("MCP capability verification failed")
         return False
     def _verify_codex_url(self,a):
         result=self._run(["/home/god/.local/bin/codex","mcp","get","theunderdark","--json"])
@@ -220,8 +233,12 @@ def runtime_digest(path,commit):
         if item.is_symlink() or (not item.is_file() and not item.is_dir()): raise ValueError("runtime tree contains unsupported entries")
         if item.is_file(): files.append({"path":relative.as_posix(),"mode":item.stat().st_mode&0o777,"sha256":_digest_file(item)})
     return _object_digest({"version":1,"commit":commit,"files":files})
-def capability_digest(commit,schemas): return _object_digest({"version":1,"commit":commit,"tools":schemas})
+def capability_digest(commit: str, schemas: Mapping[str, object], provisioning_contract_version: str = PROVISIONING_CONTRACT_VERSION) -> str: return _object_digest({"version":2,"commit":commit,"provisioning_contract_version":provisioning_contract_version,"tools":schemas})
 def _object_digest(value): return "sha256:"+hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+def _require_contract_identity(arguments):
+    version=arguments.get("provisioning_contract_version")
+    expected=runtime_artifact_identity(arguments.get("commit"),EXPECTED_BACKUP_TOOL_SCHEMAS) if isinstance(arguments.get("commit"),str) else None
+    if version!=PROVISIONING_CONTRACT_VERSION or arguments.get("runtime_artifact_identity")!=expected: raise RuntimeError("published contract identity mismatch")
 def _normalize_schema(value):
     if not isinstance(value,Mapping) or value.get("type")!="object" or value.get("additionalProperties") is not False or not isinstance(value.get("properties"),Mapping) or not isinstance(value.get("required"),list): raise ValueError("tool schema is not strict")
     return _normalize_schema_value(value)

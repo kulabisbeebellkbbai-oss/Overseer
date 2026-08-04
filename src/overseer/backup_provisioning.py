@@ -69,6 +69,8 @@ class DonutHoleBackupProvisioningPlan:
     adapter_commit: str
     runtime_digest: str
     capability_digest: str
+    provisioning_contract_version: str
+    runtime_artifact_identity: str
     root_authorization_refs: Mapping[str, str]
     root_registrations: tuple[Mapping[str, object], ...]
     overseer_token_source_file: str
@@ -150,6 +152,14 @@ class AllowlistedHostProvisioningAdapter:
 
 
 def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_digest: str, capability_digest: str, root_authorization_refs: Mapping[str, str], root_registrations: tuple[Mapping[str, object], ...], overseer_token_source_file: str, overseer_token_file: str, cursor_key_file: str, evidence_ids: Mapping[str, str]) -> DonutHoleBackupProvisioningPlan:
+    from .backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
+    from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest as reviewed_capability_digest
+
+    provisioning_contract_version = PROVISIONING_CONTRACT_VERSION
+    planned_runtime_identity = runtime_artifact_identity(adapter_commit, EXPECTED_BACKUP_TOOL_SCHEMAS)
+    reviewed_capability = reviewed_capability_digest(adapter_commit, EXPECTED_BACKUP_TOOL_SCHEMAS, provisioning_contract_version)
+    # Retained only to keep the existing stage-request call shape. The reviewed
+    # contract, never caller input, owns the persisted capability digest.
     private_paths = (overseer_token_file, cursor_key_file)
     refs_valid = bool(root_authorization_refs) and all(_digest(key) and isinstance(value, str) and OPAQUE_ID.fullmatch(value) for key, value in root_authorization_refs.items())
     paths_valid = all(isinstance(path, str) and path.startswith(KEY_DIRECTORY + "/") and ".." not in path.split("/") for path in private_paths) and len(set(private_paths)) == 2
@@ -185,7 +195,7 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
     }
     config_digest = _object_digest(config); unit_digest = _object_digest(unit)
     steps = (
-        ProvisioningStep("verify_published_adapter_source", {"path": ADAPTER_SOURCE_PATH, "commit": adapter_commit, "capability_digest": capability_digest}),
+        ProvisioningStep("verify_published_adapter_source", {"path": ADAPTER_SOURCE_PATH, "commit": adapter_commit, "capability_digest": reviewed_capability, "provisioning_contract_version": provisioning_contract_version, "runtime_artifact_identity": planned_runtime_identity}),
         ProvisioningStep("install_runtime", {"source": ADAPTER_SOURCE_PATH, "commit": adapter_commit, "runtime_digest": runtime_digest, "destination": "/opt/theunderdark", "owner": "root", "immutable": True}),
         ProvisioningStep("verify_endpoint_migration_ready", {"host": LISTEN_HOST, "port": LISTEN_PORT, "forbid_simultaneous_user_and_system_service": True}),
         ProvisioningStep("ensure_system_user", {"name": SYSTEM_USER, "home": "/nonexistent", "shell": "/usr/sbin/nologin"}),
@@ -202,7 +212,7 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         ProvisioningStep("stop_disable_user_service", {"unit": USER_UNIT_NAME, "scope": "user"}),
         ProvisioningStep("install_systemd_unit", {"path": UNIT_PATH, "unit": UNIT_NAME, "properties": unit, "unit_digest": unit_digest}),
         ProvisioningStep("start_enable_system_service", {"unit": UNIT_NAME, "scope": "system"}),
-        ProvisioningStep("verify_mcp_service", {"url": f"http://{LISTEN_HOST}:{LISTEN_PORT}/mcp", "capability_digest": capability_digest, "required_tools": ("underdark_backup_create", "underdark_backup_verify_restore")}),
+        ProvisioningStep("verify_mcp_service", {"url": f"http://{LISTEN_HOST}:{LISTEN_PORT}/mcp", "capability_digest": reviewed_capability, "provisioning_contract_version": provisioning_contract_version, "runtime_artifact_identity": planned_runtime_identity, "required_tools": ("underdark_backup_create", "underdark_backup_verify_restore")}),
         ProvisioningStep("verify_codex_url", {"url": f"http://{LISTEN_HOST}:{LISTEN_PORT}/mcp"}),
         ProvisioningStep("verify_gpg_identity", {"path": GPG_PATH, "sha256": gpg_sha256}),
         ProvisioningStep("verify_backup_policy", {"retention": RETENTION_COUNT, "plaintext_archive": False, "restore_required": True}),
@@ -223,7 +233,7 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         ProvisioningStep("remove_system_user_if_unused", {"name": SYSTEM_USER, "retained_path": BACKUP_PATH}),
         ProvisioningStep("remove_runtime_if_unreferenced", {"path": "/opt/theunderdark", "runtime_digest": runtime_digest}),
     )
-    plan = DonutHoleBackupProvisioningPlan(plan_id, gpg_sha256, adapter_commit, runtime_digest, capability_digest, dict(root_authorization_refs), tuple(dict(item) for item in root_registrations), overseer_token_source_file, overseer_token_file, cursor_key_file, dict(evidence_ids), steps, rollback, "", config_digest, unit_digest, read_only_paths=(SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file))
+    plan = DonutHoleBackupProvisioningPlan(plan_id, gpg_sha256, adapter_commit, runtime_digest, reviewed_capability, provisioning_contract_version, planned_runtime_identity, dict(root_authorization_refs), tuple(dict(item) for item in root_registrations), overseer_token_source_file, overseer_token_file, cursor_key_file, dict(evidence_ids), steps, rollback, "", config_digest, unit_digest, read_only_paths=(SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file))
     return replace(plan, plan_digest=_plan_digest(plan))
 
 
@@ -474,6 +484,17 @@ def review_plan(store_path: str, plan_id: str, reviewer: str) -> Mapping[str, ob
 
 
 def _validate_plan(plan: DonutHoleBackupProvisioningPlan) -> None:
+    from .backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
+    from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest as reviewed_capability_digest
+
+    if plan.provisioning_contract_version != PROVISIONING_CONTRACT_VERSION:
+        raise ValueError("provisioning contract version does not match the reviewed contract")
+    expected_runtime_identity = runtime_artifact_identity(plan.adapter_commit, EXPECTED_BACKUP_TOOL_SCHEMAS)
+    if plan.runtime_artifact_identity != expected_runtime_identity:
+        raise ValueError("runtime artifact identity does not match the reviewed contract")
+    expected_capability_digest = reviewed_capability_digest(plan.adapter_commit, EXPECTED_BACKUP_TOOL_SCHEMAS, plan.provisioning_contract_version)
+    if plan.capability_digest != expected_capability_digest:
+        raise ValueError("capability digest does not match the reviewed contract")
     rebuilt = build_plan(plan.plan_id, plan.gpg_sha256, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
     if plan.kind != PLAN_KIND or plan.plan_digest != rebuilt.plan_digest or _plan_digest(plan) != plan.plan_digest:
         raise ValueError("provisioning plan contract or digest does not match")
@@ -506,8 +527,15 @@ def _dump(plan: DonutHoleBackupProvisioningPlan) -> str:
 
 
 def _load(payload: str) -> DonutHoleBackupProvisioningPlan:
-    data = json.loads(payload); data.setdefault("failed_operation", None); data.setdefault("error_code", None); data["status"] = ProvisioningStatus(data["status"]); data["steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["steps"]); data["rollback_steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["rollback_steps"]); data["read_only_paths"] = tuple(data["read_only_paths"]); data["read_write_paths"] = tuple(data["read_write_paths"])
-    return DonutHoleBackupProvisioningPlan(**data)
+    data = json.loads(payload)
+    if "provisioning_contract_version" not in data:
+        raise ValueError("provisioning contract version is required for exact plan decoding")
+    if "runtime_artifact_identity" not in data:
+        raise ValueError("runtime artifact identity is required for exact plan decoding")
+    data.setdefault("failed_operation", None); data.setdefault("error_code", None); data["status"] = ProvisioningStatus(data["status"]); data["steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["steps"]); data["rollback_steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["rollback_steps"]); data["read_only_paths"] = tuple(data["read_only_paths"]); data["read_write_paths"] = tuple(data["read_write_paths"])
+    plan = DonutHoleBackupProvisioningPlan(**data)
+    _validate_plan(plan)
+    return plan
 
 
 def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutation: bool = False) -> Mapping[str, object]:

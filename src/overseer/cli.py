@@ -62,7 +62,13 @@ from .agent_registry import AgentRegistry
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
 from .core import decide_claim
-from .crew import CrewMessageStatus, CrewReviewStatus, build_crew_message, crew_message_status
+from .crew import (
+    CrewMessageStatus,
+    CrewReviewStatus,
+    build_crew_message,
+    crew_dispatch_audit_id,
+    crew_message_status,
+)
 from .documents import (
     documents_config_status,
     documents_list_notes_status,
@@ -7442,7 +7448,7 @@ def dispatch_crew_messages_status(
             final_status = CrewMessageStatus.ACKNOWLEDGED
         store = SQLiteStore(store_path)
         try:
-            dispatch_audit_id = f"audit.{message.id}.dispatch.{_status_id(now)}"
+            dispatch_audit_id = crew_dispatch_audit_id(message.id, now)
             review = _automatic_crew_review(store_path, message, result, final_status, dispatch_audit_id, dispatched_by, now)
             updated = replace(message, status=final_status, updated_at=now, **review)
             store.save_crew_message(updated)

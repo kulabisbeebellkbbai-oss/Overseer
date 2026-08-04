@@ -116,6 +116,15 @@ def crew_message_status(message: CrewMessage) -> dict[str, object]:
     }
 
 
+def crew_dispatch_audit_id(message_id: str, dispatched_at: str) -> str:
+    """Return the one code-owned audit ID for an exact crew dispatch."""
+    status_id = "".join(
+        character if character.isalnum() else "-"
+        for character in dispatched_at.lower()
+    ).strip("-")
+    return f"audit.{message_id}.dispatch.{status_id}"
+
+
 def _message_id(owner_domain: OwnerDomain, subject: str, created_at: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-") or "message"
     stamp = re.sub(r"[^0-9]", "", created_at)[:14] or "pending"

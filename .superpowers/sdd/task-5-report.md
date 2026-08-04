@@ -7,6 +7,12 @@ records. Lifecycle is derived from one exact materialized `CrewMessage` and two
 deterministic audit receipts: a pre-dispatch `QUEUED` claim and a post-terminal
 `VERIFIED` completion receipt.
 
+Automatic provisioning review dispatch supports exactly two terminal outcomes:
+`APPROVED` from a typed `dispatched` reviewer result and
+`CORRECTION_REQUESTED` from a typed `skipped` or `blocked` result. The separate
+human-decision workflow may record rejection, but Task 5 automatic dispatch does
+not produce or accept `REJECTED`; `WAITING_HUMAN_APPROVAL` is also nonterminal.
+
 The public dispatch boundary validates every caller-controlled field before any
 mutation, resolves the outbox and audit records through indexed exact-ID reads,
 revalidates the complete persisted bundle/binding/preflight/outbox set, and
@@ -31,14 +37,22 @@ provisioning, or protected-host operation was performed during this task.
   stable redacted 400 `INVALID_REVIEW_OUTBOX_REQUEST` response.
 - Real dispatcher integration covers both an O'Brien typed approval and a Kira
   typed correction request using the authoritative evidence shapes.
+- Final security correction RED: after a legitimate claim, arbitrary look-alike
+  dispatch audit IDs, summaries, event types, and claim/decision timestamps were
+  accepted, as was a synthetic terminal `REJECTED` message. The correction uses
+  one shared deterministic dispatch-audit ID and verifies the exact typed
+  outcome, summary, type, owner, subject, risk, evidence, and timestamp shape.
+  Subject and owner forgeries already failed closed and remain regression-tested.
 
 ## Verification
 
 - `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning_review_flow.py tests/test_backup_provisioning.py -k 'outbox or dispatch or terminal_evidence' --tb=short`
-  - 40 passed, 258 deselected.
+  - 49 passed, 258 deselected after the final audit-shape correction.
 - `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning_review_flow.py --tb=short`
-  - 269 passed (before the final additional correction-path test; the selected
-    gate above includes that test).
+  - 279 passed after the final audit-shape correction.
+- `pytest -q tests/test_core.py --tb=short`
+  - 381 passed after moving dispatch-audit ID generation to the shared crew
+    helper.
 - Full repository run:
   - 1426 passed, 6 skipped, 10 failed.
   - One concurrent SQLite test passed on isolated rerun.
@@ -47,7 +61,7 @@ provisioning, or protected-host operation was performed during this task.
   - One unchanged Roadex fixed-digest assertion remains reproducibly mismatched.
 - Task 4 disposable TheUnderdark acceptance configuration:
   - `THEUNDERDARK_PYTHON='/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python' THEUNDERDARK_SOURCE='/home/god/Documents/Codex Workspace/TheUnderdark/.worktrees/donuthole-contract-acceptance' PYTHONPATH=src '/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python' -m pytest -q tests/test_donuthole_backup_acceptance.py`
-  - 10 passed in 6.52s.
+  - 10 passed in 6.46s after the final audit-shape correction.
 
 ## Files
 

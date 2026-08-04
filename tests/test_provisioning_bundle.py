@@ -36,7 +36,12 @@ from overseer.backup_host_operations import (
     runtime_digest as reviewed_runtime_digest,
 )
 from overseer.core import OwnerDomain, RiskLevel
-from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
+from overseer.crew import (
+    CrewMessage,
+    CrewMessageStatus,
+    CrewReviewStatus,
+    crew_dispatch_audit_id,
+)
 from overseer.provisioning_bundle import (
     _PreflightDependencies as PreflightDependencies,
     _build_provisioning_bundle_with_dependencies as build_provisioning_bundle,
@@ -4413,7 +4418,7 @@ def _task5_record_terminal_dispatch(
     entry: ProvisioningReviewOutboxEntry,
     dispatched_at: str,
 ) -> dict[str, object]:
-    dispatch_audit_id = f"audit.{entry.message_id}.dispatch.20260802T120000000000Z"
+    dispatch_audit_id = crew_dispatch_audit_id(entry.message_id, dispatched_at)
     with SQLiteStore(store_path) as store:
         message = store.load_crew_message(entry.message_id)
         store.save_crew_message(replace(
@@ -4433,7 +4438,10 @@ def _task5_record_terminal_dispatch(
             event_type=AuditEventType.EXECUTED,
             owner_domain=entry.owner_domain,
             subject_id=entry.message_id,
-            summary="exact bounded provisioning review dispatched",
+            summary=(
+                f"{entry.owner_domain.value} dispatch dispatched: "
+                "exact immutable provisioning review passed"
+            ),
             risk_level=RiskLevel.HIGH,
             occurred_at=dispatched_at,
         ))
@@ -4683,6 +4691,38 @@ def test_review_outbox_real_reviewer_correction_binds_exact_dispatch_actor(tmp_p
     assert message.decision_evidence_ids == (dispatch_event.id,)
 
 
+def test_review_outbox_blocked_reviewer_uses_exact_correction_audit_shape(
+    tmp_path, monkeypatch,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    dispatched_at = "2026-08-02T12:00:00+00:00"
+
+    def blocked_reviewer(*_args, **_kwargs):
+        raise ValueError("bounded reviewer failed")
+
+    monkeypatch.setattr(cli_module, "_dispatch_crew_message", blocked_reviewer)
+
+    result = cli_module.dispatch_provisioning_review_outbox_status(
+        store_path, entry.id, "independent-dispatcher", dispatched_at,
+    )
+
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        dispatch_event = store.load_audit_event(message.decision_evidence_ids[-1])
+    assert result["outbox_state"] == "dispatched"
+    assert message.review_status == CrewReviewStatus.CORRECTION_REQUESTED
+    assert message.correction_request == "bounded reviewer failed"
+    assert dispatch_event == AuditEvent(
+        id=crew_dispatch_audit_id(entry.message_id, dispatched_at),
+        event_type=AuditEventType.BLOCKED,
+        owner_domain=entry.owner_domain,
+        subject_id=entry.message_id,
+        summary=f"{entry.owner_domain.value} dispatch blocked: bounded reviewer failed",
+        risk_level=RiskLevel.HIGH,
+        occurred_at=dispatched_at,
+    )
+
+
 def test_review_outbox_partial_or_host_mutating_dispatch_is_claimed_and_fails_closed(
     tmp_path, monkeypatch,
 ):
@@ -4824,6 +4864,154 @@ def test_review_outbox_forged_completion_receipt_cannot_replace_dispatch_audit(
             evidence_ids=forged.decision_evidence_ids,
             occurred_at=decided_at,
         ))
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_OUTBOX_MESSAGE_MISMATCH$",
+    ):
+        provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+
+def _task5_forge_claimed_terminal(
+    store_path: str,
+    entry: ProvisioningReviewOutboxEntry,
+    *,
+    review_status: CrewReviewStatus = CrewReviewStatus.APPROVED,
+    claim_at: str = "2026-08-02T12:00:00+00:00",
+    decided_at: str = "2026-08-02T12:00:00+00:00",
+    audit_id: str | None = None,
+    audit_type: AuditEventType = AuditEventType.EXECUTED,
+    audit_owner: OwnerDomain | None = None,
+    audit_subject: str | None = None,
+    audit_summary: str | None = None,
+) -> None:
+    provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+    _entry, _message, claimed = (
+        provisioning_bundle_module._claim_review_outbox_dispatch(
+            store_path,
+            entry.id,
+            "independent-dispatcher",
+            claim_at,
+        )
+    )
+    assert claimed is True
+    selected_audit_id = audit_id or crew_dispatch_audit_id(
+        entry.message_id, decided_at,
+    )
+    decision_reason = "exact immutable provisioning review passed"
+    evidence_prefix = (
+        (*entry.evidence_ids, entry.plan_id)
+        if review_status == CrewReviewStatus.APPROVED
+        else ()
+    )
+    decided_by = (
+        entry.owner_domain.value
+        if review_status == CrewReviewStatus.APPROVED
+        else "independent-dispatcher"
+    )
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        terminal = replace(
+            message,
+            status=CrewMessageStatus.ACKNOWLEDGED,
+            review_status=review_status,
+            decision_reason=decision_reason,
+            correction_request=(
+                decision_reason
+                if review_status == CrewReviewStatus.CORRECTION_REQUESTED
+                else None
+            ),
+            decision_evidence_ids=(*evidence_prefix, selected_audit_id),
+            decided_by=decided_by,
+            decided_at=decided_at,
+            updated_at=decided_at,
+        )
+        store.save_crew_message(terminal)
+        store.save_audit_event(AuditEvent(
+            id=selected_audit_id,
+            event_type=audit_type,
+            owner_domain=audit_owner or entry.owner_domain,
+            subject_id=audit_subject or entry.message_id,
+            summary=(
+                audit_summary
+                if audit_summary is not None
+                else (
+                    f"{entry.owner_domain.value} dispatch dispatched: "
+                    f"{decision_reason}"
+                )
+            ),
+            risk_level=RiskLevel.HIGH,
+            occurred_at=decided_at,
+        ))
+        store.save_audit_event(AuditEvent(
+            id=f"audit.{entry.message_id}.provisioning-review-dispatch-complete",
+            event_type=AuditEventType.VERIFIED,
+            owner_domain=entry.owner_domain,
+            subject_id=entry.message_id,
+            summary="exact provisioning review dispatch completed",
+            risk_level=RiskLevel.HIGH,
+            evidence_ids=terminal.decision_evidence_ids,
+            occurred_at=decided_at,
+        ))
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "arbitrary-id",
+        "summary",
+        "type",
+        "claim-time",
+        "subject",
+        "owner",
+    ),
+)
+def test_review_outbox_rejects_forged_dispatch_audit_after_legitimate_claim(
+    tmp_path, forgery,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    kwargs: dict[str, object] = {}
+    if forgery == "arbitrary-id":
+        kwargs["audit_id"] = f"audit.{entry.message_id}.dispatch.look-alike"
+    elif forgery == "summary":
+        kwargs["audit_summary"] = "look-alike provisioning review dispatched"
+    elif forgery == "type":
+        kwargs["audit_type"] = AuditEventType.BLOCKED
+    elif forgery == "claim-time":
+        kwargs["decided_at"] = "2026-08-02T12:01:00+00:00"
+    elif forgery == "subject":
+        kwargs["audit_subject"] = f"{entry.message_id}.look-alike"
+    else:
+        kwargs["audit_owner"] = OwnerDomain.SISKO
+    _task5_forge_claimed_terminal(store_path, entry, **kwargs)
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_OUTBOX_MESSAGE_MISMATCH$",
+    ):
+        provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+
+@pytest.mark.parametrize(
+    "unsupported_status",
+    (
+        CrewReviewStatus.REJECTED,
+        CrewReviewStatus.WAITING_HUMAN_APPROVAL,
+    ),
+)
+def test_review_outbox_rejects_unsupported_terminal_after_dispatch_claim(
+    tmp_path, unsupported_status,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    _task5_forge_claimed_terminal(
+        store_path,
+        entry,
+        review_status=unsupported_status,
+        audit_summary=(
+            f"{entry.owner_domain.value} dispatch rejected: "
+            "exact immutable provisioning review passed"
+        ),
+    )
 
     with pytest.raises(
         ProvisioningBundleError,

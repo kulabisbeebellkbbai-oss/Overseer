@@ -44,6 +44,7 @@ from .crew import (
     CrewMessage,
     CrewMessageStatus,
     CrewReviewStatus,
+    crew_dispatch_audit_id,
     crew_message_status,
 )
 from .roadex_approval_status import (
@@ -2848,7 +2849,6 @@ _REVIEW_DISPATCH_CLAIM_SUMMARY = "exact provisioning review dispatch claimed by 
 _TERMINAL_REVIEW_STATUSES = frozenset({
     CrewReviewStatus.APPROVED,
     CrewReviewStatus.CORRECTION_REQUESTED,
-    CrewReviewStatus.REJECTED,
 })
 
 
@@ -3012,6 +3012,7 @@ def _verify_review_message_request(
         or claim.risk_level != RiskLevel.HIGH
         or claim.evidence_ids != entry.evidence_ids
         or not claim.occurred_at
+        or claim.occurred_at != message.decided_at
         or not claim.summary.startswith(_REVIEW_DISPATCH_CLAIM_SUMMARY)
     ):
         raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
@@ -3034,19 +3035,49 @@ def _verify_review_message_request(
         or len(message.decision_evidence_ids) != len(evidence_prefix) + 1
     ):
         raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
-    dispatch_audit_id = message.decision_evidence_ids[-1]
+    dispatch_audit_id = crew_dispatch_audit_id(
+        entry.message_id, message.decided_at,
+    )
+    if message.decision_evidence_ids[-1] != dispatch_audit_id:
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
     dispatch_event = _exact_audit_event(store, dispatch_audit_id)
     if (
         dispatch_event is None
-        or dispatch_event.event_type not in {
-            AuditEventType.EXECUTED, AuditEventType.BLOCKED,
-        }
         or dispatch_event.owner_domain != entry.owner_domain
         or dispatch_event.subject_id != entry.message_id
         or dispatch_event.risk_level != RiskLevel.HIGH
+        or dispatch_event.evidence_ids
         or dispatch_event.occurred_at != message.decided_at
     ):
         raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    if message.review_status == CrewReviewStatus.APPROVED:
+        if (
+            message.correction_request is not None
+            or dispatch_event.event_type != AuditEventType.EXECUTED
+            or dispatch_event.summary != (
+                f"{entry.owner_domain.value} dispatch dispatched: "
+                f"{message.decision_reason}"
+            )
+        ):
+            raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    else:
+        if (
+            message.correction_request != message.decision_reason
+            or dispatch_event.event_type not in {
+                AuditEventType.EXECUTED, AuditEventType.BLOCKED,
+            }
+        ):
+            raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+        dispatch_status = (
+            "blocked"
+            if dispatch_event.event_type == AuditEventType.BLOCKED
+            else "skipped"
+        )
+        if dispatch_event.summary != (
+            f"{entry.owner_domain.value} dispatch {dispatch_status}: "
+            f"{message.decision_reason}"
+        ):
+            raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
 
 
 def _review_completion_event(

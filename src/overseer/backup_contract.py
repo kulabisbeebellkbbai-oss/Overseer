@@ -172,6 +172,8 @@ def _validate_runtime_identity(value: object, schemas: Mapping[str, object]) -> 
     expected = runtime_artifact_identity(commit, schemas)
     if mapping["planned_identity"] != expected:
         raise ValueError("runtime_identity.planned_identity does not match commit and schemas")
+    if mapping["previous_identity"] == mapping["planned_identity"]:
+        raise ValueError("runtime_identity previous identity must differ from planned identity")
     return mapping
 
 
@@ -247,6 +249,10 @@ def _validate_cross_references(root: Mapping[str, object], requests: Mapping[str
         parameters = requests[request_name]["parameters"]
         if parameters["project_id"] != root["project_id"] or parameters["root_id"] != root["root_id"] or parameters["authorization_ref"] != root["authorization_ref"]:
             raise ValueError(f"{request_name} does not match root registration")
+        if parameters["policy_revision"] != root["policy_revision"]:
+            raise ValueError(f"{request_name} policy revision does not match root registration")
+        if request_name == "backup_create" and parameters["source_root_id"] != root["root_id"]:
+            raise ValueError("backup_create source root does not match root registration")
 
 
 def _reject_forbidden_values(value: object) -> None:

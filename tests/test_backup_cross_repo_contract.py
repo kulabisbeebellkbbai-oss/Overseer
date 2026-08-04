@@ -61,6 +61,45 @@ def test_provisioning_contract_rejects_noncanonical_bytes_and_invalid_nested_typ
         load_provisioning_contract(noncanonical_path)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda raw: raw["acceptance_requests"]["backup_create"]["parameters"].__setitem__("policy_revision", "2"),
+            "backup_create policy revision does not match root registration",
+        ),
+        (
+            lambda raw: raw["acceptance_requests"]["backup_verify_restore"]["parameters"].__setitem__("policy_revision", "2"),
+            "backup_verify_restore policy revision does not match root registration",
+        ),
+        (
+            lambda raw: raw["acceptance_requests"]["backup_create"]["parameters"].__setitem__("source_root_id", "different-root"),
+            "backup_create source root does not match root registration",
+        ),
+    ],
+)
+def test_provisioning_contract_rejects_backup_request_registration_mismatches(tmp_path, mutation, message):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    mutation(raw)
+    path = tmp_path / "mismatched-contract.json"
+    path.write_bytes(canonical_contract_bytes(raw))
+
+    with pytest.raises(ValueError, match=message):
+        load_provisioning_contract(path)
+
+
+def test_provisioning_contract_rejects_active_upgrade_without_a_distinct_previous_runtime(tmp_path):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    planned = raw["runtime_identity"]["planned_identity"]
+    raw["runtime_identity"]["previous_identity"] = planned
+    raw["scenarios"][1]["previous_runtime_identity"] = planned
+    path = tmp_path / "same-runtime-contract.json"
+    path.write_bytes(canonical_contract_bytes(raw))
+
+    with pytest.raises(ValueError, match="previous identity must differ"):
+        load_provisioning_contract(path)
+
+
 def test_runtime_artifact_identity_is_deterministic_and_schema_bound():
     identity = runtime_artifact_identity("a" * 40, EXPECTED_BACKUP_TOOL_SCHEMAS)
 

@@ -6,7 +6,7 @@ import pytest
 from overseer.backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
 from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest
 from overseer.backup_host_operations import RedactedHostOperationError
-from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStep, _dump, _load, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, stage_plan
+from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStatus, ProvisioningStep, _dump, _load, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, save_staged_plan_source, stage_plan
 from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
@@ -33,6 +33,23 @@ def test_stage_is_immutable_and_binds_all_terminal_evidence(tmp_path):
     changed = build_plan(plan.plan_id, "sha256:" + "b" * 64, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
     with pytest.raises(ValueError, match="immutable"):
         stage_plan(path, changed)
+
+
+def test_atomic_bundle_source_rejects_non_staged_plan_before_persistence(tmp_path):
+    path, plan = seeded(tmp_path)
+    non_staged = replace(
+        plan,
+        status=ProvisioningStatus.APPROVED,
+        approved_by="human-user",
+        approved_at=datetime.now(UTC).isoformat(),
+    )
+
+    with SQLiteStore(path) as store:
+        with pytest.raises(ValueError, match="staged"):
+            save_staged_plan_source(store, non_staged)
+        assert store.registered_source_exists(
+            "backup-provisioning-plan", plan.plan_id,
+        ) is False
 
 
 def test_plan_derives_contract_and_runtime_artifact_identity_from_reviewed_inputs(tmp_path):

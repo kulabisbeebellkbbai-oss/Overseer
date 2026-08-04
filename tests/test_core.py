@@ -10951,8 +10951,9 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 3)
         self.assertEqual(len(migrations), 10)
-        self.assertEqual(migrations[0].version, CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrations[0].version, 3)
         self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
         self.assertEqual(migrations[1].version, "agent_driver_v1")
         self.assertEqual(migrations[2].version, "agent_driver_v2")
@@ -10964,6 +10965,48 @@ class SQLiteStoreTests(unittest.TestCase):
             "persist provider-neutral agent driver lifecycle records",
         )
         self.assertEqual(reopened_migrations, migrations)
+
+    def test_schema_v3_provisions_atomic_bundle_tables_and_outbox_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "overseer.sqlite3")
+            tables = {
+                str(row["name"])
+                for row in store._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            indexes = {
+                str(row["name"])
+                for row in store._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            store.close()
+
+        self.assertTrue({
+            "provisioning_preflight_reports",
+            "provisioning_bundles",
+            "provisioning_review_outbox",
+        } <= tables)
+        self.assertIn("provisioning_review_outbox_plan_state", indexes)
+
+    def test_schema_v3_rejects_malformed_indexed_bundle_digests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteStore(Path(directory) / "overseer.sqlite3") as store:
+                with self.assertRaisesRegex(ValueError, "digest"):
+                    store.save_provisioning_preflight_report(
+                        "preflight.test",
+                        "plan.test",
+                        "not-a-digest",
+                        "{}",
+                    )
+                with self.assertRaisesRegex(ValueError, "digest"):
+                    store.save_provisioning_bundle(
+                        "plan.test",
+                        "plan.test",
+                        "not-a-digest",
+                        "{}",
+                    )
 
     def test_persists_resource_claim_and_decision_in_explicit_temp_database(self):
         with tempfile.TemporaryDirectory() as directory:

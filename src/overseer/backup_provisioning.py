@@ -538,6 +538,33 @@ def _load(payload: str) -> DonutHoleBackupProvisioningPlan:
     return plan
 
 
+def dump_staged_plan_payload(plan: DonutHoleBackupProvisioningPlan) -> str:
+    """Encode an exact immutable source payload for the atomic bundle boundary."""
+    _validate_plan(plan)
+    payload = _dump(plan)
+    if _dump(_load(payload)) != payload:
+        raise ValueError("provisioning plan payload is not exact after serialization")
+    return payload
+
+
+def save_staged_plan_source(store: SQLiteStore, plan: DonutHoleBackupProvisioningPlan) -> None:
+    """Save an initial source while preserving a caller-owned transaction."""
+    if (
+        plan.status != ProvisioningStatus.STAGED
+        or plan.approved_by is not None
+        or plan.approved_at is not None
+        or plan.decided_by is not None
+        or plan.decided_at is not None
+        or plan.decision_reason is not None
+        or plan.executed_at is not None
+        or plan.evidence_digest is not None
+        or plan.failed_operation is not None
+        or plan.error_code is not None
+    ):
+        raise ValueError("atomic bundle source must be an exact staged plan")
+    store.save_backup_provisioning_plan_payload(plan.plan_id, dump_staged_plan_payload(plan))
+
+
 def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutation: bool = False) -> Mapping[str, object]:
     return {"ok": True, "plan_id": plan.plan_id, "kind": plan.kind, "plan_digest": plan.plan_digest, "status": plan.status.value, "approval_required": plan.status == ProvisioningStatus.STAGED, "approved_by": plan.approved_by, "evidence_ids": dict(plan.evidence_ids), "evidence_digest": plan.evidence_digest, "failed_operation": plan.failed_operation, "error_code": plan.error_code, "rollback_operations": [step.operation for step in plan.rollback_steps], "redactions_applied": True, "mutation_performed": mutation, "host_mutation_performed": host_mutation}
 
@@ -568,4 +595,4 @@ def _time(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-__all__ = ["DonutHoleBackupProvisioningPlan", "DedicatedProvisioningAdapter", "AllowlistedHostProvisioningAdapter", "ProvisioningStep", "ProvisioningStatus", "build_plan", "stage_plan", "list_plans", "approve_plan", "execute_plan", "stage_plan_api", "approve_plan_api", "execute_plan_api", "review_plan"]
+__all__ = ["DonutHoleBackupProvisioningPlan", "DedicatedProvisioningAdapter", "AllowlistedHostProvisioningAdapter", "ProvisioningStep", "ProvisioningStatus", "build_plan", "stage_plan", "list_plans", "approve_plan", "execute_plan", "stage_plan_api", "approve_plan_api", "execute_plan_api", "review_plan", "dump_staged_plan_payload", "save_staged_plan_source"]

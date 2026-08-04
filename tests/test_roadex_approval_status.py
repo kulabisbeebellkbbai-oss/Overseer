@@ -292,6 +292,17 @@ def test_bound_source_and_scope_are_one_transaction(tmp_path):
         assert binding.scope_digest.startswith("sha256:")
 
 
+def test_bundle_binding_draft_scope_includes_the_exact_bundle_digest(tmp_path):
+    from overseer.provisioning_bundle import binding_draft_for_bundle
+    from tests.test_provisioning_bundle import authoritative_bundle_fixture
+
+    _, bundle = authoritative_bundle_fixture(tmp_path)
+
+    draft = binding_draft_for_bundle(bundle)
+
+    assert bundle.bundle_digest in draft.subject
+
+
 def test_scope_digest_uses_exact_contract_for_admin_source(tmp_path):
     source = plan_user_service_restart(
         "admin.roadex.test",

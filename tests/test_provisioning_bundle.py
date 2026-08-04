@@ -43,6 +43,7 @@ from overseer.storage_control import (
     stage_authorization,
 )
 from overseer.store import SQLiteStore
+from overseer import provisioning_bundle as provisioning_bundle_module
 
 
 def intent_payload(**changes: object) -> dict[str, object]:
@@ -214,6 +215,222 @@ def deterministic_dependencies(
         canonical_boundaries_valid=lambda: canonical_boundaries_valid,
         rollback_prerequisites_valid=lambda: rollback_prerequisites_valid,
     )
+
+
+def authoritative_bundle_fixture(
+    tmp_path, *, source_commit: str = "b" * 40,
+) -> tuple[str, ProvisioningBundleV1]:
+    """Build one valid bundle against a disposable authoritative root."""
+    store_path = seeded_authority_store(tmp_path)
+    intent = intent_fixture(source_commit=source_commit)
+    bundle = build_provisioning_bundle(
+        store_path,
+        intent,
+        deterministic_dependencies(source_head=source_commit),
+    )
+    return store_path, bundle
+
+
+def persisted_bundle_rows(store_path: str, plan_id: str) -> dict[str, int]:
+    """Count only Task 3 records, excluding the prerequisite root evidence."""
+    tables = {
+        "plans": "backup_provisioning_plans",
+        "bindings": "roadex_approval_bindings",
+        "reports": "provisioning_preflight_reports",
+        "bundles": "provisioning_bundles",
+        "outbox": "provisioning_review_outbox",
+    }
+    with SQLiteStore(store_path) as store:
+        available = {
+            str(row["name"])
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        counts = {}
+        for name, table in tables.items():
+            if table not in available:
+                counts[name] = 0
+            elif name == "plans":
+                counts[name] = int(store._connection.execute(
+                    "SELECT COUNT(*) AS count FROM backup_provisioning_plans WHERE id=?",
+                    (plan_id,),
+                ).fetchone()["count"])
+            elif name == "bindings":
+                counts[name] = int(store._connection.execute(
+                    "SELECT COUNT(*) AS count FROM roadex_approval_bindings WHERE source_id=?",
+                    (plan_id,),
+                ).fetchone()["count"])
+            else:
+                counts[name] = int(store._connection.execute(
+                    f"SELECT COUNT(*) AS count FROM {table} WHERE plan_id=?",
+                    (plan_id,),
+                ).fetchone()["count"])
+        counts["crew"] = int(
+            store._connection.execute(
+                "SELECT COUNT(*) AS count FROM crew_messages WHERE payload LIKE ?",
+                (f'%"related_plan_id":"{plan_id}"%',),
+            ).fetchone()["count"]
+        )
+    return counts
+
+
+def test_atomic_stage_rolls_back_every_source_binding_bundle_boundary(tmp_path, monkeypatch):
+    """Every callback write must be protected by the one binding transaction."""
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    expected = {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
+
+    for method_name in (
+        "save_backup_provisioning_plan_payload",
+        "save_provisioning_preflight_report",
+        "save_provisioning_bundle",
+        "save_provisioning_review_outbox",
+        "save_roadex_approval_binding",
+    ):
+        def fail_boundary(*_arguments, name=method_name, **_kwargs):
+            raise RuntimeError(f"injected {name} failure")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(SQLiteStore, method_name, fail_boundary, raising=False)
+            with pytest.raises(RuntimeError, match=f"injected {method_name} failure"):
+                provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+        assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == expected
+
+
+def test_atomic_stage_is_exactly_idempotent_and_does_not_reenter_source_callback(tmp_path, monkeypatch):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+
+    first = provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+
+    def fail_source_reentry(*_arguments, **_kwargs):
+        pytest.fail("exact persisted replay must not re-enter source persistence")
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "save_backup_provisioning_plan_payload",
+        fail_source_reentry,
+        raising=False,
+    )
+    second = provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+
+    assert first["mutation_performed"] is True
+    assert second["mutation_performed"] is False
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
+        "plans": 1, "bindings": 1, "reports": 1,
+        "bundles": 1, "outbox": 4, "crew": 0,
+    }
+
+
+def test_atomic_stage_rejects_changed_replay_without_mutating_bound_source(tmp_path):
+    store_path, original = authoritative_bundle_fixture(tmp_path)
+    provisioning_bundle_module.stage_authoritative_bundle(store_path, original)
+    changed = build_provisioning_bundle(
+        store_path,
+        intent_fixture(source_commit="c" * 40),
+        deterministic_dependencies(source_head="c" * 40),
+    )
+    before = persisted_bundle_rows(store_path, original.plan.plan_id)
+    with SQLiteStore(store_path) as store:
+        source_before = store.load_registered_source_payload(
+            "backup-provisioning-plan", original.plan.plan_id,
+        )
+        binding_before = store.load_roadex_approval_binding(
+            f"approval.donuthole.{original.plan.plan_id}",
+        )
+
+    with pytest.raises(ValueError, match="immutable"):
+        provisioning_bundle_module.stage_authoritative_bundle(store_path, changed)
+
+    with SQLiteStore(store_path) as store:
+        assert store.load_registered_source_payload(
+            "backup-provisioning-plan", original.plan.plan_id,
+        ) == source_before
+        assert store.load_roadex_approval_binding(
+            f"approval.donuthole.{original.plan.plan_id}",
+        ) == binding_before
+    assert persisted_bundle_rows(store_path, original.plan.plan_id) == before
+
+
+def test_atomic_stage_rejects_partial_replay_without_reconstruction(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    with SQLiteStore(store_path) as store:
+        store._connection.execute(
+            "DELETE FROM provisioning_preflight_reports WHERE plan_id=?",
+            (bundle.plan.plan_id,),
+        )
+        store._commit_agent_mutation()
+
+    with pytest.raises(ValueError, match="immutable"):
+        provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
+        "plans": 1, "bindings": 1, "reports": 0,
+        "bundles": 1, "outbox": 4, "crew": 0,
+    }
+
+
+def test_atomic_stage_rechecks_current_root_and_rejects_drift_without_writes(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    revoke_authorization(store_path, "root-auth.current", "human", "crew.kira.root-review")
+
+    with pytest.raises(ValueError, match="STALE_PREVIEW"):
+        provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
+
+
+def test_persisted_bundle_load_requires_exact_serialized_bytes_and_digests(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+
+    with SQLiteStore(store_path) as store:
+        loaded = provisioning_bundle_module.load_provisioning_bundle(
+            store, bundle.plan.plan_id,
+        )
+        assert provisioning_bundle_module.dump_provisioning_bundle(loaded) == (
+            provisioning_bundle_module.dump_provisioning_bundle(bundle)
+        )
+        store._connection.execute(
+            "UPDATE provisioning_bundles SET payload=payload || ' ' WHERE plan_id=?",
+            (bundle.plan.plan_id,),
+        )
+        store._commit_agent_mutation()
+        with pytest.raises(ValueError, match="serialized"):
+            provisioning_bundle_module.load_provisioning_bundle(store, bundle.plan.plan_id)
+
+
+def test_persisted_bundle_rejects_tampered_indexed_digest_metadata(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    with SQLiteStore(store_path) as store:
+        store._connection.execute(
+            "UPDATE provisioning_bundles SET bundle_digest=? WHERE plan_id=?",
+            ("sha256:" + "f" * 64, bundle.plan.plan_id),
+        )
+        store._commit_agent_mutation()
+        with pytest.raises(ValueError, match="digest"):
+            provisioning_bundle_module.load_provisioning_bundle(store, bundle.plan.plan_id)
+
+
+def test_atomic_stage_replay_rejects_tampered_preflight_digest_metadata(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    with SQLiteStore(store_path) as store:
+        store._connection.execute(
+            "UPDATE provisioning_preflight_reports SET report_digest=? WHERE plan_id=?",
+            ("sha256:" + "f" * 64, bundle.plan.plan_id),
+        )
+        store._commit_agent_mutation()
+
+    with pytest.raises(ValueError, match="digest"):
+        provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
 
 
 def test_canonical_root_target_digest_is_versioned_and_deterministic():

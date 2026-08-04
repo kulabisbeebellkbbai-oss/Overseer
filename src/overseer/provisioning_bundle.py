@@ -24,11 +24,19 @@ from typing import Callable, Mapping
 from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
 from .backup_provisioning import (
     ADAPTER_SOURCE_PATH, GPG_PATH, SOURCE_PATH, DonutHoleBackupProvisioningPlan,
-    ProvisioningStep, _validate_plan, build_plan,
+    ProvisioningStep, _validate_plan, build_plan, save_staged_plan_source,
 )
 from .backup_host_operations import capability_digest as reviewed_capability_digest
 from .backup_contract import PROVISIONING_CONTRACT_VERSION
 from .core import OwnerDomain
+from .roadex_approval_status import (
+    RoadexApprovalBinding,
+    RoadexApprovalBindingDraft,
+    load_exact_bound_source,
+    stage_bound_roadex_approval,
+)
+from .serialization import dataclass_from_jsonable, to_jsonable
+from .store import SQLiteStore
 from .storage_control import current_root_identity
 
 
@@ -65,6 +73,8 @@ _ROOT_MAX_BYTES = 1073741824
 _OVERSEER_TOKEN_SOURCE_FILE = "/home/god/.local/share/overseer/project/state/api-token"
 _OVERSEER_TOKEN_FILE = "/etc/codex-development-backups/keys/overseer.token"
 _CURSOR_KEY_FILE = "/etc/codex-development-backups/keys/cursor.key"
+_BUNDLE_WORKSPACE_ID = "workspace.donuthole"
+_BUNDLE_BINDING_SUBJECT = "Review exact DonutHole provisioning bundle"
 
 
 class ProvisioningBundleError(ValueError):
@@ -1188,6 +1198,299 @@ def build_provisioning_bundle(
     )
 
 
+def _validate_staged_bundle(bundle: ProvisioningBundleV1) -> None:
+    """Require the full immutable builder contract before writing any row."""
+    if type(bundle) is not ProvisioningBundleV1:
+        raise ValueError("bundle must be an exact ProvisioningBundleV1")
+    if not _valid_predecessor_contract(bundle):
+        raise ValueError("bundle immutable contract is invalid")
+    if bundle.bundle_digest != bundle_digest(bundle):
+        raise ValueError("bundle digest does not match immutable content")
+
+
+def _canonical_payload(value: object) -> str:
+    return json.dumps(to_jsonable(value), sort_keys=True, separators=(",", ":"))
+
+
+def _decode_exact_payload(payload: str, value_type: type[object], label: str):
+    if not isinstance(payload, str):
+        raise ValueError(f"{label} serialized payload is invalid")
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{label} serialized payload is invalid") from error
+    if not isinstance(data, dict) or set(data) != {field.name for field in fields(value_type)}:
+        raise ValueError(f"{label} serialized payload has an invalid shape")
+    try:
+        decoded = dataclass_from_jsonable(value_type, data)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} serialized payload is invalid") from error
+    if type(decoded) is not value_type or _canonical_payload(decoded) != payload:
+        raise ValueError(f"{label} serialized payload is not exact")
+    return decoded
+
+
+def dump_provisioning_bundle(bundle: ProvisioningBundleV1) -> str:
+    """Serialize one already-validated bundle into its exact persisted bytes."""
+    _validate_staged_bundle(bundle)
+    payload = _canonical_payload(bundle)
+    if _decode_exact_payload(payload, ProvisioningBundleV1, "provisioning bundle") != bundle:
+        raise ValueError("provisioning bundle serialized payload is not exact")
+    return payload
+
+
+def load_provisioning_bundle(store: SQLiteStore, plan_id: str) -> ProvisioningBundleV1:
+    """Load one bundle only if its stored bytes and digest reconstruct exactly."""
+    if not isinstance(store, SQLiteStore):
+        raise ValueError("bundle store must be an exact SQLiteStore")
+    bundle_id, stored_plan_id, stored_digest, payload = store.load_provisioning_bundle_record(plan_id)
+    bundle = _decode_exact_payload(
+        payload,
+        ProvisioningBundleV1,
+        "provisioning bundle",
+    )
+    _validate_staged_bundle(bundle)
+    if (
+        bundle_id != plan_id
+        or stored_plan_id != plan_id
+        or bundle.plan.plan_id != plan_id
+        or bundle.bundle_digest != stored_digest
+    ):
+        raise ValueError("provisioning bundle digest or plan ID is inconsistent")
+    return bundle
+
+
+def _dump_preflight_report(report: ProvisioningPreflightReport) -> str:
+    payload = _canonical_payload(report)
+    if _decode_exact_payload(payload, ProvisioningPreflightReport, "preflight report") != report:
+        raise ValueError("preflight report serialized payload is not exact")
+    return payload
+
+
+def _dump_review_outbox_entry(entry: ProvisioningReviewOutboxEntry) -> str:
+    payload = _canonical_payload(entry)
+    if _decode_exact_payload(payload, ProvisioningReviewOutboxEntry, "review outbox") != entry:
+        raise ValueError("review outbox serialized payload is not exact")
+    return payload
+
+
+def _recheck_current_root_authority(
+    store_path: str,
+    bundle: ProvisioningBundleV1,
+) -> None:
+    """Reject a preview that is no longer bound to the current exact root."""
+    resolved = bundle.preflight.resolved_inputs
+    try:
+        current = _read_current_root_authorization(
+            store_path,
+            bundle.intent.project_id,
+            bundle.intent.root_id,
+            bundle.intent.policy_revision,
+            str(resolved["root_identity"]),
+            _ROOT_ALIAS,
+            _ROOT_STATUS,
+            _ROOT_MAX_BYTES,
+            str(resolved["target_digest"]),
+        )
+    except Exception as error:
+        raise ValueError("STALE_PREVIEW") from error
+    if (
+        not isinstance(current, Mapping)
+        or current.get("authorization_ref") != resolved.get("authorization_ref")
+        or current.get("root_identity") != resolved.get("root_identity")
+        or current.get("target_digest") != resolved.get("target_digest")
+    ):
+        raise ValueError("STALE_PREVIEW")
+
+
+def binding_draft_for_bundle(bundle: ProvisioningBundleV1) -> RoadexApprovalBindingDraft:
+    """Derive the one code-owned prospective approval binding for a bundle."""
+    _validate_staged_bundle(bundle)
+    return RoadexApprovalBindingDraft(
+        approval_ref=f"approval.donuthole.{bundle.plan.plan_id}",
+        source_kind="roadex-human-decision",
+        source_id=bundle.plan.plan_id,
+        project_id=bundle.intent.project_id,
+        workspace_id=_BUNDLE_WORKSPACE_ID,
+        resource_ref=bundle.intent.resource_id,
+        authority_class="project-workflow",
+        subject=f"{_BUNDLE_BINDING_SUBJECT} {bundle.bundle_digest}",
+    )
+
+
+def _load_exact_preflight_report(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+) -> ProvisioningPreflightReport:
+    report_id, plan_id, report_digest, payload = store.load_provisioning_preflight_report_record(
+        bundle.preflight.report_id,
+    )
+    report = _decode_exact_payload(
+        payload,
+        ProvisioningPreflightReport,
+        "preflight report",
+    )
+    if (
+        report_id != bundle.preflight.report_id
+        or plan_id != bundle.plan.plan_id
+        or report_digest != bundle.preflight.report_digest
+        or payload != _dump_preflight_report(bundle.preflight)
+    ):
+        raise ValueError("provisioning bundle immutable preflight digest is inconsistent")
+    return report
+
+
+def _load_exact_outbox(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+) -> tuple[ProvisioningReviewOutboxEntry, ...]:
+    records = store.list_provisioning_review_outbox_records(bundle.plan.plan_id)
+    entries = tuple(
+        _decode_exact_payload(record[4], ProvisioningReviewOutboxEntry, "review outbox")
+        for record in records
+    )
+    if entries != bundle.outbox or tuple(
+        _dump_review_outbox_entry(entry) for entry in entries
+    ) != tuple(_dump_review_outbox_entry(entry) for entry in bundle.outbox):
+        raise ValueError("provisioning bundle immutable review outbox is inconsistent")
+    if any(
+        record[:4] != (
+            entry.id,
+            entry.plan_id,
+            entry.owner_domain.value,
+            entry.state,
+        )
+        for record, entry in zip(records, entries, strict=True)
+    ):
+        raise ValueError("provisioning bundle immutable review outbox is inconsistent")
+    return entries
+
+
+def verify_exact_persisted_bundle_set(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+    binding: RoadexApprovalBinding,
+) -> None:
+    """Reject a missing or changed persisted member without reconstructing it."""
+    try:
+        _verify_exact_persisted_bundle_set(store, bundle, binding)
+    except KeyError as error:
+        raise ValueError("provisioning bundle immutable persisted set is incomplete") from error
+
+
+def _verify_exact_persisted_bundle_set(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+    binding: RoadexApprovalBinding,
+) -> None:
+    """Prove that every stage record is present and byte-for-byte exact."""
+    expected_draft = binding_draft_for_bundle(bundle)
+    persisted_binding = store.load_roadex_approval_binding(binding.approval_ref)
+    if persisted_binding != binding:
+        raise ValueError("provisioning bundle immutable binding is inconsistent")
+    if (
+        persisted_binding.approval_ref != expected_draft.approval_ref
+        or persisted_binding.source_kind != expected_draft.source_kind
+        or persisted_binding.source_id != expected_draft.source_id
+        or persisted_binding.project_id != expected_draft.project_id
+        or persisted_binding.workspace_id != expected_draft.workspace_id
+        or persisted_binding.resource_ref != expected_draft.resource_ref
+        or persisted_binding.authority_class != expected_draft.authority_class
+        or persisted_binding.subject != expected_draft.subject
+    ):
+        raise ValueError("provisioning bundle immutable binding is inconsistent")
+
+    source_payload = store.load_registered_source_payload(
+        "backup-provisioning-plan", bundle.plan.plan_id,
+    )
+    expected_source_payload = _canonical_payload(bundle.plan)
+    if source_payload != expected_source_payload:
+        raise ValueError("provisioning bundle immutable source is inconsistent")
+    source = load_exact_bound_source(store, persisted_binding)
+    if _canonical_payload(source) != expected_source_payload:
+        raise ValueError("provisioning bundle immutable source is inconsistent")
+
+    _load_exact_preflight_report(store, bundle)
+    persisted_bundle = load_provisioning_bundle(store, bundle.plan.plan_id)
+    if dump_provisioning_bundle(persisted_bundle) != dump_provisioning_bundle(bundle):
+        raise ValueError("provisioning bundle immutable payload is inconsistent")
+    _load_exact_outbox(store, bundle)
+
+
+def _public_bundle_status(
+    bundle: ProvisioningBundleV1,
+    binding: RoadexApprovalBinding,
+    *,
+    mutation: bool,
+) -> Mapping[str, object]:
+    return {
+        "ok": True,
+        "status": "staged",
+        "plan_id": bundle.plan.plan_id,
+        "plan_digest": bundle.plan.plan_digest,
+        "preflight_digest": bundle.preflight.report_digest,
+        "bundle_digest": bundle.bundle_digest,
+        "approval_ref": binding.approval_ref,
+        "scope_digest": binding.scope_digest,
+        "approval_required": True,
+        "redactions_applied": True,
+        "mutation_performed": mutation,
+        "host_mutation_performed": False,
+    }
+
+
+def stage_authoritative_bundle(
+    store_path: str,
+    bundle: ProvisioningBundleV1,
+) -> Mapping[str, object]:
+    """Atomically create the source, binding, evidence bundle, and review outbox.
+
+    The public stage API is deliberately a later concern.  This internal
+    boundary accepts only an already-built exact bundle and rechecks its root
+    authority immediately before the binding primitive opens its sole
+    transaction.
+    """
+    _validate_staged_bundle(bundle)
+    serialized_bundle = dump_provisioning_bundle(bundle)
+    binding_draft = binding_draft_for_bundle(bundle)
+    _recheck_current_root_authority(store_path, bundle)
+    with SQLiteStore(store_path) as store:
+        source_persisted = False
+
+        def save_source_and_bundle() -> None:
+            nonlocal source_persisted
+            save_staged_plan_source(store, bundle.plan)
+            store.save_provisioning_preflight_report(
+                bundle.preflight.report_id,
+                bundle.plan.plan_id,
+                bundle.preflight.report_digest,
+                _dump_preflight_report(bundle.preflight),
+            )
+            store.save_provisioning_bundle(
+                bundle.intent.plan_id,
+                bundle.plan.plan_id,
+                bundle.bundle_digest,
+                serialized_bundle,
+            )
+            for entry in bundle.outbox:
+                store.save_provisioning_review_outbox(
+                    entry.id,
+                    entry.plan_id,
+                    entry.owner_domain.value,
+                    entry.state,
+                    _dump_review_outbox_entry(entry),
+                )
+            source_persisted = True
+
+        binding = stage_bound_roadex_approval(
+            store,
+            binding_draft,
+            save_source_and_bundle,
+        )
+        verify_exact_persisted_bundle_set(store, bundle, binding)
+    return _public_bundle_status(bundle, binding, mutation=source_persisted)
+
+
 def canonical_bundle_payload(bundle: ProvisioningBundleV1) -> Mapping[str, object]:
     """Return immutable bundle fields, omitting mutable and derived outbox state.
 
@@ -1235,6 +1538,8 @@ __all__ = [
     "INTENT_FIELDS", "REQUIRED_PREFLIGHT_CODES", "PreflightCheck", "PreflightDependencies",
     "ProvisioningBundleError", "ProvisioningBundleV1", "ProvisioningIntentV1",
     "ProvisioningPreflightReport", "ProvisioningReviewOutboxEntry", "build_provisioning_bundle",
+    "binding_draft_for_bundle", "dump_provisioning_bundle", "load_provisioning_bundle",
+    "stage_authoritative_bundle", "verify_exact_persisted_bundle_set",
     "bundle_digest", "canonical_bundle_bytes", "canonical_bundle_payload", "canonical_digest",
     "canonical_root_target_digest", "changed_immutable_inputs", "parse_provisioning_intent",
     "run_provisioning_preflight",

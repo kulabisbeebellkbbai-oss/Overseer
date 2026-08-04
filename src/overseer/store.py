@@ -60,7 +60,7 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
@@ -505,6 +505,25 @@ class SQLiteStore:
                 source_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS provisioning_preflight_reports (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                report_digest TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS provisioning_bundles (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE,
+                bundle_digest TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS provisioning_review_outbox (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                owner_domain TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS host_security_source_reviews (
                 id TEXT PRIMARY KEY,
                 remote_address TEXT NOT NULL,
@@ -557,6 +576,8 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_kind ON roadex_approval_bindings (source_kind);
             CREATE INDEX IF NOT EXISTS idx_roadex_approval_bindings_source_id ON roadex_approval_bindings (source_id);
+            CREATE INDEX IF NOT EXISTS provisioning_review_outbox_plan_state
+                ON provisioning_review_outbox(plan_id, state);
             """
         )
         with self._connection:
@@ -1999,6 +2020,225 @@ class SQLiteStore:
 
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
+
+    def save_backup_provisioning_plan_payload(self, plan_id: str, payload: str) -> None:
+        """Persist one canonical staging source without committing an outer transaction."""
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS backup_provisioning_plans "
+            "(id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        self._save_immutable_payload(
+            "backup_provisioning_plans",
+            ("id",),
+            (plan_id,),
+            {"payload": payload},
+            "backup provisioning plan",
+        )
+
+    def save_provisioning_preflight_report(
+        self,
+        report_id: str,
+        plan_id: str,
+        report_digest: str,
+        payload: str,
+    ) -> None:
+        """Persist one canonical immutable preflight report."""
+        self._require_sha256_digest(report_digest, "provisioning preflight report")
+        self._save_immutable_payload(
+            "provisioning_preflight_reports",
+            ("id",),
+            (report_id,),
+            {
+                "plan_id": plan_id,
+                "report_digest": report_digest,
+                "payload": payload,
+            },
+            "provisioning preflight report",
+        )
+
+    def load_provisioning_preflight_report_payload(self, report_id: str) -> str:
+        return self.load_provisioning_preflight_report_record(report_id)[3]
+
+    def load_provisioning_preflight_report_record(
+        self,
+        report_id: str,
+    ) -> tuple[str, str, str, str]:
+        row = self._connection.execute(
+            "SELECT id, plan_id, report_digest, payload "
+            "FROM provisioning_preflight_reports WHERE id=?",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(report_id)
+        return (
+            str(row["id"]),
+            str(row["plan_id"]),
+            str(row["report_digest"]),
+            str(row["payload"]),
+        )
+
+    def save_provisioning_bundle(
+        self,
+        bundle_id: str,
+        plan_id: str,
+        bundle_digest: str,
+        payload: str,
+    ) -> None:
+        """Persist exactly one immutable bundle for a plan and digest."""
+        self._require_sha256_digest(bundle_digest, "provisioning bundle")
+        self._require_canonical_object_payload(payload, "provisioning bundle")
+        collision = self._connection.execute(
+            "SELECT id, plan_id, bundle_digest, payload FROM provisioning_bundles "
+            "WHERE id=? OR plan_id=? OR bundle_digest=?",
+            (bundle_id, plan_id, bundle_digest),
+        ).fetchone()
+        if collision is not None:
+            if (
+                str(collision["id"]) != bundle_id
+                or str(collision["plan_id"]) != plan_id
+                or str(collision["bundle_digest"]) != bundle_digest
+                or str(collision["payload"]) != payload
+            ):
+                raise ValueError("provisioning bundle is immutable")
+            self._commit_agent_mutation()
+            return
+        self._connection.execute(
+            "INSERT INTO provisioning_bundles (id, plan_id, bundle_digest, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (bundle_id, plan_id, bundle_digest, payload),
+        )
+        self._commit_agent_mutation()
+
+    def load_provisioning_bundle_payload(self, plan_id: str) -> str:
+        return self.load_provisioning_bundle_record(plan_id)[3]
+
+    def load_provisioning_bundle_record(
+        self,
+        plan_id: str,
+    ) -> tuple[str, str, str, str]:
+        row = self._connection.execute(
+            "SELECT id, plan_id, bundle_digest, payload "
+            "FROM provisioning_bundles WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(plan_id)
+        return (
+            str(row["id"]),
+            str(row["plan_id"]),
+            str(row["bundle_digest"]),
+            str(row["payload"]),
+        )
+
+    def save_provisioning_review_outbox(
+        self,
+        entry_id: str,
+        plan_id: str,
+        owner_domain: str,
+        state: str,
+        payload: str,
+    ) -> None:
+        """Persist one immutable review-outbox entry inside the active transaction."""
+        self._save_immutable_payload(
+            "provisioning_review_outbox",
+            ("id",),
+            (entry_id,),
+            {
+                "plan_id": plan_id,
+                "owner_domain": owner_domain,
+                "state": state,
+                "payload": payload,
+            },
+            "provisioning review outbox entry",
+        )
+
+    def load_provisioning_review_outbox_payload(self, entry_id: str) -> str:
+        row = self._connection.execute(
+            "SELECT payload FROM provisioning_review_outbox WHERE id=?",
+            (entry_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(entry_id)
+        return str(row["payload"])
+
+    def list_provisioning_review_outbox_payloads(
+        self,
+        plan_id: str | None = None,
+    ) -> tuple[str, ...]:
+        return tuple(record[4] for record in self.list_provisioning_review_outbox_records(plan_id))
+
+    def list_provisioning_review_outbox_records(
+        self,
+        plan_id: str | None = None,
+    ) -> tuple[tuple[str, str, str, str, str], ...]:
+        if plan_id is None:
+            rows = self._connection.execute(
+                "SELECT id, plan_id, owner_domain, state, payload "
+                "FROM provisioning_review_outbox ORDER BY id"
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                "SELECT id, plan_id, owner_domain, state, payload "
+                "FROM provisioning_review_outbox WHERE plan_id=? ORDER BY id",
+                (plan_id,),
+            ).fetchall()
+        return tuple(
+            (
+                str(row["id"]),
+                str(row["plan_id"]),
+                str(row["owner_domain"]),
+                str(row["state"]),
+                str(row["payload"]),
+            )
+            for row in rows
+        )
+
+    def _save_immutable_payload(
+        self,
+        table: str,
+        identity_columns: tuple[str, ...],
+        identity_values: tuple[str, ...],
+        values: dict[str, str],
+        label: str,
+    ) -> None:
+        for key, value in (*zip(identity_columns, identity_values), *values.items()):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{label} {key} must be a non-empty string")
+        payload = values.get("payload")
+        assert payload is not None
+        self._require_canonical_object_payload(payload, label)
+        where = " AND ".join(f"{column}=?" for column in identity_columns)
+        existing = self._connection.execute(
+            f"SELECT * FROM {table} WHERE {where}", identity_values,
+        ).fetchone()
+        if existing is not None:
+            if any(str(existing[column]) != value for column, value in values.items()):
+                raise ValueError(f"{label} is immutable")
+            self._commit_agent_mutation()
+            return
+        columns = (*identity_columns, *values)
+        placeholders = ", ".join("?" for _ in columns)
+        self._connection.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+            (*identity_values, *values.values()),
+        )
+        self._commit_agent_mutation()
+
+    def _require_canonical_object_payload(self, payload: str, label: str) -> None:
+        if not isinstance(payload, str):
+            raise ValueError(f"{label} payload must be a string")
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} payload must be canonical JSON") from error
+        if not isinstance(decoded, dict):
+            raise ValueError(f"{label} payload must be a JSON object")
+        if json.dumps(decoded, sort_keys=True, separators=(",", ":")) != payload:
+            raise ValueError(f"{label} payload must be canonical JSON")
+
+    def _require_sha256_digest(self, value: str, label: str) -> None:
+        if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{label} digest must be a sha256 digest")
 
     def registered_source_exists(self, accessor: str, source_id: str) -> bool:
         """Check a reviewed approval-source accessor without accepting SQL."""

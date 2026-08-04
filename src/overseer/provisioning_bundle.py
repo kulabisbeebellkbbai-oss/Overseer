@@ -867,6 +867,14 @@ def _remaining_deadline(deadline: float) -> float:
     return remaining
 
 
+def _deadline_result(deadline: float, operation: Callable[..., object], *arguments, **keywords):
+    """Run one non-owning operation inside the shared repository deadline."""
+    _remaining_deadline(deadline)
+    result = operation(*arguments, **keywords)
+    _remaining_deadline(deadline)
+    return result
+
+
 def _close_owned_git_descriptors(*descriptors: int | None) -> None:
     """Close every descriptor, then preserve any ordinary or control-flow failure."""
     ordinary_error: Exception | None = None
@@ -887,97 +895,129 @@ def _close_owned_git_descriptors(*descriptors: int | None) -> None:
         raise OSError("authoritative Git descriptor close failed") from ordinary_error
 
 
-def _open_git_directory(parent_fd: int, name: str) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int]]:
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        dir_fd=parent_fd,
-    )
-    descriptor_info = os.fstat(descriptor)
-    entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(descriptor_info.st_mode)
-        or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
-    ):
+def _open_git_directory(
+    parent_fd: int, name: str, deadline: float,
+) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int]]:
+    descriptor: int | None = None
+    try:
+        _remaining_deadline(deadline)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        _remaining_deadline(deadline)
+        descriptor_info = _deadline_result(deadline, os.fstat, descriptor)
+        entry_info = _deadline_result(
+            deadline, os.stat, name, dir_fd=parent_fd, follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(descriptor_info.st_mode)
+            or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
+        ):
+            raise ValueError("authoritative source repository is unavailable")
+        result = descriptor, _pinned_identity(descriptor_info)
+        descriptor = None
+        return result
+    finally:
         _close_owned_git_descriptors(descriptor)
-        raise ValueError("authoritative source repository is unavailable")
-    return descriptor, _pinned_identity(descriptor_info)
 
 
-def _open_git_regular(parent_fd: int, name: str) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int]]:
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        dir_fd=parent_fd,
-    )
-    descriptor_info = os.fstat(descriptor)
-    entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if (
-        not stat.S_ISREG(descriptor_info.st_mode)
-        or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
-    ):
+def _open_git_regular(
+    parent_fd: int, name: str, deadline: float,
+) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int]]:
+    descriptor: int | None = None
+    try:
+        _remaining_deadline(deadline)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        _remaining_deadline(deadline)
+        descriptor_info = _deadline_result(deadline, os.fstat, descriptor)
+        entry_info = _deadline_result(
+            deadline, os.stat, name, dir_fd=parent_fd, follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(descriptor_info.st_mode)
+            or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
+        ):
+            raise ValueError("authoritative source repository is unavailable")
+        result = descriptor, _pinned_identity(descriptor_info)
+        descriptor = None
+        return result
+    finally:
         _close_owned_git_descriptors(descriptor)
-        raise ValueError("authoritative source repository is unavailable")
-    return descriptor, _pinned_identity(descriptor_info)
 
 
-def _read_pinned_descriptor(descriptor: int, maximum: int) -> bytes:
-    info = os.fstat(descriptor)
+def _read_pinned_descriptor(descriptor: int, maximum: int, deadline: float) -> bytes:
+    info = _deadline_result(deadline, os.fstat, descriptor)
     if not stat.S_ISREG(info.st_mode) or info.st_size < 0 or info.st_size > maximum:
         raise ValueError("authoritative source repository is unavailable")
     chunks: list[bytes] = []
     offset = 0
     while offset < info.st_size:
-        chunk = os.pread(descriptor, min(64 * 1024, info.st_size - offset), offset)
+        chunk = _deadline_result(
+            deadline, os.pread, descriptor, min(64 * 1024, info.st_size - offset), offset,
+        )
         if not chunk:
             raise ValueError("authoritative source repository is unavailable")
         chunks.append(chunk)
         offset += len(chunk)
-    if _pinned_identity(os.fstat(descriptor)) != _pinned_identity(info):
+    if _pinned_identity(_deadline_result(deadline, os.fstat, descriptor)) != _pinned_identity(info):
         raise ValueError("authoritative source repository is unavailable")
+    _remaining_deadline(deadline)
     return b"".join(chunks)
 
 
 def _snapshot_git_metadata_tree(
-    root_fd: int, prefix: str,
+    root_fd: int, prefix: str, deadline: float,
 ) -> dict[str, tuple[int, int, int, int, int, int, int, int, int]]:
     """Pin all object/ref components, rejecting links and unsupported nodes."""
     snapshot: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {}
 
     def walk(directory_fd: int, directory_prefix: str) -> None:
-        entries = sorted(os.listdir(f"/proc/self/fd/{directory_fd}"))
+        entries = sorted(_deadline_result(deadline, os.listdir, f"/proc/self/fd/{directory_fd}"))
         for name in entries:
+            _remaining_deadline(deadline)
             if not name or name in {".", ".."} or "/" in name or "\x00" in name:
                 raise ValueError("authoritative source repository is unavailable")
-            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            entry = _deadline_result(
+                deadline, os.stat, name, dir_fd=directory_fd, follow_symlinks=False,
+            )
             entry_path = f"{directory_prefix}/{name}"
+            if entry_path.startswith("objects/pack/") and name.casefold().endswith(".promisor"):
+                raise ValueError("authoritative source repository is unavailable")
             if stat.S_ISLNK(entry.st_mode) or not (stat.S_ISREG(entry.st_mode) or stat.S_ISDIR(entry.st_mode)):
                 raise ValueError("authoritative source repository is unavailable")
             snapshot[entry_path] = _pinned_identity(entry)
             if len(snapshot) > _MAX_GIT_METADATA_ENTRIES:
                 raise ValueError("authoritative source repository is unavailable")
             if stat.S_ISDIR(entry.st_mode):
-                child_fd, child_identity = _open_git_directory(directory_fd, name)
+                child_fd, child_identity = _open_git_directory(directory_fd, name, deadline)
                 try:
                     if child_identity != snapshot[entry_path]:
                         raise ValueError("authoritative source repository is unavailable")
                     walk(child_fd, entry_path)
                 finally:
                     _close_owned_git_descriptors(child_fd)
+                _remaining_deadline(deadline)
 
     walk(root_fd, prefix)
+    _remaining_deadline(deadline)
     return snapshot
 
 
-def _reject_present_git_entry(parent_fd: int, name: str) -> None:
+def _reject_present_git_entry(parent_fd: int, name: str, deadline: float) -> None:
     try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        _deadline_result(deadline, os.stat, name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
     raise ValueError("authoritative source repository is unavailable")
 
 
-def _validate_production_git_config(raw_config: bytes) -> None:
+def _validate_production_git_config(raw_config: bytes, deadline: float) -> None:
     """Permit ordinary local settings, never source-selection configuration."""
     try:
         lines = raw_config.decode("utf-8", "strict").splitlines()
@@ -985,6 +1025,7 @@ def _validate_production_git_config(raw_config: bytes) -> None:
         raise ValueError("authoritative source repository is unavailable") from None
     section = ""
     for raw_line in lines:
+        _remaining_deadline(deadline)
         line = raw_line.strip()
         if not line or line.startswith(("#", ";")):
             continue
@@ -1004,6 +1045,7 @@ def _validate_production_git_config(raw_config: bytes) -> None:
             raise ValueError("authoritative source repository is unavailable")
         if section == "core" and key == "bare" and value not in {"false", "0", "no"}:
             raise ValueError("authoritative source repository is unavailable")
+    _remaining_deadline(deadline)
 
 
 def _valid_ref_path(value: str) -> bool:
@@ -1015,13 +1057,14 @@ def _valid_ref_path(value: str) -> bool:
     )
 
 
-def _read_packed_ref(raw_packed_refs: bytes, ref_path: str) -> str:
+def _read_packed_ref(raw_packed_refs: bytes, ref_path: str, deadline: float) -> str:
     try:
         lines = raw_packed_refs.decode("ascii", "strict").splitlines()
     except UnicodeDecodeError:
         raise ValueError("authoritative source repository is unavailable") from None
     found: str | None = None
     for line in lines:
+        _remaining_deadline(deadline)
         if not line or line.startswith("#") or line.startswith("^"):
             continue
         try:
@@ -1038,16 +1081,18 @@ def _read_packed_ref(raw_packed_refs: bytes, ref_path: str) -> str:
             found = commit
     if found is None:
         raise ValueError("authoritative source repository is unavailable")
+    _remaining_deadline(deadline)
     return found
 
 
-def _validate_packed_refs(raw_packed_refs: bytes) -> None:
+def _validate_packed_refs(raw_packed_refs: bytes, deadline: float) -> None:
     """Reject malformed packed references and every replacement namespace entry."""
     try:
         lines = raw_packed_refs.decode("ascii", "strict").splitlines()
     except UnicodeDecodeError:
         raise ValueError("authoritative source repository is unavailable") from None
     for line in lines:
+        _remaining_deadline(deadline)
         if not line or line.startswith("#") or line.startswith("^"):
             continue
         try:
@@ -1060,11 +1105,13 @@ def _validate_packed_refs(raw_packed_refs: bytes) -> None:
             or ref_path.startswith("refs/replace/")
         ):
             raise ValueError("authoritative source repository is unavailable")
+    _remaining_deadline(deadline)
 
 
 def _open_relative_git_ref(
-    refs_fd: int, ref_path: str,
+    refs_fd: int, ref_path: str, deadline: float,
 ) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int], bytes]:
+    _remaining_deadline(deadline)
     if not _valid_ref_path(ref_path):
         raise ValueError("authoritative source repository is unavailable")
     parent_fd = refs_fd
@@ -1072,34 +1119,39 @@ def _open_relative_git_ref(
     descriptor: int | None = None
     try:
         for component in ref_path.split("/")[1:-1]:
-            descriptor, _identity = _open_git_directory(parent_fd, component)
+            descriptor, _identity = _open_git_directory(parent_fd, component, deadline)
             intermediates.append(descriptor)
             parent_fd = descriptor
-        descriptor, identity = _open_git_regular(parent_fd, ref_path.rsplit("/", 1)[1])
-        data = _read_pinned_descriptor(descriptor, 256)
+        descriptor, identity = _open_git_regular(parent_fd, ref_path.rsplit("/", 1)[1], deadline)
+        data = _read_pinned_descriptor(descriptor, 256, deadline)
         if not data.endswith(b"\n") or data.count(b"\n") != 1:
             raise ValueError("authoritative source repository is unavailable")
         commit = data[:-1].decode("ascii", "strict")
         if _COMMIT.fullmatch(commit) is None:
             raise ValueError("authoritative source repository is unavailable")
         result = descriptor, identity, data
+        _remaining_deadline(deadline)
         descriptor = None
         return result
     finally:
         _close_owned_git_descriptors(*reversed(intermediates), descriptor)
 
 
-def _stat_relative_git_ref(refs_fd: int, ref_path: str) -> os.stat_result:
+def _stat_relative_git_ref(refs_fd: int, ref_path: str, deadline: float) -> os.stat_result:
+    _remaining_deadline(deadline)
     if not _valid_ref_path(ref_path):
         raise ValueError("authoritative source repository is unavailable")
     parent_fd = refs_fd
     intermediates: list[int] = []
     try:
         for component in ref_path.split("/")[1:-1]:
-            descriptor, _identity = _open_git_directory(parent_fd, component)
+            descriptor, _identity = _open_git_directory(parent_fd, component, deadline)
             intermediates.append(descriptor)
             parent_fd = descriptor
-        return os.stat(ref_path.rsplit("/", 1)[1], dir_fd=parent_fd, follow_symlinks=False)
+        return _deadline_result(
+            deadline, os.stat, ref_path.rsplit("/", 1)[1],
+            dir_fd=parent_fd, follow_symlinks=False,
+        )
     finally:
         _close_owned_git_descriptors(*reversed(intermediates))
 
@@ -1139,8 +1191,9 @@ class _ProductionGitSession:
         )
 
 
-def _open_production_repository(path: str) -> _ProductionGitSession:
+def _open_production_repository(path: str, deadline: float) -> _ProductionGitSession:
     """Pin one non-worktree Git repository session with no indirect object source."""
+    _remaining_deadline(deadline)
     if path != ADAPTER_SOURCE_PATH:
         raise ValueError("authoritative source path is fixed")
     candidate = Path(path)
@@ -1149,51 +1202,58 @@ def _open_production_repository(path: str) -> _ProductionGitSession:
     descriptors: list[int] = []
     session: _ProductionGitSession | None = None
     try:
+        _remaining_deadline(deadline)
         parent_fd = os.open(
             "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
         descriptors.append(parent_fd)
+        _remaining_deadline(deadline)
         for component in candidate.parts[1:-1]:
-            child_fd, _identity = _open_git_directory(parent_fd, component)
+            child_fd, _identity = _open_git_directory(parent_fd, component, deadline)
             descriptors.append(child_fd)
             _close_owned_git_descriptors(parent_fd)
             descriptors.remove(parent_fd)
             parent_fd = child_fd
-        worktree_fd, worktree_identity = _open_git_directory(parent_fd, candidate.name)
+            _remaining_deadline(deadline)
+        worktree_fd, worktree_identity = _open_git_directory(parent_fd, candidate.name, deadline)
         descriptors.append(worktree_fd)
-        git_fd, git_identity = _open_git_directory(worktree_fd, ".git")
+        git_fd, git_identity = _open_git_directory(worktree_fd, ".git", deadline)
         descriptors.append(git_fd)
-        config_fd, config_identity = _open_git_regular(git_fd, "config")
+        config_fd, config_identity = _open_git_regular(git_fd, "config", deadline)
         descriptors.append(config_fd)
-        config_bytes = _read_pinned_descriptor(config_fd, _MAX_GIT_METADATA_BYTES)
-        _validate_production_git_config(config_bytes)
-        head_fd, head_identity = _open_git_regular(git_fd, "HEAD")
+        config_bytes = _read_pinned_descriptor(config_fd, _MAX_GIT_METADATA_BYTES, deadline)
+        _validate_production_git_config(config_bytes, deadline)
+        head_fd, head_identity = _open_git_regular(git_fd, "HEAD", deadline)
         descriptors.append(head_fd)
-        head_bytes = _read_pinned_descriptor(head_fd, 256)
-        refs_fd, refs_identity = _open_git_directory(git_fd, "refs")
+        head_bytes = _read_pinned_descriptor(head_fd, 256, deadline)
+        refs_fd, refs_identity = _open_git_directory(git_fd, "refs", deadline)
         descriptors.append(refs_fd)
-        objects_fd, objects_identity = _open_git_directory(git_fd, "objects")
+        objects_fd, objects_identity = _open_git_directory(git_fd, "objects", deadline)
         descriptors.append(objects_fd)
-        objects_info_fd, objects_info_identity = _open_git_directory(objects_fd, "info")
+        objects_info_fd, objects_info_identity = _open_git_directory(objects_fd, "info", deadline)
         descriptors.append(objects_info_fd)
-        objects_pack_fd, objects_pack_identity = _open_git_directory(objects_fd, "pack")
+        objects_pack_fd, objects_pack_identity = _open_git_directory(objects_fd, "pack", deadline)
         descriptors.append(objects_pack_fd)
-        info_fd, info_identity = _open_git_directory(git_fd, "info")
+        info_fd, info_identity = _open_git_directory(git_fd, "info", deadline)
         descriptors.append(info_fd)
-        _reject_present_git_entry(info_fd, "grafts")
-        _reject_present_git_entry(objects_info_fd, "alternates")
-        _reject_present_git_entry(objects_info_fd, "http-alternates")
-        _reject_present_git_entry(refs_fd, "replace")
-        metadata_nodes = _snapshot_git_metadata_tree(refs_fd, "refs")
-        metadata_nodes.update(_snapshot_git_metadata_tree(objects_fd, "objects"))
+        _reject_present_git_entry(info_fd, "grafts", deadline)
+        _reject_present_git_entry(objects_info_fd, "alternates", deadline)
+        _reject_present_git_entry(objects_info_fd, "http-alternates", deadline)
+        _reject_present_git_entry(refs_fd, "replace", deadline)
+        metadata_nodes = _snapshot_git_metadata_tree(refs_fd, "refs", deadline)
+        _remaining_deadline(deadline)
+        metadata_nodes.update(_snapshot_git_metadata_tree(objects_fd, "objects", deadline))
+        _remaining_deadline(deadline)
         packed_refs_fd: int | None = None
         packed_refs_identity: tuple[int, int, int, int, int, int, int, int, int] | None = None
         packed_refs_bytes: bytes | None = None
         try:
-            packed_refs_fd, packed_refs_identity = _open_git_regular(git_fd, "packed-refs")
+            packed_refs_fd, packed_refs_identity = _open_git_regular(git_fd, "packed-refs", deadline)
             descriptors.append(packed_refs_fd)
-            packed_refs_bytes = _read_pinned_descriptor(packed_refs_fd, _MAX_GIT_METADATA_BYTES)
-            _validate_packed_refs(packed_refs_bytes)
+            packed_refs_bytes = _read_pinned_descriptor(
+                packed_refs_fd, _MAX_GIT_METADATA_BYTES, deadline,
+            )
+            _validate_packed_refs(packed_refs_bytes, deadline)
         except FileNotFoundError:
             packed_refs_fd = None
             packed_refs_identity = None
@@ -1212,19 +1272,21 @@ def _open_production_repository(path: str) -> _ProductionGitSession:
         if head_value.startswith("ref: "):
             ref_path = head_value[5:]
             try:
-                ref_fd, ref_identity, ref_bytes = _open_relative_git_ref(refs_fd, ref_path)
+                ref_fd, ref_identity, ref_bytes = _open_relative_git_ref(
+                    refs_fd, ref_path, deadline,
+                )
                 descriptors.append(ref_fd)
                 head_commit = ref_bytes[:-1].decode("ascii", "strict")
             except FileNotFoundError:
                 if packed_refs_bytes is None:
                     raise ValueError("authoritative source repository is unavailable") from None
-                head_commit = _read_packed_ref(packed_refs_bytes, ref_path)
+                head_commit = _read_packed_ref(packed_refs_bytes, ref_path, deadline)
         else:
             head_commit = head_value
         if _COMMIT.fullmatch(head_commit) is None:
             raise ValueError("authoritative source repository is unavailable")
         identities = {
-            "parent": _pinned_identity(os.fstat(parent_fd)),
+            "parent": _pinned_identity(_deadline_result(deadline, os.fstat, parent_fd)),
             "worktree": worktree_identity,
             "git": git_identity,
             "config": config_identity,
@@ -1243,8 +1305,9 @@ def _open_production_repository(path: str) -> _ProductionGitSession:
             str(candidate), candidate.name, parent_fd, worktree_fd, git_fd, config_fd,
             head_fd, refs_fd, objects_fd, objects_info_fd, objects_pack_fd, info_fd,
             packed_refs_fd, ref_fd, identities, metadata_nodes, config_bytes, head_bytes, packed_refs_bytes,
-            ref_path, ref_bytes, head_commit, time.monotonic() + _MAX_GIT_OPERATION_SECONDS,
+            ref_path, ref_bytes, head_commit, deadline,
         )
+        _remaining_deadline(deadline)
         descriptors.clear()
         return session
     except Exception:
@@ -1255,24 +1318,30 @@ def _open_production_repository(path: str) -> _ProductionGitSession:
         raise ValueError("authoritative source repository is unavailable") from None
 
 
-def _reopen_production_repository_identity(path: str) -> tuple[int, int, int, int, int]:
+def _reopen_production_repository_identity(
+    path: str, deadline: float,
+) -> tuple[int, int, int, int, int]:
     """Retraverse every absolute worktree component without following symlinks."""
     candidate = Path(path)
     current_fd: int | None = None
     child_fd: int | None = None
     result: tuple[int, int, int, int, int] | None = None
     try:
+        _remaining_deadline(deadline)
         current_fd = os.open(
             "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
+        _remaining_deadline(deadline)
         for component in candidate.parts[1:]:
-            child_fd, _identity = _open_git_directory(current_fd, component)
+            child_fd, _identity = _open_git_directory(current_fd, component, deadline)
             _close_owned_git_descriptors(current_fd)
             current_fd = child_fd
             child_fd = None
-        result = _repository_identity(os.fstat(current_fd))
+            _remaining_deadline(deadline)
+        result = _repository_identity(_deadline_result(deadline, os.fstat, current_fd))
     finally:
         _close_owned_git_descriptors(child_fd, current_fd)
+    _remaining_deadline(deadline)
     if result is None:
         raise ValueError("authoritative source repository is unavailable")
     return result
@@ -1280,6 +1349,7 @@ def _reopen_production_repository_identity(path: str) -> tuple[int, int, int, in
 
 def _verify_production_repository_identity(session: _ProductionGitSession) -> None:
     """Revalidate every pinned worktree, Git metadata, ref, and object-store node."""
+    _remaining_deadline(session.deadline)
     descriptors = {
         "parent": session.parent_fd, "worktree": session.worktree_fd, "git": session.git_fd,
         "config": session.config_fd, "head": session.head_fd, "refs": session.refs_fd,
@@ -1290,8 +1360,11 @@ def _verify_production_repository_identity(session: _ProductionGitSession) -> No
         descriptors["packed_refs"] = session.packed_refs_fd
     if session.ref_fd is not None:
         descriptors["ref"] = session.ref_fd
-    if any(_pinned_identity(os.fstat(fd)) != session.identities[name] for name, fd in descriptors.items()):
-        raise ValueError("authoritative source repository changed during read")
+    for name, descriptor in descriptors.items():
+        if _pinned_identity(
+            _deadline_result(session.deadline, os.fstat, descriptor)
+        ) != session.identities[name]:
+            raise ValueError("authoritative source repository changed during read")
     checks = (
         (session.parent_fd, session.worktree_name, "worktree"),
         (session.worktree_fd, ".git", "git"),
@@ -1304,39 +1377,59 @@ def _verify_production_repository_identity(session: _ProductionGitSession) -> No
         (session.git_fd, "info", "info"),
     )
     for parent_fd, name, identity_name in checks:
-        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        entry = _deadline_result(
+            session.deadline, os.stat, name, dir_fd=parent_fd, follow_symlinks=False,
+        )
         if _pinned_identity(entry) != session.identities[identity_name]:
             raise ValueError("authoritative source repository changed during read")
     if session.packed_refs_fd is not None:
-        entry = os.stat("packed-refs", dir_fd=session.git_fd, follow_symlinks=False)
+        entry = _deadline_result(
+            session.deadline, os.stat, "packed-refs",
+            dir_fd=session.git_fd, follow_symlinks=False,
+        )
         if _pinned_identity(entry) != session.identities["packed_refs"]:
             raise ValueError("authoritative source repository changed during read")
     if session.ref_fd is not None and session.ref_path is not None:
-        if _pinned_identity(_stat_relative_git_ref(session.refs_fd, session.ref_path)) != session.identities["ref"]:
+        if _pinned_identity(
+            _stat_relative_git_ref(session.refs_fd, session.ref_path, session.deadline)
+        ) != session.identities["ref"]:
             raise ValueError("authoritative source repository changed during read")
-    if _reopen_production_repository_identity(session.path) != _repository_identity(os.fstat(session.worktree_fd)):
+    if _reopen_production_repository_identity(
+        session.path, session.deadline,
+    ) != _repository_identity(
+        _deadline_result(session.deadline, os.fstat, session.worktree_fd)
+    ):
         raise ValueError("authoritative source repository changed during read")
-    _reject_present_git_entry(session.info_fd, "grafts")
-    _reject_present_git_entry(session.objects_info_fd, "alternates")
-    _reject_present_git_entry(session.objects_info_fd, "http-alternates")
-    _reject_present_git_entry(session.refs_fd, "replace")
-    current_metadata_nodes = _snapshot_git_metadata_tree(session.refs_fd, "refs")
-    current_metadata_nodes.update(_snapshot_git_metadata_tree(session.objects_fd, "objects"))
+    _reject_present_git_entry(session.info_fd, "grafts", session.deadline)
+    _reject_present_git_entry(session.objects_info_fd, "alternates", session.deadline)
+    _reject_present_git_entry(session.objects_info_fd, "http-alternates", session.deadline)
+    _reject_present_git_entry(session.refs_fd, "replace", session.deadline)
+    current_metadata_nodes = _snapshot_git_metadata_tree(
+        session.refs_fd, "refs", session.deadline,
+    )
+    current_metadata_nodes.update(_snapshot_git_metadata_tree(
+        session.objects_fd, "objects", session.deadline,
+    ))
     if current_metadata_nodes != session.metadata_nodes:
         raise ValueError("authoritative source repository changed during read")
-    if _read_pinned_descriptor(session.config_fd, _MAX_GIT_METADATA_BYTES) != session.config_bytes:
+    if _read_pinned_descriptor(
+        session.config_fd, _MAX_GIT_METADATA_BYTES, session.deadline,
+    ) != session.config_bytes:
         raise ValueError("authoritative source repository changed during read")
-    _validate_production_git_config(session.config_bytes)
-    if _read_pinned_descriptor(session.head_fd, 256) != session.head_bytes:
+    _validate_production_git_config(session.config_bytes, session.deadline)
+    if _read_pinned_descriptor(session.head_fd, 256, session.deadline) != session.head_bytes:
         raise ValueError("authoritative source repository changed during read")
     if session.packed_refs_fd is not None:
-        current_packed_refs = _read_pinned_descriptor(session.packed_refs_fd, _MAX_GIT_METADATA_BYTES)
+        current_packed_refs = _read_pinned_descriptor(
+            session.packed_refs_fd, _MAX_GIT_METADATA_BYTES, session.deadline,
+        )
         if current_packed_refs != session.packed_refs_bytes:
             raise ValueError("authoritative source repository changed during read")
-        _validate_packed_refs(current_packed_refs)
+        _validate_packed_refs(current_packed_refs, session.deadline)
     if session.ref_fd is not None and session.ref_bytes is not None:
-        if _read_pinned_descriptor(session.ref_fd, 256) != session.ref_bytes:
+        if _read_pinned_descriptor(session.ref_fd, 256, session.deadline) != session.ref_bytes:
             raise ValueError("authoritative source repository changed during read")
+    _remaining_deadline(session.deadline)
 
 
 def _unsafe_ambient_git_environment() -> bool:
@@ -1351,9 +1444,11 @@ def _unsafe_ambient_git_environment() -> bool:
 
 def _git_stdout(session: _ProductionGitSession, arguments: tuple[str, ...], limit: int) -> bytes:
     """Read one bounded Git result under the session's single monotonic deadline."""
+    if not isinstance(session, _ProductionGitSession):
+        raise ValueError("authoritative Git read is unavailable")
+    _remaining_deadline(session.deadline)
     if (
-        not isinstance(session, _ProductionGitSession)
-        or not isinstance(arguments, tuple)
+        not isinstance(arguments, tuple)
         or not arguments
         or any(type(argument) is not str or not argument for argument in arguments)
         or type(limit) is not int
@@ -1387,6 +1482,7 @@ def _git_stdout(session: _ProductionGitSession, arguments: tuple[str, ...], limi
             pass_fds=(session.git_fd,),
             env=environment,
         )
+        _remaining_deadline(session.deadline)
         if process.stdout is None:
             raise ValueError("authoritative Git read is unavailable")
         chunks: list[bytes] = []
@@ -1396,7 +1492,9 @@ def _git_stdout(session: _ProductionGitSession, arguments: tuple[str, ...], limi
             while True:
                 if not selector.select(_remaining_deadline(session.deadline)):
                     raise ValueError("authoritative Git read is unavailable")
+                _remaining_deadline(session.deadline)
                 chunk = os.read(process.stdout.fileno(), min(64 * 1024, limit + 1 - total))
+                _remaining_deadline(session.deadline)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -1410,16 +1508,39 @@ def _git_stdout(session: _ProductionGitSession, arguments: tuple[str, ...], limi
         failed = True
     finally:
         if process is not None:
+            ordinary_cleanup_error: Exception | None = None
+            base_cleanup_error: BaseException | None = None
+
+            def cleanup(operation: Callable[[], object]) -> None:
+                nonlocal ordinary_cleanup_error, base_cleanup_error
+                try:
+                    operation()
+                except BaseException as error:
+                    if isinstance(error, Exception):
+                        ordinary_cleanup_error = ordinary_cleanup_error or error
+                    else:
+                        base_cleanup_error = base_cleanup_error or error
+
             try:
-                if process.poll() is None:
-                    process.kill()
-                process.wait(timeout=1)
-                if process.stdout is not None:
-                    process.stdout.close()
-            except Exception:
+                running = process.poll() is None
+            except BaseException as error:
+                running = True
+                if isinstance(error, Exception):
+                    ordinary_cleanup_error = error
+                else:
+                    base_cleanup_error = error
+            if running:
+                cleanup(process.terminate)
+            cleanup(lambda: process.wait(timeout=1))
+            if process.stdout is not None:
+                cleanup(process.stdout.close)
+            if base_cleanup_error is not None:
+                raise base_cleanup_error
+            if ordinary_cleanup_error is not None:
                 failed = True
     if failed:
         raise ValueError("authoritative Git read is unavailable")
+    _remaining_deadline(session.deadline)
     return output
 
 
@@ -1432,15 +1553,18 @@ def _git_object_id(object_type: str, content: bytes) -> str:
 def _read_git_object(
     session: _ProductionGitSession, object_type: str, object_id: str, limit: int,
 ) -> bytes:
+    _remaining_deadline(session.deadline)
     if object_type not in {"commit", "tree", "blob"} or _COMMIT.fullmatch(object_id) is None:
         raise ValueError("authoritative runtime tree is malformed")
     content = _git_stdout(session, ("cat-file", object_type, object_id), limit)
     if len(content) > limit or _git_object_id(object_type, content) != object_id:
         raise ValueError("authoritative runtime tree is malformed")
+    _remaining_deadline(session.deadline)
     return content
 
 
-def _commit_tree_id(content: bytes) -> str:
+def _commit_tree_id(content: bytes, deadline: float) -> str:
+    _remaining_deadline(deadline)
     header, separator, _message = content.partition(b"\n\n")
     if not separator:
         raise ValueError("authoritative runtime tree is malformed")
@@ -1453,13 +1577,17 @@ def _commit_tree_id(content: bytes) -> str:
         raise ValueError("authoritative runtime tree is malformed") from None
     if _COMMIT.fullmatch(tree_id) is None:
         raise ValueError("authoritative runtime tree is malformed")
+    _remaining_deadline(deadline)
     return tree_id
 
 
-def _tree_entries(content: bytes) -> list[tuple[bytes, bytes, str]]:
+def _tree_entries(content: bytes, deadline: float) -> list[tuple[bytes, bytes, str]]:
     entries: list[tuple[bytes, bytes, str]] = []
+    seen_names: set[bytes] = set()
+    previous_sort_key: bytes | None = None
     offset = 0
     while offset < len(content):
+        _remaining_deadline(deadline)
         separator = content.find(b" ", offset)
         terminator = content.find(b"\0", separator + 1)
         if separator <= offset or terminator < 0 or terminator + 21 > len(content):
@@ -1469,14 +1597,24 @@ def _tree_entries(content: bytes) -> list[tuple[bytes, bytes, str]]:
         object_id = content[terminator + 1:terminator + 21].hex()
         if not encoded_name or b"/" in encoded_name:
             raise ValueError("authoritative runtime tree is malformed")
+        sort_key = encoded_name + (b"/" if mode == b"40000" else b"\0")
+        if (
+            encoded_name in seen_names
+            or (previous_sort_key is not None and previous_sort_key >= sort_key)
+        ):
+            raise ValueError("authoritative runtime tree is malformed")
+        seen_names.add(encoded_name)
+        previous_sort_key = sort_key
         entries.append((mode, encoded_name, object_id))
         offset = terminator + 21
     if offset != len(content):
         raise ValueError("authoritative runtime tree is malformed")
+    _remaining_deadline(deadline)
     return entries
 
 
 def _verify_live_runtime_entry(session: _ProductionGitSession, path: str, mode: int) -> None:
+    _remaining_deadline(session.deadline)
     components = path.split("/")
     if not path or any(component in {"", ".", ".."} for component in components):
         raise ValueError("authoritative runtime tree is malformed")
@@ -1485,12 +1623,15 @@ def _verify_live_runtime_entry(session: _ProductionGitSession, path: str, mode: 
     descriptor: int | None = None
     try:
         for component in components[:-1]:
-            descriptor, _identity = _open_git_directory(parent_fd, component)
+            descriptor, _identity = _open_git_directory(parent_fd, component, session.deadline)
             intermediates.append(descriptor)
             parent_fd = descriptor
-        descriptor, _identity = _open_git_regular(parent_fd, components[-1])
-        descriptor_info = os.fstat(descriptor)
-        entry_info = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
+        descriptor, _identity = _open_git_regular(parent_fd, components[-1], session.deadline)
+        descriptor_info = _deadline_result(session.deadline, os.fstat, descriptor)
+        entry_info = _deadline_result(
+            session.deadline, os.stat, components[-1],
+            dir_fd=parent_fd, follow_symlinks=False,
+        )
         if (
             not stat.S_ISREG(descriptor_info.st_mode)
             or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
@@ -1499,12 +1640,17 @@ def _verify_live_runtime_entry(session: _ProductionGitSession, path: str, mode: 
             raise ValueError("authoritative runtime tree is malformed")
     finally:
         _close_owned_git_descriptors(descriptor, *reversed(intermediates))
+    _remaining_deadline(session.deadline)
 
 
 def _runtime_tree_records(session: _ProductionGitSession, commit: str) -> list[dict[str, object]]:
+    _remaining_deadline(session.deadline)
     if _COMMIT.fullmatch(commit) is None:
         raise ValueError("authoritative runtime tree is malformed")
-    tree_id = _commit_tree_id(_read_git_object(session, "commit", commit, _MAX_GIT_METADATA_BYTES))
+    tree_id = _commit_tree_id(
+        _read_git_object(session, "commit", commit, _MAX_GIT_METADATA_BYTES),
+        session.deadline,
+    )
     files: list[dict[str, object]] = []
     seen_paths: set[str] = set()
     seen_trees: set[str] = set()
@@ -1512,11 +1658,13 @@ def _runtime_tree_records(session: _ProductionGitSession, commit: str) -> list[d
 
     def walk(current_tree_id: str, prefix: str) -> None:
         nonlocal total_blob_bytes
+        _remaining_deadline(session.deadline)
         if current_tree_id in seen_trees:
             raise ValueError("authoritative runtime tree is malformed")
         seen_trees.add(current_tree_id)
         tree = _read_git_object(session, "tree", current_tree_id, _MAX_GIT_TREE_BYTES)
-        for raw_mode, encoded_name, object_id in _tree_entries(tree):
+        for raw_mode, encoded_name, object_id in _tree_entries(tree, session.deadline):
+            _remaining_deadline(session.deadline)
             try:
                 name = encoded_name.decode("utf-8", "strict")
             except UnicodeDecodeError:
@@ -1553,23 +1701,29 @@ def _runtime_tree_records(session: _ProductionGitSession, commit: str) -> list[d
     files.sort(key=lambda item: str(item["path"]))
     for item in files:
         _verify_live_runtime_entry(session, str(item["path"]), int(item["mode"]))
+        _remaining_deadline(session.deadline)
     _verify_production_repository_identity(session)
     for item in files:
         _verify_live_runtime_entry(session, str(item["path"]), int(item["mode"]))
+        _remaining_deadline(session.deadline)
+    _remaining_deadline(session.deadline)
     return files
 
 
 def _with_production_repository(
     path: str, reader: Callable[[_ProductionGitSession], str], label: str,
 ) -> str:
+    deadline = time.monotonic() + _MAX_GIT_OPERATION_SECONDS
     session: _ProductionGitSession | None = None
     value: str | None = None
     failed = False
     try:
-        session = _open_production_repository(path)
+        _remaining_deadline(deadline)
+        session = _open_production_repository(path, deadline)
         _verify_production_repository_identity(session)
         value = reader(session)
         _verify_production_repository_identity(session)
+        _remaining_deadline(deadline)
     except Exception:
         failed = True
     finally:
@@ -1578,6 +1732,10 @@ def _with_production_repository(
                 session.close()
             except Exception:
                 failed = True
+        try:
+            _remaining_deadline(deadline)
+        except Exception:
+            failed = True
     if failed or value is None:
         raise ValueError(f"{label} is unavailable")
     return value

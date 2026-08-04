@@ -269,3 +269,58 @@ environment prerequisite: `mcp` is not installed and `THEUNDERDARK_PYTHON` and
 failures, 24 passes, and 5 skips; no source, database, service, gateway,
 approval, dispatch, provisioning, deployment, restart, or push mutation was
 performed.
+
+## Final Git-parser and operation-lifetime correction
+
+The last independent review found four remaining Git-session gaps. A promisor
+marker under `objects/pack` could be accepted when no related configuration was
+present. The shared deadline began only after the initial repository snapshot.
+Raw Git trees did not reject duplicate component names or enforce Git's
+directory-aware byte ordering before descent. Finally, an ordinary process
+cleanup failure could prevent a later owned stdout close attempt.
+
+Production now rejects every case-insensitive `.promisor` marker beneath the
+pinned pack metadata tree independently of configuration. One deadline is
+created before repository path traversal and is checked around every open,
+metadata operation, bounded descriptor read, recursive snapshot, config/ref and
+object validation, live-entry validation, identity recheck, subprocess read,
+and successful finalization. Owned descriptor and process cleanup remains
+outside the fail-fast deadline checks so it is still attempted after expiry.
+
+Raw tree parsing now rejects duplicate byte names and noncanonical order before
+any child tree is read, using Git's comparison rule that treats a directory as
+if its name ends with `/`. Process cleanup independently attempts termination,
+bounded wait, and stdout close; ordinary failures produce only the redacted
+unavailable result, while control-flow `BaseException` failures are preserved
+after all cleanup attempts.
+
+### RED evidence
+
+- `python3 -m py_compile tests/test_provisioning_bundle.py && pytest -q
+  tests/test_provisioning_bundle.py -k 'pack_promisor_markers or
+  deadline_includes_initial or hash_valid_duplicate or hash_valid_noncanonical
+  or force_no_replacements'` — 8 failed, 155 deselected. Four marker variants
+  were accepted, initial snapshot time was excluded, two hash-valid malformed
+  trees were descended, and a cleanup wait failure skipped stdout close.
+- The first correction run reported 7 passed and 1 failed because the deadline
+  regression required a second snapshot after the first snapshot had already
+  exhausted the deadline. The test was split into deterministic first-open and
+  first-snapshot cases and now expects the required immediate fail-closed abort.
+
+### GREEN verification
+
+- Corrected focus including independent terminate/wait/close cleanup — 11
+  passed, 155 deselected.
+- Expanded Git/session security selection — 37 passed, 129 deselected.
+- `pytest -q tests/test_provisioning_bundle.py` — 166 passed.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_roadex_approval_status.py tests/test_core.py -k 'not
+  test_roadex_human_scope_and_source_evidence_digest_use_exact_contract'` — 700
+  passed, 1 deselected in 80.62 seconds.
+- `python3 -m py_compile src/overseer/provisioning_bundle.py
+  tests/test_provisioning_bundle.py` and `git diff --check` — passed.
+
+The previously documented disposable acceptance prerequisites remain absent and
+were not changed. No live source checkout, production database, service,
+gateway, remote host, approval, dispatch, provisioning, deployment, restart,
+push, or other external mutation was performed.

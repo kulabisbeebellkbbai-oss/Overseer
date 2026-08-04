@@ -955,6 +955,36 @@ def add_adapter_commit(repository: Path, value: int) -> str:
     ).stdout.strip()
 
 
+def store_literal_git_object(repository: Path, object_type: str, content: bytes) -> str:
+    """Store exact disposable object bytes, including intentionally invalid trees."""
+    return subprocess.run(
+        (
+            "git", "-C", str(repository), "hash-object", "-w", "--literally",
+            "-t", object_type, "--stdin",
+        ),
+        check=True,
+        input=content,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+
+
+def git_tree_entry(mode: bytes, name: bytes, object_id: str) -> bytes:
+    return mode + b" " + name + b"\0" + bytes.fromhex(object_id)
+
+
+def point_repository_head_at_literal_tree(repository: Path, tree: bytes) -> tuple[str, str]:
+    tree_id = store_literal_git_object(repository, "tree", tree)
+    commit = (
+        b"tree " + tree_id.encode("ascii")
+        + b"\nauthor Disposable Test <test@example.invalid> 0 +0000"
+        + b"\ncommitter Disposable Test <test@example.invalid> 0 +0000"
+        + b"\n\ninvalid tree fixture\n"
+    )
+    commit_id = store_literal_git_object(repository, "commit", commit)
+    subprocess.run(("git", "-C", str(repository), "update-ref", "HEAD", commit_id), check=True)
+    return commit_id, tree_id
+
+
 @pytest.mark.parametrize("packed", (False, True))
 def test_production_git_boundary_rejects_loose_and_packed_replacement_refs(
     tmp_path, monkeypatch, packed,
@@ -1056,6 +1086,120 @@ def test_production_git_boundary_rejects_shared_and_partial_clone_metadata(tmp_p
     subprocess.run(("git", "-C", str(repository), "config", "remote.origin.promisor", "true"), check=True)
     with pytest.raises(ValueError, match="authoritative runtime tree"):
         dependencies.runtime_digest(str(repository), revision)
+
+
+@pytest.mark.parametrize("marker_variant", ("matching", "uppercase", "malformed", "nested"))
+def test_production_git_boundary_rejects_pack_promisor_markers_without_config(
+    tmp_path, monkeypatch, marker_variant,
+):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    subprocess.run(("git", "-C", str(repository), "repack", "-a", "-d"), check=True)
+    pack = next((repository / ".git" / "objects" / "pack").glob("pack-*.pack"))
+    if marker_variant == "matching":
+        marker = pack.with_suffix(".promisor")
+    elif marker_variant == "uppercase":
+        marker = pack.with_suffix(".PROMISOR")
+    elif marker_variant == "malformed":
+        marker = pack.parent / "malformed.promisor"
+    else:
+        marker = pack.parent / "nested" / "pack-deadbeef.promisor"
+        marker.parent.mkdir()
+    marker.write_bytes(b"")
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+
+@pytest.mark.parametrize("slow_stage", ("open", "snapshot"))
+def test_production_git_deadline_includes_initial_path_and_metadata_snapshot(
+    tmp_path, monkeypatch, slow_stage,
+):
+    repository, _revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    clock = [0.0]
+    opens = 0
+    snapshots = 0
+    original_open = provisioning_bundle_module.os.open
+    original_snapshot = provisioning_bundle_module._snapshot_git_metadata_tree
+
+    def slow_initial_open(*arguments, **keywords):
+        nonlocal opens
+        result = original_open(*arguments, **keywords)
+        opens += 1
+        if slow_stage == "open" and opens == 1:
+            clock[0] += provisioning_bundle_module._MAX_GIT_OPERATION_SECONDS + 1
+        return result
+
+    def slow_initial_snapshot(*arguments, **keywords):
+        nonlocal snapshots
+        result = original_snapshot(*arguments, **keywords)
+        snapshots += 1
+        if slow_stage == "snapshot" and snapshots == 1:
+            clock[0] += provisioning_bundle_module._MAX_GIT_OPERATION_SECONDS + 1
+        return result
+
+    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(provisioning_bundle_module.os, "open", slow_initial_open)
+    monkeypatch.setattr(
+        provisioning_bundle_module, "_snapshot_git_metadata_tree", slow_initial_snapshot,
+    )
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+    assert opens >= 1
+    assert snapshots == (1 if slow_stage == "snapshot" else 0)
+
+
+def test_production_runtime_digest_rejects_hash_valid_duplicate_tree_names_before_descent(
+    tmp_path, monkeypatch,
+):
+    repository, _revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    blob_id = store_literal_git_object(repository, "blob", b"value\n")
+    empty_tree_id = store_literal_git_object(repository, "tree", b"")
+    populated_tree_id = store_literal_git_object(
+        repository, "tree", git_tree_entry(b"100644", b"value", blob_id),
+    )
+    commit_id, root_tree_id = point_repository_head_at_literal_tree(
+        repository,
+        git_tree_entry(b"40000", b"duplicate", empty_tree_id)
+        + git_tree_entry(b"40000", b"duplicate", populated_tree_id),
+    )
+    tree_reads: list[str] = []
+    original_git_stdout = provisioning_bundle_module._git_stdout
+
+    def record_tree_reads(session, arguments, limit):
+        if arguments[:2] == ("cat-file", "tree"):
+            tree_reads.append(arguments[2])
+        return original_git_stdout(session, arguments, limit)
+
+    monkeypatch.setattr(provisioning_bundle_module, "_git_stdout", record_tree_reads)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), commit_id)
+    assert tree_reads == [root_tree_id]
+
+
+def test_production_runtime_digest_rejects_hash_valid_noncanonical_git_tree_order(
+    tmp_path, monkeypatch,
+):
+    repository, _revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    blob_id = store_literal_git_object(repository, "blob", b"value\n")
+    empty_tree_id = store_literal_git_object(repository, "tree", b"")
+    commit_id, root_tree_id = point_repository_head_at_literal_tree(
+        repository,
+        git_tree_entry(b"40000", b"a", empty_tree_id)
+        + git_tree_entry(b"100644", b"a.c", blob_id),
+    )
+    tree_reads: list[str] = []
+    original_git_stdout = provisioning_bundle_module._git_stdout
+
+    def record_tree_reads(session, arguments, limit):
+        if arguments[:2] == ("cat-file", "tree"):
+            tree_reads.append(arguments[2])
+        return original_git_stdout(session, arguments, limit)
+
+    monkeypatch.setattr(provisioning_bundle_module, "_git_stdout", record_tree_reads)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), commit_id)
+    assert tree_reads == [root_tree_id]
 
 
 def test_production_runtime_digest_requires_one_unchanged_head_session(tmp_path, monkeypatch):
@@ -1173,10 +1317,24 @@ def test_production_git_commands_force_no_replacements_and_owned_process_cleanup
     original_popen = subprocess.Popen
     observed: list[tuple[object, dict[str, object]]] = []
 
+    stdout_close_attempted: list[bool] = []
+
+    class RecordingStdout:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def fileno(self):
+            return self._stream.fileno()
+
+        def close(self):
+            stdout_close_attempted.append(True)
+            return self._stream.close()
+
     def recording_popen(arguments, *positional, **keywords):
         process = original_popen(arguments, *positional, **keywords)
         observed.append((arguments, keywords))
         original_wait = process.wait
+        process.stdout = RecordingStdout(process.stdout)
         calls = 0
 
         def fail_cleanup_wait(*wait_args, **wait_keywords):
@@ -1198,6 +1356,70 @@ def test_production_git_commands_force_no_replacements_and_owned_process_cleanup
     arguments, keywords = observed[0]
     assert "--no-replace-objects" in arguments
     assert keywords["env"]["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert stdout_close_attempted == [True]
+
+
+@pytest.mark.parametrize("fatal_terminate", (False, True))
+def test_git_process_cleanup_attempts_terminate_wait_and_stdout_close_independently(
+    monkeypatch, fatal_terminate,
+):
+    operations: list[str] = []
+
+    class CleanupAbort(BaseException):
+        pass
+
+    class FakeStdout:
+        def fileno(self):
+            return 37
+
+        def close(self):
+            operations.append("stdout-close")
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def wait(self, **_keywords):
+            operations.append("wait")
+            raise OSError("private wait failure")
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            operations.append("terminate")
+            if fatal_terminate:
+                raise CleanupAbort("private fatal terminate failure")
+            raise OSError("private terminate failure")
+
+    class FakeSelector:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_arguments):
+            return False
+
+        def register(self, *_arguments):
+            return None
+
+        def select(self, _timeout):
+            return [object()]
+
+    session = object.__new__(provisioning_bundle_module._ProductionGitSession)
+    session.git_fd = 11
+    session.deadline = provisioning_bundle_module.time.monotonic() + 10
+    session.process_count = 0
+    monkeypatch.setattr(provisioning_bundle_module, "_unsafe_ambient_git_environment", lambda: False)
+    monkeypatch.setattr(provisioning_bundle_module.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(provisioning_bundle_module.selectors, "DefaultSelector", FakeSelector)
+    monkeypatch.setattr(provisioning_bundle_module.os, "read", lambda *_arguments: b"")
+
+    expected_error = CleanupAbort if fatal_terminate else ValueError
+    with pytest.raises(expected_error) as captured:
+        provisioning_bundle_module._git_stdout(session, ("cat-file", "blob", "0" * 40), 1)
+
+    assert operations == ["wait", "terminate", "wait", "stdout-close"]
+    if not fatal_terminate:
+        assert "private" not in str(captured.value)
 
 
 def test_git_descriptor_cleanup_attempts_every_owned_descriptor_on_failure(monkeypatch):

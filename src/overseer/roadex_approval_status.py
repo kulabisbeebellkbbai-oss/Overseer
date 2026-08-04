@@ -313,12 +313,7 @@ def _decode_admin_plan_payload(payload: str) -> AdminChangePlan:
 
 
 def _decode_roadex_plan_payload(payload: str) -> DonutHoleBackupProvisioningPlan:
-    plan = _decode_dataclass_payload(payload, DonutHoleBackupProvisioningPlan, "roadex source")
-    if plan.kind != PLAN_KIND:
-        raise ValueError("exact kind must be preserved")
-    if plan.decision_source != "Roadex":
-        raise ValueError("Roadex decision source must be preserved")
-    return plan
+    return _decode_dataclass_payload(payload, DonutHoleBackupProvisioningPlan, "roadex source")
 
 
 def _load_admin_change_payload(store: ApprovalSourceStore, source_id: str) -> AdminChangePlan:
@@ -924,10 +919,10 @@ def _validate_source(source: object, binding: RoadexApprovalBinding) -> None:
 def _require_roadex_plan(source: object) -> DonutHoleBackupProvisioningPlan:
     if not isinstance(source, DonutHoleBackupProvisioningPlan):
         raise ValueError("roadex-human source must be a provisioning plan")
-    if source.decision_source != "Roadex":
-        raise ValueError("Roadex decision source must be preserved")
     if source.kind != PLAN_KIND:
         raise ValueError("exact kind must be preserved")
+    if source.decision_source != "Roadex":
+        raise ValueError("Roadex decision source must be preserved")
     return source
 
 

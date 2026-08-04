@@ -931,6 +931,288 @@ def test_production_gpg_digest_propagates_baseexception_from_close(tmp_path, mon
         provisioning_bundle_module._production_file_digest(str(executable))
 
 
+def production_repository_dependencies(tmp_path, monkeypatch):
+    """Build production dependencies for a disposable, fixed adapter checkout."""
+    repository, revision = disposable_adapter_repository(tmp_path)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(repository))
+    return repository, revision, provisioning_bundle_module.production_preflight_dependencies(store_path)
+
+
+def add_adapter_commit(repository: Path, value: int) -> str:
+    (repository / "adapter.py").write_text(f"VALUE = {value}\\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "adapter.py"), check=True)
+    subprocess.run(
+        (
+            "git", "-C", str(repository), "-c", "user.name=Disposable Test",
+            "-c", "user.email=test@example.invalid", "commit", "-q", "-m", f"fixture {value}",
+        ),
+        check=True,
+    )
+    return subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize("packed", (False, True))
+def test_production_git_boundary_rejects_loose_and_packed_replacement_refs(
+    tmp_path, monkeypatch, packed,
+):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    replacement = add_adapter_commit(repository, 2)
+    subprocess.run(("git", "-C", str(repository), "checkout", "-q", revision), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "update-ref", f"refs/replace/{revision}", replacement),
+        check=True,
+    )
+    if packed:
+        subprocess.run(("git", "-C", str(repository), "pack-refs", "--all", "--prune"), check=True)
+        assert not (repository / ".git" / "refs" / "replace" / revision).exists()
+        assert f"refs/replace/{revision}" in (repository / ".git" / "packed-refs").read_text()
+
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+def test_production_git_boundary_rejects_grafts_and_ambient_object_overrides(tmp_path, monkeypatch):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    grafts = repository / ".git" / "info" / "grafts"
+    grafts.write_text(f"{revision}\\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+    grafts.unlink()
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "poisoned-objects"))
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+
+def test_production_git_boundary_rejects_gitfiles_and_external_object_sources(tmp_path, monkeypatch):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    git_directory = repository / ".git"
+    external = tmp_path / "external-git-directory"
+    git_directory.rename(external)
+    git_directory.write_text(f"gitdir: {external}\\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+    git_directory.unlink()
+    external.rename(git_directory)
+    alternate_parent = tmp_path / "alternate-source"
+    alternate_parent.mkdir()
+    alternate_source, _ = disposable_adapter_repository(alternate_parent)
+    alternates = git_directory / "objects" / "info" / "alternates"
+    alternates.write_text(str(alternate_source / ".git" / "objects") + "\\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+@pytest.mark.parametrize("component", (".git", "objects", "objects-child", "refs", "config"))
+def test_production_git_boundary_rejects_symlinked_git_components(tmp_path, monkeypatch, component):
+    repository, _revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    git_directory = repository / ".git"
+    target = {
+        ".git": git_directory,
+        "objects": git_directory / "objects",
+        "objects-child": git_directory / "objects" / "zz",
+        "refs": git_directory / "refs",
+        "config": git_directory / "config",
+    }[component]
+    replacement = tmp_path / f"replacement-{component}"
+    if component == "objects-child":
+        replacement.mkdir()
+    else:
+        target.rename(replacement)
+    target.symlink_to(replacement, target_is_directory=component != "config")
+
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+
+def test_production_git_boundary_rejects_shared_and_partial_clone_metadata(tmp_path, monkeypatch):
+    source_parent = tmp_path / "source"
+    source_parent.mkdir()
+    source, _ = disposable_adapter_repository(source_parent)
+    shared = tmp_path / "shared"
+    subprocess.run(("git", "clone", "-q", "--shared", str(source), str(shared)), check=True)
+    store_path = seeded_authority_store(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(shared))
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+    shared_revision = subprocess.run(
+        ("git", "-C", str(shared), "rev-parse", "HEAD"), check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(shared), shared_revision)
+
+    repository, revision = disposable_adapter_repository(tmp_path)
+    monkeypatch.setattr(provisioning_bundle_module, "ADAPTER_SOURCE_PATH", str(repository))
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+    subprocess.run(("git", "-C", str(repository), "config", "extensions.partialClone", "origin"), check=True)
+    subprocess.run(("git", "-C", str(repository), "config", "remote.origin.promisor", "true"), check=True)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+def test_production_runtime_digest_requires_one_unchanged_head_session(tmp_path, monkeypatch):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    successor = add_adapter_commit(repository, 2)
+    subprocess.run(("git", "-C", str(repository), "checkout", "-q", revision), check=True)
+
+    assert dependencies.source_head(str(repository)) == revision
+    subprocess.run(("git", "-C", str(repository), "checkout", "-q", successor), check=True)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+    subprocess.run(("git", "-C", str(repository), "checkout", "-q", revision), check=True)
+    original_git_stdout = provisioning_bundle_module._git_stdout
+    moved = False
+
+    def move_head_during_object_read(session, arguments, limit):
+        nonlocal moved
+        result = original_git_stdout(session, arguments, limit)
+        if not moved and arguments[:2] == ("cat-file", "commit"):
+            moved = True
+            subprocess.run(("git", "-C", str(repository), "checkout", "-q", successor), check=True)
+        return result
+
+    monkeypatch.setattr(provisioning_bundle_module, "_git_stdout", move_head_during_object_read)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+@pytest.mark.parametrize(
+    ("path_name", "mode"),
+    (("adapter.py", 0o664), ("adapter-tool", 0o775)),
+)
+def test_production_runtime_digest_rejects_noncanonical_live_tracked_modes(
+    tmp_path, monkeypatch, path_name, mode,
+):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    (repository / path_name).chmod(mode)
+
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+@pytest.mark.parametrize("object_type", ("commit", "tree", "blob"))
+def test_production_runtime_digest_rejects_object_id_content_mismatch(
+    tmp_path, monkeypatch, object_type,
+):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    original_git_stdout = provisioning_bundle_module._git_stdout
+
+    def forged_object(session, arguments, limit):
+        if arguments[:2] == ("cat-file", object_type):
+            return b"counterfeit object bytes"
+        return original_git_stdout(session, arguments, limit)
+
+    monkeypatch.setattr(provisioning_bundle_module, "_git_stdout", forged_object)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+def test_production_runtime_digest_uses_one_aggregate_deadline_for_many_blobs(tmp_path, monkeypatch):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    for number in range(8):
+        (repository / f"extra-{number}.py").write_text(f"VALUE = {number}\\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "-c", "user.name=Disposable Test", "-c",
+         "user.email=test@example.invalid", "commit", "-q", "-m", "many blobs"),
+        check=True,
+    )
+    revision = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    clock = [0.0]
+    original_git_stdout = provisioning_bundle_module._git_stdout
+
+    def expiring_git_stdout(session, arguments, limit):
+        result = original_git_stdout(session, arguments, limit)
+        clock[0] += provisioning_bundle_module._MAX_GIT_OPERATION_SECONDS / 3
+        provisioning_bundle_module._remaining_deadline(session.deadline)
+        return result
+
+    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(provisioning_bundle_module, "_git_stdout", expiring_git_stdout)
+    with pytest.raises(ValueError, match="authoritative runtime tree"):
+        dependencies.runtime_digest(str(repository), revision)
+
+
+def test_production_gpg_digest_rejects_oversized_and_slow_executables(tmp_path, monkeypatch):
+    executable = tmp_path / "gpg"
+    executable.write_bytes(b"disposable-gpg")
+    executable.chmod(0o755)
+    monkeypatch.setattr(provisioning_bundle_module, "GPG_PATH", str(executable))
+    monkeypatch.setattr(provisioning_bundle_module, "_MAX_GPG_BYTES", 3)
+    with pytest.raises(ValueError, match="authoritative GPG executable is unavailable"):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+    monkeypatch.setattr(provisioning_bundle_module, "_MAX_GPG_BYTES", 1024)
+    clock = [0.0]
+    original_pread = os.pread
+
+    def slow_pread(*arguments):
+        clock[0] += provisioning_bundle_module._MAX_GPG_READ_SECONDS + 1
+        return original_pread(*arguments)
+
+    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(provisioning_bundle_module.os, "pread", slow_pread)
+    with pytest.raises(ValueError, match="authoritative GPG executable is unavailable"):
+        provisioning_bundle_module._production_file_digest(str(executable))
+
+
+def test_production_git_commands_force_no_replacements_and_owned_process_cleanup(tmp_path, monkeypatch):
+    repository, revision, dependencies = production_repository_dependencies(tmp_path, monkeypatch)
+    original_popen = subprocess.Popen
+    observed: list[tuple[object, dict[str, object]]] = []
+
+    def recording_popen(arguments, *positional, **keywords):
+        process = original_popen(arguments, *positional, **keywords)
+        observed.append((arguments, keywords))
+        original_wait = process.wait
+        calls = 0
+
+        def fail_cleanup_wait(*wait_args, **wait_keywords):
+            nonlocal calls
+            result = original_wait(*wait_args, **wait_keywords)
+            calls += 1
+            if calls > 1:
+                raise OSError("injected process cleanup failure")
+            return result
+
+        process.wait = fail_cleanup_wait
+        return process
+
+    monkeypatch.setattr(provisioning_bundle_module.subprocess, "Popen", recording_popen)
+    with pytest.raises(ValueError, match="authoritative source"):
+        dependencies.source_head(str(repository))
+
+    assert observed
+    arguments, keywords = observed[0]
+    assert "--no-replace-objects" in arguments
+    assert keywords["env"]["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+def test_git_descriptor_cleanup_attempts_every_owned_descriptor_on_failure(monkeypatch):
+    calls: list[int] = []
+
+    def failing_close(descriptor):
+        calls.append(descriptor)
+        raise OSError("injected descriptor cleanup failure")
+
+    monkeypatch.setattr(provisioning_bundle_module.os, "close", failing_close)
+    with pytest.raises(OSError, match="descriptor close"):
+        provisioning_bundle_module._close_owned_git_descriptors(11, 12, 13)
+    assert calls == [11, 12, 13]
+
+
 def test_locked_chain_rejects_second_same_scope_root_and_allows_distinct_scope(tmp_path):
     store_path, first = authoritative_bundle_fixture(tmp_path)
     stage_expected_bundle(store_path, first)

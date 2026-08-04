@@ -204,3 +204,68 @@ Disposable cross-repository acceptance was not runnable: the `mcp` package,
 `THEUNDERDARK_PYTHON`, and `THEUNDERDARK_SOURCE` were all absent. No live source
 checkout, production database, service, gateway, remote host, approval,
 dispatch, provisioning, deployment, restart, or push action was performed.
+
+## Git-session and evidence-source correction
+
+The final security review found that the production evidence reader pinned only
+the worktree root. It now creates one descriptor-owned Git session for each
+production read. The session accepts only a real, non-symlink `.git` directory;
+pins and rechecks worktree, Git directory, config, HEAD, active ref,
+packed-refs, refs, objects, and bounded recursive object/ref metadata; and
+rejects gitfiles/worktrees, links, alternates, shared stores, promisor/partial
+metadata, grafts, loose or packed replacement refs, includes, and
+object-interpretation configuration. Every Git subprocess uses both
+`--no-replace-objects` and `GIT_NO_REPLACE_OBJECTS=1`, while unsafe ambient Git
+overrides fail closed.
+
+Runtime evidence opens one such session, requires its authenticated HEAD to
+equal the requested commit before reconstruction, verifies commit/tree/blob
+object identifiers against the exact returned object bytes, rebuilds the tree
+without replacements, validates tracked live path type and canonical 0644/0755
+mode without reading live file bytes, and rechecks all pinned identity and HEAD
+state before return. The operation owns one monotonic deadline across all Git
+reads, with output/member/path/blob/aggregate/process caps. The GPG reader now
+also has an explicit executable-size cap and one elapsed-read deadline while
+retaining `O_NOATIME`, stable metadata, successful-close-before-return, and
+`BaseException` cleanup behavior.
+
+### RED evidence
+
+- `pytest -q tests/test_provisioning_bundle.py -k 'loose_and_packed_replacement
+  or grafts_and_ambient or gitfiles_and_external or symlinked_git_components or
+  shared_and_partial or unchanged_head_session or noncanonical_live or
+  object_id_content_mismatch or aggregate_deadline or oversized_and_slow'`
+  initially reported 14 failures and 1 pass. The failures proved acceptance of
+  loose and packed replacement refs, grafts, gitfile/symlink metadata,
+  HEAD drift, noncanonical modes, and counterfeit blob bytes; explicit GPG
+  caps were absent. Two fixture-parent setup errors were corrected before
+  production edits.
+- `pytest -q tests/test_provisioning_bundle.py::test_production_git_boundary_rejects_symlinked_git_components --tb=short`
+  then reported 1 failure and 4 passes: an unused nested `objects/zz` symlink
+  was not pinned. This drove the bounded recursive metadata snapshot.
+
+### GREEN verification
+
+- The full security selection passed after the session correction, covering
+  loose/packed replacement refs, grafts, gitfiles/external gitdirs,
+  alternates/shared/partial clones, linked Git components, HEAD moves before
+  and during runtime, 0664/0775 mode rejection, commit/tree/blob byte-ID
+  mismatch, aggregate deadline, GPG size/time bounds, and descriptor/process
+  cleanup.
+- `pytest -q tests/test_provisioning_bundle.py` — 156 passed.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_core.py -k 'schema or migration or atomic or idempotent or
+  provisioning or correction'` — 192 passed, 363 deselected.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_roadex_approval_status.py -k 'correction or atomic or binding or
+  replay or rollback or trusted_boundary or locked_chain or concurrent_root'`
+  — 76 passed, 244 deselected.
+- `python3 -m compileall -q src/overseer/provisioning_bundle.py
+  tests/test_provisioning_bundle.py` and `git diff --check` — passed.
+
+Configured disposable cross-repository acceptance was attempted but remains an
+environment prerequisite: `mcp` is not installed and `THEUNDERDARK_PYTHON` and
+`THEUNDERDARK_SOURCE` are unset. The paired command produced 8 prerequisite
+failures, 24 passes, and 5 skips; no source, database, service, gateway,
+approval, dispatch, provisioning, deployment, restart, or push mutation was
+performed.

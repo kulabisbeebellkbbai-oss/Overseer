@@ -90,6 +90,12 @@ _MAX_GIT_BLOB_BYTES = 64 * 1024 * 1024
 _MAX_GIT_RUNTIME_BYTES = 256 * 1024 * 1024
 _MAX_GIT_TREE_ENTRIES = 10_000
 _MAX_GIT_PATH_BYTES = 4096
+_MAX_GIT_METADATA_BYTES = 1024 * 1024
+_MAX_GIT_METADATA_ENTRIES = 100_000
+_MAX_GIT_OPERATION_SECONDS = 10.0
+_MAX_GIT_PROCESS_COUNT = _MAX_GIT_TREE_ENTRIES * 2 + 8
+_MAX_GPG_BYTES = 128 * 1024 * 1024
+_MAX_GPG_READ_SECONDS = 10.0
 
 
 class ProvisioningBundleError(ValueError):
@@ -846,158 +852,549 @@ def _repository_identity(info: os.stat_result) -> tuple[int, int, int, int, int]
     return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid)
 
 
-def _open_production_repository(
-    path: str,
-) -> tuple[int, int, tuple[str, str, tuple[int, int, int, int, int], tuple[int, int, int, int, int]]]:
-    """Open the fixed repository by descriptor without following path symlinks."""
+def _pinned_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int, int, int]:
+    """Identity suitable for stable descriptors without treating atime as content."""
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid, info.st_gid,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _remaining_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise ValueError("authoritative Git read is unavailable")
+    return remaining
+
+
+def _close_owned_git_descriptors(*descriptors: int | None) -> None:
+    """Close every descriptor, then preserve any ordinary or control-flow failure."""
+    ordinary_error: Exception | None = None
+    base_error: BaseException | None = None
+    for descriptor in descriptors:
+        if descriptor is None:
+            continue
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if isinstance(error, Exception):
+                ordinary_error = ordinary_error or error
+            else:
+                base_error = base_error or error
+    if base_error is not None:
+        raise base_error
+    if ordinary_error is not None:
+        raise OSError("authoritative Git descriptor close failed") from ordinary_error
+
+
+def _open_git_directory(parent_fd: int, name: str) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int]]:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    descriptor_info = os.fstat(descriptor)
+    entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(descriptor_info.st_mode)
+        or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
+    ):
+        _close_owned_git_descriptors(descriptor)
+        raise ValueError("authoritative source repository is unavailable")
+    return descriptor, _pinned_identity(descriptor_info)
+
+
+def _open_git_regular(parent_fd: int, name: str) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int]]:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    descriptor_info = os.fstat(descriptor)
+    entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(descriptor_info.st_mode)
+        or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
+    ):
+        _close_owned_git_descriptors(descriptor)
+        raise ValueError("authoritative source repository is unavailable")
+    return descriptor, _pinned_identity(descriptor_info)
+
+
+def _read_pinned_descriptor(descriptor: int, maximum: int) -> bytes:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_size < 0 or info.st_size > maximum:
+        raise ValueError("authoritative source repository is unavailable")
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < info.st_size:
+        chunk = os.pread(descriptor, min(64 * 1024, info.st_size - offset), offset)
+        if not chunk:
+            raise ValueError("authoritative source repository is unavailable")
+        chunks.append(chunk)
+        offset += len(chunk)
+    if _pinned_identity(os.fstat(descriptor)) != _pinned_identity(info):
+        raise ValueError("authoritative source repository is unavailable")
+    return b"".join(chunks)
+
+
+def _snapshot_git_metadata_tree(
+    root_fd: int, prefix: str,
+) -> dict[str, tuple[int, int, int, int, int, int, int, int, int]]:
+    """Pin all object/ref components, rejecting links and unsupported nodes."""
+    snapshot: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {}
+
+    def walk(directory_fd: int, directory_prefix: str) -> None:
+        entries = sorted(os.listdir(f"/proc/self/fd/{directory_fd}"))
+        for name in entries:
+            if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+                raise ValueError("authoritative source repository is unavailable")
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            entry_path = f"{directory_prefix}/{name}"
+            if stat.S_ISLNK(entry.st_mode) or not (stat.S_ISREG(entry.st_mode) or stat.S_ISDIR(entry.st_mode)):
+                raise ValueError("authoritative source repository is unavailable")
+            snapshot[entry_path] = _pinned_identity(entry)
+            if len(snapshot) > _MAX_GIT_METADATA_ENTRIES:
+                raise ValueError("authoritative source repository is unavailable")
+            if stat.S_ISDIR(entry.st_mode):
+                child_fd, child_identity = _open_git_directory(directory_fd, name)
+                try:
+                    if child_identity != snapshot[entry_path]:
+                        raise ValueError("authoritative source repository is unavailable")
+                    walk(child_fd, entry_path)
+                finally:
+                    _close_owned_git_descriptors(child_fd)
+
+    walk(root_fd, prefix)
+    return snapshot
+
+
+def _reject_present_git_entry(parent_fd: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise ValueError("authoritative source repository is unavailable")
+
+
+def _validate_production_git_config(raw_config: bytes) -> None:
+    """Permit ordinary local settings, never source-selection configuration."""
+    try:
+        lines = raw_config.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("authoritative source repository is unavailable") from None
+    section = ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().split(None, 1)[0].lower()
+            if section in {"include", "includeif", "extensions"}:
+                raise ValueError("authoritative source repository is unavailable")
+            continue
+        if "=" not in line:
+            raise ValueError("authoritative source repository is unavailable")
+        key, value = (item.strip().lower() for item in line.split("=", 1))
+        if not key or any(token in key for token in (
+            "promisor", "partial", "alternate", "replace", "graft", "object", "gitdir", "worktree", "commondir",
+        )):
+            raise ValueError("authoritative source repository is unavailable")
+        if section == "core" and key == "repositoryformatversion" and value != "0":
+            raise ValueError("authoritative source repository is unavailable")
+        if section == "core" and key == "bare" and value not in {"false", "0", "no"}:
+            raise ValueError("authoritative source repository is unavailable")
+
+
+def _valid_ref_path(value: str) -> bool:
+    components = value.split("/")
+    return (
+        len(components) >= 3
+        and components[0] == "refs"
+        and all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", component) for component in components[1:])
+    )
+
+
+def _read_packed_ref(raw_packed_refs: bytes, ref_path: str) -> str:
+    try:
+        lines = raw_packed_refs.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("authoritative source repository is unavailable") from None
+    found: str | None = None
+    for line in lines:
+        if not line or line.startswith("#") or line.startswith("^"):
+            continue
+        try:
+            commit, candidate = line.split(" ", 1)
+        except ValueError:
+            raise ValueError("authoritative source repository is unavailable") from None
+        if _COMMIT.fullmatch(commit) is None or not _valid_ref_path(candidate):
+            raise ValueError("authoritative source repository is unavailable")
+        if candidate.startswith("refs/replace/"):
+            raise ValueError("authoritative source repository is unavailable")
+        if candidate == ref_path:
+            if found is not None:
+                raise ValueError("authoritative source repository is unavailable")
+            found = commit
+    if found is None:
+        raise ValueError("authoritative source repository is unavailable")
+    return found
+
+
+def _validate_packed_refs(raw_packed_refs: bytes) -> None:
+    """Reject malformed packed references and every replacement namespace entry."""
+    try:
+        lines = raw_packed_refs.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("authoritative source repository is unavailable") from None
+    for line in lines:
+        if not line or line.startswith("#") or line.startswith("^"):
+            continue
+        try:
+            commit, ref_path = line.split(" ", 1)
+        except ValueError:
+            raise ValueError("authoritative source repository is unavailable") from None
+        if (
+            _COMMIT.fullmatch(commit) is None
+            or not _valid_ref_path(ref_path)
+            or ref_path.startswith("refs/replace/")
+        ):
+            raise ValueError("authoritative source repository is unavailable")
+
+
+def _open_relative_git_ref(
+    refs_fd: int, ref_path: str,
+) -> tuple[int, tuple[int, int, int, int, int, int, int, int, int], bytes]:
+    if not _valid_ref_path(ref_path):
+        raise ValueError("authoritative source repository is unavailable")
+    parent_fd = refs_fd
+    intermediates: list[int] = []
+    descriptor: int | None = None
+    try:
+        for component in ref_path.split("/")[1:-1]:
+            descriptor, _identity = _open_git_directory(parent_fd, component)
+            intermediates.append(descriptor)
+            parent_fd = descriptor
+        descriptor, identity = _open_git_regular(parent_fd, ref_path.rsplit("/", 1)[1])
+        data = _read_pinned_descriptor(descriptor, 256)
+        if not data.endswith(b"\n") or data.count(b"\n") != 1:
+            raise ValueError("authoritative source repository is unavailable")
+        commit = data[:-1].decode("ascii", "strict")
+        if _COMMIT.fullmatch(commit) is None:
+            raise ValueError("authoritative source repository is unavailable")
+        result = descriptor, identity, data
+        descriptor = None
+        return result
+    finally:
+        _close_owned_git_descriptors(*reversed(intermediates), descriptor)
+
+
+def _stat_relative_git_ref(refs_fd: int, ref_path: str) -> os.stat_result:
+    if not _valid_ref_path(ref_path):
+        raise ValueError("authoritative source repository is unavailable")
+    parent_fd = refs_fd
+    intermediates: list[int] = []
+    try:
+        for component in ref_path.split("/")[1:-1]:
+            descriptor, _identity = _open_git_directory(parent_fd, component)
+            intermediates.append(descriptor)
+            parent_fd = descriptor
+        return os.stat(ref_path.rsplit("/", 1)[1], dir_fd=parent_fd, follow_symlinks=False)
+    finally:
+        _close_owned_git_descriptors(*reversed(intermediates))
+
+
+@dataclass
+class _ProductionGitSession:
+    path: str
+    worktree_name: str
+    parent_fd: int
+    worktree_fd: int
+    git_fd: int
+    config_fd: int
+    head_fd: int
+    refs_fd: int
+    objects_fd: int
+    objects_info_fd: int
+    objects_pack_fd: int
+    info_fd: int
+    packed_refs_fd: int | None
+    ref_fd: int | None
+    identities: dict[str, tuple[int, int, int, int, int, int, int, int, int]]
+    metadata_nodes: dict[str, tuple[int, int, int, int, int, int, int, int, int]]
+    config_bytes: bytes
+    head_bytes: bytes
+    packed_refs_bytes: bytes | None
+    ref_path: str | None
+    ref_bytes: bytes | None
+    head_commit: str
+    deadline: float
+    process_count: int = 0
+
+    def close(self) -> None:
+        _close_owned_git_descriptors(
+            self.ref_fd, self.packed_refs_fd, self.info_fd, self.objects_pack_fd,
+            self.objects_info_fd, self.objects_fd, self.refs_fd, self.head_fd,
+            self.config_fd, self.git_fd, self.worktree_fd, self.parent_fd,
+        )
+
+
+def _open_production_repository(path: str) -> _ProductionGitSession:
+    """Pin one non-worktree Git repository session with no indirect object source."""
     if path != ADAPTER_SOURCE_PATH:
         raise ValueError("authoritative source path is fixed")
     candidate = Path(path)
     if not candidate.is_absolute() or candidate.name in {"", ".", ".."}:
         raise ValueError("authoritative source repository is unavailable")
-    parent_fd: int | None = None
-    repository_fd: int | None = None
-    child_fd: int | None = None
+    descriptors: list[int] = []
+    session: _ProductionGitSession | None = None
     try:
         parent_fd = os.open(
             "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
+        descriptors.append(parent_fd)
         for component in candidate.parts[1:-1]:
-            child_fd = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=parent_fd,
-            )
-            os.close(parent_fd)
+            child_fd, _identity = _open_git_directory(parent_fd, component)
+            descriptors.append(child_fd)
+            _close_owned_git_descriptors(parent_fd)
+            descriptors.remove(parent_fd)
             parent_fd = child_fd
-            child_fd = None
-        repository_fd = os.open(
-            candidate.name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_fd,
-        )
-        repository_info = os.fstat(repository_fd)
-        entry_info = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
-        parent_info = os.fstat(parent_fd)
-        if (
-            not stat.S_ISDIR(repository_info.st_mode)
-            or _repository_identity(repository_info) != _repository_identity(entry_info)
-        ):
+        worktree_fd, worktree_identity = _open_git_directory(parent_fd, candidate.name)
+        descriptors.append(worktree_fd)
+        git_fd, git_identity = _open_git_directory(worktree_fd, ".git")
+        descriptors.append(git_fd)
+        config_fd, config_identity = _open_git_regular(git_fd, "config")
+        descriptors.append(config_fd)
+        config_bytes = _read_pinned_descriptor(config_fd, _MAX_GIT_METADATA_BYTES)
+        _validate_production_git_config(config_bytes)
+        head_fd, head_identity = _open_git_regular(git_fd, "HEAD")
+        descriptors.append(head_fd)
+        head_bytes = _read_pinned_descriptor(head_fd, 256)
+        refs_fd, refs_identity = _open_git_directory(git_fd, "refs")
+        descriptors.append(refs_fd)
+        objects_fd, objects_identity = _open_git_directory(git_fd, "objects")
+        descriptors.append(objects_fd)
+        objects_info_fd, objects_info_identity = _open_git_directory(objects_fd, "info")
+        descriptors.append(objects_info_fd)
+        objects_pack_fd, objects_pack_identity = _open_git_directory(objects_fd, "pack")
+        descriptors.append(objects_pack_fd)
+        info_fd, info_identity = _open_git_directory(git_fd, "info")
+        descriptors.append(info_fd)
+        _reject_present_git_entry(info_fd, "grafts")
+        _reject_present_git_entry(objects_info_fd, "alternates")
+        _reject_present_git_entry(objects_info_fd, "http-alternates")
+        _reject_present_git_entry(refs_fd, "replace")
+        metadata_nodes = _snapshot_git_metadata_tree(refs_fd, "refs")
+        metadata_nodes.update(_snapshot_git_metadata_tree(objects_fd, "objects"))
+        packed_refs_fd: int | None = None
+        packed_refs_identity: tuple[int, int, int, int, int, int, int, int, int] | None = None
+        packed_refs_bytes: bytes | None = None
+        try:
+            packed_refs_fd, packed_refs_identity = _open_git_regular(git_fd, "packed-refs")
+            descriptors.append(packed_refs_fd)
+            packed_refs_bytes = _read_pinned_descriptor(packed_refs_fd, _MAX_GIT_METADATA_BYTES)
+            _validate_packed_refs(packed_refs_bytes)
+        except FileNotFoundError:
+            packed_refs_fd = None
+            packed_refs_identity = None
+            packed_refs_bytes = None
+        except ValueError as error:
+            if str(error) == "authoritative source repository is unavailable":
+                raise
+            raise
+        if not head_bytes.endswith(b"\n") or head_bytes.count(b"\n") != 1:
             raise ValueError("authoritative source repository is unavailable")
+        head_value = head_bytes[:-1].decode("ascii", "strict")
+        ref_path: str | None = None
+        ref_fd: int | None = None
+        ref_identity: tuple[int, int, int, int, int, int, int, int, int] | None = None
+        ref_bytes: bytes | None = None
+        if head_value.startswith("ref: "):
+            ref_path = head_value[5:]
+            try:
+                ref_fd, ref_identity, ref_bytes = _open_relative_git_ref(refs_fd, ref_path)
+                descriptors.append(ref_fd)
+                head_commit = ref_bytes[:-1].decode("ascii", "strict")
+            except FileNotFoundError:
+                if packed_refs_bytes is None:
+                    raise ValueError("authoritative source repository is unavailable") from None
+                head_commit = _read_packed_ref(packed_refs_bytes, ref_path)
+        else:
+            head_commit = head_value
+        if _COMMIT.fullmatch(head_commit) is None:
+            raise ValueError("authoritative source repository is unavailable")
+        identities = {
+            "parent": _pinned_identity(os.fstat(parent_fd)),
+            "worktree": worktree_identity,
+            "git": git_identity,
+            "config": config_identity,
+            "head": head_identity,
+            "refs": refs_identity,
+            "objects": objects_identity,
+            "objects_info": objects_info_identity,
+            "objects_pack": objects_pack_identity,
+            "info": info_identity,
+        }
+        if packed_refs_identity is not None:
+            identities["packed_refs"] = packed_refs_identity
+        if ref_identity is not None:
+            identities["ref"] = ref_identity
+        session = _ProductionGitSession(
+            str(candidate), candidate.name, parent_fd, worktree_fd, git_fd, config_fd,
+            head_fd, refs_fd, objects_fd, objects_info_fd, objects_pack_fd, info_fd,
+            packed_refs_fd, ref_fd, identities, metadata_nodes, config_bytes, head_bytes, packed_refs_bytes,
+            ref_path, ref_bytes, head_commit, time.monotonic() + _MAX_GIT_OPERATION_SECONDS,
+        )
+        descriptors.clear()
+        return session
     except Exception:
-        _close_authority_descriptors(repository_fd, child_fd, parent_fd)
+        try:
+            _close_owned_git_descriptors(*reversed(descriptors))
+        except Exception:
+            pass
         raise ValueError("authoritative source repository is unavailable") from None
-    identity = (
-        str(candidate),
-        candidate.name,
-        _repository_identity(repository_info),
-        _repository_identity(parent_info),
-    )
-    return repository_fd, parent_fd, identity
 
 
 def _reopen_production_repository_identity(path: str) -> tuple[int, int, int, int, int]:
-    """Retraverse every absolute path component without following symlinks."""
+    """Retraverse every absolute worktree component without following symlinks."""
     candidate = Path(path)
     current_fd: int | None = None
     child_fd: int | None = None
     result: tuple[int, int, int, int, int] | None = None
-    failed = False
     try:
         current_fd = os.open(
             "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
         for component in candidate.parts[1:]:
-            child_fd = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=current_fd,
-            )
-            os.close(current_fd)
+            child_fd, _identity = _open_git_directory(current_fd, component)
+            _close_owned_git_descriptors(current_fd)
             current_fd = child_fd
             child_fd = None
         result = _repository_identity(os.fstat(current_fd))
-    except Exception:
-        failed = True
     finally:
-        for descriptor in (child_fd, current_fd):
-            if descriptor is None:
-                continue
-            try:
-                os.close(descriptor)
-            except Exception:
-                failed = True
-    if failed or result is None:
+        _close_owned_git_descriptors(child_fd, current_fd)
+    if result is None:
         raise ValueError("authoritative source repository is unavailable")
     return result
 
 
-def _verify_production_repository_identity(
-    repository_fd: int,
-    parent_fd: int,
-    identity: tuple[
-        str,
-        str,
-        tuple[int, int, int, int, int],
-        tuple[int, int, int, int, int],
-    ],
-) -> None:
-    path, name, repository_identity, parent_identity = identity
-    entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if (
-        _repository_identity(os.fstat(repository_fd)) != repository_identity
-        or _repository_identity(entry_info) != repository_identity
-        or _repository_identity(os.fstat(parent_fd)) != parent_identity
-        or _reopen_production_repository_identity(path) != repository_identity
-        or not stat.S_ISDIR(entry_info.st_mode)
-    ):
+def _verify_production_repository_identity(session: _ProductionGitSession) -> None:
+    """Revalidate every pinned worktree, Git metadata, ref, and object-store node."""
+    descriptors = {
+        "parent": session.parent_fd, "worktree": session.worktree_fd, "git": session.git_fd,
+        "config": session.config_fd, "head": session.head_fd, "refs": session.refs_fd,
+        "objects": session.objects_fd, "objects_info": session.objects_info_fd,
+        "objects_pack": session.objects_pack_fd, "info": session.info_fd,
+    }
+    if session.packed_refs_fd is not None:
+        descriptors["packed_refs"] = session.packed_refs_fd
+    if session.ref_fd is not None:
+        descriptors["ref"] = session.ref_fd
+    if any(_pinned_identity(os.fstat(fd)) != session.identities[name] for name, fd in descriptors.items()):
         raise ValueError("authoritative source repository changed during read")
+    checks = (
+        (session.parent_fd, session.worktree_name, "worktree"),
+        (session.worktree_fd, ".git", "git"),
+        (session.git_fd, "config", "config"),
+        (session.git_fd, "HEAD", "head"),
+        (session.git_fd, "refs", "refs"),
+        (session.git_fd, "objects", "objects"),
+        (session.objects_fd, "info", "objects_info"),
+        (session.objects_fd, "pack", "objects_pack"),
+        (session.git_fd, "info", "info"),
+    )
+    for parent_fd, name, identity_name in checks:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _pinned_identity(entry) != session.identities[identity_name]:
+            raise ValueError("authoritative source repository changed during read")
+    if session.packed_refs_fd is not None:
+        entry = os.stat("packed-refs", dir_fd=session.git_fd, follow_symlinks=False)
+        if _pinned_identity(entry) != session.identities["packed_refs"]:
+            raise ValueError("authoritative source repository changed during read")
+    if session.ref_fd is not None and session.ref_path is not None:
+        if _pinned_identity(_stat_relative_git_ref(session.refs_fd, session.ref_path)) != session.identities["ref"]:
+            raise ValueError("authoritative source repository changed during read")
+    if _reopen_production_repository_identity(session.path) != _repository_identity(os.fstat(session.worktree_fd)):
+        raise ValueError("authoritative source repository changed during read")
+    _reject_present_git_entry(session.info_fd, "grafts")
+    _reject_present_git_entry(session.objects_info_fd, "alternates")
+    _reject_present_git_entry(session.objects_info_fd, "http-alternates")
+    _reject_present_git_entry(session.refs_fd, "replace")
+    current_metadata_nodes = _snapshot_git_metadata_tree(session.refs_fd, "refs")
+    current_metadata_nodes.update(_snapshot_git_metadata_tree(session.objects_fd, "objects"))
+    if current_metadata_nodes != session.metadata_nodes:
+        raise ValueError("authoritative source repository changed during read")
+    if _read_pinned_descriptor(session.config_fd, _MAX_GIT_METADATA_BYTES) != session.config_bytes:
+        raise ValueError("authoritative source repository changed during read")
+    _validate_production_git_config(session.config_bytes)
+    if _read_pinned_descriptor(session.head_fd, 256) != session.head_bytes:
+        raise ValueError("authoritative source repository changed during read")
+    if session.packed_refs_fd is not None:
+        current_packed_refs = _read_pinned_descriptor(session.packed_refs_fd, _MAX_GIT_METADATA_BYTES)
+        if current_packed_refs != session.packed_refs_bytes:
+            raise ValueError("authoritative source repository changed during read")
+        _validate_packed_refs(current_packed_refs)
+    if session.ref_fd is not None and session.ref_bytes is not None:
+        if _read_pinned_descriptor(session.ref_fd, 256) != session.ref_bytes:
+            raise ValueError("authoritative source repository changed during read")
 
 
-def _git_stdout(repository_fd: int, arguments: tuple[str, ...], limit: int) -> bytes:
-    """Read one Git result through the pinned directory with a strict byte cap."""
+def _unsafe_ambient_git_environment() -> bool:
+    protected = {
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS",
+    }
+    return any(key in protected or key.startswith("GIT_CONFIG_") for key in os.environ)
+
+
+def _git_stdout(session: _ProductionGitSession, arguments: tuple[str, ...], limit: int) -> bytes:
+    """Read one bounded Git result under the session's single monotonic deadline."""
     if (
-        type(repository_fd) is not int
+        not isinstance(session, _ProductionGitSession)
         or not isinstance(arguments, tuple)
         or not arguments
         or any(type(argument) is not str or not argument for argument in arguments)
         or type(limit) is not int
         or limit <= 0
+        or _unsafe_ambient_git_environment()
+        or session.process_count >= _MAX_GIT_PROCESS_COUNT
     ):
         raise ValueError("authoritative Git read is unavailable")
     process: subprocess.Popen[bytes] | None = None
     output = b""
     failed = False
+    session.process_count += 1
     try:
-        environment = {
-            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
-        }
+        _remaining_deadline(session.deadline)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         environment.update({
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
         })
         process = subprocess.Popen(
-            ("/usr/bin/git", "-C", f"/proc/self/fd/{repository_fd}", *arguments),
+            (
+                "/usr/bin/git", "--no-replace-objects", f"--git-dir=/proc/self/fd/{session.git_fd}",
+                *arguments,
+            ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            pass_fds=(repository_fd,),
+            pass_fds=(session.git_fd,),
             env=environment,
         )
         if process.stdout is None:
             raise ValueError("authoritative Git read is unavailable")
         chunks: list[bytes] = []
         total = 0
-        deadline = time.monotonic() + 10
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ValueError("authoritative Git read is unavailable")
-                if not selector.select(remaining):
+                if not selector.select(_remaining_deadline(session.deadline)):
                     raise ValueError("authoritative Git read is unavailable")
                 chunk = os.read(process.stdout.fileno(), min(64 * 1024, limit + 1 - total))
                 if not chunk:
@@ -1007,7 +1404,7 @@ def _git_stdout(repository_fd: int, arguments: tuple[str, ...], limit: int) -> b
                 if total > limit:
                     raise ValueError("authoritative Git read is unavailable")
         output = b"".join(chunks)
-        if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+        if process.wait(timeout=_remaining_deadline(session.deadline)) != 0:
             raise ValueError("authoritative Git read is unavailable")
     except Exception:
         failed = True
@@ -1016,7 +1413,7 @@ def _git_stdout(repository_fd: int, arguments: tuple[str, ...], limit: int) -> b
             try:
                 if process.poll() is None:
                     process.kill()
-                process.wait(timeout=10)
+                process.wait(timeout=1)
                 if process.stdout is not None:
                     process.stdout.close()
             except Exception:
@@ -1026,44 +1423,159 @@ def _git_stdout(repository_fd: int, arguments: tuple[str, ...], limit: int) -> b
     return output
 
 
-def _read_production_revision(repository_fd: int, revision: str) -> str:
-    if revision != "HEAD" and _COMMIT.fullmatch(revision) is None:
-        raise ValueError("authoritative Git revision is unavailable")
-    resolved = _git_stdout(
-        repository_fd,
-        ("rev-parse", "--verify", f"{revision}^{{commit}}"),
-        64,
-    )
+def _git_object_id(object_type: str, content: bytes) -> str:
+    return hashlib.sha1(
+        object_type.encode("ascii") + b" " + str(len(content)).encode("ascii") + b"\0" + content,
+    ).hexdigest()
+
+
+def _read_git_object(
+    session: _ProductionGitSession, object_type: str, object_id: str, limit: int,
+) -> bytes:
+    if object_type not in {"commit", "tree", "blob"} or _COMMIT.fullmatch(object_id) is None:
+        raise ValueError("authoritative runtime tree is malformed")
+    content = _git_stdout(session, ("cat-file", object_type, object_id), limit)
+    if len(content) > limit or _git_object_id(object_type, content) != object_id:
+        raise ValueError("authoritative runtime tree is malformed")
+    return content
+
+
+def _commit_tree_id(content: bytes) -> str:
+    header, separator, _message = content.partition(b"\n\n")
+    if not separator:
+        raise ValueError("authoritative runtime tree is malformed")
+    tree_ids = [line[5:] for line in header.split(b"\n") if line.startswith(b"tree ")]
+    if len(tree_ids) != 1:
+        raise ValueError("authoritative runtime tree is malformed")
     try:
-        decoded = resolved.decode("ascii")
+        tree_id = tree_ids[0].decode("ascii", "strict")
     except UnicodeDecodeError:
-        raise ValueError("authoritative Git revision is unavailable") from None
-    if not decoded.endswith("\n") or decoded.count("\n") != 1:
-        raise ValueError("authoritative Git revision is unavailable")
-    commit = decoded[:-1]
-    if _COMMIT.fullmatch(commit) is None or (revision != "HEAD" and commit != revision):
-        raise ValueError("authoritative Git revision is unavailable")
-    return commit
+        raise ValueError("authoritative runtime tree is malformed") from None
+    if _COMMIT.fullmatch(tree_id) is None:
+        raise ValueError("authoritative runtime tree is malformed")
+    return tree_id
 
 
-def _with_production_repository(path: str, reader: Callable[[int], str], label: str) -> str:
-    repository_fd: int | None = None
-    parent_fd: int | None = None
+def _tree_entries(content: bytes) -> list[tuple[bytes, bytes, str]]:
+    entries: list[tuple[bytes, bytes, str]] = []
+    offset = 0
+    while offset < len(content):
+        separator = content.find(b" ", offset)
+        terminator = content.find(b"\0", separator + 1)
+        if separator <= offset or terminator < 0 or terminator + 21 > len(content):
+            raise ValueError("authoritative runtime tree is malformed")
+        mode = content[offset:separator]
+        encoded_name = content[separator + 1:terminator]
+        object_id = content[terminator + 1:terminator + 21].hex()
+        if not encoded_name or b"/" in encoded_name:
+            raise ValueError("authoritative runtime tree is malformed")
+        entries.append((mode, encoded_name, object_id))
+        offset = terminator + 21
+    if offset != len(content):
+        raise ValueError("authoritative runtime tree is malformed")
+    return entries
+
+
+def _verify_live_runtime_entry(session: _ProductionGitSession, path: str, mode: int) -> None:
+    components = path.split("/")
+    if not path or any(component in {"", ".", ".."} for component in components):
+        raise ValueError("authoritative runtime tree is malformed")
+    parent_fd = session.worktree_fd
+    intermediates: list[int] = []
+    descriptor: int | None = None
+    try:
+        for component in components[:-1]:
+            descriptor, _identity = _open_git_directory(parent_fd, component)
+            intermediates.append(descriptor)
+            parent_fd = descriptor
+        descriptor, _identity = _open_git_regular(parent_fd, components[-1])
+        descriptor_info = os.fstat(descriptor)
+        entry_info = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(descriptor_info.st_mode)
+            or _pinned_identity(descriptor_info) != _pinned_identity(entry_info)
+            or stat.S_IMODE(descriptor_info.st_mode) != mode
+        ):
+            raise ValueError("authoritative runtime tree is malformed")
+    finally:
+        _close_owned_git_descriptors(descriptor, *reversed(intermediates))
+
+
+def _runtime_tree_records(session: _ProductionGitSession, commit: str) -> list[dict[str, object]]:
+    if _COMMIT.fullmatch(commit) is None:
+        raise ValueError("authoritative runtime tree is malformed")
+    tree_id = _commit_tree_id(_read_git_object(session, "commit", commit, _MAX_GIT_METADATA_BYTES))
+    files: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    seen_trees: set[str] = set()
+    total_blob_bytes = 0
+
+    def walk(current_tree_id: str, prefix: str) -> None:
+        nonlocal total_blob_bytes
+        if current_tree_id in seen_trees:
+            raise ValueError("authoritative runtime tree is malformed")
+        seen_trees.add(current_tree_id)
+        tree = _read_git_object(session, "tree", current_tree_id, _MAX_GIT_TREE_BYTES)
+        for raw_mode, encoded_name, object_id in _tree_entries(tree):
+            try:
+                name = encoded_name.decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                raise ValueError("authoritative runtime tree is malformed") from None
+            path = f"{prefix}/{name}" if prefix else name
+            components = path.split("/")
+            if (
+                len(encoded_name) > _MAX_GIT_PATH_BYTES
+                or len(path.encode("utf-8")) > _MAX_GIT_PATH_BYTES
+                or any(component in {"", ".", ".."} for component in components)
+            ):
+                raise ValueError("authoritative runtime tree is malformed")
+            if any(component in RUNTIME_EXCLUDED for component in components):
+                continue
+            if raw_mode == b"40000":
+                walk(object_id, path)
+                continue
+            if raw_mode not in {b"100644", b"100755"} or path in seen_paths:
+                raise ValueError("authoritative runtime tree contains unsupported entries")
+            seen_paths.add(path)
+            if len(seen_paths) > _MAX_GIT_TREE_ENTRIES:
+                raise ValueError("authoritative runtime tree is oversized")
+            blob = _read_git_object(session, "blob", object_id, _MAX_GIT_BLOB_BYTES)
+            total_blob_bytes += len(blob)
+            if total_blob_bytes > _MAX_GIT_RUNTIME_BYTES:
+                raise ValueError("authoritative runtime tree is oversized")
+            files.append({
+                "path": path,
+                "mode": 0o644 if raw_mode == b"100644" else 0o755,
+                "sha256": "sha256:" + hashlib.sha256(blob).hexdigest(),
+            })
+
+    walk(tree_id, "")
+    files.sort(key=lambda item: str(item["path"]))
+    for item in files:
+        _verify_live_runtime_entry(session, str(item["path"]), int(item["mode"]))
+    _verify_production_repository_identity(session)
+    for item in files:
+        _verify_live_runtime_entry(session, str(item["path"]), int(item["mode"]))
+    return files
+
+
+def _with_production_repository(
+    path: str, reader: Callable[[_ProductionGitSession], str], label: str,
+) -> str:
+    session: _ProductionGitSession | None = None
     value: str | None = None
     failed = False
     try:
-        repository_fd, parent_fd, identity = _open_production_repository(path)
-        _verify_production_repository_identity(repository_fd, parent_fd, identity)
-        value = reader(repository_fd)
-        _verify_production_repository_identity(repository_fd, parent_fd, identity)
+        session = _open_production_repository(path)
+        _verify_production_repository_identity(session)
+        value = reader(session)
+        _verify_production_repository_identity(session)
     except Exception:
         failed = True
     finally:
-        for descriptor in (repository_fd, parent_fd):
-            if descriptor is None:
-                continue
+        if session is not None:
             try:
-                os.close(descriptor)
+                session.close()
             except Exception:
                 failed = True
     if failed or value is None:
@@ -1072,93 +1584,36 @@ def _with_production_repository(path: str, reader: Callable[[int], str], label: 
 
 
 def _production_source_head(path: str) -> str:
-    """Resolve HEAD from the exact reviewed repository descriptor."""
+    """Resolve and authenticate HEAD from the exact pinned repository session."""
     if path != ADAPTER_SOURCE_PATH:
         raise ValueError("authoritative source path is fixed")
-    return _with_production_repository(
-        path,
-        lambda repository_fd: _read_production_revision(repository_fd, "HEAD"),
-        "authoritative source revision",
-    )
 
+    def reader(session: _ProductionGitSession) -> str:
+        _read_git_object(session, "commit", session.head_commit, _MAX_GIT_METADATA_BYTES)
+        return session.head_commit
 
-def _runtime_tree_records(repository_fd: int, commit: str) -> list[dict[str, object]]:
-    resolved = _read_production_revision(repository_fd, commit)
-    tree = _git_stdout(
-        repository_fd,
-        ("ls-tree", "-rz", "--full-tree", resolved),
-        _MAX_GIT_TREE_BYTES,
-    )
-    if len(tree) > _MAX_GIT_TREE_BYTES:
-        raise ValueError("authoritative runtime tree is oversized")
-    if tree and not tree.endswith(b"\0"):
-        raise ValueError("authoritative runtime tree is malformed")
-    raw_records = tree[:-1].split(b"\0") if tree else []
-    if len(raw_records) > _MAX_GIT_TREE_ENTRIES:
-        raise ValueError("authoritative runtime tree is malformed")
-    files: list[dict[str, object]] = []
-    seen: set[str] = set()
-    total_blob_bytes = 0
-    for raw_record in raw_records:
-        try:
-            metadata, encoded_path = raw_record.split(b"\t", 1)
-            mode, object_type, object_id = metadata.split(b" ", 2)
-            path = encoded_path.decode("utf-8", "strict")
-        except (UnicodeDecodeError, ValueError):
-            raise ValueError("authoritative runtime tree is malformed") from None
-        components = path.split("/")
-        if (
-            not path
-            or len(encoded_path) > _MAX_GIT_PATH_BYTES
-            or path.startswith("/")
-            or any(component in {"", ".", ".."} for component in components)
-            or path in seen
-        ):
-            raise ValueError("authoritative runtime tree is malformed")
-        seen.add(path)
-        if any(component in RUNTIME_EXCLUDED for component in components):
-            continue
-        if (
-            mode not in {b"100644", b"100755"}
-            or object_type != b"blob"
-            or re.fullmatch(rb"[0-9a-f]{40}", object_id) is None
-        ):
-            raise ValueError("authoritative runtime tree contains unsupported entries")
-        blob = _git_stdout(
-            repository_fd,
-            ("cat-file", "blob", object_id.decode("ascii")),
-            _MAX_GIT_BLOB_BYTES,
-        )
-        if len(blob) > _MAX_GIT_BLOB_BYTES:
-            raise ValueError("authoritative runtime tree is oversized")
-        total_blob_bytes += len(blob)
-        if total_blob_bytes > _MAX_GIT_RUNTIME_BYTES:
-            raise ValueError("authoritative runtime tree is oversized")
-        files.append({
-            "path": path,
-            "mode": 0o644 if mode == b"100644" else 0o755,
-            "sha256": "sha256:" + hashlib.sha256(blob).hexdigest(),
-        })
-    files.sort(key=lambda item: str(item["path"]))
-    return files
+    return _with_production_repository(path, reader, "authoritative source revision")
 
 
 def _production_runtime_digest(path: str, commit: str) -> str:
-    """Digest immutable blobs from the named Git object tree, never worktree bytes."""
+    """Digest a named immutable tree only while the pinned checkout remains at it."""
+    if path != ADAPTER_SOURCE_PATH or _COMMIT.fullmatch(commit) is None:
+        raise ValueError("authoritative runtime tree is unavailable")
+
+    def reader(session: _ProductionGitSession) -> str:
+        if session.head_commit != commit:
+            raise ValueError("authoritative runtime tree is unavailable")
+        files = _runtime_tree_records(session, commit)
+        _verify_production_repository_identity(session)
+        if session.head_commit != commit:
+            raise ValueError("authoritative runtime tree is unavailable")
+        return "sha256:" + hashlib.sha256(json.dumps(
+            {"version": 1, "commit": commit, "files": files},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+
     try:
-        return _with_production_repository(
-            path,
-            lambda repository_fd: "sha256:" + hashlib.sha256(json.dumps(
-                {
-                    "version": 1,
-                    "commit": commit,
-                    "files": _runtime_tree_records(repository_fd, commit),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()).hexdigest(),
-            "authoritative runtime tree",
-        )
+        return _with_production_repository(path, reader, "authoritative runtime tree")
     except Exception:
         raise ValueError("authoritative runtime tree is unavailable") from None
 
@@ -1182,17 +1637,21 @@ def _production_file_digest(path: str) -> str:
         entry_before = os.stat(GPG_PATH, follow_symlinks=False)
         if (
             not stat.S_ISREG(before.st_mode)
+            or before.st_size > _MAX_GPG_BYTES
             or _exact_file_metadata(before) != _exact_file_metadata(entry_before)
         ):
             raise ValueError("authoritative GPG executable is unavailable")
         digest = hashlib.sha256()
         offset = 0
+        deadline = time.monotonic() + _MAX_GPG_READ_SECONDS
         while offset < before.st_size:
+            _remaining_deadline(deadline)
             chunk = os.pread(descriptor, min(1024 * 1024, before.st_size - offset), offset)
             if not chunk:
                 raise ValueError("authoritative GPG executable is unavailable")
             digest.update(chunk)
             offset += len(chunk)
+        _remaining_deadline(deadline)
         after = os.fstat(descriptor)
         entry_after = os.stat(GPG_PATH, follow_symlinks=False)
         if (

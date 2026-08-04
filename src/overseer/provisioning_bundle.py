@@ -272,7 +272,7 @@ def _require_authority_schema(connection: sqlite3.Connection) -> None:
             or type(schema_rows[0][0]) is not str
             or " ".join(schema_rows[0][0].split()) != " ".join(canonical_sql.split())
             or connection.execute(
-                "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name=? LIMIT 1",
+                "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1",
                 (table,),
             ).fetchone() is not None
         ):

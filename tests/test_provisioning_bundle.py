@@ -927,6 +927,39 @@ def test_default_authority_resolution_rejects_noncanonical_schema_clauses(tmp_pa
     assert "CHECK(length" not in repr(report)
 
 
+@pytest.mark.parametrize(
+    ("table", "trigger_target"),
+    (
+        ("storage_root_authorizations", "STORAGE_ROOT_AUTHORIZATIONS"),
+        ("approvals", "ApPrOvAlS"),
+        ("crew_messages", "CrEw_MeSsAgEs"),
+        ("storage_authorization_revocations", "StOrAgE_AuThOrIzAtIoN_ReVoCaTiOnS"),
+    ),
+)
+def test_default_authority_resolution_rejects_case_variant_authority_triggers(tmp_path, table, trigger_target):
+    store_path = seeded_authority_store(tmp_path)
+    trigger_name = f"private_schema_trigger_{table}"
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(
+            f"CREATE TRIGGER {trigger_name} AFTER INSERT ON {trigger_target} BEGIN SELECT 1; END"
+        )
+        stored_target = connection.execute(
+            "SELECT tbl_name FROM sqlite_schema WHERE type='trigger' AND name=?",
+            (trigger_name,),
+        ).fetchone()[0]
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert stored_target == trigger_target
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert trigger_name not in repr(report)
+    assert "CREATE TRIGGER" not in repr(report)
+
+
 @pytest.mark.parametrize("payload_kind", ("blob", "duplicate-key"))
 def test_default_authority_resolution_rejects_noncanonical_physical_payloads(tmp_path, payload_kind):
     store_path = seeded_authority_store(tmp_path)

@@ -67,6 +67,7 @@ provisioning, or protected-host operation was performed during this task.
 
 - `src/overseer/provisioning_bundle.py`
 - `src/overseer/cli.py`
+- `src/overseer/crew.py` (shared deterministic dispatch-audit ID helper)
 - `src/overseer/api.py`
 - `src/overseer/backup_provisioning_cli.py`
 - `src/overseer/store.py` (bounded exact-ID outbox/audit loaders)

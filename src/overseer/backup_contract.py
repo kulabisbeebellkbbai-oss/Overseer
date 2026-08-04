@@ -219,6 +219,10 @@ def _validate_tool_parameters(value: object, tool_name: str, label: str) -> None
         elif name == "encryption_profile":
             if parameter != BACKUP_ENCRYPTION_PROFILE:
                 raise ValueError(f"{label}.encryption profile must match BACKUP_ENCRYPTION_PROFILE")
+        elif name == "artifact_id":
+            artifact_id = _string(parameter, f"{label}.artifact_id")
+            if not artifact_id.startswith("backup-"):
+                raise ValueError(f"{label}.artifact_id must start with backup-")
         elif name.endswith("digest"):
             _digest(parameter, f"{label}.{name}")
         else:

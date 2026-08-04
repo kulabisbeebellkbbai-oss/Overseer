@@ -138,6 +138,16 @@ def test_provisioning_contract_rejects_inexact_numeric_and_encryption_values(tmp
         load_provisioning_contract(path)
 
 
+def test_provisioning_contract_rejects_restore_artifact_without_backup_prefix(tmp_path):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["acceptance_requests"]["backup_verify_restore"]["parameters"]["artifact_id"] = "artifact-contract-v1"
+    path = tmp_path / "invalid-restore-artifact.json"
+    path.write_bytes(canonical_contract_bytes(raw))
+
+    with pytest.raises(ValueError, match="artifact_id must start with backup-"):
+        load_provisioning_contract(path)
+
+
 @pytest.mark.parametrize(
     ("request_name", "action"),
     (("backup_create", "backup.create"), ("backup_verify_restore", "backup.verify_restore")),

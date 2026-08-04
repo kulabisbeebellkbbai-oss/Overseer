@@ -231,6 +231,30 @@ def authoritative_bundle_fixture(
     return store_path, bundle
 
 
+def expected_preview_digests(bundle: ProvisioningBundleV1):
+    return provisioning_bundle_module.ProvisioningPreviewDigests(
+        plan_digest=bundle.plan.plan_digest,
+        preflight_digest=bundle.preflight.report_digest,
+        bundle_digest=bundle.bundle_digest,
+    )
+
+
+def stage_expected_bundle(
+    store_path: str,
+    bundle: ProvisioningBundleV1,
+    dependencies: PreflightDependencies | None = None,
+):
+    authoritative_dependencies = dependencies or deterministic_dependencies(
+        source_head=bundle.intent.source_commit,
+    )
+    return provisioning_bundle_module.stage_authoritative_bundle(
+        store_path,
+        bundle.intent,
+        authoritative_dependencies,
+        expected_preview_digests(bundle),
+    )
+
+
 def persisted_bundle_rows(store_path: str, plan_id: str) -> dict[str, int]:
     """Count only Task 3 records, excluding the prerequisite root evidence."""
     tables = {
@@ -296,14 +320,198 @@ def test_atomic_stage_rolls_back_every_source_binding_bundle_boundary(tmp_path, 
         with monkeypatch.context() as scoped:
             scoped.setattr(SQLiteStore, method_name, fail_boundary, raising=False)
             with pytest.raises(RuntimeError, match=f"injected {method_name} failure"):
-                provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+                stage_expected_bundle(store_path, bundle)
         assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == expected
+
+
+def test_correction_silently_omitted_fourth_outbox_rolls_back_every_record(tmp_path, monkeypatch):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    original = SQLiteStore.save_provisioning_review_outbox
+    calls = {"count": 0}
+
+    def omit_fourth(self, *arguments, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 4:
+            return None
+        return original(self, *arguments, **kwargs)
+
+    monkeypatch.setattr(SQLiteStore, "save_provisioning_review_outbox", omit_fourth)
+
+    with pytest.raises(ValueError, match="outbox"):
+        stage_expected_bundle(store_path, bundle)
+
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
+
+
+@pytest.mark.parametrize("replay", (False, True))
+def test_correction_locked_root_recheck_rejects_revocation_after_outer_recheck(
+    tmp_path, monkeypatch, replay,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    if replay:
+        stage_expected_bundle(store_path, bundle)
+        before = persisted_bundle_rows(store_path, bundle.plan.plan_id)
+    else:
+        before = {
+            "plans": 0, "bindings": 0, "reports": 0,
+            "bundles": 0, "outbox": 0, "crew": 0,
+        }
+    original_init = SQLiteStore.__init__
+    injected = {"done": False}
+
+    def init_then_revoke(self, path):
+        original_init(self, path)
+        if not injected["done"] and str(self.path) == store_path:
+            self._connection.execute(
+                "INSERT INTO storage_authorization_revocations "
+                "(id, kind, authorization_ref, revoked_by, revoked_at, evidence_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "revoke.root-auth.current",
+                    "root",
+                    "root-auth.current",
+                    "human",
+                    datetime.now(UTC).isoformat(),
+                    "crew.kira.root-review",
+                ),
+            )
+            self._commit()
+            injected["done"] = True
+
+    monkeypatch.setattr(SQLiteStore, "__init__", init_then_revoke)
+
+    with pytest.raises(ValueError, match="STALE_PREVIEW"):
+        stage_expected_bundle(store_path, bundle)
+
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == before
+
+
+def test_correction_typed_stage_rebuilds_and_rejects_source_head_drift(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    intent = intent_fixture()
+    authoritative = {"source_head": intent.source_commit}
+    dependencies = deterministic_dependencies()
+    dependencies = replace(
+        dependencies,
+        source_head=lambda _path: authoritative["source_head"],
+    )
+    preview = build_provisioning_bundle(store_path, intent, dependencies)
+    expected = expected_preview_digests(preview)
+
+    first = provisioning_bundle_module.stage_authoritative_bundle(
+        store_path,
+        intent,
+        dependencies,
+        expected,
+    )
+    before = persisted_bundle_rows(store_path, intent.plan_id)
+    authoritative["source_head"] = "c" * 40
+
+    with pytest.raises(ProvisioningBundleError, match="PREFLIGHT_FAILED"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            intent,
+            dependencies,
+            expected,
+        )
+
+    assert first["mutation_performed"] is True
+    assert persisted_bundle_rows(store_path, intent.plan_id) == before
+
+
+def test_correction_typed_stage_rejects_invalid_preview_and_forbidden_caller_fields(tmp_path):
+    store_path, preview = authoritative_bundle_fixture(tmp_path)
+    dependencies = deterministic_dependencies(source_head=preview.intent.source_commit)
+    expected = expected_preview_digests(preview)
+    empty = {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
+
+    with pytest.raises(TypeError):
+        provisioning_bundle_module.ProvisioningPreviewDigests(
+            plan_digest=preview.plan.plan_digest,
+            preflight_digest=preview.preflight.report_digest,
+        )
+    with pytest.raises(ValueError, match="preview digest"):
+        provisioning_bundle_module.ProvisioningPreviewDigests(
+            plan_digest="not-a-digest",
+            preflight_digest=preview.preflight.report_digest,
+            bundle_digest=preview.bundle_digest,
+        )
+    with pytest.raises(TypeError):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            preview.intent,
+            dependencies,
+        )
+    with pytest.raises(ValueError, match="expected preview"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            preview.intent,
+            dependencies,
+            {
+                "plan_digest": preview.plan.plan_digest,
+                "preflight_digest": preview.preflight.report_digest,
+                "bundle_digest": preview.bundle_digest,
+                "authorization_ref": "root-auth.current",
+            },
+        )
+    with pytest.raises(ValueError, match="typed provisioning intent"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            {**intent_payload(), "authorization_ref": "root-auth.current"},
+            dependencies,
+            expected,
+        )
+    with pytest.raises(ValueError, match="PREVIEW_MISMATCH"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            preview.intent,
+            dependencies,
+            replace(expected, bundle_digest="sha256:" + "f" * 64),
+        )
+
+    assert persisted_bundle_rows(store_path, preview.plan.plan_id) == empty
+
+
+def test_correction_typed_stage_rejects_extra_attributes_on_typed_inputs(tmp_path):
+    store_path, preview = authoritative_bundle_fixture(tmp_path)
+    dependencies = deterministic_dependencies(source_head=preview.intent.source_commit)
+    expected = expected_preview_digests(preview)
+    tainted_intent = replace(preview.intent)
+    object.__setattr__(tainted_intent, "approval_ref", "root-auth.current")
+    tainted_expected = replace(expected)
+    object.__setattr__(tainted_expected, "evidence_ids", ("sha256:" + "a" * 64,))
+
+    with pytest.raises(ValueError, match="typed provisioning intent"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            tainted_intent,
+            dependencies,
+            expected,
+        )
+    with pytest.raises(ValueError, match="expected preview"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            preview.intent,
+            dependencies,
+            tainted_expected,
+        )
+
+    assert persisted_bundle_rows(store_path, preview.plan.plan_id) == {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
 
 
 def test_atomic_stage_is_exactly_idempotent_and_does_not_reenter_source_callback(tmp_path, monkeypatch):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
 
-    first = provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    first = stage_expected_bundle(store_path, bundle)
 
     def fail_source_reentry(*_arguments, **_kwargs):
         pytest.fail("exact persisted replay must not re-enter source persistence")
@@ -314,7 +522,7 @@ def test_atomic_stage_is_exactly_idempotent_and_does_not_reenter_source_callback
         fail_source_reentry,
         raising=False,
     )
-    second = provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    second = stage_expected_bundle(store_path, bundle)
 
     assert first["mutation_performed"] is True
     assert second["mutation_performed"] is False
@@ -326,7 +534,7 @@ def test_atomic_stage_is_exactly_idempotent_and_does_not_reenter_source_callback
 
 def test_atomic_stage_rejects_changed_replay_without_mutating_bound_source(tmp_path):
     store_path, original = authoritative_bundle_fixture(tmp_path)
-    provisioning_bundle_module.stage_authoritative_bundle(store_path, original)
+    stage_expected_bundle(store_path, original)
     changed = build_provisioning_bundle(
         store_path,
         intent_fixture(source_commit="c" * 40),
@@ -342,7 +550,7 @@ def test_atomic_stage_rejects_changed_replay_without_mutating_bound_source(tmp_p
         )
 
     with pytest.raises(ValueError, match="immutable"):
-        provisioning_bundle_module.stage_authoritative_bundle(store_path, changed)
+        stage_expected_bundle(store_path, changed)
 
     with SQLiteStore(store_path) as store:
         assert store.load_registered_source_payload(
@@ -356,7 +564,7 @@ def test_atomic_stage_rejects_changed_replay_without_mutating_bound_source(tmp_p
 
 def test_atomic_stage_rejects_partial_replay_without_reconstruction(tmp_path):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
-    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    stage_expected_bundle(store_path, bundle)
     with SQLiteStore(store_path) as store:
         store._connection.execute(
             "DELETE FROM provisioning_preflight_reports WHERE plan_id=?",
@@ -365,7 +573,7 @@ def test_atomic_stage_rejects_partial_replay_without_reconstruction(tmp_path):
         store._commit_agent_mutation()
 
     with pytest.raises(ValueError, match="immutable"):
-        provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+        stage_expected_bundle(store_path, bundle)
 
     assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
         "plans": 1, "bindings": 1, "reports": 0,
@@ -377,8 +585,8 @@ def test_atomic_stage_rechecks_current_root_and_rejects_drift_without_writes(tmp
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
     revoke_authorization(store_path, "root-auth.current", "human", "crew.kira.root-review")
 
-    with pytest.raises(ValueError, match="STALE_PREVIEW"):
-        provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    with pytest.raises(ProvisioningBundleError, match="PREFLIGHT_FAILED"):
+        stage_expected_bundle(store_path, bundle)
 
     assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
         "plans": 0, "bindings": 0, "reports": 0,
@@ -388,7 +596,7 @@ def test_atomic_stage_rechecks_current_root_and_rejects_drift_without_writes(tmp
 
 def test_persisted_bundle_load_requires_exact_serialized_bytes_and_digests(tmp_path):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
-    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    stage_expected_bundle(store_path, bundle)
 
     with SQLiteStore(store_path) as store:
         loaded = provisioning_bundle_module.load_provisioning_bundle(
@@ -408,7 +616,7 @@ def test_persisted_bundle_load_requires_exact_serialized_bytes_and_digests(tmp_p
 
 def test_persisted_bundle_rejects_tampered_indexed_digest_metadata(tmp_path):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
-    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    stage_expected_bundle(store_path, bundle)
     with SQLiteStore(store_path) as store:
         store._connection.execute(
             "UPDATE provisioning_bundles SET bundle_digest=? WHERE plan_id=?",
@@ -421,7 +629,7 @@ def test_persisted_bundle_rejects_tampered_indexed_digest_metadata(tmp_path):
 
 def test_atomic_stage_replay_rejects_tampered_preflight_digest_metadata(tmp_path):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
-    provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+    stage_expected_bundle(store_path, bundle)
     with SQLiteStore(store_path) as store:
         store._connection.execute(
             "UPDATE provisioning_preflight_reports SET report_digest=? WHERE plan_id=?",
@@ -430,7 +638,7 @@ def test_atomic_stage_replay_rejects_tampered_preflight_digest_metadata(tmp_path
         store._commit_agent_mutation()
 
     with pytest.raises(ValueError, match="digest"):
-        provisioning_bundle_module.stage_authoritative_bundle(store_path, bundle)
+        stage_expected_bundle(store_path, bundle)
 
 
 def test_canonical_root_target_digest_is_versioned_and_deterministic():

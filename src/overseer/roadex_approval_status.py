@@ -358,24 +358,35 @@ def stage_bound_roadex_approval(
     save_source: Callable[[], None],
     *,
     registry=PRODUCTION_APPROVAL_SOURCE_REGISTRY,
+    validate_locked: Callable[[], None] | None = None,
+    verify_bound: Callable[[RoadexApprovalBinding], None] | None = None,
 ) -> RoadexApprovalBinding:
     adapter = _validate_approval_binding_draft(draft, registry=registry)
+    if validate_locked is not None and not callable(validate_locked):
+        raise ValueError("locked binding validator must be callable")
+    if verify_bound is not None and not callable(verify_bound):
+        raise ValueError("bound approval verifier must be callable")
     with store.agent_transaction():
+        if validate_locked is not None:
+            validate_locked()
         existing = _load_existing_binding(store, draft.approval_ref)
         if existing is not None:
             source = load_source_from_draft(store, draft, registry=registry)
             _validate_replayed_binding(existing, draft, source, adapter=adapter)
-            return existing
+            binding = existing
+        else:
+            if _source_exists_for_draft(store, draft, registry=registry):
+                raise ValueError("preexisting source cannot be bound")
 
-        if _source_exists_for_draft(store, draft, registry=registry):
-            raise ValueError("preexisting source cannot be bound")
-
-        save_source()
-        source = load_source_from_draft(store, draft, registry=registry)
-        adapter.require_initial(source)
-        source_digest = _adapter_evidence_digest(adapter, source)
-        binding = binding_from_draft(draft, source_digest)
-        return store.save_roadex_approval_binding(binding)
+            save_source()
+            source = load_source_from_draft(store, draft, registry=registry)
+            adapter.require_initial(source)
+            source_digest = _adapter_evidence_digest(adapter, source)
+            binding = binding_from_draft(draft, source_digest)
+            binding = store.save_roadex_approval_binding(binding)
+        if verify_bound is not None:
+            verify_bound(binding)
+        return binding
 
 
 def _source_exists_for_draft(store: ApprovalSourceStore, draft: RoadexApprovalBindingDraft, *, registry) -> bool:

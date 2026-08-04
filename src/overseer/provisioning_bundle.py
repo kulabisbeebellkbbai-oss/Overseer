@@ -1,7 +1,8 @@
-"""Frozen, bounded contracts for DonutHole provisioning bundles.
+"""Frozen contracts, authoritative preview, and atomic DonutHole bundle staging.
 
-This module contains read-only preflight and immutable bundle construction. It
-deliberately contains no persistence, dispatch, or host-operation behavior.
+This module performs read-only preflight and immutable bundle construction,
+then persists the exact previewed records through one approval-owned
+transaction. It deliberately contains no dispatch or host-operation behavior.
 """
 from __future__ import annotations
 
@@ -131,6 +132,39 @@ def _read_current_root_authorization(
                 failed = True
     if failed:
         raise ValueError("root authorization read is unavailable")
+    return _select_current_root_authorization(
+        roots,
+        approvals,
+        crew_messages,
+        revocations,
+        project_id,
+        root_id,
+        policy_revision,
+        root_identity,
+        alias,
+        status,
+        max_bytes,
+        target_digest,
+        now,
+    )
+
+
+def _select_current_root_authorization(
+    roots: list[tuple[str, ...]],
+    approvals: Mapping[str, tuple[str, str]],
+    crew_messages: Mapping[str, tuple[str, str]],
+    revocations: set[str],
+    project_id: str,
+    root_id: str,
+    policy_revision: str,
+    root_identity: str,
+    alias: str,
+    status: str,
+    max_bytes: int,
+    target_digest: str,
+    now: datetime,
+) -> Mapping[str, object]:
+    """Select one exact current root from already-validated authority rows."""
     candidates: list[tuple[Mapping[str, object], datetime]] = []
     supplied = ("root.register", project_id, root_id, policy_revision, root_identity, alias, status, max_bytes, target_digest)
     for root_row_id, root_project_id, root_root_id, root_status, root_payload in roots:
@@ -162,6 +196,50 @@ def _read_current_root_authorization(
         raise ValueError("current root authorization is ambiguous")
     record = candidates[0][0]
     return {"ok": True, **record, "mutation_performed": False, "host_mutation_performed": False, "redactions_applied": True}
+
+
+def _read_current_root_authorization_from_connection(
+    connection: sqlite3.Connection,
+    project_id: str,
+    root_id: str,
+    policy_revision: str,
+    root_identity: str,
+    alias: str,
+    status: str,
+    max_bytes: int,
+    target_digest: str,
+) -> Mapping[str, object]:
+    """Resolve current root authority from a caller-locked SQLite connection."""
+    _require_authority_schema(connection)
+    roots = _text_rows(
+        connection,
+        "storage_root_authorizations",
+        ("id", "project_id", "root_id", "status", "payload"),
+    )
+    approvals = {
+        row[0]: (row[1], row[2])
+        for row in _text_rows(connection, "approvals", ("id", "subject_id", "payload"))
+    }
+    crew_messages = {
+        row[0]: (row[1], row[2])
+        for row in _text_rows(connection, "crew_messages", ("id", "owner_domain", "payload"))
+    }
+    revocations = _validated_revocations(connection)
+    return _select_current_root_authorization(
+        roots,
+        approvals,
+        crew_messages,
+        revocations,
+        project_id,
+        root_id,
+        policy_revision,
+        root_identity,
+        alias,
+        status,
+        max_bytes,
+        target_digest,
+        datetime.now(UTC),
+    )
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -651,6 +729,20 @@ def _canonical_bytes(value: object) -> bytes:
 def canonical_digest(value: object) -> str:
     """Return the SHA-256 digest of canonical JSON for a typed value."""
     return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProvisioningPreviewDigests:
+    """Exact immutable digests returned by an authoritative bundle preview."""
+
+    plan_digest: str
+    preflight_digest: str
+    bundle_digest: str
+
+    def __post_init__(self) -> None:
+        _digest(self.plan_digest, "preview digest plan")
+        _digest(self.preflight_digest, "preview digest preflight")
+        _digest(self.bundle_digest, "preview digest bundle")
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1395,34 @@ def _recheck_current_root_authority(
         raise ValueError("STALE_PREVIEW")
 
 
+def _recheck_current_root_authority_locked(
+    store: SQLiteStore,
+    bundle: ProvisioningBundleV1,
+) -> None:
+    """Revalidate the exact root after the binding transaction owns the write lock."""
+    resolved = bundle.preflight.resolved_inputs
+    try:
+        current = _read_current_root_authorization_from_connection(
+            store._connection,
+            bundle.intent.project_id,
+            bundle.intent.root_id,
+            bundle.intent.policy_revision,
+            str(resolved["root_identity"]),
+            _ROOT_ALIAS,
+            _ROOT_STATUS,
+            _ROOT_MAX_BYTES,
+            str(resolved["target_digest"]),
+        )
+    except Exception as error:
+        raise ValueError("STALE_PREVIEW") from error
+    if (
+        current.get("authorization_ref") != resolved.get("authorization_ref")
+        or current.get("root_identity") != resolved.get("root_identity")
+        or current.get("target_digest") != resolved.get("target_digest")
+    ):
+        raise ValueError("STALE_PREVIEW")
+
+
 def binding_draft_for_bundle(bundle: ProvisioningBundleV1) -> RoadexApprovalBindingDraft:
     """Derive the one code-owned prospective approval binding for a bundle."""
     _validate_staged_bundle(bundle)
@@ -1441,15 +1561,28 @@ def _public_bundle_status(
 
 def stage_authoritative_bundle(
     store_path: str,
-    bundle: ProvisioningBundleV1,
+    intent: ProvisioningIntentV1,
+    dependencies: PreflightDependencies,
+    expected_preview: ProvisioningPreviewDigests,
 ) -> Mapping[str, object]:
-    """Atomically create the source, binding, evidence bundle, and review outbox.
-
-    The public stage API is deliberately a later concern.  This internal
-    boundary accepts only an already-built exact bundle and rechecks its root
-    authority immediately before the binding primitive opens its sole
-    transaction.
-    """
+    """Rebuild and atomically stage exactly one caller-previewed typed intent."""
+    if type(intent) is not ProvisioningIntentV1 or set(vars(intent)) != INTENT_FIELDS:
+        raise ValueError("exact typed provisioning intent is required")
+    if type(dependencies) is not PreflightDependencies or set(vars(dependencies)) != {
+        field.name for field in fields(PreflightDependencies)
+    }:
+        raise ValueError("exact typed preflight dependencies are required")
+    if type(expected_preview) is not ProvisioningPreviewDigests or set(vars(expected_preview)) != {
+        field.name for field in fields(ProvisioningPreviewDigests)
+    }:
+        raise ValueError("exact expected preview digests are required")
+    bundle = build_provisioning_bundle(store_path, intent, dependencies)
+    if (
+        bundle.plan.plan_digest != expected_preview.plan_digest
+        or bundle.preflight.report_digest != expected_preview.preflight_digest
+        or bundle.bundle_digest != expected_preview.bundle_digest
+    ):
+        raise ValueError("PREVIEW_MISMATCH")
     _validate_staged_bundle(bundle)
     serialized_bundle = dump_provisioning_bundle(bundle)
     binding_draft = binding_draft_for_bundle(bundle)
@@ -1486,8 +1619,11 @@ def stage_authoritative_bundle(
             store,
             binding_draft,
             save_source_and_bundle,
+            validate_locked=lambda: _recheck_current_root_authority_locked(store, bundle),
+            verify_bound=lambda candidate: verify_exact_persisted_bundle_set(
+                store, bundle, candidate,
+            ),
         )
-        verify_exact_persisted_bundle_set(store, bundle, binding)
     return _public_bundle_status(bundle, binding, mutation=source_persisted)
 
 
@@ -1537,6 +1673,7 @@ def bundle_digest(bundle: ProvisioningBundleV1) -> str:
 __all__ = [
     "INTENT_FIELDS", "REQUIRED_PREFLIGHT_CODES", "PreflightCheck", "PreflightDependencies",
     "ProvisioningBundleError", "ProvisioningBundleV1", "ProvisioningIntentV1",
+    "ProvisioningPreviewDigests",
     "ProvisioningPreflightReport", "ProvisioningReviewOutboxEntry", "build_provisioning_bundle",
     "binding_draft_for_bundle", "dump_provisioning_bundle", "load_provisioning_bundle",
     "stage_authoritative_bundle", "verify_exact_persisted_bundle_set",

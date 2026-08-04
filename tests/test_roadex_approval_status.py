@@ -433,6 +433,76 @@ def test_stage_bound_roadex_approval_is_idempotent_for_identical_replay(tmp_path
         assert first.created_at == second.created_at
 
 
+def test_correction_stage_callbacks_run_inside_one_transaction_on_initial_and_replay(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path) as store:
+        plan = plan_user_service_restart(
+            "admin.roadex.callback-boundary",
+            "roadex-test.service",
+            "Approval callback boundary fixture",
+        )
+        draft = _draft_for("admin.roadex.callback-boundary")
+        calls = {"locked": 0, "source": 0, "verified": 0}
+
+        def validate_locked() -> None:
+            assert store._agent_transaction_depth == 1
+            calls["locked"] += 1
+
+        def save_source() -> None:
+            assert store._agent_transaction_depth == 1
+            calls["source"] += 1
+            store.save_admin_change_plan(plan)
+
+        def verify_bound(binding: RoadexApprovalBinding) -> None:
+            assert store._agent_transaction_depth == 1
+            assert store.load_roadex_approval_binding(binding.approval_ref) == binding
+            calls["verified"] += 1
+
+        first = stage_bound_roadex_approval(
+            store,
+            draft,
+            save_source,
+            validate_locked=validate_locked,
+            verify_bound=verify_bound,
+        )
+        second = stage_bound_roadex_approval(
+            store,
+            draft,
+            save_source,
+            validate_locked=validate_locked,
+            verify_bound=verify_bound,
+        )
+
+    assert first == second
+    assert calls == {"locked": 2, "source": 1, "verified": 2}
+
+
+def test_correction_bound_verifier_failure_rolls_back_source_and_binding(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with SQLiteStore(path) as store:
+        plan = plan_user_service_restart(
+            "admin.roadex.verifier-rollback",
+            "roadex-test.service",
+            "Approval verifier rollback fixture",
+        )
+        draft = _draft_for("admin.roadex.verifier-rollback")
+
+        def reject_bound(_binding: RoadexApprovalBinding) -> None:
+            raise RuntimeError("injected bound verification failure")
+
+        with pytest.raises(RuntimeError, match="injected bound verification failure"):
+            stage_bound_roadex_approval(
+                store,
+                draft,
+                lambda: store.save_admin_change_plan(plan),
+                verify_bound=reject_bound,
+            )
+
+        assert store.registered_source_exists("admin-change-plan", plan.id) is False
+        with pytest.raises(KeyError, match=draft.approval_ref):
+            store.load_roadex_approval_binding(draft.approval_ref)
+
+
 @pytest.mark.parametrize(
     "status",
     (

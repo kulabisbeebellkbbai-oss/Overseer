@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -20,7 +21,9 @@ from overseer.backup_host_operations import capability_digest as reviewed_capabi
 from overseer.core import OwnerDomain, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.provisioning_bundle import (
-    PreflightDependencies,
+    _PreflightDependencies as PreflightDependencies,
+    _build_provisioning_bundle_with_dependencies as build_provisioning_bundle,
+    _run_provisioning_preflight_with_dependencies as run_provisioning_preflight,
     PreflightCheck,
     ProvisioningBundleV1,
     ProvisioningBundleError,
@@ -28,13 +31,11 @@ from overseer.provisioning_bundle import (
     ProvisioningPreflightReport,
     ProvisioningReviewOutboxEntry,
     REQUIRED_PREFLIGHT_CODES,
-    build_provisioning_bundle,
     bundle_digest,
     canonical_root_target_digest,
     canonical_digest,
     changed_immutable_inputs,
     parse_provisioning_intent,
-    run_provisioning_preflight,
 )
 from overseer.storage_control import (
     approve_authorization,
@@ -247,7 +248,7 @@ def stage_expected_bundle(
     authoritative_dependencies = dependencies or deterministic_dependencies(
         source_head=bundle.intent.source_commit,
     )
-    return provisioning_bundle_module.stage_authoritative_bundle(
+    return provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
         store_path,
         bundle.intent,
         authoritative_dependencies,
@@ -401,7 +402,7 @@ def test_correction_typed_stage_rebuilds_and_rejects_source_head_drift(tmp_path)
     preview = build_provisioning_bundle(store_path, intent, dependencies)
     expected = expected_preview_digests(preview)
 
-    first = provisioning_bundle_module.stage_authoritative_bundle(
+    first = provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
         store_path,
         intent,
         dependencies,
@@ -411,7 +412,7 @@ def test_correction_typed_stage_rebuilds_and_rejects_source_head_drift(tmp_path)
     authoritative["source_head"] = "c" * 40
 
     with pytest.raises(ProvisioningBundleError, match="PREFLIGHT_FAILED"):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             intent,
             dependencies,
@@ -443,13 +444,13 @@ def test_correction_typed_stage_rejects_invalid_preview_and_forbidden_caller_fie
             bundle_digest=preview.bundle_digest,
         )
     with pytest.raises(TypeError):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             preview.intent,
             dependencies,
         )
     with pytest.raises(ValueError, match="expected preview"):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             preview.intent,
             dependencies,
@@ -461,14 +462,14 @@ def test_correction_typed_stage_rejects_invalid_preview_and_forbidden_caller_fie
             },
         )
     with pytest.raises(ValueError, match="typed provisioning intent"):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             {**intent_payload(), "authorization_ref": "root-auth.current"},
             dependencies,
             expected,
         )
     with pytest.raises(ValueError, match="PREVIEW_MISMATCH"):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             preview.intent,
             dependencies,
@@ -488,14 +489,14 @@ def test_correction_typed_stage_rejects_extra_attributes_on_typed_inputs(tmp_pat
     object.__setattr__(tainted_expected, "evidence_ids", ("sha256:" + "a" * 64,))
 
     with pytest.raises(ValueError, match="typed provisioning intent"):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             tainted_intent,
             dependencies,
             expected,
         )
     with pytest.raises(ValueError, match="expected preview"):
-        provisioning_bundle_module.stage_authoritative_bundle(
+        provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
             store_path,
             preview.intent,
             dependencies,
@@ -506,6 +507,135 @@ def test_correction_typed_stage_rejects_extra_attributes_on_typed_inputs(tmp_pat
         "plans": 0, "bindings": 0, "reports": 0,
         "bundles": 0, "outbox": 0, "crew": 0,
     }
+
+
+def test_trusted_boundary_public_stage_rejects_caller_dependencies_without_writes(tmp_path):
+    store_path, preview = authoritative_bundle_fixture(tmp_path)
+    callback_calls = {"count": 0}
+
+    def forged_source_head(_path):
+        callback_calls["count"] += 1
+        return preview.intent.source_commit
+
+    forged = replace(
+        deterministic_dependencies(source_head=preview.intent.source_commit),
+        source_head=forged_source_head,
+    )
+
+    with pytest.raises(TypeError):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path,
+            preview.intent,
+            forged,
+            expected_preview_digests(preview),
+        )
+
+    assert callback_calls["count"] == 0
+    assert persisted_bundle_rows(store_path, preview.plan.plan_id) == {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
+
+
+def test_trusted_boundary_public_signatures_and_exports_have_no_dependency_seam():
+    assert tuple(inspect.signature(
+        provisioning_bundle_module.stage_authoritative_bundle,
+    ).parameters) == ("store_path", "intent", "expected_preview")
+    assert tuple(inspect.signature(
+        provisioning_bundle_module.build_provisioning_bundle,
+    ).parameters) == ("store_path", "intent")
+    assert tuple(inspect.signature(
+        provisioning_bundle_module.run_provisioning_preflight,
+    ).parameters) == ("store_path", "intent")
+    assert "PreflightDependencies" not in provisioning_bundle_module.__all__
+    assert "production_preflight_dependencies" not in provisioning_bundle_module.__all__
+    assert all(not name.startswith("_stage_authoritative_bundle") for name in provisioning_bundle_module.__all__)
+
+
+def test_trusted_boundary_factory_runs_on_initial_replay_and_source_drift(
+    tmp_path, monkeypatch,
+):
+    store_path, preview = authoritative_bundle_fixture(tmp_path)
+    authoritative = {"source_head": preview.intent.source_commit}
+    calls = {"count": 0}
+
+    def trusted_factory(_store_path):
+        calls["count"] += 1
+        return replace(
+            deterministic_dependencies(),
+            source_head=lambda _path: authoritative["source_head"],
+        )
+
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "production_preflight_dependencies",
+        trusted_factory,
+        raising=False,
+    )
+    expected = expected_preview_digests(preview)
+
+    first = provisioning_bundle_module.stage_authoritative_bundle(
+        store_path, preview.intent, expected,
+    )
+    second = provisioning_bundle_module.stage_authoritative_bundle(
+        store_path, preview.intent, expected,
+    )
+    before = persisted_bundle_rows(store_path, preview.plan.plan_id)
+    authoritative["source_head"] = "c" * 40
+
+    with pytest.raises(ProvisioningBundleError, match="PREFLIGHT_FAILED"):
+        provisioning_bundle_module.stage_authoritative_bundle(
+            store_path, preview.intent, expected,
+        )
+
+    assert calls["count"] == 3
+    assert first["mutation_performed"] is True
+    assert second["mutation_performed"] is False
+    assert persisted_bundle_rows(store_path, preview.plan.plan_id) == before
+
+
+def test_trusted_boundary_production_factory_uses_exact_persisted_chain_read_only(tmp_path):
+    store_path, preview = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, preview)
+    observed = lambda: (
+        Path(store_path).stat().st_mtime_ns,
+        Path(store_path).stat().st_ctime_ns,
+        Path(store_path).read_bytes(),
+        tuple(sorted(path.name for path in tmp_path.glob("state.sqlite3*"))),
+    )
+    before = observed()
+
+    dependencies = provisioning_bundle_module.production_preflight_dependencies(store_path)
+    predecessor = dependencies.predecessor_lookup(preview.plan.plan_id)
+    tip = dependencies.authoritative_chain_tip(preview.plan.plan_id)
+
+    assert predecessor == preview
+    assert tip == preview.plan.plan_id
+    assert dependencies.source_path == "/home/god/Documents/Codex Workspace/TheUnderdark"
+    assert dependencies.root_path == "/home/god/Documents/Codex Workspace/DonutHole"
+    with pytest.raises(ValueError, match="source path"):
+        dependencies.source_head("/caller/selected/source")
+    with pytest.raises(ValueError, match="GPG path"):
+        dependencies.file_digest("/caller/selected/gpg")
+    assert dependencies.executable_exists("/caller/selected/gpg") is False
+    assert dependencies.canonical_boundaries_valid() is True
+    assert dependencies.rollback_prerequisites_valid() is True
+    assert observed() == before
+
+    repeated = provisioning_bundle_module.production_preflight_dependencies(store_path)
+    assert repeated.predecessor_lookup(preview.plan.plan_id) == predecessor
+    assert repeated.authoritative_chain_tip(preview.plan.plan_id) == tip
+    assert observed() == before
+
+    with sqlite3.connect(store_path) as connection:
+        connection.execute(
+            "UPDATE provisioning_bundles SET payload=? WHERE plan_id=?",
+            ("{}", preview.plan.plan_id),
+        )
+    corrupted = observed()
+    with pytest.raises(ValueError, match="persisted provisioning chain is unavailable"):
+        provisioning_bundle_module.production_preflight_dependencies(store_path)
+    assert observed() == corrupted
 
 
 def test_atomic_stage_is_exactly_idempotent_and_does_not_reenter_source_callback(tmp_path, monkeypatch):
@@ -1562,7 +1692,7 @@ def test_bundle_rejects_missing_non_tip_and_superseded_predecessors_without_muta
     with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_NOT_CURRENT"):
         build_provisioning_bundle(
             store_path, successor,
-            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: predecessor, authoritative_chain_tip=lambda: "other-plan"),
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: predecessor, authoritative_chain_tip=lambda _id: "other-plan"),
         )
     superseded_predecessor = replace(
         predecessor,
@@ -1572,7 +1702,7 @@ def test_bundle_rejects_missing_non_tip_and_superseded_predecessors_without_muta
     with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
         build_provisioning_bundle(
             store_path, successor,
-            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: superseded_predecessor, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: superseded_predecessor, authoritative_chain_tip=lambda _id: predecessor.plan.plan_id),
         )
     assert Path(store_path).read_bytes() == before
 
@@ -1595,7 +1725,7 @@ def test_bundle_redacts_unexpected_predecessor_callback_exception_as_unavailable
             replace(
                 deterministic_dependencies(),
                 predecessor_lookup=failing_predecessor_lookup,
-                authoritative_chain_tip=lambda: predecessor.plan.plan_id,
+                authoritative_chain_tip=lambda _id: predecessor.plan.plan_id,
             ),
         )
 
@@ -1621,7 +1751,7 @@ def test_successor_rejects_a_tampered_predecessor_contract(tmp_path, tamper):
         build_provisioning_bundle(
             store_path,
             successor,
-            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: tamper(predecessor), authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: tamper(predecessor), authoritative_chain_tip=lambda _id: predecessor.plan.plan_id),
         )
 
 
@@ -1650,7 +1780,7 @@ def test_successor_rejects_coherently_redigested_predecessor_cross_binding_tampe
     with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
         build_provisioning_bundle(
             store_path, successor,
-            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: forged, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: forged, authoritative_chain_tip=lambda _id: predecessor.plan.plan_id),
         )
 
 
@@ -1684,7 +1814,7 @@ def test_successor_rejects_coherently_redigested_predecessor_preflight_check_for
     with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
         build_provisioning_bundle(
             store_path, successor,
-            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: forged, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: forged, authoritative_chain_tip=lambda _id: predecessor.plan.plan_id),
         )
 
 
@@ -1694,7 +1824,7 @@ def test_successor_rejects_predecessor_with_forged_unchanged_chain_delta(tmp_pat
     middle_intent = intent_fixture(plan_id="backup-provision.donuthole.v21.20260802", supersedes_plan_id=root.plan.plan_id)
     middle = build_provisioning_bundle(
         store_path, middle_intent,
-        replace(deterministic_dependencies(), predecessor_lookup=lambda _id: root, authoritative_chain_tip=lambda: root.plan.plan_id),
+        replace(deterministic_dependencies(), predecessor_lookup=lambda _id: root, authoritative_chain_tip=lambda _id: root.plan.plan_id),
     )
     changed = ("gpg_sha256",)
     provisional = ProvisioningBundleV1(
@@ -1716,7 +1846,7 @@ def test_successor_rejects_predecessor_with_forged_unchanged_chain_delta(tmp_pat
             replace(
                 deterministic_dependencies(),
                 predecessor_lookup=lambda identifier: root if identifier == root.plan.plan_id else forged,
-                authoritative_chain_tip=lambda: middle.plan.plan_id,
+                authoritative_chain_tip=lambda _id: middle.plan.plan_id,
             ),
         )
 
@@ -1741,7 +1871,7 @@ def test_changed_immutable_inputs_ignore_derived_successor_plan_identity_but_det
     successor = build_provisioning_bundle(
         store_path,
         intent_fixture(plan_id="backup-provision.donuthole.v21.20260802", supersedes_plan_id=previous.plan.plan_id),
-        replace(deterministic_dependencies(), predecessor_lookup=lambda _id: previous, authoritative_chain_tip=lambda: previous.plan.plan_id),
+        replace(deterministic_dependencies(), predecessor_lookup=lambda _id: previous, authoritative_chain_tip=lambda _id: previous.plan.plan_id),
     )
 
     assert successor.changed_immutable_inputs == ()

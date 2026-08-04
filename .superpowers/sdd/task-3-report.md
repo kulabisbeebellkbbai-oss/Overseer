@@ -55,3 +55,72 @@ Correction verification:
 - Final standalone baseline assertion — the same expected `sha256:0d127...` versus actual `sha256:327b...` mismatch.
 
 No live database, service, gateway, remote host, approval, dispatch, provisioning, deployment, restart, or push action was performed.
+
+## Final trusted-boundary correction
+
+The final independent review found that the public staging function still
+accepted caller-constructed preflight dependencies. The public boundary now
+accepts exactly `(store_path, ProvisioningIntentV1,
+ProvisioningPreviewDigests)`. Public preview and preflight functions likewise
+accept only the store path and typed intent. The dependency record and all
+dependency-injected execution helpers are private and absent from `__all__`.
+
+Every public staging attempt constructs a fresh server-owned dependency set.
+The factory fixes the reviewed adapter and source paths, reads the real Git
+HEAD, uses the reviewed runtime and capability digest implementations, hashes
+and checks the exact GPG executable, resolves the exact current root identity
+and authorization, validates code-owned canonical boundaries and packaged
+rollback scenarios, and loads exact persisted predecessor bundles and the
+current chain tip from a stable read-only store snapshot. The snapshot reader
+rejects sidecars, identity drift, malformed rows, inexact serialized bundles,
+inconsistent indexed metadata, and corruption. The chain resolver rejects broken
+links, forks, cycles, disconnected history, and a non-current predecessor. Both
+leave the real database bytes, timestamps, and sidecar set unchanged.
+
+The private injected helper retains the prior one-transaction staging flow,
+locked root validation, precommit persisted-set verification, exact replay
+callback suppression, and typed-object guards. The public wrapper validates
+typed inputs before constructing production dependencies. Supplying a fourth
+dependency argument therefore raises `TypeError` before any callback or write.
+
+Trusted-boundary RED evidence:
+
+- `pytest -q tests/test_provisioning_bundle.py -k trusted_boundary` — 4 expected
+  failures: a fourth caller dependency argument was accepted, public signatures
+  and exports exposed dependency injection, the trusted factory was absent, and
+  the public three-argument stage call was unavailable.
+- The added corrupted-store case initially failed because the chain reader
+  correctly rejected the store but exposed a lower-level root-authority error;
+  the public-facing failure is now normalized to `persisted provisioning chain
+  is unavailable`.
+
+Final correction verification:
+
+- `pytest -q tests/test_provisioning_bundle.py -k trusted_boundary` — 4 passed,
+  114 deselected.
+- `pytest -q tests/test_provisioning_bundle.py` — 118 passed.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_core.py -k 'schema or migration or atomic or idempotent or
+  provisioning or correction'` — 154 passed, 363 deselected.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_roadex_approval_status.py -k 'correction or atomic or binding or
+  replay or rollback'` — 72 passed, 210 deselected.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_roadex_approval_status.py tests/test_core.py -k 'not
+  test_roadex_human_scope_and_source_evidence_digest_use_exact_contract'` — 652
+  passed, 1 deselected.
+- `python3 -m compileall -q src/overseer/provisioning_bundle.py
+  tests/test_provisioning_bundle.py` and `git diff --check` — passed.
+
+The unfiltered repository suite produced 1269 passed, 6 skipped, and 10
+failures. None is in the corrected files: one pre-existing agent-store migration
+expectation includes an unexpected integer migration `3`; eight disposable
+cross-repository acceptance failures lack the `mcp` package and/or required
+`THEUNDERDARK_PYTHON` and `THEUNDERDARK_SOURCE` environment; and the already
+documented Roadex fixture still expects `sha256:0d127...` while obtaining
+`sha256:327b7...`. No baseline fixture, acceptance environment, or unrelated
+module was changed.
+
+No live database, production source checkout, service, gateway, remote host,
+approval, dispatch, provisioning, deployment, restart, push, or host mutation
+was performed during this correction.

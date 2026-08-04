@@ -16,19 +16,26 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
+from .backup_host_operations import (
+    EXPECTED_BACKUP_TOOL_SCHEMAS,
+    capability_digest as reviewed_capability_digest,
+    runtime_digest as reviewed_runtime_digest,
+)
 from .backup_provisioning import (
     ADAPTER_SOURCE_PATH, GPG_PATH, SOURCE_PATH, DonutHoleBackupProvisioningPlan,
     ProvisioningStep, _validate_plan, build_plan, save_staged_plan_source,
 )
-from .backup_host_operations import capability_digest as reviewed_capability_digest
-from .backup_contract import PROVISIONING_CONTRACT_VERSION
+from .backup_contract import (
+    PROVISIONING_CONTRACT_VERSION,
+    load_packaged_provisioning_contract,
+)
 from .core import OwnerDomain
 from .roadex_approval_status import (
     RoadexApprovalBinding,
@@ -788,7 +795,7 @@ def parse_provisioning_intent(payload: Mapping[str, object]) -> ProvisioningInte
 
 
 @dataclass(frozen=True)
-class PreflightDependencies:
+class _PreflightDependencies:
     """Read-only dependencies needed to resolve one deterministic preflight."""
 
     source_path: str
@@ -803,7 +810,239 @@ class PreflightDependencies:
     canonical_boundaries_valid: Callable[[], bool] = _always_true
     rollback_prerequisites_valid: Callable[[], bool] = _always_true
     predecessor_lookup: Callable[[str], ProvisioningBundleV1 | None] | None = None
-    authoritative_chain_tip: Callable[[], str | None] | None = None
+    authoritative_chain_tip: Callable[[str], str | None] | None = None
+
+
+def _production_source_head(path: str) -> str:
+    """Resolve the reviewed adapter revision without accepting a caller path."""
+    if path != ADAPTER_SOURCE_PATH:
+        raise ValueError("authoritative source path is fixed")
+    result = subprocess.run(
+        ("/usr/bin/git", "-C", ADAPTER_SOURCE_PATH, "rev-parse", "HEAD"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=10,
+        check=False,
+    )
+    revision = result.stdout.strip()
+    if result.returncode != 0 or _COMMIT.fullmatch(revision) is None:
+        raise ValueError("authoritative source revision is unavailable")
+    return revision
+
+
+def _production_file_digest(path: str) -> str:
+    """Digest only the reviewed GPG executable through a stable descriptor."""
+    if path != GPG_PATH:
+        raise ValueError("authoritative GPG path is fixed")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            GPG_PATH,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.fstat(descriptor)
+        entry = os.stat(GPG_PATH, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _file_identity(before)[:2] != _file_identity(entry)[:2]
+        ):
+            raise ValueError("authoritative GPG executable is unavailable")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(descriptor, min(1024 * 1024, before.st_size - offset), offset)
+            if not chunk:
+                raise ValueError("authoritative GPG executable is unavailable")
+            digest.update(chunk)
+            offset += len(chunk)
+        if _file_identity(os.fstat(descriptor)) != _file_identity(before):
+            raise ValueError("authoritative GPG executable changed during digest")
+        return "sha256:" + digest.hexdigest()
+    except (OSError, ValueError):
+        raise ValueError("authoritative GPG executable is unavailable") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _production_executable_exists(path: str) -> bool:
+    if path != GPG_PATH:
+        return False
+    try:
+        info = os.stat(GPG_PATH, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and bool(info.st_mode & 0o111)
+
+
+def _production_canonical_boundaries_valid() -> bool:
+    """Validate the code-owned host boundary constants without host mutation."""
+    fixed_paths = (
+        ADAPTER_SOURCE_PATH,
+        SOURCE_PATH,
+        GPG_PATH,
+        _OVERSEER_TOKEN_SOURCE_FILE,
+        _OVERSEER_TOKEN_FILE,
+        _CURSOR_KEY_FILE,
+    )
+    return (
+        ADAPTER_SOURCE_PATH == "/home/god/Documents/Codex Workspace/TheUnderdark"
+        and SOURCE_PATH == "/home/god/Documents/Codex Workspace/DonutHole"
+        and GPG_PATH == "/usr/bin/gpg"
+        and all(Path(path).is_absolute() for path in fixed_paths)
+    )
+
+
+def _production_rollback_prerequisites_valid() -> bool:
+    """Require the reviewed packaged rollback and acceptance scenarios."""
+    contract = load_packaged_provisioning_contract()
+    scenarios = contract.raw["scenarios"]
+    return (
+        contract.version == PROVISIONING_CONTRACT_VERSION
+        and isinstance(scenarios, list)
+        and tuple(item.get("name") for item in scenarios if isinstance(item, dict))
+        == ("clean_install", "active_service_upgrade")
+        and all(
+            isinstance(item, dict)
+            and item.get("expected_terminal_status") == "acceptance_passed"
+            for item in scenarios
+        )
+    )
+
+
+def _load_persisted_bundles_read_only(store_path: str) -> tuple[ProvisioningBundleV1, ...]:
+    """Load exact bundles from a stable byte snapshot without touching the store."""
+    try:
+        database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
+    except Exception:
+        raise ValueError("persisted provisioning chain is unavailable") from None
+    snapshot_fd: int | None = None
+    snapshot_path: str | None = None
+    connection: sqlite3.Connection | None = None
+    failed = False
+    bundles: list[ProvisioningBundleV1] = []
+    try:
+        snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
+        snapshot_fd, snapshot_path = tempfile.mkstemp(
+            prefix="overseer-bundle-chain-", suffix=".sqlite3",
+        )
+        _write_snapshot(snapshot_fd, snapshot)
+        os.fsync(snapshot_fd)
+        os.close(snapshot_fd)
+        snapshot_fd = None
+        _verify_authority_snapshot(parent_fd, identity)
+        connection = sqlite3.connect(f"file:{snapshot_path}?mode=ro&immutable=1", uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        rows = connection.execute(
+            "SELECT id, plan_id, bundle_digest, payload "
+            "FROM provisioning_bundles ORDER BY plan_id"
+        ).fetchall()
+        for row in rows:
+            if len(row) != 4 or any(type(value) is not str for value in row):
+                raise ValueError("persisted provisioning chain is malformed")
+            bundle_id, plan_id, stored_digest, payload = row
+            bundle = _decode_exact_payload(
+                payload, ProvisioningBundleV1, "provisioning bundle",
+            )
+            _validate_staged_bundle(bundle)
+            if (
+                bundle_id != plan_id
+                or bundle.plan.plan_id != plan_id
+                or bundle.bundle_digest != stored_digest
+            ):
+                raise ValueError("persisted provisioning chain is inconsistent")
+            bundles.append(bundle)
+        if _read_authority_snapshot(database_fd, parent_fd, identity) != snapshot:
+            raise ValueError("persisted provisioning chain changed during read")
+    except Exception:
+        failed = True
+    finally:
+        for cleanup in (
+            (lambda: connection.close() if connection is not None else None),
+            (lambda: os.close(snapshot_fd) if snapshot_fd is not None else None),
+            (lambda: os.unlink(snapshot_path) if snapshot_path is not None else None),
+            (lambda: _verify_authority_snapshot(parent_fd, identity)),
+            (lambda: os.close(database_fd)),
+            (lambda: os.close(parent_fd)),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                failed = True
+    if failed:
+        raise ValueError("persisted provisioning chain is unavailable")
+    return tuple(bundles)
+
+
+def _persisted_chain_tip(
+    bundles: tuple[ProvisioningBundleV1, ...], predecessor_plan_id: str,
+) -> str | None:
+    by_id = {bundle.plan.plan_id: bundle for bundle in bundles}
+    predecessor = by_id.get(predecessor_plan_id)
+    if predecessor is None or len(by_id) != len(bundles):
+        return None
+    scope = (
+        predecessor.intent.kind,
+        predecessor.intent.project_id,
+        predecessor.intent.resource_id,
+    )
+    scoped = {
+        plan_id: bundle
+        for plan_id, bundle in by_id.items()
+        if (
+            bundle.intent.kind,
+            bundle.intent.project_id,
+            bundle.intent.resource_id,
+        ) == scope
+    }
+    referenced: set[str] = set()
+    for bundle in scoped.values():
+        declared = bundle.supersedes_plan_id
+        if declared is not None:
+            if declared not in scoped:
+                return None
+            referenced.add(declared)
+    tips = set(scoped) - referenced
+    if len(tips) != 1:
+        return None
+    tip = next(iter(tips))
+    visited: set[str] = set()
+    cursor: str | None = tip
+    while cursor is not None:
+        if cursor in visited or cursor not in scoped:
+            return None
+        visited.add(cursor)
+        cursor = scoped[cursor].supersedes_plan_id
+    return tip if visited == set(scoped) else None
+
+
+def production_preflight_dependencies(store_path: str) -> _PreflightDependencies:
+    """Construct the sole production-owned authoritative preflight boundary."""
+    bundles = _load_persisted_bundles_read_only(store_path)
+    by_id = {bundle.plan.plan_id: bundle for bundle in bundles}
+    return _PreflightDependencies(
+        source_path=ADAPTER_SOURCE_PATH,
+        source_head=_production_source_head,
+        runtime_digest=reviewed_runtime_digest,
+        capability_digest=reviewed_capability_digest,
+        file_digest=_production_file_digest,
+        executable_exists=_production_executable_exists,
+        root_path=SOURCE_PATH,
+        root_identity=current_root_identity,
+        resolve_root_authorization=_read_current_root_authorization,
+        canonical_boundaries_valid=_production_canonical_boundaries_valid,
+        rollback_prerequisites_valid=_production_rollback_prerequisites_valid,
+        predecessor_lookup=lambda plan_id: by_id.get(plan_id),
+        authoritative_chain_tip=lambda plan_id: _persisted_chain_tip(bundles, plan_id),
+    )
 
 
 @dataclass(frozen=True)
@@ -892,8 +1131,8 @@ def _resolved_authorization_ref(value: object) -> str:
     return value if isinstance(value, str) and value and value == value.strip() else ""
 
 
-def run_provisioning_preflight(
-    store_path: str, intent: ProvisioningIntentV1, dependencies: PreflightDependencies,
+def _run_provisioning_preflight_with_dependencies(
+    store_path: str, intent: ProvisioningIntentV1, dependencies: _PreflightDependencies,
 ) -> ProvisioningPreflightReport:
     """Resolve the fixed authority inputs without changing store or host state."""
     source_head, source_available = _safe_read(dependencies.source_head, dependencies.source_path)
@@ -968,6 +1207,15 @@ def run_provisioning_preflight(
     return ProvisioningPreflightReport(
         report_id, intent.plan_id, resolved_inputs, checks,
         all(item.status == "passed" for item in checks), report_digest,
+    )
+
+
+def run_provisioning_preflight(
+    store_path: str, intent: ProvisioningIntentV1,
+) -> ProvisioningPreflightReport:
+    """Run production preflight using only server-owned authority readers."""
+    return _run_provisioning_preflight_with_dependencies(
+        store_path, intent, production_preflight_dependencies(store_path),
     )
 
 
@@ -1117,7 +1365,7 @@ def changed_immutable_inputs(
 
 
 def _authoritative_predecessor(
-    intent: ProvisioningIntentV1, dependencies: PreflightDependencies,
+    intent: ProvisioningIntentV1, dependencies: _PreflightDependencies,
 ) -> ProvisioningBundleV1 | None:
     if not intent.supersedes_plan_id:
         return None
@@ -1132,7 +1380,9 @@ def _authoritative_predecessor(
         or predecessor.plan.plan_id != intent.supersedes_plan_id
     ):
         raise ProvisioningBundleError("PREDECESSOR_INVALID")
-    tip, tip_available = _safe_read(dependencies.authoritative_chain_tip)
+    tip, tip_available = _safe_read(
+        dependencies.authoritative_chain_tip, intent.supersedes_plan_id,
+    )
     if not tip_available or tip != intent.supersedes_plan_id:
         raise ProvisioningBundleError("PREDECESSOR_NOT_CURRENT")
     return predecessor
@@ -1185,7 +1435,7 @@ def _valid_predecessor_contract(predecessor: ProvisioningBundleV1) -> bool:
 
 
 def _valid_predecessor_chain(
-    predecessor: ProvisioningBundleV1, dependencies: PreflightDependencies, seen: set[str],
+    predecessor: ProvisioningBundleV1, dependencies: _PreflightDependencies, seen: set[str],
 ) -> bool:
     """Reconstruct a predecessor's declared chain before trusting the chain tip."""
     plan_id = predecessor.plan.plan_id
@@ -1250,11 +1500,11 @@ def _outbox_static_fields(entry: ProvisioningReviewOutboxEntry) -> tuple[object,
     )
 
 
-def build_provisioning_bundle(
-    store_path: str, intent: ProvisioningIntentV1, dependencies: PreflightDependencies,
+def _build_provisioning_bundle_with_dependencies(
+    store_path: str, intent: ProvisioningIntentV1, dependencies: _PreflightDependencies,
 ) -> ProvisioningBundleV1:
     """Build one immutable, read-only review bundle from the preflight snapshot."""
-    report = run_provisioning_preflight(store_path, intent, dependencies)
+    report = _run_provisioning_preflight_with_dependencies(store_path, intent, dependencies)
     if not report.passed:
         raise ProvisioningBundleError("PREFLIGHT_FAILED")
     predecessor = _authoritative_predecessor(intent, dependencies)
@@ -1287,6 +1537,15 @@ def build_provisioning_bundle(
     return ProvisioningBundleV1(
         "1", intent, plan, report, outbox, digest,
         intent.supersedes_plan_id or None, changed,
+    )
+
+
+def build_provisioning_bundle(
+    store_path: str, intent: ProvisioningIntentV1,
+) -> ProvisioningBundleV1:
+    """Build a production preview using only server-owned authority readers."""
+    return _build_provisioning_bundle_with_dependencies(
+        store_path, intent, production_preflight_dependencies(store_path),
     )
 
 
@@ -1559,24 +1818,31 @@ def _public_bundle_status(
     }
 
 
-def stage_authoritative_bundle(
-    store_path: str,
+def _validate_stage_inputs(
     intent: ProvisioningIntentV1,
-    dependencies: PreflightDependencies,
     expected_preview: ProvisioningPreviewDigests,
-) -> Mapping[str, object]:
-    """Rebuild and atomically stage exactly one caller-previewed typed intent."""
+) -> None:
     if type(intent) is not ProvisioningIntentV1 or set(vars(intent)) != INTENT_FIELDS:
         raise ValueError("exact typed provisioning intent is required")
-    if type(dependencies) is not PreflightDependencies or set(vars(dependencies)) != {
-        field.name for field in fields(PreflightDependencies)
-    }:
-        raise ValueError("exact typed preflight dependencies are required")
     if type(expected_preview) is not ProvisioningPreviewDigests or set(vars(expected_preview)) != {
         field.name for field in fields(ProvisioningPreviewDigests)
     }:
         raise ValueError("exact expected preview digests are required")
-    bundle = build_provisioning_bundle(store_path, intent, dependencies)
+
+
+def _stage_authoritative_bundle_with_dependencies(
+    store_path: str,
+    intent: ProvisioningIntentV1,
+    dependencies: _PreflightDependencies,
+    expected_preview: ProvisioningPreviewDigests,
+) -> Mapping[str, object]:
+    """Rebuild and atomically stage exactly one caller-previewed typed intent."""
+    _validate_stage_inputs(intent, expected_preview)
+    if type(dependencies) is not _PreflightDependencies or set(vars(dependencies)) != {
+        field.name for field in fields(_PreflightDependencies)
+    }:
+        raise ValueError("exact typed preflight dependencies are required")
+    bundle = _build_provisioning_bundle_with_dependencies(store_path, intent, dependencies)
     if (
         bundle.plan.plan_digest != expected_preview.plan_digest
         or bundle.preflight.report_digest != expected_preview.preflight_digest
@@ -1627,6 +1893,21 @@ def stage_authoritative_bundle(
     return _public_bundle_status(bundle, binding, mutation=source_persisted)
 
 
+def stage_authoritative_bundle(
+    store_path: str,
+    intent: ProvisioningIntentV1,
+    expected_preview: ProvisioningPreviewDigests,
+) -> Mapping[str, object]:
+    """Rebuild and atomically stage through the server-owned trust boundary."""
+    _validate_stage_inputs(intent, expected_preview)
+    return _stage_authoritative_bundle_with_dependencies(
+        store_path,
+        intent,
+        production_preflight_dependencies(store_path),
+        expected_preview,
+    )
+
+
 def canonical_bundle_payload(bundle: ProvisioningBundleV1) -> Mapping[str, object]:
     """Return immutable bundle fields, omitting mutable and derived outbox state.
 
@@ -1671,7 +1952,7 @@ def bundle_digest(bundle: ProvisioningBundleV1) -> str:
 
 
 __all__ = [
-    "INTENT_FIELDS", "REQUIRED_PREFLIGHT_CODES", "PreflightCheck", "PreflightDependencies",
+    "INTENT_FIELDS", "REQUIRED_PREFLIGHT_CODES", "PreflightCheck",
     "ProvisioningBundleError", "ProvisioningBundleV1", "ProvisioningIntentV1",
     "ProvisioningPreviewDigests",
     "ProvisioningPreflightReport", "ProvisioningReviewOutboxEntry", "build_provisioning_bundle",

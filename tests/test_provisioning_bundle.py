@@ -478,6 +478,59 @@ def test_default_authority_snapshot_closes_owned_descriptors_after_unexpected_si
     assert "private sidecar validation failure" not in repr(report)
 
 
+def test_default_authority_clock_failure_is_redacted_without_descriptor_leaks_and_fatal_clocks_propagate(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    store_path = seeded_authority_store(tmp_path)
+    real_open = os.open
+    real_close = os.close
+    owned_fds: set[int] = set()
+
+    class FailingClock:
+        error: BaseException = AttributeError("private clock failure")
+
+        @classmethod
+        def now(cls, *_arguments):
+            raise cls.error
+
+    def recording_open(path, flags, *arguments, **keywords):
+        fd = real_open(path, flags, *arguments, **keywords)
+        if path == "state.sqlite3":
+            owned_fds.update((fd, keywords["dir_fd"]))
+        return fd
+
+    def close_owned_fds():
+        for fd in owned_fds:
+            try:
+                real_close(fd)
+            except OSError:
+                pass
+        owned_fds.clear()
+
+    monkeypatch.setattr(bundle_module.os, "open", recording_open)
+    monkeypatch.setattr(bundle_module, "datetime", FailingClock)
+    before = len(os.listdir("/proc/self/fd"))
+    try:
+        report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+        after = len(os.listdir("/proc/self/fd"))
+    finally:
+        close_owned_fds()
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert after == before
+    assert "private clock failure" not in repr(report)
+    for error_type in (KeyboardInterrupt, SystemExit):
+        FailingClock.error = error_type("private fatal clock failure")
+        fatal_before = len(os.listdir("/proc/self/fd"))
+        try:
+            with pytest.raises(error_type):
+                run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+            fatal_after = len(os.listdir("/proc/self/fd"))
+        finally:
+            close_owned_fds()
+        assert fatal_after == fatal_before
+
+
 @pytest.mark.parametrize("failure", ("write", "fsync", "connect", "query", "close", "unlink"))
 def test_default_authority_snapshot_cleans_up_each_partial_failure(tmp_path, monkeypatch, failure):
     import overseer.provisioning_bundle as bundle_module
@@ -794,6 +847,34 @@ def test_default_authority_resolution_requires_exact_independent_staged_approval
             "UPDATE approvals SET payload=? WHERE id=?",
             (json.dumps(approval, sort_keys=True, separators=(",", ":")), "approval.storage.root.root-auth.current"),
         )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+@pytest.mark.parametrize(
+    ("table", "columns"),
+    (
+        ("storage_root_authorizations", ("id", "project_id", "root_id", "status", "payload")),
+        ("approvals", ("id", "subject_id", "payload")),
+        ("crew_messages", ("id", "owner_domain", "payload")),
+        ("storage_authorization_revocations", ("id", "kind", "authorization_ref", "revoked_by", "revoked_at", "evidence_id")),
+    ),
+)
+def test_default_authority_resolution_rejects_constraint_free_lookalike_schema(tmp_path, table, columns):
+    store_path = seeded_authority_store(tmp_path)
+    canonical_table = f"{table}_canonical"
+    column_list = ", ".join(columns)
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(f"ALTER TABLE {table} RENAME TO {canonical_table}")
+        connection.execute(f"CREATE TABLE {table} ({', '.join(f'{column} TEXT' for column in columns)})")
+        connection.execute(f"INSERT INTO {table} ({column_list}) SELECT {column_list} FROM {canonical_table}")
+        connection.execute(f"DROP TABLE {canonical_table}")
         connection.commit()
     finally:
         connection.close()

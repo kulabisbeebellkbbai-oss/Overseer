@@ -76,8 +76,8 @@ def _read_current_root_authorization(
     root_identity: str, alias: str, status: str, max_bytes: int, target_digest: str,
 ) -> Mapping[str, object]:
     """Read one current root authorization from a stable read-only snapshot."""
-    database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
     now = datetime.now(UTC)
+    database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
     snapshot_fd: int | None = None
     snapshot_path: str | None = None
     connection: sqlite3.Connection | None = None
@@ -232,14 +232,49 @@ def _write_snapshot(snapshot_fd: int, snapshot: bytes) -> None:
 
 def _require_authority_schema(connection: sqlite3.Connection) -> None:
     required = {
-        "storage_root_authorizations": ("id", "project_id", "root_id", "status", "payload"),
-        "approvals": ("id", "subject_id", "payload"),
-        "crew_messages": ("id", "owner_domain", "payload"),
-        "storage_authorization_revocations": ("id", "kind", "authorization_ref", "revoked_by", "revoked_at", "evidence_id"),
+        "storage_root_authorizations": (("id", "project_id", "root_id", "status", "payload"), ()),
+        "approvals": (("id", "subject_id", "payload"), ()),
+        "crew_messages": (("id", "owner_domain", "payload"), ()),
+        "storage_authorization_revocations": (
+            ("id", "kind", "authorization_ref", "revoked_by", "revoked_at", "evidence_id"),
+            (("authorization_ref", 2),),
+        ),
     }
-    for table, columns in required.items():
-        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-        if tuple(row[1] for row in rows) != columns or any(str(row[2]).upper() != "TEXT" for row in rows):
+    for table, (columns, unique_columns) in required.items():
+        expected_columns = tuple(
+            (position, column, "TEXT", 0 if position == 0 else 1, None, 1 if position == 0 else 0, 0)
+            for position, column in enumerate(columns)
+        )
+        actual_columns = tuple(
+            tuple(row) for row in connection.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        )
+        if actual_columns != expected_columns:
+            raise ValueError("root authorization schema is unavailable")
+        expected_indexes = [
+            (1, "pk", 0, ((0, 0, "id", 0, "BINARY", 1), (1, -1, None, 0, "BINARY", 0))),
+            *(
+                (1, "u", 0, ((0, column_id, column, 0, "BINARY", 1), (1, -1, None, 0, "BINARY", 0)))
+                for column, column_id in unique_columns
+            ),
+        ]
+        actual_indexes = []
+        for index in connection.execute(f"PRAGMA index_list({table})").fetchall():
+            if len(index) != 5 or type(index[1]) is not str or not index[1]:
+                raise ValueError("root authorization schema is unavailable")
+            index_columns = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT seqno,cid,name,desc,coll,key FROM pragma_index_xinfo(?) ORDER BY seqno",
+                    (index[1],),
+                ).fetchall()
+            )
+            actual_indexes.append((index[2], index[3], index[4], index_columns))
+        unmatched_indexes = list(expected_indexes)
+        for index in actual_indexes:
+            if index not in unmatched_indexes:
+                raise ValueError("root authorization schema is unavailable")
+            unmatched_indexes.remove(index)
+        if unmatched_indexes or connection.execute(f"PRAGMA foreign_key_list({table})").fetchall():
             raise ValueError("root authorization schema is unavailable")
 
 

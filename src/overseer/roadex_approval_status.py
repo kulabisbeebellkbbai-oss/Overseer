@@ -420,6 +420,10 @@ def load_exact_bound_source(store: ApprovalSourceStore, binding: RoadexApprovalB
     except KeyError as error:
         raise RoadexApprovalProjectionError("source reference is malformed") from error
     _validate_loader_source_identity(binding, source)
+    # Exact loading is an integrity boundary, not merely deserialization.  In
+    # particular, the backup adapter validates its immutable plan digest here
+    # after source identity has been checked, matching the legacy load order.
+    _adapter_evidence_digest(adapter, source)
     return source
 
 

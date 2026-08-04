@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import asdict
 
 import pytest
 
@@ -249,3 +250,45 @@ def test_bundle_digest_converges_after_outbox_entries_receive_its_derived_value(
     )
 
     assert bundle_digest(bound) == bound.bundle_digest
+
+
+def test_bundle_snapshots_nested_plan_mappings_against_external_mutation():
+    intent = intent_fixture()
+    plan = plan_fixture(intent.plan_id)
+    original_evidence = plan.evidence_ids
+    original_arguments = plan.steps[0].arguments
+    bundle = ProvisioningBundleV1(
+        "1", intent, plan, report_fixture(intent.plan_id),
+        outbox_fixture(plan_id=intent.plan_id), "sha256:" + "0" * 64, None, (),
+    )
+    original_digest = bundle_digest(bundle)
+
+    original_evidence["kira"] = "crew.changed"
+    original_arguments["commit"] = "f" * 40
+
+    assert bundle.plan.evidence_ids["kira"] == "crew.kira.review-v20"
+    assert bundle.plan.steps[0].arguments["commit"] == "b" * 40
+    assert bundle_digest(bundle) == original_digest
+    with pytest.raises(TypeError):
+        bundle.plan.evidence_ids["kira"] = "crew.changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        bundle.plan.steps[0].arguments["commit"] = "f" * 40  # type: ignore[index]
+    assert asdict(bundle.plan)["evidence_ids"]["kira"] == "crew.kira.review-v20"
+
+
+def test_canonical_digest_rejects_non_string_mapping_keys_at_every_depth():
+    with pytest.raises(ValueError, match="string keys"):
+        canonical_digest({1: "one"})
+    with pytest.raises(ValueError, match="string keys"):
+        canonical_digest({"outer": [{"nested": {1: "one"}}]})
+
+
+def test_bundle_rejects_malformed_outbox_entry_with_value_error():
+    bundle = bundle_fixture()
+
+    with pytest.raises(ValueError, match="bundle requires four exact"):
+        ProvisioningBundleV1(
+            bundle.schema_version, bundle.intent, bundle.plan, bundle.preflight,
+            (object(), *bundle.outbox[1:]), bundle.bundle_digest,
+            bundle.supersedes_plan_id, bundle.changed_immutable_inputs,
+        )

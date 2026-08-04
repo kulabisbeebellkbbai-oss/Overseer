@@ -6,7 +6,8 @@ will build and persist authoritatively.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+import copy
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
 import json
@@ -14,7 +15,7 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
-from .backup_provisioning import DonutHoleBackupProvisioningPlan
+from .backup_provisioning import DonutHoleBackupProvisioningPlan, ProvisioningStep
 from .core import OwnerDomain
 
 
@@ -40,6 +41,27 @@ _REVIEW_OWNERS = (
     ("security", OwnerDomain.ODO_IDS),
     ("sisko", OwnerDomain.SISKO),
 )
+
+
+class _FrozenMapping(Mapping[str, object]):
+    """An immutable mapping that remains compatible with dataclass snapshots."""
+
+    def __init__(self, values: Mapping[str, object]) -> None:
+        self._values = MappingProxyType(dict(values))
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> dict[str, object]:
+        copied = {key: copy.deepcopy(value, memo) for key, value in self._values.items()}
+        memo[id(self)] = copied
+        return copied
 
 
 def _nonempty_string(value: object, label: str) -> str:
@@ -69,7 +91,7 @@ def _freeze_value(value: object) -> object:
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise ValueError("canonical mappings require string keys")
-        return MappingProxyType({key: _freeze_value(child) for key, child in value.items()})
+        return _FrozenMapping({key: _freeze_value(child) for key, child in value.items()})
     if isinstance(value, tuple):
         return tuple(_freeze_value(child) for child in value)
     if isinstance(value, list):
@@ -87,12 +109,43 @@ def _frozen_mapping(value: object, label: str) -> Mapping[str, object]:
     return frozen
 
 
+def _snapshot_steps(value: object, label: str) -> tuple[ProvisioningStep, ...]:
+    if not isinstance(value, tuple) or any(type(step) is not ProvisioningStep for step in value):
+        raise ValueError(f"{label} must be an immutable tuple of exact provisioning steps")
+    return tuple(
+        ProvisioningStep(
+            _nonempty_string(step.operation, f"{label} operation"),
+            _frozen_mapping(step.arguments, f"{label} arguments"),
+        )
+        for step in value
+    )
+
+
+def _snapshot_plan(plan: DonutHoleBackupProvisioningPlan) -> DonutHoleBackupProvisioningPlan:
+    """Detach bundle-owned plan values from every caller-owned nested mapping."""
+    if not isinstance(plan.root_registrations, tuple):
+        raise ValueError("bundle plan root registrations must be immutable")
+    return replace(
+        plan,
+        root_authorization_refs=_frozen_mapping(plan.root_authorization_refs, "bundle plan authorization references"),
+        root_registrations=tuple(
+            _frozen_mapping(registration, "bundle plan root registration")
+            for registration in plan.root_registrations
+        ),
+        evidence_ids=_frozen_mapping(plan.evidence_ids, "bundle plan evidence IDs"),
+        steps=_snapshot_steps(plan.steps, "bundle plan steps"),
+        rollback_steps=_snapshot_steps(plan.rollback_steps, "bundle plan rollback steps"),
+    )
+
+
 def _canonical_value(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value) and not isinstance(value, type):
         return {field.name: _canonical_value(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("canonical mappings require string keys")
         return {key: _canonical_value(child) for key, child in value.items()}
     if isinstance(value, (tuple, list)):
         return [_canonical_value(child) for child in value]
@@ -244,13 +297,16 @@ class ProvisioningBundleV1:
             raise ValueError("bundle requires exact typed intent and plan")
         if type(self.preflight) is not ProvisioningPreflightReport:
             raise ValueError("bundle requires an exact preflight report")
+        object.__setattr__(self, "plan", _snapshot_plan(self.plan))
         if self.intent.plan_id != self.plan.plan_id:
             raise ValueError("bundle plan ID must match intent")
         if self.preflight.plan_id != self.plan.plan_id:
             raise ValueError("bundle plan ID must match preflight")
-        if not isinstance(self.outbox, tuple) or tuple((entry.role, entry.owner_domain) for entry in self.outbox) != _REVIEW_OWNERS:
+        if not isinstance(self.outbox, tuple) or any(type(entry) is not ProvisioningReviewOutboxEntry for entry in self.outbox):
             raise ValueError("bundle requires four exact ordered review outbox entries")
-        if any(type(entry) is not ProvisioningReviewOutboxEntry or entry.plan_id != self.plan.plan_id for entry in self.outbox):
+        if tuple((entry.role, entry.owner_domain) for entry in self.outbox) != _REVIEW_OWNERS:
+            raise ValueError("bundle requires four exact ordered review outbox entries")
+        if any(entry.plan_id != self.plan.plan_id for entry in self.outbox):
             raise ValueError("bundle outbox must bind the exact plan")
         _digest(self.bundle_digest, "bundle digest")
         if any(entry.bundle_digest != self.bundle_digest for entry in self.outbox):

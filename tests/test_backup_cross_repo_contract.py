@@ -2,6 +2,7 @@ import ast
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -27,6 +28,9 @@ from overseer.storage_adapter import (
 THEUNDERDARK = Path(__file__).resolve().parents[2] / "TheUnderdark"
 FIXTURE = Path(__file__).parent / "fixtures/contracts/donuthole_backup_provisioning_v1.json"
 COMMON = {"project_id", "root_id", "request_id", "idempotency_key", "authorization_ref", "policy_revision", "reason"}
+THEUNDERDARK_PYTHON_ENV = "THEUNDERDARK_CONTRACT_PYTHON"
+THEUNDERDARK_SOURCE_ENV = "THEUNDERDARK_CONTRACT_SOURCE"
+THEUNDERDARK_FIXTURE_ENV = "THEUNDERDARK_DONUTHOLE_CONTRACT_FIXTURE"
 
 
 def test_provisioning_contract_fixture_is_canonical_complete_and_matches_current_mcp_schemas():
@@ -188,6 +192,46 @@ def test_runtime_artifact_identity_is_deterministic_and_schema_bound():
     altered = copy.deepcopy(EXPECTED_BACKUP_TOOL_SCHEMAS)
     altered["underdark_backup_create"]["properties"]["retention_count"] = {"type": "number"}
     assert identity != runtime_artifact_identity("a" * 40, altered)
+
+
+def test_theunderdark_contract_mirror_parses_via_explicit_checkout_paths() -> None:
+    configured = {
+        THEUNDERDARK_PYTHON_ENV: os.environ.get(THEUNDERDARK_PYTHON_ENV),
+        THEUNDERDARK_SOURCE_ENV: os.environ.get(THEUNDERDARK_SOURCE_ENV),
+        THEUNDERDARK_FIXTURE_ENV: os.environ.get(THEUNDERDARK_FIXTURE_ENV),
+    }
+    if not all(configured.values()):
+        pytest.skip(
+            "external TheUnderdark checkout is intentionally absent; set "
+            f"{THEUNDERDARK_PYTHON_ENV}, {THEUNDERDARK_SOURCE_ENV}, and "
+            f"{THEUNDERDARK_FIXTURE_ENV} to verify the mirror"
+        )
+    python = Path(configured[THEUNDERDARK_PYTHON_ENV])
+    source = Path(configured[THEUNDERDARK_SOURCE_ENV])
+    fixture = Path(configured[THEUNDERDARK_FIXTURE_ENV])
+    assert python.is_file(), f"configured TheUnderdark interpreter is not a file: {python}"
+    assert source.is_dir(), f"configured TheUnderdark source is not a directory: {source}"
+    assert fixture.is_file(), f"configured TheUnderdark fixture is not a file: {fixture}"
+    assert FIXTURE.read_bytes() == fixture.read_bytes()
+    script = textwrap.dedent("""
+        from pathlib import Path
+        from theunderdark.backup_contract import canonical_contract_bytes, load_provisioning_contract
+        fixture = Path(__import__("sys").argv[1])
+        contract = load_provisioning_contract(fixture)
+        assert fixture.read_bytes() == canonical_contract_bytes(contract.raw)
+        print(contract.version)
+    """)
+    environment = {**os.environ, "PYTHONPATH": str(source)}
+    result = subprocess.run(
+        [str(python), "-c", script, str(fixture)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "1\n"
 
 
 @pytest.mark.skipif(not THEUNDERDARK.exists(), reason="sibling TheUnderdark checkout is unavailable")

@@ -33,6 +33,23 @@ THEUNDERDARK_SOURCE_ENV = "THEUNDERDARK_CONTRACT_SOURCE"
 THEUNDERDARK_FIXTURE_ENV = "THEUNDERDARK_DONUTHOLE_CONTRACT_FIXTURE"
 
 
+def _external_theunderdark_contract_config() -> dict[str, str] | None:
+    configured = {
+        THEUNDERDARK_PYTHON_ENV: os.environ.get(THEUNDERDARK_PYTHON_ENV),
+        THEUNDERDARK_SOURCE_ENV: os.environ.get(THEUNDERDARK_SOURCE_ENV),
+        THEUNDERDARK_FIXTURE_ENV: os.environ.get(THEUNDERDARK_FIXTURE_ENV),
+    }
+    if not any(configured.values()):
+        return None
+    missing = [name for name, value in configured.items() if not value]
+    if missing:
+        raise ValueError(
+            "incomplete external TheUnderdark contract configuration; missing "
+            + ", ".join(missing)
+        )
+    return {name: value for name, value in configured.items() if value is not None}
+
+
 def test_provisioning_contract_fixture_is_canonical_complete_and_matches_current_mcp_schemas():
     contract = load_provisioning_contract(FIXTURE)
 
@@ -194,13 +211,22 @@ def test_runtime_artifact_identity_is_deterministic_and_schema_bound():
     assert identity != runtime_artifact_identity("a" * 40, altered)
 
 
+def test_partial_external_theunderdark_contract_config_fails_clearly(monkeypatch) -> None:
+    for name in (
+        THEUNDERDARK_PYTHON_ENV,
+        THEUNDERDARK_SOURCE_ENV,
+        THEUNDERDARK_FIXTURE_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(THEUNDERDARK_PYTHON_ENV, "/fixture/python")
+
+    with pytest.raises(ValueError, match="incomplete external TheUnderdark contract configuration"):
+        _external_theunderdark_contract_config()
+
+
 def test_theunderdark_contract_mirror_parses_via_explicit_checkout_paths() -> None:
-    configured = {
-        THEUNDERDARK_PYTHON_ENV: os.environ.get(THEUNDERDARK_PYTHON_ENV),
-        THEUNDERDARK_SOURCE_ENV: os.environ.get(THEUNDERDARK_SOURCE_ENV),
-        THEUNDERDARK_FIXTURE_ENV: os.environ.get(THEUNDERDARK_FIXTURE_ENV),
-    }
-    if not all(configured.values()):
+    configured = _external_theunderdark_contract_config()
+    if configured is None:
         pytest.skip(
             "external TheUnderdark checkout is intentionally absent; set "
             f"{THEUNDERDARK_PYTHON_ENV}, {THEUNDERDARK_SOURCE_ENV}, and "

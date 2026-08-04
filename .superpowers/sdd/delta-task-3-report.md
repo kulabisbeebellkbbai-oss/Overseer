@@ -176,7 +176,8 @@ store.
   `http://127.0.0.1:8766/roadex/approval-stage`, using the existing root-owned
   Overseer token reader. It sends exactly `{intent}`, validates authentication,
   HTTP status/framing/content length/size, exact locator shape and scope,
-  aborts on timeout, and returns only redacted failures.
+  rejects intent project/resource scope before remote staging, aborts on
+  timeout, and returns only redacted failures.
 - The workflow host passes an `AbortSignal` through staging and checks the
   timed-out/settled guard immediately before durable wait registration. A
   staging promise released after timeout registers zero waits.
@@ -195,13 +196,13 @@ After the minimal implementation, the focused correction suite passed:
 
 ```text
 npm test -- --run tests/approvalWorkflowMcp.test.ts tests/overseerApprovalStageTransport.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalWorkflowHost.test.ts tests/sessionService.test.ts
-5 files passed, 117 tests passed
+5 files passed, 118 tests passed
 
 npm test -- tests/approvalLifecycleIntegration.test.ts tests/approvalStatusProvider.test.ts tests/approvalCoordinator.test.ts tests/approvalWorkflowMcp.test.ts
 4 files passed, 108 tests passed
 
 npm test
-53 files passed, 540 tests passed
+53 files passed, 542 tests passed
 
 npm run lint
 passed
@@ -231,7 +232,7 @@ producer decisions. No correction file is involved.
 
 ### Correction commits and boundaries
 
-- Roadex source: `7369f59a6c5c7fdf611a9f9b839531603114bf18` — `fix: correct authoritative approval staging`
+- Roadex source: `d370b3bdef797376170ff54988f969ebadf31913` — follow-up `fix: reject mismatched approval intents before staging` after `7369f59a6c5c7fdf611a9f9b839531603114bf18`
 - Overseer source: `10bc64417344de2d699b58d75e724144b455daf0` — `fix: harden Roadex approval staging API`
 
 No main checkout, DonutHole checkout, live store/service, approval,

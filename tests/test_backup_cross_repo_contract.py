@@ -12,6 +12,7 @@ import pytest
 from overseer.backup_contract import (
     PROVISIONING_CONTRACT_VERSION,
     canonical_contract_bytes,
+    load_packaged_provisioning_contract,
     load_provisioning_contract,
     runtime_artifact_identity,
 )
@@ -72,6 +73,13 @@ def test_provisioning_contract_fixture_is_canonical_complete_and_matches_current
         "clean_install",
         "active_service_upgrade",
     ]
+
+
+def test_packaged_contract_bytes_exactly_match_the_test_fixture():
+    packaged = load_packaged_provisioning_contract()
+
+    assert canonical_contract_bytes(packaged.raw) == FIXTURE.read_bytes()
+    assert packaged.raw == load_provisioning_contract(FIXTURE).raw
 
 
 def test_provisioning_contract_rejects_noncanonical_bytes_and_invalid_nested_types(tmp_path):

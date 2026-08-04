@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from importlib.resources import files
 import json
 import re
 from pathlib import Path
@@ -64,9 +65,19 @@ def runtime_artifact_identity(commit: str, schemas: Mapping[str, object]) -> str
     return "sha256:" + hashlib.sha256(canonical_contract_bytes(payload)).hexdigest()
 
 
+def load_packaged_provisioning_contract() -> ProvisioningContract:
+    """Load the production-owned reviewed contract bundled with Overseer."""
+    return _load_provisioning_contract_bytes(
+        files("overseer").joinpath("data/donuthole_backup_provisioning_v1.json").read_bytes()
+    )
+
+
 def load_provisioning_contract(path: Path) -> ProvisioningContract:
     """Load one canonical v1 fixture, rejecting unknown fields and malformed values."""
-    encoded = path.read_bytes()
+    return _load_provisioning_contract_bytes(path.read_bytes())
+
+
+def _load_provisioning_contract_bytes(encoded: bytes) -> ProvisioningContract:
     try:
         raw = json.loads(encoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

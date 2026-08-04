@@ -1,5 +1,10 @@
 from types import SimpleNamespace
 import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 import urllib.error
 
 import pytest
@@ -20,6 +25,24 @@ def test_construction_requires_explicit_confirmation_and_root():
     with pytest.raises(PermissionError): ConcreteHostProvisioningAdapter(plan,privileged_confirmation="yes",euid_provider=lambda:1000,username_provider=lambda uid:"god")
     with pytest.raises(PermissionError): ConcreteHostProvisioningAdapter(plan,privileged_confirmation=PRIVILEGED_CONFIRMATION,euid_provider=lambda:0,username_provider=lambda uid:"root")
     with pytest.raises(PermissionError): ConcreteHostProvisioningAdapter(plan,privileged_confirmation=PRIVILEGED_CONFIRMATION,euid_provider=lambda:1001,username_provider=lambda uid:"other")
+
+
+def test_package_only_import_loads_the_reviewed_contract_without_tests_directory(tmp_path):
+    source_package = Path(__file__).parents[1] / "src/overseer"
+    package_root = tmp_path / "package-only"
+    shutil.copytree(source_package, package_root / "overseer", ignore=shutil.ignore_patterns("__pycache__"))
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS; print(sorted(EXPECTED_BACKUP_TOOL_SCHEMAS))"],
+        cwd=package_root,
+        env={**os.environ, "PYTHONPATH": ""},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "['underdark_backup_create', 'underdark_backup_verify_restore']"
 
 def test_exact_plan_step_uses_argv_without_shell_and_redacts_process_output():
     commit="a"*40; step=ProvisioningStep("verify_published_adapter_source",{"path":"/approved/source","commit":commit,"capability_digest":capability_digest(commit,EXPECTED_BACKUP_TOOL_SCHEMAS),"provisioning_contract_version":PROVISIONING_CONTRACT_VERSION,"runtime_artifact_identity":runtime_artifact_identity(commit,EXPECTED_BACKUP_TOOL_SCHEMAS)}); calls=[]

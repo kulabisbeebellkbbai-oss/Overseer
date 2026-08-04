@@ -23,18 +23,15 @@ from typing import Callable, Mapping
 
 from .backup_contract import (
     PROVISIONING_CONTRACT_VERSION,
-    load_provisioning_contract,
+    load_packaged_provisioning_contract,
     runtime_artifact_identity,
 )
 from .backup_provisioning import DonutHoleBackupProvisioningPlan, ProvisioningStep
 
 PRIVILEGED_CONFIRMATION="execute-exact-donuthole-backup-provisioning-plan"
 OPERATOR_USER="god"
-_CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "tests/fixtures/contracts/donuthole_backup_provisioning_v1.json"
-
-
 def _reviewed_backup_tool_schemas() -> dict[str, object]:
-    contract = load_provisioning_contract(_CONTRACT_FIXTURE)
+    contract = load_packaged_provisioning_contract()
     tools = contract.raw["mcp_tools"]
     if not isinstance(tools, Mapping):
         raise RuntimeError("reviewed provisioning contract tool schemas are invalid")

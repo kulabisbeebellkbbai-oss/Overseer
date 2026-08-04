@@ -79,6 +79,7 @@ def run_acceptance_scenario(
     *,
     include_backup_restore: bool = False,
     retain_previous_runtime: bool = False,
+    tamper_installed_runtime: bool = False,
 ) -> dict[str, object]:
     """Launch disposable composition with explicit external interpreter/source paths."""
 
@@ -105,6 +106,7 @@ def run_acceptance_scenario(
             "--child",
             *( ["--include-backup-restore"] if include_backup_restore else [] ),
             *( ["--retain-previous-runtime"] if retain_previous_runtime else [] ),
+            *( ["--tamper-installed-runtime"] if tamper_installed_runtime else [] ),
             str(contract_path),
             scenario_name,
             str(workspace),
@@ -379,10 +381,8 @@ def _seed_active_upgrade_state(
     return "verified_no_op"
 
 
-def _write_runtime_artifact(path: Path, identity: str) -> None:
-    payload = {"identity": identity, "kind": "donuthole-runtime-artifact-v1"}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    path.write_bytes(encoded)
+def _write_runtime_artifact(path: Path, artifact_bytes: bytes) -> None:
+    path.write_bytes(artifact_bytes)
     path.chmod(0o400)
 
 
@@ -390,25 +390,21 @@ def _read_runtime_artifact(path: Path) -> str:
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o400:
         raise AssertionError("disposable runtime artifact is not immutable")
-    decoded = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(decoded, dict) or set(decoded) != {"identity", "kind"}:
-        raise AssertionError("disposable runtime artifact is malformed")
-    identity = decoded["identity"]
-    if decoded["kind"] != "donuthole-runtime-artifact-v1" or not isinstance(identity, str):
-        raise AssertionError("disposable runtime artifact identity is malformed")
-    return identity
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _seed_runtime_artifacts(
     workspace: Path,
-    scenario: Mapping[str, object],
     *,
+    previous_bytes: bytes,
+    previous_identity: str,
+    planned_bytes: bytes,
+    planned_identity: str,
     retain_previous_runtime: bool,
+    tamper_installed_runtime: bool,
 ) -> dict[str, str]:
     """Install the deterministic planned candidate without a process lifecycle."""
-    previous = scenario["previous_runtime_identity"]
-    planned = scenario["planned_runtime_identity"]
-    if not isinstance(previous, str) or not isinstance(planned, str) or previous == planned:
+    if previous_identity == planned_identity:
         raise AssertionError("active-upgrade runtime identities are invalid")
     artifact_dir = workspace / "runtime-artifacts"
     artifact_dir.mkdir(mode=0o700, exist_ok=True)
@@ -416,15 +412,19 @@ def _seed_runtime_artifacts(
     previous_path = artifact_dir / "previous.json"
     planned_path = artifact_dir / "planned.json"
     installed_path = artifact_dir / "installed.json"
-    _write_runtime_artifact(previous_path, previous)
-    _write_runtime_artifact(planned_path, planned)
-    _write_runtime_artifact(installed_path, previous if retain_previous_runtime else planned)
+    _write_runtime_artifact(previous_path, previous_bytes)
+    _write_runtime_artifact(planned_path, planned_bytes)
+    _write_runtime_artifact(installed_path, previous_bytes if retain_previous_runtime else planned_bytes)
+    if tamper_installed_runtime:
+        installed_path.chmod(0o600)
+        installed_path.write_bytes(installed_path.read_bytes() + b"!")
+        installed_path.chmod(0o400)
     identities = {
         "previous": _read_runtime_artifact(previous_path),
         "planned": _read_runtime_artifact(planned_path),
         "installed": _read_runtime_artifact(installed_path),
     }
-    if identities["previous"] != previous or identities["planned"] != planned:
+    if identities["previous"] != previous_identity or identities["planned"] != planned_identity:
         raise AssertionError("runtime artifact identities diverged from the fixture")
     return identities
 
@@ -437,6 +437,7 @@ def _child_run(
     *,
     include_backup_restore: bool,
     retain_previous_runtime: bool,
+    tamper_installed_runtime: bool,
 ) -> dict[str, object]:
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     scenarios = {item["name"]: item for item in contract["scenarios"]}
@@ -471,6 +472,8 @@ def _child_run(
     registration_disposition = None
     runtime_identity = None
     if scenario_name == "active_service_upgrade":
+        from overseer.backup_contract import previous_runtime_artifact_bytes, runtime_artifact_bytes
+
         runtime = contract["runtime_identity"]
         if not isinstance(runtime, Mapping) or scenario.get("previous_runtime_identity") != runtime.get("previous_identity") or scenario.get("planned_runtime_identity") != runtime.get("planned_identity"):
             raise AssertionError("active-upgrade scenario does not match the reviewed runtime identity")
@@ -482,8 +485,12 @@ def _child_run(
         )
         runtime_identity = _seed_runtime_artifacts(
             workspace,
-            scenario,
+            previous_bytes=previous_runtime_artifact_bytes(str(runtime["commit"]), contract["mcp_tools"]),
+            previous_identity=str(scenario["previous_runtime_identity"]),
+            planned_bytes=runtime_artifact_bytes(str(runtime["commit"]), contract["mcp_tools"]),
+            planned_identity=str(scenario["planned_runtime_identity"]),
             retain_previous_runtime=retain_previous_runtime,
+            tamper_installed_runtime=tamper_installed_runtime,
         )
     service = _load_builder(builder_path)(workspace, authority_path)
     from theunderdark.production_app import create_production_mcp
@@ -642,6 +649,7 @@ def _main() -> None:
     parser.add_argument("--child", action="store_true")
     parser.add_argument("--include-backup-restore", action="store_true")
     parser.add_argument("--retain-previous-runtime", action="store_true")
+    parser.add_argument("--tamper-installed-runtime", action="store_true")
     parser.add_argument("contract_path", type=Path)
     parser.add_argument("scenario_name")
     parser.add_argument("workspace", type=Path)
@@ -656,6 +664,7 @@ def _main() -> None:
         arguments.builder_path,
         include_backup_restore=arguments.include_backup_restore,
         retain_previous_runtime=arguments.retain_previous_runtime,
+        tamper_installed_runtime=arguments.tamper_installed_runtime,
     ), sort_keys=True))
 
 

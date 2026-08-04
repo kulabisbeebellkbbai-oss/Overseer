@@ -130,3 +130,18 @@ def test_active_service_upgrade_rejects_stale_installed_runtime(tmp_path: Path) 
     assert result["evidence"] == {"code": "runtime_identity_mismatch", "redacted": True}
     assert result["root_listing"]["relative_path"] == ""
     _assert_recursively_redacted(result, workspace=tmp_path)
+
+
+def test_active_service_upgrade_rejects_tampered_installed_runtime_bytes(tmp_path: Path) -> None:
+    result = run_acceptance_scenario(
+        CONTRACT_FIXTURE,
+        "active_service_upgrade",
+        tmp_path,
+        tamper_installed_runtime=True,
+    )
+
+    assert result["runtime_identity"]["installed"] != result["runtime_identity"]["planned"]
+    assert result["runtime_identity"]["matches_plan"] is False
+    assert result["terminal_status"] == "acceptance_failed"
+    assert result["evidence"] == {"code": "runtime_identity_mismatch", "redacted": True}
+    _assert_recursively_redacted(result, workspace=tmp_path)

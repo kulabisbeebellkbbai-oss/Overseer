@@ -14,6 +14,9 @@ from overseer.backup_contract import (
     canonical_contract_bytes,
     load_packaged_provisioning_contract,
     load_provisioning_contract,
+    previous_runtime_artifact_bytes,
+    previous_runtime_artifact_identity,
+    runtime_artifact_bytes,
     runtime_artifact_identity,
 )
 from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
@@ -223,6 +226,17 @@ def test_runtime_artifact_identity_is_deterministic_and_schema_bound():
     altered = copy.deepcopy(EXPECTED_BACKUP_TOOL_SCHEMAS)
     altered["underdark_backup_create"]["properties"]["retention_count"] = {"type": "number"}
     assert identity != runtime_artifact_identity("a" * 40, altered)
+
+
+def test_runtime_artifact_identities_are_the_sha256_of_their_canonical_bytes():
+    commit = "a" * 40
+
+    planned_bytes = runtime_artifact_bytes(commit, EXPECTED_BACKUP_TOOL_SCHEMAS)
+    previous_bytes = previous_runtime_artifact_bytes(commit, EXPECTED_BACKUP_TOOL_SCHEMAS)
+
+    assert runtime_artifact_identity(commit, EXPECTED_BACKUP_TOOL_SCHEMAS) == "sha256:" + hashlib.sha256(planned_bytes).hexdigest()
+    assert previous_runtime_artifact_identity(commit, EXPECTED_BACKUP_TOOL_SCHEMAS) == "sha256:" + hashlib.sha256(previous_bytes).hexdigest()
+    assert planned_bytes != previous_bytes
 
 
 @pytest.mark.parametrize(

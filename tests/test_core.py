@@ -3007,6 +3007,66 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_roadex_stage_locator_is_derived_from_persisted_binding(self):
+        from overseer.admin import plan_user_service_restart
+        from overseer.roadex_approval_status import RoadexApprovalBindingDraft, stage_bound_roadex_approval
+
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "overseer.sqlite3"
+            draft = RoadexApprovalBindingDraft(
+                approval_ref="admin.persisted.locator",
+                source_kind="admin-plan",
+                source_id="admin.persisted.locator",
+                project_id="project.persisted",
+                workspace_id="workspace.persisted",
+                resource_ref="resource.persisted",
+                authority_class="project-workflow",
+                subject="Persisted approval subject",
+            )
+            with SQLiteStore(store_path) as store:
+                binding = stage_bound_roadex_approval(
+                    store,
+                    draft,
+                    lambda: store.save_admin_change_plan(
+                        plan_user_service_restart(
+                            "admin.persisted.locator",
+                            "resource.persisted",
+                            "Persisted approval subject",
+                        )
+                    ),
+                )
+
+            with patch.object(
+                overseer_api,
+                "preflight_bundle_api",
+                return_value={"preflight_digest": "sha256:" + "a" * 64, "bundle_digest": "sha256:" + "b" * 64},
+            ), patch.object(
+                overseer_api,
+                "stage_bundle_api",
+                return_value={
+                    "approval_ref": binding.approval_ref,
+                    "project_id": "caller.override",
+                    "workspace_id": "caller.override",
+                    "resource_id": "caller.override",
+                    "authority_class": "privileged-operation",
+                    "scope_digest": "sha256:" + "c" * 64,
+                },
+            ):
+                locator = overseer_api.stage_roadex_approval_api(
+                    str(store_path),
+                    {"intent": {"operation": "typed-only"}},
+                )
+
+        self.assertEqual(locator, {
+            "provider": "overseer",
+            "approvalRef": binding.approval_ref,
+            "projectId": binding.project_id,
+            "workspaceId": binding.workspace_id,
+            "resourceRef": binding.resource_ref,
+            "authorityClass": binding.authority_class,
+            "scopeDigest": binding.scope_digest,
+        })
+
     def test_raw_provisioning_stage_api_fails_closed_after_typed_activation(self):
         from tests.test_backup_provisioning import (
             _raw_stage_payload,

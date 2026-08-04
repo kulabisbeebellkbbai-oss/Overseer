@@ -11,7 +11,7 @@ from json import JSONDecodeError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, urlsplit
 
 from .backup_provisioning import approve_plan_api as approve_backup_provisioning_plan_api, decide_roadex_human_plan_api, execute_plan_api as execute_backup_provisioning_plan_api, list_plans as list_backup_provisioning_plans, list_roadex_human_decisions, stage_plan_api as stage_backup_provisioning_plan_api
@@ -19,6 +19,7 @@ from .roadex_approval_status import (
     MissingRoadexApprovalError,
     roadex_approval_status,
 )
+from .store import SQLiteStore
 from .provisioning_bundle import (
     ProvisioningBundleError,
     bundle_status,
@@ -336,6 +337,45 @@ def codex_usage_health_status(db_path: str | Path | None = None) -> dict[str, An
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
 PROTECTED_GATEWAY_PREFIX = "/Overseer"
+
+
+def stage_roadex_approval_api(
+    store_path: str,
+    payload: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Stage one typed intent and return only its persisted approval locator."""
+    if type(payload) is not dict or set(payload) != {"intent"}:
+        raise ProvisioningBundleError("INVALID_ROADEX_APPROVAL_STAGE_REQUEST")
+
+    try:
+        preview = preflight_bundle_api(store_path, payload)
+        staged = stage_bundle_api(
+            store_path,
+            {
+                "intent": payload["intent"],
+                "expected_preflight_digest": preview["preflight_digest"],
+                "expected_bundle_digest": preview["bundle_digest"],
+            },
+        )
+        approval_ref = staged.get("approval_ref")
+        if not isinstance(approval_ref, str) or not approval_ref:
+            raise ValueError("staged approval reference is unavailable")
+        with SQLiteStore(store_path) as store:
+            binding = store.load_roadex_approval_binding(approval_ref)
+    except ProvisioningBundleError:
+        raise
+    except Exception as error:
+        raise ProvisioningBundleError("ROADEX_APPROVAL_STAGE_UNAVAILABLE") from error
+
+    return {
+        "provider": "overseer",
+        "approvalRef": binding.approval_ref,
+        "projectId": binding.project_id,
+        "workspaceId": binding.workspace_id,
+        "resourceRef": binding.resource_ref,
+        "authorityClass": binding.authority_class,
+        "scopeDigest": binding.scope_digest,
+    }
 
 
 def _strip_protected_gateway_prefix(path: str) -> str:
@@ -749,13 +789,14 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path == "/roadex/human-decisions/decide") and auth_context.get("auth_type") != "admin_token":
+            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path in {"/roadex/human-decisions/decide", "/roadex/approval-stage"}) and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
                 return
             if path in {
                 "/backup-provisioning/bundles/preflight",
                 "/backup-provisioning/bundles/stage",
                 "/backup-provisioning/review-outbox/dispatch",
+                "/roadex/approval-stage",
             } and route.query:
                 self._write_bundle_error(
                     "INVALID_BUNDLE_PREFLIGHT_REQUEST"
@@ -763,6 +804,8 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     else "INVALID_BUNDLE_STAGE_REQUEST"
                     if path.endswith("/stage")
                     else "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST"
+                    if path.endswith("/dispatch")
+                    else "INVALID_ROADEX_APPROVAL_STAGE_REQUEST"
                 )
                 return
             if path == "/backup-provisioning/bundles/preflight":
@@ -777,6 +820,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     lambda payload: stage_bundle_api(store_path, payload),
                     "INVALID_BUNDLE_STAGE_REQUEST",
                     "BUNDLE_STAGE_UNAVAILABLE",
+                )
+                return
+            if path == "/roadex/approval-stage":
+                self._handle_bundle_json(
+                    lambda payload: stage_roadex_approval_api(store_path, payload),
+                    "INVALID_ROADEX_APPROVAL_STAGE_REQUEST",
+                    "ROADEX_APPROVAL_STAGE_UNAVAILABLE",
                 )
                 return
             if path == "/backup-provisioning/review-outbox/dispatch":
@@ -1359,6 +1409,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     "BUNDLE_REQUEST_TOO_LARGE": HTTPStatus.CONTENT_TOO_LARGE,
                     "BUNDLE_PREFLIGHT_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
                     "BUNDLE_STAGE_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "ROADEX_APPROVAL_STAGE_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
                     "BUNDLE_STATUS_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
                     "BUNDLE_INTERNAL_ERROR": HTTPStatus.INTERNAL_SERVER_ERROR,
                     "REVIEW_OUTBOX_NOT_FOUND": HTTPStatus.NOT_FOUND,
@@ -1421,6 +1472,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     "BUNDLE_PREFLIGHT_UNAVAILABLE",
                     "BUNDLE_STAGE_UNAVAILABLE",
                     "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+                    "INVALID_ROADEX_APPROVAL_STAGE_REQUEST",
                     "INVALID_REVIEW_OUTBOX_REQUEST",
                     "REVIEW_OUTBOX_NOT_FOUND",
                     "REVIEW_OUTBOX_INTEGRITY_ERROR",

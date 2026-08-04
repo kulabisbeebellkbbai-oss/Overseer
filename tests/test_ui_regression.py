@@ -74,6 +74,34 @@ class LocalApiHarness:
 
 
 class ProtectedGatewayUiRegressionTests(unittest.TestCase):
+    def test_roadex_typed_stage_rejects_caller_supplied_locator_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "overseer.sqlite3"
+            with LocalApiHarness(path) as server:
+                request = Request(
+                    f"{server.url}/roadex/approval-stage",
+                    data=json.dumps({
+                        "intent": {"operation": "typed-only"},
+                        "approvalRef": "caller.override",
+                    }).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer test-secret",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(request)
+
+        self.assertEqual(error.exception.code, 400)
+        self.assertEqual(
+            json.loads(error.exception.read().decode("utf-8")),
+            {
+                "error": "provisioning_bundle_request_failed",
+                "error_code": "INVALID_ROADEX_APPROVAL_STAGE_REQUEST",
+            },
+        )
+
     def test_failover_recovery_ui_uses_status_contract(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 

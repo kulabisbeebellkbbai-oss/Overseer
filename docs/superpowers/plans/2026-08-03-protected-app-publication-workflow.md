@@ -27,6 +27,9 @@ cannot create gateway authority through its request payload.
   firewall authorization.
 - No existing submitted request is retroactively promoted without an exact
   migration decision and new binding.
+- Separate exact approval records are preserved for Roadex, Overseer, Protected
+  Service Gateway, firewall/IDS, and each project application; do not merge or
+  imply transfer among them.
 
 ---
 

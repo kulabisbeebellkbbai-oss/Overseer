@@ -399,15 +399,15 @@ crew requirements, and execution steps.
 - Do not modify Roadex, Overseer, Protected Service Gateway, firewall, or IDS
   source under this backup-facility plan.
 
-- [ ] Preserve the requester's inability to approve, deploy, activate, or edit
+- [x] Preserve the requester's inability to approve, deploy, activate, or edit
   gateway/firewall state.
-- [ ] Keep status exactly `submitted` until an authoritative external workflow
+- [x] Keep status exactly `submitted` until an authoritative external workflow
   reference and read-only status projection are designed and approved.
-- [ ] If prefixes beyond `/Roadex/...` are required, use the separate plan's
+- [x] If prefixes beyond `/Roadex/...` are required, use the separate plan's
   Protected Service Gateway prefix registry, Overseer ownership, compatibility
   tests, security/IDS review, deployment, activation, rollback, and distinct
   approvals. Roadex alone cannot authorize or assert that gateway support.
-- [ ] Preserve separate exact approval records for Roadex, Overseer, gateway,
+- [x] Preserve separate exact approval records for Roadex, Overseer, gateway,
   firewall/IDS, and each project application.
 
 ## Post-Implementation Operations Handoff

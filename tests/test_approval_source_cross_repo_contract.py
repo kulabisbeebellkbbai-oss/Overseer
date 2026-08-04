@@ -11,7 +11,6 @@ import pytest
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "approval_source_contract_v1.json"
 MANIFEST_PATH = Path(__file__).parents[1] / "docs" / "verification" / "approval-source-contract-v1-manifest.md"
-WORKSPACE_PATH = FIXTURE_PATH.parents[5]
 REVIEWED_FIXTURE_SHA256 = "4d79ef227927c13984ca2f913017352576d3ab8721063197ae049f4f57cf12e7"
 
 EXPECTED_STAGE_TYPES = {
@@ -151,8 +150,8 @@ EXPECTED_CONTRACT = {
 }
 
 
-def _load_contract() -> dict[str, object]:
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+def _load_contract(fixture_path: Path = FIXTURE_PATH) -> dict[str, object]:
+    return json.loads(fixture_path.read_text(encoding="utf-8"))
 
 
 def _manifest_digest(manifest: str) -> str:
@@ -168,6 +167,11 @@ def _validate_contract(contract: dict[str, object]) -> None:
 def _validate_reviewed_digest(fixture_bytes: bytes, manifest: str) -> None:
     assert _manifest_digest(manifest) == REVIEWED_FIXTURE_SHA256
     assert hashlib.sha256(fixture_bytes).hexdigest() == REVIEWED_FIXTURE_SHA256
+
+
+def _validate_local_contract_files(fixture_path: Path, manifest_path: Path) -> None:
+    _validate_contract(_load_contract(fixture_path))
+    _validate_reviewed_digest(fixture_path.read_bytes(), manifest_path.read_text(encoding="utf-8"))
 
 
 def test_canonical_approval_source_contract_has_exact_safe_shapes_and_cases() -> None:
@@ -208,22 +212,12 @@ def test_reviewed_digest_validator_rejects_a_stale_manifest_digest() -> None:
         _validate_reviewed_digest(FIXTURE_PATH.read_bytes(), stale_manifest)
 
 
-def test_consumer_contract_tests_do_not_depend_on_a_sibling_worktree_layout() -> None:
-    consumer_tests = (
-        WORKSPACE_PATH
-        / "Roadex"
-        / ".worktrees"
-        / "reusable-approval-facility"
-        / "tests"
-        / "approvalSourceContract.test.ts",
-        WORKSPACE_PATH
-        / "Overseer"
-        / ".worktrees"
-        / "donuthole-reusable-approval-facility"
-        / "tests"
-        / "tools"
-        / "test_approval_source_contract.py",
-    )
+def test_canonical_contract_validation_runs_from_only_local_checkout_files(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "tests" / "fixtures" / "approval_source_contract_v1.json"
+    manifest_path = tmp_path / "docs" / "verification" / "approval-source-contract-v1-manifest.md"
+    fixture_path.parent.mkdir(parents=True)
+    manifest_path.parent.mkdir(parents=True)
+    fixture_path.write_bytes(FIXTURE_PATH.read_bytes())
+    manifest_path.write_text(MANIFEST_PATH.read_text(encoding="utf-8"), encoding="utf-8")
 
-    for consumer_test in consumer_tests:
-        assert ".worktrees" not in consumer_test.read_text(encoding="utf-8")
+    _validate_local_contract_files(fixture_path, manifest_path)

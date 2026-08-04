@@ -22,6 +22,14 @@ from typing import (
     get_type_hints,
 )
 
+from .approval_source_registry import (
+    PRODUCTION_APPROVAL_SOURCE_REGISTRY,
+    ApprovalSourceAdapter,
+    ApprovalSourceStore,
+    ProjectedDecision,
+    resolve_adapter,
+    validate_projected_decision,
+)
 from .admin import AdminChangePlan
 from .backup_provisioning import (
     DonutHoleBackupProvisioningPlan,
@@ -271,7 +279,11 @@ def _decode_roadex_binding_payload(payload: str) -> RoadexApprovalBinding:
             _require_truthy_str(data[field.name], field.name)
             continue
         if field.name == "source_kind":
-            _require_enum(data[field.name], {"admin-plan", "roadex-human-decision"}, field.name)
+            try:
+                resolve_adapter(PRODUCTION_APPROVAL_SOURCE_REGISTRY, data[field.name])
+            except ValueError as error:
+                allowed = ",".join(sorted(PRODUCTION_APPROVAL_SOURCE_REGISTRY))
+                raise ValueError(f"source_kind must be one of: {allowed}") from error
             continue
         if field.name == "authority_class":
             _require_enum(
@@ -301,27 +313,28 @@ def _decode_admin_plan_payload(payload: str) -> AdminChangePlan:
 
 
 def _decode_roadex_plan_payload(payload: str) -> DonutHoleBackupProvisioningPlan:
-    return _decode_dataclass_payload(payload, DonutHoleBackupProvisioningPlan, "roadex source")
+    plan = _decode_dataclass_payload(payload, DonutHoleBackupProvisioningPlan, "roadex source")
+    if plan.kind != PLAN_KIND:
+        raise ValueError("exact kind must be preserved")
+    if plan.decision_source != "Roadex":
+        raise ValueError("Roadex decision source must be preserved")
+    return plan
 
 
-def _load_admin_change_payload(store, source_id: str) -> AdminChangePlan:
-    row = store._connection.execute(
-        "SELECT payload FROM admin_change_plans WHERE id=?",
-        (source_id,),
-    ).fetchone()
-    if row is None:
-        raise KeyError(source_id)
-    return _decode_admin_plan_payload(str(row["payload"]))
+def _load_admin_change_payload(store: ApprovalSourceStore, source_id: str) -> AdminChangePlan:
+    return _decode_admin_plan_payload(
+        store.load_registered_source_payload("admin-change-plan", source_id)
+    )
 
 
-def _load_roadex_plan_payload(store, source_id: str) -> DonutHoleBackupProvisioningPlan:
+def _load_roadex_plan_payload(store: ApprovalSourceStore, source_id: str) -> DonutHoleBackupProvisioningPlan:
     return load_roadex_human_plan(store, source_id)
 
 
 @dataclass(frozen=True)
 class RoadexApprovalBindingDraft:
     approval_ref: str
-    source_kind: Literal["admin-plan", "roadex-human-decision"]
+    source_kind: str
     source_id: str
     project_id: str
     workspace_id: str
@@ -333,7 +346,7 @@ class RoadexApprovalBindingDraft:
 @dataclass(frozen=True)
 class RoadexApprovalBinding:
     approval_ref: str
-    source_kind: Literal["admin-plan", "roadex-human-decision"]
+    source_kind: str
     source_id: str
     project_id: str
     workspace_id: str
@@ -348,44 +361,31 @@ def stage_bound_roadex_approval(
     store,
     draft: RoadexApprovalBindingDraft,
     save_source: Callable[[], None],
+    *,
+    registry=PRODUCTION_APPROVAL_SOURCE_REGISTRY,
 ) -> RoadexApprovalBinding:
-    _validate_approval_binding_draft(draft)
+    adapter = _validate_approval_binding_draft(draft, registry=registry)
     with store.agent_transaction():
         existing = _load_existing_binding(store, draft.approval_ref)
         if existing is not None:
-            source = load_source_from_draft(store, draft)
-            _validate_replayed_binding(existing, draft, source)
+            source = load_source_from_draft(store, draft, registry=registry)
+            _validate_replayed_binding(existing, draft, source, adapter=adapter)
             return existing
 
-        if _source_exists_for_draft(store, draft):
+        if _source_exists_for_draft(store, draft, registry=registry):
             raise ValueError("preexisting source cannot be bound")
 
         save_source()
-        source = load_source_from_draft(store, draft)
-        _require_initial_source_state(draft.source_kind, source)
-        source_digest = exact_source_evidence_digest(source)
+        source = load_source_from_draft(store, draft, registry=registry)
+        adapter.require_initial(source)
+        source_digest = _adapter_evidence_digest(adapter, source)
         binding = binding_from_draft(draft, source_digest)
         return store.save_roadex_approval_binding(binding)
 
 
-def _source_exists_for_draft(store, draft: RoadexApprovalBindingDraft) -> bool:
-    table = {
-        "admin-plan": "admin_change_plans",
-        "roadex-human-decision": "backup_provisioning_plans",
-    }[draft.source_kind]
-    table_exists = store._connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
-    ).fetchone()
-    if table_exists is None:
-        return False
-    return (
-        store._connection.execute(
-            f"SELECT 1 FROM {table} WHERE id=?",
-            (draft.source_id,),
-        ).fetchone()
-        is not None
-    )
+def _source_exists_for_draft(store: ApprovalSourceStore, draft: RoadexApprovalBindingDraft, *, registry) -> bool:
+    adapter = resolve_adapter(registry, draft.source_kind)
+    return store.registered_source_exists(adapter.accessor, draft.source_id)
 
 
 def roadex_approval_status(
@@ -401,32 +401,29 @@ def roadex_approval_status(
         except KeyError as error:
             raise MissingRoadexApprovalError(approval_ref) from error
         source = load_exact_bound_source(store, binding)
-        _validate_source(source, binding)
-        _validate_roadex_source_state(binding.source_kind, source)
-        source_digest = exact_source_evidence_digest(source)
-        verify_scope_digest(binding, source_digest)
-        decision, source_status, updated_at = project_decision(store, binding, source)
+        projected = project_decision(store, binding, source)
         decision_version = project_decision_version(
             binding,
-            source_status,
-            decision,
-            updated_at,
+            projected.source_status,
+            projected.decision,
+            projected.updated_at,
         )
-        return public_projection(binding, decision, decision_version, updated_at)
+        return public_projection(binding, projected.decision, decision_version, projected.updated_at)
 
 
-def load_exact_bound_source(store, binding: RoadexApprovalBinding):
+def load_exact_bound_source(store: ApprovalSourceStore, binding: RoadexApprovalBinding, *, registry=PRODUCTION_APPROVAL_SOURCE_REGISTRY):
+    adapter = resolve_adapter(registry, binding.source_kind)
     try:
-        if binding.source_kind == "admin-plan":
-            return _load_admin_change_payload(store, binding.source_id)
-        if binding.source_kind == "roadex-human-decision":
-            return _load_roadex_plan_payload(store, binding.source_id)
+        source = adapter.decode_exact(
+            store.load_registered_source_payload(adapter.accessor, binding.source_id)
+        )
     except KeyError as error:
         raise RoadexApprovalProjectionError("source reference is malformed") from error
-    raise ValueError("unsupported source_kind")
+    _validate_loader_source_identity(binding, source)
+    return source
 
 
-def project_decision(
+def _legacy_project_decision(
     store,
     binding: RoadexApprovalBinding,
     source: object,
@@ -569,16 +566,54 @@ def project_decision(
     raise ValueError("unsupported Roadex human decision status")
 
 
-def _validate_approval_binding_draft(draft: object) -> None:
+def _project_admin_source_decision(
+    store: ApprovalSourceStore,
+    binding: RoadexApprovalBinding,
+    source: object,
+) -> ProjectedDecision:
+    if binding.source_kind != "admin-plan":
+        raise ValueError("admin adapter received an incompatible binding")
+    decision, source_status, updated_at = _legacy_project_decision(store, binding, source)
+    return ProjectedDecision(decision, source_status, updated_at)
+
+
+def _project_backup_source_decision(
+    store: ApprovalSourceStore,
+    binding: RoadexApprovalBinding,
+    source: object,
+) -> ProjectedDecision:
+    if binding.source_kind != "roadex-human-decision":
+        raise ValueError("backup adapter received an incompatible binding")
+    decision, source_status, updated_at = _legacy_project_decision(store, binding, source)
+    return ProjectedDecision(decision, source_status, updated_at)
+
+
+def project_decision(
+    store: ApprovalSourceStore,
+    binding: RoadexApprovalBinding,
+    source: object,
+    *,
+    registry=PRODUCTION_APPROVAL_SOURCE_REGISTRY,
+) -> ProjectedDecision:
+    """Project one exact bound source through a reviewed immutable adapter."""
+    adapter = resolve_adapter(registry, binding.source_kind)
+    _validate_loader_source_identity(binding, source)
+    verify_scope_digest(binding, _adapter_evidence_digest(adapter, source))
+    projected = validate_projected_decision(adapter.project_decision(store, binding, source))
+    _require_iso8601(projected.updated_at, "updatedAt")
+    return projected
+
+
+def _validate_approval_binding_draft(
+    draft: object,
+    *,
+    registry=PRODUCTION_APPROVAL_SOURCE_REGISTRY,
+) -> ApprovalSourceAdapter:
     if not isinstance(draft, RoadexApprovalBindingDraft):
         raise ValueError("binding draft must be exact RoadexApprovalBindingDraft")
     _require_truthy_str(draft.approval_ref, "approval_ref")
     validate_opaque_ref(draft.approval_ref)
-    _require_enum(
-        draft.source_kind,
-        {"admin-plan", "roadex-human-decision"},
-        "source_kind",
-    )
+    adapter = resolve_adapter(registry, draft.source_kind)
     _require_truthy_str(draft.source_id, "source_id")
     _require_truthy_str(draft.project_id, "project_id")
     _require_truthy_str(draft.workspace_id, "workspace_id")
@@ -594,16 +629,19 @@ def _validate_approval_binding_draft(draft: object) -> None:
         and draft.source_id != draft.approval_ref
     ):
         raise ValueError("admin-plan source_id must match approval_ref")
+    return adapter
 
 
 def _validate_replayed_binding(
     existing: RoadexApprovalBinding,
     draft: RoadexApprovalBindingDraft,
     source: object,
+    *,
+    adapter: ApprovalSourceAdapter,
 ) -> None:
     expected = binding_from_draft(
         draft,
-        exact_source_evidence_digest(source),
+        _adapter_evidence_digest(adapter, source),
         created_at=existing.created_at,
     )
     if existing != expected:
@@ -640,6 +678,14 @@ def _require_initial_source_state(source_kind: str, source: object) -> None:
         _require_roadex_staged_plan_evidence(source_plan)
         return
     raise ValueError("unsupported source_kind")
+
+
+def _require_initial_admin_source_state(source: object) -> None:
+    _require_initial_source_state("admin-plan", source)
+
+
+def _require_initial_backup_source_state(source: object) -> None:
+    _require_initial_source_state("roadex-human-decision", source)
 
 
 def _require_admin_binding_reference(
@@ -707,12 +753,21 @@ def binding_from_draft(
     )
 
 
-def load_source_from_draft(store, draft: RoadexApprovalBindingDraft):
-    if draft.source_kind == "admin-plan":
-        return _load_admin_change_payload(store, draft.source_id)
-    if draft.source_kind == "roadex-human-decision":
-        return _load_roadex_plan_payload(store, draft.source_id)
-    raise ValueError("unsupported source_kind")
+def load_source_from_draft(
+    store: ApprovalSourceStore,
+    draft: RoadexApprovalBindingDraft,
+    *,
+    registry=PRODUCTION_APPROVAL_SOURCE_REGISTRY,
+):
+    adapter = resolve_adapter(registry, draft.source_kind)
+    try:
+        source = adapter.decode_exact(
+            store.load_registered_source_payload(adapter.accessor, draft.source_id)
+        )
+    except KeyError as error:
+        raise ValueError("source reference is malformed") from error
+    _validate_loader_source_identity(draft, source)
+    return source
 
 
 def source_evidence_digest(source: object) -> str:
@@ -725,6 +780,39 @@ def exact_source_evidence_digest(source: object) -> str:
     if isinstance(source, DonutHoleBackupProvisioningPlan):
         return source.plan_digest
     return _digest(to_jsonable(source))
+
+
+def _source_digest_from_admin_source(source: object) -> str:
+    return source_digest_from_admin_plan(_require_admin_plan(source))
+
+
+def _source_digest_from_backup_source(source: object) -> str:
+    plan = _require_roadex_plan(source)
+    try:
+        _validate_plan(plan)
+    except ValueError as error:
+        raise ValueError("plan digest") from error
+    return plan.plan_digest
+
+
+def _adapter_evidence_digest(adapter: ApprovalSourceAdapter, source: object) -> str:
+    digest = adapter.evidence_digest(source)
+    if not isinstance(digest, str) or not _ROAD_EX_EVIDENCE_DIGEST_PATTERN.fullmatch(digest):
+        raise ValueError("source evidence digest is malformed")
+    return digest
+
+
+def _validate_loader_source_identity(binding: object, source: object) -> None:
+    expected = getattr(binding, "source_id", None)
+    if not isinstance(expected, str) or not expected:
+        raise ValueError("source identity is malformed")
+    actual = getattr(source, "id", getattr(source, "plan_id", None))
+    if actual != expected:
+        if isinstance(source, AdminChangePlan):
+            raise ValueError("admin source id must match source payload")
+        if isinstance(source, DonutHoleBackupProvisioningPlan):
+            raise ValueError("source id must match approval source")
+        raise ValueError("source identity does not match binding")
 
 
 def verify_scope_digest(
@@ -793,14 +881,13 @@ def _draft_from_binding(binding: RoadexApprovalBinding) -> RoadexApprovalBinding
     )
 
 
-def load_roadex_human_plan(store, source_id: str) -> DonutHoleBackupProvisioningPlan:
-    row = store._connection.execute(
-        "SELECT payload FROM backup_provisioning_plans WHERE id=?",
-        (source_id,),
-    ).fetchone()
-    if row is None:
-        raise KeyError(source_id)
-    plan = _decode_roadex_plan_payload(str(row["payload"]))
+def load_roadex_human_plan(
+    store: ApprovalSourceStore,
+    source_id: str,
+) -> DonutHoleBackupProvisioningPlan:
+    plan = _decode_roadex_plan_payload(
+        store.load_registered_source_payload("backup-provisioning-plan", source_id)
+    )
     if plan.plan_id != source_id:
         raise ValueError("source id must match approval source")
     if plan.kind != PLAN_KIND:
@@ -837,7 +924,6 @@ def _require_roadex_plan(source: object) -> DonutHoleBackupProvisioningPlan:
         raise ValueError("Roadex decision source must be preserved")
     if source.kind != PLAN_KIND:
         raise ValueError("exact kind must be preserved")
-    _validate_plan(source)
     return source
 
 

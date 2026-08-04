@@ -2000,6 +2000,41 @@ class SQLiteStore:
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
 
+    def registered_source_exists(self, accessor: str, source_id: str) -> bool:
+        """Check a reviewed approval-source accessor without accepting SQL."""
+        table = {
+            "admin-change-plan": "admin_change_plans",
+            "backup-provisioning-plan": "backup_provisioning_plans",
+        }.get(accessor)
+        if table is None:
+            raise ValueError("unrecognized approval source accessor")
+        table_exists = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if table_exists is None:
+            return False
+        return self._connection.execute(
+            f"SELECT 1 FROM {table} WHERE id=?",
+            (source_id,),
+        ).fetchone() is not None
+
+    def load_registered_source_payload(self, accessor: str, source_id: str) -> str:
+        """Load an exact reviewed source payload selected only by its accessor."""
+        table = {
+            "admin-change-plan": "admin_change_plans",
+            "backup-provisioning-plan": "backup_provisioning_plans",
+        }.get(accessor)
+        if table is None:
+            raise ValueError("unrecognized approval source accessor")
+        row = self._connection.execute(
+            f"SELECT payload FROM {table} WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(source_id)
+        return str(row["payload"])
+
     def _ensure_roadex_approval_bindings(self) -> None:
         self._connection.execute(
             """

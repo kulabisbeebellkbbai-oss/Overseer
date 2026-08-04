@@ -1,0 +1,217 @@
+{
+  "contractVersion": "approval-source-contract/v1",
+  "schemas": {
+    "stageLocator": {
+      "additionalProperties": false,
+      "fields": {
+        "provider": "string",
+        "approvalRef": "string",
+        "projectId": "string",
+        "workspaceId": "string",
+        "resourceRef": "string",
+        "authorityClass": "string",
+        "scopeDigest": "sha256"
+      }
+    },
+    "statusProjection": {
+      "additionalProperties": false,
+      "fields": {
+        "provider": "string",
+        "approvalRef": "string",
+        "projectId": "string",
+        "workspaceId": "string",
+        "resourceRef": "string",
+        "authorityClass": "string",
+        "scopeDigest": "sha256",
+        "sourceKind": "string",
+        "subject": "string",
+        "decision": "approval-decision",
+        "decisionVersion": "sha256",
+        "updatedAt": "rfc3339-date-time"
+      }
+    }
+  },
+  "stageLocator": {
+    "provider": "overseer",
+    "approvalRef": "approval.fixture.v1",
+    "projectId": "project.fixture",
+    "workspaceId": "workspace.fixture",
+    "resourceRef": "resource.fixture",
+    "authorityClass": "project-workflow",
+    "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "statusProjection": {
+    "provider": "overseer",
+    "approvalRef": "approval.fixture.v1",
+    "projectId": "project.fixture",
+    "workspaceId": "workspace.fixture",
+    "resourceRef": "resource.fixture",
+    "authorityClass": "project-workflow",
+    "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "fixture-source",
+    "subject": "Synthetic approval fixture",
+    "decision": "pending",
+    "decisionVersion": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "updatedAt": "2026-08-03T00:00:00+00:00"
+  },
+  "cases": [
+    {
+      "name": "pending",
+      "operation": "status-read",
+      "statusProjection": {
+        "provider": "overseer",
+        "approvalRef": "approval.fixture.v1",
+        "projectId": "project.fixture",
+        "workspaceId": "workspace.fixture",
+        "resourceRef": "resource.fixture",
+        "authorityClass": "project-workflow",
+        "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceKind": "fixture-source",
+        "subject": "Synthetic approval fixture",
+        "decision": "pending",
+        "decisionVersion": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "updatedAt": "2026-08-03T00:00:00+00:00"
+      },
+      "expected": {
+        "continuation": "blocked",
+        "decision": "pending"
+      }
+    },
+    {
+      "name": "approved",
+      "operation": "status-read",
+      "statusProjection": {
+        "provider": "overseer",
+        "approvalRef": "approval.fixture.v1",
+        "projectId": "project.fixture",
+        "workspaceId": "workspace.fixture",
+        "resourceRef": "resource.fixture",
+        "authorityClass": "project-workflow",
+        "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceKind": "fixture-source",
+        "subject": "Synthetic approval fixture",
+        "decision": "approved",
+        "decisionVersion": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "updatedAt": "2026-08-03T00:01:00+00:00"
+      },
+      "expected": {
+        "continuation": "eligible",
+        "decision": "approved"
+      }
+    },
+    {
+      "name": "revision-requested",
+      "operation": "status-read",
+      "statusProjection": {
+        "provider": "overseer",
+        "approvalRef": "approval.fixture.v1",
+        "projectId": "project.fixture",
+        "workspaceId": "workspace.fixture",
+        "resourceRef": "resource.fixture",
+        "authorityClass": "project-workflow",
+        "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceKind": "fixture-source",
+        "subject": "Synthetic approval fixture",
+        "decision": "changes-requested",
+        "decisionVersion": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "updatedAt": "2026-08-03T00:02:00+00:00"
+      },
+      "expected": {
+        "continuation": "blocked",
+        "decision": "changes-requested"
+      }
+    },
+    {
+      "name": "rejected",
+      "operation": "status-read",
+      "statusProjection": {
+        "provider": "overseer",
+        "approvalRef": "approval.fixture.v1",
+        "projectId": "project.fixture",
+        "workspaceId": "workspace.fixture",
+        "resourceRef": "resource.fixture",
+        "authorityClass": "project-workflow",
+        "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceKind": "fixture-source",
+        "subject": "Synthetic approval fixture",
+        "decision": "rejected",
+        "decisionVersion": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "updatedAt": "2026-08-03T00:03:00+00:00"
+      },
+      "expected": {
+        "continuation": "blocked",
+        "decision": "rejected"
+      }
+    },
+    {
+      "name": "provider-failure",
+      "operation": "status-read",
+      "input": {
+        "stageLocator": {
+          "provider": "overseer",
+          "approvalRef": "approval.fixture.v1",
+          "projectId": "project.fixture",
+          "workspaceId": "workspace.fixture",
+          "resourceRef": "resource.fixture",
+          "authorityClass": "project-workflow",
+          "scopeDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "providerFailure": {
+        "code": "provider_unavailable",
+        "retryable": true
+      },
+      "expected": {
+        "continuation": "blocked",
+        "retryable": true
+      }
+    },
+    {
+      "name": "changed-replay",
+      "operation": "stage",
+      "input": {
+        "requestDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "storedRequestDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "accepted": false,
+        "result": "changed-replay"
+      }
+    },
+    {
+      "name": "exact-replay",
+      "operation": "stage",
+      "input": {
+        "requestDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "storedRequestDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "expected": {
+        "accepted": true,
+        "result": "exact-replay"
+      }
+    },
+    {
+      "name": "malformed-payload",
+      "operation": "status-read",
+      "input": {
+        "payload": "{\"decision\":true}"
+      },
+      "expected": {
+        "continuation": "blocked",
+        "result": "invalid-payload"
+      }
+    },
+    {
+      "name": "scope-mismatch",
+      "operation": "status-read",
+      "input": {
+        "requestedScopeDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "returnedScopeDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "expected": {
+        "continuation": "blocked",
+        "result": "scope-mismatch"
+      }
+    }
+  ]
+}

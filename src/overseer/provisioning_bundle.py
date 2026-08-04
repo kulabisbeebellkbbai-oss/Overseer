@@ -96,8 +96,10 @@ _MAX_GIT_OPERATION_SECONDS = 10.0
 _MAX_GIT_PROCESS_COUNT = _MAX_GIT_TREE_ENTRIES * 2 + 8
 _MAX_GPG_BYTES = 128 * 1024 * 1024
 _MAX_GPG_READ_SECONDS = 10.0
-_MAX_BUNDLE_STATUS_SNAPSHOT_BYTES = 64 * 1024 * 1024
-_MAX_BUNDLE_STATUS_SECONDS = 10.0
+_MAX_BUNDLE_STATUS_DATABASE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_BUNDLE_STATUS_SECONDS = 60.0
+_BUNDLE_STATUS_PROGRESS_OPCODES = 1000
+_BUNDLE_STATUS_BUFFER_BYTES = 1024 * 1024
 
 
 class ProvisioningBundleError(ValueError):
@@ -2973,6 +2975,13 @@ def _bundle_status_from_store(
         if type(binding) is not RoadexApprovalBinding:
             raise ValueError("provisioning bundle immutable binding is inconsistent")
         verify_exact_persisted_bundle_set(store, bundle, binding)
+    except sqlite3.OperationalError as error:
+        if (
+            getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+            or "interrupted" in str(error).lower()
+        ):
+            raise
+        raise ProvisioningBundleError("BUNDLE_STATUS_INTEGRITY_ERROR") from None
     except Exception:
         raise ProvisioningBundleError("BUNDLE_STATUS_INTEGRITY_ERROR") from None
     return {
@@ -2990,6 +2999,198 @@ def _bundle_status_from_store(
     }
 
 
+class _BundleStatusReadOnlyStore(SQLiteStore):
+    """Loader-compatible SQLiteStore view with no writable lifecycle."""
+
+    def __init__(self, connection: sqlite3.Connection, path: str) -> None:
+        self.path = Path(path)
+        self._connection = connection
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._connection.close()
+        self._closed = True
+
+
+def _require_bundle_status_time(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise TimeoutError("bundle status deadline expired")
+
+
+def _open_bundle_status_store(
+    database_path: str,
+    deadline: float,
+) -> _BundleStatusReadOnlyStore:
+    """Open one private streamed copy without writable store lifecycle."""
+    _require_bundle_status_time(deadline)
+    path = Path(database_path)
+    before = path.stat(follow_symlinks=False)
+    if not path.is_absolute() or not stat.S_ISREG(before.st_mode):
+        raise ValueError("bundle status pinned database is unavailable")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{database_path}?mode=ro&immutable=1",
+            uri=True,
+            timeout=0,
+        )
+        _require_bundle_status_time(deadline)
+        if _file_identity(path.stat(follow_symlinks=False)) != _file_identity(before):
+            raise ValueError("bundle status private database changed")
+        connection.row_factory = sqlite3.Row
+        connection.set_progress_handler(
+            lambda: 1 if time.monotonic() > deadline else 0,
+            _BUNDLE_STATUS_PROGRESS_OPCODES,
+        )
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=0")
+        if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise ValueError("bundle status query-only mode is unavailable")
+        if connection.execute("PRAGMA busy_timeout").fetchone()[0] != 0:
+            raise ValueError("bundle status zero busy timeout is unavailable")
+        _require_bundle_status_time(deadline)
+        return _BundleStatusReadOnlyStore(connection, database_path)
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        raise
+
+
+def _close_bundle_status_store(store: _BundleStatusReadOnlyStore) -> None:
+    failure: BaseException | None = None
+    try:
+        store._connection.set_progress_handler(None, 0)
+    except BaseException as error:
+        failure = error
+    try:
+        store.close()
+    except BaseException as error:
+        if failure is None:
+            failure = error
+    if failure is not None:
+        raise failure
+
+
+def _write_bundle_status_chunk(
+    descriptor: int,
+    chunk: bytes,
+    deadline: float,
+) -> None:
+    offset = 0
+    while offset < len(chunk):
+        _require_bundle_status_time(deadline)
+        written = os.write(descriptor, chunk[offset:])
+        _require_bundle_status_time(deadline)
+        if written <= 0:
+            raise OSError("bundle status private copy is unavailable")
+        offset += written
+
+
+def _stream_bundle_status_database(
+    database_fd: int,
+    parent_fd: int,
+    identity: tuple[
+        str,
+        tuple[int, int, int, int, int, int],
+        tuple[int, int, int, int, int, int],
+    ],
+    deadline: float,
+) -> tuple[str, str]:
+    """Stream the pinned database into a private file with bounded memory."""
+    _require_bundle_status_time(deadline)
+    _verify_authority_snapshot(parent_fd, identity)
+    expected_size = identity[1][3]
+    if expected_size > _MAX_BUNDLE_STATUS_DATABASE_BYTES:
+        raise ValueError("bundle status database is too large")
+    snapshot_fd: int | None = None
+    snapshot_path: str | None = None
+    hasher = hashlib.sha256()
+    try:
+        snapshot_fd, snapshot_path = tempfile.mkstemp(
+            prefix="overseer-bundle-status-", suffix=".sqlite3",
+        )
+        offset = 0
+        while offset < expected_size:
+            _require_bundle_status_time(deadline)
+            chunk = os.pread(
+                database_fd,
+                min(_BUNDLE_STATUS_BUFFER_BYTES, expected_size - offset),
+                offset,
+            )
+            _require_bundle_status_time(deadline)
+            if not chunk:
+                raise ValueError("bundle status database is truncated")
+            hasher.update(chunk)
+            _write_bundle_status_chunk(snapshot_fd, chunk, deadline)
+            offset += len(chunk)
+        _require_bundle_status_time(deadline)
+        extra = os.pread(database_fd, 1, offset)
+        _require_bundle_status_time(deadline)
+        if extra:
+            raise ValueError("bundle status database grew during copy")
+        _require_bundle_status_time(deadline)
+        os.fsync(snapshot_fd)
+        _require_bundle_status_time(deadline)
+        os.close(snapshot_fd)
+        snapshot_fd = None
+        _verify_authority_snapshot(parent_fd, identity)
+        if _file_identity(os.fstat(database_fd)) != identity[1]:
+            raise ValueError("bundle status database changed during copy")
+        return snapshot_path, "sha256:" + hasher.hexdigest()
+    except BaseException:
+        if snapshot_fd is not None:
+            try:
+                os.close(snapshot_fd)
+            except Exception:
+                pass
+        if snapshot_path is not None:
+            try:
+                os.unlink(snapshot_path)
+            except Exception:
+                pass
+        raise
+
+
+def _hash_bundle_status_database(
+    database_fd: int,
+    parent_fd: int,
+    identity: tuple[
+        str,
+        tuple[int, int, int, int, int, int],
+        tuple[int, int, int, int, int, int],
+    ],
+    deadline: float,
+) -> str:
+    """Incrementally re-hash the pinned source after private queries finish."""
+    _verify_authority_snapshot(parent_fd, identity)
+    expected_size = identity[1][3]
+    hasher = hashlib.sha256()
+    offset = 0
+    while offset < expected_size:
+        _require_bundle_status_time(deadline)
+        chunk = os.pread(
+            database_fd,
+            min(_BUNDLE_STATUS_BUFFER_BYTES, expected_size - offset),
+            offset,
+        )
+        _require_bundle_status_time(deadline)
+        if not chunk:
+            raise ValueError("bundle status database is truncated")
+        hasher.update(chunk)
+        offset += len(chunk)
+    _require_bundle_status_time(deadline)
+    extra = os.pread(database_fd, 1, offset)
+    _require_bundle_status_time(deadline)
+    if extra:
+        raise ValueError("bundle status database grew during verification")
+    _verify_authority_snapshot(parent_fd, identity)
+    if _file_identity(os.fstat(database_fd)) != identity[1]:
+        raise ValueError("bundle status database changed during verification")
+    return "sha256:" + hasher.hexdigest()
+
+
 def bundle_status(store_path: str, plan_id: str) -> Mapping[str, object]:
     """Read and verify one exact persisted bundle set without touching its store."""
     if (
@@ -3002,57 +3203,67 @@ def bundle_status(store_path: str, plan_id: str) -> Mapping[str, object]:
     deadline = time.monotonic() + _MAX_BUNDLE_STATUS_SECONDS
     database_fd: int | None = None
     parent_fd: int | None = None
-    snapshot_fd: int | None = None
-    snapshot_path: str | None = None
     identity = None
+    database_metadata: tuple[int, ...] | None = None
+    entry_metadata: tuple[int, ...] | None = None
+    snapshot_path: str | None = None
+    source_digest: str | None = None
+    store: _BundleStatusReadOnlyStore | None = None
     result: Mapping[str, object] | None = None
     failed = False
     semantic_error: str | None = None
 
-    def require_time() -> None:
-        if time.monotonic() > deadline:
-            raise TimeoutError("bundle status deadline expired")
-
     try:
-        require_time()
+        _require_bundle_status_time(deadline)
         database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
-        require_time()
-        if identity[1][3] > _MAX_BUNDLE_STATUS_SNAPSHOT_BYTES:
-            raise ValueError("bundle status snapshot is too large")
-        snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
-        require_time()
-        if len(snapshot) > _MAX_BUNDLE_STATUS_SNAPSHOT_BYTES:
-            raise ValueError("bundle status snapshot is too large")
-        snapshot_fd, snapshot_path = tempfile.mkstemp(
-            prefix="overseer-bundle-status-", suffix=".sqlite3",
-        )
-        require_time()
-        _write_snapshot(snapshot_fd, snapshot)
-        require_time()
-        os.fsync(snapshot_fd)
-        require_time()
-        os.close(snapshot_fd)
-        snapshot_fd = None
-        require_time()
+        _require_bundle_status_time(deadline)
+        database_info = os.fstat(database_fd)
+        entry_info = os.stat(identity[0], dir_fd=parent_fd, follow_symlinks=False)
+        database_metadata = _exact_file_metadata(database_info)
+        entry_metadata = _exact_file_metadata(entry_info)
+        if (
+            database_info.st_size > _MAX_BUNDLE_STATUS_DATABASE_BYTES
+            or database_metadata != entry_metadata
+        ):
+            raise ValueError("bundle status database is unavailable")
         _verify_authority_snapshot(parent_fd, identity)
-        require_time()
-        with SQLiteStore(snapshot_path) as store:
-            try:
-                result = _bundle_status_from_store(store, plan_id)
-            except ProvisioningBundleError as error:
-                semantic_error = str(error)
-        require_time()
-        stable_snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
-        require_time()
-        if len(stable_snapshot) > _MAX_BUNDLE_STATUS_SNAPSHOT_BYTES:
-            raise ValueError("bundle status snapshot is too large")
-        if stable_snapshot != snapshot:
-            raise ValueError("persisted provisioning bundle changed during read")
+        _require_bundle_status_time(deadline)
+        snapshot_path, source_digest = _stream_bundle_status_database(
+            database_fd, parent_fd, identity, deadline,
+        )
+        _require_bundle_status_time(deadline)
+        store = _open_bundle_status_store(snapshot_path, deadline)
+        _require_bundle_status_time(deadline)
+        try:
+            result = _bundle_status_from_store(store, plan_id)
+        except ProvisioningBundleError as error:
+            semantic_error = str(error)
+        _require_bundle_status_time(deadline)
+        _close_bundle_status_store(store)
+        store = None
+        _require_bundle_status_time(deadline)
+        if _hash_bundle_status_database(
+            database_fd, parent_fd, identity, deadline,
+        ) != source_digest:
+            raise ValueError("bundle status database changed during read")
+        _require_bundle_status_time(deadline)
+        os.unlink(snapshot_path)
+        snapshot_path = None
+        _require_bundle_status_time(deadline)
+        _verify_authority_snapshot(parent_fd, identity)
+        if (
+            _exact_file_metadata(os.fstat(database_fd)) != database_metadata
+            or _exact_file_metadata(
+                os.stat(identity[0], dir_fd=parent_fd, follow_symlinks=False)
+            ) != entry_metadata
+        ):
+            raise ValueError("bundle status database metadata changed")
+        _require_bundle_status_time(deadline)
     except Exception:
         failed = True
     finally:
         for cleanup in (
-            (lambda: os.close(snapshot_fd) if snapshot_fd is not None else None),
+            (lambda: _close_bundle_status_store(store) if store is not None else None),
             (lambda: os.unlink(snapshot_path) if snapshot_path is not None else None),
             (
                 lambda: _verify_authority_snapshot(parent_fd, identity)

@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -2986,6 +2987,23 @@ def _stable_store_observation(store_path: str) -> tuple[int, int, bytes, tuple[s
     )
 
 
+def _exact_store_metadata_observation(store_path: str) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    path = Path(store_path)
+    sidecars = tuple(sorted(
+        entry.name for entry in path.parent.iterdir()
+        if entry.name.startswith(path.name + "-") or entry.name.startswith(path.name + "-mj")
+    ))
+    info = path.stat(follow_symlinks=False)
+    return (
+        (
+            info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_uid, info.st_gid, info.st_size,
+            info.st_atime_ns, info.st_mtime_ns, info.st_ctime_ns,
+        ),
+        sidecars,
+    )
+
+
 def test_bundle_api_preflight_is_exact_server_owned_and_read_only(tmp_path, monkeypatch):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
     dependencies = deterministic_dependencies(source_head=bundle.intent.source_commit)
@@ -3258,94 +3276,324 @@ def test_bundle_status_classifies_every_malformed_persisted_member_as_integrity_
     assert _stable_store_observation(store_path) == malformed
 
 
-def test_bundle_status_rejects_oversized_snapshot_without_source_mutation(tmp_path, monkeypatch):
-    store_path, bundle = authoritative_bundle_fixture(tmp_path)
-    stage_expected_bundle(store_path, bundle)
-    before = _stable_store_observation(store_path)
-    monkeypatch.setattr(
-        provisioning_bundle_module,
-        "_MAX_BUNDLE_STATUS_SNAPSHOT_BYTES",
-        os.stat(store_path).st_size - 1,
-        raising=False,
-    )
-
-    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
-        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
-
-    assert _stable_store_observation(store_path) == before
+def test_bundle_status_database_cap_exceeds_current_authoritative_size():
+    assert provisioning_bundle_module._MAX_BUNDLE_STATUS_DATABASE_BYTES > 778_797_056
+    assert provisioning_bundle_module._MAX_BUNDLE_STATUS_SECONDS >= 60.0
 
 
-@pytest.mark.parametrize("slow_stage", ("open", "read", "write", "fsync", "load", "verify"))
-def test_bundle_status_deadline_covers_every_snapshot_stage_and_cleans_temp_files(
-    tmp_path, monkeypatch, slow_stage,
+def test_bundle_status_accepts_valid_database_larger_than_former_snapshot_cap(
+    tmp_path, monkeypatch,
 ):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
     stage_expected_bundle(store_path, bundle)
-    before = _stable_store_observation(store_path)
-    clock = [100.0]
-    limit = 2.0
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE status_sparse_padding (payload BLOB NOT NULL)")
+        connection.execute(
+            "INSERT INTO status_sparse_padding(payload) VALUES (zeroblob(?))",
+            (70 * 1024 * 1024,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert os.stat(store_path).st_size > 64 * 1024 * 1024
+    before = _exact_store_metadata_observation(store_path)
+    pread_sizes: list[int] = []
+    real_pread = os.pread
+
+    def bounded_pread(descriptor, size, offset):
+        pread_sizes.append(size)
+        return real_pread(descriptor, size, offset)
+
+    monkeypatch.setattr(provisioning_bundle_module.os, "pread", bounded_pread)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "_read_authority_snapshot",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("whole database copy forbidden")),
+    )
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "_write_snapshot",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("whole database copy forbidden")),
+    )
+
+    result = provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert result["bundle_digest"] == bundle.bundle_digest
+    assert pread_sizes
+    assert max(pread_sizes) <= 1024 * 1024
+    assert _exact_store_metadata_observation(store_path) == before
+
+
+def test_bundle_status_uses_private_streamed_immutable_store_without_writable_lifecycle(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _exact_store_metadata_observation(store_path)
+    opened: list[tuple[str, bool, float]] = []
     created: list[str] = []
-    monkeypatch.setattr(provisioning_bundle_module, "_MAX_BUNDLE_STATUS_SECONDS", limit, raising=False)
-    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
-
-    real_open = provisioning_bundle_module._open_authority_snapshot
-    real_read = provisioning_bundle_module._read_authority_snapshot
-    real_write = provisioning_bundle_module._write_snapshot
-    real_fsync = provisioning_bundle_module.os.fsync
-    real_load = provisioning_bundle_module._bundle_status_from_store
-    real_verify = provisioning_bundle_module._verify_authority_snapshot
-    real_mkstemp = provisioning_bundle_module.tempfile.mkstemp
-    read_calls = [0]
-
-    def advance_after(value):
-        clock[0] += limit + 0.1
-        return value
+    real_connect = sqlite3.connect
+    real_mkstemp = tempfile.mkstemp
 
     def tracked_mkstemp(*args, **kwargs):
         descriptor, path = real_mkstemp(*args, **kwargs)
         created.append(path)
         return descriptor, path
 
+    def checked_connect(database, *args, **kwargs):
+        if isinstance(database, str) and "immutable=1" in database:
+            opened.append((
+                database,
+                kwargs.get("uri") is True,
+                kwargs.get("timeout"),
+            ))
+        return real_connect(database, *args, **kwargs)
+
     monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
-    if slow_stage == "open":
-        monkeypatch.setattr(
-            provisioning_bundle_module, "_open_authority_snapshot",
-            lambda *args: advance_after(real_open(*args)),
+    monkeypatch.setattr(provisioning_bundle_module.sqlite3, "connect", checked_connect)
+    monkeypatch.setattr(
+        SQLiteStore,
+        "__init__",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("writable SQLiteStore lifecycle forbidden")
+        ),
+    )
+
+    result = provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert result["bundle_digest"] == bundle.bundle_digest
+    assert len(opened) == 1
+    uri, uses_uri, timeout = opened[0]
+    assert not uri.startswith("file:/proc/self/fd/")
+    assert os.fspath(store_path) not in uri
+    assert uri.endswith("?mode=ro&immutable=1")
+    assert uses_uri is True
+    assert timeout == 0
+    assert created
+    assert created
+    assert all(not os.path.exists(path) for path in created)
+    assert _exact_store_metadata_observation(store_path) == before
+
+
+def test_bundle_status_read_only_store_enforces_query_only_zero_busy_timeout_and_progress(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    database_fd, parent_fd, identity = provisioning_bundle_module._open_authority_snapshot(
+        store_path,
+    )
+    clock = [100.0]
+    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
+    snapshot_path = None
+    try:
+        snapshot_path, _digest = provisioning_bundle_module._stream_bundle_status_database(
+            database_fd, parent_fd, identity, 101.0,
         )
-    elif slow_stage == "read":
-        def slow_read(*args):
-            read_calls[0] += 1
-            value = real_read(*args)
-            return advance_after(value) if read_calls[0] == 1 else value
-        monkeypatch.setattr(provisioning_bundle_module, "_read_authority_snapshot", slow_read)
-    elif slow_stage == "write":
-        monkeypatch.setattr(
-            provisioning_bundle_module, "_write_snapshot",
-            lambda *args: advance_after(real_write(*args)),
+        store = provisioning_bundle_module._open_bundle_status_store(snapshot_path, 101.0)
+        assert isinstance(store, SQLiteStore)
+        assert store._connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert store._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 0
+        assert store.load_provisioning_bundle_record(bundle.plan.plan_id)[0] == bundle.plan.plan_id
+        indexed_queries = (
+            ("SELECT id FROM provisioning_bundles WHERE plan_id=?", bundle.plan.plan_id),
+            (
+                "SELECT approval_ref FROM roadex_approval_bindings WHERE approval_ref=?",
+                provisioning_bundle_module.binding_draft_for_bundle(bundle).approval_ref,
+            ),
+            ("SELECT id FROM backup_provisioning_plans WHERE id=?", bundle.plan.plan_id),
+            ("SELECT id FROM provisioning_preflight_reports WHERE id=?", bundle.preflight.report_id),
+            ("SELECT id FROM provisioning_review_outbox WHERE plan_id=? ORDER BY id", bundle.plan.plan_id),
         )
-    elif slow_stage == "fsync":
+        for statement, parameter in indexed_queries:
+            details = " ".join(
+                str(row[3]) for row in store._connection.execute(
+                    "EXPLAIN QUERY PLAN " + statement, (parameter,),
+                ).fetchall()
+            )
+            assert "SEARCH" in details
+        clock[0] = 102.0
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            store._connection.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n"
+            ).fetchone()
+        provisioning_bundle_module._close_bundle_status_store(store)
+    finally:
+        if snapshot_path is not None and os.path.exists(snapshot_path):
+            os.unlink(snapshot_path)
+        os.close(database_fd)
+        os.close(parent_fd)
+
+
+def test_bundle_status_installs_progress_handler_before_sqlite_pragma_queries(
+    tmp_path, monkeypatch,
+):
+    database_path = tmp_path / "private.sqlite3"
+    database_path.write_bytes(b"private")
+    actions: list[str] = []
+
+    class Cursor:
+        def __init__(self, value):
+            self.value = value
+
+        def fetchone(self):
+            return (self.value,)
+
+    class FakeConnection:
+        row_factory = None
+
+        def set_progress_handler(self, _handler, _opcodes):
+            actions.append("progress")
+
+        def execute(self, statement):
+            actions.append(statement)
+            return Cursor(1 if "query_only" in statement else 0)
+
+        def close(self):
+            actions.append("close")
+
+    monkeypatch.setattr(
+        provisioning_bundle_module.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: FakeConnection(),
+    )
+
+    store = provisioning_bundle_module._open_bundle_status_store(
+        str(database_path), time.monotonic() + 1,
+    )
+
+    assert actions[0] == "progress"
+    provisioning_bundle_module._close_bundle_status_store(store)
+
+
+@pytest.mark.parametrize("failure_type", (OSError, KeyboardInterrupt))
+def test_bundle_status_close_attempts_connection_after_progress_handler_failure(failure_type):
+    closed = []
+
+    class FakeConnection:
+        def set_progress_handler(self, _handler, _opcodes):
+            raise failure_type("private progress cleanup failure")
+
+        def close(self):
+            closed.append(True)
+
+    store = provisioning_bundle_module._BundleStatusReadOnlyStore(
+        FakeConnection(), "/private/status.sqlite3",
+    )
+
+    with pytest.raises(failure_type):
+        provisioning_bundle_module._close_bundle_status_store(store)
+
+    assert closed == [True]
+
+
+def test_bundle_status_base_exception_close_failure_still_cleans_temp_and_descriptors(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before_metadata = _exact_store_metadata_observation(store_path)
+    before_descriptors = len(os.listdir("/proc/self/fd"))
+    created: list[str] = []
+    real_mkstemp = tempfile.mkstemp
+    real_close = provisioning_bundle_module._close_bundle_status_store
+
+    class StatusCloseInterrupted(BaseException):
+        pass
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return descriptor, path
+
+    def interrupted_close(store):
+        real_close(store)
+        raise StatusCloseInterrupted()
+
+    monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(
+        provisioning_bundle_module, "_close_bundle_status_store", interrupted_close,
+    )
+
+    with pytest.raises(StatusCloseInterrupted):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert created
+    assert all(not os.path.exists(path) for path in created)
+    assert len(os.listdir("/proc/self/fd")) == before_descriptors
+    assert _exact_store_metadata_observation(store_path) == before_metadata
+
+
+@pytest.mark.parametrize("failure_stage", ("stream", "open", "load", "verify", "close", "hash"))
+def test_bundle_status_deadline_and_close_failures_are_unavailable_without_source_mutation(
+    tmp_path, monkeypatch, failure_stage,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _exact_store_metadata_observation(store_path)
+    clock = [100.0]
+    monkeypatch.setattr(provisioning_bundle_module, "_MAX_BUNDLE_STATUS_SECONDS", 1.0)
+    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
+
+    real_stream = provisioning_bundle_module._stream_bundle_status_database
+    real_open = provisioning_bundle_module._open_bundle_status_store
+    real_load = provisioning_bundle_module._bundle_status_from_store
+    real_verify = provisioning_bundle_module._verify_authority_snapshot
+    real_close = provisioning_bundle_module._close_bundle_status_store
+
+    if failure_stage == "stream":
         monkeypatch.setattr(
-            provisioning_bundle_module.os, "fsync",
-            lambda *args: advance_after(real_fsync(*args)),
+            provisioning_bundle_module, "_stream_bundle_status_database",
+            lambda *args: (clock.__setitem__(0, 102.0), real_stream(*args))[1],
         )
-    elif slow_stage == "load":
+    elif failure_stage == "open":
+        monkeypatch.setattr(
+            provisioning_bundle_module, "_open_bundle_status_store",
+            lambda *args: (clock.__setitem__(0, 102.0), real_open(*args))[1],
+        )
+    elif failure_stage == "load":
         monkeypatch.setattr(
             provisioning_bundle_module, "_bundle_status_from_store",
-            lambda *args: advance_after(real_load(*args)),
+            lambda *args: (clock.__setitem__(0, 102.0), real_load(*args))[1],
         )
+    elif failure_stage == "verify":
+        monkeypatch.setattr(
+            provisioning_bundle_module, "_verify_authority_snapshot",
+            lambda *args: (real_verify(*args), clock.__setitem__(0, 102.0))[0],
+        )
+    elif failure_stage == "close":
+        def failing_close(store):
+            real_close(store)
+            raise OSError("private close failure")
+        monkeypatch.setattr(provisioning_bundle_module, "_close_bundle_status_store", failing_close)
     else:
-        verify_calls = [0]
-        def slow_verify(*args):
-            verify_calls[0] += 1
-            value = real_verify(*args)
-            return advance_after(value) if verify_calls[0] >= 2 else value
-        monkeypatch.setattr(provisioning_bundle_module, "_verify_authority_snapshot", slow_verify)
+        monkeypatch.setattr(
+            provisioning_bundle_module,
+            "_hash_bundle_status_database",
+            lambda *_args: "sha256:" + "0" * 64,
+        )
 
     with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
         provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
 
-    assert _stable_store_observation(store_path) == before
-    assert all(not os.path.exists(path) for path in created)
+    assert _exact_store_metadata_observation(store_path) == before
+
+
+def test_bundle_status_rejects_source_sidecars_without_reading_or_mutating_them(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    sidecar = Path(store_path + "-wal")
+    sidecar.write_bytes(b"private sidecar bytes")
+    before_store = _exact_store_metadata_observation(store_path)
+    before_sidecar = sidecar.stat(), sidecar.read_bytes()
+
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert _exact_store_metadata_observation(store_path) == before_store
+    assert (sidecar.stat(), sidecar.read_bytes()) == before_sidecar
 
 
 def test_bundle_api_rejects_malformed_stage_digests_and_redacts_dependency_failures(

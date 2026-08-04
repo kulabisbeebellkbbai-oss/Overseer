@@ -4,6 +4,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import json
 import subprocess
@@ -3006,6 +3007,33 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_bundle_post_rejects_transfer_encoding_and_trailer_before_helper(self):
+        calls = []
+        original = overseer_api.preflight_bundle_api
+        overseer_api.preflight_bundle_api = lambda *_args: calls.append("called") or {"status": "preview"}
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
+                    for framing in (
+                        b"Transfer-Encoding: chunked\r\nContent-Length: 2\r\n",
+                        b"Transfer-Encoding: identity\r\nContent-Length: 2\r\n",
+                        b"Trailer: X-Private\r\nContent-Length: 2\r\n",
+                    ):
+                        request = (
+                            b"POST /backup-provisioning/bundles/preflight HTTP/1.0\r\n"
+                            b"Host: localhost\r\n"
+                            b"Authorization: Bearer bundle-secret\r\n"
+                            b"Content-Type: application/json\r\n"
+                            + framing + b"\r\n{}"
+                        )
+                        status, payload = raw_http_response(server, request)
+                        self.assertEqual(status, 400)
+                        self.assertEqual(payload["error_code"], "INVALID_BUNDLE_PREFLIGHT_REQUEST")
+            self.assertEqual(calls, [])
+        finally:
+            overseer_api.preflight_bundle_api = original
+
     def test_bundle_post_requires_exact_bounded_content_length(self):
         original = overseer_api.preflight_bundle_api
         overseer_api.preflight_bundle_api = lambda *_args: {"status": "preview"}
@@ -3041,7 +3069,13 @@ class OverseerApiTests(unittest.TestCase):
     def test_bundle_json_reader_applies_a_bounded_socket_deadline(self):
         handler_type = make_api_handler("/private/store.sqlite3", "bundle-secret")
         handler = object.__new__(handler_type)
-        handler.headers = SimpleNamespace(get_all=lambda name, default=None: ["2"])
+        handler.headers = SimpleNamespace(
+            get_all=lambda name, default=None: {
+                "content-length": ["2"],
+                "transfer-encoding": [],
+                "trailer": [],
+            }.get(name, default),
+        )
         handler.rfile = io.BytesIO(b"{}")
 
         class FakeConnection:
@@ -3059,6 +3093,148 @@ class OverseerApiTests(unittest.TestCase):
         self.assertEqual(handler._read_bundle_json(), {})
         self.assertGreater(handler.connection.timeouts[0], 0)
         self.assertLessEqual(handler.connection.timeouts[0], 5)
+
+    def test_bundle_json_reader_uses_partial_reads_and_exact_remaining_deadline(self):
+        handler_type = make_api_handler("/private/store.sqlite3", "bundle-secret")
+        handler = object.__new__(handler_type)
+        handler.headers = SimpleNamespace(
+            get_all=lambda name, default=None: {
+                "content-length": ["2"],
+                "transfer-encoding": [],
+                "trailer": [],
+            }.get(name, default),
+        )
+        clock = [10.0]
+        original_monotonic = overseer_api.time.monotonic
+        original_deadline = overseer_api._MAX_BUNDLE_REQUEST_SECONDS
+
+        class PartialReader:
+            def __init__(self):
+                self.chunks = [b"{", b"}"]
+                self.requests = []
+
+            def read1(self, size):
+                self.requests.append(size)
+                value = self.chunks.pop(0)
+                clock[0] += 0.25
+                return value
+
+        class FakeConnection:
+            def __init__(self):
+                self.timeouts = []
+
+            def gettimeout(self):
+                return 9.0
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        handler.rfile = PartialReader()
+        handler.connection = FakeConnection()
+        overseer_api.time.monotonic = lambda: clock[0]
+        overseer_api._MAX_BUNDLE_REQUEST_SECONDS = 1.0
+        try:
+            self.assertEqual(handler._read_bundle_json(), {})
+        finally:
+            overseer_api.time.monotonic = original_monotonic
+            overseer_api._MAX_BUNDLE_REQUEST_SECONDS = original_deadline
+
+        self.assertEqual(handler.rfile.requests, [2, 1])
+        self.assertEqual(handler.connection.timeouts[-1], 9.0)
+        self.assertAlmostEqual(handler.connection.timeouts[0], 1.0)
+        self.assertAlmostEqual(handler.connection.timeouts[1], 0.75)
+
+    def test_bundle_json_reader_restores_timeout_when_partial_read_raises_base_exception(self):
+        handler_type = make_api_handler("/private/store.sqlite3", "bundle-secret")
+        handler = object.__new__(handler_type)
+        handler.headers = SimpleNamespace(
+            get_all=lambda name, default=None: {
+                "content-length": ["2"],
+                "transfer-encoding": [],
+                "trailer": [],
+            }.get(name, default),
+        )
+
+        class ReadInterrupted(BaseException):
+            pass
+
+        class PartialReader:
+            def read1(self, _size):
+                raise ReadInterrupted()
+
+        class FakeConnection:
+            def __init__(self):
+                self.timeouts = []
+
+            def gettimeout(self):
+                return 7.0
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        handler.rfile = PartialReader()
+        handler.connection = FakeConnection()
+
+        with self.assertRaises(ReadInterrupted):
+            handler._read_bundle_json()
+
+        self.assertEqual(handler.connection.timeouts[-1], 7.0)
+
+    def test_bundle_post_slow_trickle_terminates_within_aggregate_deadline(self):
+        calls = []
+        original_helper = overseer_api.preflight_bundle_api
+        original_deadline = overseer_api._MAX_BUNDLE_REQUEST_SECONDS
+        overseer_api.preflight_bundle_api = lambda *_args: calls.append("called") or {"status": "preview"}
+        overseer_api._MAX_BUNDLE_REQUEST_SECONDS = 0.2
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
+                    connection = socket.create_connection(server.server.server_address, timeout=2)
+                    connection.settimeout(2)
+                    connection.sendall(
+                        b"POST /backup-provisioning/bundles/preflight HTTP/1.0\r\n"
+                        b"Host: localhost\r\n"
+                        b"Authorization: Bearer bundle-secret\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: 7\r\n\r\n"
+                    )
+                    stopped = threading.Event()
+
+                    def trickle():
+                        try:
+                            for byte in b'{"x":1}':
+                                if stopped.wait(0.08):
+                                    return
+                                connection.sendall(bytes((byte,)))
+                        except OSError:
+                            return
+
+                    sender = threading.Thread(target=trickle, daemon=True)
+                    sender.start()
+                    started = time.monotonic()
+                    chunks = []
+                    while True:
+                        chunk = connection.recv(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    elapsed = time.monotonic() - started
+                    stopped.set()
+                    sender.join(timeout=1)
+                    connection.close()
+                    response = b"".join(chunks)
+                    head, _, body = response.partition(b"\r\n\r\n")
+                    self.assertEqual(int(head.split(b" ", 2)[1]), 400)
+                    self.assertEqual(
+                        json.loads(body.decode("utf-8"))["error_code"],
+                        "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+                    )
+                    self.assertLess(elapsed, 0.6)
+                    self.assertEqual(calls, [])
+        finally:
+            overseer_api.preflight_bundle_api = original_helper
+            overseer_api._MAX_BUNDLE_REQUEST_SECONDS = original_deadline
 
     def test_public_bundle_routes_require_admin_auth_and_exact_queries(self):
         calls = []

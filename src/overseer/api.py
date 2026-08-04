@@ -1389,6 +1389,11 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             return parsed
 
         def _read_bundle_json(self) -> dict[str, Any]:
+            if (
+                self.headers.get_all("transfer-encoding", [])
+                or self.headers.get_all("trailer", [])
+            ):
+                raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
             values = self.headers.get_all("content-length", [])
             if len(values) != 1:
                 raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
@@ -1412,15 +1417,16 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             chunks: list[bytes] = []
             remaining = length
             try:
-                self.connection.settimeout(_MAX_BUNDLE_REQUEST_SECONDS)
                 while remaining:
-                    if time.monotonic() > deadline:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
                         raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
+                    self.connection.settimeout(remaining_seconds)
                     try:
-                        chunk = self.rfile.read(min(65536, remaining))
+                        chunk = self.rfile.read1(min(65536, remaining))
                     except (TimeoutError, socket.timeout):
                         raise _BundleRequestError("INVALID_BUNDLE_REQUEST") from None
-                    if not chunk:
+                    if not chunk or len(chunk) > remaining:
                         raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
                     chunks.append(chunk)
                     remaining -= len(chunk)

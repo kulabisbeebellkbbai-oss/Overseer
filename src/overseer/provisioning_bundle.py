@@ -47,8 +47,16 @@ _REVIEW_OWNERS = (
 class _FrozenMapping(Mapping[str, object]):
     """An immutable mapping that remains compatible with dataclass snapshots."""
 
+    __slots__ = ("_values",)
+
     def __init__(self, values: Mapping[str, object]) -> None:
-        self._values = MappingProxyType(dict(values))
+        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("frozen mappings are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("frozen mappings are immutable")
 
     def __getitem__(self, key: str) -> object:
         return self._values[key]

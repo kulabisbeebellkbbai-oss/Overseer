@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import asdict, replace
+from types import MappingProxyType
 
 import pytest
 
@@ -275,6 +276,19 @@ def test_bundle_snapshots_nested_plan_mappings_against_external_mutation():
     with pytest.raises(TypeError):
         bundle.plan.steps[0].arguments["commit"] = "f" * 40  # type: ignore[index]
     assert asdict(bundle.plan)["evidence_ids"]["kira"] == "crew.kira.review-v20"
+
+
+def test_bundle_seals_frozen_mapping_backing_attributes_against_reassignment_or_deletion():
+    bundle = bundle_fixture()
+    refs = bundle.plan.root_authorization_refs
+    before = bundle_digest(bundle)
+
+    with pytest.raises(AttributeError):
+        refs._values = MappingProxyType({"sha256:" + "f" * 64: "root-auth.replaced"})  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        del refs._values  # type: ignore[attr-defined]
+
+    assert bundle_digest(bundle) == before
 
 
 def test_bundle_snapshots_every_tuple_annotated_plan_field_against_caller_mutation():

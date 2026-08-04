@@ -1,4 +1,5 @@
 import ast
+import copy
 import hashlib
 import json
 import subprocess
@@ -7,11 +8,67 @@ from pathlib import Path
 
 import pytest
 
+from overseer.backup_contract import (
+    PROVISIONING_CONTRACT_VERSION,
+    canonical_contract_bytes,
+    load_provisioning_contract,
+    runtime_artifact_identity,
+)
+from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
 from overseer.storage_adapter import BACKUP_ACTION_PARAMETERS, StorageExecutionRequest, canonical_adapter_request_digest
 
 
 THEUNDERDARK = Path(__file__).resolve().parents[2] / "TheUnderdark"
+FIXTURE = Path(__file__).parent / "fixtures/contracts/donuthole_backup_provisioning_v1.json"
 COMMON = {"project_id", "root_id", "request_id", "idempotency_key", "authorization_ref", "policy_revision", "reason"}
+
+
+def test_provisioning_contract_fixture_is_canonical_complete_and_matches_current_mcp_schemas():
+    contract = load_provisioning_contract(FIXTURE)
+
+    assert contract.version == PROVISIONING_CONTRACT_VERSION == "1"
+    assert set(contract.raw) == {
+        "version",
+        "canonical_plan_input",
+        "crew_requirements",
+        "root_registration",
+        "runtime_identity",
+        "mcp_tools",
+        "acceptance_requests",
+        "scenarios",
+    }
+    assert FIXTURE.read_bytes() == canonical_contract_bytes(contract.raw)
+    assert contract.raw["mcp_tools"] == EXPECTED_BACKUP_TOOL_SCHEMAS
+    assert [scenario["name"] for scenario in contract.raw["scenarios"]] == [
+        "clean_install",
+        "active_service_upgrade",
+    ]
+
+
+def test_provisioning_contract_rejects_noncanonical_bytes_and_invalid_nested_types(tmp_path):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    invalid = copy.deepcopy(raw)
+    invalid["acceptance_requests"]["backup_create"]["parameters"]["retention_count"] = True
+    invalid_path = tmp_path / "invalid.json"
+    invalid_path.write_bytes(canonical_contract_bytes(invalid))
+
+    with pytest.raises(ValueError, match="retention_count"):
+        load_provisioning_contract(invalid_path)
+
+    noncanonical_path = tmp_path / "noncanonical.json"
+    noncanonical_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical JSON"):
+        load_provisioning_contract(noncanonical_path)
+
+
+def test_runtime_artifact_identity_is_deterministic_and_schema_bound():
+    identity = runtime_artifact_identity("a" * 40, EXPECTED_BACKUP_TOOL_SCHEMAS)
+
+    assert identity == runtime_artifact_identity("a" * 40, EXPECTED_BACKUP_TOOL_SCHEMAS)
+    assert identity != runtime_artifact_identity("b" * 40, EXPECTED_BACKUP_TOOL_SCHEMAS)
+    altered = copy.deepcopy(EXPECTED_BACKUP_TOOL_SCHEMAS)
+    altered["underdark_backup_create"]["properties"]["retention_count"] = {"type": "number"}
+    assert identity != runtime_artifact_identity("a" * 40, altered)
 
 
 @pytest.mark.skipif(not THEUNDERDARK.exists(), reason="sibling TheUnderdark checkout is unavailable")

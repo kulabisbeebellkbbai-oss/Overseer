@@ -436,6 +436,48 @@ def test_default_authority_resolution_rejects_sqlite_sidecars_without_mutation(t
         assert (journal.stat().st_mtime_ns, journal.stat().st_ctime_ns, journal.read_bytes()) == before
 
 
+def test_default_authority_snapshot_closes_owned_descriptors_after_unexpected_sidecar_validation_failure(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    store_path = seeded_authority_store(tmp_path)
+    real_open = os.open
+    real_close = os.close
+    close_attempts: list[int] = []
+    owned_fds: set[int] = set()
+
+    def recording_open(path, flags, *arguments, **keywords):
+        fd = real_open(path, flags, *arguments, **keywords)
+        if path == "state.sqlite3":
+            owned_fds.update((fd, keywords["dir_fd"]))
+        return fd
+
+    def recording_close(fd):
+        close_attempts.append(fd)
+        return real_close(fd)
+
+    def failing_sidecar_validation(*_arguments, **_keywords):
+        raise AttributeError("private sidecar validation failure")
+
+    before = len(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(bundle_module.os, "open", recording_open)
+    monkeypatch.setattr(bundle_module.os, "close", recording_close)
+    monkeypatch.setattr(bundle_module, "_authority_sidecars_present", failing_sidecar_validation)
+    try:
+        report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+        after = len(os.listdir("/proc/self/fd"))
+    finally:
+        for fd in owned_fds:
+            try:
+                real_close(fd)
+            except OSError:
+                pass
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert owned_fds.issubset(close_attempts)
+    assert after == before
+    assert "private sidecar validation failure" not in repr(report)
+
+
 @pytest.mark.parametrize("failure", ("write", "fsync", "connect", "query", "close", "unlink"))
 def test_default_authority_snapshot_cleans_up_each_partial_failure(tmp_path, monkeypatch, failure):
     import overseer.provisioning_bundle as bundle_module
@@ -826,6 +868,38 @@ def test_preflight_redacts_unavailable_dependency_exceptions(tmp_path):
     assert Path(store_path).read_bytes() == before
 
 
+def test_preflight_redacts_unexpected_dependency_exceptions_without_masking_base_exceptions(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+
+    def raise_error(error):
+        def callback(*_arguments):
+            raise error
+        return callback
+
+    report = run_provisioning_preflight(
+        store_path,
+        intent_fixture(),
+        replace(
+            deterministic_dependencies(),
+            source_head=raise_error(AttributeError("private unexpected dependency failure")),
+        ),
+    )
+
+    assert report.passed is False
+    assert next(check for check in report.checks if check.code == "SOURCE_COMMIT_MATCH").status == "failed"
+    assert "private unexpected dependency failure" not in repr(report)
+    for error_type in (KeyboardInterrupt, SystemExit):
+        with pytest.raises(error_type):
+            run_provisioning_preflight(
+                store_path,
+                intent_fixture(),
+                replace(
+                    deterministic_dependencies(),
+                    source_head=raise_error(error_type("private fatal dependency failure")),
+                ),
+            )
+
+
 def test_preflight_redacts_sqlite_dependency_errors_and_returns_all_checks(tmp_path):
     dependencies = replace(
         deterministic_dependencies(),
@@ -919,6 +993,31 @@ def test_bundle_rejects_missing_non_tip_and_superseded_predecessors_without_muta
             replace(deterministic_dependencies(), predecessor_lookup=lambda _id: superseded_predecessor, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
         )
     assert Path(store_path).read_bytes() == before
+
+
+def test_bundle_redacts_unexpected_predecessor_callback_exception_as_unavailable(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    predecessor = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    successor = intent_fixture(
+        plan_id="backup-provision.donuthole.v21.20260802",
+        supersedes_plan_id=predecessor.plan.plan_id,
+    )
+
+    def failing_predecessor_lookup(_identifier):
+        raise AttributeError("private predecessor callback failure")
+
+    with pytest.raises(ProvisioningBundleError, match="^PREDECESSOR_UNAVAILABLE$") as error:
+        build_provisioning_bundle(
+            store_path,
+            successor,
+            replace(
+                deterministic_dependencies(),
+                predecessor_lookup=failing_predecessor_lookup,
+                authoritative_chain_tip=lambda: predecessor.plan.plan_id,
+            ),
+        )
+
+    assert "private predecessor callback failure" not in repr(error.value)
 
 
 @pytest.mark.parametrize(

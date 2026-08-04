@@ -191,16 +191,15 @@ def _open_authority_snapshot(store_path: str) -> tuple[int, int, tuple[str, tupl
         database_info = os.fstat(database_fd)
         entry_info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         parent_info = os.fstat(parent_fd)
+        if (
+            not stat.S_ISREG(database_info.st_mode)
+            or _file_identity(database_info)[:2] != _file_identity(entry_info)[:2]
+            or _authority_sidecars_present(parent_fd, path.name)
+        ):
+            raise ValueError("root authorization read is unavailable")
     except Exception:
         _close_authority_descriptors(database_fd, child_fd, parent_fd)
         raise ValueError("root authorization read is unavailable") from None
-    if (
-        not stat.S_ISREG(database_info.st_mode)
-        or _file_identity(database_info)[:2] != _file_identity(entry_info)[:2]
-        or _authority_sidecars_present(parent_fd, path.name)
-    ):
-        _close_authority_descriptors(database_fd, parent_fd)
-        raise ValueError("root authorization read is unavailable")
     return database_fd, parent_fd, (path.name, _file_identity(database_info), _file_identity(parent_info))
 
 
@@ -696,7 +695,7 @@ def _passing_preflight_checks() -> tuple[PreflightCheck, ...]:
 def _safe_read(callback: Callable[..., object], *arguments: object) -> tuple[object | None, bool]:
     try:
         return callback(*arguments), True
-    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+    except Exception:
         return None, False
 
 

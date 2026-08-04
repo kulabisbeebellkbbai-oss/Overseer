@@ -3,19 +3,23 @@ from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 import threading
+from http.server import ThreadingHTTPServer
+from urllib.request import urlopen
 
 import pytest
 
 from overseer import backup_provisioning as backup_provisioning_module
+from overseer import api as api_module
 from overseer import provisioning_bundle as provisioning_bundle_module
 from overseer.backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
 from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest
 from overseer.backup_host_operations import RedactedHostOperationError
-from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStatus, ProvisioningStep, _dump, _load, approve_plan, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, save_staged_plan_source, stage_plan, stage_plan_api
+from overseer.backup_provisioning import AllowlistedHostProvisioningAdapter, DedicatedProvisioningAdapter, ProvisioningStatus, ProvisioningStep, _dump, _load, approve_plan, approve_plan_api, build_plan, decide_roadex_human_plan, execute_plan, execute_plan_api, list_plans, list_roadex_human_decisions, review_plan, save_staged_plan_source, stage_plan, stage_plan_api
 from overseer.core import OwnerDomain, Resource, ResourceType, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
-from overseer.storage_control import approve_authorization, current_root_identity, materialize_authorization, stage_authorization
+from overseer.api import make_api_handler
+from overseer.storage_control import approve_authorization, current_root_identity, materialize_authorization, revoke_authorization, stage_authorization
 
 
 ROLES = {"kira": OwnerDomain.KIRA, "obrien": OwnerDomain.OBRIEN, "security": OwnerDomain.ODO_IDS, "sisko": OwnerDomain.SISKO}
@@ -239,6 +243,141 @@ def test_exact_typed_human_approval_is_read_only_until_atomic_plan_update(tmp_pa
         assert tuple(record[4] for record in (
             store.list_provisioning_review_outbox_records(plan.plan_id)
         )) == outbox_before
+
+
+def test_typed_approval_rechecks_current_root_authority_after_staging(tmp_path):
+    store_path, plan, _bundle = _typed_bundle_with_reviews(tmp_path)
+    revoke_authorization(store_path, "root-auth.current", "human", "crew.kira.root-review")
+
+    with pytest.raises(ValueError, match="^PREFLIGHT_NOT_CURRENT$"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+    assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
+
+
+def test_typed_approval_rechecks_current_chain_tip_after_successor_staging(tmp_path):
+    from tests.test_provisioning_bundle import (
+        authoritative_bundle_fixture,
+        expected_preview_digests,
+        intent_fixture,
+        stage_expected_bundle,
+    )
+
+    store_path, predecessor = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, predecessor)
+    successor_dependencies = provisioning_bundle_module._PreflightDependencies(
+        source_path="/home/god/Documents/Codex Workspace/TheUnderdark",
+        source_head=lambda _path: "b" * 40,
+        runtime_digest=lambda _path, _commit: "sha256:" + "d" * 64,
+        capability_digest=lambda commit, schemas: capability_digest(commit, schemas, "1"),
+        file_digest=lambda _path: "sha256:" + "a" * 64,
+        executable_exists=lambda _path: True,
+        root_identity=lambda _path: "sha256:" + "e" * 64,
+        canonical_boundaries_valid=lambda: True,
+        rollback_prerequisites_valid=lambda: True,
+        predecessor_lookup=lambda _plan_id: predecessor,
+        authoritative_chain_tip=lambda _scope: predecessor.plan.plan_id,
+    )
+    successor = provisioning_bundle_module._build_provisioning_bundle_with_dependencies(
+        store_path,
+        intent_fixture(
+            plan_id="backup-provision.donuthole.v21.20260802",
+            supersedes_plan_id=predecessor.plan.plan_id,
+        ),
+        successor_dependencies,
+    )
+    provisioning_bundle_module._stage_authoritative_bundle_with_dependencies(
+        store_path,
+        successor.intent,
+        successor_dependencies,
+        expected_preview_digests(successor),
+    )
+
+    with pytest.raises(ValueError, match="^SUCCESSOR_REQUIRED$"):
+        approve_plan(store_path, predecessor.plan.plan_id, "independent-human")
+
+    assert _task6_plan(store_path, predecessor.plan.plan_id).status == ProvisioningStatus.STAGED
+
+
+def test_approval_rejects_noncanonical_evidence_actor_without_mutation(tmp_path):
+    store_path, plan, _bundle = _typed_bundle_with_reviews(tmp_path)
+    before = _approval_control_rows(store_path)
+
+    with pytest.raises(ValueError, match="^independent human identity is required$"):
+        approve_plan_api(store_path, {"plan_id": plan.plan_id, "approved_by": " kira "})
+    with pytest.raises(ValueError, match="^independent human identity is required$"):
+        approve_plan(store_path, plan.plan_id, " kira ")
+
+    assert _approval_control_rows(store_path) == before
+    assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
+
+
+@pytest.mark.parametrize("decision", ("deny", "request_revision"))
+@pytest.mark.parametrize("actor", ("kira", " obrien ", ""))
+def test_roadex_decisions_reject_non_independent_humans_without_mutation(
+    tmp_path, decision, actor,
+):
+    store_path, plan = seeded(tmp_path)
+    stage_plan(store_path, plan)
+    before = _approval_control_rows(store_path)
+
+    with pytest.raises(ValueError, match="^independent human identity is required$"):
+        decide_roadex_human_plan(store_path, plan.plan_id, decision, actor, "Needs revision")
+
+    assert _approval_control_rows(store_path) == before
+    assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
+
+
+def test_roadex_readiness_redacts_unexpected_exception_directly(tmp_path, monkeypatch):
+    path, plan = seeded(tmp_path)
+    stage_plan(path, plan)
+    secret = "/private/path?token=unexpected-secret"
+    monkeypatch.setattr(
+        backup_provisioning_module,
+        "_require_approval_readiness",
+        lambda _store, _plan: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+
+    result = list_roadex_human_decisions(path)
+
+    assert result["items"][0]["blocker_codes"] == ["REVIEW_EVIDENCE_NOT_CURRENT"]
+    assert result["items"][0]["blockers"] == [
+        "All four exact provisioning reviews must be approved with current VERIFIED completion receipts."
+    ]
+    assert secret not in repr(result)
+
+
+def test_roadex_readiness_public_route_redacts_unexpected_exception(
+    tmp_path, monkeypatch,
+):
+    path, plan = seeded(tmp_path)
+    stage_plan(path, plan)
+    secret = "/private/path?token=route-secret"
+    monkeypatch.setattr(
+        api_module,
+        "list_roadex_human_decisions",
+        lambda _path: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(path))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{server.server_address[1]}/roadex/human-decisions",
+            timeout=5,
+        ) as response:
+            payload = json.loads(response.read())
+            assert response.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert payload == {
+        "error": "review evidence is not current",
+        "code": "REVIEW_EVIDENCE_NOT_CURRENT",
+    }
+    assert secret not in repr(payload)
 
 
 def test_roadex_readiness_is_server_derived_and_has_zero_data_mutation(tmp_path):

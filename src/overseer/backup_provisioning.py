@@ -291,7 +291,7 @@ def list_roadex_human_decisions(store_path: str) -> Mapping[str, object]:
                 failures: list[str] = []
                 try:
                     _require_approval_readiness(store, plan)
-                except (KeyError, ValueError) as exc:
+                except Exception as exc:
                     code, explanation = _approval_blocker(exc)
                     blocker_codes.append(code)
                     failures.append(explanation)
@@ -342,8 +342,6 @@ def decide_roadex_human_plan(
 ) -> Mapping[str, object]:
     if decision not in {"approve", "deny", "request_revision"}:
         raise ValueError("decision must be approve, deny, or request_revision")
-    if not decided_by.strip():
-        raise ValueError("independent human identity is required")
     if decision in {"deny", "request_revision"} and not reason.strip():
         raise ValueError("a reason is required for denial or revision")
     with SQLiteStore(store_path) as store:
@@ -351,6 +349,7 @@ def decide_roadex_human_plan(
             plan = _stored(store, plan_id)
             if plan.decision_source != "Roadex" or plan.status != ProvisioningStatus.STAGED:
                 raise ValueError("an exact staged Roadex human decision is required")
+            decided_by = _validate_independent_human(store, plan, decided_by)
             _require_approval_readiness(store, plan)
             if decision != "approve":
                 status = ProvisioningStatus.DENIED if decision == "deny" else ProvisioningStatus.REVISION_REQUESTED
@@ -381,10 +380,7 @@ def approve_plan(store_path: str, plan_id: str, approved_by: str, approved_at: s
         with store.agent_transaction():
             plan = _stored(store, plan_id)
             _require_approval_readiness(store, plan)
-            evidence_actors = set(REQUIRED_EVIDENCE) | {domain.value for domain in REQUIRED_EVIDENCE.values()}
-            evidence_requesters = {store.load_crew_message(message_id).requested_by for message_id in plan.evidence_ids.values()}
-            if plan.status != ProvisioningStatus.STAGED or not approved_by.strip() or approved_by in evidence_actors or approved_by in evidence_requesters:
-                raise ValueError("independent human approval is required")
+            approved_by = _validate_independent_human(store, plan, approved_by)
             approved = replace(plan, status=ProvisioningStatus.APPROVED, approved_by=approved_by, approved_at=now)
             store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(approved), plan_id))
     return _public(approved, mutation=True)
@@ -577,6 +573,12 @@ def _require_bundle_preflight_and_reviews(
     ):
         raise ValueError("TYPED_BUNDLE_REQUIRED")
     try:
+        provisioning_bundle._recheck_locked_authority_and_chain(store, bundle)
+    except provisioning_bundle.ProvisioningBundleError as error:
+        raise ValueError("SUCCESSOR_REQUIRED") from error
+    except ValueError as error:
+        raise ValueError("PREFLIGHT_NOT_CURRENT") from error
+    try:
         draft = provisioning_bundle.binding_draft_for_bundle(bundle)
         binding = store.load_roadex_approval_binding(draft.approval_ref)
     except KeyError as error:
@@ -613,6 +615,33 @@ def _require_approval_readiness(
         _require_bundle_preflight_and_reviews(store, plan)
     else:
         _require_terminal_evidence(store, plan)
+
+
+def _validate_independent_human(
+    store: SQLiteStore,
+    plan: DonutHoleBackupProvisioningPlan,
+    identity: str,
+) -> str:
+    """Validate one canonical actor before any decision mutation."""
+    canonical = identity.strip() if isinstance(identity, str) else ""
+    if (
+        not isinstance(identity, str)
+        or not canonical
+        or canonical != identity
+        or OPAQUE_ID.fullmatch(canonical) is None
+        or plan.status != ProvisioningStatus.STAGED
+    ):
+        raise ValueError("independent human identity is required")
+    evidence_actors = set(REQUIRED_EVIDENCE) | {
+        domain.value for domain in REQUIRED_EVIDENCE.values()
+    }
+    evidence_requesters = {
+        store.load_crew_message(message_id).requested_by
+        for message_id in plan.evidence_ids.values()
+    }
+    if canonical in evidence_actors or canonical in evidence_requesters:
+        raise ValueError("independent human identity is required")
+    return canonical
 
 
 _APPROVAL_BLOCKER_EXPLANATIONS = {

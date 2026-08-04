@@ -27,6 +27,24 @@ the blocker region as an accessible polite status.
 No live crew dispatch, approval, provisioning, deployment, restart, protected
 host mutation, or push was performed.
 
+## Task 6 Security Correction RED/GREEN Evidence
+
+- RED: focused reproductions showed typed approval still succeeded after
+  revoking the current root authorization or staging a valid successor tip;
+  API approval accepted whitespace-padded `kira`; denial and revision accepted
+  crew actors; and a projection `RuntimeError` escaped with its private text.
+- GREEN: `_require_bundle_preflight_and_reviews` now invokes the locked root
+  authority and chain recheck inside the existing approval/denial/revision
+  transaction and Roadex read snapshot. Root/preflight drift maps to
+  `PREFLIGHT_NOT_CURRENT`; stale chain state maps to `SUCCESSOR_REQUIRED`.
+  Approve, deny, and revision share one canonical independent-human validator,
+  and both direct and public Roadex projections map ordinary exceptions to the
+  fixed `REVIEW_EVIDENCE_NOT_CURRENT` explanation without catching fatal
+  `BaseException` subclasses.
+- GREEN focused correction slice: 10 passed, including direct and API identity
+  regressions and revocation/successor zero-mutation checks; the separate
+  direct/public route redaction selector passed 2 tests.
+
 ## TDD Evidence
 
 - Initial focused RED: 13 failed and 1 passed. Missing and stale preflight,

@@ -707,7 +707,10 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 self._handle(lambda: list_backup_provisioning_plans(store_path))
                 return
             if path == "/roadex/human-decisions":
-                self._handle(lambda: list_roadex_human_decisions(store_path))
+                self._handle(
+                    lambda: list_roadex_human_decisions(store_path),
+                    redact_projection_errors=True,
+                )
                 return
             if path == "/roadex/approval-status":
                 refs = query.get("approval_ref", [])
@@ -1301,6 +1304,17 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 self._write_json({"error": str(error)}, HTTPStatus.FORBIDDEN)
             except (AgentManagerError, AgentAdapterUnavailableError) as error:
                 self._write_json({"error": str(error)}, HTTPStatus.CONFLICT)
+            except Exception:
+                if redact_projection_errors:
+                    self._write_json(
+                        {
+                            "error": "review evidence is not current",
+                            "code": "REVIEW_EVIDENCE_NOT_CURRENT",
+                        },
+                        HTTPStatus.OK,
+                    )
+                else:
+                    raise
 
         def _handle_json(
             self,

@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import shutil
 import sqlite3
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -335,6 +337,115 @@ def test_default_authority_resolution_rejects_incomplete_approval_payload_and_ro
     assert Path(store_path).read_bytes() == before
 
 
+def test_default_authority_resolution_rejects_wal_lifecycle_revocation_race(tmp_path, monkeypatch):
+    store_path = Path(seeded_authority_store(tmp_path))
+    real_connect = sqlite3.connect
+    raced = False
+
+    def connect_after_wal_lifecycle(*arguments, **keywords):
+        nonlocal raced
+        connection = real_connect(*arguments, **keywords)
+        if not raced:
+            raced = True
+            writer = real_connect(store_path)
+            try:
+                assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+                writer.execute(
+                    "INSERT INTO storage_authorization_revocations VALUES(?,?,?,?,?,?)",
+                    ("revoke.root-auth.current", "root", "root-auth.current", "human", datetime.now(UTC).isoformat(), "crew.kira.root-review"),
+                )
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                writer.close()
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect_after_wal_lifecycle)
+    report = run_provisioning_preflight(str(store_path), intent_fixture(), deterministic_dependencies())
+
+    assert raced is True
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+@pytest.mark.parametrize("swap", ("inode", "rename", "symlink"))
+def test_default_authority_resolution_rejects_path_swaps_before_sqlite_snapshot(tmp_path, monkeypatch, swap):
+    store_path = Path(seeded_authority_store(tmp_path))
+    revoke_authorization(str(store_path), "root-auth.current", "human", "crew.kira.root-review")
+    replacement = tmp_path / "replacement.sqlite3"
+    shutil.copy2(store_path, replacement)
+    connection = sqlite3.connect(replacement)
+    try:
+        connection.execute("DELETE FROM storage_authorization_revocations")
+        connection.commit()
+    finally:
+        connection.close()
+    original_connect = sqlite3.connect
+    replaced = False
+
+    def replace_before_connect(*arguments, **keywords):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            if swap == "symlink":
+                store_path.unlink()
+                store_path.symlink_to(replacement)
+            elif swap == "rename":
+                os.rename(store_path, tmp_path / "revoked.sqlite3")
+                os.rename(replacement, store_path)
+            else:
+                os.replace(replacement, store_path)
+        return original_connect(*arguments, **keywords)
+
+    monkeypatch.setattr(sqlite3, "connect", replace_before_connect)
+    report = run_provisioning_preflight(str(store_path), intent_fixture(), deterministic_dependencies())
+
+    assert replaced is True
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+def test_default_authority_resolution_requires_exact_independent_staged_approval_binding(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        approval = json.loads(connection.execute("SELECT payload FROM approvals WHERE id=?", ("approval.storage.root.root-auth.current",)).fetchone()[0])
+        approval["decided_by"] = "kira"
+        approval["reason"] = "arbitrary approval"
+        approval["evidence_required"][1] = "sha256:" + "f" * 64
+        connection.execute(
+            "UPDATE approvals SET payload=? WHERE id=?",
+            (json.dumps(approval, sort_keys=True, separators=(",", ":")), "approval.storage.root.root-auth.current"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+@pytest.mark.parametrize("payload_kind", ("blob", "duplicate-key"))
+def test_default_authority_resolution_rejects_noncanonical_physical_payloads(tmp_path, payload_kind):
+    store_path = seeded_authority_store(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        root_payload = connection.execute("SELECT payload FROM storage_root_authorizations WHERE id=?", ("root-auth.current",)).fetchone()[0]
+        approval_payload = connection.execute("SELECT payload FROM approvals WHERE id=?", ("approval.storage.root.root-auth.current",)).fetchone()[0]
+        if payload_kind == "blob":
+            root_payload, approval_payload = sqlite3.Binary(root_payload.encode()), sqlite3.Binary(approval_payload.encode())
+        else:
+            root_payload = root_payload[:-1] + ',"authorization_ref":"root-auth.current"}'
+        connection.execute("UPDATE storage_root_authorizations SET payload=? WHERE id=?", (root_payload, "root-auth.current"))
+        connection.execute("UPDATE approvals SET payload=? WHERE id=?", (approval_payload, "approval.storage.root.root-auth.current"))
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
 def test_preflight_fails_closed_on_changed_source_or_authority(tmp_path):
     dependencies = deterministic_dependencies(source_head="f" * 40)
     store_path = seeded_authority_store(tmp_path)
@@ -505,6 +616,40 @@ def test_successor_rejects_coherently_redigested_predecessor_cross_binding_tampe
         "resolved_inputs": resolved, "checks": [asdict(check) for check in predecessor.preflight.checks],
     })
     report = replace(predecessor.preflight, resolved_inputs=resolved, report_digest=report_digest)
+    provisional = ProvisioningBundleV1(
+        predecessor.schema_version, predecessor.intent, predecessor.plan, report,
+        outbox_fixture(plan_id=predecessor.plan.plan_id, plan_digest=predecessor.plan.plan_digest, report_digest=report.report_digest, bundle_digest=predecessor.bundle_digest),
+        predecessor.bundle_digest, predecessor.supersedes_plan_id, predecessor.changed_immutable_inputs,
+    )
+    digest = bundle_digest(provisional)
+    forged = ProvisioningBundleV1(
+        predecessor.schema_version, predecessor.intent, predecessor.plan, report,
+        outbox_fixture(plan_id=predecessor.plan.plan_id, plan_digest=predecessor.plan.plan_digest, report_digest=report.report_digest, bundle_digest=digest),
+        digest, predecessor.supersedes_plan_id, predecessor.changed_immutable_inputs,
+    )
+    successor = intent_fixture(plan_id="backup-provision.donuthole.v21.20260802", supersedes_plan_id=predecessor.plan.plan_id)
+
+    with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
+        build_provisioning_bundle(
+            store_path, successor,
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: forged, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+        )
+
+
+def test_successor_rejects_coherently_redigested_predecessor_preflight_check_forgery(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    predecessor = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    forged_checks = tuple(
+        replace(check, evidence_digest="sha256:" + "f" * 64, summary="Forged passing preflight check.") if check.code == "GPG_DIGEST_VALID" else check
+        for check in predecessor.preflight.checks
+    )
+    report_digest = canonical_digest({
+        "report_id": predecessor.preflight.report_id,
+        "plan_id": predecessor.preflight.plan_id,
+        "resolved_inputs": predecessor.preflight.resolved_inputs,
+        "checks": [asdict(check) for check in forged_checks],
+    })
+    report = replace(predecessor.preflight, checks=forged_checks, report_digest=report_digest)
     provisional = ProvisioningBundleV1(
         predecessor.schema_version, predecessor.intent, predecessor.plan, report,
         outbox_fixture(plan_id=predecessor.plan.plan_id, plan_digest=predecessor.plan.plan_digest, report_digest=report.report_digest, bundle_digest=predecessor.bundle_digest),

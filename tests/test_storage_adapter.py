@@ -156,6 +156,21 @@ def test_backup_actions_are_registered_and_map_to_exact_mcp_tools(action, tool):
     assert set(client.capabilities()["actions"]) >= {"backup.create", "backup.verify_restore"}
 
 
+def test_read_operations_use_the_bounded_mcp_client_boundary():
+    calls = []
+    envelope = {"ok": True, "contract_version": "1.0", "request_id": "read", "result": {"value": "safe"}}
+    client = MCPBoundedStorageAdapterClient(lambda name, payload: calls.append((name, payload)) or envelope, 1)
+
+    assert client.project_get("project.donuthole") == envelope
+    assert client.root_get("project.donuthole", "backup-root") == envelope
+    assert client.directory_list("project.donuthole", "backup-root", "", "1", limit=2) == envelope
+    assert [name for name, _ in calls] == [
+        "underdark_project_get",
+        "underdark_root_get",
+        "underdark_directory_list",
+    ]
+
+
 def test_backup_action_rejects_extra_parameters_and_nonpositive_limits():
     now = datetime.now(UTC)
     dispatcher = StorageDispatcher((StorageAdapterRegistration("storage-adapter.theunderdark", "loopback-service.theunderdark", "sha256:cap", frozenset({"backup.create"}), 1, status=StorageAdapterStatus.ENABLED, approved_revision=1, readiness_checks=REQUIRED_READINESS),), lambda _: Client())

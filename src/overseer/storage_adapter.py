@@ -391,6 +391,31 @@ class MCPBoundedStorageAdapterClient:
     def health(self) -> Mapping[str, object]:
         return self._call_tool("underdark_health_get", {})
 
+    def project_get(self, project_id: str) -> Mapping[str, object]:
+        return self._read("underdark_project_get", {"project_id": project_id})
+
+    def root_get(self, project_id: str, root_id: str) -> Mapping[str, object]:
+        return self._read("underdark_root_get", {"project_id": project_id, "root_id": root_id})
+
+    def directory_list(
+        self,
+        project_id: str,
+        root_id: str,
+        relative_path: str,
+        policy_revision: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Mapping[str, object]:
+        return self._read("underdark_directory_list", {
+            "project_id": project_id,
+            "root_id": root_id,
+            "relative_path": relative_path,
+            "policy_revision": policy_revision,
+            "cursor": cursor,
+            "limit": limit,
+        })
+
     def submit(self, request: StorageExecutionRequest) -> StorageExecutionReceipt:
         validate_storage_execution_request(request)
         tool = self.TOOL_BY_ACTION.get(request.action)
@@ -421,6 +446,12 @@ class MCPBoundedStorageAdapterClient:
         if status is None or not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
             raise StorageAdapterError("RESULT_INVALID", "adapter operation state or evidence is malformed")
         return StorageExecutionResult(str(response.get("request_id")), operation_id, "storage-adapter.theunderdark", self._revision, "", status, str(result.get("action") or ""), "bounded storage operation result", tuple(ids), "verified" if status == StorageResultStatus.COMPLETED else state, evidence.get("host_state_changed", "unknown"))
+
+    def _read(self, tool: str, payload: Mapping[str, object]) -> Mapping[str, object]:
+        response = self._call_tool(tool, payload)
+        if not isinstance(response, Mapping) or response.get("contract_version") != CONTRACT_VERSION or not isinstance(response.get("ok"), bool):
+            raise StorageAdapterError("CONTRACT_MISMATCH", "storage read response contract is invalid")
+        return response
 
 
 class StorageDispatcher:

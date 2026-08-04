@@ -432,11 +432,16 @@ class MCPBoundedStorageAdapterClient:
         state = str(result.get("state") or "accepted")
         if not isinstance(operation_id, str) or state not in {"accepted", "authorized", "executing", "succeeded", "failed", "indeterminate", "cancelled"}:
             raise StorageAdapterError("RESULT_INVALID", "adapter receipt is malformed")
-        return StorageExecutionReceipt(request.request_id, operation_id, state, request.request_digest, self._revision)
+        return StorageExecutionReceipt(request.request_id, operation_id, state, str(response["request_digest"]), self._revision)
 
     def get_operation(self, project_id: str, operation_id: str) -> StorageExecutionResult:
         response = self._call_tool("underdark_operation_get", {"project_id": project_id, "operation_id": operation_id})
-        if response.get("ok") is not True or not isinstance(response.get("result"), Mapping):
+        request_digest = response.get("request_digest")
+        if (
+            response.get("ok") is not True
+            or not isinstance(response.get("result"), Mapping)
+            or not _sha256_digest(str(request_digest))
+        ):
             raise StorageAdapterError("RESULT_INVALID", "adapter operation result is malformed")
         result = response["result"]
         state = str(result.get("state"))
@@ -445,7 +450,7 @@ class MCPBoundedStorageAdapterClient:
         ids = evidence.get("evidence_ids")
         if status is None or not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
             raise StorageAdapterError("RESULT_INVALID", "adapter operation state or evidence is malformed")
-        return StorageExecutionResult(str(response.get("request_id")), operation_id, "storage-adapter.theunderdark", self._revision, "", status, str(result.get("action") or ""), "bounded storage operation result", tuple(ids), "verified" if status == StorageResultStatus.COMPLETED else state, evidence.get("host_state_changed", "unknown"))
+        return StorageExecutionResult(str(response.get("request_id")), operation_id, "storage-adapter.theunderdark", self._revision, str(request_digest), status, str(result.get("action") or ""), "bounded storage operation result", tuple(ids), "verified" if status == StorageResultStatus.COMPLETED else state, evidence.get("host_state_changed", "unknown"))
 
     def _read(self, tool: str, payload: Mapping[str, object]) -> Mapping[str, object]:
         response = self._call_tool(tool, payload)
@@ -500,7 +505,11 @@ class StorageDispatcher:
 
 
 def _validate_envelope(response: Mapping[str, object], request: StorageExecutionRequest) -> None:
-    if response.get("contract_version") != CONTRACT_VERSION or response.get("request_id") != request.request_id:
+    if (
+        response.get("contract_version") != CONTRACT_VERSION
+        or response.get("request_id") != request.request_id
+        or response.get("request_digest") != canonical_adapter_request_digest(request)
+    ):
         raise StorageAdapterError("CONTRACT_MISMATCH", "adapter response identity or contract mismatch")
 
 

@@ -149,11 +149,45 @@ def backup_request(now: datetime, *, action: str = "backup.create"):
 @pytest.mark.parametrize("action,tool", [("backup.create", "underdark_backup_create"), ("backup.verify_restore", "underdark_backup_verify_restore")])
 def test_backup_actions_are_registered_and_map_to_exact_mcp_tools(action, tool):
     now = datetime.now(UTC); calls = []
-    client = MCPBoundedStorageAdapterClient(lambda name, payload: calls.append((name, payload)) or {"ok": True, "contract_version": "1.0", "request_id": "backup-req", "operation_id": "op-backup", "result": {"state": "accepted"}}, 1)
     item = backup_request(now, action=action)
+    client = MCPBoundedStorageAdapterClient(lambda name, payload: calls.append((name, payload)) or {"ok": True, "contract_version": "1.0", "request_id": "backup-req", "request_digest": canonical_adapter_request_digest(item), "operation_id": "op-backup", "result": {"state": "accepted"}}, 1)
     receipt = client.submit(item)
     assert receipt.operation_id == "op-backup" and calls[0][0] == tool
     assert set(client.capabilities()["actions"]) >= {"backup.create", "backup.verify_restore"}
+
+
+def test_mcp_client_requires_and_retains_journaled_canonical_backup_request_digest():
+    now = datetime.now(UTC)
+    item = backup_request(now)
+    canonical = canonical_adapter_request_digest(item)
+
+    def call_tool(name, _payload):
+        if name == "underdark_backup_create":
+            return {
+                "ok": True,
+                "contract_version": "1.0",
+                "request_id": item.request_id,
+                "request_digest": canonical,
+                "operation_id": "op-backup",
+                "result": {"state": "succeeded"},
+            }
+        assert name == "underdark_operation_get"
+        return {
+            "ok": True,
+            "contract_version": "1.0",
+            "request_id": item.request_id,
+            "request_digest": canonical,
+            "operation_id": "op-backup",
+            "result": {"state": "succeeded", "action": "backup.create"},
+            "evidence": {"evidence_ids": [], "host_state_changed": True, "redactions_applied": True},
+        }
+
+    client = MCPBoundedStorageAdapterClient(call_tool, 1)
+    receipt = client.submit(item)
+    result = client.get_operation(item.project_id, receipt.operation_id)
+
+    assert receipt.request_digest == canonical
+    assert result.request_digest == canonical
 
 
 def test_read_operations_use_the_bounded_mcp_client_boundary():

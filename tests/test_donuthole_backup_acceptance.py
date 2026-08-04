@@ -4,10 +4,25 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import donuthole_backup_acceptance as acceptance
 from tests.support.donuthole_backup_acceptance import SynchronousMCPBridge, run_acceptance_scenario
 
 
 CONTRACT_FIXTURE = Path(__file__).parent / "fixtures/contracts/donuthole_backup_provisioning_v1.json"
+
+
+def _assert_recursively_redacted(value: object, *, workspace: Path) -> None:
+    if isinstance(value, dict):
+        for child in value.values():
+            _assert_recursively_redacted(child, workspace=workspace)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _assert_recursively_redacted(child, workspace=workspace)
+    elif isinstance(value, str):
+        assert not value.startswith("/")
+        assert str(workspace) not in value
+        assert "disposable encrypted backup passphrase" not in value
+        assert "disposable-test-token" not in value
 
 
 def test_bridge_discovers_tools_in_its_first_call_boundary() -> None:
@@ -50,8 +65,35 @@ def test_clean_install_acceptance_uses_real_disposable_components(tmp_path: Path
     assert result["authority"]["unchanged"] is True
 
 
-def test_clean_install_performs_disposable_backup_and_restore_through_real_adapter(tmp_path: Path) -> None:
+def test_clean_install_read_path_does_not_require_gpg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(acceptance, "_gpg_available", lambda: False)
+
     result = run_acceptance_scenario(CONTRACT_FIXTURE, "clean_install", tmp_path)
+
+    assert "backup" not in result
+    assert "restore" not in result
+
+
+def test_backup_restore_skips_only_when_gpg_is_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(acceptance, "_gpg_available", lambda: False)
+
+    with pytest.raises(pytest.skip.Exception, match="encrypted backup acceptance requires gpg"):
+        run_acceptance_scenario(CONTRACT_FIXTURE, "clean_install", tmp_path, include_backup_restore=True)
+
+
+def test_sealed_authority_status_rejects_changed_bytes_or_mode(tmp_path: Path) -> None:
+    authority = tmp_path / "authority.json"
+    authority.write_text("{}", encoding="utf-8")
+    authority.chmod(0o600)
+
+    assert acceptance._sealed_authority_status(authority, b"{}") is False
+
+    authority.chmod(0o400)
+    assert acceptance._sealed_authority_status(authority, b'{"changed":true}') is False
+
+
+def test_clean_install_performs_disposable_backup_and_restore_through_real_adapter(tmp_path: Path) -> None:
+    result = run_acceptance_scenario(CONTRACT_FIXTURE, "clean_install", tmp_path, include_backup_restore=True)
 
     assert result["backup"]["status"] == "completed"
     assert result["backup"]["request_digest"].startswith("sha256:")
@@ -59,8 +101,4 @@ def test_clean_install_performs_disposable_backup_and_restore_through_real_adapt
     assert result["restore"]["status"] == "verified"
     assert result["restore"]["request_digest"] != result["backup"]["request_digest"]
     assert result["restore"]["restored_content_digest"] == result["backup"]["source_content_digest"]
-    rendered = repr(result)
-    assert "/opt/" not in rendered
-    assert "/etc/" not in rendered
-    assert "/var/lib/" not in rendered
-    assert "disposable encrypted backup passphrase" not in rendered
+    _assert_recursively_redacted(result, workspace=tmp_path)

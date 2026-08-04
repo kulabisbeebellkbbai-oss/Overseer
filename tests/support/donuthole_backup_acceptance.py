@@ -8,12 +8,31 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 from typing import Any, Mapping
 
 
 _REQUIRED_ENVIRONMENT = ("THEUNDERDARK_PYTHON", "THEUNDERDARK_SOURCE")
+
+
+def _gpg_available() -> bool:
+    executable = Path("/usr/bin/gpg")
+    return executable.is_file() and os.access(executable, os.X_OK)
+
+
+def _sealed_authority_status(authority_path: Path, expected_bytes: bytes) -> bool:
+    """Confirm that root-owned fixture authority remains regular, sealed, and exact."""
+    try:
+        metadata = authority_path.lstat()
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and stat.S_IMODE(metadata.st_mode) == 0o400
+            and authority_path.read_bytes() == expected_bytes
+        )
+    except OSError:
+        return False
 
 
 class SynchronousMCPBridge:
@@ -53,11 +72,16 @@ class SynchronousMCPBridge:
         return asyncio.run(invoke())
 
 
-def run_acceptance_scenario(contract_path: Path, scenario_name: str, workspace: Path) -> dict[str, object]:
+def run_acceptance_scenario(
+    contract_path: Path,
+    scenario_name: str,
+    workspace: Path,
+    *,
+    include_backup_restore: bool = False,
+) -> dict[str, object]:
     """Launch clean-install composition with explicit external interpreter/source paths."""
 
-    gpg = Path("/usr/bin/gpg")
-    if not gpg.is_file() or not os.access(gpg, os.X_OK):
+    if include_backup_restore and not _gpg_available():
         import pytest
 
         pytest.skip("encrypted backup acceptance requires gpg")
@@ -78,6 +102,7 @@ def run_acceptance_scenario(contract_path: Path, scenario_name: str, workspace: 
             str(interpreter),
             str(Path(__file__).resolve()),
             "--child",
+            *( ["--include-backup-restore"] if include_backup_restore else [] ),
             str(contract_path),
             scenario_name,
             str(workspace),
@@ -253,7 +278,14 @@ def _load_builder(path: Path):
     return module.build_real_service
 
 
-def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder_path: Path) -> dict[str, object]:
+def _child_run(
+    contract_path: Path,
+    scenario_name: str,
+    workspace: Path,
+    builder_path: Path,
+    *,
+    include_backup_restore: bool,
+) -> dict[str, object]:
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     scenarios = {item["name"]: item for item in contract["scenarios"]}
     if scenario_name != "clean_install" or scenario_name not in scenarios:
@@ -275,9 +307,12 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
         "max_bytes": registration["max_bytes"],
         "root_path": str(root.resolve()),
     }
-    authority_path.write_text(json.dumps(authority, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    authority_bytes = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
+    authority_path.write_bytes(authority_bytes)
     authority_path.chmod(0o400)
-    authority_digest = "sha256:" + hashlib.sha256(authority_path.read_bytes()).hexdigest()
+    if not _sealed_authority_status(authority_path, authority_bytes):
+        raise AssertionError("disposable authority was not sealed before composition")
+    authority_digest = "sha256:" + hashlib.sha256(authority_bytes).hexdigest()
     service = _load_builder(builder_path)(workspace, authority_path)
     from theunderdark.production_app import create_production_mcp
     from overseer.storage_adapter import (
@@ -294,8 +329,6 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
     first = adapter.directory_list(registration["project_id"], registration["root_id"], "", registration["policy_revision"], limit=2)
     second = adapter.directory_list(registration["project_id"], registration["root_id"], "", registration["policy_revision"], cursor=first["result"]["next_cursor"], limit=2)
     nested_envelope = adapter.directory_list(registration["project_id"], registration["root_id"], "nested", registration["policy_revision"], limit=2)
-    if authority_path.read_bytes() != json.dumps(authority, sort_keys=True, separators=(",", ":")).encode():
-        raise AssertionError("authority bytes changed after real component composition")
     first_result = first["result"]
     second_result = second["result"]
     entries = [entry["name"] for entry in first_result["entries"] + second_result["entries"]]
@@ -303,6 +336,25 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
         raise AssertionError("pagination did not retain a stable snapshot identity")
     if first_result["total_count"] != second_result["total_count"] or len(entries) != len(set(entries)):
         raise AssertionError("pagination did not preserve a complete duplicate-free traversal")
+    if not include_backup_restore:
+        authority_unchanged = _sealed_authority_status(authority_path, authority_bytes)
+        if not authority_unchanged:
+            raise AssertionError("authority changed after read-only composition")
+        return {
+            "initialized": {"health": health, "tools": bridge.discovered_tools},
+            "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
+            "root": {**root_envelope["result"], "relative_path": ""},
+            "root_listing": {"relative_path": "", "entries": [entry["name"] for entry in first_result["entries"]]},
+            "nested_listing": {"relative_path": "nested", "entries": [entry["name"] for entry in nested_envelope["result"]["entries"]]},
+            "pagination": {
+                "entries": entries,
+                "next_cursor": second_result["next_cursor"],
+                "page_size": 2,
+                "snapshot_identity": first_result["snapshot_identity"],
+                "total_count": first_result["total_count"],
+            },
+            "authority": {"digest": authority_digest, "unchanged": authority_unchanged},
+        }
     requests = contract["acceptance_requests"]
     create_payload = requests["backup_create"]["parameters"]
     create_request = _fixture_execution_request(
@@ -325,14 +377,19 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
     create_result = adapter.get_operation(create_request.project_id, create_receipt.operation_id)
     if create_result.status != StorageResultStatus.COMPLETED:
         raise AssertionError("disposable backup did not reach verified completion")
-    if create_transport.request_digests != [canonical_adapter_request_digest(create_request)]:
+    expected_create_digest = canonical_adapter_request_digest(create_request)
+    if (
+        create_transport.request_digests != [expected_create_digest]
+        or create_receipt.request_digest != expected_create_digest
+        or create_result.request_digest != expected_create_digest
+    ):
         raise AssertionError("backup verification did not receive the canonical adapter request digest")
     create_envelope = bridge.call_tool(
         "underdark_operation_get",
         {"project_id": create_request.project_id, "operation_id": create_receipt.operation_id},
     )
     create_details = create_envelope.get("result")
-    if not isinstance(create_details, Mapping):
+    if not isinstance(create_details, Mapping) or create_envelope.get("request_digest") != expected_create_digest:
         raise AssertionError("backup operation did not expose a bounded result")
     artifact_id = create_details.get("artifact_id")
     artifact_digest = create_details.get("artifact_digest")
@@ -361,15 +418,27 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
     verify_result = adapter.get_operation(verify_request.project_id, verify_receipt.operation_id)
     if verify_result.status != StorageResultStatus.COMPLETED:
         raise AssertionError("disposable restore verification did not reach verified completion")
-    if verify_transport.request_digests != [canonical_adapter_request_digest(verify_request)]:
+    expected_verify_digest = canonical_adapter_request_digest(verify_request)
+    if (
+        verify_transport.request_digests != [expected_verify_digest]
+        or verify_receipt.request_digest != expected_verify_digest
+        or verify_result.request_digest != expected_verify_digest
+    ):
         raise AssertionError("restore verification did not receive the canonical adapter request digest")
     verify_envelope = bridge.call_tool(
         "underdark_operation_get",
         {"project_id": verify_request.project_id, "operation_id": verify_receipt.operation_id},
     )
     verify_details = verify_envelope.get("result")
-    if not isinstance(verify_details, Mapping) or verify_details.get("manifest_digest") != manifest_digest:
+    if (
+        not isinstance(verify_details, Mapping)
+        or verify_envelope.get("request_digest") != expected_verify_digest
+        or verify_details.get("manifest_digest") != manifest_digest
+    ):
         raise AssertionError("restored content did not match the source backup manifest")
+    authority_unchanged = _sealed_authority_status(authority_path, authority_bytes)
+    if not authority_unchanged:
+        raise AssertionError("authority changed after disposable restore verification")
     return {
         "initialized": {"health": health, "tools": bridge.discovered_tools},
         "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
@@ -383,16 +452,16 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
             "snapshot_identity": first_result["snapshot_identity"],
             "total_count": first_result["total_count"],
         },
-        "authority": {"digest": authority_digest, "unchanged": True},
+        "authority": {"digest": authority_digest, "unchanged": authority_unchanged},
         "backup": {
             "status": "completed",
-            "request_digest": canonical_adapter_request_digest(create_request),
+            "request_digest": create_result.request_digest,
             "artifact_identity": artifact_id,
             "source_content_digest": manifest_digest,
         },
         "restore": {
             "status": "verified",
-            "request_digest": canonical_adapter_request_digest(verify_request),
+            "request_digest": verify_result.request_digest,
             "restored_content_digest": verify_details["manifest_digest"],
         },
     }
@@ -401,6 +470,7 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
 def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--child", action="store_true")
+    parser.add_argument("--include-backup-restore", action="store_true")
     parser.add_argument("contract_path", type=Path)
     parser.add_argument("scenario_name")
     parser.add_argument("workspace", type=Path)
@@ -408,7 +478,13 @@ def _main() -> None:
     arguments = parser.parse_args()
     if not arguments.child:
         raise SystemExit("this support module is invoked by run_acceptance_scenario")
-    print(json.dumps(_child_run(arguments.contract_path, arguments.scenario_name, arguments.workspace, arguments.builder_path), sort_keys=True))
+    print(json.dumps(_child_run(
+        arguments.contract_path,
+        arguments.scenario_name,
+        arguments.workspace,
+        arguments.builder_path,
+        include_backup_restore=arguments.include_backup_restore,
+    ), sort_keys=True))
 
 
 if __name__ == "__main__":

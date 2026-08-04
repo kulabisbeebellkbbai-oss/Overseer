@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -78,28 +79,29 @@ def _read_current_root_authorization(
     database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
     now = datetime.now(UTC)
     try:
-        connection = sqlite3.connect(f"file:/proc/self/fd/{database_fd}?mode=ro&immutable=1", uri=True)
+        snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
+        snapshot_fd, snapshot_path = tempfile.mkstemp(prefix="overseer-authority-", suffix=".sqlite3")
+        try:
+            _write_snapshot(snapshot_fd, snapshot)
+            os.fsync(snapshot_fd)
+        finally:
+            os.close(snapshot_fd)
+        try:
+            connection = sqlite3.connect(f"file:{snapshot_path}?mode=ro&immutable=1", uri=True)
+        finally:
+            os.unlink(snapshot_path)
         try:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("BEGIN")
-            roots = connection.execute(
-                "SELECT id, project_id, root_id, status, payload FROM storage_root_authorizations"
-            ).fetchall()
-            approvals = {
-                row[0]: (row[1], row[2])
-                for row in connection.execute("SELECT id, subject_id, payload FROM approvals").fetchall()
-            }
-            crew_owners = {
-                row[0]: row[1]
-                for row in connection.execute("SELECT id, owner_domain FROM crew_messages").fetchall()
-            }
-            revoked = {
-                row[0] for row in connection.execute(
-                    "SELECT authorization_ref FROM storage_authorization_revocations"
-                ).fetchall()
-            }
+            _require_authority_schema(connection)
+            roots = _text_rows(connection, "storage_root_authorizations", ("id", "project_id", "root_id", "status", "payload"))
+            approvals = {row[0]: (row[1], row[2]) for row in _text_rows(connection, "approvals", ("id", "subject_id", "payload"))}
+            crew_messages = {row[0]: (row[1], row[2]) for row in _text_rows(connection, "crew_messages", ("id", "owner_domain", "payload"))}
+            revocations = _validated_revocations(connection)
         finally:
             connection.close()
+        if _read_authority_snapshot(database_fd, parent_fd, identity) != snapshot:
+            raise ValueError("root authorization snapshot changed during read")
     except sqlite3.Error:
         raise ValueError("root authorization read is unavailable") from None
     finally:
@@ -115,11 +117,11 @@ def _read_current_root_authorization(
             record, approved_at, expires_at = _root_authorization_payload(root_payload)
             approval_row_id = record["approval_id"]
             approval_subject_id, approval_payload = approvals[approval_row_id]
-            approval, decided_at = _approval_payload(approval_payload, record, crew_owners)
+            approval, decided_at = _approval_payload(approval_payload, record, crew_messages)
             exact = tuple(record[name] for name in ("action", "project_id", "root_id", "policy_revision", "root_identity", "alias", "status", "max_bytes", "target_digest"))
             if (
                 exact == supplied and record.get("authorization_status") == "approved"
-                and record["revoked_at"] is None and root_row_id not in revoked and approved_at <= now < expires_at
+                and record["revoked_at"] is None and root_row_id not in revocations and approved_at <= now < expires_at
                 and root_row_id == record["authorization_ref"] and root_project_id == record["project_id"]
                 and root_root_id == record["root_id"] and root_status == record["authorization_status"]
                 and approval_row_id == approval["id"] and approval_subject_id == approval["subject_id"]
@@ -148,19 +150,28 @@ def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
 def _open_authority_snapshot(store_path: str) -> tuple[int, int, tuple[str, tuple[int, int, int, int, int, int], tuple[int, int, int, int, int, int]]]:
     """Open the database once, without following links, and bind its identity."""
     path = Path(store_path)
-    if path.name in {"", ".", ".."} or path.parent.is_symlink():
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
         raise ValueError("root authorization read is unavailable")
+    parent_fd: int | None = None
+    database_fd: int | None = None
     try:
-        parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        database_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        parent_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for component in path.parts[1:-1]:
+            child_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        noatime = getattr(os, "O_NOATIME", 0)
+        if not noatime:
+            raise OSError("metadata-preserving access is unavailable")
+        database_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | noatime, dir_fd=parent_fd)
         database_info = os.fstat(database_fd)
         entry_info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         parent_info = os.fstat(parent_fd)
     except OSError:
-        try:
+        if database_fd is not None:
+            os.close(database_fd)
+        if parent_fd is not None:
             os.close(parent_fd)
-        except UnboundLocalError:
-            pass
         raise ValueError("root authorization read is unavailable") from None
     if (
         not stat.S_ISREG(database_info.st_mode)
@@ -171,6 +182,70 @@ def _open_authority_snapshot(store_path: str) -> tuple[int, int, tuple[str, tupl
         os.close(parent_fd)
         raise ValueError("root authorization read is unavailable")
     return database_fd, parent_fd, (path.name, _file_identity(database_info), _file_identity(parent_info))
+
+
+def _read_authority_snapshot(database_fd: int, parent_fd: int, identity: tuple[str, tuple[int, int, int, int, int, int], tuple[int, int, int, int, int, int]]) -> bytes:
+    """Copy a stable descriptor into memory without letting SQLite touch the source."""
+    _verify_authority_snapshot(parent_fd, identity)
+    expected_size = identity[1][3]
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < expected_size:
+        chunk = os.pread(database_fd, min(1024 * 1024, expected_size - offset), offset)
+        if not chunk:
+            raise ValueError("root authorization read is unavailable")
+        chunks.append(chunk)
+        offset += len(chunk)
+    if _file_identity(os.fstat(database_fd)) != identity[1]:
+        raise ValueError("root authorization read is unavailable")
+    _verify_authority_snapshot(parent_fd, identity)
+    return b"".join(chunks)
+
+
+def _write_snapshot(snapshot_fd: int, snapshot: bytes) -> None:
+    offset = 0
+    while offset < len(snapshot):
+        written = os.write(snapshot_fd, snapshot[offset:])
+        if written <= 0:
+            raise OSError("in-memory authority snapshot is unavailable")
+        offset += written
+
+
+def _require_authority_schema(connection: sqlite3.Connection) -> None:
+    required = {
+        "storage_root_authorizations": ("id", "project_id", "root_id", "status", "payload"),
+        "approvals": ("id", "subject_id", "payload"),
+        "crew_messages": ("id", "owner_domain", "payload"),
+        "storage_authorization_revocations": ("id", "kind", "authorization_ref", "revoked_by", "revoked_at", "evidence_id"),
+    }
+    for table, columns in required.items():
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        if tuple(row[1] for row in rows) != columns or any(str(row[2]).upper() != "TEXT" for row in rows):
+            raise ValueError("root authorization schema is unavailable")
+
+
+def _text_rows(connection: sqlite3.Connection, table: str, columns: tuple[str, ...]) -> list[tuple[str, ...]]:
+    query = ", ".join(columns)
+    rows = connection.execute(f"SELECT {query} FROM {table}").fetchall()
+    if any(len(row) != len(columns) or any(type(value) is not str for value in row) for row in rows):
+        raise ValueError("root authorization row is malformed")
+    return [tuple(row) for row in rows]
+
+
+def _validated_revocations(connection: sqlite3.Connection) -> set[str]:
+    revoked: set[str] = set()
+    for row in _text_rows(connection, "storage_authorization_revocations", ("id", "kind", "authorization_ref", "revoked_by", "revoked_at", "evidence_id")):
+        row_id, kind, authorization_ref, revoked_by, revoked_at, evidence_id = row
+        if (
+            any(not value or value != value.strip() for value in row)
+            or kind not in {"root", "operation"} or row_id != f"revoke.{authorization_ref}"
+            or not evidence_id.startswith("crew.")
+        ):
+            raise ValueError("root authorization revocation is malformed")
+        _aware_utc(revoked_at, "revocation time")
+        if kind == "root":
+            revoked.add(authorization_ref)
+    return revoked
 
 
 def _verify_authority_snapshot(
@@ -236,7 +311,7 @@ def _root_authorization_payload(value: object) -> tuple[Mapping[str, object], da
 
 
 def _approval_payload(
-    value: object, record: Mapping[str, object], crew_owners: Mapping[object, object],
+    value: object, record: Mapping[str, object], crew_messages: Mapping[str, tuple[str, str]],
 ) -> tuple[Mapping[str, object], datetime]:
     approval = _canonical_json_object(value, "approval payload")
     required = {
@@ -258,14 +333,31 @@ def _approval_payload(
         )
     }
     staged_digest = canonical_digest(staged_payload)
+    crew_id = evidence[0] if isinstance(evidence, list) and evidence else None
+    crew_row = crew_messages.get(crew_id) if isinstance(crew_id, str) else None
     if (
         approval["requester_thread"] != "kira" or approval["decided_by"] == approval["requester_thread"]
         or approval["reason"] != f"Approve exact root storage authorization digest {staged_digest}"
         or not isinstance(evidence, list) or len(evidence) != 2
-        or not isinstance(evidence[0], str) or crew_owners.get(evidence[0]) != OwnerDomain.KIRA.value
+        or not isinstance(evidence[0], str) or crew_row is None
         or tuple(evidence) != (evidence[0], staged_digest)
     ):
         raise ValueError("approval payload has invalid evidence")
+    crew_owner, crew_payload = crew_row
+    crew = _canonical_json_object(crew_payload, "crew evidence payload")
+    crew_required = {
+        "id", "owner_domain", "subject", "message", "priority", "status", "requested_by", "created_at",
+        "updated_at", "related_resource_id", "related_plan_id", "related_limit_id", "review_status",
+        "decision_reason", "correction_request", "decision_evidence_ids", "decided_by", "decided_at",
+        "supersedes_message_id", "superseded_by_message_id", "acceptance_criteria", "request_evidence_ids",
+    }
+    if (
+        set(crew) != crew_required or crew["id"] != crew_id or crew["owner_domain"] != crew_owner
+        or crew_owner != OwnerDomain.KIRA.value or crew["status"] != "acknowledged"
+        or crew["review_status"] != "approved" or crew["decided_by"] != "kira"
+    ):
+        raise ValueError("crew evidence is not terminal")
+    _aware_utc(crew["decided_at"], "crew decision")
     return approval, _aware_utc(approval["decided_at"], "approval decision")
 
 
@@ -821,7 +913,11 @@ def _authoritative_predecessor(
     predecessor, available = _safe_read(dependencies.predecessor_lookup, intent.supersedes_plan_id)
     if not available or type(predecessor) is not ProvisioningBundleV1:
         raise ProvisioningBundleError("PREDECESSOR_UNAVAILABLE")
-    if not _valid_predecessor_contract(predecessor) or predecessor.plan.plan_id != intent.supersedes_plan_id or predecessor.supersedes_plan_id == intent.plan_id:
+    if (
+        not _valid_predecessor_contract(predecessor)
+        or not _valid_predecessor_chain(predecessor, dependencies, {intent.plan_id})
+        or predecessor.plan.plan_id != intent.supersedes_plan_id
+    ):
         raise ProvisioningBundleError("PREDECESSOR_INVALID")
     tip, tip_available = _safe_read(dependencies.authoritative_chain_tip)
     if not tip_available or tip != intent.supersedes_plan_id:
@@ -873,6 +969,29 @@ def _valid_predecessor_contract(predecessor: ProvisioningBundleV1) -> bool:
         return bundle_digest(predecessor) == predecessor.bundle_digest
     except (TypeError, ValueError):
         return False
+
+
+def _valid_predecessor_chain(
+    predecessor: ProvisioningBundleV1, dependencies: PreflightDependencies, seen: set[str],
+) -> bool:
+    """Reconstruct a predecessor's declared chain before trusting the chain tip."""
+    plan_id = predecessor.plan.plan_id
+    if plan_id in seen:
+        return False
+    seen.add(plan_id)
+    declared = predecessor.supersedes_plan_id
+    if declared is None:
+        return predecessor.changed_immutable_inputs == ()
+    if dependencies.predecessor_lookup is None:
+        return False
+    prior, available = _safe_read(dependencies.predecessor_lookup, declared)
+    if (
+        not available or type(prior) is not ProvisioningBundleV1
+        or prior.plan.plan_id != declared or not _valid_predecessor_contract(prior)
+        or not _valid_predecessor_chain(prior, dependencies, seen)
+    ):
+        return False
+    return predecessor.changed_immutable_inputs == changed_immutable_inputs(prior, predecessor.plan, predecessor.preflight)
 
 
 def _valid_predecessor_cross_bindings(

@@ -337,6 +337,89 @@ def test_default_authority_resolution_rejects_incomplete_approval_payload_and_ro
     assert Path(store_path).read_bytes() == before
 
 
+@pytest.mark.parametrize("mutation", ("crew-payload-duplicate", "crew-nonterminal", "crew-decision-time"))
+def test_default_authority_resolution_requires_exact_terminal_kira_crew_evidence(tmp_path, mutation):
+    store_path = seeded_authority_store(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        payload = connection.execute("SELECT payload FROM crew_messages WHERE id=?", ("crew.kira.root-review",)).fetchone()[0]
+        if mutation == "crew-payload-duplicate":
+            payload = payload[:-1] + ',"id":"crew.kira.root-review"}'
+        else:
+            decoded = json.loads(payload)
+            decoded["review_status" if mutation == "crew-nonterminal" else "decided_at"] = "pending" if mutation == "crew-nonterminal" else "2026-08-02T12:00:00"
+            payload = json.dumps(decoded, sort_keys=True, separators=(",", ":"))
+        connection.execute("UPDATE crew_messages SET payload=? WHERE id=?", (payload, "crew.kira.root-review"))
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+def test_default_authority_resolution_rejects_blob_revocation_security_fields(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(
+            "INSERT INTO storage_authorization_revocations VALUES(?,?,?,?,?,?)",
+            ("revoke.unrelated", "root", sqlite3.Binary(b"root-auth.current"), "human", datetime.now(UTC).isoformat(), "crew.kira.root-review"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+def test_default_authority_snapshot_uses_noatime_and_rejects_symlinked_ancestor(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    real_open = os.open
+    observed_flags = []
+
+    def recording_open(path, flags, *arguments, **keywords):
+        observed_flags.append((path, flags))
+        return real_open(path, flags, *arguments, **keywords)
+
+    monkeypatch.setattr(bundle_module.os, "open", recording_open)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    store_path = Path(seeded_authority_store(nested))
+    before_metadata = (store_path.stat().st_atime_ns, store_path.stat().st_mtime_ns, store_path.stat().st_ctime_ns)
+    report = run_provisioning_preflight(str(store_path), intent_fixture(), deterministic_dependencies())
+    assert report.passed is True
+    assert (store_path.stat().st_atime_ns, store_path.stat().st_mtime_ns, store_path.stat().st_ctime_ns) == before_metadata
+    assert any(flags & os.O_NOATIME for _path, flags in observed_flags)
+
+    linked = tmp_path / "linked"
+    linked.symlink_to(nested, target_is_directory=True)
+    report = run_provisioning_preflight(str(linked / "state.sqlite3"), intent_fixture(), deterministic_dependencies())
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+def test_default_authority_snapshot_closes_descriptors_after_post_open_stat_failure(tmp_path, monkeypatch):
+    import overseer.provisioning_bundle as bundle_module
+
+    store_path = seeded_authority_store(tmp_path)
+    real_stat = os.stat
+    def failing_entry_stat(path, *arguments, **keywords):
+        if path == "state.sqlite3" and keywords.get("dir_fd") is not None:
+            raise OSError("simulated post-open stat failure")
+        return real_stat(path, *arguments, **keywords)
+
+    before = len(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(bundle_module.os, "stat", failing_entry_stat)
+    for _ in range(20):
+        report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+        assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 def test_default_authority_resolution_rejects_wal_lifecycle_revocation_race(tmp_path, monkeypatch):
     store_path = Path(seeded_authority_store(tmp_path))
     real_connect = sqlite3.connect
@@ -667,6 +750,39 @@ def test_successor_rejects_coherently_redigested_predecessor_preflight_check_for
         build_provisioning_bundle(
             store_path, successor,
             replace(deterministic_dependencies(), predecessor_lookup=lambda _id: forged, authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+        )
+
+
+def test_successor_rejects_predecessor_with_forged_unchanged_chain_delta(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    root = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    middle_intent = intent_fixture(plan_id="backup-provision.donuthole.v21.20260802", supersedes_plan_id=root.plan.plan_id)
+    middle = build_provisioning_bundle(
+        store_path, middle_intent,
+        replace(deterministic_dependencies(), predecessor_lookup=lambda _id: root, authoritative_chain_tip=lambda: root.plan.plan_id),
+    )
+    changed = ("gpg_sha256",)
+    provisional = ProvisioningBundleV1(
+        middle.schema_version, middle.intent, middle.plan, middle.preflight,
+        outbox_fixture(plan_id=middle.plan.plan_id, plan_digest=middle.plan.plan_digest, report_digest=middle.preflight.report_digest, bundle_digest=middle.bundle_digest),
+        middle.bundle_digest, middle.supersedes_plan_id, changed,
+    )
+    forged_digest = bundle_digest(provisional)
+    forged = ProvisioningBundleV1(
+        middle.schema_version, middle.intent, middle.plan, middle.preflight,
+        outbox_fixture(plan_id=middle.plan.plan_id, plan_digest=middle.plan.plan_digest, report_digest=middle.preflight.report_digest, bundle_digest=forged_digest),
+        forged_digest, middle.supersedes_plan_id, changed,
+    )
+    successor = intent_fixture(plan_id="backup-provision.donuthole.v22.20260802", supersedes_plan_id=middle.plan.plan_id)
+
+    with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
+        build_provisioning_bundle(
+            store_path, successor,
+            replace(
+                deterministic_dependencies(),
+                predecessor_lookup=lambda identifier: root if identifier == root.plan.plan_id else forged,
+                authoritative_chain_tip=lambda: middle.plan.plan_id,
+            ),
         )
 
 

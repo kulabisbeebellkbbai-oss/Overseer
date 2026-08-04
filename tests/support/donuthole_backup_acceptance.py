@@ -21,19 +21,23 @@ class SynchronousMCPBridge:
 
     def __init__(self, mcp: object) -> None:
         self._mcp = mcp
+        self._discovered_tools: tuple[str, ...] | None = None
 
-    def list_tools(self) -> list[str]:
-        async def invoke() -> list[str]:
-            tools = await self._mcp.list_tools()
-            return sorted(str(tool.name) for tool in tools)
-
-        return asyncio.run(invoke())
+    @property
+    def discovered_tools(self) -> tuple[str, ...]:
+        if self._discovered_tools is None:
+            raise RuntimeError("MCP tools are discovered during the first call_tool invocation")
+        return self._discovered_tools
 
     def call_tool(self, name: str, arguments: Mapping[str, object]) -> Mapping[str, object]:
         async def invoke() -> Mapping[str, object]:
             from mcp.shared.memory import create_connected_server_and_client_session
 
             async with create_connected_server_and_client_session(self._mcp) as client:
+                if self._discovered_tools is None:
+                    listed = await client.list_tools()
+                    tools = listed.tools
+                    self._discovered_tools = tuple(sorted(tool.name for tool in tools))
                 response = await client.call_tool(name, dict(arguments))
             structured = getattr(response, "structuredContent", None)
             if isinstance(structured, Mapping):
@@ -151,7 +155,7 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
     if first_result["total_count"] != second_result["total_count"] or len(entries) != len(set(entries)):
         raise AssertionError("pagination did not preserve a complete duplicate-free traversal")
     return {
-        "initialized": {"health": health, "tools": bridge.list_tools()},
+        "initialized": {"health": health, "tools": bridge.discovered_tools},
         "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
         "root": {**root_envelope["result"], "relative_path": ""},
         "root_listing": {"relative_path": "", "entries": [entry["name"] for entry in first_result["entries"]]},

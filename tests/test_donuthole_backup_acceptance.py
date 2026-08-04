@@ -4,10 +4,24 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.donuthole_backup_acceptance import run_acceptance_scenario
+from tests.support.donuthole_backup_acceptance import SynchronousMCPBridge, run_acceptance_scenario
 
 
 CONTRACT_FIXTURE = Path(__file__).parent / "fixtures/contracts/donuthole_backup_provisioning_v1.json"
+
+
+def test_bridge_discovers_tools_in_its_first_call_boundary() -> None:
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP("bridge-test")
+
+    @mcp.tool(name="fixture_echo")
+    def echo(value: str) -> dict[str, str]:
+        return {"value": value}
+
+    bridge = SynchronousMCPBridge(mcp)
+    assert bridge.call_tool("fixture_echo", {"value": "safe"}) == {"value": "safe"}
+    assert bridge.discovered_tools == ("fixture_echo",)
 
 
 def test_clean_install_acceptance_uses_real_disposable_components(tmp_path: Path) -> None:

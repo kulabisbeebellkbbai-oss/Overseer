@@ -623,7 +623,7 @@ def _validate_independent_human(
     identity: str,
 ) -> str:
     """Validate one canonical actor before any decision mutation."""
-    canonical = identity.strip() if isinstance(identity, str) else ""
+    canonical = _canonical_identity(identity)
     if (
         not isinstance(identity, str)
         or not canonical
@@ -632,16 +632,22 @@ def _validate_independent_human(
         or plan.status != ProvisioningStatus.STAGED
     ):
         raise ValueError("independent human identity is required")
-    evidence_actors = set(REQUIRED_EVIDENCE) | {
-        domain.value for domain in REQUIRED_EVIDENCE.values()
+    evidence_actors = {
+        _canonical_identity(actor) for actor in REQUIRED_EVIDENCE
+    } | {
+        _canonical_identity(domain.value) for domain in REQUIRED_EVIDENCE.values()
     }
     evidence_requesters = {
-        store.load_crew_message(message_id).requested_by
+        _canonical_identity(store.load_crew_message(message_id).requested_by)
         for message_id in plan.evidence_ids.values()
     }
     if canonical in evidence_actors or canonical in evidence_requesters:
         raise ValueError("independent human identity is required")
     return canonical
+
+
+def _canonical_identity(identity: object) -> str:
+    return identity.strip().lower() if isinstance(identity, str) else ""
 
 
 _APPROVAL_BLOCKER_EXPLANATIONS = {

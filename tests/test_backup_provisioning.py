@@ -312,8 +312,35 @@ def test_approval_rejects_noncanonical_evidence_actor_without_mutation(tmp_path)
     assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
 
 
+@pytest.mark.parametrize("actor", ("KIRA", "Kira"))
+def test_approval_rejects_case_variant_evidence_actor_without_mutation(tmp_path, actor):
+    store_path, plan, _bundle = _typed_bundle_with_reviews(tmp_path)
+    before = _approval_control_rows(store_path)
+
+    with pytest.raises(ValueError, match="^independent human identity is required$"):
+        approve_plan(store_path, plan.plan_id, actor)
+
+    assert _approval_control_rows(store_path) == before
+    assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
+
+
+def test_approval_rejects_case_variant_evidence_requester_without_mutation(tmp_path):
+    store_path, plan = seeded(tmp_path)
+    stage_plan(store_path, plan)
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(plan.evidence_ids["obrien"])
+        store.save_crew_message(replace(message, requested_by="INDEPENDENT-HUMAN"))
+    before = _approval_control_rows(store_path)
+
+    with pytest.raises(ValueError, match="^independent human identity is required$"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+    assert _approval_control_rows(store_path) == before
+    assert _task6_plan(store_path, plan.plan_id).status == ProvisioningStatus.STAGED
+
+
 @pytest.mark.parametrize("decision", ("deny", "request_revision"))
-@pytest.mark.parametrize("actor", ("kira", " obrien ", ""))
+@pytest.mark.parametrize("actor", ("kira", "KIRA", "Kira", " obrien ", ""))
 def test_roadex_decisions_reject_non_independent_humans_without_mutation(
     tmp_path, decision, actor,
 ):

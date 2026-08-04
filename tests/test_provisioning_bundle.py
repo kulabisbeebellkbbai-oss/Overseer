@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import sqlite3
+import tempfile
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -168,20 +169,30 @@ def bundle_fixture(*, outbox_state: str = "pending") -> ProvisioningBundleV1:
 def seeded_authority_store(tmp_path, *, root_identity: str = "sha256:" + "e" * 64) -> str:
     store_path = str(tmp_path / "state.sqlite3")
     now = datetime.now(UTC)
+    authorization_ref = "root-auth.current"
+    target_digest = canonical_root_target_digest(root_identity)
+    staged_payload = {
+        "authorization_ref": authorization_ref, "action": "root.register",
+        "project_id": "project.donuthole", "root_id": "backup-root", "policy_revision": "1",
+        "root_identity": root_identity, "alias": "donuthole-development", "status": "active",
+        "max_bytes": 1073741824, "target_digest": target_digest,
+        "expires_at": (now + timedelta(days=1)).isoformat(),
+    }
+    staged_digest = canonical_digest(staged_payload)
     with SQLiteStore(store_path) as store:
         store.save_crew_message(CrewMessage(
             "crew.kira.root-review", OwnerDomain.KIRA, "Root review", "Approved root",
             RiskLevel.HIGH, CrewMessageStatus.ACKNOWLEDGED,
-            review_status=CrewReviewStatus.APPROVED, decided_by="kira", decided_at=now.isoformat(),
+            related_resource_id="backup-root", related_plan_id=authorization_ref,
+            review_status=CrewReviewStatus.APPROVED,
+            decision_reason=(f"Kira terminal approval for authorization {authorization_ref} "
+                             f"staged authorization digest {staged_digest} root identity {root_identity} "
+                             f"target digest {target_digest}"),
+            decision_evidence_ids=(staged_digest, root_identity, target_digest),
+            request_evidence_ids=(staged_digest, root_identity, target_digest),
+            decided_by="kira", decided_at=now.isoformat(),
         ))
-    payload = {
-        "authorization_ref": "root-auth.current", "action": "root.register",
-        "project_id": "project.donuthole", "root_id": "backup-root", "policy_revision": "1",
-        "root_identity": root_identity, "alias": "donuthole-development", "status": "active",
-        "max_bytes": 1073741824, "target_digest": canonical_root_target_digest(root_identity),
-        "expires_at": (now + timedelta(days=1)).isoformat(),
-    }
-    stage_authorization(store_path, "root", payload, "crew.kira.root-review", "kira", now.isoformat())
+    stage_authorization(store_path, "root", staged_payload, "crew.kira.root-review", "kira", now.isoformat())
     approve_authorization(store_path, "root-auth.current", "human", now.isoformat())
     materialize_authorization(store_path, "root-auth.current", now.isoformat())
     return store_path
@@ -296,7 +307,21 @@ def test_default_authority_resolution_normalizes_same_instant_approval_times(tmp
         "max_bytes": 1073741824, "target_digest": canonical_root_target_digest("sha256:" + "e" * 64),
         "expires_at": (now + timedelta(days=1)).isoformat(),
     }
-    stage_authorization(store_path, "root", payload, "crew.kira.root-review", "kira", now.isoformat())
+    staged_digest = canonical_digest(payload)
+    with SQLiteStore(store_path) as store:
+        store.save_crew_message(CrewMessage(
+            "crew.kira.same-instant", OwnerDomain.KIRA, "Root review", "Approved root",
+            RiskLevel.HIGH, CrewMessageStatus.ACKNOWLEDGED,
+            related_resource_id="backup-root", related_plan_id="root-auth.same-instant",
+            review_status=CrewReviewStatus.APPROVED,
+            decision_reason=(f"Kira terminal approval for authorization root-auth.same-instant "
+                             f"staged authorization digest {staged_digest} root identity {'sha256:' + 'e' * 64} "
+                             f"target digest {payload['target_digest']}"),
+            decision_evidence_ids=(staged_digest, "sha256:" + "e" * 64, payload["target_digest"]),
+            request_evidence_ids=(staged_digest, "sha256:" + "e" * 64, payload["target_digest"]),
+            decided_by="kira", decided_at=now.isoformat(),
+        ))
+    stage_authorization(store_path, "root", payload, "crew.kira.same-instant", "kira", now.isoformat())
     approve_authorization(store_path, "root-auth.same-instant", "human", now.astimezone(timezone(timedelta(hours=1))).isoformat())
     materialize_authorization(store_path, "root-auth.same-instant", now.isoformat())
     connection = sqlite3.connect(store_path)
@@ -357,6 +382,119 @@ def test_default_authority_resolution_requires_exact_terminal_kira_crew_evidence
     report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
 
     assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("related_resource_id", "other-root"),
+        ("related_plan_id", "root-auth.substituted"),
+        ("decision_evidence_ids", ("sha256:" + "f" * 64, "sha256:" + "e" * 64, "sha256:" + "d" * 64)),
+        ("request_evidence_ids", ("sha256:" + "f" * 64, "sha256:" + "e" * 64, "sha256:" + "d" * 64)),
+        ("decision_reason", "Kira approved generally"),
+    ),
+)
+def test_default_authority_resolution_rejects_substituted_kira_root_bindings(tmp_path, field, value):
+    store_path = seeded_authority_store(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        payload = json.loads(connection.execute("SELECT payload FROM crew_messages WHERE id=?", ("crew.kira.root-review",)).fetchone()[0])
+        payload[field] = list(value) if isinstance(value, tuple) else value
+        connection.execute("UPDATE crew_messages SET payload=? WHERE id=?", (json.dumps(payload, sort_keys=True, separators=(",", ":")), "crew.kira.root-review"))
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+
+@pytest.mark.parametrize("sidecar", ("-journal", "-wal", "-shm", "-mj hot-journal"))
+def test_default_authority_resolution_rejects_sqlite_sidecars_without_mutation(tmp_path, sidecar):
+    store_path = Path(seeded_authority_store(tmp_path))
+    journal = store_path.with_name(store_path.name + sidecar)
+    if sidecar == "-journal":
+        writer = sqlite3.connect(store_path)
+        try:
+            assert writer.execute("PRAGMA journal_mode=DELETE").fetchone()[0].lower() == "delete"
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE approvals SET subject_id='journal-active' WHERE id='approval.storage.root.root-auth.current'")
+            assert journal.exists()
+            before = tuple((path.name, path.stat().st_mtime_ns, path.stat().st_ctime_ns, path.read_bytes()) for path in sorted(tmp_path.iterdir()))
+            report = run_provisioning_preflight(str(store_path), intent_fixture(), deterministic_dependencies())
+            assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+            assert tuple((path.name, path.stat().st_mtime_ns, path.stat().st_ctime_ns, path.read_bytes()) for path in sorted(tmp_path.iterdir())) == before
+        finally:
+            writer.rollback()
+            writer.close()
+    else:
+        journal.write_bytes(b"sidecar")
+        before = journal.stat().st_mtime_ns, journal.stat().st_ctime_ns, journal.read_bytes()
+        report = run_provisioning_preflight(str(store_path), intent_fixture(), deterministic_dependencies())
+        assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+        assert (journal.stat().st_mtime_ns, journal.stat().st_ctime_ns, journal.read_bytes()) == before
+
+
+@pytest.mark.parametrize("failure", ("write", "fsync", "connect", "query", "close", "unlink"))
+def test_default_authority_snapshot_cleans_up_each_partial_failure(tmp_path, monkeypatch, failure):
+    import overseer.provisioning_bundle as bundle_module
+
+    store_path = seeded_authority_store(tmp_path)
+    real_mkstemp = tempfile.mkstemp
+    real_unlink = os.unlink
+    real_close = os.close
+    closed_fds: list[int] = []
+    unlink_attempted = []
+
+    def fixed_mkstemp(*_arguments, **_keywords):
+        return real_mkstemp(dir=tmp_path, prefix="private-authority-temp", suffix=".sqlite3")
+
+    def recording_close(fd):
+        closed_fds.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(bundle_module.tempfile, "mkstemp", fixed_mkstemp)
+    monkeypatch.setattr(bundle_module.os, "close", recording_close)
+    if failure == "write":
+        monkeypatch.setattr(bundle_module, "_write_snapshot", lambda *_args: (_ for _ in ()).throw(OSError("private write")))
+    elif failure == "fsync":
+        monkeypatch.setattr(bundle_module.os, "fsync", lambda *_args: (_ for _ in ()).throw(OSError("private fsync")))
+    elif failure == "connect":
+        monkeypatch.setattr(bundle_module.sqlite3, "connect", lambda *_args, **_keywords: (_ for _ in ()).throw(sqlite3.Error("private connect")))
+    elif failure == "query":
+        monkeypatch.setattr(bundle_module, "_require_authority_schema", lambda *_args: (_ for _ in ()).throw(sqlite3.Error("private query")))
+    elif failure == "close":
+        real_connect = sqlite3.connect
+
+        class ClosingFailure:
+            def __init__(self, connection): self.connection = connection
+            def execute(self, *args, **kwargs): return self.connection.execute(*args, **kwargs)
+            def close(self):
+                self.connection.close()
+                raise sqlite3.Error("private close")
+
+        monkeypatch.setattr(bundle_module.sqlite3, "connect", lambda *args, **kwargs: ClosingFailure(real_connect(*args, **kwargs)))
+    else:
+        def failing_unlink(path, *args, **kwargs):
+            unlink_attempted.append(str(path))
+            if "private-authority-temp" in str(path):
+                raise OSError("private unlink")
+            return real_unlink(path, *args, **kwargs)
+        monkeypatch.setattr(bundle_module.os, "unlink", failing_unlink)
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), deterministic_dependencies())
+
+    assert next(check for check in report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+    assert closed_fds
+    assert "private-authority-temp" not in repr(report)
+    assert "private " not in repr(report)
+    if failure == "unlink":
+        assert any("private-authority-temp" in path for path in unlink_attempted)
+        for path in tmp_path.glob("private-authority-temp*.sqlite3"):
+            real_unlink(path)
+    else:
+        assert list(tmp_path.glob("private-authority-temp*.sqlite3")) == []
 
 
 def test_default_authority_resolution_rejects_blob_revocation_security_fields(tmp_path):

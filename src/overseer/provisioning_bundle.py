@@ -78,38 +78,51 @@ def _read_current_root_authorization(
     """Read one current root authorization from a stable read-only snapshot."""
     database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
     now = datetime.now(UTC)
+    snapshot_fd: int | None = None
+    snapshot_path: str | None = None
+    connection: sqlite3.Connection | None = None
+    failed = False
+    roots: list[tuple[str, ...]] = []
+    approvals: dict[str, tuple[str, str]] = {}
+    crew_messages: dict[str, tuple[str, str]] = {}
+    revocations: set[str] = set()
     try:
         snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
         snapshot_fd, snapshot_path = tempfile.mkstemp(prefix="overseer-authority-", suffix=".sqlite3")
-        try:
-            _write_snapshot(snapshot_fd, snapshot)
-            os.fsync(snapshot_fd)
-        finally:
-            os.close(snapshot_fd)
-        try:
-            connection = sqlite3.connect(f"file:{snapshot_path}?mode=ro&immutable=1", uri=True)
-        finally:
-            os.unlink(snapshot_path)
-        try:
-            connection.execute("PRAGMA query_only=ON")
-            connection.execute("BEGIN")
-            _require_authority_schema(connection)
-            roots = _text_rows(connection, "storage_root_authorizations", ("id", "project_id", "root_id", "status", "payload"))
-            approvals = {row[0]: (row[1], row[2]) for row in _text_rows(connection, "approvals", ("id", "subject_id", "payload"))}
-            crew_messages = {row[0]: (row[1], row[2]) for row in _text_rows(connection, "crew_messages", ("id", "owner_domain", "payload"))}
-            revocations = _validated_revocations(connection)
-        finally:
-            connection.close()
+        _write_snapshot(snapshot_fd, snapshot)
+        os.fsync(snapshot_fd)
+        os.close(snapshot_fd)
+        snapshot_fd = None
+        _verify_authority_snapshot(parent_fd, identity)
+        connection = sqlite3.connect(f"file:{snapshot_path}?mode=ro&immutable=1", uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        _require_authority_schema(connection)
+        roots = _text_rows(connection, "storage_root_authorizations", ("id", "project_id", "root_id", "status", "payload"))
+        approvals = {row[0]: (row[1], row[2]) for row in _text_rows(connection, "approvals", ("id", "subject_id", "payload"))}
+        crew_messages = {row[0]: (row[1], row[2]) for row in _text_rows(connection, "crew_messages", ("id", "owner_domain", "payload"))}
+        revocations = _validated_revocations(connection)
         if _read_authority_snapshot(database_fd, parent_fd, identity) != snapshot:
-            raise ValueError("root authorization snapshot changed during read")
-    except sqlite3.Error:
-        raise ValueError("root authorization read is unavailable") from None
+            raise ValueError("root authorization read is unavailable")
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        failed = True
     finally:
-        try:
-            _verify_authority_snapshot(parent_fd, identity)
-        finally:
-            os.close(database_fd)
-            os.close(parent_fd)
+        for cleanup in (
+            (connection.close if connection is not None else None),
+            (lambda: os.close(snapshot_fd) if snapshot_fd is not None else None),
+            (lambda: os.unlink(snapshot_path) if snapshot_path is not None else None),
+            (lambda: _verify_authority_snapshot(parent_fd, identity)),
+            (lambda: os.close(database_fd)),
+            (lambda: os.close(parent_fd)),
+        ):
+            if cleanup is None:
+                continue
+            try:
+                cleanup()
+            except (OSError, RuntimeError, ValueError, sqlite3.Error):
+                failed = True
+    if failed:
+        raise ValueError("root authorization read is unavailable")
     candidates: list[tuple[Mapping[str, object], datetime]] = []
     supplied = ("root.register", project_id, root_id, policy_revision, root_identity, alias, status, max_bytes, target_digest)
     for root_row_id, root_project_id, root_root_id, root_status, root_payload in roots:
@@ -267,9 +280,15 @@ def _verify_authority_snapshot(
 
 
 def _authority_sidecars_present(parent_fd: int, name: str) -> bool:
-    for suffix in ("-wal", "-shm"):
+    try:
+        entries = os.listdir(parent_fd)
+    except OSError:
+        return True
+    for entry in entries:
+        if entry not in {name + "-wal", name + "-shm", name + "-journal"} and not entry.startswith(name + "-mj"):
+            continue
         try:
-            os.stat(name + suffix, dir_fd=parent_fd, follow_symlinks=False)
+            os.stat(entry, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             continue
         except OSError:
@@ -351,10 +370,25 @@ def _approval_payload(
         "decision_reason", "correction_request", "decision_evidence_ids", "decided_by", "decided_at",
         "supersedes_message_id", "superseded_by_message_id", "acceptance_criteria", "request_evidence_ids",
     }
+    expected_crew_evidence = (staged_digest, record["root_identity"], record["target_digest"])
+    expected_reason = (
+        f"Kira terminal approval for authorization {record['authorization_ref']} "
+        f"staged authorization digest {staged_digest} root identity {record['root_identity']} "
+        f"target digest {record['target_digest']}"
+    )
     if (
         set(crew) != crew_required or crew["id"] != crew_id or crew["owner_domain"] != crew_owner
         or crew_owner != OwnerDomain.KIRA.value or crew["status"] != "acknowledged"
         or crew["review_status"] != "approved" or crew["decided_by"] != "kira"
+        or crew["related_resource_id"] != record["root_id"]
+        or crew["related_plan_id"] != record["authorization_ref"]
+        or crew["decision_reason"] != expected_reason
+        or not isinstance(crew["decision_evidence_ids"], list)
+        or not isinstance(crew["request_evidence_ids"], list)
+        or tuple(crew["decision_evidence_ids"]) != expected_crew_evidence
+        or tuple(crew["request_evidence_ids"]) != expected_crew_evidence
+        or len(set(crew["decision_evidence_ids"])) != len(crew["decision_evidence_ids"])
+        or len(set(crew["request_evidence_ids"])) != len(crew["request_evidence_ids"])
     ):
         raise ValueError("crew evidence is not terminal")
     _aware_utc(crew["decided_at"], "crew decision")

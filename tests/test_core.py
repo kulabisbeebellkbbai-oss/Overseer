@@ -2987,6 +2987,146 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_public_bundle_routes_require_admin_auth_and_exact_queries(self):
+        calls = []
+        originals = tuple(
+            getattr(overseer_api, name, None)
+            for name in ("preflight_bundle_api", "stage_bundle_api", "bundle_status")
+        )
+        overseer_api.preflight_bundle_api = lambda path, payload: calls.append(("preflight", path, payload)) or {"status": "preview"}
+        overseer_api.stage_bundle_api = lambda path, payload: calls.append(("stage", path, payload)) or {"status": "staged"}
+        overseer_api.bundle_status = lambda path, plan_id: calls.append(("status", path, plan_id)) or {"status": "staged"}
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
+                    self.assertEqual(
+                        server.post("/backup-provisioning/bundles/preflight", {"intent": {}}),
+                        {"status": "preview"},
+                    )
+                    self.assertEqual(
+                        server.post("/backup-provisioning/bundles/stage", {"intent": {}}),
+                        {"status": "staged"},
+                    )
+                    self.assertEqual(
+                        server.get("/backup-provisioning/bundles?plan_id=plan.exact"),
+                        {"status": "staged"},
+                    )
+                    for path in (
+                        "/backup-provisioning/bundles",
+                        "/backup-provisioning/bundles?plan_id=",
+                        "/backup-provisioning/bundles?plan_id=one&plan_id=two",
+                        "/backup-provisioning/bundles?plan_id=one&extra=two",
+                    ):
+                        with self.assertRaises(HTTPError) as error:
+                            server.get(path)
+                        self.assertEqual(error.exception.code, 400)
+                        body = json.loads(error.exception.read().decode("utf-8"))
+                        self.assertEqual(body["error_code"], "INVALID_BUNDLE_STATUS_REQUEST")
+                    with self.assertRaises(HTTPError) as error:
+                        server.post("/backup-provisioning/bundles/stage?extra=true", {"intent": {}})
+                    self.assertEqual(error.exception.code, 400)
+                    body = json.loads(error.exception.read().decode("utf-8"))
+                    self.assertEqual(body["error_code"], "INVALID_BUNDLE_STAGE_REQUEST")
+                    with self.assertRaises(HTTPError) as error:
+                        server.post("/backup-provisioning/bundles", {"bundle": {}})
+                    self.assertEqual(error.exception.code, 404)
+
+                    overseer_api.stage_bundle_api = lambda *_args: (_ for _ in ()).throw(
+                        overseer_api.ProvisioningBundleError("AUTHORITATIVE_REBUILD_MISMATCH")
+                    )
+                    with self.assertRaises(HTTPError) as error:
+                        server.post("/backup-provisioning/bundles/stage", {"intent": {}})
+                    self.assertEqual(error.exception.code, 400)
+                    body = json.loads(error.exception.read().decode("utf-8"))
+                    self.assertEqual(body["error_code"], "AUTHORITATIVE_REBUILD_MISMATCH")
+
+                    for method, path, payload in (
+                        ("GET", "/backup-provisioning/bundles?plan_id=plan.exact", None),
+                        ("POST", "/backup-provisioning/bundles/preflight", {"intent": {}}),
+                        ("POST", "/backup-provisioning/bundles/stage", {"intent": {}}),
+                    ):
+                        request = Request(
+                            f"{server.url}{path}",
+                            data=(json.dumps(payload).encode("utf-8") if payload is not None else None),
+                            headers=({"content-type": "application/json"} if payload is not None else {}),
+                            method=method,
+                        )
+                        with self.assertRaises(HTTPError) as unauthorized:
+                            urlopen(request, timeout=5)
+                        self.assertEqual(unauthorized.exception.code, 401)
+        finally:
+            names = ("preflight_bundle_api", "stage_bundle_api", "bundle_status")
+            for name, original in zip(names, originals, strict=True):
+                if original is None:
+                    delattr(overseer_api, name)
+                else:
+                    setattr(overseer_api, name, original)
+
+        self.assertEqual([call[0] for call in calls], ["preflight", "stage", "status"])
+
+    def test_public_bundle_routes_redact_failures_and_reject_server_without_auth(self):
+        original = getattr(overseer_api, "preflight_bundle_api", None)
+        overseer_api.preflight_bundle_api = lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("private /home/god/Documents path leaked")
+        )
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
+                    with self.assertRaises(HTTPError) as error:
+                        server.post("/backup-provisioning/bundles/preflight", {"intent": {}})
+                    self.assertEqual(error.exception.code, 400)
+                    body = json.loads(error.exception.read().decode("utf-8"))
+                    self.assertEqual(body["error_code"], "BUNDLE_PREFLIGHT_UNAVAILABLE")
+                    self.assertNotIn("/home/", repr(body))
+                with LocalOverseerApiServer(store_path) as server:
+                    with self.assertRaises(HTTPError) as error:
+                        server.get("/backup-provisioning/bundles?plan_id=plan.exact")
+                    self.assertEqual(error.exception.code, 403)
+                    with self.assertRaises(HTTPError) as error:
+                        server.post("/backup-provisioning/bundles/preflight", {"intent": {}})
+                    self.assertEqual(error.exception.code, 403)
+                    with self.assertRaises(HTTPError) as error:
+                        server.post("/backup-provisioning/bundles/stage", {"intent": {}})
+                    self.assertEqual(error.exception.code, 403)
+        finally:
+            if original is None:
+                delattr(overseer_api, "preflight_bundle_api")
+            else:
+                overseer_api.preflight_bundle_api = original
+
+    def test_public_bundle_routes_reject_remote_testing_tokens(self):
+        original = overseer_api.validate_remote_testing_token
+        overseer_api.validate_remote_testing_token = lambda *_args: {
+            "authorized": True,
+            "auth_type": "remote_testing_token",
+            "reason": "valid_remote_token",
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="admin-secret") as server:
+                    for method, path, payload in (
+                        ("GET", "/backup-provisioning/bundles?plan_id=plan.exact", None),
+                        ("POST", "/backup-provisioning/bundles/preflight", {"intent": {}}),
+                        ("POST", "/backup-provisioning/bundles/stage", {"intent": {}}),
+                    ):
+                        request = Request(
+                            f"{server.url}{path}",
+                            data=(json.dumps(payload).encode("utf-8") if payload is not None else None),
+                            headers={
+                                "authorization": "Bearer remote-secret",
+                                **({"content-type": "application/json"} if payload is not None else {}),
+                            },
+                            method=method,
+                        )
+                        with self.assertRaises(HTTPError) as forbidden:
+                            urlopen(request, timeout=5)
+                        self.assertEqual(forbidden.exception.code, 403)
+        finally:
+            overseer_api.validate_remote_testing_token = original
+
     def test_legacy_codex_discovery_keeps_payload_keys_and_successor_headers(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "overseer.sqlite3"

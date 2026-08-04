@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -17,10 +18,15 @@ from pathlib import Path
 from threading import Barrier
 from types import MappingProxyType
 from types import SimpleNamespace
+from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
+from overseer import backup_provisioning_cli as backup_provisioning_cli_module
 from overseer.backup_provisioning import build_plan
+from overseer.api import make_api_handler
 from overseer.backup_host_operations import (
     capability_digest as reviewed_capability_digest,
     runtime_digest as reviewed_runtime_digest,
@@ -2967,3 +2973,352 @@ def test_bundle_rejects_malformed_outbox_entry_with_value_error():
             (object(), *bundle.outbox[1:]), bundle.bundle_digest,
             bundle.supersedes_plan_id, bundle.changed_immutable_inputs,
         )
+
+
+def _stable_store_observation(store_path: str) -> tuple[int, int, bytes, tuple[str, ...]]:
+    path = Path(store_path)
+    info = path.stat()
+    return (
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        path.read_bytes(),
+        tuple(sorted(candidate.name for candidate in path.parent.glob(path.name + "*"))),
+    )
+
+
+def test_bundle_api_preflight_is_exact_server_owned_and_read_only(tmp_path, monkeypatch):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    dependencies = deterministic_dependencies(source_head=bundle.intent.source_commit)
+    factory_calls: list[str] = []
+
+    def production_factory(path):
+        factory_calls.append(path)
+        return dependencies
+
+    monkeypatch.setattr(
+        provisioning_bundle_module, "production_preflight_dependencies", production_factory,
+    )
+    before = _stable_store_observation(store_path)
+
+    result = provisioning_bundle_module.preflight_bundle_api(
+        store_path, {"intent": intent_payload()},
+    )
+
+    assert result == {
+        "ok": True,
+        "status": "preview",
+        "request_id": bundle.intent.request_id,
+        "plan_id": bundle.plan.plan_id,
+        "bundle_id": bundle.intent.plan_id,
+        "preflight_report_id": bundle.preflight.report_id,
+        "plan_digest": bundle.plan.plan_digest,
+        "preflight_digest": bundle.preflight.report_digest,
+        "bundle_digest": bundle.bundle_digest,
+        "approval_required": True,
+        "redactions_applied": True,
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+    assert factory_calls == [store_path]
+    assert _stable_store_observation(store_path) == before
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
+        "plans": 0, "bindings": 0, "reports": 0,
+        "bundles": 0, "outbox": 0, "crew": 0,
+    }
+
+
+def test_bundle_api_public_signatures_have_no_authority_or_dependency_seam():
+    assert tuple(inspect.signature(
+        provisioning_bundle_module.preflight_bundle_api,
+    ).parameters) == ("store_path", "payload")
+    assert tuple(inspect.signature(
+        provisioning_bundle_module.stage_bundle_api,
+    ).parameters) == ("store_path", "payload")
+    assert tuple(inspect.signature(
+        provisioning_bundle_module.bundle_status,
+    ).parameters) == ("store_path", "plan_id")
+
+
+@pytest.mark.parametrize("forbidden", ("authority", "evidence", "steps", "binding", "bundle"))
+def test_bundle_api_preflight_rejects_every_caller_owned_field(forbidden):
+    with pytest.raises(
+        ProvisioningBundleError, match="^INVALID_BUNDLE_PREFLIGHT_REQUEST$",
+    ):
+        provisioning_bundle_module.preflight_bundle_api(
+            "/private/store.sqlite3", {"intent": intent_payload(), forbidden: {}},
+        )
+
+
+def test_bundle_api_stage_rebuilds_and_rejects_stale_digests_without_partial_writes(
+    tmp_path, monkeypatch,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "production_preflight_dependencies",
+        lambda _path: deterministic_dependencies(source_head=bundle.intent.source_commit),
+    )
+    preview = provisioning_bundle_module.preflight_bundle_api(
+        store_path, {"intent": intent_payload()},
+    )
+    before = _stable_store_observation(store_path)
+
+    with pytest.raises(
+        ProvisioningBundleError, match="^AUTHORITATIVE_REBUILD_MISMATCH$",
+    ):
+        provisioning_bundle_module.stage_bundle_api(
+            store_path,
+            {
+                "intent": intent_payload(),
+                "expected_preflight_digest": "sha256:" + "0" * 64,
+                "expected_bundle_digest": "sha256:" + "1" * 64,
+            },
+        )
+    assert _stable_store_observation(store_path) == before
+
+    result = provisioning_bundle_module.stage_bundle_api(
+        store_path,
+        {
+            "intent": intent_payload(),
+            "expected_preflight_digest": preview["preflight_digest"],
+            "expected_bundle_digest": preview["bundle_digest"],
+        },
+    )
+    assert result["status"] == "staged"
+    assert result["bundle_id"] == bundle.intent.plan_id
+    assert result["preflight_report_id"] == bundle.preflight.report_id
+    assert result["mutation_performed"] is True
+    assert result["host_mutation_performed"] is False
+    assert persisted_bundle_rows(store_path, bundle.plan.plan_id) == {
+        "plans": 1, "bindings": 1, "reports": 1,
+        "bundles": 1, "outbox": 4, "crew": 0,
+    }
+
+
+def test_bundle_status_verifies_exact_persisted_set_without_writes(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    staged = stage_expected_bundle(store_path, bundle)
+    before = _stable_store_observation(store_path)
+
+    result = provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert result == {
+        **staged,
+        "bundle_id": bundle.intent.plan_id,
+        "preflight_report_id": bundle.preflight.report_id,
+        "review_outbox": tuple(
+            {"id": entry.id, "owner_domain": entry.owner_domain.value, "state": entry.state}
+            for entry in bundle.outbox
+        ),
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+    assert _stable_store_observation(store_path) == before
+
+
+def test_bundle_status_get_route_is_exact_redacted_and_read_only(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _stable_store_observation(store_path)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_api_handler(store_path, "bundle-secret"),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    headers = {"authorization": "Bearer bundle-secret"}
+    try:
+        request = Request(
+            f"{base_url}/backup-provisioning/bundles?plan_id={bundle.plan.plan_id}",
+            headers=headers,
+        )
+        with urlopen(request, timeout=5) as response:
+            status = json.loads(response.read().decode("utf-8"))
+        assert status["bundle_id"] == bundle.intent.plan_id
+        assert status["preflight_report_id"] == bundle.preflight.report_id
+        assert status["bundle_digest"] == bundle.bundle_digest
+        assert status["mutation_performed"] is False
+        assert status["host_mutation_performed"] is False
+        assert _stable_store_observation(store_path) == before
+
+        absent = Request(
+            f"{base_url}/backup-provisioning/bundles?plan_id=backup-provision.absent",
+            headers=headers,
+        )
+        with pytest.raises(HTTPError) as missing:
+            urlopen(absent, timeout=5)
+        assert missing.value.code == 404
+        assert json.loads(missing.value.read().decode("utf-8"))["error_code"] == "BUNDLE_NOT_FOUND"
+
+        with sqlite3.connect(store_path) as connection:
+            connection.execute(
+                "UPDATE provisioning_review_outbox SET payload=? WHERE id=?",
+                ("{}", bundle.outbox[0].id),
+            )
+        corrupted = _stable_store_observation(store_path)
+        with pytest.raises(HTTPError) as unavailable:
+            urlopen(request, timeout=5)
+        assert unavailable.value.code == 400
+        body = json.loads(unavailable.value.read().decode("utf-8"))
+        assert body["error_code"] == "BUNDLE_STATUS_UNAVAILABLE"
+        assert "/home/" not in repr(body)
+        assert _stable_store_observation(store_path) == corrupted
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_bundle_status_distinguishes_absent_bundle_from_incomplete_persisted_set(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_NOT_FOUND$"):
+        provisioning_bundle_module.bundle_status(store_path, "backup-provision.absent")
+
+    with sqlite3.connect(store_path) as connection:
+        connection.execute(
+            "DELETE FROM roadex_approval_bindings WHERE source_id=?",
+            (bundle.plan.plan_id,),
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM roadex_approval_bindings WHERE source_id=?",
+            (bundle.plan.plan_id,),
+        ).fetchone()[0] == 0
+    incomplete = _stable_store_observation(store_path)
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+    assert _stable_store_observation(store_path) == incomplete
+
+
+def test_bundle_api_rejects_malformed_stage_digests_and_redacts_dependency_failures(
+    tmp_path, monkeypatch,
+):
+    store_path = seeded_authority_store(tmp_path)
+    before = _stable_store_observation(store_path)
+    with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_STAGE_REQUEST$"):
+        provisioning_bundle_module.stage_bundle_api(
+            store_path,
+            {
+                "intent": intent_payload(),
+                "expected_preflight_digest": "private-invalid-digest",
+                "expected_bundle_digest": "sha256:" + "1" * 64,
+            },
+        )
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "production_preflight_dependencies",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("private /home/god/source")),
+    )
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_PREFLIGHT_UNAVAILABLE$") as error:
+        provisioning_bundle_module.preflight_bundle_api(
+            store_path, {"intent": intent_payload()},
+        )
+    assert "/home/" not in str(error.value)
+    assert _stable_store_observation(store_path) == before
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    ("dependencies", "authority", "evidence", "steps", "binding", "bundle"),
+)
+def test_bundle_api_stage_rejects_every_caller_owned_field(forbidden):
+    payload = {
+        "intent": intent_payload(),
+        "expected_preflight_digest": "sha256:" + "0" * 64,
+        "expected_bundle_digest": "sha256:" + "1" * 64,
+        forbidden: {},
+    }
+    with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_STAGE_REQUEST$"):
+        provisioning_bundle_module.stage_bundle_api("/private/store.sqlite3", payload)
+
+
+def test_bundle_cli_exposes_typed_preflight_stage_and_status(tmp_path, monkeypatch, capsys):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "production_preflight_dependencies",
+        lambda _path: deterministic_dependencies(source_head=bundle.intent.source_commit),
+    )
+    intent_file = tmp_path / "intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+
+    assert backup_provisioning_cli_module.main((
+        "--store", store_path, "bundle-preflight", "--intent-json", str(intent_file),
+    )) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert backup_provisioning_cli_module.main((
+        "--store", store_path, "bundle-stage", "--intent-json", str(intent_file),
+        "--expected-preflight-digest", preview["preflight_digest"],
+        "--expected-bundle-digest", preview["bundle_digest"],
+    )) == 0
+    json.loads(capsys.readouterr().out)
+    assert backup_provisioning_cli_module.main((
+        "--store", store_path, "bundle-status", "--plan-id", bundle.plan.plan_id,
+    )) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["bundle_digest"] == bundle.bundle_digest
+    assert status["mutation_performed"] is False
+
+
+def test_bundle_cli_keeps_legacy_stage_list_approve_and_execute(tmp_path, monkeypatch, capsys):
+    store_path = str(tmp_path / "state.sqlite3")
+    plan_file = tmp_path / "legacy-plan.json"
+    plan_file.write_text('{"legacy":true}', encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "stage_plan_api",
+        lambda path, payload: calls.append(("stage", (path, payload))) or {"command": "stage"},
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "list_plans",
+        lambda path: calls.append(("list", path)) or {"command": "list"},
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "approve_plan_api",
+        lambda path, payload: calls.append(("approve", (path, payload))) or {"command": "approve"},
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "execute_plan_api",
+        lambda path, payload, adapter_factory: calls.append(
+            ("execute", (path, payload, callable(adapter_factory)))
+        ) or {"command": "execute"},
+    )
+
+    commands = (
+        ("stage", ("--store", store_path, "stage", "--plan-json", str(plan_file))),
+        ("list", ("--store", store_path, "list")),
+        (
+            "approve",
+            ("--store", store_path, "approve", "--plan-id", "legacy.plan", "--approved-by", "human"),
+        ),
+        (
+            "execute",
+            (
+                "--store", store_path, "execute", "--plan-id", "legacy.plan",
+                "--privileged-confirmation", "legacy-confirmation",
+            ),
+        ),
+    )
+    for name, arguments in commands:
+        assert backup_provisioning_cli_module.main(arguments) == 0
+        assert json.loads(capsys.readouterr().out) == {"command": name}
+
+    assert calls == [
+        ("stage", (store_path, {"legacy": True})),
+        ("list", store_path),
+        ("approve", (store_path, {"plan_id": "legacy.plan", "approved_by": "human"})),
+        (
+            "execute",
+            (
+                store_path,
+                {"plan_id": "legacy.plan", "privileged_confirmation": "legacy-confirmation"},
+                True,
+            ),
+        ),
+    ]

@@ -17,6 +17,12 @@ from .roadex_approval_status import (
     MissingRoadexApprovalError,
     roadex_approval_status,
 )
+from .provisioning_bundle import (
+    ProvisioningBundleError,
+    bundle_status,
+    preflight_bundle_api,
+    stage_bundle_api,
+)
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
@@ -334,6 +340,22 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if path.startswith("/storage/control/") and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
+            if path == "/backup-provisioning/bundles":
+                if auth_context.get("auth_type") != "admin_token":
+                    self._write_json(
+                        {"error": "unauthorized", "reason": "admin_token_required"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                plan_ids = query.get("plan_id", [])
+                if set(query) != {"plan_id"} or len(plan_ids) != 1 or not plan_ids[0]:
+                    self._write_bundle_error("INVALID_BUNDLE_STATUS_REQUEST")
+                    return
+                self._handle_bundle(
+                    lambda: bundle_status(store_path, plan_ids[0]),
+                    "BUNDLE_STATUS_UNAVAILABLE",
+                )
                 return
             if path == "/auth-check":
                 self._write_json(
@@ -688,6 +710,30 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path == "/roadex/human-decisions/decide") and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
+            if path in {
+                "/backup-provisioning/bundles/preflight",
+                "/backup-provisioning/bundles/stage",
+            } and route.query:
+                self._write_bundle_error(
+                    "INVALID_BUNDLE_PREFLIGHT_REQUEST"
+                    if path.endswith("/preflight")
+                    else "INVALID_BUNDLE_STAGE_REQUEST"
+                )
+                return
+            if path == "/backup-provisioning/bundles/preflight":
+                self._handle_bundle_json(
+                    lambda payload: preflight_bundle_api(store_path, payload),
+                    "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+                    "BUNDLE_PREFLIGHT_UNAVAILABLE",
+                )
+                return
+            if path == "/backup-provisioning/bundles/stage":
+                self._handle_bundle_json(
+                    lambda payload: stage_bundle_api(store_path, payload),
+                    "INVALID_BUNDLE_STAGE_REQUEST",
+                    "BUNDLE_STAGE_UNAVAILABLE",
+                )
                 return
             if path == "/backup-provisioning/stage":
                 self._handle_json(lambda payload: stage_backup_provisioning_plan_api(store_path, payload))
@@ -1240,6 +1286,58 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     HTTPStatus.CONFLICT,
                     headers=response_headers,
                 )
+
+        def _write_bundle_error(self, error_code: str) -> None:
+            status = HTTPStatus.NOT_FOUND if error_code == "BUNDLE_NOT_FOUND" else HTTPStatus.BAD_REQUEST
+            self._write_json(
+                {
+                    "error": "provisioning_bundle_request_failed",
+                    "error_code": error_code,
+                },
+                status,
+            )
+
+        def _handle_bundle(self, handler, unavailable_code: str) -> None:
+            try:
+                self._write_json(dict(handler()))
+            except ProvisioningBundleError as error:
+                code = str(error)
+                if code not in {
+                    "INVALID_BUNDLE_STATUS_REQUEST",
+                    "BUNDLE_NOT_FOUND",
+                    "BUNDLE_STATUS_UNAVAILABLE",
+                }:
+                    code = unavailable_code
+                self._write_bundle_error(code)
+            except Exception:
+                self._write_bundle_error(unavailable_code)
+
+        def _handle_bundle_json(
+            self,
+            handler,
+            invalid_code: str,
+            unavailable_code: str,
+        ) -> None:
+            try:
+                payload = self._read_json()
+            except Exception:
+                self._write_bundle_error(invalid_code)
+                return
+            try:
+                self._write_json(dict(handler(payload)))
+            except ProvisioningBundleError as error:
+                code = str(error)
+                if code not in {
+                    "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+                    "INVALID_BUNDLE_STAGE_REQUEST",
+                    "AUTHORITATIVE_REBUILD_MISMATCH",
+                    "BUNDLE_PREFLIGHT_UNAVAILABLE",
+                    "BUNDLE_STAGE_UNAVAILABLE",
+                }:
+                    code = unavailable_code
+                self._write_bundle_error(code)
+            except Exception:
+                self._write_bundle_error(unavailable_code)
 
         def _handle_admin_execute(self) -> None:
             try:

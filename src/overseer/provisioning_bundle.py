@@ -2854,6 +2854,176 @@ def _public_bundle_status(
     }
 
 
+def _public_bundle_preview(bundle: ProvisioningBundleV1) -> Mapping[str, object]:
+    """Project one authoritative preview without authority or host details."""
+    return {
+        "ok": True,
+        "status": "preview",
+        "request_id": bundle.intent.request_id,
+        "plan_id": bundle.plan.plan_id,
+        "bundle_id": bundle.intent.plan_id,
+        "preflight_report_id": bundle.preflight.report_id,
+        "plan_digest": bundle.plan.plan_digest,
+        "preflight_digest": bundle.preflight.report_digest,
+        "bundle_digest": bundle.bundle_digest,
+        "approval_required": True,
+        "redactions_applied": True,
+        "mutation_performed": False,
+        "host_mutation_performed": False,
+    }
+
+
+def _parse_public_intent_request(
+    payload: Mapping[str, object],
+    required_fields: frozenset[str],
+    error_code: str,
+) -> ProvisioningIntentV1:
+    try:
+        if not isinstance(payload, Mapping) or set(payload) != required_fields:
+            raise ValueError
+        intent_payload = payload["intent"]
+        if not isinstance(intent_payload, Mapping):
+            raise ValueError
+        return parse_provisioning_intent(intent_payload)
+    except Exception:
+        raise ProvisioningBundleError(error_code) from None
+
+
+def preflight_bundle_api(
+    store_path: str, payload: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Build one redacted preview solely from a strict typed-intent mapping."""
+    intent = _parse_public_intent_request(
+        payload,
+        frozenset({"intent"}),
+        "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+    )
+    try:
+        return _public_bundle_preview(build_provisioning_bundle(store_path, intent))
+    except Exception:
+        raise ProvisioningBundleError("BUNDLE_PREFLIGHT_UNAVAILABLE") from None
+
+
+def stage_bundle_api(
+    store_path: str, payload: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Authoritatively rebuild and stage only a caller-previewed typed intent."""
+    required = frozenset({
+        "intent", "expected_preflight_digest", "expected_bundle_digest",
+    })
+    intent = _parse_public_intent_request(
+        payload,
+        required,
+        "INVALID_BUNDLE_STAGE_REQUEST",
+    )
+    expected_preflight = payload["expected_preflight_digest"]
+    expected_bundle = payload["expected_bundle_digest"]
+    if not _valid_digest(expected_preflight) or not _valid_digest(expected_bundle):
+        raise ProvisioningBundleError("INVALID_BUNDLE_STAGE_REQUEST")
+    try:
+        preview = build_provisioning_bundle(store_path, intent)
+        expected = ProvisioningPreviewDigests(
+            preview.plan.plan_digest,
+            expected_preflight,
+            expected_bundle,
+        )
+        result = stage_authoritative_bundle(store_path, intent, expected)
+    except Exception as error:
+        if str(error) == "PREVIEW_MISMATCH":
+            raise ProvisioningBundleError("AUTHORITATIVE_REBUILD_MISMATCH") from None
+        raise ProvisioningBundleError("BUNDLE_STAGE_UNAVAILABLE") from None
+    return {
+        **result,
+        "bundle_id": preview.intent.plan_id,
+        "preflight_report_id": preview.preflight.report_id,
+    }
+
+
+def _bundle_status_from_store(
+    store: SQLiteStore, plan_id: str,
+) -> Mapping[str, object]:
+    bundle = load_provisioning_bundle(store, plan_id)
+    binding = store.load_roadex_approval_binding(
+        binding_draft_for_bundle(bundle).approval_ref,
+    )
+    if type(binding) is not RoadexApprovalBinding:
+        raise ValueError("provisioning bundle immutable binding is inconsistent")
+    verify_exact_persisted_bundle_set(store, bundle, binding)
+    return {
+        **_public_bundle_status(bundle, binding, mutation=False),
+        "bundle_id": bundle.intent.plan_id,
+        "preflight_report_id": bundle.preflight.report_id,
+        "review_outbox": tuple(
+            {
+                "id": entry.id,
+                "owner_domain": entry.owner_domain.value,
+                "state": entry.state,
+            }
+            for entry in bundle.outbox
+        ),
+    }
+
+
+def bundle_status(store_path: str, plan_id: str) -> Mapping[str, object]:
+    """Read and verify one exact persisted bundle set without touching its store."""
+    if (
+        type(plan_id) is not str
+        or not plan_id
+        or plan_id != plan_id.strip()
+        or len(plan_id) > 512
+    ):
+        raise ProvisioningBundleError("INVALID_BUNDLE_STATUS_REQUEST")
+    database_fd: int | None = None
+    parent_fd: int | None = None
+    snapshot_fd: int | None = None
+    snapshot_path: str | None = None
+    result: Mapping[str, object] | None = None
+    missing = False
+    failed = False
+    try:
+        database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
+        snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
+        snapshot_fd, snapshot_path = tempfile.mkstemp(
+            prefix="overseer-bundle-status-", suffix=".sqlite3",
+        )
+        _write_snapshot(snapshot_fd, snapshot)
+        os.fsync(snapshot_fd)
+        os.close(snapshot_fd)
+        snapshot_fd = None
+        _verify_authority_snapshot(parent_fd, identity)
+        with SQLiteStore(snapshot_path) as store:
+            try:
+                result = _bundle_status_from_store(store, plan_id)
+            except KeyError:
+                missing = True
+        if _read_authority_snapshot(database_fd, parent_fd, identity) != snapshot:
+            raise ValueError("persisted provisioning bundle changed during read")
+    except Exception:
+        failed = True
+    finally:
+        for cleanup in (
+            (lambda: os.close(snapshot_fd) if snapshot_fd is not None else None),
+            (lambda: os.unlink(snapshot_path) if snapshot_path is not None else None),
+            (
+                lambda: _verify_authority_snapshot(parent_fd, identity)
+                if parent_fd is not None and database_fd is not None else None
+            ),
+            (lambda: os.close(database_fd) if database_fd is not None else None),
+            (lambda: os.close(parent_fd) if parent_fd is not None else None),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                failed = True
+    if failed:
+        raise ProvisioningBundleError("BUNDLE_STATUS_UNAVAILABLE")
+    if missing:
+        raise ProvisioningBundleError("BUNDLE_NOT_FOUND")
+    if result is None:
+        raise ProvisioningBundleError("BUNDLE_STATUS_UNAVAILABLE")
+    return result
+
+
 def _validate_stage_inputs(
     intent: ProvisioningIntentV1,
     expected_preview: ProvisioningPreviewDigests,
@@ -2993,7 +3163,8 @@ __all__ = [
     "ProvisioningPreviewDigests",
     "ProvisioningPreflightReport", "ProvisioningReviewOutboxEntry", "build_provisioning_bundle",
     "binding_draft_for_bundle", "dump_provisioning_bundle", "load_provisioning_bundle",
-    "stage_authoritative_bundle", "verify_exact_persisted_bundle_set",
+    "bundle_status", "preflight_bundle_api", "stage_authoritative_bundle", "stage_bundle_api",
+    "verify_exact_persisted_bundle_set",
     "bundle_digest", "canonical_bundle_bytes", "canonical_bundle_payload", "canonical_digest",
     "canonical_root_target_digest", "changed_immutable_inputs", "parse_provisioning_intent",
     "run_provisioning_preflight",

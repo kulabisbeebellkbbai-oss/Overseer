@@ -396,15 +396,17 @@ def _read_runtime_artifact(path: Path) -> str:
 def _seed_runtime_artifacts(
     workspace: Path,
     *,
-    previous_bytes: bytes,
-    previous_identity: str,
+    previous_bytes: bytes | None,
+    previous_identity: str | None,
     planned_bytes: bytes,
     planned_identity: str,
     retain_previous_runtime: bool,
     tamper_installed_runtime: bool,
-) -> dict[str, str]:
+) -> dict[str, str | None]:
     """Install the deterministic planned candidate without a process lifecycle."""
-    if previous_identity == planned_identity:
+    if (previous_bytes is None) != (previous_identity is None):
+        raise AssertionError("previous runtime bytes and identity must be jointly absent or present")
+    if previous_identity == planned_identity or (retain_previous_runtime and previous_bytes is None):
         raise AssertionError("active-upgrade runtime identities are invalid")
     artifact_dir = workspace / "runtime-artifacts"
     artifact_dir.mkdir(mode=0o700, exist_ok=True)
@@ -412,15 +414,18 @@ def _seed_runtime_artifacts(
     previous_path = artifact_dir / "previous.json"
     planned_path = artifact_dir / "planned.json"
     installed_path = artifact_dir / "installed.json"
-    _write_runtime_artifact(previous_path, previous_bytes)
+    if previous_bytes is not None:
+        _write_runtime_artifact(previous_path, previous_bytes)
     _write_runtime_artifact(planned_path, planned_bytes)
-    _write_runtime_artifact(installed_path, previous_bytes if retain_previous_runtime else planned_bytes)
+    installed_bytes = previous_bytes if retain_previous_runtime else planned_bytes
+    assert installed_bytes is not None
+    _write_runtime_artifact(installed_path, installed_bytes)
     if tamper_installed_runtime:
         installed_path.chmod(0o600)
         installed_path.write_bytes(installed_path.read_bytes() + b"!")
         installed_path.chmod(0o400)
     identities = {
-        "previous": _read_runtime_artifact(previous_path),
+        "previous": _read_runtime_artifact(previous_path) if previous_bytes is not None else None,
         "planned": _read_runtime_artifact(planned_path),
         "installed": _read_runtime_artifact(installed_path),
     }
@@ -470,12 +475,14 @@ def _child_run(
         raise AssertionError("disposable authority was not sealed before composition")
     authority_digest = "sha256:" + hashlib.sha256(authority_bytes).hexdigest()
     registration_disposition = None
-    runtime_identity = None
-    if scenario_name == "active_service_upgrade":
-        from overseer.backup_contract import previous_runtime_artifact_bytes, runtime_artifact_bytes
+    runtime_identity: dict[str, str | None] | None = None
+    from overseer.backup_contract import previous_runtime_artifact_bytes, runtime_artifact_bytes
 
-        runtime = contract["runtime_identity"]
-        if not isinstance(runtime, Mapping) or scenario.get("previous_runtime_identity") != runtime.get("previous_identity") or scenario.get("planned_runtime_identity") != runtime.get("planned_identity"):
+    runtime = contract["runtime_identity"]
+    if not isinstance(runtime, Mapping):
+        raise AssertionError("reviewed runtime identity is malformed")
+    if scenario_name == "active_service_upgrade":
+        if scenario.get("previous_runtime_identity") != runtime.get("previous_identity") or scenario.get("planned_runtime_identity") != runtime.get("planned_identity"):
             raise AssertionError("active-upgrade scenario does not match the reviewed runtime identity")
         registration_disposition = _seed_active_upgrade_state(
             workspace,
@@ -489,6 +496,16 @@ def _child_run(
             previous_identity=str(scenario["previous_runtime_identity"]),
             planned_bytes=runtime_artifact_bytes(str(runtime["commit"]), contract["mcp_tools"]),
             planned_identity=str(scenario["planned_runtime_identity"]),
+            retain_previous_runtime=retain_previous_runtime,
+            tamper_installed_runtime=tamper_installed_runtime,
+        )
+    else:
+        runtime_identity = _seed_runtime_artifacts(
+            workspace,
+            previous_bytes=None,
+            previous_identity=None,
+            planned_bytes=runtime_artifact_bytes(str(runtime["commit"]), contract["mcp_tools"]),
+            planned_identity=str(runtime["planned_identity"]),
             retain_previous_runtime=retain_previous_runtime,
             tamper_installed_runtime=tamper_installed_runtime,
         )
@@ -532,16 +549,21 @@ def _child_run(
     }
     if not common_result["authority"]["unchanged"]:
         raise AssertionError("authority changed after disposable composition")
+    assert runtime_identity is not None
+    matches_plan = runtime_identity["installed"] == runtime_identity["planned"]
+    common_result.update({
+        "runtime_identity": {**runtime_identity, "matches_plan": matches_plan},
+        "terminal_status": "acceptance_passed" if matches_plan else "acceptance_failed",
+    })
+    if not matches_plan:
+        failed_result = {**common_result, "evidence": {"code": "runtime_identity_mismatch", "redacted": True}}
+        if scenario_name == "active_service_upgrade":
+            assert registration_disposition is not None
+            failed_result["registration_disposition"] = registration_disposition
+        return failed_result
     if scenario_name == "active_service_upgrade":
-        assert runtime_identity is not None and registration_disposition is not None
-        matches_plan = runtime_identity["installed"] == runtime_identity["planned"]
-        return {
-            **common_result,
-            "registration_disposition": registration_disposition,
-            "runtime_identity": {**runtime_identity, "matches_plan": matches_plan},
-            "terminal_status": "acceptance_passed" if matches_plan else "acceptance_failed",
-            **({} if matches_plan else {"evidence": {"code": "runtime_identity_mismatch", "redacted": True}}),
-        }
+        assert registration_disposition is not None
+        return {**common_result, "registration_disposition": registration_disposition}
     if not include_backup_restore:
         return common_result
     requests = contract["acceptance_requests"]

@@ -63,6 +63,10 @@ def test_clean_install_acceptance_uses_real_disposable_components(tmp_path: Path
     assert result["pagination"]["total_count"] == 4
     assert len(result["pagination"]["entries"]) == len(set(result["pagination"]["entries"]))
     assert result["authority"]["unchanged"] is True
+    assert result["runtime_identity"]["previous"] is None
+    assert result["runtime_identity"]["installed"] == result["runtime_identity"]["planned"]
+    assert result["runtime_identity"]["matches_plan"] is True
+    assert result["terminal_status"] == "acceptance_passed"
 
 
 def test_clean_install_read_path_does_not_require_gpg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,6 +105,24 @@ def test_clean_install_performs_disposable_backup_and_restore_through_real_adapt
     assert result["restore"]["status"] == "verified"
     assert result["restore"]["request_digest"] != result["backup"]["request_digest"]
     assert result["restore"]["restored_content_digest"] == result["backup"]["source_content_digest"]
+    assert result["runtime_identity"]["installed"] == result["runtime_identity"]["planned"]
+    assert result["runtime_identity"]["matches_plan"] is True
+    _assert_recursively_redacted(result, workspace=tmp_path)
+
+
+def test_clean_install_rejects_tampered_installed_runtime_bytes(tmp_path: Path) -> None:
+    result = run_acceptance_scenario(
+        CONTRACT_FIXTURE,
+        "clean_install",
+        tmp_path,
+        tamper_installed_runtime=True,
+    )
+
+    assert result["runtime_identity"]["previous"] is None
+    assert result["runtime_identity"]["installed"] != result["runtime_identity"]["planned"]
+    assert result["runtime_identity"]["matches_plan"] is False
+    assert result["terminal_status"] == "acceptance_failed"
+    assert result["evidence"] == {"code": "runtime_identity_mismatch", "redacted": True}
     _assert_recursively_redacted(result, workspace=tmp_path)
 
 

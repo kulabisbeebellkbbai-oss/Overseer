@@ -11,6 +11,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
 import json
+import math
 import re
 from types import MappingProxyType
 from typing import Mapping
@@ -86,6 +87,13 @@ def _string_tuple(value: object, label: str, *, nonempty: bool = False) -> tuple
     return values
 
 
+def _snapshot_string_tuple(value: object, label: str) -> tuple[str, ...]:
+    """Copy a plan string sequence so caller-owned lists cannot survive."""
+    if not isinstance(value, (tuple, list)):
+        raise ValueError(f"{label} must be a string sequence")
+    return tuple(_nonempty_string(item, label) for item in value)
+
+
 def _freeze_value(value: object) -> object:
     """Copy a JSON-compatible value into an immutable canonical shape."""
     if isinstance(value, Mapping):
@@ -96,7 +104,11 @@ def _freeze_value(value: object) -> object:
         return tuple(_freeze_value(child) for child in value)
     if isinstance(value, list):
         return tuple(_freeze_value(child) for child in value)
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("canonical values must be finite")
         return value
     raise ValueError("canonical values must be JSON-compatible")
 
@@ -110,8 +122,8 @@ def _frozen_mapping(value: object, label: str) -> Mapping[str, object]:
 
 
 def _snapshot_steps(value: object, label: str) -> tuple[ProvisioningStep, ...]:
-    if not isinstance(value, tuple) or any(type(step) is not ProvisioningStep for step in value):
-        raise ValueError(f"{label} must be an immutable tuple of exact provisioning steps")
+    if not isinstance(value, (tuple, list)) or any(type(step) is not ProvisioningStep for step in value):
+        raise ValueError(f"{label} must be a sequence of exact provisioning steps")
     return tuple(
         ProvisioningStep(
             _nonempty_string(step.operation, f"{label} operation"),
@@ -122,9 +134,9 @@ def _snapshot_steps(value: object, label: str) -> tuple[ProvisioningStep, ...]:
 
 
 def _snapshot_plan(plan: DonutHoleBackupProvisioningPlan) -> DonutHoleBackupProvisioningPlan:
-    """Detach bundle-owned plan values from every caller-owned nested mapping."""
-    if not isinstance(plan.root_registrations, tuple):
-        raise ValueError("bundle plan root registrations must be immutable")
+    """Detach bundle-owned values from all caller-owned mutable plan inputs."""
+    if not isinstance(plan.root_registrations, (tuple, list)):
+        raise ValueError("bundle plan root registrations must be a sequence")
     return replace(
         plan,
         root_authorization_refs=_frozen_mapping(plan.root_authorization_refs, "bundle plan authorization references"),
@@ -135,6 +147,8 @@ def _snapshot_plan(plan: DonutHoleBackupProvisioningPlan) -> DonutHoleBackupProv
         evidence_ids=_frozen_mapping(plan.evidence_ids, "bundle plan evidence IDs"),
         steps=_snapshot_steps(plan.steps, "bundle plan steps"),
         rollback_steps=_snapshot_steps(plan.rollback_steps, "bundle plan rollback steps"),
+        read_only_paths=_snapshot_string_tuple(plan.read_only_paths, "bundle plan read-only paths"),
+        read_write_paths=_snapshot_string_tuple(plan.read_write_paths, "bundle plan read-write paths"),
     )
 
 
@@ -149,7 +163,11 @@ def _canonical_value(value: object) -> object:
         return {key: _canonical_value(child) for key, child in value.items()}
     if isinstance(value, (tuple, list)):
         return [_canonical_value(child) for child in value]
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("canonical values must be finite")
         return value
     raise ValueError("canonical digest value is unsupported")
 

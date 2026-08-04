@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict
+import math
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -276,11 +277,43 @@ def test_bundle_snapshots_nested_plan_mappings_against_external_mutation():
     assert asdict(bundle.plan)["evidence_ids"]["kira"] == "crew.kira.review-v20"
 
 
+def test_bundle_snapshots_every_tuple_annotated_plan_field_against_caller_mutation():
+    intent = intent_fixture()
+    original_plan = plan_fixture(intent.plan_id)
+
+    for field in ("root_registrations", "steps", "rollback_steps", "read_only_paths", "read_write_paths"):
+        caller_values = list(getattr(original_plan, field))
+        bundle = ProvisioningBundleV1(
+            "1", intent, replace(original_plan, **{field: caller_values}), report_fixture(intent.plan_id),
+            outbox_fixture(plan_id=intent.plan_id), "sha256:" + "0" * 64, None, (),
+        )
+        original_digest = bundle_digest(bundle)
+
+        caller_values.append(caller_values[0])
+
+        assert isinstance(getattr(bundle.plan, field), tuple)
+        assert len(getattr(bundle.plan, field)) == len(getattr(original_plan, field))
+        assert bundle_digest(bundle) == original_digest
+
+
 def test_canonical_digest_rejects_non_string_mapping_keys_at_every_depth():
     with pytest.raises(ValueError, match="string keys"):
         canonical_digest({1: "one"})
     with pytest.raises(ValueError, match="string keys"):
         canonical_digest({"outer": [{"nested": {1: "one"}}]})
+
+
+@pytest.mark.parametrize("value", (math.nan, math.inf, -math.inf), ids=("nan", "infinity", "negative-infinity"))
+def test_canonical_contract_rejects_nonfinite_floats_before_freezing_or_hashing(value):
+    with pytest.raises(ValueError, match="finite"):
+        canonical_digest({"value": value})
+
+    with pytest.raises(ValueError, match="finite"):
+        ProvisioningPreflightReport(
+            "preflight.nonfinite", "plan.nonfinite", {"nested": [{"value": value}]},
+            (PreflightCheck("INTENT_VALID", "passed", "sha256:" + "1" * 64, "summary"),),
+            True, "sha256:" + "3" * 64,
+        )
 
 
 def test_bundle_rejects_malformed_outbox_entry_with_value_error():

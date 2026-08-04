@@ -15,7 +15,13 @@ from overseer.backup_contract import (
     runtime_artifact_identity,
 )
 from overseer.backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
-from overseer.storage_adapter import BACKUP_ACTION_PARAMETERS, StorageExecutionRequest, canonical_adapter_request_digest
+from overseer.storage_adapter import (
+    BACKUP_ACTION_PARAMETERS,
+    BACKUP_ENCRYPTION_PROFILE,
+    StorageExecutionRequest,
+    canonical_adapter_request_digest,
+    validate_storage_execution_request,
+)
 
 
 THEUNDERDARK = Path(__file__).resolve().parents[2] / "TheUnderdark"
@@ -39,6 +45,7 @@ def test_provisioning_contract_fixture_is_canonical_complete_and_matches_current
     }
     assert FIXTURE.read_bytes() == canonical_contract_bytes(contract.raw)
     assert contract.raw["mcp_tools"] == EXPECTED_BACKUP_TOOL_SCHEMAS
+    assert contract.raw["acceptance_requests"]["backup_create"]["parameters"]["encryption_profile"] == BACKUP_ENCRYPTION_PROFILE
     assert [scenario["name"] for scenario in contract.raw["scenarios"]] == [
         "clean_install",
         "active_service_upgrade",
@@ -98,6 +105,69 @@ def test_provisioning_contract_rejects_active_upgrade_without_a_distinct_previou
 
     with pytest.raises(ValueError, match="previous identity must differ"):
         load_provisioning_contract(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda raw: raw["acceptance_requests"]["root_list"].__setitem__("page_size", 2.0),
+            "invalid acceptance_requests.root_list",
+        ),
+        (
+            lambda raw: raw["acceptance_requests"]["nested_list"].__setitem__("page_size", 2.0),
+            "invalid acceptance_requests.nested_list",
+        ),
+        (
+            lambda raw: raw["acceptance_requests"]["backup_create"]["parameters"].__setitem__("retention_count", 3.0),
+            "retention_count",
+        ),
+        (
+            lambda raw: raw["acceptance_requests"]["backup_create"]["parameters"].__setitem__("encryption_profile", "unapproved-profile"),
+            "encryption profile",
+        ),
+    ],
+)
+def test_provisioning_contract_rejects_inexact_numeric_and_encryption_values(tmp_path, mutation, message):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    mutation(raw)
+    path = tmp_path / "invalid-contract.json"
+    path.write_bytes(canonical_contract_bytes(raw))
+
+    with pytest.raises(ValueError, match=message):
+        load_provisioning_contract(path)
+
+
+@pytest.mark.parametrize(
+    ("request_name", "action"),
+    (("backup_create", "backup.create"), ("backup_verify_restore", "backup.verify_restore")),
+)
+def test_provisioning_contract_requests_construct_valid_storage_execution_requests(request_name, action):
+    contract = load_provisioning_contract(FIXTURE)
+    request_payload = contract.raw["acceptance_requests"][request_name]["parameters"]
+    parameters = {name: request_payload[name] for name in BACKUP_ACTION_PARAMETERS[action]}
+    request = StorageExecutionRequest(
+        request_id=request_payload["request_id"],
+        adapter_id="storage-adapter.theunderdark",
+        adapter_revision=1,
+        project_id=request_payload["project_id"],
+        resource_id="storage.donuthole",
+        root_id=request_payload["root_id"],
+        action=action,
+        parameters=parameters,
+        policy_revision=request_payload["policy_revision"],
+        claim_id="claim.contract-v1",
+        approval_id="approval.contract-v1",
+        authorization_ref=request_payload["authorization_ref"],
+        idempotency_key=request_payload["idempotency_key"],
+        requested_by="project.donuthole",
+        reason=request_payload["reason"],
+        acceptance_criteria=(),
+        limits={"max_bytes": 1, "max_items": 1},
+        expires_at="2099-01-01T00:00:00+00:00",
+    ).with_digest()
+
+    validate_storage_execution_request(request)
 
 
 def test_runtime_artifact_identity_is_deterministic_and_schema_bound():

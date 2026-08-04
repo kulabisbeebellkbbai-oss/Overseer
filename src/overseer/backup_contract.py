@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Mapping
 
+from .storage_adapter import BACKUP_ENCRYPTION_PROFILE
+
 
 PROVISIONING_CONTRACT_VERSION = "1"
 _REQUIRED_KEYS = frozenset({
@@ -190,7 +192,7 @@ def _validate_acceptance_requests(value: object) -> Mapping[str, object]:
     _validate_lookup_request(requests["root_get"], {"project_id", "root_id"}, "acceptance_requests.root_get")
     for name, relative_path in (("root_list", ""), ("nested_list", "nested")):
         request = _exact_fields(requests[name], {"page_size", "project_id", "relative_path", "root_id"}, f"acceptance_requests.{name}")
-        if request["relative_path"] != relative_path or isinstance(request["page_size"], bool) or request["page_size"] != 2:
+        if request["relative_path"] != relative_path or isinstance(request["page_size"], bool) or not isinstance(request["page_size"], int) or request["page_size"] != 2:
             raise ValueError(f"invalid acceptance_requests.{name}")
         _string(request["project_id"], f"acceptance_requests.{name}.project_id")
         _string(request["root_id"], f"acceptance_requests.{name}.root_id")
@@ -212,8 +214,11 @@ def _validate_tool_parameters(value: object, tool_name: str, label: str) -> None
     parameters = _exact_fields(value, set(_TOOL_FIELDS[tool_name]), label)
     for name, parameter in parameters.items():
         if name == "retention_count":
-            if isinstance(parameter, bool) or parameter != 3:
+            if isinstance(parameter, bool) or not isinstance(parameter, int) or parameter != 3:
                 raise ValueError(f"{label}.retention_count must be integer 3")
+        elif name == "encryption_profile":
+            if parameter != BACKUP_ENCRYPTION_PROFILE:
+                raise ValueError(f"{label}.encryption profile must match BACKUP_ENCRYPTION_PROFILE")
         elif name.endswith("digest"):
             _digest(parameter, f"{label}.{name}")
         else:

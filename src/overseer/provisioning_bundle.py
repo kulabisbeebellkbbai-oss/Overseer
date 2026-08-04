@@ -3352,6 +3352,11 @@ def _cleanup_bundle_status_resources(
         if attempt(store.close):
             resources.store = None
             resources.connection = None
+        elif resources.connection is not None:
+            connection = resources.connection
+            if attempt(connection.close):
+                resources.store = None
+                resources.connection = None
     elif resources.connection is not None:
         connection = resources.connection
         if attempt(connection.close):

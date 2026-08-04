@@ -70,6 +70,11 @@ run.
   replacement changed the queried database, and a fail-once temp-descriptor
   close during partial streaming lost ownership. Production code was unchanged
   before this RED run.
+- The final raw-connection cleanup correction produced 3 expected focused
+  failures: persistent ordinary and fatal store-wrapper close failures each
+  left one deleted-temp SQLite fd open, and a direct owner probe confirmed zero
+  raw-connection close attempts after two wrapper failures. Production code was
+  unchanged before this RED run.
 
 ## Outcome
 
@@ -125,10 +130,13 @@ progress clear, SQLite close, temp-fd close, temp unlink, source-fd close, and
 parent-fd close; it retries each cleanup once and continues after ordinary or
 fatal failures. Persistent ordinary and fatal cleanup failures are retained
 separately: an earlier fatal primary is preserved, while fatal cleanup outranks
-an ordinary primary. The connection must close successfully before return. The
-projection is stable and redacted, includes current exact review-outbox states,
-and reports both mutation flags false. The source database bytes, timestamps,
-and sidecar set remain unchanged on success and failure.
+an ordinary primary. If the store wrapper persistently fails before or after
+delegating, cleanup independently retries the separately owned raw connection;
+successful raw close clears both ownership references, while persistent raw
+failure remains owned and is surfaced. The connection must close successfully
+before return. The projection is stable and redacted, includes current exact
+review-outbox states, and reports both mutation flags false. The source database
+bytes, timestamps, and sidecar set remain unchanged on success and failure.
 
 The loopback API exposes only authenticated admin-token POST preflight, POST
 stage, and exact GET status routes. Missing credentials, a server without an
@@ -205,17 +213,25 @@ Final ownership/TOCTOU correction verification:
 - Python compilation and `git diff --check` are included in the final commit
   gate.
 
+Final raw-connection cleanup correction verification:
+
+- Adjacent wrapper/raw/fatal cleanup selection — 9 passed, 233 deselected.
+- Focused status selection — 38 passed, 204 deselected.
+- Full provisioning suites — 270 passed.
+- Established four-file touched suite excluding the documented unrelated
+  Roadex digest fixture — 786 passed, 1 deselected in 91.24 seconds.
+- Exact copy-paste configured disposable acceptance — 10 passed in 7.41
+  seconds.
+
 Earlier acceptance attempts with unset variables or the wrong TheUnderdark
 source root produced prerequisite/import failures; those results are retained
 only as superseded diagnostic history. The authoritative final configured
 disposable acceptance was:
 
 ```bash
-THEUNDERDARK_PYTHON='/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python'
-THEUNDERDARK_SOURCE='/home/god/Documents/Codex Workspace/TheUnderdark/.worktrees/donuthole-contract-acceptance'
-'/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python' -m pytest -q tests/test_donuthole_backup_acceptance.py
+THEUNDERDARK_PYTHON='/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python' THEUNDERDARK_SOURCE='/home/god/Documents/Codex Workspace/TheUnderdark/.worktrees/donuthole-contract-acceptance' PYTHONPATH=src '/home/god/Documents/Codex Workspace/TheUnderdark/.venv/bin/python' -m pytest -q tests/test_donuthole_backup_acceptance.py
 ```
 
-Result: 10 passed in 6.58 seconds. No dependency, source checkout, live
+Result: 10 passed in 7.41 seconds. No dependency, source checkout, live
 database, service, gateway, remote host, approval, dispatch, provisioning,
 deployment, restart, push, or external state was changed.

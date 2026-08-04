@@ -3582,6 +3582,104 @@ def test_bundle_status_cleanup_retries_fail_once_close_and_unlink(
     assert len(os.listdir("/proc/self/fd")) == before_descriptors
 
 
+@pytest.mark.parametrize("failure_type", (OSError, KeyboardInterrupt))
+def test_bundle_status_persistent_store_wrapper_close_uses_raw_connection_fallback(
+    tmp_path, monkeypatch, failure_type,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before_descriptors = len(os.listdir("/proc/self/fd"))
+    created: list[str] = []
+    connections: list[sqlite3.Connection] = []
+    close_attempts: list[bool] = []
+    real_mkstemp = tempfile.mkstemp
+    real_connect = sqlite3.connect
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return descriptor, path
+
+    def tracked_connect(database, *args, **kwargs):
+        connection = real_connect(database, *args, **kwargs)
+        if isinstance(database, str) and database.startswith("file:/proc/self/fd/"):
+            connections.append(connection)
+        return connection
+
+    def persistent_wrapper_close(_store):
+        close_attempts.append(True)
+        raise failure_type("persistent wrapper close failure")
+
+    monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(provisioning_bundle_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(
+        provisioning_bundle_module._BundleStatusReadOnlyStore,
+        "close",
+        persistent_wrapper_close,
+    )
+
+    expected = ProvisioningBundleError if failure_type is OSError else KeyboardInterrupt
+    try:
+        with pytest.raises(expected, match=(
+            "^BUNDLE_STATUS_UNAVAILABLE$"
+            if failure_type is OSError else "persistent wrapper close failure"
+        )):
+            provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+        assert close_attempts == [True, True]
+        assert connections
+        assert created and all(not os.path.exists(path) for path in created)
+        assert len(os.listdir("/proc/self/fd")) == before_descriptors
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+def test_bundle_status_persistent_raw_connection_close_is_retained_and_reported():
+    class WrapperFailure(OSError):
+        pass
+
+    class RawConnectionFailure(BaseException):
+        pass
+
+    class FailingConnection:
+        def __init__(self):
+            self.close_attempts = 0
+
+        def set_progress_handler(self, _handler, _opcodes):
+            return None
+
+        def close(self):
+            self.close_attempts += 1
+            raise RawConnectionFailure("persistent raw connection close failure")
+
+    class FailingStore:
+        def __init__(self):
+            self.close_attempts = 0
+
+        def close(self):
+            self.close_attempts += 1
+            raise WrapperFailure("persistent wrapper close failure")
+
+    connection = FailingConnection()
+    store = FailingStore()
+    resources = provisioning_bundle_module._BundleStatusResources(
+        connection=connection,
+        store=store,
+    )
+
+    ordinary, fatal = provisioning_bundle_module._cleanup_bundle_status_resources(
+        resources,
+    )
+
+    assert store.close_attempts == 2
+    assert connection.close_attempts == 2
+    assert isinstance(ordinary, WrapperFailure)
+    assert isinstance(fatal, RawConnectionFailure)
+    assert resources.store is store
+    assert resources.connection is connection
+
+
 @pytest.mark.parametrize("primary_is_fatal", (False, True))
 def test_bundle_status_fatal_cleanup_priority_preserves_fatal_primary_and_continues(
     tmp_path, monkeypatch, primary_is_fatal,

@@ -112,15 +112,35 @@ Final correction verification:
 - `python3 -m compileall -q src/overseer/provisioning_bundle.py
   tests/test_provisioning_bundle.py` and `git diff --check` — passed.
 
-The unfiltered repository suite produced 1269 passed, 6 skipped, and 10
-failures. None is in the corrected files: one pre-existing agent-store migration
-expectation includes an unexpected integer migration `3`; eight disposable
-cross-repository acceptance failures lack the `mcp` package and/or required
-`THEUNDERDARK_PYTHON` and `THEUNDERDARK_SOURCE` environment; and the already
-documented Roadex fixture still expects `sha256:0d127...` while obtaining
-`sha256:327b7...`. No baseline fixture, acceptance environment, or unrelated
-module was changed.
+The initial unfiltered repository run produced 1269 passed, 6 skipped, and 10
+failures. One failure was Task 3-owned: the integer-migration preservation test
+had not yet added schema migration `3` to its exact ordered expectation. The
+follow-up below corrects that regression. The remaining nine failures are eight
+disposable cross-repository acceptance failures lacking the `mcp` package and/or
+required `THEUNDERDARK_PYTHON` and `THEUNDERDARK_SOURCE` environment, plus the
+already documented Roadex fixture expecting `sha256:0d127...` while obtaining
+`sha256:327b7...`. No acceptance environment or unrelated module was changed.
 
 No live database, production source checkout, service, gateway, remote host,
 approval, dispatch, provisioning, deployment, restart, push, or host mutation
 was performed during this correction.
+
+## Schema-migration expectation follow-up
+
+The full-suite review correctly identified that schema version 3 makes integer
+migration `3` part of the exact preserved ordering. The existing agent-store
+test now expects `[1, 2, 3, 10, ...]` while retaining its checks that the
+pre-existing integer rows, integer column affinity, custom description index,
+and named agent migration remain preserved.
+
+The observed unfiltered-suite assertion was the RED evidence. Follow-up GREEN
+verification:
+
+- `pytest -q tests/test_agent_store.py::test_existing_integer_schema_migration_rows_and_indexes_are_preserved`
+  — 1 passed.
+- `pytest -q tests/test_agent_store.py -k migration` — 3 passed, 51 deselected.
+- `pytest -q tests/test_core.py -k 'schema or migration'` — 5 passed, 366
+  deselected.
+- `pytest -q tests/test_provisioning_bundle.py tests/test_backup_provisioning.py
+  tests/test_core.py tests/test_agent_store.py -k 'schema or migration or atomic
+  or idempotent or provisioning or correction'` — 158 passed, 413 deselected.

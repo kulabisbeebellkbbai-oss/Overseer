@@ -56,6 +56,11 @@ class SynchronousMCPBridge:
 def run_acceptance_scenario(contract_path: Path, scenario_name: str, workspace: Path) -> dict[str, object]:
     """Launch clean-install composition with explicit external interpreter/source paths."""
 
+    gpg = Path("/usr/bin/gpg")
+    if not gpg.is_file() or not os.access(gpg, os.X_OK):
+        import pytest
+
+        pytest.skip("encrypted backup acceptance requires gpg")
     missing = [name for name in _REQUIRED_ENVIRONMENT if not os.environ.get(name)]
     if missing:
         raise RuntimeError("cross-repository acceptance requires " + ", ".join(missing))
@@ -99,6 +104,146 @@ def run_acceptance_scenario(contract_path: Path, scenario_name: str, workspace: 
     return result
 
 
+def _fixture_execution_request(
+    *,
+    payload: Mapping[str, object],
+    action: str,
+    parameters: Mapping[str, object],
+):
+    """Build the bounded adapter record from the fixture-owned request fields."""
+    from overseer.storage_adapter import StorageExecutionRequest
+
+    return StorageExecutionRequest(
+        request_id=str(payload["request_id"]),
+        adapter_id="storage-adapter.theunderdark",
+        adapter_revision=1,
+        project_id=str(payload["project_id"]),
+        resource_id="storage.donuthole",
+        root_id=str(payload["root_id"]),
+        action=action,
+        parameters=dict(parameters),
+        policy_revision=str(payload["policy_revision"]),
+        claim_id=f"claim.{payload['request_id']}",
+        approval_id=f"approval.{payload['request_id']}",
+        authorization_ref=str(payload["authorization_ref"]),
+        idempotency_key=str(payload["idempotency_key"]),
+        requested_by=str(payload["project_id"]),
+        reason=str(payload["reason"]),
+        acceptance_criteria=("disposable encrypted restore verified",),
+        limits={"max_bytes": 1_073_741_824, "max_items": 16},
+        expires_at="2099-01-01T00:00:00+00:00",
+    ).with_digest()
+
+
+class _DisposableVerificationTransport:
+    """Test-only transport to the real, local Overseer verification function."""
+
+    def __init__(self, store_path: Path) -> None:
+        self._store_path = store_path
+        self.request_digests: list[str] = []
+
+    def post(self, _url: str, *, headers: Mapping[str, str], json: Mapping[str, object], timeout: float) -> Mapping[str, object]:
+        from overseer.storage_adapter import verify_storage_authorization_status
+
+        if headers.get("content-type") != "application/json" or timeout != 5.0:
+            raise AssertionError("the real verifier did not use its bounded transport contract")
+        digest = json.get("request_digest")
+        if not isinstance(digest, str):
+            raise AssertionError("the verifier omitted the canonical request digest")
+        self.request_digests.append(digest)
+        return verify_storage_authorization_status(
+            str(self._store_path),
+            json,
+            verified_at="2026-08-04T00:00:00+00:00",
+        )
+
+
+def _configure_disposable_backup_execution(
+    service: object,
+    workspace: Path,
+    request: object,
+    root: Path,
+    *,
+    journal_name: str,
+) -> _DisposableVerificationTransport:
+    """Attach real encrypted execution to an otherwise sealed disposable service."""
+    from overseer.audit import ApprovalRequest, ApprovalStatus
+    from overseer.core import ApprovalLevel, Claim, ClaimStatus, ClaimType, OwnerDomain, RiskLevel
+    from overseer.storage_adapter import StorageAuthorizationRecord, canonical_adapter_request_digest
+    from overseer.store import SQLiteStore
+    from theunderdark.backup_executor import EncryptedBackupExecutor
+    from theunderdark.journal import SQLiteOperationJournal
+    from theunderdark.overseer_verifier import OverseerAuthorizationVerifier
+
+    artifact_dir = workspace / "encrypted-artifacts"
+    artifact_dir.mkdir(mode=0o700, exist_ok=True)
+    artifact_dir.chmod(0o700)
+    passphrase_file = workspace / "backup-passphrase"
+    passphrase_file.write_text("disposable encrypted backup passphrase", encoding="utf-8")
+    passphrase_file.chmod(0o600)
+    executor = EncryptedBackupExecutor(
+        source_root=root,
+        artifact_dir=artifact_dir,
+        passphrase_file=passphrase_file,
+    )
+    store_path = workspace / f"{journal_name}-authorization.sqlite3"
+    tool_digest = canonical_adapter_request_digest(request)
+    approval = ApprovalRequest(
+        request.approval_id,
+        request.request_id,
+        ApprovalLevel.HUMAN,
+        request.requested_by,
+        OwnerDomain.OBRIEN,
+        "disposable encrypted backup acceptance",
+        status=ApprovalStatus.APPROVED,
+    )
+    claim = Claim(
+        request.claim_id,
+        request.resource_id,
+        ClaimType.LEASE,
+        request.requested_by,
+        OwnerDomain.OBRIEN,
+        "disposable encrypted backup acceptance",
+        request.action,
+        RiskLevel.HIGH,
+        status=ClaimStatus.ACTIVE,
+        expires_at="2099-01-02T00:00:00+00:00",
+    )
+    authorization = StorageAuthorizationRecord(
+        request.authorization_ref,
+        request.request_id,
+        request.request_digest,
+        request.project_id,
+        request.root_id,
+        request.action,
+        request.policy_revision,
+        request.claim_id,
+        request.approval_id,
+        tool_digest,
+        dict(request.limits),
+        "2026-08-04T00:00:00+00:00",
+        "2099-01-01T00:00:00+00:00",
+    )
+    with SQLiteStore(store_path) as store:
+        store.save_storage_execution_request(request)
+        store.save_claim(claim)
+        store.save_approval(approval)
+        store.save_storage_authorization(authorization)
+    transport = _DisposableVerificationTransport(store_path)
+    service.journal = SQLiteOperationJournal((workspace / f"{journal_name}-journal.sqlite3").resolve())
+    service.verifier = OverseerAuthorizationVerifier(
+        endpoint="http://127.0.0.1:8766/storage/authorizations/verify",
+        token_provider=lambda: "disposable-test-token",
+        http_client=transport,
+    )
+    service.backup_executor_provider = lambda project_id, root_id, policy_revision: (
+        executor
+        if (project_id, root_id, policy_revision) == (request.project_id, request.root_id, request.policy_revision)
+        else (_ for _ in ()).throw(PermissionError("no exact disposable backup binding"))
+    )
+    return transport
+
+
 def _load_builder(path: Path):
     spec = importlib.util.spec_from_file_location("theunderdark_disposable_composition", path)
     if spec is None or spec.loader is None:
@@ -135,7 +280,11 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
     authority_digest = "sha256:" + hashlib.sha256(authority_path.read_bytes()).hexdigest()
     service = _load_builder(builder_path)(workspace, authority_path)
     from theunderdark.production_app import create_production_mcp
-    from overseer.storage_adapter import MCPBoundedStorageAdapterClient
+    from overseer.storage_adapter import (
+        MCPBoundedStorageAdapterClient,
+        StorageResultStatus,
+        canonical_adapter_request_digest,
+    )
 
     bridge = SynchronousMCPBridge(create_production_mcp(service))
     adapter = MCPBoundedStorageAdapterClient(bridge.call_tool, adapter_revision=1)
@@ -154,6 +303,73 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
         raise AssertionError("pagination did not retain a stable snapshot identity")
     if first_result["total_count"] != second_result["total_count"] or len(entries) != len(set(entries)):
         raise AssertionError("pagination did not preserve a complete duplicate-free traversal")
+    requests = contract["acceptance_requests"]
+    create_payload = requests["backup_create"]["parameters"]
+    create_request = _fixture_execution_request(
+        payload=create_payload,
+        action="backup.create",
+        parameters={
+            "source_root_id": create_payload["source_root_id"],
+            "retention_count": create_payload["retention_count"],
+            "encryption_profile": create_payload["encryption_profile"],
+        },
+    )
+    create_transport = _configure_disposable_backup_execution(
+        service,
+        workspace,
+        create_request,
+        root,
+        journal_name="backup-create",
+    )
+    create_receipt = adapter.submit(create_request)
+    create_result = adapter.get_operation(create_request.project_id, create_receipt.operation_id)
+    if create_result.status != StorageResultStatus.COMPLETED:
+        raise AssertionError("disposable backup did not reach verified completion")
+    if create_transport.request_digests != [canonical_adapter_request_digest(create_request)]:
+        raise AssertionError("backup verification did not receive the canonical adapter request digest")
+    create_envelope = bridge.call_tool(
+        "underdark_operation_get",
+        {"project_id": create_request.project_id, "operation_id": create_receipt.operation_id},
+    )
+    create_details = create_envelope.get("result")
+    if not isinstance(create_details, Mapping):
+        raise AssertionError("backup operation did not expose a bounded result")
+    artifact_id = create_details.get("artifact_id")
+    artifact_digest = create_details.get("artifact_digest")
+    manifest_digest = create_details.get("manifest_digest")
+    if not all(isinstance(value, str) and value.startswith("sha256:") for value in (artifact_digest, manifest_digest)) or not isinstance(artifact_id, str):
+        raise AssertionError("backup operation did not return canonical artifact identities")
+    verify_template = requests["backup_verify_restore"]["parameters"]
+    verify_parameters = {
+        "artifact_id": artifact_id,
+        "expected_artifact_digest": artifact_digest,
+        "expected_manifest_digest": manifest_digest,
+    }
+    verify_request = _fixture_execution_request(
+        payload=verify_template,
+        action="backup.verify_restore",
+        parameters=verify_parameters,
+    )
+    verify_transport = _configure_disposable_backup_execution(
+        service,
+        workspace,
+        verify_request,
+        root,
+        journal_name="backup-verify",
+    )
+    verify_receipt = adapter.submit(verify_request)
+    verify_result = adapter.get_operation(verify_request.project_id, verify_receipt.operation_id)
+    if verify_result.status != StorageResultStatus.COMPLETED:
+        raise AssertionError("disposable restore verification did not reach verified completion")
+    if verify_transport.request_digests != [canonical_adapter_request_digest(verify_request)]:
+        raise AssertionError("restore verification did not receive the canonical adapter request digest")
+    verify_envelope = bridge.call_tool(
+        "underdark_operation_get",
+        {"project_id": verify_request.project_id, "operation_id": verify_receipt.operation_id},
+    )
+    verify_details = verify_envelope.get("result")
+    if not isinstance(verify_details, Mapping) or verify_details.get("manifest_digest") != manifest_digest:
+        raise AssertionError("restored content did not match the source backup manifest")
     return {
         "initialized": {"health": health, "tools": bridge.discovered_tools},
         "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
@@ -168,6 +384,17 @@ def _child_run(contract_path: Path, scenario_name: str, workspace: Path, builder
             "total_count": first_result["total_count"],
         },
         "authority": {"digest": authority_digest, "unchanged": True},
+        "backup": {
+            "status": "completed",
+            "request_digest": canonical_adapter_request_digest(create_request),
+            "artifact_identity": artifact_id,
+            "source_content_digest": manifest_digest,
+        },
+        "restore": {
+            "status": "verified",
+            "request_digest": canonical_adapter_request_digest(verify_request),
+            "restored_content_digest": verify_details["manifest_digest"],
+        },
     }
 
 

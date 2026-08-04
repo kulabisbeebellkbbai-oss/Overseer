@@ -26,7 +26,12 @@ from overseer.storage_adapter import (
 )
 
 
-THEUNDERDARK = Path(__file__).resolve().parents[2] / "TheUnderdark"
+THEUNDERDARK = Path(
+    os.environ.get(
+        "THEUNDERDARK_SOURCE",
+        Path(__file__).resolve().parents[2] / "TheUnderdark",
+    )
+)
 FIXTURE = Path(__file__).parent / "fixtures/contracts/donuthole_backup_provisioning_v1.json"
 COMMON = {"project_id", "root_id", "request_id", "idempotency_key", "authorization_ref", "policy_revision", "reason"}
 THEUNDERDARK_PYTHON_ENV = "THEUNDERDARK_CONTRACT_PYTHON"
@@ -308,7 +313,7 @@ def test_overseer_and_theunderdark_use_identical_backup_digest_formula():
 @pytest.mark.skipif(not THEUNDERDARK.exists(), reason="sibling TheUnderdark checkout is unavailable")
 def test_theunderdark_registration_keeps_root_owned_config_immutable_and_writes_service_state(tmp_path):
     """Model root-owned config plus mutable state owned by the service identity."""
-    sibling_python = THEUNDERDARK / ".venv/bin/python"
+    sibling_python = Path(os.environ.get("THEUNDERDARK_PYTHON", THEUNDERDARK / ".venv/bin/python"))
     if not sibling_python.exists():
         pytest.skip("sibling TheUnderdark virtual environment is unavailable")
     script = textwrap.dedent("""

@@ -48,3 +48,19 @@ def test_clean_install_acceptance_uses_real_disposable_components(tmp_path: Path
     assert result["pagination"]["total_count"] == 4
     assert len(result["pagination"]["entries"]) == len(set(result["pagination"]["entries"]))
     assert result["authority"]["unchanged"] is True
+
+
+def test_clean_install_performs_disposable_backup_and_restore_through_real_adapter(tmp_path: Path) -> None:
+    result = run_acceptance_scenario(CONTRACT_FIXTURE, "clean_install", tmp_path)
+
+    assert result["backup"]["status"] == "completed"
+    assert result["backup"]["request_digest"].startswith("sha256:")
+    assert len(result["backup"]["request_digest"]) == 71
+    assert result["restore"]["status"] == "verified"
+    assert result["restore"]["request_digest"] != result["backup"]["request_digest"]
+    assert result["restore"]["restored_content_digest"] == result["backup"]["source_content_digest"]
+    rendered = repr(result)
+    assert "/opt/" not in rendered
+    assert "/etc/" not in rendered
+    assert "/var/lib/" not in rendered
+    assert "disposable encrypted backup passphrase" not in rendered

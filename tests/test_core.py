@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -512,6 +513,24 @@ class LocalOverseerApiServer:
         if self.auth_token:
             merged["authorization"] = f"Bearer {self.auth_token}"
         return merged
+
+
+def raw_http_response(server, request_bytes):
+    """Send one exact HTTP/1.0 request so malformed length headers are preserved."""
+    with socket.create_connection(server.server.server_address, timeout=5) as connection:
+        connection.settimeout(5)
+        connection.sendall(request_bytes)
+        connection.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    response = b"".join(chunks)
+    head, _, body = response.partition(b"\r\n\r\n")
+    status = int(head.split(b" ", 2)[1])
+    return status, json.loads(body.decode("utf-8"))
 
 
 class ConflictDecisionTests(unittest.TestCase):
@@ -2987,6 +3006,60 @@ class HealthSummaryTests(unittest.TestCase):
 
 
 class OverseerApiTests(unittest.TestCase):
+    def test_bundle_post_requires_exact_bounded_content_length(self):
+        original = overseer_api.preflight_bundle_api
+        overseer_api.preflight_bundle_api = lambda *_args: {"status": "preview"}
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
+                    cases = (
+                        (b"", b"{}", 400, "INVALID_BUNDLE_PREFLIGHT_REQUEST"),
+                        (b"Content-Length: -1\r\n", b"{}", 400, "INVALID_BUNDLE_PREFLIGHT_REQUEST"),
+                        (b"Content-Length: nope\r\n", b"{}", 400, "INVALID_BUNDLE_PREFLIGHT_REQUEST"),
+                        (
+                            b"Content-Length: 2\r\nContent-Length: 2\r\n",
+                            b"{}", 400, "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+                        ),
+                        (b"Content-Length: 10\r\n", b"{}", 400, "INVALID_BUNDLE_PREFLIGHT_REQUEST"),
+                        (b"Content-Length: 65537\r\n", b"", 413, "BUNDLE_REQUEST_TOO_LARGE"),
+                    )
+                    for length_headers, body, expected_status, expected_code in cases:
+                        request = (
+                            b"POST /backup-provisioning/bundles/preflight HTTP/1.0\r\n"
+                            b"Host: localhost\r\n"
+                            b"Authorization: Bearer bundle-secret\r\n"
+                            b"Content-Type: application/json\r\n"
+                            + length_headers + b"\r\n" + body
+                        )
+                        status, payload = raw_http_response(server, request)
+                        self.assertEqual(status, expected_status)
+                        self.assertEqual(payload["error_code"], expected_code)
+        finally:
+            overseer_api.preflight_bundle_api = original
+
+    def test_bundle_json_reader_applies_a_bounded_socket_deadline(self):
+        handler_type = make_api_handler("/private/store.sqlite3", "bundle-secret")
+        handler = object.__new__(handler_type)
+        handler.headers = SimpleNamespace(get_all=lambda name, default=None: ["2"])
+        handler.rfile = io.BytesIO(b"{}")
+
+        class FakeConnection:
+            def __init__(self):
+                self.timeouts = []
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        handler.connection = FakeConnection()
+
+        self.assertEqual(handler._read_bundle_json(), {})
+        self.assertGreater(handler.connection.timeouts[0], 0)
+        self.assertLessEqual(handler.connection.timeouts[0], 5)
+
     def test_public_bundle_routes_require_admin_auth_and_exact_queries(self):
         calls = []
         originals = tuple(
@@ -3076,9 +3149,9 @@ class OverseerApiTests(unittest.TestCase):
                 with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
                     with self.assertRaises(HTTPError) as error:
                         server.post("/backup-provisioning/bundles/preflight", {"intent": {}})
-                    self.assertEqual(error.exception.code, 400)
+                    self.assertEqual(error.exception.code, 500)
                     body = json.loads(error.exception.read().decode("utf-8"))
-                    self.assertEqual(body["error_code"], "BUNDLE_PREFLIGHT_UNAVAILABLE")
+                    self.assertEqual(body["error_code"], "BUNDLE_INTERNAL_ERROR")
                     self.assertNotIn("/home/", repr(body))
                 with LocalOverseerApiServer(store_path) as server:
                     with self.assertRaises(HTTPError) as error:
@@ -3095,6 +3168,58 @@ class OverseerApiTests(unittest.TestCase):
                 delattr(overseer_api, "preflight_bundle_api")
             else:
                 overseer_api.preflight_bundle_api = original
+
+    def test_public_bundle_routes_map_typed_errors_exactly(self):
+        originals = (
+            overseer_api.preflight_bundle_api,
+            overseer_api.stage_bundle_api,
+            overseer_api.bundle_status,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                store_path = Path(directory) / "overseer.sqlite3"
+                with LocalOverseerApiServer(store_path, auth_token="bundle-secret") as server:
+                    cases = (
+                        ("preflight_bundle_api", "INVALID_BUNDLE_PREFLIGHT_REQUEST", 400),
+                        ("stage_bundle_api", "INVALID_BUNDLE_STAGE_REQUEST", 400),
+                        ("stage_bundle_api", "AUTHORITATIVE_REBUILD_MISMATCH", 400),
+                        ("preflight_bundle_api", "BUNDLE_PREFLIGHT_UNAVAILABLE", 503),
+                        ("stage_bundle_api", "BUNDLE_STAGE_UNAVAILABLE", 503),
+                        ("bundle_status", "BUNDLE_NOT_FOUND", 404),
+                        ("bundle_status", "BUNDLE_STATUS_INTEGRITY_ERROR", 409),
+                        ("bundle_status", "BUNDLE_STATUS_UNAVAILABLE", 503),
+                    )
+                    for helper_name, code, expected_status in cases:
+                        setattr(
+                            overseer_api,
+                            helper_name,
+                            lambda *_args, error_code=code: (_ for _ in ()).throw(
+                                overseer_api.ProvisioningBundleError(error_code)
+                            ),
+                        )
+                        if helper_name == "bundle_status":
+                            request = Request(
+                                f"{server.url}/backup-provisioning/bundles?plan_id=plan.exact",
+                                headers={"authorization": "Bearer bundle-secret"},
+                            )
+                            call = lambda: urlopen(request, timeout=5)
+                        else:
+                            path = helper_name.removesuffix("_bundle_api")
+                            call = lambda path=path: server.post(
+                                f"/backup-provisioning/bundles/{path}", {"intent": {}},
+                            )
+                        with self.assertRaises(HTTPError) as error:
+                            call()
+                        self.assertEqual(error.exception.code, expected_status)
+                        payload = json.loads(error.exception.read().decode("utf-8"))
+                        self.assertEqual(payload["error_code"], code)
+                        self.assertNotIn("/home/", repr(payload))
+        finally:
+            (
+                overseer_api.preflight_bundle_api,
+                overseer_api.stage_bundle_api,
+                overseer_api.bundle_status,
+            ) = originals
 
     def test_public_bundle_routes_reject_remote_testing_tokens(self):
         original = overseer_api.validate_remote_testing_token

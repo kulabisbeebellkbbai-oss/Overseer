@@ -96,6 +96,8 @@ _MAX_GIT_OPERATION_SECONDS = 10.0
 _MAX_GIT_PROCESS_COUNT = _MAX_GIT_TREE_ENTRIES * 2 + 8
 _MAX_GPG_BYTES = 128 * 1024 * 1024
 _MAX_GPG_READ_SECONDS = 10.0
+_MAX_BUNDLE_STATUS_SNAPSHOT_BYTES = 64 * 1024 * 1024
+_MAX_BUNDLE_STATUS_SECONDS = 10.0
 
 
 class ProvisioningBundleError(ValueError):
@@ -2942,13 +2944,37 @@ def stage_bundle_api(
 def _bundle_status_from_store(
     store: SQLiteStore, plan_id: str,
 ) -> Mapping[str, object]:
-    bundle = load_provisioning_bundle(store, plan_id)
-    binding = store.load_roadex_approval_binding(
-        binding_draft_for_bundle(bundle).approval_ref,
-    )
-    if type(binding) is not RoadexApprovalBinding:
-        raise ValueError("provisioning bundle immutable binding is inconsistent")
-    verify_exact_persisted_bundle_set(store, bundle, binding)
+    try:
+        bundle_id, stored_plan_id, stored_digest, payload = (
+            store.load_provisioning_bundle_record(plan_id)
+        )
+    except KeyError:
+        raise ProvisioningBundleError("BUNDLE_NOT_FOUND") from None
+    try:
+        bundle = _decode_exact_payload(
+            payload,
+            ProvisioningBundleV1,
+            "provisioning bundle",
+        )
+        _validate_staged_bundle(bundle)
+        if (
+            bundle_id != plan_id
+            or stored_plan_id != plan_id
+            or bundle.plan.plan_id != plan_id
+            or bundle.bundle_digest != stored_digest
+        ):
+            raise ValueError("provisioning bundle digest or plan ID is inconsistent")
+    except Exception:
+        raise ProvisioningBundleError("BUNDLE_STATUS_INTEGRITY_ERROR") from None
+    try:
+        binding = store.load_roadex_approval_binding(
+            binding_draft_for_bundle(bundle).approval_ref,
+        )
+        if type(binding) is not RoadexApprovalBinding:
+            raise ValueError("provisioning bundle immutable binding is inconsistent")
+        verify_exact_persisted_bundle_set(store, bundle, binding)
+    except Exception:
+        raise ProvisioningBundleError("BUNDLE_STATUS_INTEGRITY_ERROR") from None
     return {
         **_public_bundle_status(bundle, binding, mutation=False),
         "bundle_id": bundle.intent.plan_id,
@@ -2973,30 +2999,54 @@ def bundle_status(store_path: str, plan_id: str) -> Mapping[str, object]:
         or len(plan_id) > 512
     ):
         raise ProvisioningBundleError("INVALID_BUNDLE_STATUS_REQUEST")
+    deadline = time.monotonic() + _MAX_BUNDLE_STATUS_SECONDS
     database_fd: int | None = None
     parent_fd: int | None = None
     snapshot_fd: int | None = None
     snapshot_path: str | None = None
+    identity = None
     result: Mapping[str, object] | None = None
-    missing = False
     failed = False
+    semantic_error: str | None = None
+
+    def require_time() -> None:
+        if time.monotonic() > deadline:
+            raise TimeoutError("bundle status deadline expired")
+
     try:
+        require_time()
         database_fd, parent_fd, identity = _open_authority_snapshot(store_path)
+        require_time()
+        if identity[1][3] > _MAX_BUNDLE_STATUS_SNAPSHOT_BYTES:
+            raise ValueError("bundle status snapshot is too large")
         snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
+        require_time()
+        if len(snapshot) > _MAX_BUNDLE_STATUS_SNAPSHOT_BYTES:
+            raise ValueError("bundle status snapshot is too large")
         snapshot_fd, snapshot_path = tempfile.mkstemp(
             prefix="overseer-bundle-status-", suffix=".sqlite3",
         )
+        require_time()
         _write_snapshot(snapshot_fd, snapshot)
+        require_time()
         os.fsync(snapshot_fd)
+        require_time()
         os.close(snapshot_fd)
         snapshot_fd = None
+        require_time()
         _verify_authority_snapshot(parent_fd, identity)
+        require_time()
         with SQLiteStore(snapshot_path) as store:
             try:
                 result = _bundle_status_from_store(store, plan_id)
-            except KeyError:
-                missing = True
-        if _read_authority_snapshot(database_fd, parent_fd, identity) != snapshot:
+            except ProvisioningBundleError as error:
+                semantic_error = str(error)
+        require_time()
+        stable_snapshot = _read_authority_snapshot(database_fd, parent_fd, identity)
+        require_time()
+        if len(stable_snapshot) > _MAX_BUNDLE_STATUS_SNAPSHOT_BYTES:
+            raise ValueError("bundle status snapshot is too large")
+        if stable_snapshot != snapshot:
             raise ValueError("persisted provisioning bundle changed during read")
     except Exception:
         failed = True
@@ -3006,7 +3056,7 @@ def bundle_status(store_path: str, plan_id: str) -> Mapping[str, object]:
             (lambda: os.unlink(snapshot_path) if snapshot_path is not None else None),
             (
                 lambda: _verify_authority_snapshot(parent_fd, identity)
-                if parent_fd is not None and database_fd is not None else None
+                if parent_fd is not None and database_fd is not None and identity is not None else None
             ),
             (lambda: os.close(database_fd) if database_fd is not None else None),
             (lambda: os.close(parent_fd) if parent_fd is not None else None),
@@ -3015,10 +3065,12 @@ def bundle_status(store_path: str, plan_id: str) -> Mapping[str, object]:
                 cleanup()
             except Exception:
                 failed = True
+        if time.monotonic() > deadline:
+            failed = True
     if failed:
         raise ProvisioningBundleError("BUNDLE_STATUS_UNAVAILABLE")
-    if missing:
-        raise ProvisioningBundleError("BUNDLE_NOT_FOUND")
+    if semantic_error is not None:
+        raise ProvisioningBundleError(semantic_error)
     if result is None:
         raise ProvisioningBundleError("BUNDLE_STATUS_UNAVAILABLE")
     return result

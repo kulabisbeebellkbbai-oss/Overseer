@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
+import time
 from json import JSONDecodeError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,13 @@ from .provisioning_bundle import (
     preflight_bundle_api,
     stage_bundle_api,
 )
+
+_MAX_BUNDLE_REQUEST_BYTES = 64 * 1024
+_MAX_BUNDLE_REQUEST_SECONDS = 2.0
+
+
+class _BundleRequestError(ValueError):
+    pass
 
 from .codex_usage import CodexUsageTracker
 from .cli import (
@@ -1287,8 +1296,19 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     headers=response_headers,
                 )
 
-        def _write_bundle_error(self, error_code: str) -> None:
-            status = HTTPStatus.NOT_FOUND if error_code == "BUNDLE_NOT_FOUND" else HTTPStatus.BAD_REQUEST
+        def _write_bundle_error(
+            self, error_code: str, status: HTTPStatus | None = None,
+        ) -> None:
+            if status is None:
+                status = {
+                    "BUNDLE_NOT_FOUND": HTTPStatus.NOT_FOUND,
+                    "BUNDLE_STATUS_INTEGRITY_ERROR": HTTPStatus.CONFLICT,
+                    "BUNDLE_REQUEST_TOO_LARGE": HTTPStatus.CONTENT_TOO_LARGE,
+                    "BUNDLE_PREFLIGHT_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "BUNDLE_STAGE_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "BUNDLE_STATUS_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "BUNDLE_INTERNAL_ERROR": HTTPStatus.INTERNAL_SERVER_ERROR,
+                }.get(error_code, HTTPStatus.BAD_REQUEST)
             self._write_json(
                 {
                     "error": "provisioning_bundle_request_failed",
@@ -1305,12 +1325,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 if code not in {
                     "INVALID_BUNDLE_STATUS_REQUEST",
                     "BUNDLE_NOT_FOUND",
+                    "BUNDLE_STATUS_INTEGRITY_ERROR",
                     "BUNDLE_STATUS_UNAVAILABLE",
                 }:
                     code = unavailable_code
                 self._write_bundle_error(code)
             except Exception:
-                self._write_bundle_error(unavailable_code)
+                self._write_bundle_error("BUNDLE_INTERNAL_ERROR")
 
         def _handle_bundle_json(
             self,
@@ -1319,7 +1340,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             unavailable_code: str,
         ) -> None:
             try:
-                payload = self._read_json()
+                payload = self._read_bundle_json()
+            except _BundleRequestError as error:
+                code = str(error)
+                self._write_bundle_error(
+                    code if code == "BUNDLE_REQUEST_TOO_LARGE" else invalid_code,
+                )
+                return
             except Exception:
                 self._write_bundle_error(invalid_code)
                 return
@@ -1337,7 +1364,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     code = unavailable_code
                 self._write_bundle_error(code)
             except Exception:
-                self._write_bundle_error(unavailable_code)
+                self._write_bundle_error("BUNDLE_INTERNAL_ERROR")
 
         def _handle_admin_execute(self) -> None:
             try:
@@ -1359,6 +1386,54 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             parsed = json.loads(data.decode("utf-8"))
             if not isinstance(parsed, dict):
                 raise ValueError("request body must be a JSON object")
+            return parsed
+
+        def _read_bundle_json(self) -> dict[str, Any]:
+            values = self.headers.get_all("content-length", [])
+            if len(values) != 1:
+                raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
+            raw_length = values[0]
+            if (
+                type(raw_length) is not str
+                or not raw_length
+                or not raw_length.isascii()
+                or not raw_length.isdigit()
+                or (len(raw_length) > 1 and raw_length.startswith("0"))
+            ):
+                raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
+            if len(raw_length) > 6:
+                raise _BundleRequestError("BUNDLE_REQUEST_TOO_LARGE")
+            length = int(raw_length)
+            if length > _MAX_BUNDLE_REQUEST_BYTES:
+                raise _BundleRequestError("BUNDLE_REQUEST_TOO_LARGE")
+
+            previous_timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + _MAX_BUNDLE_REQUEST_SECONDS
+            chunks: list[bytes] = []
+            remaining = length
+            try:
+                self.connection.settimeout(_MAX_BUNDLE_REQUEST_SECONDS)
+                while remaining:
+                    if time.monotonic() > deadline:
+                        raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
+                    try:
+                        chunk = self.rfile.read(min(65536, remaining))
+                    except (TimeoutError, socket.timeout):
+                        raise _BundleRequestError("INVALID_BUNDLE_REQUEST") from None
+                    if not chunk:
+                        raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                if time.monotonic() > deadline:
+                    raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
+            finally:
+                self.connection.settimeout(previous_timeout)
+            try:
+                parsed = json.loads(b"".join(chunks).decode("utf-8"))
+            except Exception:
+                raise _BundleRequestError("INVALID_BUNDLE_REQUEST") from None
+            if type(parsed) is not dict:
+                raise _BundleRequestError("INVALID_BUNDLE_REQUEST")
             return parsed
 
         def _write_json(

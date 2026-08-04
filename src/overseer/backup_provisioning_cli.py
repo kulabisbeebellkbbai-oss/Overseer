@@ -2,10 +2,168 @@
 from __future__ import annotations
 import argparse
 import json
+import os
+import stat
+import time
 from pathlib import Path
 from .backup_provisioning import approve_plan_api, execute_plan_api, list_plans, stage_plan_api
 from .backup_host_operations import ConcreteHostProvisioningAdapter
-from .provisioning_bundle import bundle_status, preflight_bundle_api, stage_bundle_api
+from .provisioning_bundle import (
+    ProvisioningBundleError,
+    bundle_status,
+    preflight_bundle_api,
+    stage_bundle_api,
+)
+
+_MAX_BUNDLE_INTENT_BYTES = 64 * 1024
+_MAX_BUNDLE_INTENT_SECONDS = 2.0
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+        info.st_uid, info.st_gid, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _read_bundle_intent(path: str) -> dict[str, object]:
+    descriptor: int | None = None
+    decoded: dict[str, object] | None = None
+    invalid = False
+    deadline = time.monotonic() + _MAX_BUNDLE_INTENT_SECONDS
+
+    def require_time() -> None:
+        if time.monotonic() > deadline:
+            raise TimeoutError("bundle intent deadline expired")
+
+    try:
+        require_time()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        require_time()
+        before = os.fstat(descriptor)
+        require_time()
+        entry = os.stat(path, follow_symlinks=False)
+        require_time()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(entry.st_mode)
+            or _file_identity(before) != _file_identity(entry)
+            or before.st_size > _MAX_BUNDLE_INTENT_BYTES
+        ):
+            raise ValueError("invalid bundle intent file")
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(descriptor, min(65536, before.st_size - offset), offset)
+            require_time()
+            if not chunk:
+                raise ValueError("truncated bundle intent file")
+            chunks.append(chunk)
+            offset += len(chunk)
+        extra = os.pread(descriptor, 1, offset)
+        require_time()
+        if extra:
+            raise ValueError("growing bundle intent file")
+        after = os.fstat(descriptor)
+        require_time()
+        final_entry = os.stat(path, follow_symlinks=False)
+        require_time()
+        if (
+            _file_identity(after) != _file_identity(before)
+            or _file_identity(final_entry) != _file_identity(before)
+        ):
+            raise ValueError("unstable bundle intent file")
+        decoded_value = json.loads(b"".join(chunks).decode("utf-8"))
+        require_time()
+        if type(decoded_value) is not dict:
+            raise ValueError("bundle intent must be a JSON object")
+        decoded = decoded_value
+    except Exception:
+        invalid = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except Exception:
+                invalid = True
+            try:
+                require_time()
+            except Exception:
+                invalid = True
+    if invalid or decoded is None:
+        raise ProvisioningBundleError("INVALID_BUNDLE_CLI_INPUT") from None
+    return decoded
+
+
+def _write_bundle_cli_error(error_code: str) -> int:
+    print(json.dumps(
+        {
+            "error": "provisioning_bundle_command_failed",
+            "error_code": error_code,
+            "ok": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ))
+    return 2 if error_code in {
+        "INVALID_BUNDLE_CLI_INPUT",
+        "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+        "INVALID_BUNDLE_STAGE_REQUEST",
+        "INVALID_BUNDLE_STATUS_REQUEST",
+        "AUTHORITATIVE_REBUILD_MISMATCH",
+    } else 1
+
+
+def _run_bundle_command(args: argparse.Namespace) -> int:
+    try:
+        if args.command == "bundle-preflight":
+            result = preflight_bundle_api(
+                args.store, {"intent": _read_bundle_intent(args.intent_json)},
+            )
+        elif args.command == "bundle-stage":
+            result = stage_bundle_api(
+                args.store,
+                {
+                    "intent": _read_bundle_intent(args.intent_json),
+                    "expected_preflight_digest": args.expected_preflight_digest,
+                    "expected_bundle_digest": args.expected_bundle_digest,
+                },
+            )
+        else:
+            result = bundle_status(args.store, args.plan_id)
+    except ProvisioningBundleError as error:
+        code = str(error)
+        allowed = {
+            "INVALID_BUNDLE_CLI_INPUT",
+            "INVALID_BUNDLE_PREFLIGHT_REQUEST",
+            "INVALID_BUNDLE_STAGE_REQUEST",
+            "INVALID_BUNDLE_STATUS_REQUEST",
+            "AUTHORITATIVE_REBUILD_MISMATCH",
+            "BUNDLE_PREFLIGHT_UNAVAILABLE",
+            "BUNDLE_STAGE_UNAVAILABLE",
+            "BUNDLE_NOT_FOUND",
+            "BUNDLE_STATUS_INTEGRITY_ERROR",
+            "BUNDLE_STATUS_UNAVAILABLE",
+        }
+        if code not in allowed:
+            code = {
+                "bundle-preflight": "BUNDLE_PREFLIGHT_UNAVAILABLE",
+                "bundle-stage": "BUNDLE_STAGE_UNAVAILABLE",
+                "bundle-status": "BUNDLE_STATUS_UNAVAILABLE",
+            }[args.command]
+        return _write_bundle_cli_error(code)
+    except Exception:
+        return _write_bundle_cli_error({
+            "bundle-preflight": "BUNDLE_PREFLIGHT_UNAVAILABLE",
+            "bundle-stage": "BUNDLE_STAGE_UNAVAILABLE",
+            "bundle-status": "BUNDLE_STATUS_UNAVAILABLE",
+        }[args.command])
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,22 +206,8 @@ def main(argv: list[str] | None = None) -> int:
                 plan, privileged_confirmation=confirmation,
             ),
         )
-    elif args.command == "bundle-preflight":
-        result = preflight_bundle_api(
-            args.store,
-            {"intent": json.loads(Path(args.intent_json).read_text())},
-        )
-    elif args.command == "bundle-stage":
-        result = stage_bundle_api(
-            args.store,
-            {
-                "intent": json.loads(Path(args.intent_json).read_text()),
-                "expected_preflight_digest": args.expected_preflight_digest,
-                "expected_bundle_digest": args.expected_bundle_digest,
-            },
-        )
     else:
-        result = bundle_status(args.store, args.plan_id)
+        return _run_bundle_command(args)
     print(json.dumps(result, sort_keys=True))
     return 0
 

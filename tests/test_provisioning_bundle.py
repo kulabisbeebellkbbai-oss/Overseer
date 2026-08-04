@@ -3151,17 +3151,28 @@ def test_bundle_status_get_route_is_exact_redacted_and_read_only(tmp_path):
         assert missing.value.code == 404
         assert json.loads(missing.value.read().decode("utf-8"))["error_code"] == "BUNDLE_NOT_FOUND"
 
-        with sqlite3.connect(store_path) as connection:
+        connection = sqlite3.connect(store_path)
+        try:
             connection.execute(
                 "UPDATE provisioning_review_outbox SET payload=? WHERE id=?",
                 ("{}", bundle.outbox[0].id),
             )
+            connection.commit()
+        finally:
+            connection.close()
         corrupted = _stable_store_observation(store_path)
+        with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_INTEGRITY_ERROR$"):
+            provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
         with pytest.raises(HTTPError) as unavailable:
             urlopen(request, timeout=5)
-        assert unavailable.value.code == 400
         body = json.loads(unavailable.value.read().decode("utf-8"))
-        assert body["error_code"] == "BUNDLE_STATUS_UNAVAILABLE"
+        assert (unavailable.value.code, body) == (
+            409,
+            {
+                "error": "provisioning_bundle_request_failed",
+                "error_code": "BUNDLE_STATUS_INTEGRITY_ERROR",
+            },
+        )
         assert "/home/" not in repr(body)
         assert _stable_store_observation(store_path) == corrupted
     finally:
@@ -3170,26 +3181,171 @@ def test_bundle_status_get_route_is_exact_redacted_and_read_only(tmp_path):
         thread.join(timeout=5)
 
 
-def test_bundle_status_distinguishes_absent_bundle_from_incomplete_persisted_set(tmp_path):
+@pytest.mark.parametrize(
+    ("table", "where_column", "where_value"),
+    (
+        ("roadex_approval_bindings", "source_id", "plan"),
+        ("backup_provisioning_plans", "id", "plan"),
+        ("provisioning_preflight_reports", "plan_id", "plan"),
+        ("provisioning_review_outbox", "id", "outbox"),
+    ),
+)
+def test_bundle_status_classifies_missing_persisted_members_as_integrity_errors(
+    tmp_path, table, where_column, where_value,
+):
     store_path, bundle = authoritative_bundle_fixture(tmp_path)
     stage_expected_bundle(store_path, bundle)
+    selected = bundle.outbox[0].id if where_value == "outbox" else bundle.plan.plan_id
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(
+            f"DELETE FROM {table} WHERE {where_column}=?",
+            (selected,),
+        )
+        connection.commit()
+        assert connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {where_column}=?",
+            (selected,),
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+    incomplete = _stable_store_observation(store_path)
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_INTEGRITY_ERROR$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+    assert _stable_store_observation(store_path) == incomplete
+
+
+def test_bundle_status_only_classifies_missing_initial_bundle_row_as_not_found(tmp_path):
+    store_path, _bundle = authoritative_bundle_fixture(tmp_path)
+    before = _stable_store_observation(store_path)
 
     with pytest.raises(ProvisioningBundleError, match="^BUNDLE_NOT_FOUND$"):
         provisioning_bundle_module.bundle_status(store_path, "backup-provision.absent")
 
-    with sqlite3.connect(store_path) as connection:
+    assert _stable_store_observation(store_path) == before
+
+
+@pytest.mark.parametrize(
+    ("table", "where_column", "where_value"),
+    (
+        ("provisioning_bundles", "plan_id", "plan"),
+        ("roadex_approval_bindings", "source_id", "plan"),
+        ("backup_provisioning_plans", "id", "plan"),
+        ("provisioning_preflight_reports", "plan_id", "plan"),
+        ("provisioning_review_outbox", "id", "outbox"),
+    ),
+)
+def test_bundle_status_classifies_every_malformed_persisted_member_as_integrity_error(
+    tmp_path, table, where_column, where_value,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    selected = bundle.outbox[0].id if where_value == "outbox" else bundle.plan.plan_id
+    connection = sqlite3.connect(store_path)
+    try:
         connection.execute(
-            "DELETE FROM roadex_approval_bindings WHERE source_id=?",
-            (bundle.plan.plan_id,),
+            f"UPDATE {table} SET payload=? WHERE {where_column}=?",
+            ("{}", selected),
         )
-        assert connection.execute(
-            "SELECT COUNT(*) FROM roadex_approval_bindings WHERE source_id=?",
-            (bundle.plan.plan_id,),
-        ).fetchone()[0] == 0
-    incomplete = _stable_store_observation(store_path)
+        connection.commit()
+    finally:
+        connection.close()
+    malformed = _stable_store_observation(store_path)
+
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_INTEGRITY_ERROR$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert _stable_store_observation(store_path) == malformed
+
+
+def test_bundle_status_rejects_oversized_snapshot_without_source_mutation(tmp_path, monkeypatch):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _stable_store_observation(store_path)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "_MAX_BUNDLE_STATUS_SNAPSHOT_BYTES",
+        os.stat(store_path).st_size - 1,
+        raising=False,
+    )
+
     with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
         provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
-    assert _stable_store_observation(store_path) == incomplete
+
+    assert _stable_store_observation(store_path) == before
+
+
+@pytest.mark.parametrize("slow_stage", ("open", "read", "write", "fsync", "load", "verify"))
+def test_bundle_status_deadline_covers_every_snapshot_stage_and_cleans_temp_files(
+    tmp_path, monkeypatch, slow_stage,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    before = _stable_store_observation(store_path)
+    clock = [100.0]
+    limit = 2.0
+    created: list[str] = []
+    monkeypatch.setattr(provisioning_bundle_module, "_MAX_BUNDLE_STATUS_SECONDS", limit, raising=False)
+    monkeypatch.setattr(provisioning_bundle_module.time, "monotonic", lambda: clock[0])
+
+    real_open = provisioning_bundle_module._open_authority_snapshot
+    real_read = provisioning_bundle_module._read_authority_snapshot
+    real_write = provisioning_bundle_module._write_snapshot
+    real_fsync = provisioning_bundle_module.os.fsync
+    real_load = provisioning_bundle_module._bundle_status_from_store
+    real_verify = provisioning_bundle_module._verify_authority_snapshot
+    real_mkstemp = provisioning_bundle_module.tempfile.mkstemp
+    read_calls = [0]
+
+    def advance_after(value):
+        clock[0] += limit + 0.1
+        return value
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return descriptor, path
+
+    monkeypatch.setattr(provisioning_bundle_module.tempfile, "mkstemp", tracked_mkstemp)
+    if slow_stage == "open":
+        monkeypatch.setattr(
+            provisioning_bundle_module, "_open_authority_snapshot",
+            lambda *args: advance_after(real_open(*args)),
+        )
+    elif slow_stage == "read":
+        def slow_read(*args):
+            read_calls[0] += 1
+            value = real_read(*args)
+            return advance_after(value) if read_calls[0] == 1 else value
+        monkeypatch.setattr(provisioning_bundle_module, "_read_authority_snapshot", slow_read)
+    elif slow_stage == "write":
+        monkeypatch.setattr(
+            provisioning_bundle_module, "_write_snapshot",
+            lambda *args: advance_after(real_write(*args)),
+        )
+    elif slow_stage == "fsync":
+        monkeypatch.setattr(
+            provisioning_bundle_module.os, "fsync",
+            lambda *args: advance_after(real_fsync(*args)),
+        )
+    elif slow_stage == "load":
+        monkeypatch.setattr(
+            provisioning_bundle_module, "_bundle_status_from_store",
+            lambda *args: advance_after(real_load(*args)),
+        )
+    else:
+        verify_calls = [0]
+        def slow_verify(*args):
+            verify_calls[0] += 1
+            value = real_verify(*args)
+            return advance_after(value) if verify_calls[0] >= 2 else value
+        monkeypatch.setattr(provisioning_bundle_module, "_verify_authority_snapshot", slow_verify)
+
+    with pytest.raises(ProvisioningBundleError, match="^BUNDLE_STATUS_UNAVAILABLE$"):
+        provisioning_bundle_module.bundle_status(store_path, bundle.plan.plan_id)
+
+    assert _stable_store_observation(store_path) == before
+    assert all(not os.path.exists(path) for path in created)
 
 
 def test_bundle_api_rejects_malformed_stage_digests_and_redacts_dependency_failures(
@@ -3260,6 +3416,264 @@ def test_bundle_cli_exposes_typed_preflight_stage_and_status(tmp_path, monkeypat
     status = json.loads(capsys.readouterr().out)
     assert status["bundle_digest"] == bundle.bundle_digest
     assert status["mutation_performed"] is False
+
+
+@pytest.mark.parametrize(
+    "bad_kind",
+    ("missing", "unreadable", "invalid_json", "non_object", "symlink", "nonregular", "oversized", "truncated"),
+)
+def test_bundle_cli_rejects_unstable_or_unbounded_intent_files_without_leakage(
+    tmp_path, monkeypatch, capsys, bad_kind,
+):
+    intent_file = tmp_path / "private-intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+    requested_path = intent_file
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "preflight_bundle_api",
+        lambda *_args: {"status": "preview"},
+    )
+    if bad_kind == "missing":
+        requested_path = tmp_path / "private-missing.json"
+    elif bad_kind == "unreadable":
+        real_open = os.open
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os,
+            "open",
+            lambda path, *args, **kwargs: (
+                (_ for _ in ()).throw(PermissionError("private unreadable path"))
+                if os.fspath(path) == os.fspath(requested_path)
+                else real_open(path, *args, **kwargs)
+            ),
+            raising=False,
+        )
+    elif bad_kind == "invalid_json":
+        intent_file.write_text('{"private":"unterminated', encoding="utf-8")
+    elif bad_kind == "non_object":
+        intent_file.write_text('["private-value"]', encoding="utf-8")
+    elif bad_kind == "symlink":
+        requested_path = tmp_path / "private-link.json"
+        requested_path.symlink_to(intent_file)
+    elif bad_kind == "nonregular":
+        requested_path = tmp_path / "private-directory"
+        requested_path.mkdir()
+    elif bad_kind == "oversized":
+        monkeypatch.setattr(
+            backup_provisioning_cli_module, "_MAX_BUNDLE_INTENT_BYTES", 4,
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os,
+            "pread",
+            lambda *_args: b"",
+            raising=False,
+        )
+
+    exit_code = backup_provisioning_cli_module.main((
+        "--store", str(tmp_path / "private-store.sqlite3"),
+        "bundle-preflight", "--intent-json", str(requested_path),
+    ))
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "error": "provisioning_bundle_command_failed",
+        "error_code": "INVALID_BUNDLE_CLI_INPUT",
+        "ok": False,
+    }
+    assert "private" not in captured.out
+
+
+@pytest.mark.parametrize("slow_stage", ("open", "stat", "read", "json", "close"))
+def test_bundle_cli_intent_deadline_covers_every_file_operation(
+    tmp_path, monkeypatch, capsys, slow_stage,
+):
+    intent_file = tmp_path / "private-intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+    clock = [50.0]
+    limit = 1.0
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module, "_MAX_BUNDLE_INTENT_SECONDS", limit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "preflight_bundle_api",
+        lambda *_args: {"status": "preview"},
+    )
+
+    def advance(value):
+        clock[0] += limit + 0.1
+        return value
+
+    if slow_stage == "open":
+        real = os.open
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "open",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "stat":
+        real = os.stat
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "stat",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "read":
+        real = os.pread
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "pread",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "json":
+        real = json.loads
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.json, "loads",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    else:
+        real = os.close
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "close",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+
+    actual = backup_provisioning_cli_module.main((
+        "--store", str(tmp_path / "private-store.sqlite3"),
+        "bundle-preflight", "--intent-json", str(intent_file),
+    ))
+    captured = capsys.readouterr()
+
+    assert actual == 2
+    assert json.loads(captured.out)["error_code"] == "INVALID_BUNDLE_CLI_INPUT"
+    assert "private" not in captured.out
+
+
+def test_bundle_cli_treats_ordinary_descriptor_close_failure_as_invalid_input(
+    tmp_path, monkeypatch, capsys,
+):
+    intent_file = tmp_path / "private-intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "preflight_bundle_api",
+        lambda *_args: {"status": "preview"},
+    )
+    real_close = os.close
+
+    def failing_close(descriptor):
+        real_close(descriptor)
+        raise OSError("private descriptor close failure")
+
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "close", failing_close)
+
+    actual = backup_provisioning_cli_module.main((
+        "--store", str(tmp_path / "private-store.sqlite3"),
+        "bundle-preflight", "--intent-json", str(intent_file),
+    ))
+    captured = capsys.readouterr()
+
+    assert actual == 2
+    assert json.loads(captured.out)["error_code"] == "INVALID_BUNDLE_CLI_INPUT"
+    assert "private" not in captured.out
+
+
+def test_bundle_cli_closes_intent_descriptor_when_base_exception_propagates(
+    tmp_path, monkeypatch,
+):
+    intent_file = tmp_path / "intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open = os.open
+    real_close = os.close
+
+    class IntentReadInterrupted(BaseException):
+        pass
+
+    def tracked_open(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        return real_close(descriptor)
+
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "open", tracked_open)
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "pread", lambda *_args: (_ for _ in ()).throw(IntentReadInterrupted()))
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "close", tracked_close)
+
+    with pytest.raises(IntentReadInterrupted):
+        backup_provisioning_cli_module._read_bundle_intent(str(intent_file))
+
+    assert opened
+    assert closed == opened
+
+
+@pytest.mark.parametrize(
+    ("command", "error_code", "exit_code"),
+    (
+        ("bundle-preflight", "INVALID_BUNDLE_PREFLIGHT_REQUEST", 2),
+        ("bundle-stage", "AUTHORITATIVE_REBUILD_MISMATCH", 2),
+        ("bundle-preflight", "BUNDLE_PREFLIGHT_UNAVAILABLE", 1),
+        ("bundle-stage", "BUNDLE_STAGE_UNAVAILABLE", 1),
+        ("bundle-status", "BUNDLE_NOT_FOUND", 1),
+        ("bundle-status", "BUNDLE_STATUS_INTEGRITY_ERROR", 1),
+        ("bundle-status", "BUNDLE_STATUS_UNAVAILABLE", 1),
+        ("bundle-preflight", "unexpected", 1),
+    ),
+)
+def test_bundle_cli_maps_helper_failures_to_bounded_redacted_json(
+    tmp_path, monkeypatch, capsys, command, error_code, exit_code,
+):
+    intent_file = tmp_path / "private-intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+    private_message = "private /home/god/Documents secret intent content"
+    if error_code == "unexpected":
+        error = RuntimeError(private_message)
+        expected_code = "BUNDLE_PREFLIGHT_UNAVAILABLE"
+    else:
+        error = ProvisioningBundleError(error_code)
+        expected_code = error_code
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        {
+            "bundle-preflight": "preflight_bundle_api",
+            "bundle-stage": "stage_bundle_api",
+            "bundle-status": "bundle_status",
+        }[command],
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    arguments = ["--store", str(tmp_path / "private-store.sqlite3"), command]
+    if command == "bundle-status":
+        arguments += ["--plan-id", "private.plan"]
+    else:
+        arguments += ["--intent-json", str(intent_file)]
+        if command == "bundle-stage":
+            arguments += [
+                "--expected-preflight-digest", "sha256:" + "0" * 64,
+                "--expected-bundle-digest", "sha256:" + "1" * 64,
+            ]
+
+    actual = backup_provisioning_cli_module.main(tuple(arguments))
+    captured = capsys.readouterr()
+
+    assert actual == exit_code
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "error": "provisioning_bundle_command_failed",
+        "error_code": expected_code,
+        "ok": False,
+    }
+    assert "private" not in captured.out
 
 
 def test_bundle_cli_keeps_legacy_stage_list_approve_and_execute(tmp_path, monkeypatch, capsys):

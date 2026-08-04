@@ -292,3 +292,65 @@ passed
 No main checkout, DonutHole checkout, live service/store, approval,
 deployment, gateway, firewall/IDS, or push was touched. The Roadex and
 Overseer worktrees were verified clean after their separate commits.
+
+### Review-correction addendum: irreversible registration commit fence
+
+The remaining ambiguous-persistence race was corrected in the isolated Roadex
+worktree. The prior best-effort compensating-persist rollback guarantee is no
+longer used for cancellable registration. Roadex now creates an explicit
+registration commit fence shared by the workflow host and
+`ApprovalCoordinator.register`. The coordinator crosses the fence
+synchronously immediately before the first durable persist. Timeout and socket
+close cancellation can cancel only an open fence; once crossed, the host does
+not emit `request_timeout` and waits for the persistence result. A committed
+registration therefore returns its real pending wait result, even when the
+first async persist is still in flight and any attempted compensating persist
+would throw.
+
+The host also aborts and cancels an open registration fence when the client
+socket closes. Late staging after timeout or disconnect cannot register a wait,
+publish a waiting message, or write a registration audit event. Delayed-status
+and delayed-lock cancellation coverage remains green.
+
+TDD evidence:
+
+- RED: `npm test -- --run tests/approvalWorkflowTimeoutRace.test.ts -t 'does not report request_timeout after registration crosses the durable commit fence'` failed because the host returned `request_timeout` while the first persist was unresolved.
+- GREEN: the same regression passes with one durable persist, an active pending snapshot, a truthful successful wait response, and no compensating persist call; the socket-close regression also passes after first failing with a late registration.
+
+Verification:
+
+```text
+npm test -- tests/approvalWorkflowHost.test.ts tests/approvalCoordinator.test.ts tests/approvalLifecycleIntegration.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalWorkflowTimeoutRace.test.ts tests/approvalStatusProvider.test.ts
+6 files passed, 117 tests passed
+
+npm test
+54 files passed, 548 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed (TypeScript build and Vite production build)
+
+git diff --check
+passed
+
+python3 -m pytest -q tests/test_core.py -k 'roadex_stage_real_bundle_returns_sqlite_loadable_binding or roadex_stage_locator_is_derived_from_persisted_binding'
+2 passed
+
+python3 -m pytest -q tests/test_ui_regression.py -k 'roadex_typed_stage_rejects_caller_supplied_locator_fields'
+1 passed
+```
+
+The broader Overseer projection suite remains outside this Roadex follow-up;
+its three previously documented pre-existing failures are unchanged and no
+Overseer source was modified.
+
+Commits:
+
+- Roadex source/tests: `b87ce334a80eb6bd34e9a460ef3055733b197473` — `Fix approval registration commit race`
+- Existing Overseer source: `556fddac47ee8ae5e80b94ddc847f1aaa8b0c13f`
+- This report addendum is committed separately in the Overseer worktree.
+
+No main Roadex checkout, DonutHole checkout, live service/store, approval,
+deployment, gateway, firewall/IDS, or push was touched.

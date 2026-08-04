@@ -102,3 +102,31 @@ def test_clean_install_performs_disposable_backup_and_restore_through_real_adapt
     assert result["restore"]["request_digest"] != result["backup"]["request_digest"]
     assert result["restore"]["restored_content_digest"] == result["backup"]["source_content_digest"]
     _assert_recursively_redacted(result, workspace=tmp_path)
+
+
+def test_active_service_upgrade_converges_and_matches_planned_runtime(tmp_path: Path) -> None:
+    result = run_acceptance_scenario(CONTRACT_FIXTURE, "active_service_upgrade", tmp_path)
+
+    assert result["registration_disposition"] == "verified_no_op"
+    assert result["runtime_identity"]["previous"] != result["runtime_identity"]["planned"]
+    assert result["runtime_identity"]["installed"] == result["runtime_identity"]["planned"]
+    assert result["runtime_identity"]["matches_plan"] is True
+    assert result["terminal_status"] == "acceptance_passed"
+    assert result["root_listing"]["relative_path"] == ""
+    _assert_recursively_redacted(result, workspace=tmp_path)
+
+
+def test_active_service_upgrade_rejects_stale_installed_runtime(tmp_path: Path) -> None:
+    result = run_acceptance_scenario(
+        CONTRACT_FIXTURE,
+        "active_service_upgrade",
+        tmp_path,
+        retain_previous_runtime=True,
+    )
+
+    assert result["registration_disposition"] == "verified_no_op"
+    assert result["runtime_identity"]["matches_plan"] is False
+    assert result["terminal_status"] == "acceptance_failed"
+    assert result["evidence"] == {"code": "runtime_identity_mismatch", "redacted": True}
+    assert result["root_listing"]["relative_path"] == ""
+    _assert_recursively_redacted(result, workspace=tmp_path)

@@ -78,8 +78,9 @@ def run_acceptance_scenario(
     workspace: Path,
     *,
     include_backup_restore: bool = False,
+    retain_previous_runtime: bool = False,
 ) -> dict[str, object]:
-    """Launch clean-install composition with explicit external interpreter/source paths."""
+    """Launch disposable composition with explicit external interpreter/source paths."""
 
     if include_backup_restore and not _gpg_available():
         import pytest
@@ -103,6 +104,7 @@ def run_acceptance_scenario(
             str(Path(__file__).resolve()),
             "--child",
             *( ["--include-backup-restore"] if include_backup_restore else [] ),
+            *( ["--retain-previous-runtime"] if retain_previous_runtime else [] ),
             str(contract_path),
             scenario_name,
             str(workspace),
@@ -278,6 +280,155 @@ def _load_builder(path: Path):
     return module.build_real_service
 
 
+def _seed_active_upgrade_state(
+    workspace: Path,
+    registration: Mapping[str, object],
+    root: Path,
+    previous_identity: str,
+) -> str:
+    """Create the pre-existing registered root and a terminal journal record."""
+    from theunderdark.journal import AuthorizationSnapshot, OperationState, SQLiteOperationJournal
+    from theunderdark.root_registry import ControlPlaneApproval, SQLiteRootRegistry
+
+    class DisposableRootVerifier:
+        def verify(self, action: str, payload: Mapping[str, object], target_digest: str) -> object:
+            return ControlPlaneApproval(
+                "disposable-active-upgrade-approval",
+                action,
+                str(payload["project_id"]),
+                str(payload["root_id"]),
+                str(payload["policy_revision"]),
+                target_digest,
+                "approved",
+                "2099-01-01T00:00:00+00:00",
+            )
+
+    state = workspace / "state"
+    state.mkdir(mode=0o700, exist_ok=True)
+    registry = SQLiteRootRegistry((state / "roots.sqlite3").resolve(), verifier=DisposableRootVerifier())
+    try:
+        arguments = {
+            "project_id": str(registration["project_id"]),
+            "root_id": str(registration["root_id"]),
+            "policy_revision": str(registration["policy_revision"]),
+            "host_path": root,
+            "alias": str(registration["alias"]),
+            "max_bytes": int(registration["max_bytes"]),
+        }
+        registry.register(**arguments)
+        changes_before_retry = registry._connection.total_changes
+        registry.register(**arguments)
+        if registry._connection.total_changes != changes_before_retry:
+            raise AssertionError("exact active root registration was not a verified no-op")
+    finally:
+        registry.close()
+
+    journal = SQLiteOperationJournal((state / "journal.sqlite3").resolve())
+    try:
+        request_id = "request.active-upgrade-preexisting"
+        authorization = AuthorizationSnapshot(
+            "authorization.active-upgrade-preexisting",
+            request_id,
+            str(registration["project_id"]),
+            str(registration["root_id"]),
+            "backup.create",
+            previous_identity,
+            str(registration["policy_revision"]),
+            "claim.active-upgrade-preexisting",
+            "approval.active-upgrade-preexisting",
+            "2026-08-04T00:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+            {},
+        )
+        journal.store_authorization(authorization)
+        operation, created = journal.reserve(
+            project_id=authorization.project_id,
+            request_id=request_id,
+            idempotency_key="active-upgrade-preexisting",
+            request_digest=previous_identity,
+            authorization_ref=authorization.authorization_ref,
+            action=authorization.action,
+            now="2026-08-04T00:00:00+00:00",
+        )
+        if not created:
+            raise AssertionError("active-upgrade journal seed was not newly reserved")
+        operation = journal.transition(
+            operation.operation_id,
+            OperationState.AUTHORIZED,
+            summary="disposable active-upgrade authority retained",
+            now="2026-08-04T00:00:01+00:00",
+        )
+        operation = journal.transition(
+            operation.operation_id,
+            OperationState.EXECUTING,
+            summary="disposable active-upgrade journal retained",
+            now="2026-08-04T00:00:02+00:00",
+        )
+        operation = journal.transition(
+            operation.operation_id,
+            OperationState.SUCCEEDED,
+            host_state_changed=False,
+            result={"retained": True},
+            summary="disposable active-upgrade journal terminal",
+            now="2026-08-04T00:00:03+00:00",
+        )
+        if operation.state != OperationState.SUCCEEDED:
+            raise AssertionError("active-upgrade journal seed did not reach a terminal state")
+    finally:
+        journal.close()
+    return "verified_no_op"
+
+
+def _write_runtime_artifact(path: Path, identity: str) -> None:
+    payload = {"identity": identity, "kind": "donuthole-runtime-artifact-v1"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(encoded)
+    path.chmod(0o400)
+
+
+def _read_runtime_artifact(path: Path) -> str:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o400:
+        raise AssertionError("disposable runtime artifact is not immutable")
+    decoded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(decoded, dict) or set(decoded) != {"identity", "kind"}:
+        raise AssertionError("disposable runtime artifact is malformed")
+    identity = decoded["identity"]
+    if decoded["kind"] != "donuthole-runtime-artifact-v1" or not isinstance(identity, str):
+        raise AssertionError("disposable runtime artifact identity is malformed")
+    return identity
+
+
+def _seed_runtime_artifacts(
+    workspace: Path,
+    scenario: Mapping[str, object],
+    *,
+    retain_previous_runtime: bool,
+) -> dict[str, str]:
+    """Install the deterministic planned candidate without a process lifecycle."""
+    previous = scenario["previous_runtime_identity"]
+    planned = scenario["planned_runtime_identity"]
+    if not isinstance(previous, str) or not isinstance(planned, str) or previous == planned:
+        raise AssertionError("active-upgrade runtime identities are invalid")
+    artifact_dir = workspace / "runtime-artifacts"
+    artifact_dir.mkdir(mode=0o700, exist_ok=True)
+    artifact_dir.chmod(0o700)
+    previous_path = artifact_dir / "previous.json"
+    planned_path = artifact_dir / "planned.json"
+    installed_path = artifact_dir / "installed.json"
+    _write_runtime_artifact(previous_path, previous)
+    _write_runtime_artifact(planned_path, planned)
+    _write_runtime_artifact(installed_path, previous if retain_previous_runtime else planned)
+    identities = {
+        "previous": _read_runtime_artifact(previous_path),
+        "planned": _read_runtime_artifact(planned_path),
+        "installed": _read_runtime_artifact(installed_path),
+    }
+    if identities["previous"] != previous or identities["planned"] != planned:
+        raise AssertionError("runtime artifact identities diverged from the fixture")
+    return identities
+
+
 def _child_run(
     contract_path: Path,
     scenario_name: str,
@@ -285,11 +436,15 @@ def _child_run(
     builder_path: Path,
     *,
     include_backup_restore: bool,
+    retain_previous_runtime: bool,
 ) -> dict[str, object]:
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     scenarios = {item["name"]: item for item in contract["scenarios"]}
-    if scenario_name != "clean_install" or scenario_name not in scenarios:
-        raise ValueError("only the clean_install scenario belongs to Capability A Task 4")
+    if scenario_name not in {"clean_install", "active_service_upgrade"} or scenario_name not in scenarios:
+        raise ValueError("unsupported Capability A acceptance scenario")
+    scenario = scenarios[scenario_name]
+    if not isinstance(scenario, Mapping):
+        raise ValueError("acceptance scenario must be an object")
     workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
     root = workspace / "disposable-root"
     nested = root / "nested"
@@ -313,6 +468,23 @@ def _child_run(
     if not _sealed_authority_status(authority_path, authority_bytes):
         raise AssertionError("disposable authority was not sealed before composition")
     authority_digest = "sha256:" + hashlib.sha256(authority_bytes).hexdigest()
+    registration_disposition = None
+    runtime_identity = None
+    if scenario_name == "active_service_upgrade":
+        runtime = contract["runtime_identity"]
+        if not isinstance(runtime, Mapping) or scenario.get("previous_runtime_identity") != runtime.get("previous_identity") or scenario.get("planned_runtime_identity") != runtime.get("planned_identity"):
+            raise AssertionError("active-upgrade scenario does not match the reviewed runtime identity")
+        registration_disposition = _seed_active_upgrade_state(
+            workspace,
+            registration,
+            root,
+            str(scenario["previous_runtime_identity"]),
+        )
+        runtime_identity = _seed_runtime_artifacts(
+            workspace,
+            scenario,
+            retain_previous_runtime=retain_previous_runtime,
+        )
     service = _load_builder(builder_path)(workspace, authority_path)
     from theunderdark.production_app import create_production_mcp
     from overseer.storage_adapter import (
@@ -336,25 +508,35 @@ def _child_run(
         raise AssertionError("pagination did not retain a stable snapshot identity")
     if first_result["total_count"] != second_result["total_count"] or len(entries) != len(set(entries)):
         raise AssertionError("pagination did not preserve a complete duplicate-free traversal")
-    if not include_backup_restore:
-        authority_unchanged = _sealed_authority_status(authority_path, authority_bytes)
-        if not authority_unchanged:
-            raise AssertionError("authority changed after read-only composition")
+    common_result = {
+        "initialized": {"health": health, "tools": bridge.discovered_tools},
+        "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
+        "root": {**root_envelope["result"], "relative_path": ""},
+        "root_listing": {"relative_path": "", "entries": [entry["name"] for entry in first_result["entries"]]},
+        "nested_listing": {"relative_path": "nested", "entries": [entry["name"] for entry in nested_envelope["result"]["entries"]]},
+        "pagination": {
+            "entries": entries,
+            "next_cursor": second_result["next_cursor"],
+            "page_size": 2,
+            "snapshot_identity": first_result["snapshot_identity"],
+            "total_count": first_result["total_count"],
+        },
+        "authority": {"digest": authority_digest, "unchanged": _sealed_authority_status(authority_path, authority_bytes)},
+    }
+    if not common_result["authority"]["unchanged"]:
+        raise AssertionError("authority changed after disposable composition")
+    if scenario_name == "active_service_upgrade":
+        assert runtime_identity is not None and registration_disposition is not None
+        matches_plan = runtime_identity["installed"] == runtime_identity["planned"]
         return {
-            "initialized": {"health": health, "tools": bridge.discovered_tools},
-            "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
-            "root": {**root_envelope["result"], "relative_path": ""},
-            "root_listing": {"relative_path": "", "entries": [entry["name"] for entry in first_result["entries"]]},
-            "nested_listing": {"relative_path": "nested", "entries": [entry["name"] for entry in nested_envelope["result"]["entries"]]},
-            "pagination": {
-                "entries": entries,
-                "next_cursor": second_result["next_cursor"],
-                "page_size": 2,
-                "snapshot_identity": first_result["snapshot_identity"],
-                "total_count": first_result["total_count"],
-            },
-            "authority": {"digest": authority_digest, "unchanged": authority_unchanged},
+            **common_result,
+            "registration_disposition": registration_disposition,
+            "runtime_identity": {**runtime_identity, "matches_plan": matches_plan},
+            "terminal_status": "acceptance_passed" if matches_plan else "acceptance_failed",
+            **({} if matches_plan else {"evidence": {"code": "runtime_identity_mismatch", "redacted": True}}),
         }
+    if not include_backup_restore:
+        return common_result
     requests = contract["acceptance_requests"]
     create_payload = requests["backup_create"]["parameters"]
     create_request = _fixture_execution_request(
@@ -440,19 +622,7 @@ def _child_run(
     if not authority_unchanged:
         raise AssertionError("authority changed after disposable restore verification")
     return {
-        "initialized": {"health": health, "tools": bridge.discovered_tools},
-        "project": {"name": "DonutHole", "project_id": registration["project_id"], "roots": project_envelope["result"]["roots"]},
-        "root": {**root_envelope["result"], "relative_path": ""},
-        "root_listing": {"relative_path": "", "entries": [entry["name"] for entry in first_result["entries"]]},
-        "nested_listing": {"relative_path": "nested", "entries": [entry["name"] for entry in nested_envelope["result"]["entries"]]},
-        "pagination": {
-            "entries": entries,
-            "next_cursor": second_result["next_cursor"],
-            "page_size": 2,
-            "snapshot_identity": first_result["snapshot_identity"],
-            "total_count": first_result["total_count"],
-        },
-        "authority": {"digest": authority_digest, "unchanged": authority_unchanged},
+        **common_result,
         "backup": {
             "status": "completed",
             "request_digest": create_result.request_digest,
@@ -471,6 +641,7 @@ def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--child", action="store_true")
     parser.add_argument("--include-backup-restore", action="store_true")
+    parser.add_argument("--retain-previous-runtime", action="store_true")
     parser.add_argument("contract_path", type=Path)
     parser.add_argument("scenario_name")
     parser.add_argument("workspace", type=Path)
@@ -484,6 +655,7 @@ def _main() -> None:
         arguments.workspace,
         arguments.builder_path,
         include_backup_restore=arguments.include_backup_restore,
+        retain_previous_runtime=arguments.retain_previous_runtime,
     ), sort_keys=True))
 
 

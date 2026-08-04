@@ -2153,13 +2153,26 @@ class SQLiteStore:
         )
 
     def load_provisioning_review_outbox_payload(self, entry_id: str) -> str:
+        return self.load_provisioning_review_outbox_record(entry_id)[4]
+
+    def load_provisioning_review_outbox_record(
+        self,
+        entry_id: str,
+    ) -> tuple[str, str, str, str, str]:
         row = self._connection.execute(
-            "SELECT payload FROM provisioning_review_outbox WHERE id=?",
+            "SELECT id, plan_id, owner_domain, state, payload "
+            "FROM provisioning_review_outbox WHERE id=?",
             (entry_id,),
         ).fetchone()
         if row is None:
             raise KeyError(entry_id)
-        return str(row["payload"])
+        return (
+            str(row["id"]),
+            str(row["plan_id"]),
+            str(row["owner_domain"]),
+            str(row["state"]),
+            str(row["payload"]),
+        )
 
     def list_provisioning_review_outbox_payloads(
         self,
@@ -2596,6 +2609,12 @@ class SQLiteStore:
             (event.id, event.subject_id, _dump(event)),
         )
         self._commit_agent_mutation()
+
+    def load_audit_event(self, event_id: str) -> AuditEvent:
+        return _load_dataclass(
+            AuditEvent,
+            self._get_payload("audit_events", event_id),
+        )
 
     def list_audit_events(
         self,

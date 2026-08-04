@@ -13,6 +13,7 @@ from overseer.backup_provisioning import (
     stage_plan,
 )
 from overseer.core import OwnerDomain, RiskLevel
+from overseer.cli import dispatch_crew_messages_status
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.store import SQLiteStore
 
@@ -142,6 +143,35 @@ def test_acknowledgement_is_not_approval(tmp_path):
     )
 
     with pytest.raises(ValueError, match="obrien"):
+        approve_plan(store_path, plan.plan_id, "independent-human")
+
+
+def test_legacy_exact_message_dispatch_keeps_other_reviews_open(tmp_path):
+    store_path = str(tmp_path / "state.sqlite3")
+    plan = _plan(store_path)
+    stage_plan(store_path, plan)
+
+    result = dispatch_crew_messages_status(
+        store_path,
+        message_id=plan.evidence_ids["obrien"],
+        dispatched_by="legacy-review-runner",
+        dispatched_at="2026-08-02T12:00:00+00:00",
+    )
+
+    with SQLiteStore(store_path) as store:
+        messages = {
+            role: store.load_crew_message(message_id)
+            for role, message_id in plan.evidence_ids.items()
+        }
+    assert result["requested_message_id"] == plan.evidence_ids["obrien"]
+    assert result["processed"] == 1
+    assert messages["obrien"].status == CrewMessageStatus.ACKNOWLEDGED
+    assert all(
+        message.status == CrewMessageStatus.OPEN
+        for role, message in messages.items()
+        if role != "obrien"
+    )
+    with pytest.raises(ValueError, match="kira"):
         approve_plan(store_path, plan.plan_id, "independent-human")
 
 

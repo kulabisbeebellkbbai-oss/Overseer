@@ -26,6 +26,9 @@ from urllib.request import Request, urlopen
 import pytest
 
 from overseer import backup_provisioning_cli as backup_provisioning_cli_module
+from overseer import cli as cli_module
+from overseer import api as api_module
+from overseer.audit import AuditEvent, AuditEventType
 from overseer.backup_provisioning import build_plan
 from overseer.api import make_api_handler
 from overseer.backup_host_operations import (
@@ -4379,3 +4382,593 @@ def test_bundle_cli_keeps_legacy_stage_list_approve_and_execute(tmp_path, monkey
             ),
         ),
     ]
+
+
+def _task5_staged_bundle(tmp_path):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    stage_expected_bundle(store_path, bundle)
+    return store_path, bundle, bundle.outbox[0]
+
+
+def _task5_crew_ids(store_path: str) -> tuple[str, ...]:
+    with SQLiteStore(store_path) as store:
+        return tuple(
+            message.id
+            for message in store.list_crew_messages()
+            if "review-backup-provision" in message.id
+        )
+
+
+def _task5_outbox_record(store_path: str, outbox_id: str) -> tuple[str, ...]:
+    with SQLiteStore(store_path) as store:
+        return next(
+            record
+            for record in store.list_provisioning_review_outbox_records()
+            if record[0] == outbox_id
+        )
+
+
+def _task5_record_terminal_dispatch(
+    store_path: str,
+    entry: ProvisioningReviewOutboxEntry,
+    dispatched_at: str,
+) -> dict[str, object]:
+    dispatch_audit_id = f"audit.{entry.message_id}.dispatch.20260802T120000000000Z"
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        store.save_crew_message(replace(
+            message,
+            status=CrewMessageStatus.ACKNOWLEDGED,
+            review_status=CrewReviewStatus.APPROVED,
+            decision_reason="exact immutable provisioning review passed",
+            decision_evidence_ids=(
+                *entry.evidence_ids, entry.plan_id, dispatch_audit_id,
+            ),
+            decided_by=entry.owner_domain.value,
+            decided_at=dispatched_at,
+            updated_at=dispatched_at,
+        ))
+        store.save_audit_event(AuditEvent(
+            id=dispatch_audit_id,
+            event_type=AuditEventType.EXECUTED,
+            owner_domain=entry.owner_domain,
+            subject_id=entry.message_id,
+            summary="exact bounded provisioning review dispatched",
+            risk_level=RiskLevel.HIGH,
+            occurred_at=dispatched_at,
+        ))
+    return {
+        "requested_message_id": entry.message_id,
+        "processed": 1,
+        "items": [{
+            "message_id": entry.message_id,
+            "owner_domain": entry.owner_domain.value,
+            "status": "dispatched",
+            "message_status": CrewMessageStatus.ACKNOWLEDGED.value,
+            "review_status": CrewReviewStatus.APPROVED.value,
+        }],
+        "mutation_performed": True,
+        "host_mutation_performed": False,
+    }
+
+
+def test_review_outbox_materializes_one_exact_message_without_mutating_bundle_intent(
+    tmp_path,
+):
+    store_path, bundle, entry = _task5_staged_bundle(tmp_path)
+    outbox_before = _task5_outbox_record(store_path, entry.id)
+
+    first = provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+    second = provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+    assert first["outbox_id"] == entry.id
+    assert first["outbox_state"] == "materialized"
+    assert first["mutation_performed"] is True
+    assert first["host_mutation_performed"] is False
+    assert first["message"] == {
+        **first["message"],
+        "id": entry.message_id,
+        "owner_domain": entry.owner_domain.value,
+        "related_plan_id": bundle.plan.plan_id,
+        "related_resource_id": entry.related_resource_id,
+        "acceptance_criteria": list(entry.acceptance_criteria),
+        "request_evidence_ids": list(entry.evidence_ids),
+        "status": CrewMessageStatus.OPEN.value,
+        "review_status": CrewReviewStatus.PENDING.value,
+    }
+    assert second["mutation_performed"] is False
+    assert _task5_crew_ids(store_path) == (entry.message_id,)
+    assert _task5_outbox_record(store_path, entry.id) == outbox_before
+
+
+@pytest.mark.parametrize("corruption", ("missing-plan", "owner", "evidence"))
+def test_review_outbox_requires_exact_committed_bundle_members_before_materialization(
+    tmp_path, corruption,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    connection = sqlite3.connect(store_path)
+    try:
+        if corruption == "missing-plan":
+            connection.execute(
+                "DELETE FROM backup_provisioning_plans WHERE id=?",
+                (entry.plan_id,),
+            )
+        elif corruption == "owner":
+            connection.execute(
+                "UPDATE provisioning_review_outbox SET owner_domain='sisko' WHERE id=?",
+                (entry.id,),
+            )
+        else:
+            payload = json.loads(connection.execute(
+                "SELECT payload FROM provisioning_review_outbox WHERE id=?",
+                (entry.id,),
+            ).fetchone()[0])
+            payload["evidence_ids"][0] = "sha256:" + "f" * 64
+            connection.execute(
+                "UPDATE provisioning_review_outbox SET payload=? WHERE id=?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")), entry.id),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_OUTBOX_INTEGRITY_ERROR$",
+    ):
+        provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+    assert _task5_crew_ids(store_path) == ()
+
+
+def test_review_outbox_rejects_semantic_collision_under_exact_message_id(tmp_path):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    with SQLiteStore(store_path) as store:
+        store.save_crew_message(CrewMessage(
+            id=entry.message_id,
+            owner_domain=OwnerDomain.SISKO,
+            subject="forged private review",
+            message="forged raw payload",
+            requested_by="requester",
+            related_plan_id=entry.plan_id,
+        ))
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_OUTBOX_MESSAGE_MISMATCH$",
+    ):
+        provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+    assert _task5_crew_ids(store_path) == (entry.message_id,)
+
+
+def test_review_outbox_message_is_not_observable_before_materialization_commit(
+    tmp_path, monkeypatch,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    observations: list[int] = []
+    real_save = SQLiteStore.save_crew_message
+
+    def observe_after_uncommitted_save(store, message):
+        real_save(store, message)
+        reader = sqlite3.connect(store_path)
+        try:
+            observations.append(int(reader.execute(
+                "SELECT COUNT(*) FROM crew_messages WHERE id=?",
+                (entry.message_id,),
+            ).fetchone()[0]))
+        finally:
+            reader.close()
+
+    monkeypatch.setattr(SQLiteStore, "save_crew_message", observe_after_uncommitted_save)
+
+    provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+    assert observations == [0]
+    assert _task5_crew_ids(store_path) == (entry.message_id,)
+
+
+def test_review_outbox_concurrent_materialization_is_exactly_idempotent(tmp_path):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    workers = 8
+    barrier = Barrier(workers)
+
+    def materialize():
+        barrier.wait()
+        return provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = tuple(executor.map(lambda _index: materialize(), range(workers)))
+
+    assert sum(result["mutation_performed"] is True for result in results) == 1
+    assert _task5_crew_ids(store_path) == (entry.message_id,)
+
+
+def test_review_outbox_public_lookup_never_scans_all_outbox_rows(
+    tmp_path, monkeypatch,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    real_list = SQLiteStore.list_provisioning_review_outbox_records
+
+    def bounded_only(store, plan_id=None):
+        if plan_id is None:
+            raise AssertionError("public outbox lookup must use the exact indexed ID")
+        return real_list(store, plan_id)
+
+    monkeypatch.setattr(
+        SQLiteStore, "list_provisioning_review_outbox_records", bounded_only,
+    )
+
+    result = provisioning_bundle_module.materialize_review_outbox(
+        store_path, entry.id,
+    )
+
+    assert result["message_id"] == entry.message_id
+
+
+def test_review_outbox_dispatch_uses_only_exact_message_and_completion_receipt(
+    tmp_path, monkeypatch,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    outbox_before = _task5_outbox_record(store_path, entry.id)
+    calls: list[dict[str, object]] = []
+    dispatched_at = "2026-08-02T12:00:00+00:00"
+
+    def exact_dispatch(path, **kwargs):
+        calls.append({"path": path, **kwargs})
+        return _task5_record_terminal_dispatch(path, entry, dispatched_at)
+
+    monkeypatch.setattr(cli_module, "dispatch_crew_messages_status", exact_dispatch)
+
+    first = cli_module.dispatch_provisioning_review_outbox_status(
+        store_path, entry.id, "independent-dispatcher", dispatched_at,
+    )
+    second = cli_module.dispatch_provisioning_review_outbox_status(
+        store_path, entry.id, "independent-dispatcher", dispatched_at,
+    )
+
+    assert calls == [{
+        "path": store_path,
+        "message_id": entry.message_id,
+        "dispatched_by": "independent-dispatcher",
+        "dispatched_at": dispatched_at,
+    }]
+    assert first["outbox_state"] == "dispatched"
+    assert first["mutation_performed"] is True
+    assert first["host_mutation_performed"] is False
+    assert second["outbox_state"] == "dispatched"
+    assert second["mutation_performed"] is False
+    assert _task5_outbox_record(store_path, entry.id) == outbox_before
+
+
+def test_review_outbox_dispatch_completes_through_real_backup_reviewer(tmp_path):
+    store_path, bundle, _entry = _task5_staged_bundle(tmp_path)
+    entry = bundle.outbox[1]
+    dispatched_at = "2026-08-02T12:00:00+00:00"
+
+    result = cli_module.dispatch_provisioning_review_outbox_status(
+        store_path, entry.id, "independent-dispatcher", dispatched_at,
+    )
+
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        dispatch_events = tuple(
+            event
+            for event in store.list_audit_events(subject_prefix=entry.message_id)
+            if ".dispatch." in event.id
+        )
+    assert result["outbox_state"] == "dispatched"
+    assert result["host_mutation_performed"] is False
+    assert message.review_status == CrewReviewStatus.APPROVED
+    assert message.decision_evidence_ids == (
+        *entry.evidence_ids, entry.plan_id, dispatch_events[0].id,
+    )
+
+
+def test_review_outbox_real_reviewer_correction_binds_exact_dispatch_actor(tmp_path):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    dispatched_at = "2026-08-02T12:00:00+00:00"
+
+    result = cli_module.dispatch_provisioning_review_outbox_status(
+        store_path, entry.id, "independent-dispatcher", dispatched_at,
+    )
+
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        dispatch_event = store.load_audit_event(message.decision_evidence_ids[-1])
+    assert result["outbox_state"] == "dispatched"
+    assert result["host_mutation_performed"] is False
+    assert message.review_status == CrewReviewStatus.CORRECTION_REQUESTED
+    assert message.decided_by == "independent-dispatcher"
+    assert message.decision_evidence_ids == (dispatch_event.id,)
+
+
+def test_review_outbox_partial_or_host_mutating_dispatch_is_claimed_and_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    calls: list[str] = []
+
+    def partial_dispatch(path, **kwargs):
+        calls.append(str(kwargs["message_id"]))
+        return {
+            "requested_message_id": entry.message_id,
+            "processed": 1,
+            "items": [{"message_id": entry.message_id}],
+            "mutation_performed": True,
+            "host_mutation_performed": True,
+        }
+
+    monkeypatch.setattr(cli_module, "dispatch_crew_messages_status", partial_dispatch)
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_DISPATCH_HOST_MUTATION$",
+    ):
+        cli_module.dispatch_provisioning_review_outbox_status(
+            store_path, entry.id, "independent-dispatcher",
+            "2026-08-02T12:00:00+00:00",
+        )
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_DISPATCH_INDETERMINATE$",
+    ):
+        cli_module.dispatch_provisioning_review_outbox_status(
+            store_path, entry.id, "independent-dispatcher",
+            "2026-08-02T12:01:00+00:00",
+        )
+
+    assert calls == [entry.message_id]
+    assert _task5_crew_ids(store_path) == (entry.message_id,)
+
+
+@pytest.mark.parametrize(
+    ("dispatched_by", "dispatched_at"),
+    (
+        ("", "2026-08-02T12:00:00+00:00"),
+        ("x" * 257, "2026-08-02T12:00:00+00:00"),
+        ("dispatchér", "2026-08-02T12:00:00+00:00"),
+        ("dispatcher", "not-a-timestamp"),
+        ("dispatcher", "2026-08-02T12:00:00"),
+    ),
+)
+def test_invalid_review_dispatch_request_mutates_nothing(
+    tmp_path, monkeypatch, dispatched_by, dispatched_at,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    with SQLiteStore(store_path) as store:
+        audits_before = store.count_audit_events()
+    monkeypatch.setattr(
+        cli_module,
+        "dispatch_crew_messages_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid request must not reach crew dispatch")
+        ),
+    )
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST$",
+    ):
+        cli_module.dispatch_provisioning_review_outbox_status(
+            store_path, entry.id, dispatched_by, dispatched_at,
+        )
+
+    with SQLiteStore(store_path) as store:
+        assert store.count_audit_events() == audits_before
+    assert _task5_crew_ids(store_path) == ()
+
+
+def test_review_outbox_terminal_looking_forgery_without_exact_audit_fails_closed(
+    tmp_path, monkeypatch,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        store.save_crew_message(replace(
+            message,
+            status=CrewMessageStatus.ACKNOWLEDGED,
+            review_status=CrewReviewStatus.APPROVED,
+            decision_reason="forged terminal review",
+            decision_evidence_ids=("audit.forged",),
+            decided_by=entry.owner_domain.value,
+            decided_at="2026-08-02T12:00:00+00:00",
+        ))
+    monkeypatch.setattr(
+        cli_module,
+        "dispatch_crew_messages_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal-looking record must not be redispatched")
+        ),
+    )
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_OUTBOX_MESSAGE_MISMATCH$",
+    ):
+        cli_module.dispatch_provisioning_review_outbox_status(
+            store_path, entry.id, "independent-dispatcher",
+        )
+
+
+def test_review_outbox_forged_completion_receipt_cannot_replace_dispatch_audit(
+    tmp_path,
+):
+    store_path, _bundle, entry = _task5_staged_bundle(tmp_path)
+    provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+    decided_at = "2026-08-02T12:00:00+00:00"
+    missing_dispatch_audit = f"audit.{entry.message_id}.dispatch.missing"
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(entry.message_id)
+        forged = replace(
+            message,
+            status=CrewMessageStatus.ACKNOWLEDGED,
+            review_status=CrewReviewStatus.APPROVED,
+            decision_reason="forged terminal review",
+            decision_evidence_ids=(
+                *entry.evidence_ids, entry.plan_id, missing_dispatch_audit,
+            ),
+            decided_by=entry.owner_domain.value,
+            decided_at=decided_at,
+            updated_at=decided_at,
+        )
+        store.save_crew_message(forged)
+        store.save_audit_event(AuditEvent(
+            id=f"audit.{entry.message_id}.provisioning-review-dispatch-complete",
+            event_type=AuditEventType.VERIFIED,
+            owner_domain=entry.owner_domain,
+            subject_id=entry.message_id,
+            summary="exact provisioning review dispatch completed",
+            risk_level=RiskLevel.HIGH,
+            evidence_ids=forged.decision_evidence_ids,
+            occurred_at=decided_at,
+        ))
+
+    with pytest.raises(
+        ProvisioningBundleError,
+        match="^REVIEW_OUTBOX_MESSAGE_MISMATCH$",
+    ):
+        provisioning_bundle_module.materialize_review_outbox(store_path, entry.id)
+
+
+def test_review_dispatch_cli_is_exact_redacted_and_keeps_legacy_commands(
+    tmp_path, monkeypatch, capsys,
+):
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "dispatch_provisioning_review_outbox_status",
+        lambda *args: calls.append(args) or {
+            "ok": True,
+            "outbox_id": "outbox.exact",
+            "host_mutation_performed": False,
+        },
+        raising=False,
+    )
+
+    assert backup_provisioning_cli_module.main((
+        "--store", str(tmp_path / "state.sqlite3"),
+        "review-dispatch",
+        "--outbox-id", "outbox.exact",
+        "--dispatched-by", "independent-dispatcher",
+        "--dispatched-at", "2026-08-02T12:00:00+00:00",
+    )) == 0
+
+    assert json.loads(capsys.readouterr().out)["host_mutation_performed"] is False
+    assert calls == [(
+        str(tmp_path / "state.sqlite3"),
+        "outbox.exact",
+        "independent-dispatcher",
+        "2026-08-02T12:00:00+00:00",
+    )]
+
+
+def test_review_dispatch_api_requires_admin_exact_body_and_redacts_errors(
+    tmp_path, monkeypatch,
+):
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        api_module,
+        "dispatch_provisioning_review_outbox_status",
+        lambda *args: calls.append(args) or {
+            "ok": True,
+            "outbox_id": "outbox.exact",
+            "host_mutation_performed": False,
+        },
+        raising=False,
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_api_handler(str(tmp_path / "state.sqlite3"), "admin-secret"),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    url = f"http://{host}:{port}/backup-provisioning/review-outbox/dispatch"
+    body = json.dumps({
+        "outbox_id": "outbox.exact",
+        "dispatched_by": "independent-dispatcher",
+    }).encode("utf-8")
+    try:
+        with pytest.raises(HTTPError) as unauthorized:
+            urlopen(Request(url, data=body, method="POST"), timeout=5)
+        assert unauthorized.value.code == 401
+
+        request = Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "authorization": "Bearer admin-secret",
+                "content-type": "application/json",
+            },
+        )
+        with urlopen(request, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        assert result["host_mutation_performed"] is False
+
+        extra = Request(
+            url,
+            data=json.dumps({
+                "outbox_id": "outbox.exact",
+                "dispatched_by": "independent-dispatcher",
+                "message_id": "caller-controlled",
+            }).encode("utf-8"),
+            method="POST",
+            headers={
+                "authorization": "Bearer admin-secret",
+                "content-type": "application/json",
+            },
+        )
+        with pytest.raises(HTTPError) as invalid:
+            urlopen(extra, timeout=5)
+        assert invalid.value.code == 400
+        assert json.loads(invalid.value.read().decode("utf-8"))["error_code"] == (
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert calls == [(
+        str(tmp_path / "state.sqlite3"),
+        "outbox.exact",
+        "independent-dispatcher",
+        None,
+    )]
+
+
+def test_review_dispatch_api_maps_invalid_bounded_outbox_id_to_stable_400(tmp_path):
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_api_handler(str(tmp_path / "state.sqlite3"), "admin-secret"),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    request = Request(
+        f"http://{host}:{port}/backup-provisioning/review-outbox/dispatch",
+        data=json.dumps({
+            "outbox_id": "x" * 513,
+            "dispatched_by": "independent-dispatcher",
+        }).encode("utf-8"),
+        method="POST",
+        headers={
+            "authorization": "Bearer admin-secret",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with pytest.raises(HTTPError) as invalid:
+            urlopen(request, timeout=5)
+        assert invalid.value.code == 400
+        assert json.loads(invalid.value.read().decode("utf-8")) == {
+            "error": "provisioning_bundle_request_failed",
+            "error_code": "INVALID_REVIEW_OUTBOX_REQUEST",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

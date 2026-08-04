@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from .backup_provisioning import approve_plan_api, execute_plan_api, list_plans, stage_plan_api
 from .backup_host_operations import ConcreteHostProvisioningAdapter
+from .cli import dispatch_provisioning_review_outbox_status
 from .provisioning_bundle import (
     ProvisioningBundleError,
     bundle_status,
@@ -115,6 +116,8 @@ def _write_bundle_cli_error(error_code: str) -> int:
         "INVALID_BUNDLE_STAGE_REQUEST",
         "INVALID_BUNDLE_STATUS_REQUEST",
         "AUTHORITATIVE_REBUILD_MISMATCH",
+        "INVALID_REVIEW_OUTBOX_REQUEST",
+        "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
     } else 1
 
 
@@ -133,8 +136,15 @@ def _run_bundle_command(args: argparse.Namespace) -> int:
                     "expected_bundle_digest": args.expected_bundle_digest,
                 },
             )
-        else:
+        elif args.command == "bundle-status":
             result = bundle_status(args.store, args.plan_id)
+        else:
+            result = dispatch_provisioning_review_outbox_status(
+                args.store,
+                args.outbox_id,
+                args.dispatched_by,
+                args.dispatched_at,
+            )
     except ProvisioningBundleError as error:
         code = str(error)
         allowed = {
@@ -148,12 +158,22 @@ def _run_bundle_command(args: argparse.Namespace) -> int:
             "BUNDLE_NOT_FOUND",
             "BUNDLE_STATUS_INTEGRITY_ERROR",
             "BUNDLE_STATUS_UNAVAILABLE",
+            "INVALID_REVIEW_OUTBOX_REQUEST",
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+            "REVIEW_OUTBOX_NOT_FOUND",
+            "REVIEW_OUTBOX_INTEGRITY_ERROR",
+            "REVIEW_OUTBOX_MESSAGE_MISMATCH",
+            "REVIEW_DISPATCH_NOT_TERMINAL",
+            "REVIEW_DISPATCH_INDETERMINATE",
+            "REVIEW_DISPATCH_HOST_MUTATION",
+            "REVIEW_DISPATCH_UNAVAILABLE",
         }
         if code not in allowed:
             code = {
                 "bundle-preflight": "BUNDLE_PREFLIGHT_UNAVAILABLE",
                 "bundle-stage": "BUNDLE_STAGE_UNAVAILABLE",
                 "bundle-status": "BUNDLE_STATUS_UNAVAILABLE",
+                "review-dispatch": "REVIEW_DISPATCH_UNAVAILABLE",
             }[args.command]
         return _write_bundle_cli_error(code)
     except Exception:
@@ -161,6 +181,7 @@ def _run_bundle_command(args: argparse.Namespace) -> int:
             "bundle-preflight": "BUNDLE_PREFLIGHT_UNAVAILABLE",
             "bundle-stage": "BUNDLE_STAGE_UNAVAILABLE",
             "bundle-status": "BUNDLE_STATUS_UNAVAILABLE",
+            "review-dispatch": "REVIEW_DISPATCH_UNAVAILABLE",
         }[args.command])
     print(json.dumps(result, sort_keys=True))
     return 0
@@ -187,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
     bundle_stage.add_argument("--expected-bundle-digest", required=True)
     bundle_status_parser = commands.add_parser("bundle-status")
     bundle_status_parser.add_argument("--plan-id", required=True)
+    review_dispatch = commands.add_parser("review-dispatch")
+    review_dispatch.add_argument("--outbox-id", required=True)
+    review_dispatch.add_argument("--dispatched-by", required=True)
+    review_dispatch.add_argument("--dispatched-at")
     args = parser.parse_args(argv)
     if args.command == "stage":
         result = stage_plan_api(args.store, json.loads(Path(args.plan_json).read_text()))

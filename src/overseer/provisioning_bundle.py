@@ -38,7 +38,14 @@ from .backup_contract import (
     PROVISIONING_CONTRACT_VERSION,
     load_packaged_provisioning_contract,
 )
-from .core import OwnerDomain
+from .audit import AuditEvent, AuditEventType
+from .core import OwnerDomain, RiskLevel
+from .crew import (
+    CrewMessage,
+    CrewMessageStatus,
+    CrewReviewStatus,
+    crew_message_status,
+)
 from .roadex_approval_status import (
     RoadexApprovalBinding,
     RoadexApprovalBindingDraft,
@@ -2834,6 +2841,366 @@ def _verify_exact_persisted_bundle_set(
     if dump_provisioning_bundle(persisted_bundle) != dump_provisioning_bundle(bundle):
         raise ValueError("provisioning bundle immutable payload is inconsistent")
     _load_exact_outbox(store, bundle)
+
+
+_REVIEW_MESSAGE_REQUESTED_BY = "overseer-provisioning-review-outbox"
+_REVIEW_DISPATCH_CLAIM_SUMMARY = "exact provisioning review dispatch claimed by "
+_TERMINAL_REVIEW_STATUSES = frozenset({
+    CrewReviewStatus.APPROVED,
+    CrewReviewStatus.CORRECTION_REQUESTED,
+    CrewReviewStatus.REJECTED,
+})
+
+
+def _validate_review_outbox_id(outbox_id: str) -> str:
+    if (
+        type(outbox_id) is not str
+        or not outbox_id
+        or len(outbox_id) > 512
+        or not outbox_id.isascii()
+    ):
+        raise ProvisioningBundleError("INVALID_REVIEW_OUTBOX_REQUEST")
+    return outbox_id
+
+
+def validate_review_outbox_dispatch_request(
+    outbox_id: str,
+    dispatched_by: str,
+    dispatched_at: str | None,
+) -> str:
+    """Validate every caller-controlled dispatch field before any mutation."""
+    _validate_review_outbox_id(outbox_id)
+    if (
+        type(dispatched_by) is not str
+        or not dispatched_by
+        or dispatched_by != dispatched_by.strip()
+        or len(dispatched_by) > 256
+        or not dispatched_by.isascii()
+    ):
+        raise ProvisioningBundleError(
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+        )
+    if dispatched_at is None:
+        return datetime.now(UTC).replace(microsecond=0).isoformat()
+    if (
+        type(dispatched_at) is not str
+        or not dispatched_at
+        or len(dispatched_at) > 64
+        or not dispatched_at.isascii()
+    ):
+        raise ProvisioningBundleError(
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+        )
+    try:
+        parsed = datetime.fromisoformat(dispatched_at)
+    except ValueError as error:
+        raise ProvisioningBundleError(
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+        ) from error
+    canonical = parsed.isoformat()
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != UTC.utcoffset(parsed)
+        or dispatched_at not in {
+            canonical, canonical.removesuffix("+00:00") + "Z",
+        }
+    ):
+        raise ProvisioningBundleError(
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+        )
+    return dispatched_at
+
+
+def _review_dispatch_claim_id(message_id: str) -> str:
+    return f"audit.{message_id}.provisioning-review-dispatch-claim"
+
+
+def _review_dispatch_completion_id(message_id: str) -> str:
+    return f"audit.{message_id}.provisioning-review-dispatch-complete"
+
+
+def _exact_audit_event(store: SQLiteStore, event_id: str) -> AuditEvent | None:
+    try:
+        return store.load_audit_event(event_id)
+    except KeyError:
+        return None
+
+
+def _review_context_locked(
+    store: SQLiteStore,
+    outbox_id: str,
+) -> tuple[ProvisioningBundleV1, ProvisioningReviewOutboxEntry]:
+    _validate_review_outbox_id(outbox_id)
+    try:
+        record = store.load_provisioning_review_outbox_record(outbox_id)
+    except KeyError:
+        raise ProvisioningBundleError("REVIEW_OUTBOX_NOT_FOUND")
+    try:
+        bundle = load_provisioning_bundle(store, record[1])
+        binding = store.load_roadex_approval_binding(
+            binding_draft_for_bundle(bundle).approval_ref,
+        )
+        verify_exact_persisted_bundle_set(store, bundle, binding)
+        entry = next(item for item in bundle.outbox if item.id == outbox_id)
+        if not bundle.preflight.passed or entry.state != "pending":
+            raise ValueError("review outbox is not materializable")
+        return bundle, entry
+    except ProvisioningBundleError:
+        raise
+    except Exception as error:
+        raise ProvisioningBundleError("REVIEW_OUTBOX_INTEGRITY_ERROR") from error
+
+
+def _new_review_message(
+    entry: ProvisioningReviewOutboxEntry,
+    created_at: str,
+) -> CrewMessage:
+    return CrewMessage(
+        id=entry.message_id,
+        owner_domain=entry.owner_domain,
+        subject=entry.subject,
+        message=entry.message,
+        priority=RiskLevel.HIGH,
+        requested_by=_REVIEW_MESSAGE_REQUESTED_BY,
+        created_at=created_at,
+        updated_at=created_at,
+        related_resource_id=entry.related_resource_id,
+        related_plan_id=entry.plan_id,
+        acceptance_criteria=entry.acceptance_criteria,
+        request_evidence_ids=entry.evidence_ids,
+    )
+
+
+def _verify_review_message_request(
+    store: SQLiteStore,
+    message: CrewMessage,
+    entry: ProvisioningReviewOutboxEntry,
+) -> None:
+    expected = _new_review_message(entry, message.created_at or "")
+    request_fields = (
+        "id", "owner_domain", "subject", "message", "priority",
+        "requested_by", "created_at", "related_resource_id", "related_plan_id",
+        "related_limit_id", "supersedes_message_id", "superseded_by_message_id",
+        "acceptance_criteria", "request_evidence_ids",
+    )
+    if any(getattr(message, name) != getattr(expected, name) for name in request_fields):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    if message.status == CrewMessageStatus.OPEN:
+        if (
+            message.review_status != CrewReviewStatus.PENDING
+            or message.decision_reason is not None
+            or message.correction_request is not None
+            or message.decision_evidence_ids
+            or message.decided_by is not None
+            or message.decided_at is not None
+        ):
+            raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+        return
+    if (
+        message.status != CrewMessageStatus.ACKNOWLEDGED
+        or message.review_status not in _TERMINAL_REVIEW_STATUSES
+        or not message.decision_reason
+        or not message.decided_at
+    ):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    claim = _exact_audit_event(store, _review_dispatch_claim_id(entry.message_id))
+    if (
+        claim is None
+        or claim.event_type != AuditEventType.QUEUED
+        or claim.owner_domain != entry.owner_domain
+        or claim.subject_id != entry.message_id
+        or claim.risk_level != RiskLevel.HIGH
+        or claim.evidence_ids != entry.evidence_ids
+        or not claim.occurred_at
+        or not claim.summary.startswith(_REVIEW_DISPATCH_CLAIM_SUMMARY)
+    ):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    dispatch_actor = claim.summary.removeprefix(_REVIEW_DISPATCH_CLAIM_SUMMARY)
+    if (
+        not dispatch_actor
+        or len(dispatch_actor) > 256
+        or not dispatch_actor.isascii()
+    ):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    if message.review_status == CrewReviewStatus.APPROVED:
+        evidence_prefix = (*entry.evidence_ids, entry.plan_id)
+        expected_decider = entry.owner_domain.value
+    else:
+        evidence_prefix = ()
+        expected_decider = dispatch_actor
+    if (
+        message.decided_by != expected_decider
+        or tuple(message.decision_evidence_ids[:-1]) != evidence_prefix
+        or len(message.decision_evidence_ids) != len(evidence_prefix) + 1
+    ):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    dispatch_audit_id = message.decision_evidence_ids[-1]
+    dispatch_event = _exact_audit_event(store, dispatch_audit_id)
+    if (
+        dispatch_event is None
+        or dispatch_event.event_type not in {
+            AuditEventType.EXECUTED, AuditEventType.BLOCKED,
+        }
+        or dispatch_event.owner_domain != entry.owner_domain
+        or dispatch_event.subject_id != entry.message_id
+        or dispatch_event.risk_level != RiskLevel.HIGH
+        or dispatch_event.occurred_at != message.decided_at
+    ):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+
+
+def _review_completion_event(
+    entry: ProvisioningReviewOutboxEntry,
+    message: CrewMessage,
+) -> AuditEvent:
+    return AuditEvent(
+        id=_review_dispatch_completion_id(entry.message_id),
+        event_type=AuditEventType.VERIFIED,
+        owner_domain=entry.owner_domain,
+        subject_id=entry.message_id,
+        summary="exact provisioning review dispatch completed",
+        risk_level=RiskLevel.HIGH,
+        evidence_ids=tuple(message.decision_evidence_ids),
+        occurred_at=message.decided_at,
+    )
+
+
+def _review_outbox_state_locked(
+    store: SQLiteStore,
+    entry: ProvisioningReviewOutboxEntry,
+    message: CrewMessage,
+) -> str:
+    completion = _exact_audit_event(
+        store, _review_dispatch_completion_id(entry.message_id),
+    )
+    if completion is None:
+        return "materialized"
+    if message.status != CrewMessageStatus.ACKNOWLEDGED:
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    if completion != _review_completion_event(entry, message):
+        raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+    return "dispatched"
+
+
+def _public_review_outbox_status(
+    entry: ProvisioningReviewOutboxEntry,
+    message: CrewMessage,
+    *,
+    state: str,
+    mutation: bool,
+) -> Mapping[str, object]:
+    return {
+        "ok": True,
+        "outbox_id": entry.id,
+        "outbox_state": state,
+        "message_id": entry.message_id,
+        "message": crew_message_status(message),
+        "mutation_performed": mutation,
+        "host_mutation_performed": False,
+    }
+
+
+def materialize_review_outbox(
+    store_path: str,
+    outbox_id: str,
+) -> Mapping[str, object]:
+    """Atomically materialize one exact immutable outbox entry at most once."""
+    try:
+        with SQLiteStore(store_path) as store:
+            with store.agent_transaction():
+                _bundle, entry = _review_context_locked(store, outbox_id)
+                try:
+                    message = store.load_crew_message(entry.message_id)
+                except KeyError:
+                    now = datetime.now(UTC).replace(microsecond=0).isoformat()
+                    message = _new_review_message(entry, now)
+                    store.save_crew_message(message)
+                    mutation = True
+                else:
+                    mutation = False
+                _verify_review_message_request(store, message, entry)
+                state = _review_outbox_state_locked(store, entry, message)
+            return _public_review_outbox_status(
+                entry, message, state=state, mutation=mutation,
+            )
+    except ProvisioningBundleError:
+        raise
+    except Exception as error:
+        raise ProvisioningBundleError("REVIEW_OUTBOX_INTEGRITY_ERROR") from error
+
+
+def _claim_review_outbox_dispatch(
+    store_path: str,
+    outbox_id: str,
+    dispatched_by: str,
+    dispatched_at: str,
+) -> tuple[ProvisioningReviewOutboxEntry, CrewMessage, bool]:
+    validate_review_outbox_dispatch_request(
+        outbox_id, dispatched_by, dispatched_at,
+    )
+    with SQLiteStore(store_path) as store:
+        with store.agent_transaction():
+            _bundle, entry = _review_context_locked(store, outbox_id)
+            try:
+                message = store.load_crew_message(entry.message_id)
+            except KeyError as error:
+                raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH") from error
+            _verify_review_message_request(store, message, entry)
+            if _review_outbox_state_locked(store, entry, message) == "dispatched":
+                return entry, message, False
+            claim = AuditEvent(
+                id=_review_dispatch_claim_id(entry.message_id),
+                event_type=AuditEventType.QUEUED,
+                owner_domain=entry.owner_domain,
+                subject_id=entry.message_id,
+                summary=f"{_REVIEW_DISPATCH_CLAIM_SUMMARY}{dispatched_by}",
+                risk_level=RiskLevel.HIGH,
+                evidence_ids=entry.evidence_ids,
+                occurred_at=dispatched_at,
+            )
+            existing = _exact_audit_event(store, claim.id)
+            if existing is not None:
+                if (
+                    existing.event_type != claim.event_type
+                    or existing.owner_domain != claim.owner_domain
+                    or existing.subject_id != claim.subject_id
+                    or existing.summary != claim.summary
+                    or existing.risk_level != claim.risk_level
+                    or existing.evidence_ids != claim.evidence_ids
+                    or not existing.occurred_at
+                ):
+                    raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+                return entry, message, False
+            if message.status != CrewMessageStatus.OPEN:
+                raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+            store.save_audit_event(claim)
+            return entry, message, True
+
+
+def _complete_review_outbox_dispatch(
+    store_path: str,
+    outbox_id: str,
+) -> Mapping[str, object]:
+    with SQLiteStore(store_path) as store:
+        with store.agent_transaction():
+            _bundle, entry = _review_context_locked(store, outbox_id)
+            try:
+                message = store.load_crew_message(entry.message_id)
+            except KeyError as error:
+                raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH") from error
+            _verify_review_message_request(store, message, entry)
+            if message.status != CrewMessageStatus.ACKNOWLEDGED:
+                raise ProvisioningBundleError("REVIEW_DISPATCH_NOT_TERMINAL")
+            completion = _review_completion_event(entry, message)
+            existing = _exact_audit_event(store, completion.id)
+            mutation = existing is None
+            if existing is not None and existing != completion:
+                raise ProvisioningBundleError("REVIEW_OUTBOX_MESSAGE_MISMATCH")
+            if mutation:
+                store.save_audit_event(completion)
+        return _public_review_outbox_status(
+            entry, message, state="dispatched", mutation=mutation,
+        )
 
 
 def _public_bundle_status(

@@ -71,6 +71,13 @@ from .documents import (
 )
 from .git import git_status_status
 from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
+from .provisioning_bundle import (
+    ProvisioningBundleError,
+    _claim_review_outbox_dispatch,
+    _complete_review_outbox_dispatch,
+    materialize_review_outbox,
+    validate_review_outbox_dispatch_request,
+)
 from .backup_ops import (
     approve_backup_cleanup_request_status,
     approve_backup_execution_request_status,
@@ -7473,6 +7480,52 @@ def dispatch_crew_messages_status(
         "mutation_performed": bool(results),
         "host_mutation_performed": any(_crew_dispatch_result_mutated_host(result) for result in results),
     }
+
+
+def dispatch_provisioning_review_outbox_status(
+    store_path: str | Path,
+    outbox_id: str,
+    dispatched_by: str,
+    dispatched_at: str | None = None,
+) -> dict[str, object]:
+    """Dispatch only the exact message committed by one provisioning outbox."""
+    now = validate_review_outbox_dispatch_request(
+        outbox_id, dispatched_by, dispatched_at,
+    )
+    materialized = materialize_review_outbox(str(store_path), outbox_id)
+    if materialized["outbox_state"] == "dispatched":
+        return {**materialized, "mutation_performed": False}
+    entry, message, claimed = _claim_review_outbox_dispatch(
+        str(store_path), outbox_id, dispatched_by, now,
+    )
+    if not claimed:
+        refreshed = materialize_review_outbox(str(store_path), outbox_id)
+        if refreshed["outbox_state"] == "dispatched":
+            return {**refreshed, "mutation_performed": False}
+        raise ProvisioningBundleError("REVIEW_DISPATCH_INDETERMINATE")
+    try:
+        result = dispatch_crew_messages_status(
+            store_path,
+            message_id=message.id,
+            dispatched_by=dispatched_by,
+            dispatched_at=now,
+        )
+    except Exception as error:
+        raise ProvisioningBundleError("REVIEW_DISPATCH_UNAVAILABLE") from error
+    if result.get("host_mutation_performed") is not False:
+        raise ProvisioningBundleError("REVIEW_DISPATCH_HOST_MUTATION")
+    items = result.get("items")
+    if (
+        result.get("requested_message_id") != entry.message_id
+        or result.get("processed") != 1
+        or type(items) is not list
+        or len(items) != 1
+        or type(items[0]) is not dict
+        or items[0].get("message_id") != entry.message_id
+    ):
+        raise ProvisioningBundleError("REVIEW_DISPATCH_INDETERMINATE")
+    completed = _complete_review_outbox_dispatch(str(store_path), outbox_id)
+    return {**completed, "mutation_performed": True}
 
 
 def _automatic_crew_review(store_path, message, result, delivery_status, evidence_id: str, decided_by: str, decided_at: str) -> dict[str, object]:

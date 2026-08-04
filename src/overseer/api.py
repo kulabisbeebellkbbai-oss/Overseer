@@ -81,6 +81,7 @@ from .cli import (
     discover_agent_sessions_status,
     dispatch_agent_goal_status,
     dispatch_crew_messages_status,
+    dispatch_provisioning_review_outbox_status,
     decide_crew_message_status,
     dispatch_usage_continuations_status,
     dispatch_host_security_ids_review_package_status,
@@ -251,6 +252,34 @@ from .virtual_ops import (
     virtual_operations_status,
 )
 from .ui import OPERATOR_CONSOLE_HTML
+
+
+def _dispatch_review_outbox_api(
+    store_path: str,
+    payload: dict[str, Any],
+) -> dict[str, object]:
+    allowed = {"outbox_id", "dispatched_by", "dispatched_at"}
+    if (
+        type(payload) is not dict
+        or set(payload) not in (
+            {"outbox_id", "dispatched_by"}, allowed,
+        )
+        or type(payload.get("outbox_id")) is not str
+        or type(payload.get("dispatched_by")) is not str
+        or (
+            "dispatched_at" in payload
+            and type(payload.get("dispatched_at")) is not str
+        )
+    ):
+        raise ProvisioningBundleError(
+            "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+        )
+    return dispatch_provisioning_review_outbox_status(
+        store_path,
+        payload["outbox_id"],
+        payload["dispatched_by"],
+        payload.get("dispatched_at"),
+    )
 
 
 DEFAULT_CODEX_USAGE_DB = Path("/home/god/.local/share/overseer/codex-usage-mcp/state.sqlite3")
@@ -723,11 +752,14 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             if path in {
                 "/backup-provisioning/bundles/preflight",
                 "/backup-provisioning/bundles/stage",
+                "/backup-provisioning/review-outbox/dispatch",
             } and route.query:
                 self._write_bundle_error(
                     "INVALID_BUNDLE_PREFLIGHT_REQUEST"
                     if path.endswith("/preflight")
                     else "INVALID_BUNDLE_STAGE_REQUEST"
+                    if path.endswith("/stage")
+                    else "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST"
                 )
                 return
             if path == "/backup-provisioning/bundles/preflight":
@@ -742,6 +774,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     lambda payload: stage_bundle_api(store_path, payload),
                     "INVALID_BUNDLE_STAGE_REQUEST",
                     "BUNDLE_STAGE_UNAVAILABLE",
+                )
+                return
+            if path == "/backup-provisioning/review-outbox/dispatch":
+                self._handle_bundle_json(
+                    lambda payload: _dispatch_review_outbox_api(store_path, payload),
+                    "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+                    "REVIEW_DISPATCH_UNAVAILABLE",
                 )
                 return
             if path == "/backup-provisioning/stage":
@@ -1308,6 +1347,13 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     "BUNDLE_STAGE_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
                     "BUNDLE_STATUS_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
                     "BUNDLE_INTERNAL_ERROR": HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "REVIEW_OUTBOX_NOT_FOUND": HTTPStatus.NOT_FOUND,
+                    "REVIEW_OUTBOX_INTEGRITY_ERROR": HTTPStatus.CONFLICT,
+                    "REVIEW_OUTBOX_MESSAGE_MISMATCH": HTTPStatus.CONFLICT,
+                    "REVIEW_DISPATCH_NOT_TERMINAL": HTTPStatus.CONFLICT,
+                    "REVIEW_DISPATCH_INDETERMINATE": HTTPStatus.CONFLICT,
+                    "REVIEW_DISPATCH_HOST_MUTATION": HTTPStatus.CONFLICT,
+                    "REVIEW_DISPATCH_UNAVAILABLE": HTTPStatus.SERVICE_UNAVAILABLE,
                 }.get(error_code, HTTPStatus.BAD_REQUEST)
             self._write_json(
                 {
@@ -1360,6 +1406,15 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     "AUTHORITATIVE_REBUILD_MISMATCH",
                     "BUNDLE_PREFLIGHT_UNAVAILABLE",
                     "BUNDLE_STAGE_UNAVAILABLE",
+                    "INVALID_REVIEW_OUTBOX_DISPATCH_REQUEST",
+                    "INVALID_REVIEW_OUTBOX_REQUEST",
+                    "REVIEW_OUTBOX_NOT_FOUND",
+                    "REVIEW_OUTBOX_INTEGRITY_ERROR",
+                    "REVIEW_OUTBOX_MESSAGE_MISMATCH",
+                    "REVIEW_DISPATCH_NOT_TERMINAL",
+                    "REVIEW_DISPATCH_INDETERMINATE",
+                    "REVIEW_DISPATCH_HOST_MUTATION",
+                    "REVIEW_DISPATCH_UNAVAILABLE",
                 }:
                     code = unavailable_code
                 self._write_bundle_error(code)

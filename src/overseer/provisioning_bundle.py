@@ -74,48 +74,113 @@ def _read_current_root_authorization(
 ) -> Mapping[str, object]:
     """Read one current root authorization without opening or changing a store."""
     path = Path(store_path)
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink() or _authority_snapshot_may_be_stale(path):
         raise ValueError("no current exact root authorization exists")
     now = datetime.now(UTC)
     try:
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
         try:
             rows = connection.execute(
-                "SELECT root.payload, approval.payload FROM storage_root_authorizations AS root "
-                "JOIN approvals AS approval ON approval.id = json_extract(root.payload, '$.approval_id')"
+                "SELECT root.id, root.project_id, root.root_id, root.status, root.payload, "
+                "approval.id, approval.subject_id, approval.payload, revocation.authorization_ref "
+                "FROM storage_root_authorizations AS root "
+                "JOIN approvals AS approval ON approval.id = json_extract(root.payload, '$.approval_id') "
+                "LEFT JOIN storage_authorization_revocations AS revocation "
+                "ON revocation.authorization_ref = root.id"
             ).fetchall()
         finally:
             connection.close()
-    except sqlite3.Error as error:
-        raise ValueError("root authorization read is unavailable") from error
-    candidates: list[Mapping[str, object]] = []
+    except sqlite3.Error:
+        raise ValueError("root authorization read is unavailable") from None
+    if _authority_snapshot_may_be_stale(path):
+        raise ValueError("root authorization read is unavailable")
+    candidates: list[tuple[Mapping[str, object], datetime]] = []
     supplied = ("root.register", project_id, root_id, policy_revision, root_identity, alias, status, max_bytes, target_digest)
-    for root_payload, approval_payload in rows:
+    for row in rows:
         try:
-            record = json.loads(root_payload)
-            approval = json.loads(approval_payload)
+            root_row_id, root_project_id, root_root_id, root_status, root_payload, approval_row_id, approval_subject_id, approval_payload, revoked_ref = row
+            record, approved_at, expires_at = _root_authorization_payload(root_payload)
+            approval, decided_at = _approval_payload(approval_payload)
             exact = tuple(record[name] for name in ("action", "project_id", "root_id", "policy_revision", "root_identity", "alias", "status", "max_bytes", "target_digest"))
-            expires_at = datetime.fromisoformat(record["expires_at"])
-            approved_at = datetime.fromisoformat(record["approved_at"])
-            if expires_at.tzinfo is None or approved_at.tzinfo is None:
-                continue
             if (
                 exact == supplied and record.get("authorization_status") == "approved"
-                and not record.get("revoked_at") and approved_at <= now < expires_at
-                and approval.get("id") == record.get("approval_id")
+                and record["revoked_at"] is None and revoked_ref is None and approved_at <= now < expires_at
+                and root_row_id == record["authorization_ref"] and root_project_id == record["project_id"]
+                and root_root_id == record["root_id"] and root_status == record["authorization_status"]
+                and approval_row_id == approval["id"] and approval_subject_id == approval["subject_id"]
+                and approval["id"] == record["approval_id"]
                 and approval.get("subject_id") == record.get("authorization_ref")
                 and approval.get("status") == "approved"
+                and approval["id"] == f"approval.storage.root.{record['authorization_ref']}"
+                and decided_at == approved_at
             ):
-                candidates.append(record)
+                candidates.append((record, approved_at))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
     if not candidates:
         raise ValueError("no current exact root authorization exists")
-    candidates.sort(key=lambda record: (str(record["approved_at"]), str(record["authorization_ref"])), reverse=True)
-    if len(candidates) > 1 and candidates[0]["approved_at"] == candidates[1]["approved_at"]:
+    candidates.sort(key=lambda candidate: (candidate[1], str(candidate[0]["authorization_ref"])), reverse=True)
+    if len(candidates) > 1 and candidates[0][1] == candidates[1][1]:
         raise ValueError("current root authorization is ambiguous")
-    record = candidates[0]
+    record = candidates[0][0]
     return {"ok": True, **record, "mutation_performed": False, "host_mutation_performed": False, "redactions_applied": True}
+
+
+def _authority_snapshot_may_be_stale(path: Path) -> bool:
+    """Immutable snapshots cannot safely incorporate a live SQLite WAL."""
+    return any(path.with_name(path.name + suffix).exists() for suffix in ("-wal", "-shm"))
+
+
+def _aware_utc(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be an aware timestamp")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{label} must be an aware timestamp")
+    return parsed.astimezone(UTC)
+
+
+def _root_authorization_payload(value: object) -> tuple[Mapping[str, object], datetime, datetime]:
+    record = json.loads(value)
+    required = {
+        "authorization_ref", "action", "project_id", "root_id", "policy_revision", "root_identity",
+        "alias", "status", "max_bytes", "target_digest", "approval_id", "approved_at", "expires_at",
+        "authorization_status", "revoked_at",
+    }
+    if not isinstance(record, dict) or set(record) != required:
+        raise ValueError("root authorization payload is not exact")
+    string_fields = required - {"max_bytes", "revoked_at"}
+    if any(not isinstance(record[field], str) or not record[field] or record[field] != record[field].strip() for field in string_fields):
+        raise ValueError("root authorization payload has invalid strings")
+    if record["action"] != "root.register" or record["status"] != "active" or record["authorization_status"] != "approved":
+        raise ValueError("root authorization payload has invalid enums")
+    if not isinstance(record["max_bytes"], int) or isinstance(record["max_bytes"], bool) or record["max_bytes"] < 1:
+        raise ValueError("root authorization payload has invalid maximum")
+    _digest(record["root_identity"], "root authorization identity")
+    _digest(record["target_digest"], "root authorization target")
+    if record["revoked_at"] is not None:
+        raise ValueError("root authorization payload is revoked")
+    return record, _aware_utc(record["approved_at"], "root approval"), _aware_utc(record["expires_at"], "root expiry")
+
+
+def _approval_payload(value: object) -> tuple[Mapping[str, object], datetime]:
+    approval = json.loads(value)
+    required = {
+        "id", "subject_id", "approval_level", "requester_thread", "owner_domain", "reason", "status",
+        "evidence_required", "decided_by", "decided_at",
+    }
+    if not isinstance(approval, dict) or set(approval) != required:
+        raise ValueError("approval payload is not exact")
+    string_fields = required - {"evidence_required"}
+    if any(not isinstance(approval[field], str) or not approval[field] or approval[field] != approval[field].strip() for field in string_fields):
+        raise ValueError("approval payload has invalid strings")
+    if approval["approval_level"] != "human" or approval["owner_domain"] != OwnerDomain.OBRIEN.value or approval["status"] != "approved":
+        raise ValueError("approval payload has invalid enums")
+    evidence = approval["evidence_required"]
+    if not isinstance(evidence, list) or len(evidence) != 2 or not isinstance(evidence[0], str) or not evidence[0].startswith("crew.kira."):
+        raise ValueError("approval payload has invalid evidence")
+    _digest(evidence[1], "approval evidence")
+    return approval, _aware_utc(approval["decided_at"], "approval decision")
 
 
 def _always_true() -> bool:
@@ -647,29 +712,83 @@ def _authoritative_predecessor(
 def _valid_predecessor_contract(predecessor: ProvisioningBundleV1) -> bool:
     """Validate every immutable predecessor binding before chain comparison."""
     try:
-        if predecessor.intent.plan_id != predecessor.plan.plan_id or predecessor.preflight.plan_id != predecessor.plan.plan_id:
+        intent = predecessor.intent
+        report = predecessor.preflight
+        plan = predecessor.plan
+        if parse_provisioning_intent({name: getattr(intent, name) for name in _INTENT_FIELD_ORDER}) != intent:
             return False
-        _validate_plan(predecessor.plan)
-        if tuple(check.code for check in predecessor.preflight.checks) != REQUIRED_PREFLIGHT_CODES:
+        if intent.plan_id != plan.plan_id or report.plan_id != plan.plan_id or report.report_id != f"preflight.{plan.plan_id}":
             return False
-        if not predecessor.preflight.passed or any(check.status != "passed" for check in predecessor.preflight.checks):
+        _validate_plan(plan)
+        if tuple(check.code for check in report.checks) != REQUIRED_PREFLIGHT_CODES:
+            return False
+        if not report.passed or any(check.status != "passed" for check in report.checks):
             return False
         expected_report = canonical_digest({
-            "report_id": predecessor.preflight.report_id, "plan_id": predecessor.preflight.plan_id,
-            "resolved_inputs": predecessor.preflight.resolved_inputs,
-            "checks": [asdict(item) for item in predecessor.preflight.checks],
+            "report_id": report.report_id, "plan_id": report.plan_id,
+            "resolved_inputs": report.resolved_inputs,
+            "checks": [asdict(item) for item in report.checks],
         })
-        if predecessor.preflight.report_digest != expected_report:
+        if report.report_digest != expected_report or not _valid_predecessor_cross_bindings(intent, plan, report):
             return False
-        expected_evidence = (predecessor.plan.plan_digest, predecessor.preflight.report_digest, predecessor.bundle_digest)
+        expected_outbox = _review_outbox(intent, plan, report, predecessor.bundle_digest)
+        expected_evidence = (plan.plan_digest, report.report_digest, predecessor.bundle_digest)
         if (
             tuple((entry.role, entry.owner_domain) for entry in predecessor.outbox) != _REVIEW_OWNERS
-            or any(entry.plan_id != predecessor.plan.plan_id or entry.bundle_digest != predecessor.bundle_digest or entry.evidence_ids != expected_evidence for entry in predecessor.outbox)
+            or any(
+                entry.state not in _OUTBOX_STATES or entry.plan_id != plan.plan_id
+                or entry.bundle_digest != predecessor.bundle_digest or entry.evidence_ids != expected_evidence
+                or _outbox_static_fields(entry) != _outbox_static_fields(expected)
+                for entry, expected in zip(predecessor.outbox, expected_outbox, strict=True)
+            )
         ):
             return False
         return bundle_digest(predecessor) == predecessor.bundle_digest
     except (TypeError, ValueError):
         return False
+
+
+def _valid_predecessor_cross_bindings(
+    intent: ProvisioningIntentV1, plan: DonutHoleBackupProvisioningPlan, report: ProvisioningPreflightReport,
+) -> bool:
+    resolved = report.resolved_inputs
+    required = {
+        "source_commit", "runtime_digest", "capability_digest", "gpg_sha256", "root_identity",
+        "target_digest", "authorization_ref",
+    }
+    if set(resolved) != required:
+        return False
+    source_commit = resolved["source_commit"]
+    runtime_digest = resolved["runtime_digest"]
+    capability_digest = resolved["capability_digest"]
+    gpg_sha256 = resolved["gpg_sha256"]
+    root_identity = resolved["root_identity"]
+    target_digest = resolved["target_digest"]
+    authorization_ref = resolved["authorization_ref"]
+    if (
+        source_commit != intent.source_commit or plan.adapter_commit != intent.source_commit
+        or not _valid_digest(runtime_digest) or runtime_digest != plan.runtime_digest
+        or not _valid_digest(capability_digest) or capability_digest != plan.capability_digest
+        or not _valid_digest(gpg_sha256) or gpg_sha256 != plan.gpg_sha256
+        or not _valid_digest(root_identity) or target_digest != canonical_root_target_digest(root_identity)
+        or not isinstance(authorization_ref, str) or not authorization_ref
+    ):
+        return False
+    expected_refs = {target_digest: authorization_ref}
+    expected_registration = (_canonical_root_registration(intent, resolved),)
+    expected_evidence = {role: f"crew.{owner.value}.review-{intent.plan_id}" for role, owner in _REVIEW_OWNERS}
+    return (
+        dict(plan.root_authorization_refs) == expected_refs
+        and tuple(plan.root_registrations) == expected_registration
+        and dict(plan.evidence_ids) == expected_evidence
+    )
+
+
+def _outbox_static_fields(entry: ProvisioningReviewOutboxEntry) -> tuple[object, ...]:
+    return (
+        entry.id, entry.message_id, entry.plan_id, entry.role, entry.owner_domain,
+        entry.related_resource_id, entry.subject, entry.message, entry.acceptance_criteria,
+    )
 
 
 def build_provisioning_bundle(

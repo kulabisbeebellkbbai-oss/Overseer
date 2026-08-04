@@ -12,16 +12,21 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping
 
 from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS
 from .backup_provisioning import (
     ADAPTER_SOURCE_PATH, GPG_PATH, SOURCE_PATH, DonutHoleBackupProvisioningPlan,
-    ProvisioningStep, build_plan,
+    ProvisioningStep, _validate_plan, build_plan,
 )
+from .backup_host_operations import capability_digest as reviewed_capability_digest
+from .backup_contract import PROVISIONING_CONTRACT_VERSION
 from .core import OwnerDomain
-from .storage_control import current_root_identity, resolve_current_root_authorization
+from .storage_control import current_root_identity
 
 
 INTENT_FIELDS = frozenset({
@@ -61,6 +66,56 @@ _CURSOR_KEY_FILE = "/etc/codex-development-backups/keys/cursor.key"
 
 class ProvisioningBundleError(ValueError):
     """A bounded bundle cannot be built from the authoritative read snapshot."""
+
+
+def _read_current_root_authorization(
+    store_path: str, project_id: str, root_id: str, policy_revision: str,
+    root_identity: str, alias: str, status: str, max_bytes: int, target_digest: str,
+) -> Mapping[str, object]:
+    """Read one current root authorization without opening or changing a store."""
+    path = Path(store_path)
+    if not path.is_file():
+        raise ValueError("no current exact root authorization exists")
+    now = datetime.now(UTC)
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT root.payload, approval.payload FROM storage_root_authorizations AS root "
+                "JOIN approvals AS approval ON approval.id = json_extract(root.payload, '$.approval_id')"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise ValueError("root authorization read is unavailable") from error
+    candidates: list[Mapping[str, object]] = []
+    supplied = ("root.register", project_id, root_id, policy_revision, root_identity, alias, status, max_bytes, target_digest)
+    for root_payload, approval_payload in rows:
+        try:
+            record = json.loads(root_payload)
+            approval = json.loads(approval_payload)
+            exact = tuple(record[name] for name in ("action", "project_id", "root_id", "policy_revision", "root_identity", "alias", "status", "max_bytes", "target_digest"))
+            expires_at = datetime.fromisoformat(record["expires_at"])
+            approved_at = datetime.fromisoformat(record["approved_at"])
+            if expires_at.tzinfo is None or approved_at.tzinfo is None:
+                continue
+            if (
+                exact == supplied and record.get("authorization_status") == "approved"
+                and not record.get("revoked_at") and approved_at <= now < expires_at
+                and approval.get("id") == record.get("approval_id")
+                and approval.get("subject_id") == record.get("authorization_ref")
+                and approval.get("status") == "approved"
+            ):
+                candidates.append(record)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    if not candidates:
+        raise ValueError("no current exact root authorization exists")
+    candidates.sort(key=lambda record: (str(record["approved_at"]), str(record["authorization_ref"])), reverse=True)
+    if len(candidates) > 1 and candidates[0]["approved_at"] == candidates[1]["approved_at"]:
+        raise ValueError("current root authorization is ambiguous")
+    record = candidates[0]
+    return {"ok": True, **record, "mutation_performed": False, "host_mutation_performed": False, "redactions_applied": True}
 
 
 def _always_true() -> bool:
@@ -269,7 +324,7 @@ class PreflightDependencies:
     executable_exists: Callable[[str], bool]
     root_path: str = SOURCE_PATH
     root_identity: Callable[[str], str] = current_root_identity
-    resolve_root_authorization: Callable[..., Mapping[str, object]] = resolve_current_root_authorization
+    resolve_root_authorization: Callable[..., Mapping[str, object]] = _read_current_root_authorization
     canonical_boundaries_valid: Callable[[], bool] = _always_true
     rollback_prerequisites_valid: Callable[[], bool] = _always_true
     predecessor_lookup: Callable[[str], ProvisioningBundleV1 | None] | None = None
@@ -323,7 +378,7 @@ def _check(code: str, passed: bool, evidence: Mapping[str, object], summary: str
 def _safe_read(callback: Callable[..., object], *arguments: object) -> tuple[object | None, bool]:
     try:
         return callback(*arguments), True
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
         return None, False
 
 
@@ -380,7 +435,10 @@ def run_provisioning_preflight(
     intent_valid = type(intent) is ProvisioningIntentV1
     source_match = source_available and _valid_commit(source_head) and source_head == intent.source_commit
     runtime_valid = runtime_available and _valid_digest(runtime)
-    capability_valid = capability_available and _valid_digest(capability)
+    expected_capability = reviewed_capability_digest(
+        intent.source_commit, EXPECTED_BACKUP_TOOL_SCHEMAS, PROVISIONING_CONTRACT_VERSION,
+    )
+    capability_valid = capability_available and _valid_digest(capability) and capability == expected_capability
     gpg_valid = gpg_available and _valid_digest(gpg)
     authority_current = authority_available and bool(authorization_ref)
     dependencies_available = all((
@@ -491,6 +549,9 @@ class ProvisioningBundleV1:
         _digest(self.bundle_digest, "bundle digest")
         if any(entry.bundle_digest != self.bundle_digest for entry in self.outbox):
             raise ValueError("bundle outbox digest must match bundle")
+        expected_evidence = (self.plan.plan_digest, self.preflight.report_digest, self.bundle_digest)
+        if any(entry.evidence_ids != expected_evidence for entry in self.outbox):
+            raise ValueError("bundle outbox evidence must be exact and ordered")
         if self.supersedes_plan_id is not None:
             _nonempty_string(self.supersedes_plan_id, "bundle supersedes plan ID")
         expected_supersedes = self.intent.supersedes_plan_id or None
@@ -540,7 +601,6 @@ def _immutable_inputs(
     plan: DonutHoleBackupProvisioningPlan, report: ProvisioningPreflightReport,
 ) -> Mapping[str, object]:
     return {
-        "plan_digest": plan.plan_digest,
         "gpg_sha256": plan.gpg_sha256,
         "adapter_commit": plan.adapter_commit,
         "runtime_digest": plan.runtime_digest,
@@ -579,9 +639,37 @@ def _authoritative_predecessor(
     tip, tip_available = _safe_read(dependencies.authoritative_chain_tip)
     if not tip_available or tip != intent.supersedes_plan_id:
         raise ProvisioningBundleError("PREDECESSOR_NOT_CURRENT")
-    if predecessor.plan.plan_id != intent.supersedes_plan_id or predecessor.supersedes_plan_id == intent.plan_id:
+    if not _valid_predecessor_contract(predecessor) or predecessor.plan.plan_id != intent.supersedes_plan_id or predecessor.supersedes_plan_id == intent.plan_id:
         raise ProvisioningBundleError("PREDECESSOR_INVALID")
     return predecessor
+
+
+def _valid_predecessor_contract(predecessor: ProvisioningBundleV1) -> bool:
+    """Validate every immutable predecessor binding before chain comparison."""
+    try:
+        if predecessor.intent.plan_id != predecessor.plan.plan_id or predecessor.preflight.plan_id != predecessor.plan.plan_id:
+            return False
+        _validate_plan(predecessor.plan)
+        if tuple(check.code for check in predecessor.preflight.checks) != REQUIRED_PREFLIGHT_CODES:
+            return False
+        if not predecessor.preflight.passed or any(check.status != "passed" for check in predecessor.preflight.checks):
+            return False
+        expected_report = canonical_digest({
+            "report_id": predecessor.preflight.report_id, "plan_id": predecessor.preflight.plan_id,
+            "resolved_inputs": predecessor.preflight.resolved_inputs,
+            "checks": [asdict(item) for item in predecessor.preflight.checks],
+        })
+        if predecessor.preflight.report_digest != expected_report:
+            return False
+        expected_evidence = (predecessor.plan.plan_digest, predecessor.preflight.report_digest, predecessor.bundle_digest)
+        if (
+            tuple((entry.role, entry.owner_domain) for entry in predecessor.outbox) != _REVIEW_OWNERS
+            or any(entry.plan_id != predecessor.plan.plan_id or entry.bundle_digest != predecessor.bundle_digest or entry.evidence_ids != expected_evidence for entry in predecessor.outbox)
+        ):
+            return False
+        return bundle_digest(predecessor) == predecessor.bundle_digest
+    except (TypeError, ValueError):
+        return False
 
 
 def build_provisioning_bundle(
@@ -648,10 +736,7 @@ def canonical_bundle_payload(bundle: ProvisioningBundleV1) -> Mapping[str, objec
                 "subject": entry.subject,
                 "message": entry.message,
                 "acceptance_criteria": entry.acceptance_criteria,
-                "evidence_ids": tuple(
-                    evidence_id for evidence_id in entry.evidence_ids
-                    if evidence_id != entry.bundle_digest
-                ),
+                "evidence_ids": entry.evidence_ids[:2],
             }
             for entry in bundle.outbox
         ),

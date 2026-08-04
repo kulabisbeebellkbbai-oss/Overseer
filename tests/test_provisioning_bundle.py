@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import sqlite3
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ from types import MappingProxyType
 import pytest
 
 from overseer.backup_provisioning import build_plan
+from overseer.backup_host_operations import capability_digest as reviewed_capability_digest
 from overseer.core import OwnerDomain, RiskLevel
 from overseer.crew import CrewMessage, CrewMessageStatus, CrewReviewStatus
 from overseer.provisioning_bundle import (
@@ -112,6 +114,9 @@ def report_fixture(plan_id: str = "backup-provision.donuthole.v20.20260802") -> 
 def outbox_fixture(
     *,
     plan_id: str = "backup-provision.donuthole.v20.20260802",
+    plan_digest: str = "sha256:" + "a" * 64,
+    report_digest: str = "sha256:" + "b" * 64,
+    bundle_digest: str = "sha256:" + "0" * 64,
     outbox_state: str = "pending",
 ) -> tuple[ProvisioningReviewOutboxEntry, ...]:
     roles = (
@@ -125,14 +130,14 @@ def outbox_fixture(
             id=f"outbox.{plan_id}.{role}",
             message_id=f"crew.{owner.value}.review-{plan_id}",
             plan_id=plan_id,
-            bundle_digest="sha256:" + "0" * 64,
+            bundle_digest=bundle_digest,
             role=role,
             owner_domain=owner,
             related_resource_id="storage.donuthole",
             subject="Review exact DonutHole provisioning bundle",
             message="Review the immutable plan and preflight evidence only.",
             acceptance_criteria=("Review the exact immutable evidence.",),
-            evidence_ids=("sha256:" + "2" * 64,),
+            evidence_ids=(plan_digest, report_digest, bundle_digest),
             state=outbox_state,
         )
         for role, owner in roles
@@ -141,13 +146,16 @@ def outbox_fixture(
 
 def bundle_fixture(*, outbox_state: str = "pending") -> ProvisioningBundleV1:
     intent = intent_fixture()
+    plan = plan_fixture(intent.plan_id)
+    report = report_fixture(intent.plan_id)
+    digest = "sha256:" + "0" * 64
     return ProvisioningBundleV1(
         schema_version="1",
         intent=intent,
-        plan=plan_fixture(intent.plan_id),
-        preflight=report_fixture(intent.plan_id),
-        outbox=outbox_fixture(plan_id=intent.plan_id, outbox_state=outbox_state),
-        bundle_digest="sha256:" + "0" * 64,
+        plan=plan,
+        preflight=report,
+        outbox=outbox_fixture(plan_id=intent.plan_id, plan_digest=plan.plan_digest, report_digest=report.report_digest, bundle_digest=digest, outbox_state=outbox_state),
+        bundle_digest=digest,
         supersedes_plan_id=None,
         changed_immutable_inputs=(),
     )
@@ -184,7 +192,7 @@ def deterministic_dependencies(
         source_path="/home/god/Documents/Codex Workspace/TheUnderdark",
         source_head=lambda _path: source_head,
         runtime_digest=lambda _path, _commit: "sha256:" + "d" * 64,
-        capability_digest=lambda _commit, _schemas: "sha256:" + "c" * 64,
+        capability_digest=lambda commit, schemas: reviewed_capability_digest(commit, schemas, "1"),
         file_digest=lambda _path: "sha256:" + "a" * 64,
         executable_exists=lambda _path: executable_available,
         root_identity=lambda _path: root_identity,
@@ -210,6 +218,24 @@ def test_preflight_resolves_authoritative_inputs_without_mutation(tmp_path):
     assert [check.code for check in report.checks] == list(REQUIRED_PREFLIGHT_CODES)
     assert report.resolved_inputs["authorization_ref"] == "root-auth.current"
     assert Path(store_path).read_bytes() == before
+
+
+def test_default_authority_resolution_is_read_only_for_absent_and_existing_stores(tmp_path):
+    absent = tmp_path / "absent.sqlite3"
+    absent_report = run_provisioning_preflight(str(absent), intent_fixture(), deterministic_dependencies())
+
+    assert absent.exists() is False
+    assert list(tmp_path.glob("absent.sqlite3*")) == []
+    assert next(check for check in absent_report.checks if check.code == "ROOT_AUTHORIZATION_CURRENT").status == "failed"
+
+    store_path = Path(seeded_authority_store(tmp_path))
+    observed = lambda: sorted((path.name, path.read_bytes()) for path in tmp_path.glob("state.sqlite3*"))
+    before = (store_path.stat().st_ino, store_path.stat().st_mode, store_path.stat().st_mtime_ns, store_path.stat().st_ctime_ns, store_path.read_bytes(), observed())
+    report = run_provisioning_preflight(str(store_path), intent_fixture(), deterministic_dependencies())
+    after = (store_path.stat().st_ino, store_path.stat().st_mode, store_path.stat().st_mtime_ns, store_path.stat().st_ctime_ns, store_path.read_bytes(), observed())
+
+    assert report.passed is True
+    assert after == before
 
 
 def test_preflight_fails_closed_on_changed_source_or_authority(tmp_path):
@@ -255,6 +281,19 @@ def test_preflight_redacts_unavailable_dependency_exceptions(tmp_path):
     assert Path(store_path).read_bytes() == before
 
 
+def test_preflight_redacts_sqlite_dependency_errors_and_returns_all_checks(tmp_path):
+    dependencies = replace(
+        deterministic_dependencies(),
+        runtime_digest=lambda _path, _commit: (_ for _ in ()).throw(sqlite3.OperationalError("private sqlite failure")),
+    )
+
+    report = run_provisioning_preflight(str(tmp_path / "absent.sqlite3"), intent_fixture(), dependencies)
+
+    assert [check.code for check in report.checks] == list(REQUIRED_PREFLIGHT_CODES)
+    assert next(check for check in report.checks if check.code == "RUNTIME_DIGEST_VALID").status == "failed"
+    assert "private sqlite failure" not in repr(report)
+
+
 @pytest.mark.parametrize(
     ("dependencies", "code"),
     (
@@ -272,6 +311,27 @@ def test_preflight_returns_all_stable_checks_when_a_prerequisite_fails(tmp_path,
     assert [check.code for check in report.checks] == list(REQUIRED_PREFLIGHT_CODES)
     assert next(check for check in report.checks if check.code == code).status == "failed"
     assert Path(store_path).read_bytes() == before
+
+
+def test_preflight_requires_the_reviewed_capability_digest(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    dependencies = replace(
+        deterministic_dependencies(), capability_digest=lambda _commit, _schemas: "sha256:" + "f" * 64,
+    )
+
+    report = run_provisioning_preflight(store_path, intent_fixture(), dependencies)
+
+    assert next(check for check in report.checks if check.code == "CAPABILITY_DIGEST_VALID").status == "failed"
+
+
+def test_built_bundle_preflight_capability_digest_matches_its_plan(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    expected = reviewed_capability_digest("b" * 40, __import__("overseer.backup_host_operations", fromlist=["EXPECTED_BACKUP_TOOL_SCHEMAS"]).EXPECTED_BACKUP_TOOL_SCHEMAS, "1")
+    dependencies = replace(deterministic_dependencies(), capability_digest=lambda _commit, _schemas: expected)
+
+    bundle = build_provisioning_bundle(store_path, intent_fixture(), dependencies)
+
+    assert bundle.preflight.resolved_inputs["capability_digest"] == bundle.plan.capability_digest == expected
 
 
 def test_authoritative_bundle_is_deterministic_and_does_not_mutate_store(tmp_path):
@@ -316,6 +376,29 @@ def test_bundle_rejects_missing_non_tip_and_superseded_predecessors_without_muta
     assert Path(store_path).read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        lambda bundle: (object.__setattr__(bundle, "bundle_digest", "sha256:" + "f" * 64), bundle)[1],
+        lambda bundle: (object.__setattr__(bundle.plan, "plan_digest", "sha256:" + "f" * 64), bundle)[1],
+        lambda bundle: (object.__setattr__(bundle.preflight, "report_digest", "sha256:" + "f" * 64), bundle)[1],
+        lambda bundle: (object.__setattr__(bundle.outbox[0], "evidence_ids", (bundle.plan.plan_digest, bundle.preflight.report_digest, "sha256:" + "f" * 64)), bundle)[1],
+    ),
+    ids=("bundle-digest", "plan-digest", "preflight-digest", "review-evidence"),
+)
+def test_successor_rejects_a_tampered_predecessor_contract(tmp_path, tamper):
+    store_path = seeded_authority_store(tmp_path)
+    predecessor = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    successor = intent_fixture(plan_id="backup-provision.donuthole.v21.20260802", supersedes_plan_id=predecessor.plan.plan_id)
+
+    with pytest.raises(ProvisioningBundleError, match="PREDECESSOR_INVALID"):
+        build_provisioning_bundle(
+            store_path,
+            successor,
+            replace(deterministic_dependencies(), predecessor_lookup=lambda _id: tamper(predecessor), authoritative_chain_tip=lambda: predecessor.plan.plan_id),
+        )
+
+
 def test_changed_immutable_inputs_are_sorted_and_limited_to_immutable_values(tmp_path):
     store_path = seeded_authority_store(tmp_path)
     previous = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
@@ -327,6 +410,24 @@ def test_changed_immutable_inputs_are_sorted_and_limited_to_immutable_values(tmp
 
     assert changed_immutable_inputs(previous, changed_plan, changed_report) == (
         "gpg_sha256", "resolved_preflight",
+    )
+
+
+def test_changed_immutable_inputs_ignore_derived_successor_plan_identity_but_detect_authority_changes(tmp_path):
+    store_path = seeded_authority_store(tmp_path)
+    previous = build_provisioning_bundle(store_path, intent_fixture(), deterministic_dependencies())
+    successor = build_provisioning_bundle(
+        store_path,
+        intent_fixture(plan_id="backup-provision.donuthole.v21.20260802", supersedes_plan_id=previous.plan.plan_id),
+        replace(deterministic_dependencies(), predecessor_lookup=lambda _id: previous, authoritative_chain_tip=lambda: previous.plan.plan_id),
+    )
+
+    assert successor.changed_immutable_inputs == ()
+    changed_plan = replace(successor.plan, gpg_sha256="sha256:" + "f" * 64, runtime_digest="sha256:" + "e" * 64, capability_digest="sha256:" + "d" * 64)
+    changed_report = replace(successor.preflight, resolved_inputs={**successor.preflight.resolved_inputs, "root_identity": "sha256:" + "f" * 64})
+
+    assert changed_immutable_inputs(previous, changed_plan, changed_report) == (
+        "capability_digest", "gpg_sha256", "resolved_preflight", "runtime_digest",
     )
 
 
@@ -413,10 +514,10 @@ def test_bundle_digest_binds_immutable_outbox_evidence_and_all_immutable_fields(
         first.plan,
         first.preflight,
         tuple(
-            entry if index else ProvisioningReviewOutboxEntry(
-                entry.id, entry.message_id, entry.plan_id, entry.bundle_digest, entry.role,
-                entry.owner_domain, entry.related_resource_id, entry.subject, entry.message,
-                entry.acceptance_criteria, ("sha256:" + "f" * 64,), entry.state,
+                entry if index else ProvisioningReviewOutboxEntry(
+                    entry.id, entry.message_id, entry.plan_id, entry.bundle_digest, entry.role,
+                    entry.owner_domain, entry.related_resource_id, entry.subject, entry.message,
+                    ("Review a different exact immutable evidence set.",), entry.evidence_ids, entry.state,
             )
             for index, entry in enumerate(first.outbox)
         ),
@@ -428,6 +529,27 @@ def test_bundle_digest_binds_immutable_outbox_evidence_and_all_immutable_fields(
     assert bundle_digest(first) != bundle_digest(changed)
 
 
+@pytest.mark.parametrize(
+    "evidence_ids",
+    (
+        lambda bundle: (bundle.plan.plan_digest, bundle.preflight.report_digest),
+        lambda bundle: (bundle.plan.plan_digest, bundle.preflight.report_digest, bundle.bundle_digest, "sha256:" + "f" * 64),
+        lambda bundle: (bundle.preflight.report_digest, bundle.plan.plan_digest, bundle.bundle_digest),
+        lambda bundle: (bundle.plan.plan_digest, "sha256:" + "f" * 64, bundle.bundle_digest),
+    ),
+    ids=("missing", "extra", "reordered", "unrelated"),
+)
+def test_bundle_rejects_non_exact_outbox_evidence(evidence_ids):
+    bundle = bundle_fixture()
+    outbox = tuple(replace(entry, evidence_ids=evidence_ids(bundle)) for entry in bundle.outbox)
+
+    with pytest.raises(ValueError, match="outbox evidence"):
+        ProvisioningBundleV1(
+            bundle.schema_version, bundle.intent, bundle.plan, bundle.preflight, outbox,
+            bundle.bundle_digest, bundle.supersedes_plan_id, bundle.changed_immutable_inputs,
+        )
+
+
 def test_bundle_digest_converges_after_outbox_entries_receive_its_derived_value():
     provisional = bundle_fixture()
     digest = bundle_digest(provisional)
@@ -435,7 +557,7 @@ def test_bundle_digest_converges_after_outbox_entries_receive_its_derived_value(
         ProvisioningReviewOutboxEntry(
             entry.id, entry.message_id, entry.plan_id, digest, entry.role,
             entry.owner_domain, entry.related_resource_id, entry.subject, entry.message,
-            entry.acceptance_criteria, entry.evidence_ids, entry.state,
+            entry.acceptance_criteria, (entry.evidence_ids[0], entry.evidence_ids[1], digest), entry.state,
         )
         for entry in provisional.outbox
     )
@@ -450,11 +572,13 @@ def test_bundle_digest_converges_after_outbox_entries_receive_its_derived_value(
 def test_bundle_snapshots_nested_plan_mappings_against_external_mutation():
     intent = intent_fixture()
     plan = plan_fixture(intent.plan_id)
+    report = report_fixture(intent.plan_id)
+    digest = "sha256:" + "0" * 64
     original_evidence = plan.evidence_ids
     original_arguments = plan.steps[0].arguments
     bundle = ProvisioningBundleV1(
-        "1", intent, plan, report_fixture(intent.plan_id),
-        outbox_fixture(plan_id=intent.plan_id), "sha256:" + "0" * 64, None, (),
+        "1", intent, plan, report,
+        outbox_fixture(plan_id=intent.plan_id, plan_digest=plan.plan_digest, report_digest=report.report_digest, bundle_digest=digest), digest, None, (),
     )
     original_digest = bundle_digest(bundle)
 
@@ -490,9 +614,11 @@ def test_bundle_snapshots_every_tuple_annotated_plan_field_against_caller_mutati
 
     for field in ("root_registrations", "steps", "rollback_steps", "read_only_paths", "read_write_paths"):
         caller_values = list(getattr(original_plan, field))
+        report = report_fixture(intent.plan_id)
+        digest = "sha256:" + "0" * 64
         bundle = ProvisioningBundleV1(
-            "1", intent, replace(original_plan, **{field: caller_values}), report_fixture(intent.plan_id),
-            outbox_fixture(plan_id=intent.plan_id), "sha256:" + "0" * 64, None, (),
+            "1", intent, replace(original_plan, **{field: caller_values}), report,
+            outbox_fixture(plan_id=intent.plan_id, plan_digest=original_plan.plan_digest, report_digest=report.report_digest, bundle_digest=digest), digest, None, (),
         )
         original_digest = bundle_digest(bundle)
 

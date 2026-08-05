@@ -985,6 +985,167 @@ def test_execute_plan_loser_serializes_its_captured_in_progress_snapshot(tmp_pat
     assert results["loser"]["host_mutation_uncertain"] is False
 
 
+def test_execute_plan_loser_uses_one_snapshot_across_winner_finalize_race(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+    import overseer.backup_provisioning as provisioning
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    winner_started = threading.Event()
+    release_winner = threading.Event()
+    loser_snapshot_loaded = threading.Event()
+    winner_finished = threading.Event()
+    winner_adapter = BlockingAdapter(winner_started, release_winner)
+    loser_adapter = RecordingAdapter()
+    results: dict[str, object] = {}
+    captured: dict[str, object] = {}
+    original_snapshot = execution._load_execution_snapshot
+    original_public = provisioning._typed_execution_public
+    loser_snapshot_calls = 0
+
+    def observe_snapshot(store, header, **kwargs):
+        nonlocal loser_snapshot_calls
+        if threading.current_thread().name == "loser":
+            loser_snapshot_calls += 1
+        if threading.current_thread().name == "loser" and loser_snapshot_calls == 2:
+            def after_checkpoints() -> None:
+                loser_snapshot_loaded.set()
+                release_winner.set()
+
+            snapshot = original_snapshot(store, header, after_checkpoints=after_checkpoints)
+            captured["loser_snapshot"] = (header, snapshot)
+            return snapshot
+        return original_snapshot(store, header, **kwargs)
+
+    def observe_public(plan_arg, view, checkpoints, **kwargs):
+        if threading.current_thread().name == "loser":
+            captured["public"] = (plan_arg, view, checkpoints, kwargs["header"])
+            assert winner_finished.wait(timeout=10)
+        return original_public(plan_arg, view, checkpoints, **kwargs)
+
+    monkeypatch.setattr(execution, "_load_execution_snapshot", observe_snapshot)
+    monkeypatch.setattr(provisioning, "_typed_execution_public", observe_public)
+
+    def run_winner() -> None:
+        results["winner"] = execute_plan(store_path, plan.plan_id, winner_adapter, acceptance_runner=Runner())
+        winner_finished.set()
+
+    def run_loser() -> None:
+        results["loser"] = execute_plan(store_path, plan.plan_id, loser_adapter, acceptance_runner=Runner())
+
+    winner = threading.Thread(target=run_winner, name="winner")
+    loser = threading.Thread(target=run_loser, name="loser")
+    winner.start()
+    assert winner_started.wait(timeout=10)
+    loser.start()
+    assert loser_snapshot_loaded.wait(timeout=10)
+    winner.join(timeout=10)
+    loser.join(timeout=10)
+
+    assert not winner.is_alive()
+    assert not loser.is_alive()
+    assert loser_adapter.calls == []
+    assert results["winner"]["status"] == "executed"
+    assert results["loser"]["status"] == "in_progress"
+    assert results["loser"]["mutation_performed"] is False
+    assert results["loser"]["host_mutation_performed"] is False
+    assert results["loser"]["host_mutation_uncertain"] is False
+
+    snapshot_header, (snapshot_checkpoints, snapshot_plan) = captured["loser_snapshot"]
+    public_plan, public_view, public_checkpoints, public_header = captured["public"]
+    assert public_header == snapshot_header
+    assert public_plan == snapshot_plan
+    assert public_checkpoints == snapshot_checkpoints
+    assert public_view == execution.derive_backup_execution_view(snapshot_header, snapshot_checkpoints)
+    assert snapshot_checkpoints[-1].event is CheckpointEvent.STEP_STARTED
+
+
+def test_execute_plan_preserves_mutation_when_later_claim_is_contended(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+    import overseer.backup_provisioning as provisioning
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    a_completed = threading.Event()
+    b_claimed = threading.Event()
+    release_a = threading.Event()
+    b_started = threading.Event()
+    release_b = threading.Event()
+    a_finished = threading.Event()
+    a_adapter = RecordingAdapter()
+    b_adapter = BlockingAdapter(b_started, release_b)
+    results: dict[str, object] = {}
+    captured: dict[str, object] = {}
+    original_append = execution._append
+    original_claim = execution._claim_forward
+    original_public = provisioning._typed_execution_public
+
+    def observe_append(store, header, ordinal, identity, event, when, **kwargs):
+        result = original_append(store, header, ordinal, identity, event, when, **kwargs)
+        if (
+            threading.current_thread().name == "caller-a"
+            and event is CheckpointEvent.STEP_COMPLETED
+            and identity.forward.operation == "install_runtime"
+        ):
+            captured["a_completed_checkpoint"] = store.load_backup_execution_checkpoints(header.execution_id)[-1]
+            a_completed.set()
+            assert b_claimed.wait(timeout=10)
+            assert release_a.wait(timeout=10)
+        return result
+
+    def observe_claim(store, header, identity, when):
+        claimed = original_claim(store, header, identity, when)
+        if threading.current_thread().name == "caller-b" and claimed:
+            if identity.forward.operation != "install_runtime":
+                captured["b_claimed_checkpoint"] = store.load_backup_execution_checkpoints(header.execution_id)[-1]
+                b_claimed.set()
+        return claimed
+
+    def observe_public(plan_arg, view, checkpoints, **kwargs):
+        if threading.current_thread().name == "caller-a":
+            captured["a_public"] = (plan_arg, view, checkpoints, kwargs["invocation_checkpoints"])
+        return original_public(plan_arg, view, checkpoints, **kwargs)
+
+    monkeypatch.setattr(execution, "_append", observe_append)
+    monkeypatch.setattr(execution, "_claim_forward", observe_claim)
+    monkeypatch.setattr(provisioning, "_typed_execution_public", observe_public)
+
+    def run_a() -> None:
+        results["a"] = execute_plan(store_path, plan.plan_id, a_adapter, acceptance_runner=Runner())
+        a_finished.set()
+
+    def run_b() -> None:
+        results["b"] = execute_plan(store_path, plan.plan_id, b_adapter, acceptance_runner=Runner())
+
+    thread_a = threading.Thread(target=run_a, name="caller-a")
+    thread_b = threading.Thread(target=run_b, name="caller-b")
+    thread_a.start()
+    assert a_completed.wait(timeout=10)
+    thread_b.start()
+    assert b_claimed.wait(timeout=10)
+    assert b_started.wait(timeout=10)
+    release_a.set()
+    assert a_finished.wait(timeout=10)
+
+    assert a_adapter.calls.count(next(step for step in plan.steps if step.operation == "install_runtime")) == 1
+    assert results["a"]["status"] == "in_progress"
+    assert results["a"]["mutation_performed"] is True
+    assert results["a"]["host_mutation_performed"] is True
+    assert results["a"]["host_mutation_uncertain"] is False
+    a_plan, a_view, a_checkpoints, a_invocation_checkpoints = captured["a_public"]
+    assert a_plan.plan_id == plan.plan_id
+    assert a_view.status == "in_progress"
+    assert captured["a_completed_checkpoint"] in a_invocation_checkpoints
+    assert captured["b_claimed_checkpoint"] in a_checkpoints
+    assert captured["b_claimed_checkpoint"] not in a_invocation_checkpoints
+    assert all(item.checkpoint_id != captured["b_claimed_checkpoint"].checkpoint_id for item in a_invocation_checkpoints)
+
+    release_b.set()
+    thread_a.join(timeout=10)
+    thread_b.join(timeout=10)
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert b_adapter.calls.count(next(step for step in plan.steps if step.operation == "install_runtime")) == 0
+
+
 def test_paused_prefix_continuations_serialize_their_own_invocation_snapshots(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
 

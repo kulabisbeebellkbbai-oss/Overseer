@@ -1053,7 +1053,17 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                 if pending_claim:
                     pending_claim = False
                 else:
-                    if not _claim_forward(store, header, identity, when):
+                    try:
+                        claimed = _claim_forward(store, header, identity, when)
+                    except ValueError as error:
+                        # This invocation may have completed changed work before
+                        # another caller claimed the next operation. Preserve its
+                        # own checkpoints and mutation accounting; only a caller
+                        # with no writes is a pure EXECUTION_IN_PROGRESS loser.
+                        if str(error) != "EXECUTION_IN_PROGRESS" or not store._backup_execution_invocation_checkpoint_ids:
+                            raise
+                        return finish()
+                    if not claimed:
                         _rollback(store, header, when, len(store.load_backup_execution_checkpoints(header.execution_id)), adapter)
                         return finish()
                     ordinal += 1

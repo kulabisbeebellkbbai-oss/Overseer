@@ -19,7 +19,7 @@ from overseer.backup_execution import (
     continue_execution,
     start_execution,
 )
-from overseer.backup_provisioning import ProvisioningStep, approve_plan
+from overseer.backup_provisioning import ProvisioningStatus, ProvisioningStep, _dump, _stored, approve_plan
 from overseer.crew import CrewReviewStatus
 from overseer.store import SQLiteStore
 from tests.test_backup_provisioning import _typed_bundle_with_reviews
@@ -626,6 +626,39 @@ def test_paused_verified_noop_prefix_authority_drift_fails_closed_without_rollba
     with pytest.raises(ValueError):
         continue_execution(store_path, paused.execution_id, adapter, Runner())
     assert len(adapter.calls) == before
+
+
+@pytest.mark.parametrize("entrypoint", ["start", "continue"])
+def test_paused_prefix_with_executed_source_projection_fails_closed(tmp_path: Path, entrypoint: str) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    paused = start_execution(store_path, plan.plan_id, adapter, None)
+    before_calls = list(adapter.calls)
+    with SQLiteStore(store_path) as store:
+        current = _stored(store, plan.plan_id)
+        tampered = replace(
+            current,
+            status=ProvisioningStatus.EXECUTED,
+            executed_at="2026-08-05T12:00:00+00:00",
+            evidence_digest="sha256:" + "e" * 64,
+        )
+        store._connection.execute(
+            "UPDATE backup_provisioning_plans SET payload=? WHERE id=?",
+            (_dump(tampered), plan.plan_id),
+        )
+        store._connection.commit()
+        before_checkpoints = store.load_backup_execution_checkpoints(paused.execution_id)
+    with pytest.raises(ValueError, match="terminal execution"):
+        if entrypoint == "start":
+            start_execution(store_path, plan.plan_id, adapter, Runner())
+        else:
+            continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert adapter.calls == before_calls
+    with SQLiteStore(store_path) as store:
+        after_checkpoints = store.load_backup_execution_checkpoints(paused.execution_id)
+    assert after_checkpoints == before_checkpoints
+    assert all(item.event is not CheckpointEvent.EXECUTION_ABORTED for item in after_checkpoints)
+    assert all(item.event not in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED) for item in after_checkpoints)
 
 
 def test_authority_and_bundle_drift_reject_continuation_before_adapter(tmp_path: Path) -> None:

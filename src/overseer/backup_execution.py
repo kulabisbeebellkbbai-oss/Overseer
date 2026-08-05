@@ -847,6 +847,19 @@ def _verify_immutable_cleanup_identity(store, header: ProvisioningExecutionHeade
     verify_backup_execution_chain(header, chain)
 
 
+def _bound_source_is_executed(store, plan_id: str) -> bool:
+    from . import provisioning_bundle
+    from .roadex_approval_status import load_exact_bound_source
+
+    try:
+        bundle = provisioning_bundle.load_provisioning_bundle(store, plan_id)
+        binding = store.load_roadex_approval_binding(provisioning_bundle.binding_draft_for_bundle(bundle).approval_ref)
+        source = load_exact_bound_source(store, binding)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return getattr(getattr(source, "status", None), "value", None) == "executed"
+
+
 def _abort_paused_forward_on_authority_loss(store, header: ProvisioningExecutionHeader, when: str) -> bool:
     """Durably stop a paused mutable prefix when forward authority has drifted."""
     with store.agent_transaction():
@@ -857,6 +870,8 @@ def _abort_paused_forward_on_authority_loss(store, header: ProvisioningExecution
             if _make_header(bundle, binding, source, header.created_at) != header:
                 raise ValueError("stored execution header does not match current authority")
         except ValueError as authority_error:
+            if _bound_source_is_executed(store, header.plan_id):
+                raise ValueError("executed approval is not bound to a terminal execution") from authority_error
             _verify_immutable_cleanup_identity(store, header, chain)
             expected_steps = [step for phase in header.phases for step in phase.steps]
             completed = [item for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
@@ -1049,6 +1064,7 @@ def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, n
         else:
             chain = store.load_backup_execution_checkpoints(header.execution_id)
             verify_backup_execution_chain(header, chain)
+            source = None
             if _chain_requires_cleanup(chain):
                 _verify_immutable_cleanup_identity(store, header, chain)
             else:

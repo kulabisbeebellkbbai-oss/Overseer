@@ -1413,7 +1413,20 @@ def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requ
             )
             if updated.rowcount != 1:
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
-            return int(claim["claim_epoch"]) + 1, owner_lock
+            acquired_epoch = int(claim["claim_epoch"]) + 1
+            persisted = _load_rollback_claim(store, header.execution_id)
+            if (
+                persisted is None
+                or persisted["execution_id"] != header.execution_id
+                or persisted["plan_step_ordinal"] != requested.plan_step_ordinal
+                or persisted["step_digest"] != requested.rollback.step_digest
+                or persisted["owner_id"] != owner_id
+                or persisted["claimed_at"] != claim_now
+                or persisted["lease_expires_at"] != claim_expires
+                or persisted["claim_epoch"] != acquired_epoch
+            ):
+                raise ValueError("rollback claim takeover read-back mismatch")
+            return acquired_epoch, owner_lock
         if claim is not None:
             claim_completed = any(
                 item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)
@@ -1434,11 +1447,25 @@ def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requ
         except _RollbackOwnerSocketCollision as error:
             raise ValueError("rollback owner socket collision without an exact active claim") from error
         owner_lock_holder[0] = owner_lock
-        store._connection.execute(
+        inserted = store._connection.execute(
             "INSERT INTO backup_provisioning_execution_rollback_claims "
             "(execution_id, plan_step_ordinal, step_digest, owner_id, claimed_at, lease_expires_at, claim_epoch) VALUES (?, ?, ?, ?, ?, ?, 1)",
             (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id, claim_now, claim_expires),
         )
+        if inserted.rowcount != 1:
+            raise ValueError("rollback claim insert rowcount is invalid")
+        persisted = _load_rollback_claim(store, header.execution_id)
+        if (
+            persisted is None
+            or persisted["execution_id"] != header.execution_id
+            or persisted["plan_step_ordinal"] != requested.plan_step_ordinal
+            or persisted["step_digest"] != requested.rollback.step_digest
+            or persisted["owner_id"] != owner_id
+            or persisted["claimed_at"] != claim_now
+            or persisted["lease_expires_at"] != claim_expires
+            or persisted["claim_epoch"] != 1
+        ):
+            raise ValueError("rollback claim insert read-back mismatch")
         try:
             _append(store, header, len(chain), requested, CheckpointEvent.ROLLBACK_STARTED, when, rollback=True)
         except BaseException as error:

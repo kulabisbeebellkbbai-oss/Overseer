@@ -644,6 +644,19 @@ def test_rollback_claim_schema_corruption_is_rejected_on_reopen(tmp_path) -> Non
         OverseerStore(path)
 
 
+@pytest.mark.parametrize("trigger_sql", [
+    "CREATE TRIGGER rollback_claim_ignore BEFORE INSERT ON backup_provisioning_execution_rollback_claims BEGIN SELECT RAISE(IGNORE); END",
+    "CREATE TRIGGER rollback_claim_rewrite AFTER INSERT ON backup_provisioning_execution_rollback_claims BEGIN UPDATE backup_provisioning_execution_rollback_claims SET owner_id='rewritten' WHERE execution_id=NEW.execution_id; END",
+])
+def test_rollback_claim_arbitrary_triggers_are_rejected_on_reopen(tmp_path, trigger_sql) -> None:
+    path = tmp_path / "rollback-claim-trigger.sqlite3"
+    with OverseerStore(path) as store:
+        store._connection.execute(trigger_sql)
+        store._connection.commit()
+    with pytest.raises(ValueError, match="rollback claims|malformed backup execution"):
+        OverseerStore(path)
+
+
 def test_preclaims_v5_database_migrates_claims_table_without_mutating_immutable_rows(tmp_path) -> None:
     path = tmp_path / "preclaims-v5.sqlite3"
     header = _header()

@@ -414,6 +414,95 @@ def test_interrupted_durable_rollback_claim_is_replayed_after_lease_expiry(tmp_p
     assert [step.operation for step in adapter.calls] == [step.operation for step in plan.rollback_steps]
 
 
+def test_rollback_claim_insert_requires_exact_readback(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    original_load = execution._load_rollback_claim
+    calls = {"value": 0}
+
+    def tamper_readback(store, execution_id):
+        calls["value"] += 1
+        row = original_load(store, execution_id)
+        if calls["value"] >= 2 and row is not None:
+            tampered = {key: row[key] for key in row.keys()}
+            tampered["owner_id"] = "rewritten-owner"
+            return tampered
+        return row
+
+    monkeypatch.setattr(execution, "_load_rollback_claim", tamper_readback)
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError, match="insert read-back mismatch"):
+        start_execution(store_path, plan.plan_id, adapter, Runner(wrong_runtime=True))
+    assert not any(step.operation in {item.operation for item in plan.rollback_steps} for step in adapter.calls)
+    with SQLiteStore(store_path) as store:
+        execution_id = store.load_backup_execution_header_for_plan(plan.plan_id).execution_id
+        checkpoints = store.load_backup_execution_checkpoints(execution_id)
+        assert all(item.event is not CheckpointEvent.ROLLBACK_STARTED for item in checkpoints)
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
+            (execution_id,),
+        ).fetchone()[0] == 0
+
+
+def test_rollback_claim_takeover_requires_exact_readback(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    claim_clock = datetime.fromisoformat(execution_time)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: claim_clock.isoformat())
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("seed exact claim for readback")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="seed exact claim for readback"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+
+    expired_clock = claim_clock + timedelta(seconds=61)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: expired_clock.isoformat())
+    original_load = execution._load_rollback_claim
+    calls = {"value": 0}
+
+    def tamper_takeover_readback(store, execution_id):
+        calls["value"] += 1
+        row = original_load(store, execution_id)
+        if calls["value"] >= 2 and row is not None:
+            tampered = {key: row[key] for key in row.keys()}
+            tampered["claim_epoch"] = int(row["claim_epoch"]) + 1
+            return tampered
+        return row
+
+    monkeypatch.setattr(execution, "_load_rollback_claim", tamper_takeover_readback)
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError, match="takeover read-back mismatch"):
+        continue_execution(
+            store_path,
+            execution_id_for(store_path, plan.plan_id),
+            adapter,
+            Runner(wrong_runtime=True),
+            now=expired_clock.isoformat(),
+        )
+    assert not any(step.operation in {item.operation for item in plan.rollback_steps} for step in adapter.calls)
+    with SQLiteStore(store_path) as store:
+        execution_id = execution_id_for(store_path, plan.plan_id)
+        checkpoints = store.load_backup_execution_checkpoints(execution_id)
+        claim = store._connection.execute(
+            "SELECT claim_epoch FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
+            (execution_id,),
+        ).fetchone()
+        assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED
+        assert claim["claim_epoch"] == 1
+
+
 def test_rollback_lease_clock_is_independent_of_stale_or_future_evidence_time(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
 

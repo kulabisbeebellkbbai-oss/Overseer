@@ -536,6 +536,12 @@ class SQLiteStore:
                 actual_indexes.add(columns)
             if actual_indexes != required_indexes:
                 raise ValueError("malformed backup execution schema indexes")
+        claim_triggers = self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+            ("backup_provisioning_execution_rollback_claims",),
+        ).fetchall()
+        if claim_triggers:
+            raise ValueError("backup execution rollback claims triggers are unavailable")
         immutable_tables = ("backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints")
         triggers = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", immutable_tables).fetchall()}
         expected_trigger_sql = {
@@ -1207,6 +1213,11 @@ class SQLiteStore:
         )"""
         normalize_sql = lambda value: " ".join(str(value).split()).lower()
         if actual_columns != expected_columns or normalize_sql(row[0]) != normalize_sql(expected_sql):
+            return False
+        if self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name=? LIMIT 1",
+            (table,),
+        ).fetchone() is not None:
             return False
         foreign_keys = tuple(
             tuple(str(value) for value in item)

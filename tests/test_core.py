@@ -11531,17 +11531,18 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 4)
-        self.assertEqual(len(migrations), 10)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 5)
+        self.assertEqual(len(migrations), 11)
         self.assertEqual(migrations[0].version, 4)
-        self.assertEqual(migrations[0].description, "append-only backup execution store")
-        self.assertEqual(migrations[1].version, "agent_driver_v1")
-        self.assertEqual(migrations[2].version, "agent_driver_v2")
-        self.assertEqual(migrations[3].version, "agent_driver_v3")
-        self.assertEqual(migrations[4].version, "agent_driver_v4")
-        self.assertEqual(migrations[5].version, "agent_driver_v5")
+        self.assertEqual(migrations[0].description, "append-only backup execution store and typed plan execution authority")
+        self.assertEqual(migrations[1].version, 5)
+        self.assertEqual(migrations[1].description, "immutable typed execution authority with transactional artifact backfill")
+        self.assertEqual(migrations[2].version, "agent_driver_v1")
+        self.assertEqual(migrations[3].version, "agent_driver_v2")
+        self.assertEqual(migrations[4].version, "agent_driver_v3")
+        self.assertEqual(migrations[5].version, "agent_driver_v4")
         self.assertEqual(
-            migrations[1].description,
+            migrations[2].description,
             "persist provider-neutral agent driver lifecycle records",
         )
         self.assertEqual(reopened_migrations, migrations)

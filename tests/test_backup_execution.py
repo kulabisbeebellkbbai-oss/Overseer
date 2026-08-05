@@ -165,7 +165,7 @@ def test_verified_chain_and_terminal_success_require_finalized_acceptance() -> N
 def test_store_persists_v4_header_and_append_only_chain(tmp_path) -> None:
     header = _header()
     checkpoints = _chain(header)
-    assert CURRENT_SCHEMA_VERSION == 4
+    assert CURRENT_SCHEMA_VERSION == 5
     assert header.schema_version == "2"
     assert checkpoints[0].schema_version == "2"
     with OverseerStore(tmp_path / "state.sqlite3") as store:
@@ -604,6 +604,23 @@ def test_schema_contract_fk_indexes_and_trigger_sql_are_exact(tmp_path) -> None:
         store._connection.commit()
     with pytest.raises(ValueError, match="immutability triggers"):
         OverseerStore(tmp_path / "schema.sqlite3")
+
+
+@pytest.mark.parametrize("corruption", ["missing_trigger", "missing_table"])
+def test_typed_execution_authority_schema_corruption_is_rejected_on_reopen(tmp_path, corruption) -> None:
+    path = tmp_path / f"typed-authority-{corruption}.sqlite3"
+    with OverseerStore(path) as store:
+        if corruption == "missing_trigger":
+            store._connection.execute(
+                "DROP TRIGGER backup_provisioning_plan_execution_modes_no_delete"
+            )
+        else:
+            store._connection.execute(
+                "DROP TABLE backup_provisioning_plan_execution_modes"
+            )
+        store._connection.commit()
+    with pytest.raises(ValueError, match="typed execution authority|immutability"):
+        OverseerStore(path)
 
 
 def test_schema_rejects_commented_checks_and_partial_unique_indexes(tmp_path) -> None:

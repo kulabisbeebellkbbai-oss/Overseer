@@ -71,7 +71,8 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
+BACKUP_EXECUTION_AUTHORITY_SCHEMA_VERSION = 5
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
@@ -217,6 +218,8 @@ class SQLiteStore:
         self._configure_connection()
         self._initialize_with_lock_retry()
         self._validate_backup_execution_schema()
+        if not self._typed_execution_authority_schema_is_exact():
+            raise ValueError("typed execution authority schema is unavailable or malformed")
         self._harden_database_files()
 
     def _prepare_database_file(self) -> tuple[int, int]:
@@ -400,7 +403,48 @@ class SQLiteStore:
             return False
         required = {"backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"}
         actual = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)", tuple(required)).fetchall()}
-        return actual == required
+        return actual == required and self._typed_execution_authority_schema_is_exact()
+
+    def _typed_execution_authority_schema_is_exact(self) -> bool:
+        table = "backup_provisioning_plan_execution_modes"
+        expected_columns = (
+            ("plan_id", "TEXT", 0, 1, None),
+            ("execution_mode", "TEXT", 1, 0, None),
+        )
+        row = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if row is None:
+            return False
+        actual_columns = tuple(
+            (str(item[1]), str(item[2]).upper(), int(item[3]), int(item[5]), item[4])
+            for item in self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        expected_sql = """CREATE TABLE backup_provisioning_plan_execution_modes (
+            plan_id TEXT PRIMARY KEY,
+            execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed')
+        )"""
+        normalize_sql = lambda value: re.sub(r"\s+", " ", str(value).strip()).replace("( ", "(").replace(" )", ")").lower()
+        if actual_columns != expected_columns or normalize_sql(row[0]) != normalize_sql(expected_sql):
+            return False
+        if self._connection.execute(
+            "SELECT 1 FROM backup_provisioning_plan_execution_modes "
+            "WHERE execution_mode <> 'typed' LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        expected_triggers = {
+            "backup_provisioning_plan_execution_modes_no_update": "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_update BEFORE UPDATE ON backup_provisioning_plan_execution_modes BEGIN SELECT RAISE(ABORT, 'typed execution mode is immutable'); END",
+            "backup_provisioning_plan_execution_modes_no_delete": "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_delete BEFORE DELETE ON backup_provisioning_plan_execution_modes BEGIN SELECT RAISE(ABORT, 'typed execution mode rows are append-only'); END",
+        }
+        rows = self._connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (table,)
+        ).fetchall()
+        if {str(item[0]) for item in rows} != set(expected_triggers):
+            return False
+        return all(
+            normalize_sql(item[1]) == normalize_sql(expected_triggers[str(item[0])])
+            for item in rows
+        )
 
     def _validate_backup_execution_schema(self) -> None:
         self._connection.execute("PRAGMA foreign_keys = ON")
@@ -626,10 +670,6 @@ class SQLiteStore:
                 plan_id TEXT PRIMARY KEY,
                 execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed')
             );
-            CREATE TRIGGER IF NOT EXISTS backup_provisioning_plan_execution_modes_no_downgrade
-            BEFORE UPDATE OF execution_mode ON backup_provisioning_plan_execution_modes
-            WHEN OLD.execution_mode = 'typed' AND NEW.execution_mode <> 'typed'
-            BEGIN SELECT RAISE(ABORT, 'typed execution mode cannot be downgraded'); END;
             CREATE TABLE IF NOT EXISTS provisioning_review_outbox (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
@@ -726,7 +766,8 @@ class SQLiteStore:
             """
         )
         with self._connection:
-            self._record_schema_migration(CURRENT_SCHEMA_VERSION, "append-only backup execution store and typed plan execution authority")
+            self._record_schema_migration(4, "append-only backup execution store and typed plan execution authority")
+            self._migrate_backup_execution_authority_v5()
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_schema_migrations (
@@ -958,6 +999,128 @@ class SQLiteStore:
                 AGENT_DRIVER_SCHEMA_V9,
                 "attest new handoffs; legacy unsigned packages remain fail-safe invalid",
             )
+
+    def _migrate_backup_execution_authority_v5(self) -> None:
+        """Install and backfill immutable typed execution authority atomically."""
+        if self._connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (BACKUP_EXECUTION_AUTHORITY_SCHEMA_VERSION,),
+        ).fetchone() is not None:
+            return
+        savepoint = "backup_execution_authority_v5_migration"
+        owns_transaction = not self._connection.in_transaction
+        if owns_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
+        else:
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            table = "backup_provisioning_plan_execution_modes"
+            existing = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if existing is None:
+                self._connection.execute(
+                    "CREATE TABLE backup_provisioning_plan_execution_modes ("
+                    "plan_id TEXT PRIMARY KEY, "
+                    "execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed'))"
+                )
+            elif not self._typed_execution_authority_table_is_exact():
+                raise ValueError("malformed typed execution authority table")
+
+            plan_ids: set[str] = set()
+            for source_table in (
+                "provisioning_bundles",
+                "provisioning_preflight_reports",
+                "provisioning_review_outbox",
+                "backup_provisioning_execution_headers",
+            ):
+                plan_ids.update(
+                    str(row[0])
+                    for row in self._connection.execute(
+                        f"SELECT DISTINCT plan_id FROM {source_table}"
+                    ).fetchall()
+                    if isinstance(row[0], str) and row[0]
+                )
+            for row in self._connection.execute(
+                "SELECT source_id, approval_ref FROM roadex_approval_bindings "
+                "WHERE source_kind='roadex-human-decision' "
+                "AND approval_ref LIKE 'approval.donuthole.%'"
+            ).fetchall():
+                source_id, approval_ref = str(row[0]), str(row[1])
+                if source_id:
+                    plan_ids.add(source_id)
+                suffix = approval_ref.removeprefix("approval.donuthole.")
+                if suffix:
+                    plan_ids.add(suffix)
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO backup_provisioning_plan_execution_modes "
+                "(plan_id, execution_mode) VALUES (?, 'typed')",
+                ((plan_id,) for plan_id in sorted(plan_ids)),
+            )
+
+            old_trigger = "backup_provisioning_plan_execution_modes_no_downgrade"
+            self._connection.execute(f"DROP TRIGGER IF EXISTS {old_trigger}")
+            for trigger in (
+                "backup_provisioning_plan_execution_modes_no_update",
+                "backup_provisioning_plan_execution_modes_no_delete",
+            ):
+                trigger_row = self._connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                    (trigger,),
+                ).fetchone()
+                if trigger_row is not None:
+                    expected = {
+                        "backup_provisioning_plan_execution_modes_no_update": "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_update BEFORE UPDATE ON backup_provisioning_plan_execution_modes BEGIN SELECT RAISE(ABORT, 'typed execution mode is immutable'); END",
+                        "backup_provisioning_plan_execution_modes_no_delete": "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_delete BEFORE DELETE ON backup_provisioning_plan_execution_modes BEGIN SELECT RAISE(ABORT, 'typed execution mode rows are append-only'); END",
+                    }[trigger]
+                    normalize_sql = lambda value: re.sub(r"\s+", " ", str(value).strip()).replace("( ", "(").replace(" )", ")").lower()
+                    if normalize_sql(trigger_row[0]) != normalize_sql(expected):
+                        raise ValueError("malformed typed execution authority trigger")
+                else:
+                    if trigger.endswith("no_update"):
+                        self._connection.execute(
+                            "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_update "
+                            "BEFORE UPDATE ON backup_provisioning_plan_execution_modes "
+                            "BEGIN SELECT RAISE(ABORT, 'typed execution mode is immutable'); END"
+                        )
+                    else:
+                        self._connection.execute(
+                            "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_delete "
+                            "BEFORE DELETE ON backup_provisioning_plan_execution_modes "
+                            "BEGIN SELECT RAISE(ABORT, 'typed execution mode rows are append-only'); END"
+                        )
+            self._record_schema_migration(
+                BACKUP_EXECUTION_AUTHORITY_SCHEMA_VERSION,
+                "immutable typed execution authority with transactional artifact backfill",
+            )
+        except BaseException:
+            if owns_transaction:
+                self._connection.rollback()
+            else:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            if owns_transaction:
+                self._connection.commit()
+            else:
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+    def _typed_execution_authority_table_is_exact(self) -> bool:
+        row = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            ("backup_provisioning_plan_execution_modes",),
+        ).fetchone()
+        if row is None:
+            return False
+        expected_columns = (("plan_id", "TEXT", 0, 1, None), ("execution_mode", "TEXT", 1, 0, None))
+        actual_columns = tuple(
+            (str(item[1]), str(item[2]).upper(), int(item[3]), int(item[5]), item[4])
+            for item in self._connection.execute("PRAGMA table_info(backup_provisioning_plan_execution_modes)").fetchall()
+        )
+        expected_sql = "CREATE TABLE backup_provisioning_plan_execution_modes (plan_id TEXT PRIMARY KEY, execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed'))"
+        normalize_sql = lambda value: re.sub(r"\s+", " ", str(value).strip()).replace("( ", "(").replace(" )", ")").lower()
+        return actual_columns == expected_columns and normalize_sql(row[0]) == normalize_sql(expected_sql)
 
     def _migrate_backup_execution_v3(self) -> None:
         """Upgrade the v3 execution tables before the idempotent schema script."""
@@ -2397,29 +2560,43 @@ class SQLiteStore:
             "(plan_id TEXT PRIMARY KEY, execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed'))"
         )
         self._connection.execute(
-            "CREATE TRIGGER IF NOT EXISTS backup_provisioning_plan_execution_modes_no_downgrade "
-            "BEFORE UPDATE OF execution_mode ON backup_provisioning_plan_execution_modes "
-            "WHEN OLD.execution_mode = 'typed' AND NEW.execution_mode <> 'typed' "
-            "BEGIN SELECT RAISE(ABORT, 'typed execution mode cannot be downgraded'); END"
+            "CREATE TRIGGER IF NOT EXISTS backup_provisioning_plan_execution_modes_no_update "
+            "BEFORE UPDATE ON backup_provisioning_plan_execution_modes "
+            "BEGIN SELECT RAISE(ABORT, 'typed execution mode is immutable'); END"
+        )
+        self._connection.execute(
+            "CREATE TRIGGER IF NOT EXISTS backup_provisioning_plan_execution_modes_no_delete "
+            "BEFORE DELETE ON backup_provisioning_plan_execution_modes "
+            "BEGIN SELECT RAISE(ABORT, 'typed execution mode rows are append-only'); END"
         )
 
     def mark_backup_provisioning_plan_typed(self, plan_id: str) -> None:
         """Monotonically bind a plan to typed execution without trusting its payload."""
-        self.ensure_backup_provisioning_plan_store()
-        self._connection.execute(
-            "INSERT OR IGNORE INTO backup_provisioning_plan_execution_modes "
-            "(plan_id, execution_mode) VALUES (?, 'typed')",
-            (plan_id,),
-        )
+        def write_marker() -> None:
+            self.ensure_backup_provisioning_plan_store()
+            self._connection.execute(
+                "INSERT OR IGNORE INTO backup_provisioning_plan_execution_modes "
+                "(plan_id, execution_mode) VALUES (?, 'typed')",
+                (plan_id,),
+            )
+        if self._agent_transaction_depth:
+            write_marker()
+        else:
+            with self.agent_transaction():
+                write_marker()
 
     def load_backup_provisioning_plan_execution_mode(self, plan_id: str) -> str:
-        """Return the durable mode; absent historical markers are legacy by default."""
+        """Return the durable mode; malformed present authority fails closed."""
         self.ensure_backup_provisioning_plan_store()
         row = self._connection.execute(
             "SELECT execution_mode FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
             (plan_id,),
         ).fetchone()
-        return "typed" if row is not None and row["execution_mode"] == "typed" else "legacy"
+        if row is None:
+            return "legacy"
+        if row["execution_mode"] != "typed":
+            raise ValueError("malformed typed execution authority marker")
+        return "typed"
 
     def save_provisioning_preflight_report(
         self,

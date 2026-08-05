@@ -608,7 +608,7 @@ def _typed_bundle_feature_enabled_locked(store: SQLiteStore) -> bool:
 
 
 def _typed_execution_enabled_for_plan_locked(store: SQLiteStore, plan_id: str) -> bool:
-    """Select typed execution from durable authority, with scoped legacy fallback."""
+    """Select typed execution from durable authority and persist scoped fallback."""
     if store.load_backup_provisioning_plan_execution_mode(plan_id) == "typed":
         return True
     checks = (
@@ -618,7 +618,10 @@ def _typed_execution_enabled_for_plan_locked(store: SQLiteStore, plan_id: str) -
         ("SELECT 1 FROM provisioning_review_outbox WHERE plan_id=? LIMIT 1", (plan_id,)),
         ("SELECT 1 FROM roadex_approval_bindings WHERE source_id=? OR approval_ref=? LIMIT 1", (plan_id, f"approval.donuthole.{plan_id}")),
     )
-    return any(store._connection.execute(sql, parameters).fetchone() is not None for sql, parameters in checks)
+    if any(store._connection.execute(sql, parameters).fetchone() is not None for sql, parameters in checks):
+        store.mark_backup_provisioning_plan_typed(plan_id)
+        return True
+    return False
 
 
 def _require_bundle_preflight_and_reviews(

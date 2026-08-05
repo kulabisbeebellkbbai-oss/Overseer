@@ -395,6 +395,21 @@ def test_typed_execution_marker_rejects_downgrade(tmp_path: Path) -> None:
                 "UPDATE backup_provisioning_plan_execution_modes SET execution_mode='legacy' WHERE plan_id=?",
                 (plan.plan_id,),
             )
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute(
+                "UPDATE backup_provisioning_plan_execution_modes SET execution_mode='typed' WHERE plan_id=?",
+                (plan.plan_id,),
+            )
+
+
+def test_typed_execution_marker_rejects_delete(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    with SQLiteStore(store_path) as store:
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute(
+                "DELETE FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
+                (plan.plan_id,),
+            )
 
 
 def test_valid_source_rewrite_cannot_downgrade_typed_execution(tmp_path: Path) -> None:
@@ -413,6 +428,9 @@ def test_valid_source_rewrite_cannot_downgrade_typed_execution(tmp_path: Path) -
 def test_pre_upgrade_plan_shape_loads_and_scoped_artifacts_select_mode(tmp_path: Path) -> None:
     store_path, typed_plan, _bundle = _approved(tmp_path)
     with SQLiteStore(store_path) as store:
+        store._connection.execute(
+            "DROP TRIGGER backup_provisioning_plan_execution_modes_no_delete"
+        )
         store._connection.execute(
             "DELETE FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
             (typed_plan.plan_id,),
@@ -437,6 +455,54 @@ def test_pre_upgrade_plan_shape_loads_and_scoped_artifacts_select_mode(tmp_path:
         )
         stage_plan(store_path, legacy_plan)
         assert _typed_execution_enabled_for_plan_locked(store, legacy_plan.plan_id) is False
+
+
+def test_v4_typed_artifact_reopen_backfills_marker_and_stays_fail_closed_after_cleanup(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    with SQLiteStore(store_path) as store:
+        store._connection.execute(
+            "DROP TRIGGER backup_provisioning_plan_execution_modes_no_update"
+        )
+        store._connection.execute(
+            "DROP TRIGGER backup_provisioning_plan_execution_modes_no_delete"
+        )
+        store._connection.execute(
+            "CREATE TRIGGER backup_provisioning_plan_execution_modes_no_downgrade "
+            "BEFORE UPDATE OF execution_mode ON backup_provisioning_plan_execution_modes "
+            "WHEN OLD.execution_mode='typed' AND NEW.execution_mode<>'typed' "
+            "BEGIN SELECT RAISE(ABORT, 'typed execution mode cannot be downgraded'); END"
+        )
+        store._connection.execute(
+            "DELETE FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
+            (plan.plan_id,),
+        )
+        store._connection.execute(
+            "DELETE FROM schema_migrations WHERE version=5"
+        )
+        store._connection.commit()
+
+    with SQLiteStore(store_path) as store:
+        assert store.load_backup_provisioning_plan_execution_mode(plan.plan_id) == "typed"
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
+            (plan.plan_id,),
+        ).fetchone()[0] == 1
+        for table in (
+            "provisioning_bundles",
+            "provisioning_preflight_reports",
+            "provisioning_review_outbox",
+        ):
+            store._connection.execute(f"DELETE FROM {table} WHERE plan_id=?", (plan.plan_id,))
+        store._connection.execute(
+            "DELETE FROM roadex_approval_bindings WHERE approval_ref=?",
+            (f"approval.donuthole.{plan.plan_id}",),
+        )
+        store._connection.commit()
+
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError, match="SUCCESSOR_REQUIRED"):
+        execute_plan(store_path, plan.plan_id, adapter, acceptance_runner=Runner())
+    assert adapter.calls == []
 
 
 @pytest.mark.parametrize("artifact", ["binding", "preflight", "outbox"])

@@ -11,6 +11,7 @@ import math
 import re
 import errno
 import socket
+from pathlib import Path
 import uuid
 from typing import Any, Literal, Mapping, TYPE_CHECKING
 
@@ -68,6 +69,10 @@ class _ExactApprovalSourceError(ValueError):
 
 class _ExecutionContentionError(ValueError):
     """A verified concurrent execution owns the next durable transition."""
+
+
+class _RollbackOwnerSocketCollision(OSError):
+    """An owner socket namespace is already occupied; claim context decides its meaning."""
 
 
 def _string(value: object, label: str, *, identifier: bool = False) -> str:
@@ -690,6 +695,22 @@ _ROLLBACK_FOR = {
 _ROLLBACK_CLAIM_LEASE = timedelta(seconds=30)
 
 
+def _rollback_owner_scope_keys(store: SQLiteStore, execution_id: str) -> tuple[str, ...]:
+    canonical_path = str(Path(store.path).resolve())
+    device, inode = store._database_identity
+    return tuple(sorted({
+        f"path:{canonical_path}:{execution_id}",
+        f"inode:{device}:{inode}:{execution_id}",
+    }))
+
+
+def _rollback_owner_socket_addresses(store: SQLiteStore, execution_id: str) -> tuple[bytes, ...]:
+    return tuple(
+        b"\0overseer.rollback-owner." + hashlib.sha256(scope_key.encode()).hexdigest().encode()
+        for scope_key in _rollback_owner_scope_keys(store, execution_id)
+    )
+
+
 class _RollbackOwnerLock:
     """Hold an OS lock for the duration of one rollback adapter call.
 
@@ -698,27 +719,33 @@ class _RollbackOwnerLock:
     its initial lease elapsed.
     """
 
-    def __init__(self, socket_handle: socket.socket) -> None:
-        self._socket = socket_handle
+    def __init__(self, socket_handles: list[socket.socket]) -> None:
+        self._sockets = socket_handles
 
     @classmethod
     def acquire(cls, store: SQLiteStore, execution_id: str) -> _RollbackOwnerLock:
-        lock_name = hashlib.sha256(execution_id.encode()).hexdigest().encode()
-        address = b"\0overseer.rollback-owner." + lock_name
-        socket_handle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        socket_handles: list[socket.socket] = []
         try:
-            socket_handle.bind(address)
-        except OSError as error:
-            socket_handle.close()
-            if error.errno == errno.EADDRINUSE:
-                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS") from error
+            for address in _rollback_owner_socket_addresses(store, execution_id):
+                socket_handle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    socket_handle.bind(address)
+                except OSError as error:
+                    socket_handle.close()
+                    if error.errno == errno.EADDRINUSE:
+                        raise _RollbackOwnerSocketCollision(str(error), errno.EADDRINUSE) from error
+                    raise
+                socket_handles.append(socket_handle)
+        except BaseException:
+            for socket_handle in socket_handles:
+                socket_handle.close()
             raise
-        return cls(socket_handle)
+        return cls(socket_handles)
 
     def release(self) -> None:
-        if self._socket is not None:
-            self._socket.close()
-            self._socket = None
+        sockets, self._sockets = self._sockets, []
+        for socket_handle in sockets:
+            socket_handle.close()
 
     def __enter__(self) -> _RollbackOwnerLock:
         return self
@@ -1337,19 +1364,21 @@ def _release_rollback_claim_locked(store, header: ProvisioningExecutionHeader, r
 
 
 def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str) -> tuple[int, _RollbackOwnerLock]:
-    owner_lock = _RollbackOwnerLock.acquire(store, header.execution_id)
+    owner_lock_holder: list[_RollbackOwnerLock | None] = [None]
     try:
-        return _claim_rollback_transaction(store, header, requested, when, owner_id, owner_lock)
+        return _claim_rollback_transaction(store, header, requested, when, owner_id, owner_lock_holder)
     except BaseException:
-        owner_lock.release()
+        if owner_lock_holder[0] is not None:
+            owner_lock_holder[0].release()
         raise
 
 
-def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str, owner_lock: _RollbackOwnerLock) -> tuple[int, _RollbackOwnerLock]:
+def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str, owner_lock_holder: list[_RollbackOwnerLock | None]) -> tuple[int, _RollbackOwnerLock]:
     """Atomically claim one exact rollback operation on the verified frontier."""
     if requested.rollback is None:
         raise ValueError("rollback is not approved for this operation")
     deferred_error = None
+    owner_lock = None
     with store.agent_transaction():
         claim_now = _rollback_claim_clock()
         claim_expires = (datetime.fromisoformat(claim_now) + _ROLLBACK_CLAIM_LEASE).isoformat()
@@ -1369,6 +1398,11 @@ def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requ
                 raise ValueError("rollback frontier has an impossible active identity")
             if claim is None or claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest:
                 raise ValueError("active rollback claim metadata is missing or mismatched")
+            try:
+                owner_lock = _RollbackOwnerLock.acquire(store, header.execution_id)
+            except _RollbackOwnerSocketCollision as error:
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS") from error
+            owner_lock_holder[0] = owner_lock
             if not _rollback_claim_expired(str(claim["lease_expires_at"]), claim_now):
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             updated = store._connection.execute(
@@ -1395,6 +1429,11 @@ def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requ
             if (requested.plan_step_ordinal, requested.rollback.step_digest) in done:
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             raise ValueError("requested rollback is outside the verified frontier")
+        try:
+            owner_lock = _RollbackOwnerLock.acquire(store, header.execution_id)
+        except _RollbackOwnerSocketCollision as error:
+            raise ValueError("rollback owner socket collision without an exact active claim") from error
+        owner_lock_holder[0] = owner_lock
         store._connection.execute(
             "INSERT INTO backup_provisioning_execution_rollback_claims "
             "(execution_id, plan_step_ordinal, step_digest, owner_id, claimed_at, lease_expires_at, claim_epoch) VALUES (?, ?, ?, ?, ?, ?, 1)",

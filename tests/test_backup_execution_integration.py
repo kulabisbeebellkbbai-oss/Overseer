@@ -8,6 +8,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import threading
 
 import pytest
@@ -109,7 +110,8 @@ def _owner_lock_process(path: str, execution_id: str, ready, release, crash: boo
     from types import SimpleNamespace
     from overseer.backup_execution import _RollbackOwnerLock
 
-    lock = _RollbackOwnerLock.acquire(SimpleNamespace(path=Path(path)), execution_id)
+    status = Path(path).stat()
+    lock = _RollbackOwnerLock.acquire(SimpleNamespace(path=Path(path), _database_identity=(status.st_dev, status.st_ino)), execution_id)
     ready.set()
     if crash:
         os._exit(0)
@@ -486,6 +488,54 @@ def test_live_rollback_claim_contends_without_duplicate_adapter_call(tmp_path: P
     assert adapter.calls == []
 
 
+def test_foreign_owner_socket_prebind_without_claim_is_not_contention(tmp_path: Path) -> None:
+    from overseer.backup_execution import _rollback_owner_socket_addresses
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_id = "execution." + plan.plan_digest.removeprefix("sha256:")
+    with SQLiteStore(store_path) as store:
+        address = _rollback_owner_socket_addresses(store, execution_id)[0]
+    prebind = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    prebind.bind(address)
+    try:
+        with pytest.raises(ValueError, match="without an exact active claim"):
+            start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True))
+    finally:
+        prebind.close()
+
+
+def test_exact_active_claim_socket_collision_is_typed_contention(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+    from overseer.backup_execution import _rollback_owner_socket_addresses
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("seed exact active claim")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="seed exact active claim"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+    execution_id = execution_id_for(store_path, plan.plan_id)
+    with SQLiteStore(store_path) as store:
+        address = _rollback_owner_socket_addresses(store, execution_id)[0]
+    prebind = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    prebind.bind(address)
+    try:
+        with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+            continue_execution(store_path, execution_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    finally:
+        prebind.close()
+
+
 def test_crash_after_durable_rollback_completion_allows_immediate_resume(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
 
@@ -660,21 +710,67 @@ def test_rollback_owner_lock_is_kernel_fenced_without_replaceable_artifact(tmp_p
     from types import SimpleNamespace
     from overseer.backup_execution import _RollbackOwnerLock
 
-    store = SimpleNamespace(path=tmp_path / "state.sqlite3")
+    store_path = tmp_path / "state.sqlite3"
+    store_path.touch()
+    status = store_path.stat()
+    store = SimpleNamespace(path=store_path, _database_identity=(status.st_dev, status.st_ino))
     execution_id = "execution.lock.test"
     lock_path = Path(f"{store.path}.rollback-owner-{hashlib.sha256(execution_id.encode()).hexdigest()}.lock")
     with _RollbackOwnerLock.acquire(store, execution_id):
         assert not lock_path.exists()
-        with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+        with pytest.raises(OSError):
             _RollbackOwnerLock.acquire(store, execution_id)
     assert not lock_path.exists()
+
+
+def test_rollback_owner_lock_scopes_same_execution_id_to_store_identity(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from overseer.backup_execution import _RollbackOwnerLock
+
+    path_a = tmp_path / "store-a.sqlite3"
+    path_b = tmp_path / "store-b.sqlite3"
+    path_a.touch()
+    path_b.touch()
+    status_a = path_a.stat()
+    status_b = path_b.stat()
+    store_a = SimpleNamespace(path=path_a, _database_identity=(status_a.st_dev, status_a.st_ino))
+    store_b = SimpleNamespace(path=path_b, _database_identity=(status_b.st_dev, status_b.st_ino))
+    execution_id = "execution.same-id"
+    with _RollbackOwnerLock.acquire(store_a, execution_id):
+        with _RollbackOwnerLock.acquire(store_b, execution_id):
+            pass
+
+
+def test_rollback_owner_lock_alias_and_replacement_cannot_bypass_scope(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from overseer.backup_execution import _RollbackOwnerLock
+
+    original = tmp_path / "store.sqlite3"
+    original.touch()
+    alias = tmp_path / "store-hardlink.sqlite3"
+    alias.hardlink_to(original)
+    status = original.stat()
+    store = SimpleNamespace(path=original, _database_identity=(status.st_dev, status.st_ino))
+    hardlink_store = SimpleNamespace(path=alias, _database_identity=(status.st_dev, status.st_ino))
+    execution_id = "execution.alias"
+    with _RollbackOwnerLock.acquire(store, execution_id):
+        with pytest.raises(OSError):
+            _RollbackOwnerLock.acquire(hardlink_store, execution_id)
+
+    replacement_store = SimpleNamespace(path=original, _database_identity=(status.st_dev, status.st_ino + 1))
+    with _RollbackOwnerLock.acquire(store, execution_id):
+        with pytest.raises(OSError):
+            _RollbackOwnerLock.acquire(replacement_store, execution_id)
 
 
 def test_rollback_owner_lock_survives_separate_process_and_releases_on_exit(tmp_path: Path) -> None:
     from types import SimpleNamespace
     from overseer.backup_execution import _RollbackOwnerLock
 
-    store = SimpleNamespace(path=tmp_path / "state.sqlite3")
+    store_path = tmp_path / "state.sqlite3"
+    store_path.touch()
+    status = store_path.stat()
+    store = SimpleNamespace(path=store_path, _database_identity=(status.st_dev, status.st_ino))
     execution_id = "execution.process.lock"
     context = multiprocessing.get_context("fork")
     ready = context.Event()
@@ -682,7 +778,7 @@ def test_rollback_owner_lock_survives_separate_process_and_releases_on_exit(tmp_
     worker = context.Process(target=_owner_lock_process, args=(str(store.path), execution_id, ready, release, False))
     worker.start()
     assert ready.wait(timeout=10)
-    with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+    with pytest.raises(OSError):
         _RollbackOwnerLock.acquire(store, execution_id)
     release.set()
     worker.join(timeout=10)
@@ -694,7 +790,7 @@ def test_rollback_owner_lock_survives_separate_process_and_releases_on_exit(tmp_
     crashed = context.Process(target=_owner_lock_process, args=(str(store.path), execution_id, crashed_ready, release, True))
     crashed.start()
     assert crashed_ready.wait(timeout=10)
-    with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+    with pytest.raises(OSError):
         _RollbackOwnerLock.acquire(store, execution_id)
     crashed.join(timeout=10)
     assert crashed.exitcode == 0
@@ -736,9 +832,8 @@ def test_rollback_claim_releases_owner_lock_when_commit_exit_raises(tmp_path: Pa
         claim = store._connection.execute(
             "SELECT owner_id, claim_epoch FROM backup_provisioning_execution_rollback_claims"
         ).fetchone()
-        from types import SimpleNamespace
         from overseer.backup_execution import _RollbackOwnerLock
-        with _RollbackOwnerLock.acquire(SimpleNamespace(path=Path(store_path)), execution_id_for(store_path, plan.plan_id)):
+        with _RollbackOwnerLock.acquire(store, execution_id_for(store_path, plan.plan_id)):
             pass
     assert claim["claim_epoch"] == 1
 

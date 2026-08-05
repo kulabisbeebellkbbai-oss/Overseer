@@ -359,3 +359,12 @@ Clarification: this addendum supersedes the earlier follow-up wording that
 described compensating persistence rollback after registration cancellation.
 The fence correction deliberately removes that best-effort rollback path; the
 earlier text is retained as historical evidence of the rejected design.
+
+Scope correction: during the preceding timeout-race correction, one worker
+accidentally changed the main Roadex checkout's `server/index.ts` registration
+callback. The coordinator restored that exact line immediately. Read-only
+verification confirmed the main checkout returned to its original state:
+`server/index.ts` is clean and only the two pre-existing August 3 user diffs in
+`src/server/approvalCoordinator.ts` and
+`tests/approvalLifecycleIntegration.test.ts` remain. No other main-checkout
+file was changed by this Task 3 slice.

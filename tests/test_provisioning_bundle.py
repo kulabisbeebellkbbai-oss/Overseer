@@ -1,6 +1,7 @@
 """Contract tests for the bounded typed provisioning bundle boundary."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import inspect
 import json
@@ -4067,6 +4068,339 @@ def test_bundle_cli_exposes_typed_preflight_stage_and_status(tmp_path, monkeypat
     status = json.loads(capsys.readouterr().out)
     assert status["bundle_digest"] == bundle.bundle_digest
     assert status["mutation_performed"] is False
+
+
+def _sealed_bundle_intent_fd(payload: object = None, *, seals: int | None = None) -> int:
+    if payload is None:
+        payload = intent_payload()
+    descriptor = os.memfd_create(
+        "bundle-intent",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    os.fchmod(descriptor, 0o600)
+    os.write(descriptor, json.dumps(payload).encode("utf-8"))
+    fcntl.fcntl(
+        descriptor,
+        fcntl.F_ADD_SEALS,
+        (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+            if seals is None
+            else seals
+        ),
+    )
+    return descriptor
+
+
+def test_bundle_cli_accepts_sealed_intent_fd_for_preview_and_stage(
+    tmp_path, monkeypatch, capsys,
+):
+    store_path, bundle = authoritative_bundle_fixture(tmp_path)
+    monkeypatch.setattr(
+        provisioning_bundle_module,
+        "production_preflight_dependencies",
+        lambda _path: deterministic_dependencies(source_head=bundle.intent.source_commit),
+    )
+    descriptor = _sealed_bundle_intent_fd()
+    try:
+        before = os.fstat(descriptor), os.lseek(descriptor, 0, os.SEEK_CUR)
+        assert backup_provisioning_cli_module.main((
+            "--store", store_path, "bundle-preflight", "--intent-fd", str(descriptor),
+        )) == 0
+        preview = json.loads(capsys.readouterr().out)
+        assert backup_provisioning_cli_module.main((
+            "--store", store_path, "bundle-stage", "--intent-fd", str(descriptor),
+            "--expected-preflight-digest", preview["preflight_digest"],
+            "--expected-bundle-digest", preview["bundle_digest"],
+        )) == 0
+        json.loads(capsys.readouterr().out)
+        assert (os.fstat(descriptor), os.lseek(descriptor, 0, os.SEEK_CUR)) == before
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (b'{"private":"unterminated', b'["not-an-object"]'),
+)
+def test_bundle_cli_rejects_invalid_sealed_intent_fd_without_leakage(
+    tmp_path, monkeypatch, capsys, payload,
+):
+    descriptor = os.memfd_create("bundle-intent", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    os.fchmod(descriptor, 0o600)
+    os.write(descriptor, payload)
+    fcntl.fcntl(
+        descriptor,
+        fcntl.F_ADD_SEALS,
+        fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE,
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "preflight_bundle_api",
+        lambda *_args: {"status": "preview"},
+    )
+    try:
+        actual = backup_provisioning_cli_module.main((
+            "--store", str(tmp_path / "private-store.sqlite3"),
+            "bundle-preflight", "--intent-fd", str(descriptor),
+        ))
+        captured = capsys.readouterr()
+        assert actual == 2
+        assert json.loads(captured.out)["error_code"] == "INVALID_BUNDLE_CLI_INPUT"
+        assert captured.err == ""
+        assert "private" not in captured.out
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("seals", (0, fcntl.F_SEAL_SEAL | fcntl.F_SEAL_WRITE))
+def test_bundle_cli_rejects_incomplete_seals(tmp_path, monkeypatch, capsys, seals):
+    descriptor = _sealed_bundle_intent_fd(seals=seals)
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "preflight_bundle_api",
+        lambda *_args: {"status": "preview"},
+    )
+    try:
+        actual = backup_provisioning_cli_module.main((
+            "--store", str(tmp_path / "private-store.sqlite3"),
+            "bundle-preflight", "--intent-fd", str(descriptor),
+        ))
+        assert actual == 2
+        assert json.loads(capsys.readouterr().out)["error_code"] == "INVALID_BUNDLE_CLI_INPUT"
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("bad_fd", (-1, 999999))
+def test_bundle_cli_rejects_negative_or_closed_intent_fd(tmp_path, capsys, bad_fd):
+    if bad_fd < 0:
+        with pytest.raises(SystemExit) as error:
+            backup_provisioning_cli_module.main((
+                "--store", str(tmp_path / "private-store.sqlite3"),
+                "bundle-preflight", "--intent-fd", str(bad_fd),
+            ))
+        assert error.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.err
+        assert "private" not in captured.err
+        return
+    actual = backup_provisioning_cli_module.main((
+        "--store", str(tmp_path / "private-store.sqlite3"),
+        "bundle-preflight", "--intent-fd", str(bad_fd),
+    ))
+    captured = capsys.readouterr()
+    assert actual == 2
+    assert json.loads(captured.out)["error_code"] == "INVALID_BUNDLE_CLI_INPUT"
+
+
+def test_bundle_cli_requires_exactly_one_intent_input(tmp_path, capsys):
+    for arguments in (
+        ("bundle-preflight",),
+        ("bundle-preflight", "--intent-json", "private.json", "--intent-fd", "3"),
+    ):
+        with pytest.raises(SystemExit) as error:
+            backup_provisioning_cli_module.main(("--store", str(tmp_path / "store"), *arguments))
+        assert error.value.code == 2
+        captured = capsys.readouterr()
+        assert "private" not in captured.err
+
+
+def test_bundle_intent_fd_rejects_linked_regular_file(tmp_path):
+    intent_file = tmp_path / "intent.json"
+    intent_file.write_text(json.dumps(intent_payload()), encoding="utf-8")
+    descriptor = os.open(intent_file, os.O_RDONLY)
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+            backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_bundle_intent_fd_rejects_wrong_mode(tmp_path):
+    descriptor = _sealed_bundle_intent_fd()
+    os.fchmod(descriptor, 0o640)
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+            backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_bundle_intent_fd_rejects_oversized_and_extra_seal_state(monkeypatch):
+    descriptor = _sealed_bundle_intent_fd()
+    monkeypatch.setattr(
+        backup_provisioning_cli_module, "_MAX_BUNDLE_INTENT_BYTES", 1,
+    )
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+            backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+    extra_seal = getattr(fcntl, "F_SEAL_FUTURE_WRITE", 0)
+    if extra_seal:
+        descriptor = _sealed_bundle_intent_fd(
+            seals=(
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE
+                | extra_seal
+            ),
+        )
+        try:
+            with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+                backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+@pytest.mark.parametrize("pread_result", (b"", b"extra"))
+def test_bundle_intent_fd_rejects_truncation_or_growth(monkeypatch, pread_result):
+    descriptor = _sealed_bundle_intent_fd()
+    real_pread = os.pread
+    calls = [0]
+
+    def unstable_pread(fd, size, offset):
+        calls[0] += 1
+        if calls[0] == 1 and pread_result == b"":
+            return b""
+        if calls[0] == 2 and pread_result == b"extra":
+            return b"x"
+        return real_pread(fd, size, offset)
+
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "pread", unstable_pread)
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+            backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("failure_stage", ("dup", "fstat", "fcntl", "pread", "json", "close"))
+def test_bundle_intent_fd_operation_failures_are_redacted_and_close_duplicate(
+    monkeypatch, failure_stage,
+):
+    descriptor = _sealed_bundle_intent_fd()
+    duplicate: list[int] = []
+    closed: list[int] = []
+    real_dup = os.dup
+    real_close = os.close
+    real_fstat = os.fstat
+
+    def tracked_dup(fd):
+        result = real_dup(fd)
+        duplicate.append(result)
+        return result
+
+    def tracked_close(fd):
+        closed.append(fd)
+        result = real_close(fd)
+        if failure_stage == "close":
+            raise OSError("private close failure")
+        return result
+
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "dup", tracked_dup)
+    monkeypatch.setattr(backup_provisioning_cli_module.os, "close", tracked_close)
+    if failure_stage == "dup":
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "dup",
+            lambda _fd: (_ for _ in ()).throw(OSError("private dup failure")),
+        )
+    elif failure_stage == "fstat":
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "fstat",
+            lambda _fd: (_ for _ in ()).throw(OSError("private fstat failure")),
+        )
+    elif failure_stage == "fcntl":
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.fcntl, "fcntl",
+            lambda *_args: (_ for _ in ()).throw(OSError("private fcntl failure")),
+        )
+    elif failure_stage == "pread":
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "pread",
+            lambda *_args: (_ for _ in ()).throw(OSError("private pread failure")),
+        )
+    elif failure_stage == "json":
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.json, "loads",
+            lambda *_args: (_ for _ in ()).throw(ValueError("private json failure")),
+        )
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+            backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+        assert closed == duplicate
+        real_fstat(descriptor)
+    finally:
+        real_close(descriptor)
+
+
+@pytest.mark.parametrize("slow_stage", ("dup", "fstat", "fcntl", "pread", "json", "close"))
+def test_bundle_intent_fd_deadline_covers_every_operation(monkeypatch, slow_stage):
+    descriptor = _sealed_bundle_intent_fd()
+    clock = [50.0]
+    limit = 1.0
+    monkeypatch.setattr(
+        backup_provisioning_cli_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backup_provisioning_cli_module, "_MAX_BUNDLE_INTENT_SECONDS", limit,
+    )
+
+    def advance(value):
+        clock[0] += limit + 0.1
+        return value
+
+    if slow_stage == "dup":
+        real = os.dup
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "dup",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "fstat":
+        real = os.fstat
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "fstat",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "fcntl":
+        real = backup_provisioning_cli_module.fcntl.fcntl
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.fcntl, "fcntl",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "pread":
+        real = os.pread
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "pread",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    elif slow_stage == "json":
+        real = json.loads
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.json, "loads",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+    else:
+        real = os.close
+        monkeypatch.setattr(
+            backup_provisioning_cli_module.os, "close",
+            lambda *args, **kwargs: advance(real(*args, **kwargs)),
+        )
+
+    try:
+        with pytest.raises(ProvisioningBundleError, match="^INVALID_BUNDLE_CLI_INPUT$"):
+            backup_provisioning_cli_module._read_bundle_intent_fd(descriptor)
+        os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize(

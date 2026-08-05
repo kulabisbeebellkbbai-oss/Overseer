@@ -1,6 +1,7 @@
 """Operator CLI for the dedicated backup-provisioning control plane."""
 from __future__ import annotations
 import argparse
+import fcntl
 import json
 import os
 import stat
@@ -18,6 +19,12 @@ from .provisioning_bundle import (
 
 _MAX_BUNDLE_INTENT_BYTES = 64 * 1024
 _MAX_BUNDLE_INTENT_SECONDS = 2.0
+_REQUIRED_BUNDLE_INTENT_SEALS = (
+    fcntl.F_SEAL_SEAL
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_WRITE
+)
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -100,6 +107,85 @@ def _read_bundle_intent(path: str) -> dict[str, object]:
     return decoded
 
 
+def _read_bundle_intent_fd(fd_number: int) -> dict[str, object]:
+    descriptor: int | None = None
+    decoded: dict[str, object] | None = None
+    invalid = False
+    deadline = time.monotonic() + _MAX_BUNDLE_INTENT_SECONDS
+
+    def require_time() -> None:
+        if time.monotonic() > deadline:
+            raise TimeoutError("bundle intent deadline expired")
+
+    try:
+        descriptor = os.dup(fd_number)
+        require_time()
+        before = os.fstat(descriptor)
+        require_time()
+        before_seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+        require_time()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size > _MAX_BUNDLE_INTENT_BYTES
+            or before_seals != _REQUIRED_BUNDLE_INTENT_SEALS
+        ):
+            raise ValueError("invalid bundle intent descriptor")
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(descriptor, min(65536, before.st_size - offset), offset)
+            require_time()
+            if not chunk or len(chunk) > before.st_size - offset:
+                raise ValueError("truncated or growing bundle intent descriptor")
+            chunks.append(chunk)
+            offset += len(chunk)
+        extra = os.pread(descriptor, 1, offset)
+        require_time()
+        if extra:
+            raise ValueError("growing bundle intent descriptor")
+        after = os.fstat(descriptor)
+        require_time()
+        after_seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+        require_time()
+        if (
+            _file_identity(after) != _file_identity(before)
+            or after_seals != _REQUIRED_BUNDLE_INTENT_SEALS
+        ):
+            raise ValueError("unstable bundle intent descriptor")
+        decoded_value = json.loads(b"".join(chunks).decode("utf-8"))
+        require_time()
+        if type(decoded_value) is not dict:
+            raise ValueError("bundle intent must be a JSON object")
+        decoded = decoded_value
+    except Exception:
+        invalid = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except Exception:
+                invalid = True
+            try:
+                require_time()
+            except Exception:
+                invalid = True
+    if invalid or decoded is None:
+        raise ProvisioningBundleError("INVALID_BUNDLE_CLI_INPUT") from None
+    return decoded
+
+
+def _parse_nonnegative_fd(value: str) -> int:
+    try:
+        fd_number = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from error
+    if fd_number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return fd_number
+
+
 def _write_bundle_cli_error(error_code: str) -> int:
     print(json.dumps(
         {
@@ -124,14 +210,24 @@ def _write_bundle_cli_error(error_code: str) -> int:
 def _run_bundle_command(args: argparse.Namespace) -> int:
     try:
         if args.command == "bundle-preflight":
+            intent = (
+                _read_bundle_intent(args.intent_json)
+                if args.intent_json is not None
+                else _read_bundle_intent_fd(args.intent_fd)
+            )
             result = preflight_bundle_api(
-                args.store, {"intent": _read_bundle_intent(args.intent_json)},
+                args.store, {"intent": intent},
             )
         elif args.command == "bundle-stage":
+            intent = (
+                _read_bundle_intent(args.intent_json)
+                if args.intent_json is not None
+                else _read_bundle_intent_fd(args.intent_fd)
+            )
             result = stage_bundle_api(
                 args.store,
                 {
-                    "intent": _read_bundle_intent(args.intent_json),
+                    "intent": intent,
                     "expected_preflight_digest": args.expected_preflight_digest,
                     "expected_bundle_digest": args.expected_bundle_digest,
                 },
@@ -201,9 +297,13 @@ def main(argv: list[str] | None = None) -> int:
     execute.add_argument("--plan-id", required=True)
     execute.add_argument("--privileged-confirmation", required=True)
     bundle_preflight = commands.add_parser("bundle-preflight")
-    bundle_preflight.add_argument("--intent-json", required=True)
+    bundle_preflight_intent = bundle_preflight.add_mutually_exclusive_group(required=True)
+    bundle_preflight_intent.add_argument("--intent-json")
+    bundle_preflight_intent.add_argument("--intent-fd", type=_parse_nonnegative_fd)
     bundle_stage = commands.add_parser("bundle-stage")
-    bundle_stage.add_argument("--intent-json", required=True)
+    bundle_stage_intent = bundle_stage.add_mutually_exclusive_group(required=True)
+    bundle_stage_intent.add_argument("--intent-json")
+    bundle_stage_intent.add_argument("--intent-fd", type=_parse_nonnegative_fd)
     bundle_stage.add_argument("--expected-preflight-digest", required=True)
     bundle_stage.add_argument("--expected-bundle-digest", required=True)
     bundle_status_parser = commands.add_parser("bundle-status")

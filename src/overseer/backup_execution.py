@@ -685,6 +685,8 @@ _ROLLBACK_FOR = {
     "install_runtime": "remove_runtime_if_unreferenced",
 }
 
+_ROLLBACK_CLAIM_LEASE = timedelta(seconds=30)
+
 
 def _execution_time(value: object | None) -> str:
     if value is None:
@@ -1045,6 +1047,7 @@ def _load_execution_snapshot(store: SQLiteStore, header: ProvisioningExecutionHe
 
 def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, acceptance_runner, when: str, *, genesis_claimed: bool = False, initial_mutation: bool = False) -> _InvocationResult:
     from .store import SQLiteStore
+    owner_id = uuid.uuid4().hex
     with SQLiteStore(store_path) as store:
         store._backup_execution_invocation_checkpoint_ids = set()
         chain, plan = _load_execution_snapshot(store, header)
@@ -1072,7 +1075,7 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
 
         def rollback_or_finish(ordinal: int) -> _InvocationResult | None:
             try:
-                _rollback(store, header, when, ordinal, adapter)
+                _rollback(store, header, when, ordinal, adapter, owner_id)
             except _ExecutionContentionError:
                 if not store._backup_execution_invocation_checkpoint_ids:
                     raise
@@ -1182,7 +1185,7 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
         return finish()
 
 
-def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: int, adapter) -> None:
+def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: int, adapter, owner_id: str) -> None:
     from .backup_provisioning import _stored
     plan = _stored(store, header.plan_id)
     while True:
@@ -1198,7 +1201,7 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
             and canonical_step_digest(plan.plan_digest, "rollback", requested.plan_step_ordinal, step.operation, step.arguments) == requested.rollback.step_digest), None)
         if rollback_step is None:
             raise ValueError("approved rollback identity is not present in the exact plan")
-        _claim_rollback(store, header, requested, when)
+        _claim_rollback(store, header, requested, when, owner_id)
         try:
             result = adapter.execute(rollback_step)
             evidence = _normalize_result(rollback_step.operation, result)
@@ -1215,9 +1218,64 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
         if claimed != requested or current[-1].step_digest != requested.rollback.step_digest:
             raise ValueError("owned rollback claim identity changed")
         _append(store, header, len(current), requested, event, when, evidence=evidence, rollback=True)
+        _release_rollback_claim(store, header, requested, owner_id)
 
 
-def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str) -> bool:
+def _rollback_claim_expired(lease_expires_at: str, when: str) -> bool:
+    return datetime.fromisoformat(lease_expires_at) <= datetime.fromisoformat(when)
+
+
+def _load_rollback_claim(store, execution_id: str):
+    row = store._connection.execute(
+        "SELECT execution_id, plan_step_ordinal, step_digest, owner_id, claimed_at, lease_expires_at, claim_epoch "
+        "FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
+        (execution_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if (
+        str(row["execution_id"]) != execution_id
+        or type(row["plan_step_ordinal"]) is not int
+        or row["plan_step_ordinal"] < 0
+        or type(row["step_digest"]) is not str
+        or type(row["owner_id"]) is not str
+        or not row["owner_id"]
+        or type(row["claimed_at"]) is not str
+        or type(row["lease_expires_at"]) is not str
+        or type(row["claim_epoch"]) is not int
+        or row["claim_epoch"] < 1
+    ):
+        raise ValueError("rollback claim metadata is invalid")
+    _digest(str(row["step_digest"]), "rollback claim step_digest")
+    _timestamp(str(row["claimed_at"]), "rollback claim claimed_at")
+    _timestamp(str(row["lease_expires_at"]), "rollback claim lease_expires_at")
+    if datetime.fromisoformat(str(row["lease_expires_at"])) <= datetime.fromisoformat(str(row["claimed_at"])):
+        raise ValueError("rollback claim lease is invalid")
+    return row
+
+
+def _release_rollback_claim(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, owner_id: str) -> None:
+    with store.agent_transaction():
+        chain = store.load_backup_execution_checkpoints(header.execution_id)
+        verify_backup_execution_chain(header, chain)
+        claim = _load_rollback_claim(store, header.execution_id)
+        if claim is None:
+            return
+        if (
+            claim["plan_step_ordinal"] != requested.plan_step_ordinal
+            or claim["step_digest"] != requested.rollback.step_digest
+            or claim["owner_id"] != owner_id
+        ):
+            return
+        if not chain or chain[-1].plan_step_ordinal != requested.plan_step_ordinal or chain[-1].step_digest != requested.rollback.step_digest or chain[-1].event not in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED):
+            raise ValueError("rollback claim completion identity is invalid")
+        store._connection.execute(
+            "DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=?",
+            (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id),
+        )
+
+
+def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str) -> bool:
     """Atomically claim one exact rollback operation on the verified frontier."""
     if requested.rollback is None:
         raise ValueError("rollback is not approved for this operation")
@@ -1229,20 +1287,52 @@ def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: Execu
         frontier = _derive_rollback_frontier(header, chain)
         done = {(item.plan_step_ordinal, item.step_digest) for item in chain
                 if item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)}
+        claim = _load_rollback_claim(store, header.execution_id)
         if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
-            if chain[-1].plan_step_ordinal == requested.plan_step_ordinal and chain[-1].step_digest == requested.rollback.step_digest:
+            if chain[-1].plan_step_ordinal != requested.plan_step_ordinal or chain[-1].step_digest != requested.rollback.step_digest:
+                raise ValueError("rollback frontier has an impossible active identity")
+            if claim is None or claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest:
+                raise ValueError("active rollback claim metadata is missing or mismatched")
+            if not _rollback_claim_expired(str(claim["lease_expires_at"]), when):
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
-            raise ValueError("rollback frontier has an impossible active identity")
+            updated = store._connection.execute(
+                "UPDATE backup_provisioning_execution_rollback_claims "
+                "SET owner_id=?, claimed_at=?, lease_expires_at=?, claim_epoch=claim_epoch+1 "
+                "WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=? AND lease_expires_at=?",
+                (owner_id, when, (datetime.fromisoformat(when) + _ROLLBACK_CLAIM_LEASE).isoformat(), header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, claim["owner_id"], claim["lease_expires_at"]),
+            )
+            if updated.rowcount != 1:
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+            return True
+        if claim is not None:
+            claim_completed = any(
+                item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)
+                and item.plan_step_ordinal == claim["plan_step_ordinal"]
+                and item.step_digest == claim["step_digest"]
+                for item in chain
+            )
+            if claim_completed:
+                store._connection.execute("DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?", (header.execution_id,))
+            else:
+                raise ValueError("rollback claim metadata is not bound to the verified chain")
         if not frontier or frontier[0] != requested:
             if (requested.plan_step_ordinal, requested.rollback.step_digest) in done:
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             raise ValueError("requested rollback is outside the verified frontier")
+        store._connection.execute(
+            "INSERT INTO backup_provisioning_execution_rollback_claims "
+            "(execution_id, plan_step_ordinal, step_digest, owner_id, claimed_at, lease_expires_at, claim_epoch) VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id, when, (datetime.fromisoformat(when) + _ROLLBACK_CLAIM_LEASE).isoformat()),
+        )
         try:
             _append(store, header, len(chain), requested, CheckpointEvent.ROLLBACK_STARTED, when, rollback=True)
         except BaseException as error:
+            current = store.load_backup_execution_checkpoints(header.execution_id)
+            if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED or current[-1].plan_step_ordinal != requested.plan_step_ordinal or current[-1].step_digest != requested.rollback.step_digest:
+                raise
             # _append may have durably inserted the immutable row before an
             # injected crash is raised by a test/instrumentation wrapper.
-            # Let the transaction commit that claim, then preserve the crash.
+            # Commit the exact claim metadata with it, then preserve the crash.
             deferred_error = error
     if deferred_error is not None:
         raise deferred_error

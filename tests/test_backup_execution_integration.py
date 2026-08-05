@@ -117,6 +117,7 @@ def _execution_time_at_or_after_approval(store_path: str, plan_id: str) -> str:
 
 def test_exact_manifest_phase_order_and_arguments_are_used(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
     adapter = RecordingAdapter()
     runner = Runner()
 
@@ -201,6 +202,63 @@ def test_completed_rollback_pure_loser_performs_no_mutation_or_adapter_call(tmp_
     assert loser["host_mutation_performed"] is False
     assert loser["host_mutation_uncertain"] is False
     assert loser_adapter.calls == []
+
+
+def test_concurrent_rollback_pure_loser_uses_zero_mutation_snapshot(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    original_rollback = execution._rollback
+
+    def stop_before_rollback(*args, **kwargs):
+        raise BaseException("seed exact failed tail")
+
+    monkeypatch.setattr(execution, "_rollback", stop_before_rollback)
+    with pytest.raises(BaseException, match="seed exact failed tail"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_rollback", original_rollback)
+
+    caller_a_ready = threading.Event()
+    release_a = threading.Event()
+    original_claim = execution._claim_rollback
+    adapter_a = RecordingAdapter()
+    adapter_b = RecordingAdapter()
+    results: dict[str, object] = {}
+
+    def pause_a(store, header, requested, when, owner_id):
+        if threading.current_thread().name == "rollback-loser" and not caller_a_ready.is_set():
+            caller_a_ready.set()
+            assert release_a.wait(timeout=10)
+        return original_claim(store, header, requested, when, owner_id)
+
+    monkeypatch.setattr(execution, "_claim_rollback", pause_a)
+
+    def run_a() -> None:
+        results["a"] = execute_plan(store_path, plan.plan_id, adapter_a, acceptance_runner=Runner(wrong_runtime=True))
+
+    def run_b() -> None:
+        results["b"] = execute_plan(store_path, plan.plan_id, adapter_b, acceptance_runner=Runner(wrong_runtime=True))
+
+    caller_a = threading.Thread(target=run_a, name="rollback-loser")
+    caller_b = threading.Thread(target=run_b, name="rollback-winner")
+    caller_a.start()
+    assert caller_a_ready.wait(timeout=10)
+    caller_b.start()
+    caller_b.join(timeout=10)
+    assert not caller_b.is_alive()
+    release_a.set()
+    caller_a.join(timeout=10)
+    assert not caller_a.is_alive()
+
+    loser = results["a"]
+    assert loser["status"] == "rolled_back"
+    assert loser["mutation_performed"] is False
+    assert loser["host_mutation_performed"] is False
+    assert loser["host_mutation_uncertain"] is False
+    assert adapter_a.calls == []
+    assert len(adapter_b.calls) == len(plan.rollback_steps)
+    assert [step.operation for step in adapter_b.calls] == [step.operation for step in plan.rollback_steps]
 
 
 def test_rollback_owner_retains_prior_changed_attribution_when_next_is_claimed(tmp_path: Path, monkeypatch) -> None:
@@ -303,6 +361,70 @@ def test_rollback_does_not_swallow_unrelated_tamper_error_as_contention(tmp_path
     monkeypatch.setattr(execution, "_claim_rollback", unrelated_claim_error)
     with pytest.raises(ValueError, match="persistence invariant"):
         continue_execution(store_path, execution_id_for(store_path, plan.plan_id), RecordingAdapter(), Runner(wrong_runtime=True))
+
+
+def test_interrupted_durable_rollback_claim_is_replayed_after_lease_expiry(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("crash after durable rollback claim")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="crash after durable rollback claim"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+
+    adapter = RecordingAdapter()
+    view = continue_execution(
+        store_path,
+        execution_id_for(store_path, plan.plan_id),
+        adapter,
+        Runner(wrong_runtime=True),
+        now=(datetime.fromisoformat(execution_time) + timedelta(seconds=61)).isoformat(),
+    )
+    assert view.rollback_status == "completed"
+    assert [step.operation for step in adapter.calls] == [step.operation for step in plan.rollback_steps]
+
+
+def test_live_rollback_claim_contends_without_duplicate_adapter_call(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("live owner paused after claim")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="live owner paused after claim"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+        continue_execution(
+            store_path,
+            execution_id_for(store_path, plan.plan_id),
+            adapter,
+            Runner(wrong_runtime=True),
+            now=(datetime.fromisoformat(execution_time) + timedelta(seconds=1)).isoformat(),
+        )
+    assert adapter.calls == []
 
 
 def test_typed_execute_plan_delegates_to_runner_coordinator(tmp_path: Path) -> None:

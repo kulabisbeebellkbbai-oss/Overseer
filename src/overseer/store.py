@@ -747,6 +747,16 @@ class SQLiteStore:
                 UNIQUE(execution_id, checkpoint_ordinal),
                 FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
             );
+            CREATE TABLE IF NOT EXISTS backup_provisioning_execution_rollback_claims (
+                execution_id TEXT PRIMARY KEY,
+                plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+                step_digest TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            );
             CREATE TRIGGER IF NOT EXISTS backup_execution_headers_no_update
             BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS backup_execution_headers_no_delete

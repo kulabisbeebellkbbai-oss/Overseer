@@ -113,3 +113,12 @@ Baseline qualification: Overseer focused approval tests passed. Roadex timeout-o
 
 No deployment, restart, protected-host mutation, publication, approval action,
 or provisioning execution is authorized by this source milestone.
+
+- Capability C Task 1/C1 — durable execution contracts: complete and
+  release-reviewed at `872470b4a890ed275d6247dd820e1da736d29bba`.
+  - Focused execution tests: 38 passed.
+  - Combined compatibility tests: 476 passed.
+  - Both Terra reviews: APPROVED.
+  - Final Sol security review: APPROVED; no findings.
+  - No live actions were performed.
+  - Task 2 — resumable phase coordinator — is next.

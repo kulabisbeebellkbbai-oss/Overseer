@@ -40,3 +40,44 @@ tuple as `committed`. Strict reads and startup quarantine are unchanged.
 
 No live services, deployment, restart, push, approval, or provisioning action
 was performed.
+
+## Final correction addendum: directory close after durable fsync
+
+The Roadex review correction addressed the remaining distinction between the
+parent-directory fsync durability boundary and a later directory-handle close
+exception. A successful `syncDirectory()` is now treated as durable; a
+subsequent `closeDirectory()` failure is propagated as its original generic
+error for observability, while `commitAuthoritativeRegistration` reconciles an
+exact authoritative tuple as `committed`. Parent-directory synchronization
+failures retain the typed indeterminate result. The unique same-directory
+exclusive no-follow `0600` temporary-file lifecycle and no-post-rename-unlink
+guarantees are unchanged.
+
+TDD evidence:
+
+- RED: `npm test -- --run tests/statePersistence.test.ts -t 'reconciles an exact registration as committed after directory fsync and close failure' --pool=forks --maxWorkers=1` failed because the injected close error was wrapped as `JsonPersistenceDurabilityError`, and the exact error was not observable.
+- GREEN: the same regression passed after the correction; the complete
+  `tests/statePersistence.test.ts` file passed 39/39.
+
+Exact Roadex verification:
+
+```text
+npm test -- --run tests/approvalCoordinator.test.ts tests/approvalWorkflowHost.test.ts tests/approvalWorkflowTimeoutRace.test.ts tests/approvalLifecycleIntegration.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalStatusProvider.test.ts tests/sessionService.test.ts tests/statePersistence.test.ts tests/approvalRegistrationCommitIntegration.test.ts tests/overseerApprovalStageTransport.test.ts --pool=forks --maxWorkers=1
+10 files passed, 264 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed (TypeScript build and Vite production build)
+
+git diff --check
+passed
+
+npm test -- --pool=forks --maxWorkers=1
+55 files passed, 579 tests passed
+```
+
+Roadex final correction SHA: `6c5b27e6284d07f56f9062e88881ad63eab22418`.
+No live services, deployment, restart, push, approval, or provisioning action
+was performed.

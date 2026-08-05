@@ -368,6 +368,8 @@ def test_interrupted_durable_rollback_claim_is_replayed_after_lease_expiry(tmp_p
 
     store_path, plan, _bundle = _approved(tmp_path)
     execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    claim_clock = datetime.fromisoformat(execution_time)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: claim_clock.isoformat())
     original_append = execution._append
     interrupted = {"value": False}
 
@@ -384,15 +386,59 @@ def test_interrupted_durable_rollback_claim_is_replayed_after_lease_expiry(tmp_p
     monkeypatch.setattr(execution, "_append", original_append)
 
     adapter = RecordingAdapter()
+    expired_clock = claim_clock + timedelta(seconds=61)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: expired_clock.isoformat())
     view = continue_execution(
         store_path,
         execution_id_for(store_path, plan.plan_id),
         adapter,
         Runner(wrong_runtime=True),
-        now=(datetime.fromisoformat(execution_time) + timedelta(seconds=61)).isoformat(),
+        now=expired_clock.isoformat(),
     )
     assert view.rollback_status == "completed"
     assert [step.operation for step in adapter.calls] == [step.operation for step in plan.rollback_steps]
+
+
+def test_rollback_lease_clock_is_independent_of_stale_or_future_evidence_time(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    claim_clock = datetime.fromisoformat(execution_time) + timedelta(seconds=100)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: claim_clock.isoformat())
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("crash after trusted rollback claim")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="crash after trusted rollback claim"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+
+    with SQLiteStore(store_path) as store:
+        claim = store._connection.execute(
+            "SELECT claimed_at, lease_expires_at FROM backup_provisioning_execution_rollback_claims"
+        ).fetchone()
+    assert claim["claimed_at"] == claim_clock.isoformat()
+    assert claim["lease_expires_at"] == (claim_clock + timedelta(seconds=30)).isoformat()
+
+    evidence_future = claim_clock + timedelta(hours=1)
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+        continue_execution(
+            store_path,
+            execution_id_for(store_path, plan.plan_id),
+            adapter,
+            Runner(wrong_runtime=True),
+            now=evidence_future.isoformat(),
+        )
+    assert adapter.calls == []
 
 
 def test_live_rollback_claim_contends_without_duplicate_adapter_call(tmp_path: Path, monkeypatch) -> None:

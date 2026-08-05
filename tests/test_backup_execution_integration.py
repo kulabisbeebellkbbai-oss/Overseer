@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import hashlib
+import multiprocessing
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -100,6 +103,18 @@ class Runner:
             "ACCEPTANCE_PASSED" if self.passed else "ACCEPTANCE_FAILED",
             "sha256:" + "a" * 64,
         )
+
+
+def _owner_lock_process(path: str, execution_id: str, ready, release, crash: bool) -> None:
+    from types import SimpleNamespace
+    from overseer.backup_execution import _RollbackOwnerLock
+
+    lock = _RollbackOwnerLock.acquire(SimpleNamespace(path=Path(path)), execution_id)
+    ready.set()
+    if crash:
+        os._exit(0)
+    release.wait(timeout=10)
+    lock.release()
 
 
 def _approved(tmp_path: Path):
@@ -471,6 +486,36 @@ def test_live_rollback_claim_contends_without_duplicate_adapter_call(tmp_path: P
     assert adapter.calls == []
 
 
+def test_crash_after_durable_rollback_completion_allows_immediate_resume(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    rollback_operations = {step.operation for step in plan.rollback_steps}
+    adapter = RecordingAdapter()
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def crash_after_completion(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_COMPLETED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("crash after durable rollback completion")
+        return result
+
+    monkeypatch.setattr(execution, "_append", crash_after_completion)
+    with pytest.raises(BaseException, match="crash after durable rollback completion"):
+        start_execution(store_path, plan.plan_id, adapter, Runner(wrong_runtime=True))
+    monkeypatch.setattr(execution, "_append", original_append)
+    before_resume = len(adapter.calls)
+    view = continue_execution(
+        store_path, execution_id_for(store_path, plan.plan_id), adapter, Runner(wrong_runtime=True)
+    )
+    resumed_calls = adapter.calls[before_resume:]
+    assert view.rollback_status == "completed"
+    assert sum(step.operation in rollback_operations for step in resumed_calls) == len(plan.rollback_steps) - 1
+    assert sum(step.operation == plan.rollback_steps[0].operation for step in resumed_calls) == 0
+
+
 def test_rollback_completion_rejects_takeover_at_owner_boundary(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
 
@@ -611,27 +656,91 @@ def test_live_owner_lock_prevents_expired_lease_takeover_during_adapter_call(tmp
     assert sum(item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED) for item in checkpoints) == len(plan.rollback_steps)
 
 
-@pytest.mark.parametrize("artifact_kind", ["symlink", "wrong_mode"])
-def test_rollback_owner_lock_rejects_unsafe_stable_artifact(tmp_path: Path, artifact_kind: str) -> None:
-    import hashlib
+def test_rollback_owner_lock_is_kernel_fenced_without_replaceable_artifact(tmp_path: Path) -> None:
     from types import SimpleNamespace
     from overseer.backup_execution import _RollbackOwnerLock
 
     store = SimpleNamespace(path=tmp_path / "state.sqlite3")
     execution_id = "execution.lock.test"
     lock_path = Path(f"{store.path}.rollback-owner-{hashlib.sha256(execution_id.encode()).hexdigest()}.lock")
-    if artifact_kind == "symlink":
-        target = tmp_path / "target.lock"
-        target.touch()
-        target.chmod(0o600)
-        lock_path.symlink_to(target)
-        with pytest.raises(OSError):
+    with _RollbackOwnerLock.acquire(store, execution_id):
+        assert not lock_path.exists()
+        with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
             _RollbackOwnerLock.acquire(store, execution_id)
-    else:
-        lock_path.touch()
-        lock_path.chmod(0o644)
-        with pytest.raises(ValueError, match="unsafe"):
-            _RollbackOwnerLock.acquire(store, execution_id)
+    assert not lock_path.exists()
+
+
+def test_rollback_owner_lock_survives_separate_process_and_releases_on_exit(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from overseer.backup_execution import _RollbackOwnerLock
+
+    store = SimpleNamespace(path=tmp_path / "state.sqlite3")
+    execution_id = "execution.process.lock"
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    release = context.Event()
+    worker = context.Process(target=_owner_lock_process, args=(str(store.path), execution_id, ready, release, False))
+    worker.start()
+    assert ready.wait(timeout=10)
+    with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+        _RollbackOwnerLock.acquire(store, execution_id)
+    release.set()
+    worker.join(timeout=10)
+    assert worker.exitcode == 0
+    with _RollbackOwnerLock.acquire(store, execution_id):
+        pass
+
+    crashed_ready = context.Event()
+    crashed = context.Process(target=_owner_lock_process, args=(str(store.path), execution_id, crashed_ready, release, True))
+    crashed.start()
+    assert crashed_ready.wait(timeout=10)
+    with pytest.raises(ValueError, match="EXECUTION_IN_PROGRESS"):
+        _RollbackOwnerLock.acquire(store, execution_id)
+    crashed.join(timeout=10)
+    assert crashed.exitcode == 0
+    with _RollbackOwnerLock.acquire(store, execution_id):
+        pass
+
+
+def test_rollback_claim_releases_owner_lock_when_commit_exit_raises(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    original_rollback = execution._rollback
+
+    def seed_interrupted(*args, **kwargs):
+        raise BaseException("seed exact failed tail")
+
+    monkeypatch.setattr(execution, "_rollback", seed_interrupted)
+    with pytest.raises(BaseException, match="seed exact failed tail"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True))
+    monkeypatch.setattr(execution, "_rollback", original_rollback)
+
+    from overseer.store import SQLiteStore
+    original_commit = SQLiteStore._commit
+
+    def commit_then_raise(store):
+        original_commit(store)
+        if store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_execution_rollback_claims"
+        ).fetchone()[0]:
+            raise RuntimeError("commit exit failure")
+
+    monkeypatch.setattr(SQLiteStore, "_commit", commit_then_raise)
+    with pytest.raises(RuntimeError, match="commit exit failure"):
+        continue_execution(
+            store_path, execution_id_for(store_path, plan.plan_id), RecordingAdapter(), Runner(wrong_runtime=True)
+        )
+    monkeypatch.setattr(SQLiteStore, "_commit", original_commit)
+    with SQLiteStore(store_path) as store:
+        claim = store._connection.execute(
+            "SELECT owner_id, claim_epoch FROM backup_provisioning_execution_rollback_claims"
+        ).fetchone()
+        from types import SimpleNamespace
+        from overseer.backup_execution import _RollbackOwnerLock
+        with _RollbackOwnerLock.acquire(SimpleNamespace(path=Path(store_path)), execution_id_for(store_path, plan.plan_id)):
+            pass
+    assert claim["claim_epoch"] == 1
 
 
 def test_typed_execute_plan_delegates_to_runner_coordinator(tmp_path: Path) -> None:

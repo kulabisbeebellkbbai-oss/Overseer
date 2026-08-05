@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1"
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "donuthole_encrypted_backup_provisioning_v1"
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "resource_id": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "root_id": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "policy_revision": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "[0-9a-f]{40}\\Z"
+    },
+    "requested_by": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "reason": {
+      "type": "string",
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "supersedes_plan_id": {
+      "type": "string",
+      "pattern": "(?:^$|^\\S(?:.*\\S)?$)"
+    }
+  },
+  "required": [
+    "schema_version",
+    "request_id",
+    "plan_id",
+    "kind",
+    "project_id",
+    "resource_id",
+    "root_id",
+    "policy_revision",
+    "source_commit",
+    "requested_by",
+    "reason",
+    "supersedes_plan_id"
+  ],
+  "examples": [
+    {
+      "schema_version": "1",
+      "request_id": "request.fixture.v1",
+      "plan_id": "backup-provision.fixture.v1",
+      "kind": "donuthole_encrypted_backup_provisioning_v1",
+      "project_id": "project.donuthole",
+      "resource_id": "storage.donuthole",
+      "root_id": "backup-root",
+      "policy_revision": "1",
+      "source_commit": "0123456789abcdef0123456789abcdef01234567",
+      "requested_by": "fixture",
+      "reason": "Validate the canonical typed provisioning intent fixture.",
+      "supersedes_plan_id": ""
+    }
+  ]
+}

@@ -453,6 +453,7 @@ class SQLiteStore:
         expected = {
             "backup_provisioning_execution_headers": (("execution_id", "TEXT", 0, 1, None), ("plan_id", "TEXT", 1, 0, None), ("plan_digest", "TEXT", 1, 0, None), ("bundle_id", "TEXT", 1, 0, None), ("bundle_digest", "TEXT", 1, 0, None), ("approved_runtime_digest", "TEXT", 1, 0, None), ("approved_config_digest", "TEXT", 1, 0, None), ("header_digest", "TEXT", 1, 0, None), ("payload", "TEXT", 1, 0, None)),
             "backup_provisioning_execution_checkpoints": (("checkpoint_id", "TEXT", 0, 1, None), ("execution_id", "TEXT", 1, 0, None), ("checkpoint_ordinal", "INTEGER", 1, 0, None), ("phase_ordinal", "INTEGER", 1, 0, None), ("plan_step_ordinal", "INTEGER", 1, 0, None), ("step_digest", "TEXT", 1, 0, None), ("previous_digest", "TEXT", 1, 0, None), ("checkpoint_digest", "TEXT", 1, 0, None), ("payload", "TEXT", 1, 0, None)),
+            "backup_provisioning_execution_rollback_claims": (("execution_id", "TEXT", 0, 1, None), ("plan_step_ordinal", "INTEGER", 1, 0, None), ("step_digest", "TEXT", 1, 0, None), ("owner_id", "TEXT", 1, 0, None), ("claimed_at", "TEXT", 1, 0, None), ("lease_expires_at", "TEXT", 1, 0, None), ("claim_epoch", "INTEGER", 1, 0, None)),
         }
         expected_sql = {
             "backup_provisioning_execution_headers": """CREATE TABLE backup_provisioning_execution_headers (
@@ -479,6 +480,16 @@ class SQLiteStore:
                 UNIQUE(execution_id, checkpoint_ordinal),
                 FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
             )""",
+            "backup_provisioning_execution_rollback_claims": """CREATE TABLE backup_provisioning_execution_rollback_claims (
+                execution_id TEXT PRIMARY KEY,
+                plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+                step_digest TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            )""",
         }
         for table, column_specs in expected.items():
             rows = self._connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -490,16 +501,20 @@ class SQLiteStore:
             ).fetchone()
             if row is None or " ".join(str(row[0]).split()).lower() != " ".join(expected_sql[table].split()).lower():
                 raise ValueError(f"malformed backup execution table definition: {table}")
-        foreign_keys = tuple(tuple(str(value) for value in row) for row in self._connection.execute("PRAGMA foreign_key_list(backup_provisioning_execution_checkpoints)").fetchall())
-        if len(foreign_keys) != 1 or foreign_keys[0][2:7] != ("backup_provisioning_execution_headers", "execution_id", "execution_id", "RESTRICT", "RESTRICT"):
-            raise ValueError("malformed backup execution foreign key")
+        expected_foreign_key = ("backup_provisioning_execution_headers", "execution_id", "execution_id", "RESTRICT", "RESTRICT")
+        for table in ("backup_provisioning_execution_checkpoints", "backup_provisioning_execution_rollback_claims"):
+            foreign_keys = tuple(tuple(str(value) for value in row) for row in self._connection.execute(f"PRAGMA foreign_key_list({table})").fetchall())
+            if len(foreign_keys) != 1 or foreign_keys[0][2:7] != expected_foreign_key:
+                raise ValueError("malformed backup execution foreign key")
         expected_indexes = {
             "backup_provisioning_execution_headers": {("execution_id",), ("plan_id",), ("plan_digest",), ("bundle_id",), ("bundle_digest",), ("header_digest",)},
             "backup_provisioning_execution_checkpoints": {("checkpoint_id",), ("checkpoint_digest",), ("execution_id", "checkpoint_ordinal")},
+            "backup_provisioning_execution_rollback_claims": {("execution_id",)},
         }
         expected_origins = {
             "backup_provisioning_execution_headers": {("execution_id",): "pk", ("plan_id",): "u", ("plan_digest",): "u", ("bundle_id",): "u", ("bundle_digest",): "u", ("header_digest",): "u"},
             "backup_provisioning_execution_checkpoints": {("checkpoint_id",): "pk", ("checkpoint_digest",): "u", ("execution_id", "checkpoint_ordinal"): "u"},
+            "backup_provisioning_execution_rollback_claims": {("execution_id",): "pk"},
         }
         for table, required_indexes in expected_indexes.items():
             rows = self._connection.execute(f"PRAGMA index_list({table})").fetchall()
@@ -516,14 +531,15 @@ class SQLiteStore:
                 actual_indexes.add(columns)
             if actual_indexes != required_indexes:
                 raise ValueError("malformed backup execution schema indexes")
-        triggers = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", tuple(expected)).fetchall()}
+        immutable_tables = ("backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints")
+        triggers = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", immutable_tables).fetchall()}
         expected_trigger_sql = {
             "backup_execution_headers_no_update": "CREATE TRIGGER backup_execution_headers_no_update BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END",
             "backup_execution_headers_no_delete": "CREATE TRIGGER backup_execution_headers_no_delete BEFORE DELETE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END",
             "backup_execution_checkpoints_no_update": "CREATE TRIGGER backup_execution_checkpoints_no_update BEFORE UPDATE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END",
             "backup_execution_checkpoints_no_delete": "CREATE TRIGGER backup_execution_checkpoints_no_delete BEFORE DELETE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END",
         }
-        trigger_rows = self._connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", tuple(expected)).fetchall()
+        trigger_rows = self._connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", immutable_tables).fetchall()
         if {str(row[0]) for row in trigger_rows} != set(expected_trigger_sql) or any(" ".join(str(row[1]).split()) != " ".join(sql.split()) for row in trigger_rows for name, sql in expected_trigger_sql.items() if str(row[0]) == name):
             raise ValueError("backup execution immutability triggers are unavailable")
 

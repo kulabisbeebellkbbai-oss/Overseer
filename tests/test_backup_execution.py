@@ -619,7 +619,28 @@ def test_typed_execution_authority_schema_corruption_is_rejected_on_reopen(tmp_p
                 "DROP TABLE backup_provisioning_plan_execution_modes"
             )
         store._connection.commit()
-    with pytest.raises(ValueError, match="typed execution authority|immutability"):
+        with pytest.raises(ValueError, match="typed execution authority|immutability"):
+            OverseerStore(path)
+
+
+def test_rollback_claim_schema_corruption_is_rejected_on_reopen(tmp_path) -> None:
+    path = tmp_path / "rollback-claim-schema.sqlite3"
+    with OverseerStore(path) as store:
+        store._connection.execute("DROP TABLE backup_provisioning_execution_rollback_claims")
+        store._connection.execute(
+            """
+            CREATE TABLE backup_provisioning_execution_rollback_claims (
+                execution_id TEXT PRIMARY KEY,
+                plan_step_ordinal INTEGER NOT NULL,
+                step_digest TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL
+            )
+            """
+        )
+        store._connection.commit()
+    with pytest.raises(ValueError, match="malformed backup execution"):
         OverseerStore(path)
 
 

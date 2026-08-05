@@ -1215,18 +1215,30 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
             code = "ROLLBACK_FAILED"
             evidence = ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(rollback_step.operation, False, code), True)
             event = CheckpointEvent.ROLLBACK_FAILED
-        current = store.load_backup_execution_checkpoints(header.execution_id)
-        verify_backup_execution_chain(header, current)
-        if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED:
-            raise ValueError("owned rollback claim is missing")
-        claim = _load_rollback_claim(store, header.execution_id)
-        if claim is None or claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest or claim["owner_id"] != owner_id:
-            raise ValueError("owned rollback claim owner changed")
-        claimed = next(step for phase in header.phases for step in phase.steps if step.plan_step_ordinal == current[-1].plan_step_ordinal)
-        if claimed != requested or current[-1].step_digest != requested.rollback.step_digest:
-            raise ValueError("owned rollback claim identity changed")
-        _append(store, header, len(current), requested, event, when, evidence=evidence, rollback=True)
-        _release_rollback_claim(store, header, requested, owner_id)
+        deferred_error = None
+        with store.agent_transaction():
+            current = store.load_backup_execution_checkpoints(header.execution_id)
+            verify_backup_execution_chain(header, current)
+            if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED:
+                raise ValueError("owned rollback claim is missing")
+            claim = _load_rollback_claim(store, header.execution_id)
+            if claim is None or claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest or claim["owner_id"] != owner_id:
+                raise ValueError("owned rollback claim owner changed")
+            claimed = next(step for phase in header.phases for step in phase.steps if step.plan_step_ordinal == current[-1].plan_step_ordinal)
+            if claimed != requested or current[-1].step_digest != requested.rollback.step_digest:
+                raise ValueError("owned rollback claim identity changed")
+            try:
+                _append(store, header, len(current), requested, event, when, evidence=evidence, rollback=True)
+            except BaseException as error:
+                completed = store.load_backup_execution_checkpoints(header.execution_id)
+                if not completed or completed[-1].event is not event or completed[-1].plan_step_ordinal != requested.plan_step_ordinal or completed[-1].step_digest != requested.rollback.step_digest:
+                    raise
+                _release_rollback_claim_locked(store, header, requested, owner_id)
+                deferred_error = error
+            else:
+                _release_rollback_claim_locked(store, header, requested, owner_id)
+        if deferred_error is not None:
+            raise deferred_error
 
 
 def _rollback_claim_expired(lease_expires_at: str, when: str) -> bool:
@@ -1262,24 +1274,18 @@ def _load_rollback_claim(store, execution_id: str):
     return row
 
 
-def _release_rollback_claim(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, owner_id: str) -> None:
-    with store.agent_transaction():
-        chain = store.load_backup_execution_checkpoints(header.execution_id)
-        verify_backup_execution_chain(header, chain)
-        claim = _load_rollback_claim(store, header.execution_id)
-        if claim is None:
-            return
-        if claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest:
-            # A later invocation may already own the next exact rollback.
-            return
-        if claim["owner_id"] != owner_id:
-            raise ValueError("rollback claim owner changed before release")
-        if not chain or chain[-1].plan_step_ordinal != requested.plan_step_ordinal or chain[-1].step_digest != requested.rollback.step_digest or chain[-1].event not in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED):
-            raise ValueError("rollback claim completion identity is invalid")
-        store._connection.execute(
-            "DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=?",
-            (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id),
-        )
+def _release_rollback_claim_locked(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, owner_id: str) -> None:
+    claim = _load_rollback_claim(store, header.execution_id)
+    if claim is None:
+        return
+    if claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest:
+        raise ValueError("rollback claim completion identity is invalid")
+    if claim["owner_id"] != owner_id:
+        raise ValueError("rollback claim owner changed before release")
+    store._connection.execute(
+        "DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=?",
+        (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id),
+    )
 
 
 def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str) -> bool:
@@ -1287,9 +1293,9 @@ def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: Execu
     if requested.rollback is None:
         raise ValueError("rollback is not approved for this operation")
     deferred_error = None
-    claim_now = _rollback_claim_clock()
-    claim_expires = (datetime.fromisoformat(claim_now) + _ROLLBACK_CLAIM_LEASE).isoformat()
     with store.agent_transaction():
+        claim_now = _rollback_claim_clock()
+        claim_expires = (datetime.fromisoformat(claim_now) + _ROLLBACK_CLAIM_LEASE).isoformat()
         chain = store.load_backup_execution_checkpoints(header.execution_id)
         verify_backup_execution_chain(header, chain)
         _verify_immutable_cleanup_identity(store, header, chain)

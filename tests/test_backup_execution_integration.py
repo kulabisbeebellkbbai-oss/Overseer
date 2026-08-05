@@ -266,29 +266,27 @@ def test_rollback_owner_retains_prior_changed_attribution_when_next_is_claimed(t
     import overseer.backup_provisioning as provisioning
 
     store_path, plan, _bundle = _approved(tmp_path)
-    first_rollback_completed = threading.Event()
+    owner_before_next_claim = threading.Event()
     next_rollback_claimed = threading.Event()
     release_owner = threading.Event()
     owner_adapter = RecordingAdapter()
     contender_adapter = RecordingAdapter()
     results: dict[str, object] = {}
     captured: dict[str, object] = {}
-    original_append = execution._append
+    original_claim = execution._claim_rollback
     original_public = provisioning._typed_execution_public
 
     rollback_operations = {step.operation for step in plan.rollback_steps}
 
-    def observe_append(store, header, ordinal, identity, event, when, **kwargs):
-        result = original_append(store, header, ordinal, identity, event, when, **kwargs)
-        if (
-            threading.current_thread().name == "rollback-owner"
-            and event is CheckpointEvent.ROLLBACK_COMPLETED
-            and identity.rollback is not None
-            and not first_rollback_completed.is_set()
-        ):
-            first_rollback_completed.set()
-            assert release_owner.wait(timeout=10)
-        return result
+    claim_count = {"owner": 0}
+
+    def pause_before_next_claim(store, header, requested, when, owner_id):
+        if threading.current_thread().name == "rollback-owner":
+            claim_count["owner"] += 1
+            if claim_count["owner"] == 2:
+                owner_before_next_claim.set()
+                assert release_owner.wait(timeout=10)
+        return original_claim(store, header, requested, when, owner_id)
 
     def observe_public(plan_arg, view, checkpoints, **kwargs):
         if threading.current_thread().name == "rollback-owner":
@@ -300,7 +298,7 @@ def test_rollback_owner_retains_prior_changed_attribution_when_next_is_claimed(t
             next_rollback_claimed.set()
         return RecordingAdapter.execute(contender_adapter, step)
 
-    monkeypatch.setattr(execution, "_append", observe_append)
+    monkeypatch.setattr(execution, "_claim_rollback", pause_before_next_claim)
     monkeypatch.setattr(provisioning, "_typed_execution_public", observe_public)
     contender_adapter.execute = observe_execute
 
@@ -317,7 +315,7 @@ def test_rollback_owner_retains_prior_changed_attribution_when_next_is_claimed(t
     owner = threading.Thread(target=run_owner, name="rollback-owner")
     contender = threading.Thread(target=run_contender, name="rollback-contender")
     owner.start()
-    assert first_rollback_completed.wait(timeout=10)
+    assert owner_before_next_claim.wait(timeout=10)
     contender.start()
     assert next_rollback_claimed.wait(timeout=10)
     release_owner.set()
@@ -471,6 +469,57 @@ def test_live_rollback_claim_contends_without_duplicate_adapter_call(tmp_path: P
             now=(datetime.fromisoformat(execution_time) + timedelta(seconds=1)).isoformat(),
         )
     assert adapter.calls == []
+
+
+def test_rollback_completion_rejects_takeover_at_owner_boundary(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    claim_clock = datetime.fromisoformat(execution_time)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: claim_clock.isoformat())
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("crash before completion boundary")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="crash before completion boundary"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+    expired_clock = claim_clock + timedelta(seconds=61)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: expired_clock.isoformat())
+
+    takeover = {"value": False}
+
+    def takeover_before_completion(store, header, ordinal, identity, event, when, **kwargs):
+        if event is CheckpointEvent.ROLLBACK_COMPLETED and not takeover["value"]:
+            takeover["value"] = True
+            store._connection.execute(
+                "UPDATE backup_provisioning_execution_rollback_claims SET owner_id=? WHERE execution_id=?",
+                ("stale-takeover", header.execution_id),
+            )
+        return original_append(store, header, ordinal, identity, event, when, **kwargs)
+
+    monkeypatch.setattr(execution, "_append", takeover_before_completion)
+    adapter = RecordingAdapter()
+    with pytest.raises(ValueError, match="owner changed"):
+        continue_execution(
+            store_path,
+            execution_id_for(store_path, plan.plan_id),
+            adapter,
+            Runner(wrong_runtime=True),
+            now=execution_time,
+        )
+    assert sum(step.operation in {item.operation for item in plan.rollback_steps} for step in adapter.calls) == 1
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(execution_id_for(store_path, plan.plan_id))
+        assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED
 
 
 def test_typed_execute_plan_delegates_to_runner_coordinator(tmp_path: Path) -> None:

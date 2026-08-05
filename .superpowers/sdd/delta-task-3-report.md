@@ -354,3 +354,8 @@ Commits:
 
 No main Roadex checkout, DonutHole checkout, live service/store, approval,
 deployment, gateway, firewall/IDS, or push was touched.
+
+Clarification: this addendum supersedes the earlier follow-up wording that
+described compensating persistence rollback after registration cancellation.
+The fence correction deliberately removes that best-effort rollback path; the
+earlier text is retained as historical evidence of the rejected design.

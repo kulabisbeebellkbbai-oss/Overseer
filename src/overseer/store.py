@@ -338,6 +338,9 @@ class SQLiteStore:
 
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA busy_timeout = 30000")
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        if self._connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise ValueError("SQLite foreign_keys must be enabled")
         try:
             # Overseer has a long-lived coordinator and API plus short-lived
             # CLI writers. WAL keeps readers from blocking the coordinator's
@@ -400,27 +403,46 @@ class SQLiteStore:
         return actual == required
 
     def _validate_backup_execution_schema(self) -> None:
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        if self._connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise ValueError("SQLite foreign_keys must be enabled")
         expected = {
-            "backup_provisioning_execution_headers": ("execution_id", "plan_id", "plan_digest", "bundle_id", "bundle_digest", "header_digest", "payload"),
-            "backup_provisioning_execution_checkpoints": ("checkpoint_id", "execution_id", "checkpoint_ordinal", "phase_ordinal", "plan_step_ordinal", "step_digest", "previous_digest", "checkpoint_digest", "payload"),
+            "backup_provisioning_execution_headers": (("execution_id", "TEXT", 0, 1, None), ("plan_id", "TEXT", 1, 0, None), ("plan_digest", "TEXT", 1, 0, None), ("bundle_id", "TEXT", 1, 0, None), ("bundle_digest", "TEXT", 1, 0, None), ("approved_runtime_digest", "TEXT", 1, 0, None), ("approved_config_digest", "TEXT", 1, 0, None), ("header_digest", "TEXT", 1, 0, None), ("payload", "TEXT", 1, 0, None)),
+            "backup_provisioning_execution_checkpoints": (("checkpoint_id", "TEXT", 0, 1, None), ("execution_id", "TEXT", 1, 0, None), ("checkpoint_ordinal", "INTEGER", 1, 0, None), ("phase_ordinal", "INTEGER", 1, 0, None), ("plan_step_ordinal", "INTEGER", 1, 0, None), ("step_digest", "TEXT", 1, 0, None), ("previous_digest", "TEXT", 1, 0, None), ("checkpoint_digest", "TEXT", 1, 0, None), ("payload", "TEXT", 1, 0, None)),
         }
-        for table, columns in expected.items():
-            actual = tuple(str(row[1]) for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall())
-            if actual != columns:
+        for table, column_specs in expected.items():
+            rows = self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+            actual = tuple((str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]), row[4]) for row in rows)
+            if actual != column_specs:
                 raise ValueError(f"malformed backup execution schema: {table}")
-        indexes = {str(row[1]) for row in self._connection.execute("PRAGMA index_list(backup_provisioning_execution_headers)").fetchall()}
-        indexes |= {str(row[1]) for row in self._connection.execute("PRAGMA index_list(backup_provisioning_execution_checkpoints)").fetchall()}
-        required_indexes = {
-            "sqlite_autoindex_backup_provisioning_execution_headers_1", "sqlite_autoindex_backup_provisioning_execution_headers_2",
-            "sqlite_autoindex_backup_provisioning_execution_headers_3", "sqlite_autoindex_backup_provisioning_execution_headers_4",
-            "sqlite_autoindex_backup_provisioning_execution_headers_5", "sqlite_autoindex_backup_provisioning_execution_headers_6",
-            "sqlite_autoindex_backup_provisioning_execution_checkpoints_1", "sqlite_autoindex_backup_provisioning_execution_checkpoints_2",
-            "sqlite_autoindex_backup_provisioning_execution_checkpoints_3",
-        }
-        if not required_indexes <= indexes:
+        foreign_keys = tuple(tuple(str(value) for value in row) for row in self._connection.execute("PRAGMA foreign_key_list(backup_provisioning_execution_checkpoints)").fetchall())
+        if len(foreign_keys) != 1 or foreign_keys[0][2:7] != ("backup_provisioning_execution_headers", "execution_id", "execution_id", "RESTRICT", "RESTRICT"):
+            raise ValueError("malformed backup execution foreign key")
+        checkpoint_sql = str(self._connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='backup_provisioning_execution_checkpoints'").fetchone()[0])
+        normalized_checkpoint_sql = " ".join(checkpoint_sql.split()).lower()
+        for check in ("check (checkpoint_ordinal >= 0)", "check (phase_ordinal >= 0)", "check (plan_step_ordinal >= 0)"):
+            if check not in normalized_checkpoint_sql:
+                raise ValueError("malformed backup execution check constraints")
+        unique_tuples: dict[str, set[tuple[str, ...]]] = {}
+        for table in expected:
+            values: set[tuple[str, ...]] = set()
+            for row in self._connection.execute(f"PRAGMA index_list({table})").fetchall():
+                if int(row[2]) != 1:
+                    continue
+                name = str(row[1])
+                values.add(tuple(str(item[2]) for item in self._connection.execute(f"PRAGMA index_info({name})").fetchall()))
+            unique_tuples[table] = values
+        if unique_tuples["backup_provisioning_execution_headers"] != {("execution_id",), ("plan_id",), ("plan_digest",), ("bundle_id",), ("bundle_digest",), ("header_digest",)} or unique_tuples["backup_provisioning_execution_checkpoints"] != {("checkpoint_id",), ("checkpoint_digest",), ("execution_id", "checkpoint_ordinal")}:
             raise ValueError("malformed backup execution schema indexes")
         triggers = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", tuple(expected)).fetchall()}
-        if triggers != {"backup_execution_headers_no_update", "backup_execution_headers_no_delete", "backup_execution_checkpoints_no_update", "backup_execution_checkpoints_no_delete"}:
+        expected_trigger_sql = {
+            "backup_execution_headers_no_update": "CREATE TRIGGER backup_execution_headers_no_update BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END",
+            "backup_execution_headers_no_delete": "CREATE TRIGGER backup_execution_headers_no_delete BEFORE DELETE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END",
+            "backup_execution_checkpoints_no_update": "CREATE TRIGGER backup_execution_checkpoints_no_update BEFORE UPDATE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END",
+            "backup_execution_checkpoints_no_delete": "CREATE TRIGGER backup_execution_checkpoints_no_delete BEFORE DELETE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END",
+        }
+        trigger_rows = self._connection.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", tuple(expected)).fetchall()
+        if {str(row[0]) for row in trigger_rows} != set(expected_trigger_sql) or any(" ".join(str(row[1]).split()) != " ".join(sql.split()) for row in trigger_rows for name, sql in expected_trigger_sql.items() if str(row[0]) == name):
             raise ValueError("backup execution immutability triggers are unavailable")
 
     def close(self) -> None:
@@ -620,6 +642,8 @@ class SQLiteStore:
                 plan_digest TEXT NOT NULL UNIQUE,
                 bundle_id TEXT NOT NULL UNIQUE,
                 bundle_digest TEXT NOT NULL UNIQUE,
+                approved_runtime_digest TEXT NOT NULL,
+                approved_config_digest TEXT NOT NULL,
                 header_digest TEXT NOT NULL UNIQUE,
                 payload TEXT NOT NULL
             );
@@ -634,7 +658,7 @@ class SQLiteStore:
                 checkpoint_digest TEXT NOT NULL UNIQUE,
                 payload TEXT NOT NULL,
                 UNIQUE(execution_id, checkpoint_ordinal),
-                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id)
+                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
             );
             CREATE TRIGGER IF NOT EXISTS backup_execution_headers_no_update
             BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
@@ -2092,10 +2116,12 @@ class SQLiteStore:
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
 
-    def save_backup_execution_header(self, header: ProvisioningExecutionHeader) -> None:
-        """Save one immutable execution header with exact-replay idempotency."""
-        if not isinstance(header, ProvisioningExecutionHeader):
-            raise ValueError("backup execution header has the wrong type")
+    def save_backup_execution(self, header: ProvisioningExecutionHeader, checkpoint: ProvisioningCheckpoint) -> None:
+        """Atomically create an execution with its verified genesis checkpoint."""
+        if type(header) is not ProvisioningExecutionHeader or type(checkpoint) is not ProvisioningCheckpoint:
+            raise ValueError("backup execution creation requires exact DTO types")
+        if checkpoint.execution_id != header.execution_id or checkpoint.checkpoint_ordinal != 0 or checkpoint.previous_digest != header.header_digest:
+            raise ValueError("genesis checkpoint is not bound to header")
         with self.agent_transaction():
             payload = header_payload(header)
             existing = self._connection.execute(
@@ -2108,17 +2134,18 @@ class SQLiteStore:
                 if len(existing) != 1:
                     raise ValueError("backup execution header identity conflicts")
                 self._validate_backup_header_row(existing[0], header)
-                return
-            self._connection.execute(
-                "INSERT INTO backup_provisioning_execution_headers "
-                "(execution_id, plan_id, plan_digest, bundle_id, bundle_digest, header_digest, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (header.execution_id, header.plan_id, header.plan_digest, header.bundle_id, header.bundle_digest, header.header_digest, payload),
-            )
+            else:
+                self._connection.execute(
+                    "INSERT INTO backup_provisioning_execution_headers "
+                    "(execution_id, plan_id, plan_digest, bundle_id, bundle_digest, approved_runtime_digest, approved_config_digest, header_digest, payload) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (header.execution_id, header.plan_id, header.plan_digest, header.bundle_id, header.bundle_digest, header.approved_runtime_digest, header.approved_config_digest, header.header_digest, payload),
+                )
+            self._append_backup_execution_checkpoint_locked(checkpoint)
 
     def _validate_backup_header_row(self, row: sqlite3.Row, header: ProvisioningExecutionHeader) -> None:
-        expected = (header.execution_id, header.plan_id, header.plan_digest, header.bundle_id, header.bundle_digest, header.header_digest, header_payload(header))
-        actual = tuple(str(row[name]) for name in ("execution_id", "plan_id", "plan_digest", "bundle_id", "bundle_digest", "header_digest", "payload"))
+        expected = (header.execution_id, header.plan_id, header.plan_digest, header.bundle_id, header.bundle_digest, header.approved_runtime_digest, header.approved_config_digest, header.header_digest, header_payload(header))
+        actual = tuple(str(row[name]) for name in ("execution_id", "plan_id", "plan_digest", "bundle_id", "bundle_digest", "approved_runtime_digest", "approved_config_digest", "header_digest", "payload"))
         if actual != expected:
             raise ValueError("backup execution header is immutable or corrupt")
 
@@ -2145,7 +2172,7 @@ class SQLiteStore:
         return header
 
     def append_backup_execution_checkpoint(self, checkpoint: ProvisioningCheckpoint) -> None:
-        if not isinstance(checkpoint, ProvisioningCheckpoint):
+        if type(checkpoint) is not ProvisioningCheckpoint:
             raise ValueError("backup execution checkpoint has the wrong type")
         with self.agent_transaction():
             self._append_backup_execution_checkpoint_locked(checkpoint)
@@ -2211,26 +2238,6 @@ class SQLiteStore:
     def load_backup_execution_tail(self, execution_id: str) -> ProvisioningCheckpoint | None:
         checkpoints = self.load_backup_execution_checkpoints(execution_id)
         return checkpoints[-1] if checkpoints else None
-
-    def verify_backup_execution_chain(self, header: ProvisioningExecutionHeader, checkpoints: tuple[ProvisioningCheckpoint, ...]) -> str | None:
-        return verify_backup_execution_chain(header, checkpoints)
-
-    def derive_backup_execution_view(self, header: ProvisioningExecutionHeader, checkpoints: tuple[ProvisioningCheckpoint, ...]) -> ProvisioningExecutionView:
-        return derive_backup_execution_view(header, checkpoints)
-
-    def save_backup_execution_header_and_initial_checkpoint(
-        self, header: ProvisioningExecutionHeader, checkpoint: ProvisioningCheckpoint
-    ) -> None:
-        if checkpoint.execution_id != header.execution_id or checkpoint.checkpoint_ordinal != 0 or checkpoint.previous_digest != header.header_digest:
-            raise ValueError("initial backup checkpoint is not bound to header")
-        with self.agent_transaction():
-            self.save_backup_execution_header(header)
-            self._append_backup_execution_checkpoint_locked(checkpoint)
-
-    def save_backup_execution_with_initial_checkpoint(
-        self, header: ProvisioningExecutionHeader, checkpoint: ProvisioningCheckpoint
-    ) -> None:
-        self.save_backup_execution_header_and_initial_checkpoint(header, checkpoint)
 
     def save_backup_provisioning_plan_payload(self, plan_id: str, payload: str) -> None:
         """Persist one canonical staging source without committing an outer transaction."""

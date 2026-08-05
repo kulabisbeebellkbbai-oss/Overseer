@@ -70,7 +70,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
     previous = header.header_digest
     ordinal = 0
     attestation = RuntimeAttestation(PLAN_DIGEST, PLAN_DIGEST, BUNDLE_DIGEST, BUNDLE_DIGEST, "process.1")
-    acceptance = BehaviorAcceptance("contract.v1", True, "ACCEPTANCE_PASSED", CONTRACT_DIGEST)
+    acceptance = BehaviorAcceptance("contract.v1", CONTRACT_DIGEST, True, "ACCEPTANCE_PASSED", CONTRACT_DIGEST)
     for phase in header.phases:
         step = phase.steps[0]
         started = build_checkpoint(
@@ -78,7 +78,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
             checkpoint_ordinal=ordinal, previous_digest=previous, phase=phase.phase,
             phase_ordinal=phase.phase_ordinal, plan_step_ordinal=step.plan_step_ordinal,
             step_digest=step.step_digest, event=CheckpointEvent.STEP_STARTED,
-            observed_at=f"2026-08-05T12:01:{ordinal:02d}Z",
+            observed_at=f"2026-08-05T12:{1 + ordinal // 60:02d}:{ordinal % 60:02d}Z",
         )
         checkpoints.append(started)
         previous = started.checkpoint_digest
@@ -89,7 +89,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
             checkpoint_ordinal=ordinal, previous_digest=previous, phase=phase.phase,
             phase_ordinal=phase.phase_ordinal, plan_step_ordinal=step.plan_step_ordinal,
             step_digest=step.step_digest, event=CheckpointEvent.STEP_COMPLETED,
-            observed_at=f"2026-08-05T12:02:{ordinal:02d}Z", step_evidence=evidence,
+            observed_at=f"2026-08-05T12:{1 + ordinal // 60:02d}:{ordinal % 60:02d}Z", step_evidence=evidence,
             runtime_attestation=attestation if phase.phase is ExecutionPhase.ATTEST else None,
             behavior_acceptance=acceptance if phase.phase is ExecutionPhase.ACCEPT else None,
         )
@@ -152,23 +152,23 @@ def test_store_persists_v4_header_and_append_only_chain(tmp_path) -> None:
     checkpoints = _chain(header)
     assert CURRENT_SCHEMA_VERSION == 4
     with OverseerStore(tmp_path / "state.sqlite3") as store:
-        store.save_backup_execution_header(header)
-        store.save_backup_execution_header(header)
-        for checkpoint in checkpoints:
+        store.save_backup_execution(header, checkpoints[0])
+        store.save_backup_execution(header, checkpoints[0])
+        for checkpoint in checkpoints[1:]:
             store.append_backup_execution_checkpoint(checkpoint)
         assert store.load_backup_execution_header(header.execution_id) == header
         assert store.load_backup_execution_header_for_plan(header.plan_id) == header
         assert store.load_backup_execution_checkpoints(header.execution_id) == checkpoints
         assert store.load_backup_execution_tail(header.execution_id) == checkpoints[-1]
-        assert store.verify_backup_execution_chain(header, checkpoints) == checkpoints[-1].checkpoint_digest
-        assert store.derive_backup_execution_view(header, checkpoints).terminal_success
+        assert verify_backup_execution_chain(header, checkpoints) == checkpoints[-1].checkpoint_digest
+        assert derive_backup_execution_view(header, checkpoints).terminal_success
 
 
 def test_store_rejects_conflicting_replay_gaps_forks_and_foreign_steps(tmp_path) -> None:
     header = _header()
     checkpoints = _chain(header)
     with OverseerStore(tmp_path / "state.sqlite3") as store:
-        store.save_backup_execution_header(header)
+        store.save_backup_execution(header, checkpoints[0])
         store.append_backup_execution_checkpoint(checkpoints[0])
         store.append_backup_execution_checkpoint(checkpoints[0])
         with __import__("pytest").raises(ValueError, match="gap"):
@@ -250,7 +250,7 @@ def test_semantic_validator_rejects_impossible_event_and_evidence_sequences() ->
 def test_direct_schema_update_delete_and_cancellation_rollback(tmp_path) -> None:
     header = _header()
     with OverseerStore(tmp_path / "state.sqlite3") as store:
-        store.save_backup_execution_header(header)
+        store.save_backup_execution(header, _chain(header)[0])
         with pytest.raises(Exception):
             store._connection.execute("UPDATE backup_provisioning_execution_headers SET payload='x'")
         with pytest.raises(Exception):

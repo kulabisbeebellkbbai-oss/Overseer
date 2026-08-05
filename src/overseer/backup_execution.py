@@ -1,9 +1,4 @@
-"""Immutable, hash-chained backup-provisioning execution contracts.
-
-This module is deliberately limited to typed contracts, canonical digests, and
-derivation of a verified execution view.  It does not invoke adapters or host
-operations.
-"""
+"""Typed, immutable and hash-chained backup execution contracts."""
 
 from __future__ import annotations
 
@@ -16,12 +11,12 @@ import math
 import re
 from typing import Any, Literal
 
-
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?\+00:00\Z")
 _SAFE_CODE = re.compile(r"[A-Z][A-Z0-9_]{1,63}\Z")
 _SUCCESS = "ACCEPTANCE_PASSED"
+_DOMAIN_ARGS = "overseer.backup-provisioning.arguments.v1"
 _DOMAIN_STEP = "overseer.backup-provisioning.step.v1"
 _DOMAIN_HEADER = "overseer.backup-provisioning.execution-header.v1"
 _DOMAIN_CHECKPOINT = "overseer.backup-provisioning.checkpoint.v1"
@@ -53,7 +48,7 @@ class CheckpointEvent(StrEnum):
 
 
 def _string(value: object, label: str, *, identifier: bool = False) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value:
+    if type(value) is not str or not value or "\x00" in value:
         raise ValueError(f"{label} must be a non-empty string")
     if identifier and _ID.fullmatch(value) is None:
         raise ValueError(f"{label} is not a safe identifier")
@@ -70,29 +65,32 @@ def _digest(value: object, label: str) -> str:
 def _timestamp(value: object, label: str) -> str:
     value = _string(value, label)
     if _UTC.fullmatch(value) is None:
-        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
+        raise ValueError(f"{label} must be a canonical +00:00 timestamp")
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp") from error
+        raise ValueError(f"{label} must be a canonical +00:00 timestamp") from error
     if parsed.tzinfo != UTC:
         raise ValueError(f"{label} must be UTC")
     return value
 
 
 def _canonical_timestamp(value: object, label: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
     candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
-    parsed = datetime.fromisoformat(candidate)
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as error:
+        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp") from error
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp")
+        raise ValueError(f"{label} must be UTC")
     parsed = parsed.astimezone(UTC)
     return parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds")
 
 
 def _ordinal(value: object, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise ValueError(f"{label} must be a nonnegative integer")
     return value
 
@@ -105,13 +103,13 @@ def _code(value: object, label: str) -> str:
 
 
 def _strict_bool(value: object, label: str) -> bool:
-    if not isinstance(value, bool):
+    if type(value) is not bool:
         raise ValueError(f"{label} must be a bool")
     return value
 
 
 def _tuple(value: object, label: str, *, nonempty: bool = False) -> tuple[Any, ...]:
-    if not isinstance(value, tuple) or (nonempty and not value):
+    if type(value) is not tuple or (nonempty and not value):
         raise ValueError(f"{label} must be an immutable tuple")
     return value
 
@@ -124,18 +122,21 @@ def _hash(domain: str, value: Any) -> str:
     return "sha256:" + hashlib.sha256((domain + "\n" + _canonical(value)).encode()).hexdigest()
 
 
+def _exact(value: Any, cls: type[Any], label: str) -> None:
+    if type(value) is not cls:
+        raise ValueError(f"{label} has the wrong exact type")
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, StrEnum):
         return value.value
-    if isinstance(value, tuple):
+    if type(value) is tuple:
         return [_json_value(item) for item in value]
-    if isinstance(value, frozenset):
-        raise ValueError("mutable or unordered values are not permitted")
-    if isinstance(value, dict):
+    if type(value) is dict:
         raise ValueError("arbitrary mappings are not permitted in execution evidence")
     if hasattr(value, "__dataclass_fields__"):
         return {field.name: _json_value(getattr(value, field.name)) for field in fields(value)}
-    if value is None or type(value) is str or type(value) is bool or type(value) is int:
+    if value is None or type(value) in (str, bool, int):
         return value
     if type(value) is float and math.isfinite(value):
         return value
@@ -143,15 +144,41 @@ def _json_value(value: Any) -> Any:
 
 
 @dataclass(frozen=True)
+class ExecutionOperationIdentity:
+    operation: str
+    arguments_digest: str
+    step_digest: str
+
+    def __post_init__(self) -> None:
+        _string(self.operation, "operation", identifier=True)
+        _digest(self.arguments_digest, "arguments_digest")
+        _digest(self.step_digest, "step_digest")
+
+
+@dataclass(frozen=True)
 class ExecutionStepIdentity:
     plan_step_ordinal: int
     operation: str
     step_digest: str
+    arguments_digest: str | None = None
+    rollback: ExecutionOperationIdentity | None = None
 
     def __post_init__(self) -> None:
         _ordinal(self.plan_step_ordinal, "plan_step_ordinal")
         _string(self.operation, "operation", identifier=True)
         _digest(self.step_digest, "step_digest")
+        if self.arguments_digest is not None:
+            _digest(self.arguments_digest, "arguments_digest")
+        if self.rollback is not None:
+            _exact(self.rollback, ExecutionOperationIdentity, "rollback")
+
+    @property
+    def forward(self) -> ExecutionOperationIdentity:
+        return ExecutionOperationIdentity(self.operation, self.arguments_digest or self.step_digest, self.step_digest)
+
+    @property
+    def rollback_operation(self) -> ExecutionOperationIdentity | None:
+        return self.rollback
 
 
 @dataclass(frozen=True)
@@ -162,17 +189,14 @@ class ExecutionPhaseSpec:
 
     def __post_init__(self) -> None:
         _ordinal(self.phase_ordinal, "phase_ordinal")
-        if not isinstance(self.phase, ExecutionPhase):
+        if type(self.phase) is not ExecutionPhase:
             raise ValueError("phase must be an ExecutionPhase")
         _tuple(self.steps, "steps", nonempty=True)
-        if any(not isinstance(step, ExecutionStepIdentity) for step in self.steps):
-            raise ValueError("steps must contain ExecutionStepIdentity values")
-        if tuple(step.plan_step_ordinal for step in self.steps) != tuple(sorted(step.plan_step_ordinal for step in self.steps)):
-            raise ValueError("phase steps must be ordered by ordinal")
-        if len({step.plan_step_ordinal for step in self.steps}) != len(self.steps):
-            raise ValueError("phase step ordinals must be unique")
-        if len({step.step_digest for step in self.steps}) != len(self.steps):
-            raise ValueError("phase step digests must be unique")
+        if any(type(step) is not ExecutionStepIdentity for step in self.steps):
+            raise ValueError("steps must contain exact ExecutionStepIdentity values")
+        ordinals = tuple(step.plan_step_ordinal for step in self.steps)
+        if ordinals != tuple(sorted(ordinals)) or len(set(ordinals)) != len(ordinals):
+            raise ValueError("phase steps must be ordered and unique")
 
 
 @dataclass(frozen=True)
@@ -189,6 +213,8 @@ class ProvisioningExecutionHeader:
     approved_at: str
     acceptance_contract_version: str
     acceptance_contract_digest: str
+    approved_runtime_digest: str
+    approved_config_digest: str
     created_at: str
     phases: tuple[ExecutionPhaseSpec, ...]
     header_digest: str
@@ -198,25 +224,24 @@ class ProvisioningExecutionHeader:
             raise ValueError("schema_version must be '1'")
         for name in ("execution_id", "plan_id", "bundle_id", "approval_ref", "approved_by"):
             _string(getattr(self, name), name, identifier=True)
-        for name in ("plan_digest", "bundle_digest", "approval_scope_digest", "acceptance_contract_digest", "header_digest"):
+        for name in ("plan_digest", "bundle_digest", "approval_scope_digest", "acceptance_contract_digest", "approved_runtime_digest", "approved_config_digest", "header_digest"):
             _digest(getattr(self, name), name)
         _timestamp(self.approved_at, "approved_at")
         _timestamp(self.created_at, "created_at")
+        if datetime.fromisoformat(self.created_at) < datetime.fromisoformat(self.approved_at):
+            raise ValueError("created_at must be at or after approved_at")
         _string(self.acceptance_contract_version, "acceptance_contract_version", identifier=True)
         _tuple(self.phases, "phases", nonempty=True)
-        if any(not isinstance(phase, ExecutionPhaseSpec) for phase in self.phases):
-            raise ValueError("phases must contain ExecutionPhaseSpec values")
-        if tuple(phase.phase_ordinal for phase in self.phases) != tuple(range(len(self.phases))):
-            raise ValueError("phases must use canonical phase ordinals")
-        if tuple(phase.phase for phase in self.phases) != tuple(ExecutionPhase):
+        if any(type(phase) is not ExecutionPhaseSpec for phase in self.phases):
+            raise ValueError("phases must contain exact ExecutionPhaseSpec values")
+        if tuple(p.phase_ordinal for p in self.phases) != tuple(range(len(self.phases))) or tuple(p.phase for p in self.phases) != tuple(ExecutionPhase):
             raise ValueError("phases must use canonical phase order")
         all_steps = [step for phase in self.phases for step in phase.steps]
         if len({step.plan_step_ordinal for step in all_steps}) != len(all_steps):
             raise ValueError("plan step ordinals must be globally unique")
         if self.execution_id != "execution." + self.plan_digest.removeprefix("sha256:"):
             raise ValueError("execution_id must be derived from plan_digest")
-        expected = execution_header_digest(self)
-        if self.header_digest != expected:
+        if self.header_digest != _hash(_DOMAIN_HEADER, _header_values(self)):
             raise ValueError("header_digest does not match header")
 
 
@@ -237,12 +262,14 @@ class RuntimeAttestation:
 @dataclass(frozen=True)
 class BehaviorAcceptance:
     contract_version: str
+    acceptance_contract_digest: str
     passed: bool
     safe_code: str
     results_digest: str
 
     def __post_init__(self) -> None:
         _string(self.contract_version, "contract_version", identifier=True)
+        _digest(self.acceptance_contract_digest, "acceptance_contract_digest")
         _strict_bool(self.passed, "passed")
         _code(self.safe_code, "safe_code")
         _digest(self.results_digest, "results_digest")
@@ -260,12 +287,11 @@ class ProvisioningStepEvidence:
     redactions_applied: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.disposition, StepDisposition):
+        if type(self.disposition) is not StepDisposition:
             raise ValueError("disposition must be a StepDisposition")
         _code(self.safe_code, "safe_code")
         _digest(self.result_digest, "result_digest")
-        _strict_bool(self.redactions_applied, "redactions_applied")
-        if not self.redactions_applied:
+        if not _strict_bool(self.redactions_applied, "redactions_applied"):
             raise ValueError("persisted evidence must have redactions_applied=True")
 
 
@@ -294,19 +320,17 @@ class ProvisioningCheckpoint:
         _string(self.execution_id, "execution_id", identifier=True)
         _ordinal(self.checkpoint_ordinal, "checkpoint_ordinal")
         _digest(self.previous_digest, "previous_digest")
-        if not isinstance(self.phase, ExecutionPhase):
-            raise ValueError("phase must be an ExecutionPhase")
+        if type(self.phase) is not ExecutionPhase or type(self.event) is not CheckpointEvent:
+            raise ValueError("checkpoint enum has the wrong exact type")
         _ordinal(self.phase_ordinal, "phase_ordinal")
         _ordinal(self.plan_step_ordinal, "plan_step_ordinal")
         _digest(self.step_digest, "step_digest")
-        if not isinstance(self.event, CheckpointEvent):
-            raise ValueError("event must be a CheckpointEvent")
         _timestamp(self.observed_at, "observed_at")
         for name, value, cls in (("step_evidence", self.step_evidence, ProvisioningStepEvidence), ("runtime_attestation", self.runtime_attestation, RuntimeAttestation), ("behavior_acceptance", self.behavior_acceptance, BehaviorAcceptance)):
-            if value is not None and not isinstance(value, cls):
-                raise ValueError(f"{name} has the wrong type")
+            if value is not None:
+                _exact(value, cls, name)
         _digest(self.checkpoint_digest, "checkpoint_digest")
-        if self.checkpoint_digest != provisioning_checkpoint_digest(self):
+        if self.checkpoint_digest != _hash(_DOMAIN_CHECKPOINT, _checkpoint_values(self)):
             raise ValueError("checkpoint_digest does not match checkpoint")
 
 
@@ -325,111 +349,92 @@ class ProvisioningExecutionView:
     terminal_success: bool
 
 
-def canonical_step_digest(plan_digest: str, direction: str, plan_step_ordinal: int, operation: str, arguments: Any) -> str:
-    """Digest a step without allowing runtime timestamps or evidence into it."""
-    _digest(plan_digest, "plan_digest")
-    if direction not in {"forward", "rollback"}:
-        raise ValueError("direction must be forward or rollback")
-    _ordinal(plan_step_ordinal, "plan_step_ordinal")
-    _string(operation, "operation", identifier=True)
-    try:
-        normalized = _canonical_value(arguments)
-        _canonical(normalized)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError("arguments must be strict canonical JSON data") from error
-    return _hash(_DOMAIN_STEP, {"plan_digest": plan_digest, "direction": direction, "plan_step_ordinal": plan_step_ordinal, "operation": operation, "arguments": normalized})
-
-
-def _validate_canonical_arguments(value: Any) -> None:
-    if isinstance(value, dict):
+def _validate_args(value: Any) -> None:
+    if type(value) is dict:
         for key, child in value.items():
             if type(key) is not str or not key:
                 raise ValueError("step argument keys must be non-empty strings")
-            _validate_canonical_arguments(child)
-    elif isinstance(value, (list, tuple)):
+            _validate_args(child)
+    elif type(value) in (list, tuple):
         for child in value:
-            _validate_canonical_arguments(child)
-    elif value is not None and type(value) not in (str, int, float, bool):
+            _validate_args(child)
+    elif value is not None and type(value) not in (str, int, bool, float):
         raise ValueError("step arguments contain an unsupported value")
     elif type(value) is float and not math.isfinite(value):
         raise ValueError("step arguments contain a non-finite float")
 
 
 def _canonical_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        _validate_canonical_arguments(value)
+    _validate_args(value)
+    if type(value) is dict:
         return {key: _canonical_value(child) for key, child in value.items()}
-    if isinstance(value, (list, tuple)):
+    if type(value) in (list, tuple):
         return [_canonical_value(child) for child in value]
-    if value is None or type(value) in (str, int, bool):
-        return value
-    if type(value) is float and math.isfinite(value):
-        return value
-    raise ValueError("unsupported canonical value")
+    return value
 
 
-def build_execution_header(
-    *, schema_version: Literal["1"] = "1", execution_id: str, plan_id: str,
-    plan_digest: str, bundle_id: str, bundle_digest: str, approval_ref: str,
-    approval_scope_digest: str, approved_by: str, approved_at: str,
-    acceptance_contract_version: str, acceptance_contract_digest: str,
-    created_at: str, phases: tuple[ExecutionPhaseSpec, ...],
-) -> ProvisioningExecutionHeader:
-    """Construct a header after calculating its immutable digest."""
-    approved_at = _canonical_timestamp(approved_at, "approved_at")
-    created_at = _canonical_timestamp(created_at, "created_at")
-    draft = object.__new__(ProvisioningExecutionHeader)
-    for name, value in locals().items():
-        if name != "schema_version":
-            object.__setattr__(draft, name, value)
-    object.__setattr__(draft, "schema_version", schema_version)
-    object.__setattr__(draft, "header_digest", "")
-    return ProvisioningExecutionHeader(
-        schema_version, execution_id, plan_id, plan_digest, bundle_id, bundle_digest,
-        approval_ref, approval_scope_digest, approved_by, approved_at,
-        acceptance_contract_version, acceptance_contract_digest, created_at, phases,
-        execution_header_digest(draft),
-    )
+def _arguments_digest(arguments: Any) -> str:
+    return _hash(_DOMAIN_ARGS, _canonical_value(arguments))
 
 
-def build_checkpoint(
-    *, schema_version: Literal["1"] = "1", checkpoint_id: str, execution_id: str,
-    checkpoint_ordinal: int, previous_digest: str, phase: ExecutionPhase,
-    phase_ordinal: int, plan_step_ordinal: int, step_digest: str,
-    event: CheckpointEvent, observed_at: str,
-    step_evidence: ProvisioningStepEvidence | None = None,
-    runtime_attestation: RuntimeAttestation | None = None,
-    behavior_acceptance: BehaviorAcceptance | None = None,
-) -> ProvisioningCheckpoint:
-    observed_at = _canonical_timestamp(observed_at, "observed_at")
-    draft = object.__new__(ProvisioningCheckpoint)
-    values = locals().copy()
-    values.pop("schema_version")
-    values.pop("draft", None)
-    for name, value in values.items():
-        object.__setattr__(draft, name, value)
-    object.__setattr__(draft, "schema_version", schema_version)
-    object.__setattr__(draft, "checkpoint_digest", "")
-    return ProvisioningCheckpoint(
-        schema_version, checkpoint_id, execution_id, checkpoint_ordinal, previous_digest,
-        phase, phase_ordinal, plan_step_ordinal, step_digest, event, observed_at,
-        step_evidence, runtime_attestation, behavior_acceptance,
-        provisioning_checkpoint_digest(draft),
-    )
+def _step_digest_from_identity(plan_digest: str, direction: str, ordinal: int, operation: str, arguments_digest: str) -> str:
+    return _hash(_DOMAIN_STEP, {"plan_digest": plan_digest, "direction": direction, "plan_step_ordinal": ordinal, "operation": operation, "arguments_digest": arguments_digest})
 
 
-def _without(value: Any, field_name: str) -> dict[str, Any]:
-    data = _json_value(value)
-    data.pop(field_name)
-    return data
+def canonical_step_digest(plan_digest: str, direction: str, plan_step_ordinal: int, operation: str, arguments: Any) -> str:
+    _digest(plan_digest, "plan_digest")
+    if direction not in {"forward", "rollback"}:
+        raise ValueError("direction must be forward or rollback")
+    _ordinal(plan_step_ordinal, "plan_step_ordinal")
+    _string(operation, "operation", identifier=True)
+    args_digest = _arguments_digest(arguments)
+    return _step_digest_from_identity(plan_digest, direction, plan_step_ordinal, operation, args_digest)
+
+
+def _header_values(header: ProvisioningExecutionHeader) -> dict[str, Any]:
+    return {field.name: _json_value(getattr(header, field.name)) for field in fields(header) if field.name != "header_digest"}
+
+
+def _checkpoint_values(checkpoint: ProvisioningCheckpoint) -> dict[str, Any]:
+    return {field.name: _json_value(getattr(checkpoint, field.name)) for field in fields(checkpoint) if field.name != "checkpoint_digest"}
 
 
 def execution_header_digest(header: ProvisioningExecutionHeader) -> str:
-    return _hash(_DOMAIN_HEADER, _without(header, "header_digest"))
+    _exact(header, ProvisioningExecutionHeader, "header")
+    _validate_header_fields(header)
+    return _hash(_DOMAIN_HEADER, _header_values(header))
 
 
 def provisioning_checkpoint_digest(checkpoint: ProvisioningCheckpoint) -> str:
-    return _hash(_DOMAIN_CHECKPOINT, _without(checkpoint, "checkpoint_digest"))
+    _exact(checkpoint, ProvisioningCheckpoint, "checkpoint")
+    _validate_checkpoint_fields(checkpoint)
+    return _hash(_DOMAIN_CHECKPOINT, _checkpoint_values(checkpoint))
+
+
+def _validate_header_fields(header: ProvisioningExecutionHeader) -> None:
+    # Re-run nested validation so object.__setattr__ mutation cannot cross a boundary.
+    ProvisioningExecutionHeader.__post_init__(header)
+
+
+def _validate_checkpoint_fields(checkpoint: ProvisioningCheckpoint) -> None:
+    ProvisioningCheckpoint.__post_init__(checkpoint)
+
+
+def build_execution_header(*, schema_version: Literal["1"] = "1", execution_id: str, plan_id: str, plan_digest: str, bundle_id: str, bundle_digest: str, approval_ref: str, approval_scope_digest: str, approved_by: str, approved_at: str, acceptance_contract_version: str, acceptance_contract_digest: str, created_at: str, phases: tuple[ExecutionPhaseSpec, ...], approved_runtime_digest: str | None = None, approved_config_digest: str | None = None) -> ProvisioningExecutionHeader:
+    approved_at = _canonical_timestamp(approved_at, "approved_at")
+    created_at = _canonical_timestamp(created_at, "created_at")
+    _digest(approved_runtime_digest or plan_digest, "approved_runtime_digest")
+    _digest(approved_config_digest or bundle_digest, "approved_config_digest")
+    values = (schema_version, execution_id, plan_id, plan_digest, bundle_id, bundle_digest, approval_ref, approval_scope_digest, approved_by, approved_at, acceptance_contract_version, acceptance_contract_digest, approved_runtime_digest or plan_digest, approved_config_digest or bundle_digest, created_at, phases)
+    digest = _hash(_DOMAIN_HEADER, {field.name: _json_value(value) for field, value in zip(fields(ProvisioningExecutionHeader)[:-1], values)})
+    return ProvisioningExecutionHeader(*values, digest)
+
+
+def build_checkpoint(*, schema_version: Literal["1"] = "1", checkpoint_id: str, execution_id: str, checkpoint_ordinal: int, previous_digest: str, phase: ExecutionPhase, phase_ordinal: int, plan_step_ordinal: int, step_digest: str, event: CheckpointEvent, observed_at: str, step_evidence: ProvisioningStepEvidence | None = None, runtime_attestation: RuntimeAttestation | None = None, behavior_acceptance: BehaviorAcceptance | None = None) -> ProvisioningCheckpoint:
+    observed_at = _canonical_timestamp(observed_at, "observed_at")
+    values = (schema_version, checkpoint_id, execution_id, checkpoint_ordinal, previous_digest, phase, phase_ordinal, plan_step_ordinal, step_digest, event, observed_at, step_evidence, runtime_attestation, behavior_acceptance)
+    digest = _hash(_DOMAIN_CHECKPOINT, {field.name: _json_value(value) for field, value in zip(fields(ProvisioningCheckpoint)[:-1], values)})
+    return ProvisioningCheckpoint(*values, digest)
 
 
 def canonical_json(value: Any) -> str:
@@ -437,26 +442,13 @@ def canonical_json(value: Any) -> str:
 
 
 def header_payload(header: ProvisioningExecutionHeader) -> str:
+    _validate_header_fields(header)
     return canonical_json(header)
 
 
 def checkpoint_payload(checkpoint: ProvisioningCheckpoint) -> str:
+    _validate_checkpoint_fields(checkpoint)
     return canonical_json(checkpoint)
-
-
-def _decode(cls: type[Any], payload: str) -> Any:
-    if not isinstance(payload, str):
-        raise ValueError("payload must be a string")
-    try:
-        value = json.loads(payload, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
-    except (json.JSONDecodeError, ValueError, TypeError) as error:
-        raise ValueError("payload must be canonical JSON") from error
-    if not isinstance(value, dict) or _canonical(value) != payload:
-        raise ValueError("payload must be canonical JSON")
-    expected = {field.name for field in fields(cls)}
-    if set(value) != expected:
-        raise ValueError("payload has missing or extra fields")
-    return _decode_dataclass(cls, value)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -473,17 +465,18 @@ def _reject_constant(value: str) -> Any:
 
 
 def _decode_dataclass(cls: type[Any], value: dict[str, Any]) -> Any:
+    if type(value) is not dict or set(value) != {field.name for field in fields(cls)}:
+        raise ValueError("payload has missing or extra fields")
     try:
+        if cls is ExecutionOperationIdentity:
+            return ExecutionOperationIdentity(value["operation"], value["arguments_digest"], value["step_digest"])
         if cls is ExecutionStepIdentity:
-            return ExecutionStepIdentity(value["plan_step_ordinal"], value["operation"], value["step_digest"])
+            rollback = value["rollback"]
+            return ExecutionStepIdentity(value["plan_step_ordinal"], value["operation"], value["step_digest"], value["arguments_digest"], None if rollback is None else _decode_dataclass(ExecutionOperationIdentity, rollback))
         if cls is ExecutionPhaseSpec:
-            if type(value["steps"]) is not list:
-                raise ValueError("steps must be an array")
             return ExecutionPhaseSpec(value["phase_ordinal"], ExecutionPhase(value["phase"]), tuple(_decode_dataclass(ExecutionStepIdentity, item) for item in value["steps"]))
         if cls is ProvisioningExecutionHeader:
-            if type(value["phases"]) is not list:
-                raise ValueError("phases must be an array")
-            return ProvisioningExecutionHeader(value["schema_version"], value["execution_id"], value["plan_id"], value["plan_digest"], value["bundle_id"], value["bundle_digest"], value["approval_ref"], value["approval_scope_digest"], value["approved_by"], value["approved_at"], value["acceptance_contract_version"], value["acceptance_contract_digest"], value["created_at"], tuple(_decode_dataclass(ExecutionPhaseSpec, item) for item in value["phases"]), value["header_digest"])
+            return ProvisioningExecutionHeader(value["schema_version"], value["execution_id"], value["plan_id"], value["plan_digest"], value["bundle_id"], value["bundle_digest"], value["approval_ref"], value["approval_scope_digest"], value["approved_by"], value["approved_at"], value["acceptance_contract_version"], value["acceptance_contract_digest"], value["approved_runtime_digest"], value["approved_config_digest"], value["created_at"], tuple(_decode_dataclass(ExecutionPhaseSpec, item) for item in value["phases"]), value["header_digest"])
         if cls is RuntimeAttestation:
             return RuntimeAttestation(**value)
         if cls is BehaviorAcceptance:
@@ -491,17 +484,21 @@ def _decode_dataclass(cls: type[Any], value: dict[str, Any]) -> Any:
         if cls is ProvisioningStepEvidence:
             return ProvisioningStepEvidence(StepDisposition(value["disposition"]), value["safe_code"], value["result_digest"], value["redactions_applied"])
         if cls is ProvisioningCheckpoint:
-            return ProvisioningCheckpoint(value["schema_version"], value["checkpoint_id"], value["execution_id"], value["checkpoint_ordinal"], value["previous_digest"], ExecutionPhase(value["phase"]), value["phase_ordinal"], value["plan_step_ordinal"], value["step_digest"], CheckpointEvent(value["event"]), value["observed_at"], _optional(ProvisioningStepEvidence, value["step_evidence"]), _optional(RuntimeAttestation, value["runtime_attestation"]), _optional(BehaviorAcceptance, value["behavior_acceptance"]), value["checkpoint_digest"])
+            return ProvisioningCheckpoint(value["schema_version"], value["checkpoint_id"], value["execution_id"], value["checkpoint_ordinal"], value["previous_digest"], ExecutionPhase(value["phase"]), value["phase_ordinal"], value["plan_step_ordinal"], value["step_digest"], CheckpointEvent(value["event"]), value["observed_at"], None if value["step_evidence"] is None else _decode_dataclass(ProvisioningStepEvidence, value["step_evidence"]), None if value["runtime_attestation"] is None else _decode_dataclass(RuntimeAttestation, value["runtime_attestation"]), None if value["behavior_acceptance"] is None else _decode_dataclass(BehaviorAcceptance, value["behavior_acceptance"]), value["checkpoint_digest"])
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise ValueError("payload contains an invalid typed value") from error
     raise ValueError("unsupported execution payload type")
 
 
-def _optional(cls: type[Any], value: Any) -> Any:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("optional value must be an object or null")
+def _decode(cls: type[Any], payload: str) -> Any:
+    if type(payload) is not str:
+        raise ValueError("payload must be a string")
+    try:
+        value = json.loads(payload, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
+    except (json.JSONDecodeError, ValueError, TypeError) as error:
+        raise ValueError("payload must be canonical JSON") from error
+    if type(value) is not dict or _canonical(value) != payload:
+        raise ValueError("payload must be canonical JSON")
     return _decode_dataclass(cls, value)
 
 
@@ -513,94 +510,104 @@ def checkpoint_from_payload(payload: str) -> ProvisioningCheckpoint:
     return _decode(ProvisioningCheckpoint, payload)
 
 
+def _bound_step(header: ProvisioningExecutionHeader, checkpoint: ProvisioningCheckpoint) -> tuple[ExecutionStepIdentity, bool]:
+    for phase in header.phases:
+        if phase.phase is checkpoint.phase and phase.phase_ordinal == checkpoint.phase_ordinal:
+            for step in phase.steps:
+                if step.plan_step_ordinal == checkpoint.plan_step_ordinal:
+                    if step.arguments_digest is not None and step.step_digest != _step_digest_from_identity(header.plan_digest, "forward", step.plan_step_ordinal, step.operation, step.arguments_digest):
+                        raise ValueError("forward operation identity has a mismatching digest")
+                    if step.rollback is not None and step.rollback.step_digest != _step_digest_from_identity(header.plan_digest, "rollback", step.plan_step_ordinal, step.rollback.operation, step.rollback.arguments_digest):
+                        raise ValueError("rollback operation identity has a mismatching digest")
+                    if checkpoint.step_digest == step.step_digest:
+                        return step, False
+                    if step.rollback is not None and checkpoint.step_digest == step.rollback.step_digest:
+                        return step, True
+    raise ValueError("checkpoint is not a member of the execution manifest")
+
+
 def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoints: tuple[ProvisioningCheckpoint, ...]) -> str | None:
-    if not isinstance(checkpoints, tuple):
-        raise ValueError("checkpoints must be an immutable tuple")
-    manifest = {(phase.phase_ordinal, step.plan_step_ordinal, step.step_digest): (phase.phase, step) for phase in header.phases for step in phase.steps}
-    ordered = [(phase.phase, phase.phase_ordinal, step) for phase in header.phases for step in phase.steps]
+    _exact(header, ProvisioningExecutionHeader, "header")
+    _validate_header_fields(header)
+    if type(checkpoints) is not tuple or any(type(c) is not ProvisioningCheckpoint for c in checkpoints):
+        raise ValueError("checkpoints must be an immutable tuple of exact DTOs")
     previous = header.header_digest
+    ordered = [(phase.phase, phase.phase_ordinal, step) for phase in header.phases for step in phase.steps]
     next_forward = 0
-    started: tuple[ExecutionStepIdentity, ExecutionPhase] | None = None
+    started: tuple[ExecutionStepIdentity, ExecutionPhase, bool] | None = None
     completed: list[tuple[ExecutionStepIdentity, ExecutionPhase]] = []
     failure_seen = False
-    rollback_next = -1
     rollback_started: tuple[ExecutionStepIdentity, ExecutionPhase] | None = None
+    rollback_remaining: list[tuple[ExecutionStepIdentity, ExecutionPhase]] = []
     attestation: RuntimeAttestation | None = None
     acceptance: BehaviorAcceptance | None = None
     finalized = False
+    last_observed = header.created_at
     for ordinal, checkpoint in enumerate(checkpoints):
-        if checkpoint.checkpoint_ordinal != ordinal or checkpoint.execution_id != header.execution_id:
-            raise ValueError("checkpoint ordinal or execution binding is invalid")
-        if checkpoint.previous_digest != previous:
-            raise ValueError("checkpoint digest chain is broken")
-        identity = (checkpoint.phase_ordinal, checkpoint.plan_step_ordinal, checkpoint.step_digest)
-        entry = manifest.get(identity)
-        if entry is None or entry[0] is not checkpoint.phase:
-            raise ValueError("checkpoint is not a member of the execution manifest")
-        if checkpoint.phase_ordinal != list(ExecutionPhase).index(checkpoint.phase):
-            raise ValueError("checkpoint phase ordinal is invalid")
-        if finalized:
-            raise ValueError("checkpoint follows execution finalization")
+        _validate_checkpoint_fields(checkpoint)
+        if checkpoint.checkpoint_ordinal != ordinal or checkpoint.execution_id != header.execution_id or checkpoint.previous_digest != previous:
+            raise ValueError("checkpoint ordinal, execution binding, or digest chain is invalid")
+        if checkpoint.observed_at < last_observed:
+            raise ValueError("checkpoint timestamps must be nondecreasing")
+        last_observed = checkpoint.observed_at
+        step, is_rollback = _bound_step(header, checkpoint)
+        if checkpoint.phase_ordinal != list(ExecutionPhase).index(checkpoint.phase) or finalized:
+            raise ValueError("checkpoint phase or finalization state is invalid")
         event = checkpoint.event
-        has_optional = (checkpoint.step_evidence, checkpoint.runtime_attestation, checkpoint.behavior_acceptance)
+        evidence, runtime, behavior = checkpoint.step_evidence, checkpoint.runtime_attestation, checkpoint.behavior_acceptance
+        if is_rollback:
+            if event not in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED):
+                raise ValueError("rollback identity used by a non-rollback event")
+        elif event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED):
+            raise ValueError("rollback event lacks approved rollback identity")
         if event is CheckpointEvent.STEP_STARTED:
-            if any(value is not None for value in has_optional) or started is not None or failure_seen:
-                raise ValueError("STEP_STARTED has invalid state or evidence")
-            if next_forward >= len(ordered) or entry[1] is not ordered[next_forward][2] or checkpoint.phase is not ordered[next_forward][0]:
-                raise ValueError("forward steps must start once in manifest order")
-            started = (entry[1], checkpoint.phase)
+            if any(x is not None for x in (evidence, runtime, behavior)) or started or failure_seen or is_rollback or next_forward >= len(ordered) or step is not ordered[next_forward][2] or checkpoint.phase is not ordered[next_forward][0]:
+                raise ValueError("STEP_STARTED has invalid state")
+            started = (step, checkpoint.phase, False)
         elif event in (CheckpointEvent.STEP_COMPLETED, CheckpointEvent.STEP_FAILED):
-            if started is None or started[0] is not entry[1] or started[1] is not checkpoint.phase or checkpoint.step_evidence is None:
+            if is_rollback or started is None or started[0] is not step or started[1] is not checkpoint.phase or evidence is None:
                 raise ValueError("step outcome does not match its start")
-            if checkpoint.runtime_attestation is not None and checkpoint.phase is not ExecutionPhase.ATTEST:
-                raise ValueError("runtime attestation is only valid for ATTEST completion")
-            if checkpoint.behavior_acceptance is not None and checkpoint.phase is not ExecutionPhase.ACCEPT:
-                raise ValueError("behavior acceptance is only valid for ACCEPT completion")
-            evidence = checkpoint.step_evidence
             if event is CheckpointEvent.STEP_COMPLETED:
-                if evidence.disposition not in (StepDisposition.CHANGED, StepDisposition.VERIFIED_NOOP):
-                    raise ValueError("successful step completion has an invalid disposition")
+                if evidence.disposition not in (StepDisposition.CHANGED, StepDisposition.VERIFIED_NOOP) or (runtime is not None and checkpoint.phase is not ExecutionPhase.ATTEST) or (behavior is not None and checkpoint.phase is not ExecutionPhase.ACCEPT):
+                    raise ValueError("successful step has invalid evidence")
                 if checkpoint.phase is ExecutionPhase.ATTEST:
-                    if checkpoint.runtime_attestation is None or checkpoint.runtime_attestation.approved_runtime_digest != checkpoint.runtime_attestation.active_runtime_digest or checkpoint.runtime_attestation.approved_config_digest != checkpoint.runtime_attestation.active_config_digest:
-                        raise ValueError("ATTEST completion lacks an exact runtime attestation")
-                    attestation = checkpoint.runtime_attestation
-                elif checkpoint.runtime_attestation is not None:
-                    raise ValueError("runtime attestation is only valid for ATTEST completion")
+                    if runtime is None or runtime.approved_runtime_digest != header.approved_runtime_digest or runtime.approved_config_digest != header.approved_config_digest or runtime.active_runtime_digest != runtime.approved_runtime_digest or runtime.active_config_digest != runtime.approved_config_digest:
+                        raise ValueError("ATTEST completion lacks bound active identities")
+                    attestation = runtime
                 if checkpoint.phase is ExecutionPhase.ACCEPT:
-                    if checkpoint.behavior_acceptance is None or checkpoint.behavior_acceptance.contract_version != header.acceptance_contract_version or not checkpoint.behavior_acceptance.passed or checkpoint.behavior_acceptance.safe_code != _SUCCESS:
-                        raise ValueError("ACCEPT completion lacks passing contract acceptance")
-                    acceptance = checkpoint.behavior_acceptance
-                elif checkpoint.behavior_acceptance is not None:
-                    raise ValueError("behavior acceptance is only valid for ACCEPT completion")
-                completed.append((entry[1], checkpoint.phase))
-                next_forward += 1
+                    if behavior is None or behavior.acceptance_contract_digest != header.acceptance_contract_digest or behavior.contract_version != header.acceptance_contract_version or not behavior.passed or behavior.safe_code != _SUCCESS:
+                        raise ValueError("ACCEPT completion lacks bound passing contract acceptance")
+                    acceptance = behavior
+                completed.append((step, checkpoint.phase)); next_forward += 1
             else:
-                if evidence.disposition is not StepDisposition.FAILED or checkpoint.runtime_attestation is not None or checkpoint.behavior_acceptance is not None:
-                    raise ValueError("failed step has invalid evidence")
+                if evidence.disposition is not StepDisposition.FAILED or (runtime is not None and checkpoint.phase is not ExecutionPhase.ATTEST) or (behavior is not None and checkpoint.phase is not ExecutionPhase.ACCEPT):
+                    raise ValueError("failed step has invalid typed evidence")
+                if runtime is not None and (runtime.approved_runtime_digest != header.approved_runtime_digest or runtime.approved_config_digest != header.approved_config_digest):
+                    raise ValueError("failed ATTEST detail is not bound to approved identities")
+                if behavior is not None and (behavior.acceptance_contract_digest != header.acceptance_contract_digest or behavior.contract_version != header.acceptance_contract_version or behavior.passed):
+                    raise ValueError("failed ACCEPT detail is not bound to the acceptance contract")
                 failure_seen = True
-                rollback_next = len(completed) - 1
+                rollback_remaining = [(s, p) for s, p in reversed(completed) if s.rollback is not None]
             started = None
         elif event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED):
-            if not failure_seen or rollback_next < 0 or entry[1] is not completed[rollback_next][0] or checkpoint.phase is not completed[rollback_next][1]:
-                raise ValueError("rollback is not the reverse of completed steps")
+            if not failure_seen or not rollback_remaining or rollback_remaining[0] != (step, checkpoint.phase):
+                raise ValueError("rollback is not reverse order over approved completed steps")
             if event is CheckpointEvent.ROLLBACK_STARTED:
-                if rollback_started is not None or any(value is not None for value in has_optional):
-                    raise ValueError("rollback start has invalid state or evidence")
-                rollback_started = (entry[1], checkpoint.phase)
+                if rollback_started or any(x is not None for x in (evidence, runtime, behavior)):
+                    raise ValueError("rollback start has invalid state")
+                rollback_started = (step, checkpoint.phase)
             else:
-                if rollback_started is None or rollback_started != (entry[1], checkpoint.phase) or checkpoint.step_evidence is None:
+                if rollback_started != (step, checkpoint.phase) or evidence is None or runtime is not None or behavior is not None:
                     raise ValueError("rollback outcome does not match its start")
-                if checkpoint.runtime_attestation is not None or checkpoint.behavior_acceptance is not None:
-                    raise ValueError("rollback cannot carry attestation or acceptance")
-                if event is CheckpointEvent.ROLLBACK_COMPLETED:
-                    if checkpoint.step_evidence.disposition not in (StepDisposition.CHANGED, StepDisposition.VERIFIED_NOOP):
-                        raise ValueError("rollback completion has an invalid disposition")
-                elif checkpoint.step_evidence.disposition is not StepDisposition.FAILED:
-                    raise ValueError("rollback failure has an invalid disposition")
-                rollback_started = None
-                rollback_next -= 1
+                if event is CheckpointEvent.ROLLBACK_COMPLETED and evidence.disposition not in (StepDisposition.CHANGED, StepDisposition.VERIFIED_NOOP):
+                    raise ValueError("rollback completion has invalid disposition")
+                if event is CheckpointEvent.ROLLBACK_FAILED and evidence.disposition is not StepDisposition.FAILED:
+                    raise ValueError("rollback failure has invalid disposition")
+                if event is CheckpointEvent.ROLLBACK_FAILED:
+                    failure_seen = True
+                rollback_started = None; rollback_remaining.pop(0)
         elif event is CheckpointEvent.EXECUTION_FINALIZED:
-            if any(value is not None for value in has_optional) or checkpoint.phase is not ExecutionPhase.FINALIZE or not entry[1] is header.phases[-1].steps[-1] or started is not None or failure_seen or rollback_next >= 0 or next_forward != len(ordered) or attestation is None or acceptance is None or not acceptance.passed:
+            if any(x is not None for x in (evidence, runtime, behavior)) or checkpoint.phase is not ExecutionPhase.FINALIZE or step is not header.phases[-1].steps[-1] or started or failure_seen or rollback_remaining or next_forward != len(ordered) or attestation is None or acceptance is None or not acceptance.passed:
                 raise ValueError("execution finalization is not justified")
             finalized = True
         else:
@@ -611,24 +618,16 @@ def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoin
 
 def derive_backup_execution_view(header: ProvisioningExecutionHeader, checkpoints: tuple[ProvisioningCheckpoint, ...]) -> ProvisioningExecutionView:
     tail = verify_backup_execution_chain(header, checkpoints)
-    current_phase = checkpoints[-1].phase if checkpoints else None
-    failure = next((c.step_evidence.safe_code for c in reversed(checkpoints) if c.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.ROLLBACK_FAILED) and c.step_evidence), None)
-    rollback = "failed" if any(c.event == CheckpointEvent.ROLLBACK_FAILED for c in checkpoints) else "completed" if any(c.event == CheckpointEvent.ROLLBACK_COMPLETED for c in checkpoints) else "started" if any(c.event == CheckpointEvent.ROLLBACK_STARTED for c in checkpoints) else "not_started"
     attestation = next((c.runtime_attestation for c in reversed(checkpoints) if c.runtime_attestation), None)
     acceptance = next((c.behavior_acceptance for c in reversed(checkpoints) if c.behavior_acceptance), None)
     tail_evidence = next((c.step_evidence for c in reversed(checkpoints) if c.step_evidence), None)
-    finalized = bool(checkpoints and checkpoints[-1].event == CheckpointEvent.EXECUTION_FINALIZED and checkpoints[-1].phase is ExecutionPhase.FINALIZE)
+    failure = next((c.step_evidence.safe_code for c in reversed(checkpoints) if c.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.ROLLBACK_FAILED) and c.step_evidence), None)
+    rollback_events = [c.event for c in checkpoints if c.event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)]
+    rollback = "failed" if CheckpointEvent.ROLLBACK_FAILED in rollback_events else "completed" if rollback_events and rollback_events[-1] is CheckpointEvent.ROLLBACK_COMPLETED and not any(e is CheckpointEvent.ROLLBACK_STARTED for e in rollback_events[rollback_events.index(CheckpointEvent.ROLLBACK_COMPLETED)+1:]) else "in_progress" if rollback_events else "not_started"
+    finalized = bool(checkpoints and checkpoints[-1].event is CheckpointEvent.EXECUTION_FINALIZED)
     terminal = finalized and acceptance is not None and acceptance.passed and failure is None
     status = "succeeded" if terminal else "failed" if failure or (acceptance is not None and not acceptance.passed) else "finalized" if finalized else "in_progress" if checkpoints else "not_started"
-    return ProvisioningExecutionView(header.execution_id, header.plan_id, current_phase, status, failure or (acceptance.safe_code if acceptance and not acceptance.passed else None), rollback, attestation, acceptance, tail_evidence, tail, terminal)
+    return ProvisioningExecutionView(header.execution_id, header.plan_id, checkpoints[-1].phase if checkpoints else None, status, failure or (acceptance.safe_code if acceptance and not acceptance.passed else None), rollback, attestation, acceptance, tail_evidence, tail, terminal)
 
 
-__all__ = [
-    "BehaviorAcceptance", "CheckpointEvent", "ExecutionPhase", "ExecutionPhaseSpec",
-    "ExecutionStepIdentity", "ProvisioningCheckpoint", "ProvisioningExecutionHeader",
-    "ProvisioningExecutionView", "ProvisioningStepEvidence", "RuntimeAttestation",
-    "StepDisposition", "build_checkpoint", "build_execution_header", "canonical_json",
-    "canonical_step_digest", "checkpoint_from_payload", "checkpoint_payload",
-    "derive_backup_execution_view", "execution_header_digest", "header_from_payload",
-    "header_payload", "provisioning_checkpoint_digest", "verify_backup_execution_chain",
-]
+__all__ = ["BehaviorAcceptance", "CheckpointEvent", "ExecutionOperationIdentity", "ExecutionPhase", "ExecutionPhaseSpec", "ExecutionStepIdentity", "ProvisioningCheckpoint", "ProvisioningExecutionHeader", "ProvisioningExecutionView", "ProvisioningStepEvidence", "RuntimeAttestation", "StepDisposition", "build_checkpoint", "build_execution_header", "canonical_json", "canonical_step_digest", "checkpoint_from_payload", "checkpoint_payload", "derive_backup_execution_view", "execution_header_digest", "header_from_payload", "header_payload", "provisioning_checkpoint_digest", "verify_backup_execution_chain"]

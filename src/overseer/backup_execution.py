@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 import hashlib
@@ -27,6 +27,7 @@ _DOMAIN_ARGS = "overseer.backup-provisioning.arguments.v1"
 _DOMAIN_STEP = "overseer.backup-provisioning.step.v1"
 _DOMAIN_HEADER = "overseer.backup-provisioning.execution-header.v1"
 _DOMAIN_CHECKPOINT = "overseer.backup-provisioning.checkpoint.v1"
+_DOMAIN_CHECKPOINT_V3 = "overseer.backup-provisioning.checkpoint.v3"
 
 
 class ExecutionPhase(StrEnum):
@@ -161,7 +162,9 @@ def _json_value(value: Any) -> Any:
     if type(value) is tuple:
         return [_json_value(item) for item in value]
     if type(value) is dict:
-        raise ValueError("arbitrary mappings are not permitted in execution evidence")
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("execution evidence mapping keys must be strings")
+        return {key: _json_value(item) for key, item in sorted(value.items())}
     if hasattr(value, "__dataclass_fields__"):
         return {field.name: _json_value(getattr(value, field.name)) for field in fields(value)}
     if value is None or type(value) in (str, bool, int):
@@ -311,6 +314,7 @@ class ProvisioningStepEvidence:
     safe_code: str
     result_digest: str
     redactions_applied: bool
+    evidence: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if type(self.disposition) is not StepDisposition:
@@ -319,11 +323,24 @@ class ProvisioningStepEvidence:
         _digest(self.result_digest, "result_digest")
         if not _strict_bool(self.redactions_applied, "redactions_applied"):
             raise ValueError("persisted evidence must have redactions_applied=True")
+        if not isinstance(self.evidence, Mapping):
+            raise ValueError("persisted adapter evidence must be a mapping")
+        clean: dict[str, object] = {}
+        for key, value in self.evidence.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key):
+                raise ValueError("persisted adapter evidence key is invalid")
+            if any(term in key.lower() for term in ("stdout", "stderr", "secret", "token", "password", "private", "path", "content", "raw")):
+                raise ValueError("persisted adapter evidence key is unsafe")
+            if isinstance(value, bool) or (type(value) is int and 0 <= value <= 1_000_000_000) or (isinstance(value, str) and (re.fullmatch(r"sha256:[0-9a-f]{64}", value) or re.fullmatch(r"[1-9][0-9]{0,38}", value))):
+                clean[key] = value
+            else:
+                raise ValueError("persisted adapter evidence value is invalid")
+        object.__setattr__(self, "evidence", clean)
 
 
 @dataclass(frozen=True)
 class ProvisioningCheckpoint:
-    schema_version: Literal["2"]
+    schema_version: Literal["2", "3"]
     checkpoint_id: str
     execution_id: str
     checkpoint_ordinal: int
@@ -340,8 +357,8 @@ class ProvisioningCheckpoint:
     checkpoint_digest: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != "2":
-            raise ValueError("schema_version must be '2'")
+        if self.schema_version not in {"2", "3"}:
+            raise ValueError("schema_version must be '2' or '3'")
         _string(self.checkpoint_id, "checkpoint_id", identifier=True)
         _string(self.execution_id, "execution_id", identifier=True)
         _ordinal(self.checkpoint_ordinal, "checkpoint_ordinal")
@@ -357,7 +374,7 @@ class ProvisioningCheckpoint:
                 _exact(value, cls, name)
                 value.__post_init__()
         _digest(self.checkpoint_digest, "checkpoint_digest")
-        if self.checkpoint_digest != _hash(_DOMAIN_CHECKPOINT, _checkpoint_values(self)):
+        if self.checkpoint_digest != _hash(_checkpoint_domain(self.schema_version), _checkpoint_values(self)):
             raise ValueError("checkpoint_digest does not match checkpoint")
 
 
@@ -431,7 +448,22 @@ def _header_values(header: ProvisioningExecutionHeader) -> dict[str, Any]:
 
 
 def _checkpoint_values(checkpoint: ProvisioningCheckpoint) -> dict[str, Any]:
-    return {field.name: _json_value(getattr(checkpoint, field.name)) for field in fields(checkpoint) if field.name != "checkpoint_digest"}
+    values = {field.name: _json_value(getattr(checkpoint, field.name)) for field in fields(checkpoint) if field.name != "checkpoint_digest"}
+    if checkpoint.schema_version == "2":
+        # Historical v2 omitted the evidence member from empty step evidence.
+        # Preserve that exact serialized hash contract forever.
+        evidence = values.get("step_evidence")
+        if isinstance(evidence, dict) and evidence.get("evidence") == {}:
+            evidence.pop("evidence", None)
+    return values
+
+
+def _checkpoint_domain(schema_version: str) -> str:
+    if schema_version == "2":
+        return _DOMAIN_CHECKPOINT
+    if schema_version == "3":
+        return _DOMAIN_CHECKPOINT_V3
+    raise ValueError("unsupported checkpoint schema version")
 
 
 def execution_header_digest(header: ProvisioningExecutionHeader) -> str:
@@ -443,7 +475,7 @@ def execution_header_digest(header: ProvisioningExecutionHeader) -> str:
 def provisioning_checkpoint_digest(checkpoint: ProvisioningCheckpoint) -> str:
     _exact(checkpoint, ProvisioningCheckpoint, "checkpoint")
     _validate_checkpoint_fields(checkpoint)
-    return _hash(_DOMAIN_CHECKPOINT, _checkpoint_values(checkpoint))
+    return _hash(_checkpoint_domain(checkpoint.schema_version), _checkpoint_values(checkpoint))
 
 
 def _validate_header_fields(header: ProvisioningExecutionHeader) -> None:
@@ -466,10 +498,13 @@ def build_execution_header(*, schema_version: Literal["2"] = "2", execution_id: 
     return ProvisioningExecutionHeader(*values, digest)
 
 
-def build_checkpoint(*, schema_version: Literal["2"] = "2", checkpoint_id: str, execution_id: str, checkpoint_ordinal: int, previous_digest: str, phase: ExecutionPhase, phase_ordinal: int, plan_step_ordinal: int, step_digest: str, event: CheckpointEvent, observed_at: str, step_evidence: ProvisioningStepEvidence | None = None, runtime_attestation: RuntimeAttestation | None = None, behavior_acceptance: BehaviorAcceptance | None = None) -> ProvisioningCheckpoint:
+def build_checkpoint(*, schema_version: Literal["2", "3"] = "3", checkpoint_id: str, execution_id: str, checkpoint_ordinal: int, previous_digest: str, phase: ExecutionPhase, phase_ordinal: int, plan_step_ordinal: int, step_digest: str, event: CheckpointEvent, observed_at: str, step_evidence: ProvisioningStepEvidence | None = None, runtime_attestation: RuntimeAttestation | None = None, behavior_acceptance: BehaviorAcceptance | None = None) -> ProvisioningCheckpoint:
     observed_at = _canonical_timestamp(observed_at, "observed_at")
     values = (schema_version, checkpoint_id, execution_id, checkpoint_ordinal, previous_digest, phase, phase_ordinal, plan_step_ordinal, step_digest, event, observed_at, step_evidence, runtime_attestation, behavior_acceptance)
-    digest = _hash(_DOMAIN_CHECKPOINT, {field.name: _json_value(value) for field, value in zip(fields(ProvisioningCheckpoint)[:-1], values)})
+    hash_values = {field.name: _json_value(value) for field, value in zip(fields(ProvisioningCheckpoint)[:-1], values)}
+    if schema_version == "2" and isinstance(hash_values.get("step_evidence"), dict) and hash_values["step_evidence"].get("evidence") == {}:
+        hash_values["step_evidence"].pop("evidence", None)
+    digest = _hash(_checkpoint_domain(schema_version), hash_values)
     return ProvisioningCheckpoint(*values, digest)
 
 
@@ -501,7 +536,10 @@ def _reject_constant(value: str) -> Any:
 
 
 def _decode_dataclass(cls: type[Any], value: dict[str, Any]) -> Any:
-    if type(value) is not dict or set(value) != {field.name for field in fields(cls)}:
+    if type(value) is not dict:
+        raise ValueError("payload has missing or extra fields")
+    expected_fields = {field.name for field in fields(cls)}
+    if set(value) != expected_fields:
         raise ValueError("payload has missing or extra fields")
     try:
         if cls is ExecutionOperationIdentity:
@@ -518,9 +556,12 @@ def _decode_dataclass(cls: type[Any], value: dict[str, Any]) -> Any:
         if cls is BehaviorAcceptance:
             return BehaviorAcceptance(**value)
         if cls is ProvisioningStepEvidence:
-            return ProvisioningStepEvidence(StepDisposition(value["disposition"]), value["safe_code"], value["result_digest"], value["redactions_applied"])
+            return ProvisioningStepEvidence(StepDisposition(value["disposition"]), value["safe_code"], value["result_digest"], value["redactions_applied"], value.get("evidence", {}))
         if cls is ProvisioningCheckpoint:
-            return ProvisioningCheckpoint(value["schema_version"], value["checkpoint_id"], value["execution_id"], value["checkpoint_ordinal"], value["previous_digest"], ExecutionPhase(value["phase"]), value["phase_ordinal"], value["plan_step_ordinal"], value["step_digest"], CheckpointEvent(value["event"]), value["observed_at"], None if value["step_evidence"] is None else _decode_dataclass(ProvisioningStepEvidence, value["step_evidence"]), None if value["runtime_attestation"] is None else _decode_dataclass(RuntimeAttestation, value["runtime_attestation"]), None if value["behavior_acceptance"] is None else _decode_dataclass(BehaviorAcceptance, value["behavior_acceptance"]), value["checkpoint_digest"])
+            step_evidence = value["step_evidence"]
+            if step_evidence is not None and value["schema_version"] == "2" and set(step_evidence) == {"disposition", "safe_code", "result_digest", "redactions_applied"}:
+                step_evidence = {**step_evidence, "evidence": {}}
+            return ProvisioningCheckpoint(value["schema_version"], value["checkpoint_id"], value["execution_id"], value["checkpoint_ordinal"], value["previous_digest"], ExecutionPhase(value["phase"]), value["phase_ordinal"], value["plan_step_ordinal"], value["step_digest"], CheckpointEvent(value["event"]), value["observed_at"], None if step_evidence is None else _decode_dataclass(ProvisioningStepEvidence, step_evidence), None if value["runtime_attestation"] is None else _decode_dataclass(RuntimeAttestation, value["runtime_attestation"]), None if value["behavior_acceptance"] is None else _decode_dataclass(BehaviorAcceptance, value["behavior_acceptance"]), value["checkpoint_digest"])
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise ValueError("payload contains an invalid typed value") from error
     raise ValueError("unsupported execution payload type")
@@ -770,7 +811,101 @@ def _execution_time(value: object | None) -> str:
 
 
 def _result_digest(operation: str, result: object, safe_code: str) -> str:
+    if isinstance(result, Mapping) and result.get("ok") is True:
+        return canonical_arguments_digest({
+            "operation": result.get("operation"),
+            "disposition": result.get("disposition"),
+            "safe_code": result.get("safe_code"),
+            "evidence": result.get("evidence"),
+            "redactions_applied": result.get("redactions_applied"),
+        })
     return canonical_arguments_digest({"operation": operation, "outcome": safe_code})
+
+_ADAPTER_RESULT_CONTRACT = {
+    "verify_published_adapter_source": ({"verified_noop"}, {"SOURCE_ALREADY_PUBLISHED"}, {"source_commit_verified"}),
+    "install_runtime": ({"changed", "verified_noop"}, {"RUNTIME_INSTALLED", "RUNTIME_ALREADY_CURRENT"}, {"runtime_digest", "metadata_verified"}),
+    "verify_endpoint_migration_ready": ({"verified_noop"}, {"ENDPOINT_READY"}, set()),
+    "ensure_system_user": ({"changed", "verified_noop"}, {"SYSTEM_USER_CREATED", "SYSTEM_USER_ALREADY_CURRENT"}, {"metadata_verified"}),
+    "ensure_directory": ({"changed", "verified_noop"}, {"DIRECTORY_CREATED", "DIRECTORY_ALREADY_CURRENT"}, {"metadata_verified"}),
+    "generate_secret_file": ({"changed", "verified_noop"}, {"SECRET_CREATED", "SECRET_ALREADY_PRESENT"}, {"size_bytes", "metadata_verified", "identity_digest"}),
+    "generate_cursor_key": ({"changed", "verified_noop"}, {"SECRET_CREATED", "SECRET_ALREADY_PRESENT"}, {"size_bytes", "metadata_verified", "identity_digest"}),
+    "install_overseer_api_token": ({"changed", "verified_noop"}, {"TOKEN_INSTALLED", "TOKEN_ALREADY_PRESENT"}, {"identity_digest", "metadata_verified"}),
+    "ensure_read_only_acl": ({"changed", "verified_noop"}, {"ACL_APPLIED"}, {"acl_verified", "acl_present_before"}),
+    "install_private_config": ({"changed", "verified_noop"}, {"CONFIG_INSTALLED", "CONFIG_ALREADY_CURRENT"}, {"config_digest", "metadata_verified"}),
+    "register_authorized_roots": ({"changed", "verified_noop"}, {"ROOTS_REGISTERED", "ROOTS_ALREADY_REGISTERED"}, {"roots_added", "roots_verified"}),
+    "start_enable_system_service": ({"changed"}, {"SYSTEM_SERVICE_RESTARTED"}, {"active_enter_timestamp_monotonic"}),
+    "stop_disable_user_service": ({"changed", "verified_noop"}, {"USER_SERVICE_DISABLED"}, {"previously_enabled", "previously_active", "service_verified"}),
+    "stop_disable_system_service": ({"changed", "verified_noop"}, {"SYSTEM_SERVICE_DISABLED"}, {"service_verified"}),
+    "restore_enable_user_service": ({"changed", "verified_noop"}, {"USER_SERVICE_ENABLED", "USER_SERVICE_NOT_RESTORED"}, {"service_verified"}),
+    "install_systemd_unit": ({"changed", "verified_noop"}, {"SYSTEMD_UNIT_INSTALLED", "SYSTEMD_UNIT_ALREADY_CURRENT"}, {"unit_digest", "identity_digest", "metadata_verified"}),
+    "verify_mcp_service": ({"verified_noop"}, {"MCP_SCHEMA_VERIFIED"}, set()),
+    "verify_codex_url": ({"verified_noop"}, {"CODEX_MCP_URL_VERIFIED"}, set()),
+    "verify_gpg_identity": ({"verified_noop"}, {"GPG_IDENTITY_VERIFIED"}, {"identity_digest"}),
+    "verify_backup_policy": ({"verified_noop"}, {"BACKUP_POLICY_VERIFIED"}, set()),
+    "remove_private_config": ({"changed", "verified_noop"}, {"CONFIG_REMOVED", "CONFIG_ALREADY_ABSENT"}, {"metadata_verified"}),
+    "remove_overseer_api_token": ({"changed", "verified_noop"}, {"TOKEN_REMOVED", "TOKEN_ALREADY_ABSENT"}, {"metadata_verified"}),
+    "remove_cursor_key_if_unreferenced": ({"changed", "verified_noop"}, {"CURSOR_KEY_REMOVED", "CURSOR_KEY_ALREADY_ABSENT"}, {"metadata_verified"}),
+    "remove_secret_file_if_no_backups": ({"changed", "verified_noop"}, {"SECRET_REMOVED", "SECRET_ALREADY_ABSENT", "SECRET_RETAINED_WITH_BACKUPS"}, {"metadata_verified"}),
+    "remove_systemd_unit": ({"changed", "verified_noop"}, {"SYSTEMD_UNIT_REMOVED", "SYSTEMD_UNIT_ALREADY_ABSENT"}, {"metadata_verified"}),
+    "remove_read_only_acl": ({"changed", "verified_noop"}, {"ACL_REMOVED"}, {"acl_verified"}),
+    "remove_directory_if_empty": ({"changed", "verified_noop"}, {"DIRECTORY_REMOVED", "DIRECTORY_ALREADY_ABSENT"}, set()),
+    "remove_system_user_if_unused": ({"changed", "verified_noop"}, {"SYSTEM_USER_REMOVED", "SYSTEM_USER_ALREADY_ABSENT", "SYSTEM_USER_RETAINED_WITH_STATE"}, set()),
+    "remove_runtime_if_unreferenced": ({"changed", "verified_noop"}, {"RUNTIME_REMOVED", "RUNTIME_ALREADY_ABSENT"}, {"runtime_digest", "metadata_verified"}),
+}
+
+_ADAPTER_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+# Disposition and safe code are one contract, not two independent allowlists.
+_ADAPTER_RESULT_PAIRS = {
+    "verify_published_adapter_source": {"verified_noop": {"SOURCE_ALREADY_PUBLISHED"}},
+    "install_runtime": {"changed": {"RUNTIME_INSTALLED"}, "verified_noop": {"RUNTIME_ALREADY_CURRENT"}},
+    "verify_endpoint_migration_ready": {"verified_noop": {"ENDPOINT_READY"}},
+    "ensure_system_user": {"changed": {"SYSTEM_USER_CREATED"}, "verified_noop": {"SYSTEM_USER_ALREADY_CURRENT"}},
+    "ensure_directory": {"changed": {"DIRECTORY_CREATED"}, "verified_noop": {"DIRECTORY_ALREADY_CURRENT"}},
+    "generate_secret_file": {"changed": {"SECRET_CREATED"}, "verified_noop": {"SECRET_ALREADY_PRESENT"}},
+    "generate_cursor_key": {"changed": {"SECRET_CREATED"}, "verified_noop": {"SECRET_ALREADY_PRESENT"}},
+    "install_overseer_api_token": {"changed": {"TOKEN_INSTALLED"}, "verified_noop": {"TOKEN_ALREADY_PRESENT"}},
+    "ensure_read_only_acl": {"changed": {"ACL_APPLIED"}, "verified_noop": {"ACL_APPLIED"}},
+    "install_private_config": {"changed": {"CONFIG_INSTALLED"}, "verified_noop": {"CONFIG_ALREADY_CURRENT"}},
+    "register_authorized_roots": {"changed": {"ROOTS_REGISTERED"}, "verified_noop": {"ROOTS_ALREADY_REGISTERED"}},
+    "start_enable_system_service": {"changed": {"SYSTEM_SERVICE_RESTARTED"}},
+    "stop_disable_user_service": {"changed": {"USER_SERVICE_DISABLED"}, "verified_noop": {"USER_SERVICE_DISABLED"}},
+    "stop_disable_system_service": {"changed": {"SYSTEM_SERVICE_DISABLED"}, "verified_noop": {"SYSTEM_SERVICE_DISABLED"}},
+    "restore_enable_user_service": {"changed": {"USER_SERVICE_ENABLED"}, "verified_noop": {"USER_SERVICE_NOT_RESTORED"}},
+    "install_systemd_unit": {"changed": {"SYSTEMD_UNIT_INSTALLED"}, "verified_noop": {"SYSTEMD_UNIT_ALREADY_CURRENT"}},
+    "verify_mcp_service": {"verified_noop": {"MCP_SCHEMA_VERIFIED"}},
+    "verify_codex_url": {"verified_noop": {"CODEX_MCP_URL_VERIFIED"}},
+    "verify_gpg_identity": {"verified_noop": {"GPG_IDENTITY_VERIFIED"}},
+    "verify_backup_policy": {"verified_noop": {"BACKUP_POLICY_VERIFIED"}},
+    "remove_private_config": {"changed": {"CONFIG_REMOVED"}, "verified_noop": {"CONFIG_ALREADY_ABSENT"}},
+    "remove_overseer_api_token": {"changed": {"TOKEN_REMOVED"}, "verified_noop": {"TOKEN_ALREADY_ABSENT"}},
+    "remove_cursor_key_if_unreferenced": {"changed": {"CURSOR_KEY_REMOVED"}, "verified_noop": {"CURSOR_KEY_ALREADY_ABSENT"}},
+    "remove_secret_file_if_no_backups": {"changed": {"SECRET_REMOVED"}, "verified_noop": {"SECRET_ALREADY_ABSENT", "SECRET_RETAINED_WITH_BACKUPS"}},
+    "remove_systemd_unit": {"changed": {"SYSTEMD_UNIT_REMOVED"}, "verified_noop": {"SYSTEMD_UNIT_ALREADY_ABSENT"}},
+    "remove_read_only_acl": {"changed": {"ACL_REMOVED"}, "verified_noop": {"ACL_REMOVED"}},
+    "remove_directory_if_empty": {"changed": {"DIRECTORY_REMOVED"}, "verified_noop": {"DIRECTORY_ALREADY_ABSENT"}},
+    "remove_system_user_if_unused": {"changed": {"SYSTEM_USER_REMOVED"}, "verified_noop": {"SYSTEM_USER_ALREADY_ABSENT", "SYSTEM_USER_RETAINED_WITH_STATE"}},
+    "remove_runtime_if_unreferenced": {"changed": {"RUNTIME_REMOVED"}, "verified_noop": {"RUNTIME_ALREADY_ABSENT"}},
+}
+
+
+def _validate_adapter_evidence(evidence: Mapping[str, object]) -> None:
+    """Apply the same bounded evidence vocabulary at the persistence boundary."""
+    for key, value in evidence.items():
+        if key in {"config_digest", "identity_digest", "runtime_digest", "unit_digest"}:
+            if not isinstance(value, str) or _ADAPTER_DIGEST.fullmatch(value) is None:
+                raise ValueError("adapter evidence digest is invalid")
+        elif key in {"metadata_verified", "acl_verified", "previously_enabled", "previously_active", "service_verified"}:
+            if type(value) is not bool:
+                raise ValueError("adapter evidence boolean is invalid")
+        elif key in {"roots_added", "roots_verified", "size_bytes"}:
+            if type(value) is not int or not 0 <= value <= 1_000_000_000:
+                raise ValueError("adapter evidence count is invalid")
+        elif key == "active_enter_timestamp_monotonic":
+            if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,38}", value) is None:
+                raise ValueError("adapter evidence timestamp is invalid")
+        else:
+            raise ValueError("adapter evidence key is not allowlisted")
 
 
 def _normalize_result(operation: str, result: object) -> ProvisioningStepEvidence:
@@ -779,13 +914,22 @@ def _normalize_result(operation: str, result: object) -> ProvisioningStepEvidenc
     if result["operation"] != operation or result["redactions_applied"] is not True:
         raise ValueError("adapter result is not bound to the approved operation")
     if result["ok"] is not True:
-        code = "OPERATION_REPORTED_FAILURE"
-        return ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(operation, False, code), True)
+        raise ValueError("concrete host adapter must not return ok=false")
     if result["disposition"] not in {"changed", "verified_noop"}:
         raise ValueError("adapter result has an invalid disposition")
     disposition = StepDisposition(result["disposition"])
+    contract = _ADAPTER_RESULT_CONTRACT.get(operation)
+    if contract is None:
+        raise ValueError("adapter operation contract is not allowlisted")
+    pairs = _ADAPTER_RESULT_PAIRS.get(operation)
+    if pairs is None or result["disposition"] not in pairs or result["safe_code"] not in pairs[result["disposition"]]:
+        raise ValueError("adapter result does not match the operation contract")
+    evidence = result["evidence"]
+    if not isinstance(evidence, Mapping) or not set(evidence).issubset(contract[2]):
+        raise ValueError("adapter evidence does not match the operation contract")
+    _validate_adapter_evidence(evidence)
     code = "STEP_COMPLETED" if disposition is StepDisposition.CHANGED else "STEP_VERIFIED_NOOP"
-    return ProvisioningStepEvidence(disposition, code, _result_digest(operation, True, code), True)
+    return ProvisioningStepEvidence(disposition, code, _result_digest(operation, result, code), True, evidence)
 
 
 def _runtime(value: object) -> RuntimeAttestation:
@@ -1275,6 +1419,9 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
         claim_epoch, owner_lock = _claim_rollback(store, header, requested, when, owner_id)
         try:
             try:
+                prior = next((item.step_evidence for item in checkpoints if item.event is CheckpointEvent.STEP_COMPLETED and item.plan_step_ordinal == requested.plan_step_ordinal and item.step_digest == requested.forward.step_digest), None)
+                setter = getattr(adapter, "set_rollback_prestate", None)
+                if callable(setter): setter(requested.plan_step_ordinal, prior)
                 result = adapter.execute(rollback_step)
                 evidence = _normalize_result(rollback_step.operation, result)
                 event = CheckpointEvent.ROLLBACK_FAILED if evidence.disposition is StepDisposition.FAILED else CheckpointEvent.ROLLBACK_COMPLETED

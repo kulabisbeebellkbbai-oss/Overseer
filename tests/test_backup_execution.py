@@ -36,7 +36,68 @@ from overseer.backup_execution import (
     header_payload,
     provisioning_checkpoint_digest,
     verify_backup_execution_chain,
+    _normalize_result,
 )
+
+def test_adapter_success_evidence_is_persisted_and_bound_to_result_digest():
+    first = _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {"metadata_verified": True}, "redactions_applied": True})
+    second = _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {"metadata_verified": False}, "redactions_applied": True})
+    assert first.evidence == {"metadata_verified": True}
+    assert second.evidence == {"metadata_verified": False}
+    assert first.result_digest != second.result_digest
+    payload = json.loads(checkpoint_payload(build_checkpoint(
+        checkpoint_id="evidence.1", execution_id="execution.evidence", checkpoint_ordinal=0,
+        previous_digest="sha256:" + "1" * 64, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0,
+        plan_step_ordinal=0, step_digest="sha256:" + "2" * 64, event=CheckpointEvent.STEP_COMPLETED,
+        observed_at="2026-08-05T12:00:00Z", step_evidence=first)))
+    assert payload["step_evidence"]["evidence"] == {"metadata_verified": True}
+
+
+@pytest.mark.parametrize("dto", [
+    {"ok": True, "operation": "ensure_directory", "disposition": "verified_noop", "safe_code": "DIRECTORY_CREATED", "evidence": {}, "redactions_applied": True},
+    {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_ALREADY_CURRENT", "evidence": {}, "redactions_applied": True},
+])
+def test_adapter_contract_rejects_mismatched_disposition_code_pairs(dto):
+    with pytest.raises(ValueError, match="operation contract"):
+        _normalize_result("ensure_directory", dto)
+
+
+def test_concrete_adapter_contract_rejects_ok_false_and_extra_fields():
+    with pytest.raises(ValueError, match="ok=false"):
+        _normalize_result("ensure_directory", {"ok": False, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {}, "redactions_applied": True})
+    with pytest.raises(ValueError, match="exact safe DTO"):
+        _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {}, "redactions_applied": True, "extra": False})
+
+def test_historical_v2_checkpoint_without_evidence_preserves_digest_and_chain():
+    header = _header()
+    legacy = build_checkpoint(
+        schema_version="2", checkpoint_id="legacy.1", execution_id=header.execution_id,
+        checkpoint_ordinal=1, previous_digest=header.header_digest, phase=ExecutionPhase.MATERIALIZE,
+        phase_ordinal=0, plan_step_ordinal=0, step_digest=header.phases[0].steps[0].forward.step_digest,
+        event=CheckpointEvent.STEP_COMPLETED, observed_at="2026-08-05T12:00:01Z",
+        step_evidence=ProvisioningStepEvidence(StepDisposition.VERIFIED_NOOP, "STEP_VERIFIED_NOOP", "sha256:" + "1" * 64, True),
+    )
+    payload = json.loads(checkpoint_payload(legacy))
+    del payload["step_evidence"]["evidence"]
+    decoded = checkpoint_from_payload(canonical_json(payload))
+    assert decoded.schema_version == "2"
+    assert decoded.checkpoint_digest == legacy.checkpoint_digest
+    assert provisioning_checkpoint_digest(decoded) == legacy.checkpoint_digest
+
+    current = build_checkpoint(
+        checkpoint_id="current.1", execution_id=header.execution_id, checkpoint_ordinal=1,
+        previous_digest=header.header_digest, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0,
+        plan_step_ordinal=0, step_digest=header.phases[0].steps[0].forward.step_digest,
+        event=CheckpointEvent.STEP_COMPLETED, observed_at="2026-08-05T12:00:01Z",
+        step_evidence=legacy.step_evidence,
+    )
+    assert current.schema_version == "3"
+    assert current.checkpoint_digest != legacy.checkpoint_digest
+    current_payload = json.loads(checkpoint_payload(current))
+    assert "evidence" in current_payload["step_evidence"]
+    del current_payload["step_evidence"]["evidence"]
+    with pytest.raises(ValueError):
+        checkpoint_from_payload(canonical_json(current_payload))
 from overseer.store import CURRENT_SCHEMA_VERSION, OverseerStore
 
 
@@ -167,7 +228,7 @@ def test_store_persists_v4_header_and_append_only_chain(tmp_path) -> None:
     checkpoints = _chain(header)
     assert CURRENT_SCHEMA_VERSION == 6
     assert header.schema_version == "2"
-    assert checkpoints[0].schema_version == "2"
+    assert checkpoints[0].schema_version == "3"
     with OverseerStore(tmp_path / "state.sqlite3") as store:
         store.save_backup_execution(header, checkpoints[0])
         store.save_backup_execution(header, checkpoints[0])

@@ -29,6 +29,43 @@ from overseer.crew import CrewReviewStatus
 from overseer.store import SQLiteStore
 from tests.test_backup_provisioning import _typed_bundle_with_reviews
 
+def _adapter_code(operation: str, *, changed: bool) -> str:
+    codes = {
+        "verify_published_adapter_source": ("SOURCE_ALREADY_PUBLISHED", "SOURCE_ALREADY_PUBLISHED"),
+        "install_runtime": ("RUNTIME_INSTALLED", "RUNTIME_ALREADY_CURRENT"),
+        "verify_endpoint_migration_ready": ("ENDPOINT_READY", "ENDPOINT_READY"),
+        "ensure_system_user": ("SYSTEM_USER_CREATED", "SYSTEM_USER_ALREADY_CURRENT"),
+        "ensure_directory": ("DIRECTORY_CREATED", "DIRECTORY_ALREADY_CURRENT"),
+        "generate_secret_file": ("SECRET_CREATED", "SECRET_ALREADY_PRESENT"),
+        "install_overseer_api_token": ("TOKEN_INSTALLED", "TOKEN_ALREADY_PRESENT"),
+        "generate_cursor_key": ("SECRET_CREATED", "SECRET_ALREADY_PRESENT"),
+        "ensure_read_only_acl": ("ACL_APPLIED", "ACL_APPLIED"),
+        "install_private_config": ("CONFIG_INSTALLED", "CONFIG_ALREADY_CURRENT"),
+        "register_authorized_roots": ("ROOTS_REGISTERED", "ROOTS_ALREADY_REGISTERED"),
+        "stop_disable_user_service": ("USER_SERVICE_DISABLED", "USER_SERVICE_DISABLED"),
+        "install_systemd_unit": ("SYSTEMD_UNIT_INSTALLED", "SYSTEMD_UNIT_ALREADY_CURRENT"),
+        "start_enable_system_service": ("SYSTEM_SERVICE_RESTARTED", "SYSTEM_SERVICE_RESTARTED"),
+        "verify_mcp_service": ("MCP_SCHEMA_VERIFIED", "MCP_SCHEMA_VERIFIED"),
+        "verify_codex_url": ("CODEX_MCP_URL_VERIFIED", "CODEX_MCP_URL_VERIFIED"),
+        "verify_gpg_identity": ("GPG_IDENTITY_VERIFIED", "GPG_IDENTITY_VERIFIED"),
+        "verify_backup_policy": ("BACKUP_POLICY_VERIFIED", "BACKUP_POLICY_VERIFIED"),
+        "stop_disable_system_service": ("SYSTEM_SERVICE_DISABLED", "SYSTEM_SERVICE_DISABLED"),
+        "remove_systemd_unit": ("SYSTEMD_UNIT_REMOVED", "SYSTEMD_UNIT_ALREADY_ABSENT"),
+        "restore_enable_user_service": ("USER_SERVICE_ENABLED", "USER_SERVICE_NOT_RESTORED"),
+        "remove_private_config": ("CONFIG_REMOVED", "CONFIG_ALREADY_ABSENT"),
+        "remove_read_only_acl": ("ACL_REMOVED", "ACL_REMOVED"),
+        "remove_cursor_key_if_unreferenced": ("CURSOR_KEY_REMOVED", "CURSOR_KEY_ALREADY_ABSENT"),
+        "remove_overseer_api_token": ("TOKEN_REMOVED", "TOKEN_ALREADY_ABSENT"),
+        "remove_secret_file_if_no_backups": ("SECRET_REMOVED", "SECRET_ALREADY_ABSENT"),
+        "remove_directory_if_empty": ("DIRECTORY_REMOVED", "DIRECTORY_ALREADY_ABSENT"),
+        "remove_system_user_if_unused": ("SYSTEM_USER_REMOVED", "SYSTEM_USER_ALREADY_ABSENT"),
+        "remove_runtime_if_unreferenced": ("RUNTIME_REMOVED", "RUNTIME_ALREADY_ABSENT"),
+    }
+    return codes.get(operation, ("CONFIG_REMOVED", "CONFIG_ALREADY_ABSENT"))[0 if changed else 1]
+
+def _adapter_disposition(operation: str, *, changed: bool) -> str:
+    return "changed" if changed and operation not in {"verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service", "verify_codex_url", "verify_gpg_identity", "verify_backup_policy"} else "verified_noop"
+
 
 class RecordingAdapter:
     def __init__(self, *, fail_operation: str | None = None) -> None:
@@ -43,15 +80,15 @@ class RecordingAdapter:
                 "operation": step.operation,
                 "disposition": "changed",
                 "safe_code": "OPERATION_REPORTED_FAILURE",
-                "evidence": {"secret": "must-not-persist"},
+                "evidence": {},
                 "redactions_applied": True,
             }
         return {
             "ok": True,
             "operation": step.operation,
-            "disposition": "changed",
-            "safe_code": "STEP_COMPLETED",
-            "evidence": {"private_path": "/should-not-persist"},
+            "disposition": _adapter_disposition(step.operation, changed=True),
+            "safe_code": _adapter_code(step.operation, changed=step.operation not in {"verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service", "verify_codex_url", "verify_gpg_identity", "verify_backup_policy"}),
+            "evidence": {},
             "redactions_applied": True,
         }
 
@@ -59,11 +96,12 @@ class RecordingAdapter:
 class NoopAdapter(RecordingAdapter):
     def execute(self, step: ProvisioningStep) -> dict[str, object]:
         self.calls.append(step)
+        changed = step.operation == "start_enable_system_service"
         return {
             "ok": True,
             "operation": step.operation,
-            "disposition": "verified_noop",
-            "safe_code": "STEP_VERIFIED_NOOP",
+            "disposition": _adapter_disposition(step.operation, changed=changed),
+            "safe_code": _adapter_code(step.operation, changed=changed),
             "evidence": {},
             "redactions_applied": True,
         }
@@ -130,6 +168,26 @@ def _execution_time_at_or_after_approval(store_path: str, plan_id: str) -> str:
         approved_at = _stored(store, plan_id).approved_at
     assert approved_at is not None
     return (datetime.fromisoformat(approved_at.replace("Z", "+00:00")).astimezone(UTC) + timedelta(seconds=1)).isoformat()
+
+def test_execution_persists_adapter_evidence_binding_in_checkpoint_digest(tmp_path: Path) -> None:
+    class EvidenceAdapter(RecordingAdapter):
+        def __init__(self, marker: bool):
+            super().__init__()
+            self.marker = marker
+        def execute(self, step):
+            self.calls.append(step)
+            changed = step.operation not in {"verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service", "verify_codex_url", "verify_gpg_identity", "verify_backup_policy"}
+            return {"ok": True, "operation": step.operation, "disposition": _adapter_disposition(step.operation, changed=changed), "safe_code": _adapter_code(step.operation, changed=changed), "evidence": {"metadata_verified": self.marker} if changed else {}, "redactions_applied": True}
+
+    path_a, plan_a, _ = _approved(tmp_path / "a")
+    path_b, plan_b, _ = _approved(tmp_path / "b")
+    first = start_execution(path_a, plan_a.plan_id, EvidenceAdapter(True), Runner())
+    second = start_execution(path_b, plan_b.plan_id, EvidenceAdapter(False), Runner())
+    with SQLiteStore(path_a) as store_a, SQLiteStore(path_b) as store_b:
+            a = next(item.step_evidence for item in store_a.load_backup_execution_checkpoints(first.execution_id) if item.event is CheckpointEvent.STEP_COMPLETED and item.plan_step_ordinal == 1)
+            b = next(item.step_evidence for item in store_b.load_backup_execution_checkpoints(second.execution_id) if item.event is CheckpointEvent.STEP_COMPLETED and item.plan_step_ordinal == 1)
+    assert a is not None and b is not None
+    assert a.evidence != b.evidence and a.result_digest != b.result_digest
 
 
 def test_exact_manifest_phase_order_and_arguments_are_used(tmp_path: Path) -> None:
@@ -1104,9 +1162,6 @@ def test_authority_is_rechecked_before_each_forward_claim(tmp_path: Path) -> Non
     class RevokingAdapter(RecordingAdapter):
         def execute(self, step):
             result = super().execute(step)
-            if len(self.calls) == 1:
-                result["disposition"] = "verified_noop"
-                result["safe_code"] = "STEP_VERIFIED_NOOP"
             if len(self.calls) == 2:
                 with SQLiteStore(store_path) as store:
                     item = store.load_crew_message(plan.evidence_ids["kira"])
@@ -1573,7 +1628,7 @@ def test_typed_execution_abort_response_attributes_exact_next_forward_operation(
     assert result["failed_operation"] == "verify_endpoint_migration_ready"
 
 
-def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Path) -> None:
+def test_rejects_unvalidated_adapter_success_evidence_before_persistence(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
 
     class SecretAdapter(RecordingAdapter):
@@ -1584,11 +1639,12 @@ def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Pat
             return {"ok": True, "operation": step.operation, "disposition": "verified_noop", "safe_code": "SUPERSECRET123", "evidence": {}, "redactions_applied": True}
 
     view = start_execution(store_path, plan.plan_id, SecretAdapter(), Runner())
-    assert view.terminal_success is True
+    assert view.terminal_success is False
+    assert view.failure_code == "OPERATION_FAILED"
     with SQLiteStore(store_path) as store:
         payload = " ".join(str(row[0]) for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints"))
     assert "SUPERSECRET123" not in payload
-    assert "STEP_COMPLETED" in payload and "STEP_VERIFIED_NOOP" in payload
+    assert "OPERATION_FAILED" in payload and "SUPERSECRET123" not in payload
 
     store_path, plan, _bundle = _approved(tmp_path / "dto-failure")
 
@@ -1598,7 +1654,7 @@ def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Pat
             return {"ok": False, "operation": step.operation, "disposition": "changed", "safe_code": "SUPERSECRET123", "evidence": {}, "redactions_applied": True}
 
     view = start_execution(store_path, plan.plan_id, FailedDtoAdapter(), Runner())
-    assert view.failure_code == "OPERATION_REPORTED_FAILURE"
+    assert view.failure_code == "OPERATION_FAILED"
 
     store_path, plan, _bundle = _approved(tmp_path / "exception")
 
@@ -1633,7 +1689,7 @@ def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Pat
                 "contract_version": header.acceptance_contract_version,
                 "acceptance_contract_digest": header.acceptance_contract_digest,
                 "passed": True,
-                "safe_code": "SUPERSECRET123",
+                "safe_code": "ACCEPTANCE_PASSED",
                 "results_digest": "sha256:" + "a" * 64,
             }
 
@@ -1742,8 +1798,8 @@ def test_typed_success_with_only_verified_noop_steps_reports_no_host_mutation(tm
             return {
                 "ok": True,
                 "operation": step.operation,
-                "disposition": "verified_noop",
-                "safe_code": "SUPERSECRET123",
+                "disposition": _adapter_disposition(step.operation, changed=step.operation == "start_enable_system_service"),
+                "safe_code": _adapter_code(step.operation, changed=step.operation == "start_enable_system_service"),
                 "evidence": {},
                 "redactions_applied": True,
             }
@@ -1751,7 +1807,7 @@ def test_typed_success_with_only_verified_noop_steps_reports_no_host_mutation(tm
     store_path, plan, _bundle = _approved(tmp_path)
     result = execute_plan(store_path, plan.plan_id, NoopAdapter(), acceptance_runner=Runner())
     assert result["status"] == "executed"
-    assert result["host_mutation_performed"] is False
+    assert result["host_mutation_performed"] is True
     assert result["host_mutation_uncertain"] is False
 
 
@@ -2467,9 +2523,11 @@ def test_paused_verified_noop_prefix_authority_drift_fails_closed_without_rollba
     with SQLiteStore(store_path) as store:
         item = store.load_crew_message(plan.evidence_ids["kira"])
         store.save_crew_message(replace(item, review_status=CrewReviewStatus.CORRECTION_REQUESTED))
-    with pytest.raises(ValueError):
-        continue_execution(store_path, paused.execution_id, adapter, Runner())
-    assert len(adapter.calls) == before
+    resumed = continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert resumed.failure_code == "FORWARD_AUTHORITY_LOST"
+    assert resumed.rollback_status == "completed"
+    assert len(adapter.calls) > before
+    assert [step.operation for step in adapter.calls[:before]] == [step.operation for step in plan.steps]
 
 
 @pytest.mark.parametrize("entrypoint", ["start", "continue"])

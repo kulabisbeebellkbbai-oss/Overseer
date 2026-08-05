@@ -411,3 +411,72 @@ Commits:
 No Overseer source, main Roadex checkout, DonutHole checkout, live
 service/store, approval, deployment, gateway, firewall/IDS, or push was
 touched for this final security fix.
+
+## Final Sol Task 3 security-correction addendum: authoritative registration commit
+
+The final Roadex correction is complete in the isolated Roadex feature
+worktree. Final Roadex source/test SHA: `bf84278521525add6b4194baefad6d77edfde9c8`.
+It preserves the prior bounded transport corrections `16333ba` (bounded
+approval-staging response streams) and `fac2372` (cancel-safe approval response
+transport). The existing isolated Overseer Task 3 source SHA remains
+`556fddac47ee8ae5e80b94ddc847f1aaa8b0c13f`; no Overseer source was changed.
+
+Resolved Sol findings:
+
+- The registration path no longer awaits generic `persist()`. It uses a
+  dedicated synchronous authoritative registration commit port with the
+  closed outcomes `committed`, `not-committed`, and `indeterminate`.
+- The one atomic snapshot contains the pending wait, paused session/wait
+  summary, registration stream event, and `approval_wait.register` audit event.
+  Subscriber delivery happens only after `committed` and does not resave.
+- JSON and memory persistence now expose strict authoritative reads. Save
+  success and save exceptions are reconciled by exact canonical tuple readback;
+  a post-rename exception therefore remains committed, confirmed empty state
+  is not-committed, and unreadable/malformed/partial/conflicting/nonmatching
+  state is indeterminate. The forgiving load-empty path is not used as absence
+  evidence.
+- `not-committed` restores the exact in-memory preimage and returns the
+  redacted provider-unavailable result. `indeterminate` retains a blocked,
+  reconciliation-required, non-dispatchable session, blocks polling and
+  continuation, returns the redacted `persistence_indeterminate` host/MCP
+  result, and performs no compensating write. Startup uses the strict
+  authoritative state for restart recovery and fails closed on indeterminate
+  state.
+- Pre-fence timeout and socket-close races leave no durable wait, stream event,
+  or audit. Post-fence timeout/socket-close races preserve the committed wait
+  and truthful restart state.
+
+TDD and verification evidence for `bf84278521525add6b4194baefad6d77edfde9c8`:
+
+```text
+RED:
+npm test -- --run tests/approvalCoordinator.test.ts -t 'does not route registration through a never-settling generic persistence callback' --pool=forks --maxWorkers=1
+1 failed: registration hung in generic persist
+
+RED:
+npm test -- --run tests/statePersistence.test.ts -t 'strict authoritative probe exception' --pool=forks --maxWorkers=1
+1 failed: strict probe exception escaped instead of returning indeterminate
+
+Focused GREEN:
+npm test -- --run tests/approvalCoordinator.test.ts tests/approvalWorkflowHost.test.ts tests/approvalWorkflowTimeoutRace.test.ts tests/approvalLifecycleIntegration.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalStatusProvider.test.ts tests/sessionService.test.ts tests/statePersistence.test.ts tests/approvalRegistrationCommitIntegration.test.ts tests/overseerApprovalStageTransport.test.ts --pool=forks --maxWorkers=1
+10 files passed, 251 tests passed
+
+Full verification:
+npm test -- --pool=forks --maxWorkers=1
+55 files passed, 566 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed
+
+git diff --check
+passed
+```
+
+No main Roadex checkout, main DonutHole checkout, live service/store,
+approval, deployment, gateway, firewall/IDS, or push was touched. The Roadex
+feature worktree was clean after the source/test commit; this addendum is the
+only intended change in this isolated Overseer feature worktree and is
+committed separately.

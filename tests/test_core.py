@@ -11531,10 +11531,10 @@ class SQLiteStoreTests(unittest.TestCase):
             reopened_migrations = reopened.list_schema_migrations()
             reopened.close()
 
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 3)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 4)
         self.assertEqual(len(migrations), 10)
-        self.assertEqual(migrations[0].version, 3)
-        self.assertEqual(migrations[0].description, "bootstrap JSON payload store")
+        self.assertEqual(migrations[0].version, 4)
+        self.assertEqual(migrations[0].description, "append-only backup execution store")
         self.assertEqual(migrations[1].version, "agent_driver_v1")
         self.assertEqual(migrations[2].version, "agent_driver_v2")
         self.assertEqual(migrations[3].version, "agent_driver_v3")

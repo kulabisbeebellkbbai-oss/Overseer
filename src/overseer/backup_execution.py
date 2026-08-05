@@ -863,7 +863,8 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
             raise _ExecutionContentionError(message)
 
         try:
-            bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
+            terminal = bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED)
+            bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=terminal)
             if _make_header(bundle, binding, source, header.created_at) != header:
                 raise _AuthorityMismatchError("stored execution header does not match current authority")
         except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:

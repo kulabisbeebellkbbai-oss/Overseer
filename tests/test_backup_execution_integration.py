@@ -1223,6 +1223,96 @@ def test_execute_plan_preserves_mutation_when_later_completed_claim_is_contended
     assert not thread_b.is_alive()
 
 
+def test_execute_plan_preserves_changed_mutation_when_terminal_claim_is_contended(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+    import overseer.backup_provisioning as provisioning
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    a_completed = threading.Event()
+    b_finished = threading.Event()
+    release_a = threading.Event()
+    a_finished = threading.Event()
+    a_adapter = RecordingAdapter()
+    b_adapter = RecordingAdapter()
+    results: dict[str, object] = {}
+    captured: dict[str, object] = {}
+    original_append = execution._append
+    original_public = provisioning._typed_execution_public
+
+    def observe_append(store, header, ordinal, identity, event, when, **kwargs):
+        result = original_append(store, header, ordinal, identity, event, when, **kwargs)
+        if (
+            threading.current_thread().name == "caller-a"
+            and event is CheckpointEvent.STEP_COMPLETED
+            and identity.forward.operation == "install_runtime"
+        ):
+            captured["a_completed_checkpoint"] = store.load_backup_execution_checkpoints(header.execution_id)[-1]
+            a_completed.set()
+            assert b_finished.wait(timeout=10)
+            assert release_a.wait(timeout=10)
+        return result
+
+    def observe_public(plan_arg, view, checkpoints, **kwargs):
+        if threading.current_thread().name == "caller-a":
+            captured["a_public"] = (plan_arg, view, checkpoints, kwargs["invocation_checkpoints"])
+        return original_public(plan_arg, view, checkpoints, **kwargs)
+
+    monkeypatch.setattr(execution, "_append", observe_append)
+    monkeypatch.setattr(provisioning, "_typed_execution_public", observe_public)
+
+    def run_a() -> None:
+        results["a"] = execute_plan(store_path, plan.plan_id, a_adapter, acceptance_runner=Runner())
+        a_finished.set()
+
+    def run_b() -> None:
+        with SQLiteStore(store_path) as store:
+            entry_checkpoint_ids = {
+                checkpoint.checkpoint_id
+                for checkpoint in store.load_backup_execution_checkpoints(
+                    store.load_backup_execution_header_for_plan(plan.plan_id).execution_id
+                )
+            }
+        results["b"] = execute_plan(store_path, plan.plan_id, b_adapter, acceptance_runner=Runner())
+        with SQLiteStore(store_path) as store:
+            captured["b_checkpoint_ids"] = {
+                checkpoint.checkpoint_id
+                for checkpoint in store.load_backup_execution_checkpoints(
+                    store.load_backup_execution_header_for_plan(plan.plan_id).execution_id
+                )
+            } - entry_checkpoint_ids
+        b_finished.set()
+
+    thread_a = threading.Thread(target=run_a, name="caller-a")
+    thread_b = threading.Thread(target=run_b, name="caller-b")
+    thread_a.start()
+    assert a_completed.wait(timeout=10)
+    thread_b.start()
+    assert b_finished.wait(timeout=10)
+    release_a.set()
+    assert a_finished.wait(timeout=10)
+    thread_a.join(timeout=10)
+    thread_b.join(timeout=10)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    install_runtime = next(step for step in plan.steps if step.operation == "install_runtime")
+    assert a_adapter.calls.count(install_runtime) == 1
+    assert b_adapter.calls.count(install_runtime) == 0
+    assert results["b"]["status"] == "executed"
+    assert results["a"]["status"] == "executed"
+    assert results["a"]["mutation_performed"] is True
+    assert results["a"]["host_mutation_performed"] is True
+    assert results["a"]["host_mutation_uncertain"] is False
+    a_plan, a_view, a_checkpoints, a_invocation_checkpoints = captured["a_public"]
+    assert a_plan.plan_id == plan.plan_id
+    assert a_view.status == "succeeded"
+    assert a_view.terminal_success is True
+    assert captured["a_completed_checkpoint"] in a_invocation_checkpoints
+    assert {item.checkpoint_id for item in a_invocation_checkpoints}.isdisjoint(captured["b_checkpoint_ids"])
+    assert a_checkpoints[-1].event is CheckpointEvent.EXECUTION_FINALIZED
+    assert a_adapter.calls.count(install_runtime) == 1
+
+
 def test_execute_plan_does_not_swallow_unrelated_claim_value_error(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
 

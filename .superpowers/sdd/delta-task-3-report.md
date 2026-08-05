@@ -523,3 +523,50 @@ service/store, approval, deployment, gateway, firewall/IDS, push, main
 Roadex checkout, or DonutHole checkout was touched. This report-only
 Overseer change is committed separately; the Overseer worktree is clean after
 that commit.
+
+## Cancellation-cleanup correction addendum
+
+The isolated Roadex Task 3 correction is committed at
+`0198cb8ff53e2351397e80681e852cac613ceaee` (`Fix approval transport
+cancellation cleanup`). On the response-header failure path,
+`cancelResponseBody()` remains invoked and memoized, but its settlement is no
+longer awaited. The existing redacted unavailable error, reader/body choice,
+timeout and parent-abort behavior, and rejection consumption are preserved.
+
+TDD evidence:
+
+```text
+RED:
+npm test -- --run tests/overseerApprovalStageTransport.test.ts -t 'rejects promptly after invoking a never-settling response-body cancellation' --pool=forks --maxWorkers=1
+1 failed: cancellation was invoked, but the stage remained pending and the bounded setImmediate sentinel won instead of the expected rejection.
+
+GREEN:
+npm test -- --run tests/overseerApprovalStageTransport.test.ts -t 'rejects promptly after invoking a never-settling response-body cancellation' --pool=forks --maxWorkers=1
+1 test passed (13 skipped); cancellation was observed and the stage rejected with 'Overseer approval staging is unavailable.'.
+
+Focused transport file:
+npm test -- --run tests/overseerApprovalStageTransport.test.ts --pool=forks --maxWorkers=1
+1 file passed, 14 tests passed
+
+Task 3 focused suite:
+npm test -- --run tests/approvalCoordinator.test.ts tests/approvalWorkflowHost.test.ts tests/approvalWorkflowTimeoutRace.test.ts tests/approvalLifecycleIntegration.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalStatusProvider.test.ts tests/sessionService.test.ts tests/statePersistence.test.ts tests/approvalRegistrationCommitIntegration.test.ts tests/overseerApprovalStageTransport.test.ts --pool=forks --maxWorkers=1
+10 files passed, 252 tests passed
+
+Full verification:
+npx vitest run --dir tests --pool=forks --maxWorkers=1 --reporter=dot
+55 files passed, 567 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed
+
+git diff --check
+passed
+```
+
+The Roadex worktree was clean after commit `0198cb8ff53e2351397e80681e852cac613ceaee`.
+No live service/store, approval, deployment, gateway, firewall/IDS, push,
+main Roadex checkout, or DonutHole checkout was touched. This report-only
+Overseer addendum is the sole intended change in this worktree.

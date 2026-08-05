@@ -480,3 +480,46 @@ approval, deployment, gateway, firewall/IDS, or push was touched. The Roadex
 feature worktree was clean after the source/test commit; this addendum is the
 only intended change in this isolated Overseer feature worktree and is
 committed separately.
+
+## UTF-8 correction addendum
+
+The isolated Roadex Task 3 correction is committed at
+`72e3e82b595c7cc775cac9ecbfcb43a47e31dc62` (`fix: reject invalid UTF-8
+approval requests`). The worker socket framing boundary now decodes request
+bytes with `TextDecoder('utf-8', { fatal: true })`; newline framing and the
+4,096-byte request limit are unchanged.
+
+TDD evidence:
+
+```text
+RED:
+npm test -- --run tests/approvalWorkflowHost.test.ts -t 'rejects invalid UTF-8 before consuming or staging an approval request' --pool=forks --maxWorkers=1
+1 failed: malformed 0xff in intent.reason was replaced during permissive UTF-8 decoding and the host returned { ok: true, waitId: 'wait-1', waitState: 'pending' }.
+
+GREEN:
+same focused command
+1 test passed (13 skipped); response was { ok: false, reason: 'request_invalid' } and consumeGrant, stageTypedIntent, and registerApprovalWait were each called zero times.
+
+Task 3 focused suite:
+npm test -- --run tests/approvalCoordinator.test.ts tests/approvalWorkflowHost.test.ts tests/approvalWorkflowTimeoutRace.test.ts tests/approvalLifecycleIntegration.test.ts tests/approvalWorkflowComposition.test.ts tests/approvalStatusProvider.test.ts tests/sessionService.test.ts tests/statePersistence.test.ts tests/approvalRegistrationCommitIntegration.test.ts tests/overseerApprovalStageTransport.test.ts --pool=forks --maxWorkers=1
+10 files passed, 252 tests passed
+
+Full Roadex tests serially:
+npx vitest run --dir tests --pool=forks --maxWorkers=1 --reporter=dot
+55 files passed, 567 tests passed
+
+npm run lint
+passed
+
+npm run build
+passed
+
+git diff --check
+passed
+```
+
+Only the Roadex source/test correction was committed in Roadex. No live
+service/store, approval, deployment, gateway, firewall/IDS, push, main
+Roadex checkout, or DonutHole checkout was touched. This report-only
+Overseer change is committed separately; the Overseer worktree is clean after
+that commit.

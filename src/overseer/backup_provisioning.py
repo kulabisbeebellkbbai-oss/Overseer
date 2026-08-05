@@ -405,10 +405,13 @@ def execute_plan(
             typed_execution = False
         if typed_execution:
             from .backup_execution import continue_execution, start_execution
+            before_plan = _stored(store, plan_id)
             try:
                 execution_id = store.load_backup_execution_header_for_plan(plan_id).execution_id
+                before_checkpoints = store.load_backup_execution_checkpoints(execution_id)
             except KeyError:
                 execution_id = None
+                before_checkpoints = ()
             if execution_id is None:
                 view = start_execution(store_path, plan_id, adapter, acceptance_runner, now=now)
             else:
@@ -416,7 +419,8 @@ def execute_plan(
             with SQLiteStore(store_path) as store:
                 plan = _stored(store, plan_id)
                 checkpoints = store.load_backup_execution_checkpoints(view.execution_id)
-            return _typed_execution_public(plan, view, checkpoints)
+            delta = checkpoints[len(before_checkpoints):] if checkpoints[:len(before_checkpoints)] == before_checkpoints else checkpoints
+            return _typed_execution_public(plan, view, checkpoints, invocation_checkpoints=delta, mutation=bool(delta) or plan != before_plan)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)
@@ -748,16 +752,17 @@ def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutat
     return {"ok": True, "plan_id": plan.plan_id, "kind": plan.kind, "plan_digest": plan.plan_digest, "status": plan.status.value, "approval_required": plan.status == ProvisioningStatus.STAGED, "approved_by": plan.approved_by, "evidence_ids": dict(plan.evidence_ids), "evidence_digest": plan.evidence_digest, "failed_operation": plan.failed_operation, "error_code": plan.error_code, "rollback_operations": [step.operation for step in plan.rollback_steps], "redactions_applied": True, "mutation_performed": mutation, "host_mutation_performed": host_mutation}
 
 
-def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpoints: tuple[object, ...]) -> Mapping[str, object]:
+def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpoints: tuple[object, ...], *, invocation_checkpoints: tuple[object, ...] | None = None, mutation: bool = True) -> Mapping[str, object]:
     from .backup_execution import CheckpointEvent, StepDisposition
     non_synthetic = len(plan.steps)
+    current = checkpoints if invocation_checkpoints is None else invocation_checkpoints
     host_mutation = any(
         getattr(item, "plan_step_ordinal", non_synthetic) < non_synthetic
         and (
             getattr(getattr(item, "step_evidence", None), "disposition", None) in {StepDisposition.CHANGED, StepDisposition.FAILED}
             or getattr(item, "event", None) in {CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED}
         )
-        for item in checkpoints
+        for item in current
     )
     if view.terminal_success:
         status = "executed"
@@ -767,7 +772,7 @@ def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpo
         status = "failed"
     else:
         status = "in_progress"
-    result = dict(_public(plan, mutation=True, host_mutation=host_mutation))
+    result = dict(_public(plan, mutation=mutation, host_mutation=host_mutation))
     result.update({
         "execution_id": view.execution_id,
         "execution_status": view.status,

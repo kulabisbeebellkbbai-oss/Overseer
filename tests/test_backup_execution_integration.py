@@ -51,6 +51,19 @@ class RecordingAdapter:
         }
 
 
+class NoopAdapter(RecordingAdapter):
+    def execute(self, step: ProvisioningStep) -> dict[str, object]:
+        self.calls.append(step)
+        return {
+            "ok": True,
+            "operation": step.operation,
+            "disposition": "verified_noop",
+            "safe_code": "STEP_VERIFIED_NOOP",
+            "evidence": {},
+            "redactions_applied": True,
+        }
+
+
 class BlockingAdapter(RecordingAdapter):
     def __init__(self, started: threading.Event, release: threading.Event) -> None:
         super().__init__()
@@ -210,15 +223,81 @@ def test_authority_is_rechecked_before_each_forward_claim(tmp_path: Path) -> Non
         def execute(self, step):
             result = super().execute(step)
             if len(self.calls) == 1:
+                result["disposition"] = "verified_noop"
+                result["safe_code"] = "STEP_VERIFIED_NOOP"
+            if len(self.calls) == 2:
                 with SQLiteStore(store_path) as store:
                     item = store.load_crew_message(plan.evidence_ids["kira"])
                     store.save_crew_message(replace(item, review_status=CrewReviewStatus.CORRECTION_REQUESTED))
             return result
 
     adapter = RevokingAdapter()
-    with pytest.raises(ValueError):
+    view = start_execution(store_path, plan.plan_id, adapter, Runner())
+    assert view.failure_code == "FORWARD_AUTHORITY_LOST"
+    assert view.rollback_status == "completed"
+    assert [step.operation for step in adapter.calls] == [
+        "verify_published_adapter_source", "install_runtime", "remove_runtime_if_unreferenced",
+    ]
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(view.execution_id)
+    assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_COMPLETED
+    assert any(item.event is CheckpointEvent.EXECUTION_ABORTED for item in checkpoints)
+    assert sum(step.operation == "remove_runtime_if_unreferenced" for step in adapter.calls) == 1
+
+
+def test_verified_noop_is_not_rolled_back_after_later_failure(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = NoopAdapter()
+    view = start_execution(store_path, plan.plan_id, adapter, Runner(wrong_runtime=True))
+    assert view.failure_code == "OPERATION_FAILED"
+    assert "remove_runtime_if_unreferenced" not in [step.operation for step in adapter.calls]
+
+
+def test_interrupted_rollback_resumes_without_renewed_forward_authority(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter(fail_operation="install_systemd_unit")
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_one_rollback(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_COMPLETED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("crash after one rollback")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_one_rollback)
+    with pytest.raises(BaseException):
         start_execution(store_path, plan.plan_id, adapter, Runner())
-    assert len(adapter.calls) == 1
+    monkeypatch.setattr(execution, "_append", original_append)
+    with SQLiteStore(store_path) as store:
+        message = store.load_crew_message(plan.evidence_ids["kira"])
+        store.save_crew_message(replace(message, review_status=CrewReviewStatus.CORRECTION_REQUESTED))
+    before = len(adapter.calls)
+    view = continue_execution(store_path, execution_id_for(store_path, plan.plan_id), adapter, Runner())
+    assert view.rollback_status == "completed"
+    assert [step.operation for step in adapter.calls[before:]] == [
+        "remove_private_config",
+        "remove_read_only_acl", "remove_cursor_key_if_unreferenced", "remove_overseer_api_token",
+        "remove_secret_file_if_no_backups", "remove_directory_if_empty", "remove_directory_if_empty",
+        "remove_directory_if_empty", "remove_directory_if_empty", "remove_system_user_if_unused",
+        "remove_runtime_if_unreferenced",
+    ]
+
+
+def test_typed_execute_plan_reports_only_current_invocation_mutation(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    first = execute_plan(store_path, plan.plan_id, RecordingAdapter(), acceptance_runner=Runner())
+    assert first["mutation_performed"] is True and first["host_mutation_performed"] is True
+    replay_adapter = RecordingAdapter()
+    replay = execute_plan(store_path, plan.plan_id, replay_adapter, acceptance_runner=Runner())
+    assert replay["mutation_performed"] is False
+    assert replay["host_mutation_performed"] is False
+    assert replay_adapter.calls == []
 
 
 def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Path) -> None:

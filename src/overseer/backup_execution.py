@@ -48,6 +48,7 @@ class CheckpointEvent(StrEnum):
     ROLLBACK_STARTED = "rollback_started"
     ROLLBACK_COMPLETED = "rollback_completed"
     ROLLBACK_FAILED = "rollback_failed"
+    EXECUTION_ABORTED = "execution_aborted"
     EXECUTION_FINALIZED = "execution_finalized"
 
 
@@ -543,7 +544,7 @@ def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoin
     ordered = [(phase.phase, phase.phase_ordinal, step) for phase in header.phases for step in phase.steps]
     next_forward = 0
     started: tuple[ExecutionStepIdentity, ExecutionPhase, bool] | None = None
-    completed: list[tuple[ExecutionStepIdentity, ExecutionPhase]] = []
+    completed: list[tuple[ExecutionStepIdentity, ExecutionPhase, StepDisposition]] = []
     failure_seen = False
     rollback_started: tuple[ExecutionStepIdentity, ExecutionPhase] | None = None
     rollback_remaining: list[tuple[ExecutionStepIdentity, ExecutionPhase]] = []
@@ -586,7 +587,7 @@ def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoin
                     if behavior is None or behavior.acceptance_contract_digest != header.acceptance_contract_digest or behavior.contract_version != header.acceptance_contract_version or not behavior.passed or behavior.safe_code != _SUCCESS:
                         raise ValueError("ACCEPT completion lacks bound passing contract acceptance")
                     acceptance = behavior
-                completed.append((step, checkpoint.phase)); next_forward += 1
+                completed.append((step, checkpoint.phase, evidence.disposition)); next_forward += 1
             else:
                 if evidence.disposition is not StepDisposition.FAILED or (runtime is not None and checkpoint.phase is not ExecutionPhase.ATTEST) or (behavior is not None and checkpoint.phase is not ExecutionPhase.ACCEPT):
                     raise ValueError("failed step has invalid typed evidence")
@@ -595,7 +596,7 @@ def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoin
                 if behavior is not None and (behavior.acceptance_contract_digest != header.acceptance_contract_digest or behavior.contract_version != header.acceptance_contract_version or behavior.passed):
                     raise ValueError("failed ACCEPT detail is not bound to the acceptance contract")
                 failure_seen = True
-                rollback_remaining = [(s, p) for s, p in reversed(completed) if s.rollback is not None]
+                rollback_remaining = [(s, p) for s, p, disposition in reversed(completed) if disposition is StepDisposition.CHANGED and s.rollback is not None]
             started = None
         elif event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED):
             if not failure_seen or not rollback_remaining or rollback_remaining[0] != (step, checkpoint.phase):
@@ -614,6 +615,11 @@ def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoin
                 if event is CheckpointEvent.ROLLBACK_FAILED:
                     failure_seen = True
                 rollback_started = None; rollback_remaining.pop(0)
+        elif event is CheckpointEvent.EXECUTION_ABORTED:
+            if is_rollback or any(x is not None for x in (runtime, behavior)) or started or failure_seen or rollback_started or evidence is None or evidence.disposition is not StepDisposition.FAILED or evidence.safe_code != "FORWARD_AUTHORITY_LOST" or next_forward >= len(ordered) or step is not ordered[next_forward][2] or checkpoint.phase is not ordered[next_forward][0]:
+                raise ValueError("execution abort has invalid state")
+            failure_seen = True
+            rollback_remaining = [(s, p) for s, p, disposition in reversed(completed) if disposition is StepDisposition.CHANGED and s.rollback is not None]
         elif event is CheckpointEvent.EXECUTION_FINALIZED:
             if any(x is not None for x in (evidence, runtime, behavior)) or checkpoint.phase is not ExecutionPhase.FINALIZE or step is not header.phases[-1].steps[-1] or started or failure_seen or rollback_remaining or next_forward != len(ordered) or attestation is None or acceptance is None or not acceptance.passed:
                 raise ValueError("execution finalization is not justified")
@@ -629,12 +635,14 @@ def derive_backup_execution_view(header: ProvisioningExecutionHeader, checkpoint
     attestation = next((c.runtime_attestation for c in reversed(checkpoints) if c.runtime_attestation), None)
     acceptance = next((c.behavior_acceptance for c in reversed(checkpoints) if c.behavior_acceptance), None)
     tail_evidence = next((c.step_evidence for c in reversed(checkpoints) if c.step_evidence), None)
-    failure = next((c.step_evidence.safe_code for c in reversed(checkpoints) if c.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.ROLLBACK_FAILED) and c.step_evidence), None)
+    failure = next((c.step_evidence.safe_code for c in reversed(checkpoints) if c.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.ROLLBACK_FAILED, CheckpointEvent.EXECUTION_ABORTED) and c.step_evidence), None)
     rollback_events = [c.event for c in checkpoints if c.event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)]
     required_rollbacks = len({
         _bound_step(header, checkpoint)[0].plan_step_ordinal
         for checkpoint in checkpoints
         if checkpoint.event is CheckpointEvent.STEP_COMPLETED
+        and checkpoint.step_evidence is not None
+        and checkpoint.step_evidence.disposition is StepDisposition.CHANGED
         and _bound_step(header, checkpoint)[0].rollback is not None
     })
     completed_rollbacks = sum(1 for event in rollback_events if event is CheckpointEvent.ROLLBACK_COMPLETED)
@@ -796,14 +804,26 @@ def _append(store: SQLiteStore, header: ProvisioningExecutionHeader, ordinal: in
     store.append_backup_execution_checkpoint(checkpoint)
 
 
-def _claim_forward(store, header: ProvisioningExecutionHeader, identity: ExecutionStepIdentity, when: str) -> None:
+def _claim_forward(store, header: ProvisioningExecutionHeader, identity: ExecutionStepIdentity, when: str) -> bool:
     """Revalidate authority and claim one exact operation in one transaction."""
     with store.agent_transaction():
-        bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
-        if _make_header(bundle, binding, source, header.created_at) != header:
-            raise ValueError("stored execution header does not match current authority")
         chain = store.load_backup_execution_checkpoints(header.execution_id)
         verify_backup_execution_chain(header, chain)
+        try:
+            bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
+            if _make_header(bundle, binding, source, header.created_at) != header:
+                raise ValueError("stored execution header does not match current authority")
+        except ValueError:
+            _verify_immutable_cleanup_identity(store, header, chain)
+            expected_steps = [step for phase in header.phases for step in phase.steps]
+            completed = [item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
+            if chain and chain[-1].event in (CheckpointEvent.STEP_STARTED, CheckpointEvent.ROLLBACK_STARTED):
+                raise ValueError("EXECUTION_IN_PROGRESS")
+            if completed != [step.plan_step_ordinal for step in expected_steps[:len(completed)]] or len(completed) >= len(expected_steps) or expected_steps[len(completed)] != identity:
+                raise ValueError("execution claim is not the next exact operation")
+            evidence = ProvisioningStepEvidence(StepDisposition.FAILED, "FORWARD_AUTHORITY_LOST", _result_digest(identity.forward.operation, False, "FORWARD_AUTHORITY_LOST"), True)
+            _append(store, header, len(chain), identity, CheckpointEvent.EXECUTION_ABORTED, when, evidence=evidence)
+            return False
         if not chain or chain[-1].event in (CheckpointEvent.STEP_STARTED, CheckpointEvent.ROLLBACK_STARTED):
             raise ValueError("EXECUTION_IN_PROGRESS")
         completed = [item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
@@ -813,6 +833,17 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
         if len(completed) >= len(expected_steps) or expected_steps[len(completed)] != identity:
             raise ValueError("execution claim is not the next exact operation")
         _append(store, header, len(chain), identity, CheckpointEvent.STEP_STARTED, when)
+        return True
+
+
+def _verify_immutable_cleanup_identity(store, header: ProvisioningExecutionHeader, chain: tuple[ProvisioningCheckpoint, ...]) -> None:
+    from . import provisioning_bundle
+    bundle = provisioning_bundle.load_provisioning_bundle(store, header.plan_id)
+    if type(bundle) is not provisioning_bundle.ProvisioningBundleV1 or not bundle.preflight.passed:
+        raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID")
+    if bundle.intent.plan_id != header.bundle_id or bundle.bundle_digest != header.bundle_digest or bundle.plan.plan_id != header.plan_id or bundle.plan.plan_digest != header.plan_digest or _manifest(bundle.plan) != header.phases:
+        raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID")
+    verify_backup_execution_chain(header, chain)
 
 
 def _view(store: SQLiteStore, execution_id: str) -> ProvisioningExecutionView:
@@ -829,7 +860,7 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
         if not chain:
             raise ValueError("execution has no atomic genesis")
         plan = _stored(store, header.plan_id)
-        if any(item.event is CheckpointEvent.STEP_FAILED for item in chain):
+        if any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED) for item in chain):
             if chain[-1].event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.STEP_STARTED):
                 raise ValueError("EXECUTION_IN_PROGRESS")
             _rollback(store, header, when, len(chain), adapter)
@@ -860,7 +891,9 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                 if pending_claim:
                     pending_claim = False
                 else:
-                    _claim_forward(store, header, identity, when)
+                    if not _claim_forward(store, header, identity, when):
+                        _rollback(store, header, when, len(store.load_backup_execution_checkpoints(header.execution_id)), adapter)
+                        return _view(store, header.execution_id)
                     ordinal += 1
                 operation = identity.forward.operation
                 try:
@@ -915,7 +948,7 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
     checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
     if checkpoints and checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED:
         raise ValueError("EXECUTION_IN_PROGRESS")
-    completed = [item for item in checkpoints if item.event is CheckpointEvent.STEP_COMPLETED]
+    completed = [item for item in checkpoints if item.event is CheckpointEvent.STEP_COMPLETED and item.step_evidence is not None and item.step_evidence.disposition is StepDisposition.CHANGED]
     rollback_done = {item.plan_step_ordinal for item in checkpoints if item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)}
     identities = {step.plan_step_ordinal: step for phase in header.phases for step in phase.steps}
     plan = _stored(store, header.plan_id)
@@ -959,6 +992,10 @@ def _reconcile_executed(store, header: ProvisioningExecutionHeader) -> None:
         store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(replace(current, status=ProvisioningStatus.EXECUTED, executed_at=executed_at, evidence_digest=evidence_digest)), header.plan_id))
 
 
+def _chain_requires_cleanup(chain: tuple[ProvisioningCheckpoint, ...]) -> bool:
+    return any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED, CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED) for item in chain)
+
+
 def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:
     when = _execution_time(now)
     from .store import SQLiteStore
@@ -974,12 +1011,15 @@ def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, n
                 store.save_backup_execution(header, genesis)
             genesis_claimed = True
         else:
-            bundle, binding, source = _load_authoritative_bundle(store, plan_id, terminal=True)
-            expected = _make_header(bundle, binding, source, header.created_at)
-            if expected != header:
-                raise ValueError("stored execution header does not match current authority")
             chain = store.load_backup_execution_checkpoints(header.execution_id)
             verify_backup_execution_chain(header, chain)
+            if _chain_requires_cleanup(chain):
+                _verify_immutable_cleanup_identity(store, header, chain)
+            else:
+                bundle, binding, source = _load_authoritative_bundle(store, plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
+                expected = _make_header(bundle, binding, source, header.created_at)
+                if expected != header:
+                    raise ValueError("stored execution header does not match current authority")
             if chain and chain[-1].event is CheckpointEvent.STEP_STARTED:
                 raise ValueError("EXECUTION_IN_PROGRESS")
             if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
@@ -995,12 +1035,16 @@ def continue_execution(store_path: str, execution_id: str, adapter, acceptance_r
     from .store import SQLiteStore
     with SQLiteStore(store_path) as store:
         header = store.load_backup_execution_header(execution_id)
-        bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=True)
-        if _make_header(bundle, binding, source, header.created_at) != header:
-            raise ValueError("checkpoint header identity or manifest has drifted")
         chain = store.load_backup_execution_checkpoints(execution_id)
-        if source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
-            raise ValueError("executed approval is not bound to a terminal execution")
+        verify_backup_execution_chain(header, chain)
+        if _chain_requires_cleanup(chain):
+            _verify_immutable_cleanup_identity(store, header, chain)
+        else:
+            bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
+            if _make_header(bundle, binding, source, header.created_at) != header:
+                raise ValueError("checkpoint header identity or manifest has drifted")
+            if source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
+                raise ValueError("executed approval is not bound to a terminal execution")
     return _drive(store_path, header, adapter, acceptance_runner, when)
 
 

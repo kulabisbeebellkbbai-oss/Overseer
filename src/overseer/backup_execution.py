@@ -64,6 +64,10 @@ class _ExactApprovalSourceError(ValueError):
     """The exact approval source is missing or cannot be decoded."""
 
 
+class _ExecutionContentionError(ValueError):
+    """A verified concurrent execution owns the next durable transition."""
+
+
 def _string(value: object, label: str, *, identifier: bool = False) -> str:
     if type(value) is not str or not value or "\x00" in value:
         raise ValueError(f"{label} must be a non-empty string")
@@ -843,6 +847,21 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
     with store.agent_transaction():
         chain = store.load_backup_execution_checkpoints(header.execution_id)
         verify_backup_execution_chain(header, chain)
+        expected_steps = [step for phase in header.phases for step in phase.steps]
+        try:
+            requested_index = expected_steps.index(identity)
+        except ValueError as error:
+            raise ValueError("execution claim is not the next exact operation") from error
+
+        def validate_frontier() -> list[int]:
+            completed = [item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
+            if completed != [step.plan_step_ordinal for step in expected_steps[:len(completed)]]:
+                raise ValueError("execution completed prefix is not exact")
+            return completed
+
+        def contend(message: str = "EXECUTION_IN_PROGRESS") -> None:
+            raise _ExecutionContentionError(message)
+
         try:
             bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
             if _make_header(bundle, binding, source, header.created_at) != header:
@@ -851,22 +870,24 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
             if _bound_source_is_executed(store, header.plan_id):
                 raise ValueError("executed approval is not bound to a terminal execution")
             _verify_immutable_cleanup_identity(store, header, chain)
-            expected_steps = [step for phase in header.phases for step in phase.steps]
-            completed = [item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
+            completed = validate_frontier()
             if chain and chain[-1].event in (CheckpointEvent.STEP_STARTED, CheckpointEvent.ROLLBACK_STARTED):
                 raise ValueError("EXECUTION_IN_PROGRESS")
-            if completed != [step.plan_step_ordinal for step in expected_steps[:len(completed)]] or len(completed) >= len(expected_steps) or expected_steps[len(completed)] != identity:
-                raise ValueError("execution claim is not the next exact operation")
-            evidence = ProvisioningStepEvidence(StepDisposition.FAILED, "FORWARD_AUTHORITY_LOST", _result_digest(identity.forward.operation, False, "FORWARD_AUTHORITY_LOST"), True)
-            _append(store, header, len(chain), identity, CheckpointEvent.EXECUTION_ABORTED, when, evidence=evidence)
+            if len(completed) >= len(expected_steps) or chain[-1].event is not CheckpointEvent.STEP_COMPLETED:
+                raise authority_error
+            frontier_index = len(completed)
+            if requested_index > frontier_index:
+                raise authority_error
+            frontier_identity = expected_steps[frontier_index]
+            evidence = ProvisioningStepEvidence(StepDisposition.FAILED, "FORWARD_AUTHORITY_LOST", _result_digest(frontier_identity.forward.operation, False, "FORWARD_AUTHORITY_LOST"), True)
+            _append(store, header, len(chain), frontier_identity, CheckpointEvent.EXECUTION_ABORTED, when, evidence=evidence)
             return False
-        if not chain or chain[-1].event in (CheckpointEvent.STEP_STARTED, CheckpointEvent.ROLLBACK_STARTED):
-            raise ValueError("EXECUTION_IN_PROGRESS")
-        completed = [item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
-        expected_steps = [step for phase in header.phases for step in phase.steps]
-        if completed != [step.plan_step_ordinal for step in expected_steps[:len(completed)]]:
-            raise ValueError("execution completed prefix is not exact")
-        if len(completed) >= len(expected_steps) or expected_steps[len(completed)] != identity:
+        completed = validate_frontier()
+        if len(completed) >= len(expected_steps) or requested_index < len(completed):
+            contend()
+        if chain and chain[-1].event in (CheckpointEvent.STEP_STARTED, CheckpointEvent.ROLLBACK_STARTED):
+            contend()
+        if requested_index > len(completed) or expected_steps[len(completed)] != identity:
             raise ValueError("execution claim is not the next exact operation")
         _append(store, header, len(chain), identity, CheckpointEvent.STEP_STARTED, when)
         return True
@@ -1022,10 +1043,21 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                 initial_mutation or genesis_claimed or store._connection.total_changes > initial_changes,
             )
 
+        def rollback_or_finish(ordinal: int) -> _InvocationResult | None:
+            try:
+                _rollback(store, header, when, ordinal, adapter)
+            except _ExecutionContentionError:
+                if not store._backup_execution_invocation_checkpoint_ids:
+                    raise
+                return finish()
+            return None
+
         if any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED) for item in chain):
             if chain[-1].event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.STEP_STARTED):
-                raise ValueError("EXECUTION_IN_PROGRESS")
-            _rollback(store, header, when, len(chain), adapter)
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+            rollback_result = rollback_or_finish(len(chain))
+            if rollback_result is not None:
+                return rollback_result
             return finish()
         if chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED:
             _reconcile_executed(store, header)
@@ -1039,7 +1071,7 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
         ordinal = len(chain)
         pending_claim = chain[-1].event is CheckpointEvent.STEP_STARTED
         if pending_claim and not genesis_claimed:
-            raise ValueError("EXECUTION_IN_PROGRESS")
+            raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
         for phase in header.phases:
             for identity in phase.steps:
                 if identity.plan_step_ordinal in completed:
@@ -1055,16 +1087,18 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                 else:
                     try:
                         claimed = _claim_forward(store, header, identity, when)
-                    except ValueError as error:
+                    except _ExecutionContentionError:
                         # This invocation may have completed changed work before
                         # another caller claimed the next operation. Preserve its
                         # own checkpoints and mutation accounting; only a caller
                         # with no writes is a pure EXECUTION_IN_PROGRESS loser.
-                        if str(error) != "EXECUTION_IN_PROGRESS" or not store._backup_execution_invocation_checkpoint_ids:
+                        if not store._backup_execution_invocation_checkpoint_ids:
                             raise
                         return finish()
                     if not claimed:
-                        _rollback(store, header, when, len(store.load_backup_execution_checkpoints(header.execution_id)), adapter)
+                        rollback_result = rollback_or_finish(len(store.load_backup_execution_checkpoints(header.execution_id)))
+                        if rollback_result is not None:
+                            return rollback_result
                         return finish()
                     ordinal += 1
                 operation = identity.forward.operation
@@ -1087,7 +1121,9 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                         event = CheckpointEvent.STEP_COMPLETED if acceptance.passed else CheckpointEvent.STEP_FAILED
                         _append(store, header, ordinal, identity, event, when, evidence=evidence, acceptance=acceptance); ordinal += 1
                         if not acceptance.passed:
-                            _rollback(store, header, when, ordinal, adapter)
+                            rollback_result = rollback_or_finish(ordinal)
+                            if rollback_result is not None:
+                                return rollback_result
                             return finish()
                     elif operation == "finalize_execution":
                         evidence = ProvisioningStepEvidence(StepDisposition.CHANGED, "FINALIZATION_VERIFIED", _result_digest(operation, True, "FINALIZATION_VERIFIED"), True)
@@ -1103,14 +1139,18 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                         evidence = _normalize_result(operation, result)
                         if evidence.disposition is StepDisposition.FAILED:
                             _append(store, header, ordinal, identity, CheckpointEvent.STEP_FAILED, when, evidence=evidence); ordinal += 1
-                            _rollback(store, header, when, ordinal, adapter)
+                            rollback_result = rollback_or_finish(ordinal)
+                            if rollback_result is not None:
+                                return rollback_result
                             return finish()
                         _append(store, header, ordinal, identity, CheckpointEvent.STEP_COMPLETED, when, evidence=evidence); ordinal += 1
                 except Exception as error:
                     code = "OPERATION_FAILED"
                     evidence = ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(operation, False, code), True)
                     _append(store, header, ordinal, identity, CheckpointEvent.STEP_FAILED, when, evidence=evidence); ordinal += 1
-                    _rollback(store, header, when, ordinal, adapter)
+                    rollback_result = rollback_or_finish(ordinal)
+                    if rollback_result is not None:
+                        return rollback_result
                     return finish()
         return finish()
 
@@ -1119,7 +1159,7 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
     from .backup_provisioning import _stored
     checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
     if checkpoints and checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED:
-        raise ValueError("EXECUTION_IN_PROGRESS")
+        raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
     completed = [item for item in checkpoints if item.event is CheckpointEvent.STEP_COMPLETED and item.step_evidence is not None and item.step_evidence.disposition is StepDisposition.CHANGED]
     rollback_done = {item.plan_step_ordinal for item in checkpoints if item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)}
     identities = {step.plan_step_ordinal: step for phase in header.phases for step in phase.steps}
@@ -1205,9 +1245,9 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
                     initial_mutation = True
                     source = None
             if chain and chain[-1].event is CheckpointEvent.STEP_STARTED:
-                raise ValueError("EXECUTION_IN_PROGRESS")
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
-                raise ValueError("EXECUTION_IN_PROGRESS")
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             if source is not None and not _chain_requires_cleanup(chain) and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
             genesis_claimed = False

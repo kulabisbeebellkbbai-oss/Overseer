@@ -400,7 +400,7 @@ def execute_plan(
     with SQLiteStore(store_path) as store:
         typed_execution = _typed_execution_enabled_for_plan_locked(store, plan_id)
         if typed_execution:
-            from .backup_execution import _InvocationResult, _continue_execution_with_invocation, _load_execution_snapshot, _start_execution_with_invocation, derive_backup_execution_view
+            from .backup_execution import _ExecutionContentionError, _InvocationResult, _continue_execution_with_invocation, _load_execution_snapshot, _start_execution_with_invocation, derive_backup_execution_view
             _require_typed_execution_bundle(store, _stored(store, plan_id))
             try:
                 execution_id = store.load_backup_execution_header_for_plan(plan_id).execution_id
@@ -411,16 +411,12 @@ def execute_plan(
                     invocation = _start_execution_with_invocation(store_path, plan_id, adapter, acceptance_runner, now=now)
                 else:
                     invocation = _continue_execution_with_invocation(store_path, execution_id, adapter, acceptance_runner, now=now)
-            except ValueError as error:
+            except _ExecutionContentionError:
                 # A concurrent caller may observe the winner's durable step
                 # claim.  It did not claim or execute anything itself.
-                if str(error) != "EXECUTION_IN_PROGRESS":
-                    raise
                 with SQLiteStore(store_path) as current_store:
                     current_header = current_store.load_backup_execution_header_for_plan(plan_id)
                     current_checkpoints, current_plan = _load_execution_snapshot(current_store, current_header)
-                    if not current_checkpoints or current_checkpoints[-1].event.value != "step_started":
-                        raise
                     current_view = derive_backup_execution_view(current_header, current_checkpoints)
                     invocation = _InvocationResult(
                         view=current_view,

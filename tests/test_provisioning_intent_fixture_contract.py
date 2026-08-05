@@ -83,7 +83,7 @@ def test_fixture_constants_and_validation_boundary_match_real_source():
     }
     assert properties["supersedes_plan_id"] == {
         "type": "string",
-        "pattern": r"(?:^$|^\S(?:.*\S)?$)",
+        "pattern": "^(?:|[^\\u0009-\\u000d\\u001c-\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000](?:[\\s\\S]*[^\\u0009-\\u000d\\u001c-\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000])?)(?![\\s\\S])",
     }
     assert parse_provisioning_intent(example).source_commit == example["source_commit"]
 
@@ -142,33 +142,54 @@ const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const regexes = Object.fromEntries(
   Object.entries(input.patterns).map(([field, pattern]) => [field, new RegExp(pattern)])
 );
-const samples = {
-  request_id: [['request', true], ['', false], [' request', false], ['request ', false], ['\nrequest', false], ['request\n', false]],
-  plan_id: [['plan', true], ['', false], [' plan', false], ['plan ', false], ['\nplan', false], ['plan\n', false]],
-  project_id: [['project', true], ['', false], [' project', false], ['project ', false], ['\nproject', false], ['project\n', false]],
-  resource_id: [['resource', true], ['', false], [' resource', false], ['resource ', false], ['\nresource', false], ['resource\n', false]],
-  root_id: [['root', true], ['', false], [' root', false], ['root ', false], ['\nroot', false], ['root\n', false]],
-  policy_revision: [['1', true], ['', false], [' 1', false], ['1 ', false], ['\n1', false], ['1\n', false]],
-  requested_by: [['operator', true], ['', false], [' operator', false], ['operator ', false], ['\noperator', false], ['operator\n', false]],
-  reason: [['reason', true], ['', false], [' reason', false], ['reason ', false], ['\nreason', false], ['reason\n', false]],
-  source_commit: [['a'.repeat(40), true], ['A'.repeat(40), false], ['a'.repeat(39), false], ['a'.repeat(41), false], ['x' + 'a'.repeat(39), false], ['a'.repeat(39) + 'x', false], ['a'.repeat(40) + '\n', false], [' ' + 'a'.repeat(40), false], ['a'.repeat(40) + ' ', false]],
-  supersedes_plan_id: [['', true], ['successor', true], [' successor', false], ['successor ', false], ['\nsuccessor', false], ['successor\n', false]],
-};
-for (const [field, cases] of Object.entries(samples)) {
+const mismatches = [];
+for (const [field, cases] of Object.entries(input.cases)) {
   if (!(field in regexes)) throw new Error('missing pattern for ' + field);
   for (const [value, expected] of cases) {
     const actual = regexes[field].test(value);
-    if (actual !== expected) throw new Error(field + ': ' + JSON.stringify(value) + ' expected ' + expected + ', got ' + actual);
+    if (actual !== expected) mismatches.push({field, value, expected, actual});
   }
 }
-console.log(JSON.stringify({fields: Object.keys(regexes).length, validated: true}));
+console.log(JSON.stringify({fields: Object.keys(regexes).length, mismatches}));
 """
+    example = _load_fixture()["examples"][0]
+    strip_boundaries = (
+        "\u0009", "\u000a", "\u000b", "\u000c", "\u000d",
+        "\u001c", "\u001d", "\u001e", "\u001f", "\u0020", "\u0085",
+        "\u00a0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003",
+        "\u2004", "\u2005", "\u2006", "\u2007", "\u2008", "\u2009",
+        "\u200a", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000",
+    )
+    samples = (
+        "normal",
+        "Δelta",
+        "left\tright",
+        "request\nrevision",
+        "request\r\nrevision",
+        "",
+        " padded ",
+        "\ufeffecmascript-only\ufeff",
+        *(boundary + "boundary" for boundary in strip_boundaries),
+        *("boundary" + boundary for boundary in strip_boundaries),
+    )
+    generic_fields = tuple(field for field in EXPECTED_FIELDS if field not in {"schema_version", "kind", "source_commit", "supersedes_plan_id"})
+    cases = {}
+    for field in (*generic_fields, "supersedes_plan_id"):
+        cases[field] = []
+        for value in samples:
+            payload = {**example, field: value}
+            expected = True
+            try:
+                parse_provisioning_intent(payload)
+            except ValueError:
+                expected = False
+            cases[field].append([value, expected])
     result = subprocess.run(
         [node, "-e", script],
-        input=json.dumps({"patterns": patterns}),
+        input=json.dumps({"patterns": patterns, "cases": cases}),
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"fields": 10, "validated": True}
+    assert json.loads(result.stdout) == {"fields": 10, "mismatches": []}

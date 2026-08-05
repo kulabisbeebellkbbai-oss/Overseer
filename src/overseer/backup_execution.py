@@ -616,7 +616,8 @@ def verify_backup_execution_chain(header: ProvisioningExecutionHeader, checkpoin
                     failure_seen = True
                 rollback_started = None; rollback_remaining.pop(0)
         elif event is CheckpointEvent.EXECUTION_ABORTED:
-            if is_rollback or any(x is not None for x in (runtime, behavior)) or started or failure_seen or rollback_started or evidence is None or evidence.disposition is not StepDisposition.FAILED or evidence.safe_code != "FORWARD_AUTHORITY_LOST" or next_forward >= len(ordered) or step is not ordered[next_forward][2] or checkpoint.phase is not ordered[next_forward][0]:
+            expected_abort_digest = _result_digest(step.forward.operation, False, "FORWARD_AUTHORITY_LOST")
+            if is_rollback or any(x is not None for x in (runtime, behavior)) or started or failure_seen or rollback_started or evidence is None or evidence.disposition is not StepDisposition.FAILED or evidence.safe_code != "FORWARD_AUTHORITY_LOST" or evidence.result_digest != expected_abort_digest or next_forward >= len(ordered) or step is not ordered[next_forward][2] or checkpoint.phase is not ordered[next_forward][0]:
                 raise ValueError("execution abort has invalid state")
             failure_seen = True
             rollback_remaining = [(s, p) for s, p, disposition in reversed(completed) if disposition is StepDisposition.CHANGED and s.rollback is not None]
@@ -984,6 +985,9 @@ def _reconcile_executed(store, header: ProvisioningExecutionHeader) -> None:
         executed_at = terminal.observed_at
         current = _stored(store, header.plan_id)
         if current.status is ProvisioningStatus.EXECUTED and current.evidence_digest == evidence_digest:
+            if current.executed_at == executed_at:
+                return
+            store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(replace(current, executed_at=executed_at)), header.plan_id))
             return
         if current.status is ProvisioningStatus.EXECUTED:
             raise ValueError("executed plan evidence is not bound to this execution chain")
@@ -1024,7 +1028,7 @@ def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, n
                 raise ValueError("EXECUTION_IN_PROGRESS")
             if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
                 raise ValueError("EXECUTION_IN_PROGRESS")
-            if source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
+            if not _chain_requires_cleanup(chain) and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
             genesis_claimed = False
     return _drive(store_path, header, adapter, acceptance_runner, when, genesis_claimed=genesis_claimed)

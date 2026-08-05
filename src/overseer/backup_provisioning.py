@@ -755,15 +755,40 @@ def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutat
 def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpoints: tuple[object, ...], *, invocation_checkpoints: tuple[object, ...] | None = None, mutation: bool = True) -> Mapping[str, object]:
     from .backup_execution import CheckpointEvent, StepDisposition
     non_synthetic = len(plan.steps)
+    synthetic_operations = ("verify_runtime_attestation", "run_behavior_acceptance", "finalize_execution")
     current = checkpoints if invocation_checkpoints is None else invocation_checkpoints
-    host_mutation = any(
-        getattr(item, "plan_step_ordinal", non_synthetic) < non_synthetic
-        and (
-            getattr(getattr(item, "step_evidence", None), "disposition", None) in {StepDisposition.CHANGED, StepDisposition.FAILED}
-            or getattr(item, "event", None) in {CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED}
-        )
-        for item in current
-    )
+    read_only = {
+        "verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service",
+        "verify_codex_url", "verify_gpg_identity", "verify_backup_policy",
+    }
+    host_mutation = False
+    host_mutation_uncertain = False
+    failed_operation = None
+    for index, item in enumerate(current):
+        event = getattr(item, "event", None)
+        evidence = getattr(item, "step_evidence", None)
+        ordinal = getattr(item, "plan_step_ordinal", non_synthetic)
+        later = current[index + 1:]
+        if event is CheckpointEvent.STEP_FAILED and evidence is not None:
+            operation = plan.steps[ordinal].operation if ordinal < non_synthetic else synthetic_operations[ordinal - non_synthetic] if ordinal - non_synthetic < len(synthetic_operations) else None
+            failed_operation = operation
+            if ordinal < non_synthetic and operation not in read_only:
+                host_mutation_uncertain = True
+        elif event is CheckpointEvent.STEP_STARTED and ordinal < non_synthetic:
+            operation = plan.steps[ordinal].operation
+            outcome_events = {CheckpointEvent.STEP_COMPLETED, CheckpointEvent.STEP_FAILED}
+            if operation not in read_only and not any(getattr(next_item, "plan_step_ordinal", None) == ordinal and getattr(next_item, "event", None) in outcome_events for next_item in later):
+                host_mutation_uncertain = True
+        elif event is CheckpointEvent.STEP_COMPLETED and ordinal < non_synthetic and evidence is not None and evidence.disposition is StepDisposition.CHANGED:
+            if plan.steps[ordinal].operation not in read_only:
+                host_mutation = True
+        elif event is CheckpointEvent.ROLLBACK_STARTED:
+            if not any(getattr(next_item, "plan_step_ordinal", None) == ordinal and getattr(next_item, "event", None) in {CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED} for next_item in later):
+                host_mutation_uncertain = True
+        elif event is CheckpointEvent.ROLLBACK_FAILED:
+            host_mutation_uncertain = True
+        elif event is CheckpointEvent.ROLLBACK_COMPLETED and evidence is not None and evidence.disposition is StepDisposition.CHANGED:
+            host_mutation = True
     if view.terminal_success:
         status = "executed"
     elif view.rollback_status == "completed":
@@ -781,7 +806,10 @@ def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpo
         "failure_code": view.failure_code,
         "error_code": view.failure_code,
         "evidence_digest": view.evidence_digest,
+        "host_mutation_uncertain": host_mutation_uncertain,
     })
+    if failed_operation is not None:
+        result["failed_operation"] = failed_operation
     return result
 
 

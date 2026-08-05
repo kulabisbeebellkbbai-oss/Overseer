@@ -297,6 +297,7 @@ def test_typed_execute_plan_reports_only_current_invocation_mutation(tmp_path: P
     replay = execute_plan(store_path, plan.plan_id, replay_adapter, acceptance_runner=Runner())
     assert replay["mutation_performed"] is False
     assert replay["host_mutation_performed"] is False
+    assert replay["host_mutation_uncertain"] is False
     assert replay_adapter.calls == []
 
 
@@ -436,6 +437,30 @@ def test_reconcile_reads_authoritative_chain_inside_transaction(tmp_path: Path, 
         assert _stored(store, plan.plan_id).executed_at == terminal.observed_at
 
 
+def test_reconcile_repairs_only_terminal_timestamp_pair_and_rejects_digest_mismatch(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import _dump, _stored
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now="2026-08-05T12:00:00+00:00")
+    with SQLiteStore(store_path) as store:
+        header = store.load_backup_execution_header(view.execution_id)
+        terminal = store.load_backup_execution_checkpoints(view.execution_id)[-1]
+        current = _stored(store, plan.plan_id)
+        store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(replace(current, executed_at="2026-08-05T12:00:01+00:00")), plan.plan_id))
+        store._connection.commit()
+        _reconcile_executed(store, header)
+        repaired = _stored(store, plan.plan_id)
+        assert repaired.executed_at == terminal.observed_at
+        assert repaired.evidence_digest == current.evidence_digest
+        assert repaired.plan_digest == current.plan_digest
+        _reconcile_executed(store, header)
+        assert _stored(store, plan.plan_id) == repaired
+        store._connection.execute("UPDATE backup_provisioning_plans SET payload=? WHERE id=?", (_dump(replace(repaired, evidence_digest="sha256:" + "f" * 64)), plan.plan_id))
+        store._connection.commit()
+        with pytest.raises(ValueError, match="evidence"):
+            _reconcile_executed(store, header)
+
+
 def test_typed_success_with_only_verified_noop_steps_reports_no_host_mutation(tmp_path: Path) -> None:
     from overseer.backup_provisioning import execute_plan
 
@@ -455,6 +480,37 @@ def test_typed_success_with_only_verified_noop_steps_reports_no_host_mutation(tm
     result = execute_plan(store_path, plan.plan_id, NoopAdapter(), acceptance_runner=Runner())
     assert result["status"] == "executed"
     assert result["host_mutation_performed"] is False
+    assert result["host_mutation_uncertain"] is False
+
+
+def test_typed_mutation_truth_and_failed_operation_are_bound_to_this_invocation(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    class ReadOnlyFailure(RecordingAdapter):
+        def execute(self, step):
+            self.calls.append(step)
+            if step.operation == "verify_published_adapter_source":
+                raise RuntimeError("read-only probe failed")
+            return super().execute(step)
+
+    store_path, plan, _bundle = _approved(tmp_path / "readonly")
+    result = execute_plan(store_path, plan.plan_id, ReadOnlyFailure(), acceptance_runner=Runner())
+    assert result["host_mutation_performed"] is False
+    assert result["host_mutation_uncertain"] is False
+    assert result["failed_operation"] == "verify_published_adapter_source"
+
+    class MutableFailure(RecordingAdapter):
+        def execute(self, step):
+            self.calls.append(step)
+            if step.operation == "install_runtime":
+                raise RuntimeError("mutable operation failed")
+            return super().execute(step)
+
+    store_path, plan, _bundle = _approved(tmp_path / "mutable")
+    result = execute_plan(store_path, plan.plan_id, MutableFailure(), acceptance_runner=Runner())
+    assert result["host_mutation_performed"] is False
+    assert result["host_mutation_uncertain"] is True
+    assert result["failed_operation"] == "install_runtime"
 
 
 def test_same_now_racing_starts_have_one_durable_claim_and_one_adapter_call(tmp_path: Path) -> None:
@@ -529,6 +585,34 @@ def test_authority_and_bundle_drift_reject_continuation_before_adapter(tmp_path:
     assert len(adapter.calls) == len(plan.steps)
 
 
+def test_tampered_execution_aborted_evidence_is_rejected_without_forward_claim(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    paused = start_execution(store_path, plan.plan_id, adapter, None)
+    original_append = execution._append
+    original_load = execution._load_authoritative_bundle
+    load_count = {"value": 0}
+
+    def drift_on_claim(*args, **kwargs):
+        load_count["value"] += 1
+        if load_count["value"] == 2:
+            raise ValueError("review drift")
+        return original_load(*args, **kwargs)
+
+    def tamper_abort(*args, **kwargs):
+        if args[4] is CheckpointEvent.EXECUTION_ABORTED:
+            kwargs["evidence"] = replace(kwargs["evidence"], result_digest="sha256:" + "0" * 64)
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(execution, "_append", tamper_abort)
+    monkeypatch.setattr(execution, "_load_authoritative_bundle", drift_on_claim)
+    with pytest.raises(ValueError, match="execution abort|checkpoint"):
+        continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert len(adapter.calls) == len(plan.steps)
+
+
 def test_exception_and_failed_forward_never_rerun_forward_or_persist_unsafe_text(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
 
@@ -549,7 +633,8 @@ def test_exception_and_failed_forward_never_rerun_forward_or_persist_unsafe_text
     assert "shh" not in repr(view) and "/private/secret" not in repr(view)
 
 
-def test_interrupted_rollback_recovery_skips_failed_identity_and_forward(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("resume_with_start", (False, True))
+def test_interrupted_rollback_recovery_skips_failed_identity_and_forward(tmp_path: Path, monkeypatch, resume_with_start: bool) -> None:
     import overseer.backup_execution as execution
 
     store_path, plan, _bundle = _approved(tmp_path)
@@ -583,7 +668,7 @@ def test_interrupted_rollback_recovery_skips_failed_identity_and_forward(tmp_pat
         start_execution(store_path, plan.plan_id, adapter, Runner())
     monkeypatch.setattr(execution, "_append", original_append)
     before = [step.operation for step in adapter.calls[:16]]
-    view = continue_execution(store_path, execution_id_for(store_path, plan.plan_id), adapter, Runner())
+    view = (start_execution(store_path, plan.plan_id, adapter, Runner()) if resume_with_start else continue_execution(store_path, execution_id_for(store_path, plan.plan_id), adapter, Runner()))
     assert view.rollback_status == "failed"
     assert before == [step.operation for step in plan.steps[:16]]
     assert sum(step.operation == "remove_private_config" for step in adapter.calls) == 1

@@ -1352,15 +1352,19 @@ def _load_rollback_claim(store, execution_id: str):
 def _release_rollback_claim_locked(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, owner_id: str, claim_epoch: int) -> None:
     claim = _load_rollback_claim(store, header.execution_id)
     if claim is None:
-        return
+        raise ValueError("rollback claim is missing before release")
     if claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest:
         raise ValueError("rollback claim completion identity is invalid")
     if claim["owner_id"] != owner_id or claim["claim_epoch"] != claim_epoch:
         raise ValueError("rollback claim owner changed before release")
-    store._connection.execute(
+    deleted = store._connection.execute(
         "DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=? AND claim_epoch=?",
         (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id, claim_epoch),
     )
+    if deleted.rowcount != 1:
+        raise ValueError("rollback claim release rowcount is invalid")
+    if _load_rollback_claim(store, header.execution_id) is not None:
+        raise ValueError("rollback claim remains after release")
 
 
 def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str) -> tuple[int, _RollbackOwnerLock]:
@@ -1412,7 +1416,7 @@ def _claim_rollback_transaction(store, header: ProvisioningExecutionHeader, requ
                 (owner_id, claim_now, claim_expires, header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, claim["owner_id"], claim["lease_expires_at"], claim["claim_epoch"]),
             )
             if updated.rowcount != 1:
-                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+                raise ValueError("rollback claim takeover rowcount is invalid")
             acquired_epoch = int(claim["claim_epoch"]) + 1
             persisted = _load_rollback_claim(store, header.execution_id)
             if (

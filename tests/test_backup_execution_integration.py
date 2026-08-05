@@ -503,6 +503,70 @@ def test_rollback_claim_takeover_requires_exact_readback(tmp_path: Path, monkeyp
         assert claim["claim_epoch"] == 1
 
 
+def test_rollback_claim_ignored_takeover_update_is_non_contention(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    claim_clock = datetime.fromisoformat(execution_time)
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: claim_clock.isoformat())
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("seed claim for ignored takeover")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="seed claim for ignored takeover"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True), now=execution_time)
+    monkeypatch.setattr(execution, "_append", original_append)
+
+    trigger_name = "rollback_claim_ignore_update_runtime"
+    original_load = execution._load_rollback_claim
+    installed = {"value": False}
+
+    def install_runtime_trigger(store, execution_id):
+        row = original_load(store, execution_id)
+        if row is not None and not installed["value"]:
+            store._connection.execute(
+                f"CREATE TRIGGER {trigger_name} BEFORE UPDATE ON backup_provisioning_execution_rollback_claims "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+            installed["value"] = True
+        return row
+
+    monkeypatch.setattr(execution, "_load_rollback_claim", install_runtime_trigger)
+    monkeypatch.setattr(
+        execution,
+        "_rollback_claim_clock",
+        lambda: (claim_clock + timedelta(seconds=61)).isoformat(),
+    )
+    adapter = RecordingAdapter()
+    execution_id = execution_id_for(store_path, plan.plan_id)
+    with pytest.raises(ValueError, match="takeover rowcount is invalid"):
+        continue_execution(
+            store_path,
+            execution_id,
+            adapter,
+            Runner(wrong_runtime=True),
+            now=(claim_clock + timedelta(seconds=61)).isoformat(),
+        )
+    assert not any(step.operation in {item.operation for item in plan.rollback_steps} for step in adapter.calls)
+
+    with sqlite3.connect(store_path, timeout=30.0) as connection:
+        connection.row_factory = sqlite3.Row
+        claim = connection.execute(
+            "SELECT claim_epoch FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
+            (execution_id,),
+        ).fetchone()
+        assert claim is not None and claim["claim_epoch"] == 1
+    assert installed["value"] is True
+
+
 def test_rollback_lease_clock_is_independent_of_stale_or_future_evidence_time(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
 
@@ -653,6 +717,76 @@ def test_crash_after_durable_rollback_completion_allows_immediate_resume(tmp_pat
     assert view.rollback_status == "completed"
     assert sum(step.operation in rollback_operations for step in resumed_calls) == len(plan.rollback_steps) - 1
     assert sum(step.operation == plan.rollback_steps[0].operation for step in resumed_calls) == 0
+
+
+def test_runtime_delete_suppression_rolls_back_completion_and_preserves_claim(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    rollback_operations = {step.operation for step in plan.rollback_steps}
+    first_rollback = plan.rollback_steps[0].operation
+    trigger_name = "rollback_claim_ignore_delete_runtime"
+
+    class DeleteTamperingAdapter(RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.triggered = False
+
+        def execute(self, step: ProvisioningStep) -> dict[str, object]:
+            if step.operation in rollback_operations and not self.triggered:
+                self.triggered = True
+                with sqlite3.connect(store_path, timeout=30.0) as connection:
+                    connection.execute(
+                        f"CREATE TRIGGER {trigger_name} BEFORE DELETE ON backup_provisioning_execution_rollback_claims "
+                        "BEGIN SELECT RAISE(IGNORE); END"
+                    )
+                    connection.commit()
+            return super().execute(step)
+
+    adapter = DeleteTamperingAdapter()
+    with pytest.raises(ValueError, match="claim release rowcount|claim remains"):
+        start_execution(store_path, plan.plan_id, adapter, Runner(wrong_runtime=True))
+    assert [step.operation for step in adapter.calls if step.operation in rollback_operations] == [first_rollback]
+
+    with sqlite3.connect(store_path, timeout=30.0) as connection:
+        connection.row_factory = sqlite3.Row
+        execution_id = connection.execute(
+            "SELECT execution_id FROM backup_provisioning_execution_headers WHERE plan_id=?",
+            (plan.plan_id,),
+        ).fetchone()["execution_id"]
+        checkpoint = connection.execute(
+            "SELECT payload FROM backup_provisioning_execution_checkpoints "
+            "WHERE execution_id=? ORDER BY checkpoint_ordinal DESC LIMIT 1",
+            (execution_id,),
+        ).fetchone()
+        claim = connection.execute(
+            "SELECT execution_id, plan_step_ordinal, step_digest, owner_id, claim_epoch "
+            "FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
+            (execution_id,),
+        ).fetchone()
+        assert checkpoint is not None and "rollback_started" in checkpoint["payload"]
+        assert claim is not None
+        assert claim["step_digest"] in checkpoint["payload"]
+
+    with sqlite3.connect(store_path, timeout=30.0) as connection:
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.commit()
+
+    monkeypatch.setattr(
+        execution,
+        "_rollback_claim_clock",
+        lambda: (datetime.now(UTC) + timedelta(seconds=61)).isoformat(),
+    )
+    resumed = RecordingAdapter()
+    view = continue_execution(
+        store_path,
+        execution_id,
+        resumed,
+        Runner(wrong_runtime=True),
+    )
+    assert view.rollback_status == "completed"
+    resumed_rollbacks = [step.operation for step in resumed.calls if step.operation in rollback_operations]
+    assert resumed_rollbacks == [step.operation for step in plan.rollback_steps]
 
 
 def test_rollback_completion_rejects_takeover_at_owner_boundary(tmp_path: Path, monkeypatch) -> None:

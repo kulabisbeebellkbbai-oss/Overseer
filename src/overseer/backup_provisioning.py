@@ -430,6 +430,8 @@ def execute_plan(
                         entry_plan=current_plan,
                         exit_checkpoints=current_checkpoints,
                         exit_plan=current_plan,
+                        invocation_checkpoints=(),
+                        mutation_performed=False,
                     )
             plan = invocation.exit_plan
             checkpoints = invocation.exit_checkpoints
@@ -437,8 +439,8 @@ def execute_plan(
             prefix = invocation.entry_checkpoints
             if checkpoints[:len(prefix)] != prefix:
                 raise ValueError("execution checkpoint prefix identity changed")
-            delta = checkpoints[len(prefix):]
-            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=bool(delta) or plan != invocation.entry_plan)
+            delta = invocation.invocation_checkpoints
+            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=invocation.mutation_performed)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)

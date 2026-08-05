@@ -833,6 +833,9 @@ def _append(store: SQLiteStore, header: ProvisioningExecutionHeader, ordinal: in
         raise ValueError("rollback is not approved for this operation")
     checkpoint = build_checkpoint(checkpoint_id=f"{header.execution_id}.checkpoint.{ordinal}.{uuid.uuid4().hex}", execution_id=header.execution_id, checkpoint_ordinal=ordinal, previous_digest=previous, phase=phase.phase, phase_ordinal=phase.phase_ordinal, plan_step_ordinal=identity.plan_step_ordinal, step_digest=bound.step_digest, event=event, observed_at=when, step_evidence=evidence, runtime_attestation=runtime, behavior_acceptance=acceptance)
     store.append_backup_execution_checkpoint(checkpoint)
+    tracker = getattr(store, "_backup_execution_invocation_checkpoint_ids", None)
+    if tracker is not None:
+        tracker.add(checkpoint.checkpoint_id)
 
 
 def _claim_forward(store, header: ProvisioningExecutionHeader, identity: ExecutionStepIdentity, when: str) -> bool:
@@ -959,30 +962,64 @@ class _InvocationResult:
     entry_plan: object
     exit_checkpoints: tuple[ProvisioningCheckpoint, ...]
     exit_plan: object
+    invocation_checkpoints: tuple[ProvisioningCheckpoint, ...]
+    mutation_performed: bool
 
 
-def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, acceptance_runner, when: str, *, genesis_claimed: bool = False) -> _InvocationResult:
-    from .backup_provisioning import _stored
+def _load_execution_snapshot(store: SQLiteStore, header: ProvisioningExecutionHeader, *, after_checkpoints=None):
+    """Load the invocation's execution chain and plan from one SQLite snapshot."""
+    from .backup_provisioning import _load
+
+    store._connection.execute("BEGIN")
+    try:
+        rows = store._connection.execute(
+            "SELECT * FROM backup_provisioning_execution_checkpoints "
+            "WHERE execution_id=? ORDER BY checkpoint_ordinal",
+            (header.execution_id,),
+        ).fetchall()
+        checkpoints = tuple(store._decode_backup_checkpoint_row(row) for row in rows)
+        verify_backup_execution_chain(header, checkpoints)
+        if after_checkpoints is not None:
+            after_checkpoints()
+        row = store._connection.execute(
+            "SELECT payload FROM backup_provisioning_plans WHERE id=?", (header.plan_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(header.plan_id)
+        plan = _load(str(row["payload"]))
+    except BaseException:
+        store._connection.rollback()
+        raise
+    else:
+        store._connection.commit()
+    return checkpoints, plan
+
+
+def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, acceptance_runner, when: str, *, genesis_claimed: bool = False, initial_mutation: bool = False) -> _InvocationResult:
     from .store import SQLiteStore
     with SQLiteStore(store_path) as store:
-        chain = store.load_backup_execution_checkpoints(header.execution_id)
-        verify_backup_execution_chain(header, chain)
+        store._backup_execution_invocation_checkpoint_ids = set()
+        chain, plan = _load_execution_snapshot(store, header)
+        initial_changes = store._connection.total_changes
         if not chain:
             raise ValueError("execution has no atomic genesis")
-        plan = _stored(store, header.plan_id)
         entry_checkpoints = chain
         entry_plan = plan
 
         def finish() -> _InvocationResult:
-            exit_checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
-            verify_backup_execution_chain(header, exit_checkpoints)
-            exit_plan = _stored(store, header.plan_id)
+            exit_checkpoints, exit_plan = _load_execution_snapshot(store, header)
+            invocation_checkpoints = tuple(
+                item for item in exit_checkpoints
+                if item.checkpoint_id in store._backup_execution_invocation_checkpoint_ids
+            )
             return _InvocationResult(
                 derive_backup_execution_view(header, exit_checkpoints),
                 entry_checkpoints,
                 entry_plan,
                 exit_checkpoints,
                 exit_plan,
+                invocation_checkpoints,
+                initial_mutation or genesis_claimed or store._connection.total_changes > initial_changes,
             )
 
         if any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED) for item in chain):
@@ -1127,6 +1164,7 @@ def _chain_requires_cleanup(chain: tuple[ProvisioningCheckpoint, ...]) -> bool:
 def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acceptance_runner, now=None) -> _InvocationResult:
     when = _execution_time(now)
     from .store import SQLiteStore
+    initial_mutation = False
     with SQLiteStore(store_path) as store:
         try:
             header = store.load_backup_execution_header_for_plan(plan_id)
@@ -1138,6 +1176,7 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
                 genesis = build_checkpoint(checkpoint_id=f"{header.execution_id}.checkpoint.0.{uuid.uuid4().hex}", execution_id=header.execution_id, checkpoint_ordinal=0, previous_digest=header.header_digest, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0, plan_step_ordinal=first.plan_step_ordinal, step_digest=first.forward.step_digest, event=CheckpointEvent.STEP_STARTED, observed_at=when)
                 store.save_backup_execution(header, genesis)
             genesis_claimed = True
+            initial_mutation = True
         else:
             chain = store.load_backup_execution_checkpoints(header.execution_id)
             verify_backup_execution_chain(header, chain)
@@ -1153,6 +1192,7 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
                 except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:
                     if not _abort_paused_forward_on_authority_loss(store, header, when):
                         raise authority_error
+                    initial_mutation = True
                     source = None
             if chain and chain[-1].event is CheckpointEvent.STEP_STARTED:
                 raise ValueError("EXECUTION_IN_PROGRESS")
@@ -1161,7 +1201,7 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
             if source is not None and not _chain_requires_cleanup(chain) and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
             genesis_claimed = False
-    return _drive(store_path, header, adapter, acceptance_runner, when, genesis_claimed=genesis_claimed)
+    return _drive(store_path, header, adapter, acceptance_runner, when, genesis_claimed=genesis_claimed, initial_mutation=initial_mutation)
 
 
 def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:
@@ -1171,6 +1211,7 @@ def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, n
 def _continue_execution_with_invocation(store_path: str, execution_id: str, adapter, acceptance_runner, now=None) -> _InvocationResult:
     when = _execution_time(now)
     from .store import SQLiteStore
+    initial_mutation = False
     with SQLiteStore(store_path) as store:
         header = store.load_backup_execution_header(execution_id)
         chain = store.load_backup_execution_checkpoints(execution_id)
@@ -1185,10 +1226,11 @@ def _continue_execution_with_invocation(store_path: str, execution_id: str, adap
             except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:
                 if not _abort_paused_forward_on_authority_loss(store, header, when):
                     raise authority_error
+                initial_mutation = True
                 source = None
             if source is not None and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
-    return _drive(store_path, header, adapter, acceptance_runner, when)
+    return _drive(store_path, header, adapter, acceptance_runner, when, initial_mutation=initial_mutation)
 
 
 def continue_execution(store_path: str, execution_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:

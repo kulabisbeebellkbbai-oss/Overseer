@@ -986,7 +986,7 @@ def test_execute_plan_loser_serializes_its_captured_in_progress_snapshot(tmp_pat
 
 
 def test_paused_prefix_continuations_serialize_their_own_invocation_snapshots(tmp_path: Path, monkeypatch) -> None:
-    import overseer.backup_provisioning as provisioning
+    import overseer.backup_execution as execution
 
     store_path, plan, _bundle = _approved(tmp_path)
     paused = execute_plan(store_path, plan.plan_id, RecordingAdapter(), acceptance_runner=None)
@@ -998,16 +998,22 @@ def test_paused_prefix_continuations_serialize_their_own_invocation_snapshots(tm
     results: dict[str, object] = {}
     a_adapter = RecordingAdapter()
     b_adapter = RecordingAdapter()
-    original_public = provisioning._typed_execution_public
+    original_snapshot = execution._load_execution_snapshot
+    snapshot_count = threading.local()
 
-    def observe_public(*args, **kwargs):
-        if kwargs.get("mutation") is False and not a_ready.is_set():
-            a_ready.set()
-            assert b_finished.wait(timeout=10)
-            assert release_a.wait(timeout=10)
-        return original_public(*args, **kwargs)
+    def observe_snapshot(store, header):
+        count = getattr(snapshot_count, "value", 0) + 1
+        snapshot_count.value = count
 
-    monkeypatch.setattr(provisioning, "_typed_execution_public", observe_public)
+        def after_checkpoints():
+            if threading.current_thread().name == "caller-a" and count == 2:
+                a_ready.set()
+                assert b_finished.wait(timeout=10)
+                assert release_a.wait(timeout=10)
+
+        return original_snapshot(store, header, after_checkpoints=after_checkpoints)
+
+    monkeypatch.setattr(execution, "_load_execution_snapshot", observe_snapshot)
 
     def run_a() -> None:
         results["a"] = execute_plan(store_path, plan.plan_id, a_adapter, acceptance_runner=None)
@@ -1016,7 +1022,7 @@ def test_paused_prefix_continuations_serialize_their_own_invocation_snapshots(tm
         results["b"] = execute_plan(store_path, plan.plan_id, b_adapter, acceptance_runner=Runner())
         b_finished.set()
 
-    thread_a = threading.Thread(target=run_a)
+    thread_a = threading.Thread(target=run_a, name="caller-a")
     thread_b = threading.Thread(target=run_b)
     thread_a.start()
     assert a_ready.wait(timeout=10)
@@ -1037,6 +1043,60 @@ def test_paused_prefix_continuations_serialize_their_own_invocation_snapshots(tm
     assert results["b"]["mutation_performed"] is True
     assert results["b"]["host_mutation_performed"] is False
     assert results["b"]["host_mutation_uncertain"] is False
+
+
+def test_continuation_does_not_claim_mutation_when_b_completes_between_snapshots(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    paused = execute_plan(store_path, plan.plan_id, RecordingAdapter(), acceptance_runner=None)
+    assert paused["status"] == "in_progress"
+
+    a_entry_ready = threading.Event()
+    b_finished = threading.Event()
+    release_a = threading.Event()
+    results: dict[str, object] = {}
+    a_adapter = RecordingAdapter()
+    b_adapter = RecordingAdapter()
+    original_snapshot = execution._load_execution_snapshot
+    snapshot_count = threading.local()
+
+    def observe_snapshot(store, header):
+        count = getattr(snapshot_count, "value", 0) + 1
+        snapshot_count.value = count
+        snapshot = original_snapshot(store, header)
+        if threading.current_thread().name == "caller-a" and count == 1:
+            a_entry_ready.set()
+            assert b_finished.wait(timeout=10)
+            assert release_a.wait(timeout=10)
+        return snapshot
+
+    monkeypatch.setattr(execution, "_load_execution_snapshot", observe_snapshot)
+
+    def run_a() -> None:
+        results["a"] = execute_plan(store_path, plan.plan_id, a_adapter, acceptance_runner=None)
+
+    def run_b() -> None:
+        results["b"] = execute_plan(store_path, plan.plan_id, b_adapter, acceptance_runner=Runner())
+        b_finished.set()
+
+    thread_a = threading.Thread(target=run_a, name="caller-a")
+    thread_b = threading.Thread(target=run_b)
+    thread_a.start()
+    assert a_entry_ready.wait(timeout=10)
+    thread_b.start()
+    thread_b.join(timeout=10)
+    assert not thread_b.is_alive()
+    release_a.set()
+    thread_a.join(timeout=10)
+    assert not thread_a.is_alive()
+
+    assert a_adapter.calls == []
+    assert results["b"]["status"] == "executed"
+    assert results["a"]["status"] == "executed"
+    assert results["a"]["mutation_performed"] is False
+    assert results["a"]["host_mutation_performed"] is False
+    assert results["a"]["host_mutation_uncertain"] is False
 
 
 def test_pending_step_started_fails_closed_for_start_and_continue(tmp_path: Path) -> None:

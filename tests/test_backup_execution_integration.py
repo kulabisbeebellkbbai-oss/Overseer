@@ -13,6 +13,7 @@ from overseer.backup_execution import (
     CheckpointEvent,
     ExecutionPhase,
     RuntimeAttestation,
+    _reconcile_executed,
     _manifest,
     canonical_arguments_digest,
     continue_execution,
@@ -272,6 +273,26 @@ def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Pat
         payload = " ".join(str(row[0]) for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints"))
     assert "SUPERSECRET123" not in payload and "SUPERSECRET123" not in repr(view)
 
+    store_path, plan, _bundle = _approved(tmp_path / "acceptance-success-secret")
+
+    class UnsafeSuccessfulAcceptanceRunner(Runner):
+        def accept(self, header, attestation):
+            return {
+                "contract_version": header.acceptance_contract_version,
+                "acceptance_contract_digest": header.acceptance_contract_digest,
+                "passed": True,
+                "safe_code": "SUPERSECRET123",
+                "results_digest": "sha256:" + "a" * 64,
+            }
+
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), UnsafeSuccessfulAcceptanceRunner())
+    assert view.terminal_success is True
+    assert view.behavior_acceptance is not None
+    assert view.behavior_acceptance.safe_code == "ACCEPTANCE_PASSED"
+    with SQLiteStore(store_path) as store:
+        payload = " ".join(str(row[0]) for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints"))
+    assert "SUPERSECRET123" not in payload and "SUPERSECRET123" not in repr(view)
+
 
 def test_genesis_header_and_claim_roll_back_together(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution
@@ -299,6 +320,62 @@ def test_reconcile_uses_terminal_checkpoint_observed_at(tmp_path: Path) -> None:
     with SQLiteStore(store_path) as store:
         terminal = store.load_backup_execution_checkpoints(view.execution_id)[-1]
         assert _stored(store, plan.plan_id).executed_at == terminal.observed_at
+
+
+def test_reconcile_reads_authoritative_chain_inside_transaction(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_provisioning as provisioning
+    from overseer.backup_provisioning import ProvisioningStatus, _stored
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now="2026-08-05T12:00:00+00:00")
+    with SQLiteStore(store_path) as store:
+        terminal = SQLiteStore.load_backup_execution_checkpoints(store, view.execution_id)[-1]
+        current = _stored(store, plan.plan_id)
+    monkeypatch.setattr(
+        provisioning,
+        "_stored",
+        lambda store, plan_id: replace(current, status=ProvisioningStatus.APPROVED, executed_at=None, evidence_digest=None),
+    )
+    depths: list[int] = []
+    original_load = SQLiteStore.load_backup_execution_checkpoints
+
+    def observe_transaction(self, execution_id):
+        if self._agent_transaction_depth == 0:
+            raise AssertionError("checkpoint chain was read before reconciliation transaction")
+        depths.append(self._agent_transaction_depth)
+        return original_load(self, execution_id)
+
+    monkeypatch.setattr(SQLiteStore, "load_backup_execution_checkpoints", observe_transaction)
+    with SQLiteStore(store_path) as store:
+        header = store.load_backup_execution_header(view.execution_id)
+        _reconcile_executed(store, header)
+        assert store._agent_transaction_depth == 0
+        assert store._connection.execute("SELECT payload FROM backup_provisioning_plans WHERE id=?", (plan.plan_id,)).fetchone()
+    assert depths and all(depth > 0 for depth in depths)
+    with SQLiteStore(store_path) as store:
+        monkeypatch.setattr(provisioning, "_stored", _stored)
+        assert _stored(store, plan.plan_id).executed_at == terminal.observed_at
+
+
+def test_typed_success_with_only_verified_noop_steps_reports_no_host_mutation(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    class NoopAdapter(RecordingAdapter):
+        def execute(self, step):
+            self.calls.append(step)
+            return {
+                "ok": True,
+                "operation": step.operation,
+                "disposition": "verified_noop",
+                "safe_code": "SUPERSECRET123",
+                "evidence": {},
+                "redactions_applied": True,
+            }
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    result = execute_plan(store_path, plan.plan_id, NoopAdapter(), acceptance_runner=Runner())
+    assert result["status"] == "executed"
+    assert result["host_mutation_performed"] is False
 
 
 def test_same_now_racing_starts_have_one_durable_claim_and_one_adapter_call(tmp_path: Path) -> None:

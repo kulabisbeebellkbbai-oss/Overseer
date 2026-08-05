@@ -700,13 +700,10 @@ def _runtime(value: object) -> RuntimeAttestation:
 
 def _acceptance(value: object) -> BehaviorAcceptance:
     if type(value) is BehaviorAcceptance:
-        if not value.passed and value.safe_code != "ACCEPTANCE_FAILED":
-            return replace(value, safe_code="ACCEPTANCE_FAILED")
-        return value
+        return replace(value, safe_code="ACCEPTANCE_PASSED" if value.passed else "ACCEPTANCE_FAILED")
     if isinstance(value, Mapping) and set(value) == {"contract_version", "acceptance_contract_digest", "passed", "safe_code", "results_digest"}:
-        if value["passed"] is not True:
-            value = dict(value)
-            value["safe_code"] = "ACCEPTANCE_FAILED"
+        value = dict(value)
+        value["safe_code"] = "ACCEPTANCE_PASSED" if value["passed"] is True else "ACCEPTANCE_FAILED"
         return BehaviorAcceptance(**value)  # type: ignore[arg-type]
     raise ValueError("typed behavior acceptance is required")
 
@@ -944,12 +941,14 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
 
 def _reconcile_executed(store, header: ProvisioningExecutionHeader) -> None:
     from .backup_provisioning import ProvisioningStatus, _dump, _stored
-    checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
-    if not checkpoints or checkpoints[-1].event is not CheckpointEvent.EXECUTION_FINALIZED:
-        raise ValueError("execution finalization is not complete")
-    evidence_digest = checkpoints[-1].checkpoint_digest
-    executed_at = checkpoints[-1].observed_at
     with store.agent_transaction():
+        checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
+        verify_backup_execution_chain(header, checkpoints)
+        if not checkpoints or checkpoints[-1].event is not CheckpointEvent.EXECUTION_FINALIZED:
+            raise ValueError("execution finalization is not complete")
+        terminal = checkpoints[-1]
+        evidence_digest = terminal.checkpoint_digest
+        executed_at = terminal.observed_at
         current = _stored(store, header.plan_id)
         if current.status is ProvisioningStatus.EXECUTED and current.evidence_digest == evidence_digest:
             return

@@ -749,10 +749,14 @@ def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutat
 
 
 def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpoints: tuple[object, ...]) -> Mapping[str, object]:
+    from .backup_execution import CheckpointEvent, StepDisposition
     non_synthetic = len(plan.steps)
     host_mutation = any(
         getattr(item, "plan_step_ordinal", non_synthetic) < non_synthetic
-        and getattr(getattr(item, "step_evidence", None), "disposition", None) is not None
+        and (
+            getattr(getattr(item, "step_evidence", None), "disposition", None) in {StepDisposition.CHANGED, StepDisposition.FAILED}
+            or getattr(item, "event", None) in {CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED}
+        )
         for item in checkpoints
     )
     if view.terminal_success:

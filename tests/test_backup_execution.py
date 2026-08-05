@@ -312,6 +312,7 @@ def test_recursive_payload_unknown_fields_are_rejected_at_every_dto_level() -> N
         (header_payload(header), ("phases", "0", "unexpected")),
         (header_payload(header), ("phases", "0", "steps", "0", "unexpected")),
         (header_payload(header), ("phases", "0", "steps", "0", "forward", "unexpected")),
+        (header_payload(_rollback_header()), ("phases", "0", "steps", "0", "rollback", "unexpected")),
         (checkpoint_payload(_chain(header)[1]), ("step_evidence", "unexpected")),
         (checkpoint_payload(_chain(header)[7]), ("runtime_attestation", "unexpected")),
         (checkpoint_payload(_chain(header)[9]), ("behavior_acceptance", "unexpected")),
@@ -346,9 +347,9 @@ def test_duplicate_keys_and_nonfinite_values_are_rejected_recursively() -> None:
 
 
 def test_mutated_header_checkpoint_and_nested_dto_fail_before_persistence(tmp_path) -> None:
-    for case in ("header", "operation", "checkpoint", "evidence"):
+    for case in ("header", "operation", "checkpoint"):
         header = _header()
-        checkpoint = _chain(header)[1]
+        checkpoint = _chain(header)[0]
         if case == "header":
             object.__setattr__(header, "plan_id", "plan.poisoned")
             digest = lambda: execution_header_digest(header)
@@ -357,13 +358,8 @@ def test_mutated_header_checkpoint_and_nested_dto_fail_before_persistence(tmp_pa
             object.__setattr__(header.phases[0].steps[0].forward, "operation", "poisoned-operation")
             digest = lambda: execution_header_digest(header)
             payload = lambda: header_payload(header)
-        elif case == "checkpoint":
-            object.__setattr__(checkpoint, "observed_at", "2026-08-05T11:00:00+00:00")
-            digest = lambda: provisioning_checkpoint_digest(checkpoint)
-            payload = lambda: checkpoint_payload(checkpoint)
         else:
-            assert checkpoint.step_evidence is not None
-            object.__setattr__(checkpoint.step_evidence, "safe_code", "poisoned")
+            object.__setattr__(checkpoint, "observed_at", "2026-08-05T11:00:00+00:00")
             digest = lambda: provisioning_checkpoint_digest(checkpoint)
             payload = lambda: checkpoint_payload(checkpoint)
         with pytest.raises(ValueError):
@@ -375,6 +371,21 @@ def test_mutated_header_checkpoint_and_nested_dto_fail_before_persistence(tmp_pa
                 store.save_backup_execution(header, checkpoint)
             assert store._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_headers").fetchone()[0] == 0
             assert store._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_checkpoints").fetchone()[0] == 0
+
+    header = _header()
+    chain = _chain(header)
+    genesis = chain[0]
+    mutated_checkpoint = chain[1]
+    assert mutated_checkpoint.step_evidence is not None
+    object.__setattr__(mutated_checkpoint.step_evidence, "safe_code", "POISONED")
+    with OverseerStore(tmp_path / "evidence.sqlite3") as store:
+        store.save_backup_execution(header, genesis)
+        with pytest.raises(ValueError):
+            verify_backup_execution_chain(header, (genesis, mutated_checkpoint))
+        with pytest.raises(ValueError):
+            store.append_backup_execution_checkpoint(mutated_checkpoint)
+        assert store.load_backup_execution_header(header.execution_id) == header
+        assert store.load_backup_execution_checkpoints(header.execution_id) == (genesis,)
 
 
 def test_operation_digest_is_required_and_mismatch_cannot_be_bound() -> None:
@@ -508,6 +519,9 @@ def test_failed_attest_and_accept_details_require_their_step_failed_phase() -> N
     failed_attest = _rebuild_checkpoint(chain[7], event=CheckpointEvent.STEP_FAILED, step_evidence=failed_evidence, runtime_attestation=mismatching_runtime)
     assert verify_backup_execution_chain(header, chain[:7] + (failed_attest,)) == failed_attest.checkpoint_digest
     assert derive_backup_execution_view(header, chain[:7] + (failed_attest,)).status == "failed"
+    unbound_runtime = RuntimeAttestation("sha256:" + "9" * 64, PLAN_DIGEST, "sha256:" + "9" * 64, BUNDLE_DIGEST, "process.1")
+    with pytest.raises(ValueError):
+        verify_backup_execution_chain(header, chain[:7] + (_rebuild_checkpoint(chain[7], event=CheckpointEvent.STEP_FAILED, step_evidence=failed_evidence, runtime_attestation=unbound_runtime),))
     wrong_phase = _rebuild_checkpoint(chain[1], event=CheckpointEvent.STEP_FAILED, step_evidence=failed_evidence, runtime_attestation=chain[7].runtime_attestation)
     with pytest.raises(ValueError):
         verify_backup_execution_chain(header, (chain[0], wrong_phase))
@@ -515,6 +529,9 @@ def test_failed_attest_and_accept_details_require_their_step_failed_phase() -> N
     failed_accept = _rebuild_checkpoint(chain[9], event=CheckpointEvent.STEP_FAILED, step_evidence=ProvisioningStepEvidence(StepDisposition.FAILED, "ACCEPT_FAILED", CONTRACT_DIGEST, True), behavior_acceptance=failed_acceptance)
     assert verify_backup_execution_chain(header, chain[:9] + (failed_accept,)) == failed_accept.checkpoint_digest
     assert derive_backup_execution_view(header, chain[:9] + (failed_accept,)).status == "failed"
+    unbound_acceptance = BehaviorAcceptance("contract.v1", "sha256:" + "9" * 64, False, "ACCEPTANCE_FAILED", CONTRACT_DIGEST)
+    with pytest.raises(ValueError):
+        verify_backup_execution_chain(header, chain[:9] + (_rebuild_checkpoint(chain[9], event=CheckpointEvent.STEP_FAILED, step_evidence=failed_accept.step_evidence, behavior_acceptance=unbound_acceptance),))
     wrong_accept_phase = _rebuild_checkpoint(chain[7], event=CheckpointEvent.STEP_FAILED, step_evidence=failed_evidence, behavior_acceptance=failed_acceptance)
     with pytest.raises(ValueError):
         verify_backup_execution_chain(header, chain[:7] + (wrong_accept_phase,))

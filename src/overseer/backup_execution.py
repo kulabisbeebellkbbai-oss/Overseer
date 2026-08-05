@@ -957,6 +957,8 @@ class _InvocationResult:
     view: ProvisioningExecutionView
     entry_checkpoints: tuple[ProvisioningCheckpoint, ...]
     entry_plan: object
+    exit_checkpoints: tuple[ProvisioningCheckpoint, ...]
+    exit_plan: object
 
 
 def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, acceptance_runner, when: str, *, genesis_claimed: bool = False) -> _InvocationResult:
@@ -972,7 +974,16 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
         entry_plan = plan
 
         def finish() -> _InvocationResult:
-            return _InvocationResult(_view(store, header.execution_id), entry_checkpoints, entry_plan)
+            exit_checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
+            verify_backup_execution_chain(header, exit_checkpoints)
+            exit_plan = _stored(store, header.plan_id)
+            return _InvocationResult(
+                derive_backup_execution_view(header, exit_checkpoints),
+                entry_checkpoints,
+                entry_plan,
+                exit_checkpoints,
+                exit_plan,
+            )
 
         if any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED) for item in chain):
             if chain[-1].event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.STEP_STARTED):

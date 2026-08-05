@@ -397,7 +397,6 @@ def execute_plan(
         raise ValueError("an explicit dedicated provisioning adapter is required")
     now = executed_at or datetime.now(UTC).isoformat(); _time(now)
     execution_id = None
-    concurrent_snapshot = None
     with SQLiteStore(store_path) as store:
         typed_execution = _typed_execution_enabled_for_plan_locked(store, plan_id)
         if typed_execution:
@@ -422,27 +421,24 @@ def execute_plan(
                     current_checkpoints = current_store.load_backup_execution_checkpoints(header.execution_id)
                     if not current_checkpoints or current_checkpoints[-1].event.value != "step_started":
                         raise
-                    concurrent_snapshot = (current_store.load_backup_execution_header(current_checkpoints[0].execution_id), _stored(current_store, plan_id), current_checkpoints)
+                    current_header = current_store.load_backup_execution_header(current_checkpoints[0].execution_id)
+                    current_plan = _stored(current_store, plan_id)
+                    current_view = derive_backup_execution_view(current_header, current_checkpoints)
                     invocation = _InvocationResult(
-                        view=derive_backup_execution_view(
-                            header,
-                            current_checkpoints,
-                        ),
+                        view=current_view,
                         entry_checkpoints=current_checkpoints,
-                        entry_plan=_stored(current_store, plan_id),
+                        entry_plan=current_plan,
+                        exit_checkpoints=current_checkpoints,
+                        exit_plan=current_plan,
                     )
-            if concurrent_snapshot is None:
-                with SQLiteStore(store_path) as store:
-                    plan = _stored(store, plan_id)
-                    checkpoints = store.load_backup_execution_checkpoints(invocation.view.execution_id)
-                    header = store.load_backup_execution_header(invocation.view.execution_id)
-            else:
-                header, plan, checkpoints = concurrent_snapshot
+            plan = invocation.exit_plan
+            checkpoints = invocation.exit_checkpoints
+            header = store.load_backup_execution_header(invocation.view.execution_id)
             prefix = invocation.entry_checkpoints
-            if concurrent_snapshot is None and checkpoints[:len(prefix)] != prefix:
+            if checkpoints[:len(prefix)] != prefix:
                 raise ValueError("execution checkpoint prefix identity changed")
-            delta = () if concurrent_snapshot is not None else checkpoints[len(prefix):]
-            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=False if concurrent_snapshot is not None else bool(delta) or plan != invocation.entry_plan)
+            delta = checkpoints[len(prefix):]
+            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=bool(delta) or plan != invocation.entry_plan)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)

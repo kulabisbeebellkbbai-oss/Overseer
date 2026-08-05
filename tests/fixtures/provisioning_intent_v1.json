@@ -37,7 +37,7 @@
     },
     "source_commit": {
       "type": "string",
-      "pattern": "[0-9a-f]{40}\\Z"
+      "pattern": "^[0-9a-f]{40}$"
     },
     "requested_by": {
       "type": "string",

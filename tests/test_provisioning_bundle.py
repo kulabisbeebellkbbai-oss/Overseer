@@ -4237,6 +4237,7 @@ def test_bundle_intent_fd_rejects_wrong_mode(tmp_path):
 
 def test_bundle_intent_fd_rejects_oversized_and_extra_seal_state(monkeypatch):
     descriptor = _sealed_bundle_intent_fd()
+    real_cap = backup_provisioning_cli_module._MAX_BUNDLE_INTENT_BYTES
     monkeypatch.setattr(
         backup_provisioning_cli_module, "_MAX_BUNDLE_INTENT_BYTES", 1,
     )
@@ -4246,6 +4247,9 @@ def test_bundle_intent_fd_rejects_oversized_and_extra_seal_state(monkeypatch):
     finally:
         os.close(descriptor)
 
+    monkeypatch.setattr(
+        backup_provisioning_cli_module, "_MAX_BUNDLE_INTENT_BYTES", real_cap,
+    )
     extra_seal = getattr(fcntl, "F_SEAL_FUTURE_WRITE", 0)
     if extra_seal:
         descriptor = _sealed_bundle_intent_fd(

@@ -849,14 +849,16 @@ def _verify_immutable_cleanup_identity(store, header: ProvisioningExecutionHeade
 
 def _bound_source_is_executed(store, plan_id: str) -> bool:
     from . import provisioning_bundle
-    from .roadex_approval_status import load_exact_bound_source
+    from .roadex_approval_status import load_roadex_human_plan
 
-    try:
-        bundle = provisioning_bundle.load_provisioning_bundle(store, plan_id)
-        binding = store.load_roadex_approval_binding(provisioning_bundle.binding_draft_for_bundle(bundle).approval_ref)
-        source = load_exact_bound_source(store, binding)
-    except (KeyError, TypeError, ValueError):
-        return False
+    # Inspect the exact source selected by the immutable bundle identity.  Do
+    # not make a malformed approval binding look like a non-executed source:
+    # the source itself is the independent safety check for abort decisions.
+    bundle = provisioning_bundle.load_provisioning_bundle(store, plan_id)
+    draft = provisioning_bundle.binding_draft_for_bundle(bundle)
+    if draft.source_kind != "roadex-human-decision" or draft.source_id != plan_id:
+        raise ValueError("expected approval source identity is invalid")
+    source = load_roadex_human_plan(store, draft.source_id)
     return getattr(getattr(source, "status", None), "value", None) == "executed"
 
 

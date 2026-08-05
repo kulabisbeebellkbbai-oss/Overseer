@@ -2,33 +2,40 @@
 
 ## Finding
 
-Roadex JSON state persistence atomically renamed a page-cache-backed temporary
-file without syncing the file or its parent directory. A parent-directory sync
-failure after rename could therefore be misclassified as a committed
-registration from strict readback alone.
+Roadex JSON state persistence used a fixed `${path}.tmp` opened with truncation,
+which could follow a symlink and overwrite an unrelated target. The correction
+also needed to make pre-rename cleanup ownership-safe while preserving the
+durability ordering from the initial patch.
 
 ## Design
 
-`createJsonFilePersistence.save` now writes through a file descriptor, fsyncs
-and closes the temporary file, renames it, then opens, fsyncs, and closes the
-parent directory before reporting success. A typed post-rename durability
-failure forces `commitAuthoritativeRegistration` to return `indeterminate`,
-while a generic exception after a fully durable save still reconciles an exact
-authoritative tuple as `committed`. Strict reads and startup quarantine are
-unchanged.
+`createJsonFilePersistence.save` now creates a bounded unique temporary file in
+the target directory with `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY` and mode `0600`.
+Ownership begins only after successful exclusive creation. Write, file-fsync,
+close, and rename failures close what can be closed and unlink only that owned
+temporary path, preserving the original error if cleanup also fails. Ownership
+is cleared immediately after rename, so no post-rename unlink is attempted.
+The existing ordering remains: write, file fsync, close, rename, parent-directory
+open/fsync/close. A typed post-rename durability failure still forces
+`commitAuthoritativeRegistration` to return `indeterminate`, while a generic
+exception after a fully durable save still reconciles an exact authoritative
+tuple as `committed`. Strict reads and startup quarantine are unchanged.
 
 ## Tests
 
+- Deterministic exclusive/no-follow flags, real symlink resistance, owned temp
+  cleanup for write/close/rename failures, unrelated-path preservation, cleanup
+  error precedence, and no post-rename unlink.
 - Deterministic file-write/sync/close, rename, directory-open/sync/close order.
-- Normal JSON save and reload.
 - Parent-directory fsync failure after rename returns `indeterminate` despite
-  exact readback.
-- Existing post-durable-save-then-throw reconciliation remains `committed`.
-- Task 3 suite: 173 passed; full Roadex suite: 569 passed; lint and build pass.
+  exact readback; post-durable-save generic exceptions still reconcile as
+  `committed`.
+- Complete approval-related suite: 14 files, 180 passed; full Roadex suite:
+  55 files, 577 passed; lint, production build, and diff check pass.
 
 ## Roadex commit
 
-`7b0bd0e41fc6e87575938cfc9d71f8563061ea31`
+`99c484ad6af1c58c2f97a52cb9c4595b409b9172`
 
 No live services, deployment, restart, push, approval, or provisioning action
 was performed.

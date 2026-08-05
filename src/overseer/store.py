@@ -618,6 +618,18 @@ class SQLiteStore:
                 bundle_digest TEXT NOT NULL UNIQUE,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS backup_provisioning_plans (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS backup_provisioning_plan_execution_modes (
+                plan_id TEXT PRIMARY KEY,
+                execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed')
+            );
+            CREATE TRIGGER IF NOT EXISTS backup_provisioning_plan_execution_modes_no_downgrade
+            BEFORE UPDATE OF execution_mode ON backup_provisioning_plan_execution_modes
+            WHEN OLD.execution_mode = 'typed' AND NEW.execution_mode <> 'typed'
+            BEGIN SELECT RAISE(ABORT, 'typed execution mode cannot be downgraded'); END;
             CREATE TABLE IF NOT EXISTS provisioning_review_outbox (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
@@ -714,7 +726,7 @@ class SQLiteStore:
             """
         )
         with self._connection:
-            self._record_schema_migration(CURRENT_SCHEMA_VERSION, "append-only backup execution store")
+            self._record_schema_migration(CURRENT_SCHEMA_VERSION, "append-only backup execution store and typed plan execution authority")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_schema_migrations (
@@ -2365,10 +2377,7 @@ class SQLiteStore:
 
     def save_backup_provisioning_plan_payload(self, plan_id: str, payload: str) -> None:
         """Persist one canonical staging source without committing an outer transaction."""
-        self._connection.execute(
-            "CREATE TABLE IF NOT EXISTS backup_provisioning_plans "
-            "(id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
-        )
+        self.ensure_backup_provisioning_plan_store()
         self._save_immutable_payload(
             "backup_provisioning_plans",
             ("id",),
@@ -2376,6 +2385,41 @@ class SQLiteStore:
             {"payload": payload},
             "backup provisioning plan",
         )
+
+    def ensure_backup_provisioning_plan_store(self) -> None:
+        """Ensure the source row and independent monotonic execution marker exist."""
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS backup_provisioning_plans "
+            "(id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS backup_provisioning_plan_execution_modes "
+            "(plan_id TEXT PRIMARY KEY, execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed'))"
+        )
+        self._connection.execute(
+            "CREATE TRIGGER IF NOT EXISTS backup_provisioning_plan_execution_modes_no_downgrade "
+            "BEFORE UPDATE OF execution_mode ON backup_provisioning_plan_execution_modes "
+            "WHEN OLD.execution_mode = 'typed' AND NEW.execution_mode <> 'typed' "
+            "BEGIN SELECT RAISE(ABORT, 'typed execution mode cannot be downgraded'); END"
+        )
+
+    def mark_backup_provisioning_plan_typed(self, plan_id: str) -> None:
+        """Monotonically bind a plan to typed execution without trusting its payload."""
+        self.ensure_backup_provisioning_plan_store()
+        self._connection.execute(
+            "INSERT OR IGNORE INTO backup_provisioning_plan_execution_modes "
+            "(plan_id, execution_mode) VALUES (?, 'typed')",
+            (plan_id,),
+        )
+
+    def load_backup_provisioning_plan_execution_mode(self, plan_id: str) -> str:
+        """Return the durable mode; absent historical markers are legacy by default."""
+        self.ensure_backup_provisioning_plan_store()
+        row = self._connection.execute(
+            "SELECT execution_mode FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        return "typed" if row is not None and row["execution_mode"] == "typed" else "legacy"
 
     def save_provisioning_preflight_report(
         self,

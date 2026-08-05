@@ -2517,7 +2517,6 @@ def _build_provisioning_bundle_with_dependencies(
         _OVERSEER_TOKEN_FILE,
         _CURSOR_KEY_FILE,
         evidence_ids,
-        execution_provenance="typed",
     )
     changed = changed_immutable_inputs(predecessor, plan, report)
     placeholder_digest = "sha256:" + "0" * 64
@@ -3967,6 +3966,7 @@ def _stage_authoritative_bundle_with_dependencies(
         def save_source_and_bundle() -> None:
             nonlocal source_persisted
             save_staged_plan_source(store, bundle.plan)
+            store.mark_backup_provisioning_plan_typed(bundle.plan.plan_id)
             store.save_provisioning_preflight_report(
                 bundle.preflight.report_id,
                 bundle.plan.plan_id,

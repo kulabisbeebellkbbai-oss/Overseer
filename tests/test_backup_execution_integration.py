@@ -20,7 +20,7 @@ from overseer.backup_execution import (
     continue_execution,
     start_execution,
 )
-from overseer.backup_provisioning import ProvisioningStatus, ProvisioningStep, _dump, _stored, approve_plan, execute_plan
+from overseer.backup_provisioning import ProvisioningStatus, ProvisioningStep, _dump, _stored, _typed_execution_enabled_for_plan_locked, approve_plan, build_plan, execute_plan, stage_plan
 from overseer.crew import CrewReviewStatus
 from overseer.store import SQLiteStore
 from tests.test_backup_provisioning import _typed_bundle_with_reviews
@@ -382,8 +382,61 @@ def test_all_typed_execution_artifacts_deleted_stays_typed_and_fails_before_adap
         execute_plan(store_path, plan.plan_id, adapter, acceptance_runner=Runner())
     assert adapter.calls == []
     with SQLiteStore(store_path) as store:
-        assert _stored(store, plan.plan_id).execution_provenance == "typed"
+        assert store.load_backup_provisioning_plan_execution_mode(plan.plan_id) == "typed"
         assert store._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_headers WHERE plan_id=?", (plan.plan_id,)).fetchone()[0] == 0
+
+
+def test_typed_execution_marker_rejects_downgrade(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    with SQLiteStore(store_path) as store:
+        assert store.load_backup_provisioning_plan_execution_mode(plan.plan_id) == "typed"
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute(
+                "UPDATE backup_provisioning_plan_execution_modes SET execution_mode='legacy' WHERE plan_id=?",
+                (plan.plan_id,),
+            )
+
+
+def test_valid_source_rewrite_cannot_downgrade_typed_execution(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    with SQLiteStore(store_path) as store:
+        rewritten = replace(plan, decision_reason="rewritten legacy source")
+        store._connection.execute(
+            "UPDATE backup_provisioning_plans SET payload=? WHERE id=?",
+            (_dump(rewritten), plan.plan_id),
+        )
+        store._connection.commit()
+        assert store.load_backup_provisioning_plan_execution_mode(plan.plan_id) == "typed"
+        assert _typed_execution_enabled_for_plan_locked(store, plan.plan_id) is True
+
+
+def test_pre_upgrade_plan_shape_loads_and_scoped_artifacts_select_mode(tmp_path: Path) -> None:
+    store_path, typed_plan, _bundle = _approved(tmp_path)
+    with SQLiteStore(store_path) as store:
+        store._connection.execute(
+            "DELETE FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
+            (typed_plan.plan_id,),
+        )
+        store._connection.commit()
+        loaded = _stored(store, typed_plan.plan_id)
+        assert loaded.plan_digest == typed_plan.plan_digest
+        assert _typed_execution_enabled_for_plan_locked(store, typed_plan.plan_id) is True
+
+        legacy_plan = build_plan(
+            "legacy-backup-plan",
+            typed_plan.gpg_sha256,
+            typed_plan.adapter_commit,
+            typed_plan.runtime_digest,
+            typed_plan.capability_digest,
+            typed_plan.root_authorization_refs,
+            typed_plan.root_registrations,
+            typed_plan.overseer_token_source_file,
+            typed_plan.overseer_token_file,
+            typed_plan.cursor_key_file,
+            {role: f"historical-missing-{role}" for role in typed_plan.evidence_ids},
+        )
+        stage_plan(store_path, legacy_plan)
+        assert _typed_execution_enabled_for_plan_locked(store, legacy_plan.plan_id) is False
 
 
 @pytest.mark.parametrize("artifact", ["binding", "preflight", "outbox"])
@@ -996,7 +1049,7 @@ def test_tampered_execution_aborted_evidence_is_rejected_without_forward_claim(t
     def drift_on_claim(*args, **kwargs):
         load_count["value"] += 1
         if load_count["value"] == 2:
-            raise ValueError("review drift")
+            raise execution._AuthorityMismatchError("review drift")
         return original_load(*args, **kwargs)
 
     def tamper_abort(*args, **kwargs):
@@ -1007,7 +1060,7 @@ def test_tampered_execution_aborted_evidence_is_rejected_without_forward_claim(t
     monkeypatch.setattr(execution, "_append", tamper_abort)
     monkeypatch.setattr(execution, "_load_authoritative_bundle", drift_on_claim)
     before_checkpoints = _checkpoints(store_path, paused.execution_id)
-    with pytest.raises(ValueError, match="review drift"):
+    with pytest.raises(ValueError, match="execution abort"):
         continue_execution(store_path, paused.execution_id, adapter, Runner())
     assert len(adapter.calls) == len(plan.steps)
     assert _checkpoints(store_path, paused.execution_id) == before_checkpoints

@@ -27,8 +27,8 @@ from tests.test_backup_provisioning import seeded
 
 EXPECTED_ADMIN_SOURCE_DIGEST = "sha256:80fce5400b5b6ea41928cdb93766cd316c39016e7c7ffc9279b77700c1cd48d0"
 EXPECTED_ADMIN_SCOPE_DIGEST = "sha256:4f2a8297cbd8be9a23fb84251d0d79b3a38190f3f165224024639128b8d8fe54"
-EXPECTED_HUMAN_PLAN_DIGEST = "sha256:0d127cc1d582dac8f751948249558ede0190035ba49b764ccd2bd87b773843a9"
-EXPECTED_HUMAN_SCOPE_DIGEST = "sha256:d917e202d315c06a436f795bc9c700805c6c457c3e4ab1bbddab51485e2d4d87"
+EXPECTED_HUMAN_PLAN_DIGEST = "sha256:327b7e0b6193589ec529cf60bf025c58df4e6c5e773abc896968e1c8d2a4db49"
+EXPECTED_HUMAN_SCOPE_DIGEST = "sha256:980db6d0eb4caadfd25bf80ecadf725f7a52c5dc6d066cd5f50f2b2d3c4aed44"
 
 
 def _draft_for(approval_ref: str, source_kind: str = "admin-plan", source_id: str = "") -> RoadexApprovalBindingDraft:
@@ -1566,7 +1566,7 @@ def test_roadex_human_projection_accepts_producer_decision_outputs(
         path,
         plan.plan_id,
         decision,
-        "kira",
+        "independent-human",
         f"Roadex decision: {decision}",
     )
     projection = roadex_approval_status(path, draft.approval_ref)

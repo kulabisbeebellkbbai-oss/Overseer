@@ -158,23 +158,16 @@ class ExecutionOperationIdentity:
 @dataclass(frozen=True)
 class ExecutionStepIdentity:
     plan_step_ordinal: int
-    operation: str
-    step_digest: str
-    arguments_digest: str | None = None
+    forward: ExecutionOperationIdentity
     rollback: ExecutionOperationIdentity | None = None
 
     def __post_init__(self) -> None:
         _ordinal(self.plan_step_ordinal, "plan_step_ordinal")
-        _string(self.operation, "operation", identifier=True)
-        _digest(self.step_digest, "step_digest")
-        if self.arguments_digest is not None:
-            _digest(self.arguments_digest, "arguments_digest")
+        _exact(self.forward, ExecutionOperationIdentity, "forward")
+        self.forward.__post_init__()
         if self.rollback is not None:
             _exact(self.rollback, ExecutionOperationIdentity, "rollback")
-
-    @property
-    def forward(self) -> ExecutionOperationIdentity:
-        return ExecutionOperationIdentity(self.operation, self.arguments_digest or self.step_digest, self.step_digest)
+            self.rollback.__post_init__()
 
     @property
     def rollback_operation(self) -> ExecutionOperationIdentity | None:
@@ -194,6 +187,8 @@ class ExecutionPhaseSpec:
         _tuple(self.steps, "steps", nonempty=True)
         if any(type(step) is not ExecutionStepIdentity for step in self.steps):
             raise ValueError("steps must contain exact ExecutionStepIdentity values")
+        for step in self.steps:
+            step.__post_init__()
         ordinals = tuple(step.plan_step_ordinal for step in self.steps)
         if ordinals != tuple(sorted(ordinals)) or len(set(ordinals)) != len(ordinals):
             raise ValueError("phase steps must be ordered and unique")
@@ -234,6 +229,8 @@ class ProvisioningExecutionHeader:
         _tuple(self.phases, "phases", nonempty=True)
         if any(type(phase) is not ExecutionPhaseSpec for phase in self.phases):
             raise ValueError("phases must contain exact ExecutionPhaseSpec values")
+        for phase in self.phases:
+            phase.__post_init__()
         if tuple(p.phase_ordinal for p in self.phases) != tuple(range(len(self.phases))) or tuple(p.phase for p in self.phases) != tuple(ExecutionPhase):
             raise ValueError("phases must use canonical phase order")
         all_steps = [step for phase in self.phases for step in phase.steps]
@@ -241,6 +238,7 @@ class ProvisioningExecutionHeader:
             raise ValueError("plan step ordinals must be globally unique")
         if self.execution_id != "execution." + self.plan_digest.removeprefix("sha256:"):
             raise ValueError("execution_id must be derived from plan_digest")
+        _validate_operation_bindings(self)
         if self.header_digest != _hash(_DOMAIN_HEADER, _header_values(self)):
             raise ValueError("header_digest does not match header")
 
@@ -329,6 +327,7 @@ class ProvisioningCheckpoint:
         for name, value, cls in (("step_evidence", self.step_evidence, ProvisioningStepEvidence), ("runtime_attestation", self.runtime_attestation, RuntimeAttestation), ("behavior_acceptance", self.behavior_acceptance, BehaviorAcceptance)):
             if value is not None:
                 _exact(value, cls, name)
+                value.__post_init__()
         _digest(self.checkpoint_digest, "checkpoint_digest")
         if self.checkpoint_digest != _hash(_DOMAIN_CHECKPOINT, _checkpoint_values(self)):
             raise ValueError("checkpoint_digest does not match checkpoint")
@@ -373,12 +372,20 @@ def _canonical_value(value: Any) -> Any:
     return value
 
 
-def _arguments_digest(arguments: Any) -> str:
+def canonical_arguments_digest(arguments: Any) -> str:
     return _hash(_DOMAIN_ARGS, _canonical_value(arguments))
 
 
 def _step_digest_from_identity(plan_digest: str, direction: str, ordinal: int, operation: str, arguments_digest: str) -> str:
     return _hash(_DOMAIN_STEP, {"plan_digest": plan_digest, "direction": direction, "plan_step_ordinal": ordinal, "operation": operation, "arguments_digest": arguments_digest})
+
+
+def _validate_operation_bindings(header: ProvisioningExecutionHeader) -> None:
+    for phase in header.phases:
+        for step in phase.steps:
+            for direction, identity in (("forward", step.forward), ("rollback", step.rollback)):
+                if identity is not None and identity.step_digest != _step_digest_from_identity(header.plan_digest, direction, step.plan_step_ordinal, identity.operation, identity.arguments_digest):
+                    raise ValueError(f"{direction} operation identity has a mismatching digest")
 
 
 def canonical_step_digest(plan_digest: str, direction: str, plan_step_ordinal: int, operation: str, arguments: Any) -> str:
@@ -387,7 +394,7 @@ def canonical_step_digest(plan_digest: str, direction: str, plan_step_ordinal: i
         raise ValueError("direction must be forward or rollback")
     _ordinal(plan_step_ordinal, "plan_step_ordinal")
     _string(operation, "operation", identifier=True)
-    args_digest = _arguments_digest(arguments)
+    args_digest = canonical_arguments_digest(arguments)
     return _step_digest_from_identity(plan_digest, direction, plan_step_ordinal, operation, args_digest)
 
 
@@ -414,6 +421,7 @@ def provisioning_checkpoint_digest(checkpoint: ProvisioningCheckpoint) -> str:
 def _validate_header_fields(header: ProvisioningExecutionHeader) -> None:
     # Re-run nested validation so object.__setattr__ mutation cannot cross a boundary.
     ProvisioningExecutionHeader.__post_init__(header)
+    _validate_operation_bindings(header)
 
 
 def _validate_checkpoint_fields(checkpoint: ProvisioningCheckpoint) -> None:
@@ -472,7 +480,7 @@ def _decode_dataclass(cls: type[Any], value: dict[str, Any]) -> Any:
             return ExecutionOperationIdentity(value["operation"], value["arguments_digest"], value["step_digest"])
         if cls is ExecutionStepIdentity:
             rollback = value["rollback"]
-            return ExecutionStepIdentity(value["plan_step_ordinal"], value["operation"], value["step_digest"], value["arguments_digest"], None if rollback is None else _decode_dataclass(ExecutionOperationIdentity, rollback))
+            return ExecutionStepIdentity(value["plan_step_ordinal"], _decode_dataclass(ExecutionOperationIdentity, value["forward"]), None if rollback is None else _decode_dataclass(ExecutionOperationIdentity, rollback))
         if cls is ExecutionPhaseSpec:
             return ExecutionPhaseSpec(value["phase_ordinal"], ExecutionPhase(value["phase"]), tuple(_decode_dataclass(ExecutionStepIdentity, item) for item in value["steps"]))
         if cls is ProvisioningExecutionHeader:
@@ -515,11 +523,7 @@ def _bound_step(header: ProvisioningExecutionHeader, checkpoint: ProvisioningChe
         if phase.phase is checkpoint.phase and phase.phase_ordinal == checkpoint.phase_ordinal:
             for step in phase.steps:
                 if step.plan_step_ordinal == checkpoint.plan_step_ordinal:
-                    if step.arguments_digest is not None and step.step_digest != _step_digest_from_identity(header.plan_digest, "forward", step.plan_step_ordinal, step.operation, step.arguments_digest):
-                        raise ValueError("forward operation identity has a mismatching digest")
-                    if step.rollback is not None and step.rollback.step_digest != _step_digest_from_identity(header.plan_digest, "rollback", step.plan_step_ordinal, step.rollback.operation, step.rollback.arguments_digest):
-                        raise ValueError("rollback operation identity has a mismatching digest")
-                    if checkpoint.step_digest == step.step_digest:
+                    if checkpoint.step_digest == step.forward.step_digest:
                         return step, False
                     if step.rollback is not None and checkpoint.step_digest == step.rollback.step_digest:
                         return step, True
@@ -623,11 +627,18 @@ def derive_backup_execution_view(header: ProvisioningExecutionHeader, checkpoint
     tail_evidence = next((c.step_evidence for c in reversed(checkpoints) if c.step_evidence), None)
     failure = next((c.step_evidence.safe_code for c in reversed(checkpoints) if c.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.ROLLBACK_FAILED) and c.step_evidence), None)
     rollback_events = [c.event for c in checkpoints if c.event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)]
-    rollback = "failed" if CheckpointEvent.ROLLBACK_FAILED in rollback_events else "completed" if rollback_events and rollback_events[-1] is CheckpointEvent.ROLLBACK_COMPLETED and not any(e is CheckpointEvent.ROLLBACK_STARTED for e in rollback_events[rollback_events.index(CheckpointEvent.ROLLBACK_COMPLETED)+1:]) else "in_progress" if rollback_events else "not_started"
+    required_rollbacks = len({
+        _bound_step(header, checkpoint)[0].plan_step_ordinal
+        for checkpoint in checkpoints
+        if checkpoint.event is CheckpointEvent.STEP_COMPLETED
+        and _bound_step(header, checkpoint)[0].rollback is not None
+    })
+    completed_rollbacks = sum(1 for event in rollback_events if event is CheckpointEvent.ROLLBACK_COMPLETED)
+    rollback = "failed" if CheckpointEvent.ROLLBACK_FAILED in rollback_events else "completed" if required_rollbacks and completed_rollbacks == required_rollbacks else "in_progress" if rollback_events else "not_started"
     finalized = bool(checkpoints and checkpoints[-1].event is CheckpointEvent.EXECUTION_FINALIZED)
     terminal = finalized and acceptance is not None and acceptance.passed and failure is None
     status = "succeeded" if terminal else "failed" if failure or (acceptance is not None and not acceptance.passed) else "finalized" if finalized else "in_progress" if checkpoints else "not_started"
     return ProvisioningExecutionView(header.execution_id, header.plan_id, checkpoints[-1].phase if checkpoints else None, status, failure or (acceptance.safe_code if acceptance and not acceptance.passed else None), rollback, attestation, acceptance, tail_evidence, tail, terminal)
 
 
-__all__ = ["BehaviorAcceptance", "CheckpointEvent", "ExecutionOperationIdentity", "ExecutionPhase", "ExecutionPhaseSpec", "ExecutionStepIdentity", "ProvisioningCheckpoint", "ProvisioningExecutionHeader", "ProvisioningExecutionView", "ProvisioningStepEvidence", "RuntimeAttestation", "StepDisposition", "build_checkpoint", "build_execution_header", "canonical_json", "canonical_step_digest", "checkpoint_from_payload", "checkpoint_payload", "derive_backup_execution_view", "execution_header_digest", "header_from_payload", "header_payload", "provisioning_checkpoint_digest", "verify_backup_execution_chain"]
+__all__ = ["BehaviorAcceptance", "CheckpointEvent", "ExecutionOperationIdentity", "ExecutionPhase", "ExecutionPhaseSpec", "ExecutionStepIdentity", "ProvisioningCheckpoint", "ProvisioningExecutionHeader", "ProvisioningExecutionView", "ProvisioningStepEvidence", "RuntimeAttestation", "StepDisposition", "build_checkpoint", "build_execution_header", "canonical_arguments_digest", "canonical_json", "canonical_step_digest", "checkpoint_from_payload", "checkpoint_payload", "derive_backup_execution_view", "execution_header_digest", "header_from_payload", "header_payload", "provisioning_checkpoint_digest", "verify_backup_execution_chain"]

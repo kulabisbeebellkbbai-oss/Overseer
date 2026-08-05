@@ -479,6 +479,7 @@ class SQLiteStore:
         self.close()
 
     def initialize(self) -> None:
+        self._migrate_backup_execution_v3()
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -685,6 +686,7 @@ class SQLiteStore:
                 )
                 """
             )
+
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_providers (
@@ -906,6 +908,60 @@ class SQLiteStore:
                 AGENT_DRIVER_SCHEMA_V9,
                 "attest new handoffs; legacy unsigned packages remain fail-safe invalid",
             )
+
+    def _migrate_backup_execution_v3(self) -> None:
+        """Upgrade the v3 execution tables before the idempotent schema script."""
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                ("backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"),
+            ).fetchall()
+        }
+        if tables != {"backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"}:
+            return
+        header_columns = {str(row[1]) for row in self._connection.execute("PRAGMA table_info(backup_provisioning_execution_headers)").fetchall()}
+        if {"approved_runtime_digest", "approved_config_digest"} <= header_columns:
+            return
+        if self._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_headers").fetchone()[0] or self._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_checkpoints").fetchone()[0]:
+            raise ValueError("v3 backup execution rows require an explicit v4 migration source")
+        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_headers_no_update")
+        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_headers_no_delete")
+        self._connection.execute("ALTER TABLE backup_provisioning_execution_headers RENAME TO backup_provisioning_execution_headers_v3")
+        self._connection.execute(f"""
+            CREATE TABLE backup_provisioning_execution_headers (
+                execution_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE,
+                plan_digest TEXT NOT NULL UNIQUE,
+                bundle_id TEXT NOT NULL UNIQUE,
+                bundle_digest TEXT NOT NULL UNIQUE,
+                approved_runtime_digest TEXT NOT NULL,
+                approved_config_digest TEXT NOT NULL,
+                header_digest TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            )
+        """)
+        self._connection.execute("DROP TABLE backup_provisioning_execution_headers_v3")
+        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_checkpoints_no_update")
+        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_checkpoints_no_delete")
+        self._connection.execute("ALTER TABLE backup_provisioning_execution_checkpoints RENAME TO backup_provisioning_execution_checkpoints_v3")
+        self._connection.execute("""
+            CREATE TABLE backup_provisioning_execution_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0),
+                phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0),
+                plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+                step_digest TEXT NOT NULL,
+                previous_digest TEXT NOT NULL,
+                checkpoint_digest TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                UNIQUE(execution_id, checkpoint_ordinal),
+                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            )
+        """)
+        self._connection.execute("INSERT INTO backup_provisioning_execution_checkpoints SELECT * FROM backup_provisioning_execution_checkpoints_v3")
+        self._connection.execute("DROP TABLE backup_provisioning_execution_checkpoints_v3")
 
     def _migrate_agent_activation_leases(self) -> None:
         columns = {
@@ -2179,7 +2235,12 @@ class SQLiteStore:
 
     def _append_backup_execution_checkpoint_locked(self, checkpoint: ProvisioningCheckpoint) -> None:
         header = self.load_backup_execution_header(checkpoint.execution_id)
-        payload = checkpoint_payload(checkpoint)
+        rows = self._connection.execute(
+            "SELECT * FROM backup_provisioning_execution_checkpoints WHERE execution_id=? ORDER BY checkpoint_ordinal",
+            (checkpoint.execution_id,),
+        ).fetchall()
+        checkpoints = tuple(self._decode_backup_checkpoint_row(row) for row in rows)
+        verify_backup_execution_chain(header, checkpoints)
         by_id = self._connection.execute(
             "SELECT * FROM backup_provisioning_execution_checkpoints WHERE checkpoint_id=?", (checkpoint.checkpoint_id,)
         ).fetchone()
@@ -2192,20 +2253,14 @@ class SQLiteStore:
         ).fetchone()
         if existing_ordinal is not None:
             self._validate_backup_checkpoint_row(existing_ordinal, checkpoint)
-            if str(existing_ordinal["payload"]) == payload:
-                return
-            raise ValueError("backup checkpoint ordinal already has a different value")
-        rows = self._connection.execute(
-                "SELECT * FROM backup_provisioning_execution_checkpoints WHERE execution_id=? ORDER BY checkpoint_ordinal",
-                (checkpoint.execution_id,),
-            ).fetchall()
-        checkpoints = tuple(self._decode_backup_checkpoint_row(row) for row in rows)
+            return
         if checkpoint.checkpoint_ordinal != len(checkpoints):
             raise ValueError("backup checkpoint ordinal has a gap")
         previous = verify_backup_execution_chain(header, checkpoints)
         if checkpoint.previous_digest != (previous or header.header_digest):
             raise ValueError("backup checkpoint previous digest is a fork")
         verify_backup_execution_chain(header, checkpoints + (checkpoint,))
+        payload = checkpoint_payload(checkpoint)
         self._connection.execute(
             "INSERT INTO backup_provisioning_execution_checkpoints "
             "(checkpoint_id, execution_id, checkpoint_ordinal, phase_ordinal, plan_step_ordinal, step_digest, previous_digest, checkpoint_digest, payload) "

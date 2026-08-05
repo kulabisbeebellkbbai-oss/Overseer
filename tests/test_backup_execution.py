@@ -619,8 +619,8 @@ def test_typed_execution_authority_schema_corruption_is_rejected_on_reopen(tmp_p
                 "DROP TABLE backup_provisioning_plan_execution_modes"
             )
         store._connection.commit()
-        with pytest.raises(ValueError, match="typed execution authority|immutability"):
-            OverseerStore(path)
+    with pytest.raises(ValueError, match="typed execution authority|immutability"):
+        OverseerStore(path)
 
 
 def test_rollback_claim_schema_corruption_is_rejected_on_reopen(tmp_path) -> None:

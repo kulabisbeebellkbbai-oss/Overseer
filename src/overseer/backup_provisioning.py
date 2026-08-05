@@ -84,6 +84,7 @@ class DonutHoleBackupProvisioningPlan:
     unit_digest: str
     status: ProvisioningStatus = ProvisioningStatus.STAGED
     kind: str = PLAN_KIND
+    execution_provenance: str = "legacy"
     system_user: str = SYSTEM_USER
     source_path: str = SOURCE_PATH
     source_access: str = "read_only_acl"
@@ -151,7 +152,7 @@ class AllowlistedHostProvisioningAdapter:
         return dict(result)
 
 
-def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_digest: str, capability_digest: str, root_authorization_refs: Mapping[str, str], root_registrations: tuple[Mapping[str, object], ...], overseer_token_source_file: str, overseer_token_file: str, cursor_key_file: str, evidence_ids: Mapping[str, str]) -> DonutHoleBackupProvisioningPlan:
+def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_digest: str, capability_digest: str, root_authorization_refs: Mapping[str, str], root_registrations: tuple[Mapping[str, object], ...], overseer_token_source_file: str, overseer_token_file: str, cursor_key_file: str, evidence_ids: Mapping[str, str], *, execution_provenance: str = "legacy") -> DonutHoleBackupProvisioningPlan:
     from .backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
     from .backup_host_operations import EXPECTED_BACKUP_TOOL_SCHEMAS, capability_digest as reviewed_capability_digest
 
@@ -233,7 +234,9 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         ProvisioningStep("remove_system_user_if_unused", {"name": SYSTEM_USER, "retained_path": BACKUP_PATH}),
         ProvisioningStep("remove_runtime_if_unreferenced", {"path": "/opt/theunderdark", "runtime_digest": runtime_digest}),
     )
-    plan = DonutHoleBackupProvisioningPlan(plan_id, gpg_sha256, adapter_commit, runtime_digest, reviewed_capability, provisioning_contract_version, planned_runtime_identity, dict(root_authorization_refs), tuple(dict(item) for item in root_registrations), overseer_token_source_file, overseer_token_file, cursor_key_file, dict(evidence_ids), steps, rollback, "", config_digest, unit_digest, read_only_paths=(SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file))
+    if execution_provenance not in {"legacy", "typed"}:
+        raise ValueError("execution provenance must be legacy or typed")
+    plan = DonutHoleBackupProvisioningPlan(plan_id, gpg_sha256, adapter_commit, runtime_digest, reviewed_capability, provisioning_contract_version, planned_runtime_identity, dict(root_authorization_refs), tuple(dict(item) for item in root_registrations), overseer_token_source_file, overseer_token_file, cursor_key_file, dict(evidence_ids), steps, rollback, "", config_digest, unit_digest, execution_provenance=execution_provenance, read_only_paths=(SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file))
     return replace(plan, plan_digest=_plan_digest(plan))
 
 
@@ -397,6 +400,7 @@ def execute_plan(
         raise ValueError("an explicit dedicated provisioning adapter is required")
     now = executed_at or datetime.now(UTC).isoformat(); _time(now)
     execution_id = None
+    concurrent_snapshot = None
     with SQLiteStore(store_path) as store:
         typed_execution = _typed_execution_enabled_for_plan_locked(store, plan_id)
         if typed_execution:
@@ -421,6 +425,7 @@ def execute_plan(
                     current_checkpoints = current_store.load_backup_execution_checkpoints(header.execution_id)
                     if not current_checkpoints or current_checkpoints[-1].event.value != "step_started":
                         raise
+                    concurrent_snapshot = (current_store.load_backup_execution_header(current_checkpoints[0].execution_id), _stored(current_store, plan_id), current_checkpoints)
                     invocation = _InvocationResult(
                         view=derive_backup_execution_view(
                             header,
@@ -429,15 +434,18 @@ def execute_plan(
                         entry_checkpoints=current_checkpoints,
                         entry_plan=_stored(current_store, plan_id),
                     )
-            with SQLiteStore(store_path) as store:
-                plan = _stored(store, plan_id)
-                checkpoints = store.load_backup_execution_checkpoints(invocation.view.execution_id)
-                header = store.load_backup_execution_header(invocation.view.execution_id)
+            if concurrent_snapshot is None:
+                with SQLiteStore(store_path) as store:
+                    plan = _stored(store, plan_id)
+                    checkpoints = store.load_backup_execution_checkpoints(invocation.view.execution_id)
+                    header = store.load_backup_execution_header(invocation.view.execution_id)
+            else:
+                header, plan, checkpoints = concurrent_snapshot
             prefix = invocation.entry_checkpoints
-            if checkpoints[:len(prefix)] != prefix:
+            if concurrent_snapshot is None and checkpoints[:len(prefix)] != prefix:
                 raise ValueError("execution checkpoint prefix identity changed")
-            delta = checkpoints[len(prefix):]
-            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=bool(delta) or plan != invocation.entry_plan)
+            delta = () if concurrent_snapshot is not None else checkpoints[len(prefix):]
+            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=False if concurrent_snapshot is not None else bool(delta) or plan != invocation.entry_plan)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)
@@ -562,7 +570,7 @@ def _validate_plan(plan: DonutHoleBackupProvisioningPlan) -> None:
     expected_capability_digest = reviewed_capability_digest(plan.adapter_commit, EXPECTED_BACKUP_TOOL_SCHEMAS, plan.provisioning_contract_version)
     if plan.capability_digest != expected_capability_digest:
         raise ValueError("capability digest does not match the reviewed contract")
-    rebuilt = build_plan(plan.plan_id, plan.gpg_sha256, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids)
+    rebuilt = build_plan(plan.plan_id, plan.gpg_sha256, plan.adapter_commit, plan.runtime_digest, plan.capability_digest, plan.root_authorization_refs, plan.root_registrations, plan.overseer_token_source_file, plan.overseer_token_file, plan.cursor_key_file, plan.evidence_ids, execution_provenance=plan.execution_provenance)
     if plan.kind != PLAN_KIND or plan.plan_digest != rebuilt.plan_digest or _plan_digest(plan) != plan.plan_digest:
         raise ValueError("provisioning plan contract or digest does not match")
 
@@ -603,7 +611,13 @@ def _typed_bundle_feature_enabled_locked(store: SQLiteStore) -> bool:
 
 
 def _typed_execution_enabled_for_plan_locked(store: SQLiteStore, plan_id: str) -> bool:
-    """Select typed execution only from artifacts belonging to this plan."""
+    """Select typed execution from durable source provenance, never row presence."""
+    row = store._connection.execute("SELECT payload FROM backup_provisioning_plans WHERE id=?", (plan_id,)).fetchone()
+    if row is not None:
+        provenance = json.loads(str(row["payload"])).get("execution_provenance", "legacy")
+        if provenance in {"typed", "legacy"}:
+            return provenance == "typed"
+        raise ValueError("invalid execution provenance")
     checks = (
         ("SELECT 1 FROM provisioning_bundles WHERE plan_id=? LIMIT 1", (plan_id,)),
         ("SELECT 1 FROM backup_provisioning_execution_headers WHERE plan_id=? LIMIT 1", (plan_id,)),
@@ -768,7 +782,7 @@ def _load(payload: str) -> DonutHoleBackupProvisioningPlan:
         raise ValueError("provisioning contract version is required for exact plan decoding")
     if "runtime_artifact_identity" not in data:
         raise ValueError("runtime artifact identity is required for exact plan decoding")
-    data.setdefault("failed_operation", None); data.setdefault("error_code", None); data["status"] = ProvisioningStatus(data["status"]); data["steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["steps"]); data["rollback_steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["rollback_steps"]); data["read_only_paths"] = tuple(data["read_only_paths"]); data["read_write_paths"] = tuple(data["read_write_paths"])
+    data.setdefault("failed_operation", None); data.setdefault("error_code", None); data.setdefault("execution_provenance", "legacy"); data["status"] = ProvisioningStatus(data["status"]); data["steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["steps"]); data["rollback_steps"] = tuple(ProvisioningStep(item["operation"], item["arguments"]) for item in data["rollback_steps"]); data["read_only_paths"] = tuple(data["read_only_paths"]); data["read_write_paths"] = tuple(data["read_write_paths"])
     plan = DonutHoleBackupProvisioningPlan(**data)
     _validate_plan(plan)
     return plan

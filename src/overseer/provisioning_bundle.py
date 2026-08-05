@@ -2517,6 +2517,7 @@ def _build_provisioning_bundle_with_dependencies(
         _OVERSEER_TOKEN_FILE,
         _CURSOR_KEY_FILE,
         evidence_ids,
+        execution_provenance="typed",
     )
     changed = changed_immutable_inputs(predecessor, plan, report)
     placeholder_digest = "sha256:" + "0" * 64

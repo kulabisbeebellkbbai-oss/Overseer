@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sqlite3
 import threading
@@ -105,6 +106,13 @@ def _approved(tmp_path: Path):
     store_path, plan, bundle = _typed_bundle_with_reviews(tmp_path)
     approve_plan(store_path, plan.plan_id, "independent-human")
     return store_path, plan, bundle
+
+
+def _execution_time_at_or_after_approval(store_path: str, plan_id: str) -> str:
+    with SQLiteStore(store_path) as store:
+        approved_at = _stored(store, plan_id).approved_at
+    assert approved_at is not None
+    return (datetime.fromisoformat(approved_at.replace("Z", "+00:00")).astimezone(UTC) + timedelta(seconds=1)).isoformat()
 
 
 def test_exact_manifest_phase_order_and_arguments_are_used(tmp_path: Path) -> None:
@@ -362,6 +370,22 @@ def test_deleted_typed_bundle_fails_closed_before_execution(tmp_path: Path) -> N
         ).fetchone()[0] == 0
 
 
+def test_all_typed_execution_artifacts_deleted_stays_typed_and_fails_before_adapter(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    with sqlite3.connect(store_path) as connection:
+        for table in ("provisioning_bundles", "provisioning_preflight_reports", "provisioning_review_outbox"):
+            connection.execute(f"DELETE FROM {table} WHERE plan_id=?", (plan.plan_id,))
+        connection.execute("DELETE FROM roadex_approval_bindings WHERE approval_ref=?", (f"approval.donuthole.{plan.plan_id}",))
+        connection.commit()
+    with pytest.raises(ValueError, match="SUCCESSOR_REQUIRED"):
+        execute_plan(store_path, plan.plan_id, adapter, acceptance_runner=Runner())
+    assert adapter.calls == []
+    with SQLiteStore(store_path) as store:
+        assert _stored(store, plan.plan_id).execution_provenance == "typed"
+        assert store._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_headers WHERE plan_id=?", (plan.plan_id,)).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("artifact", ["binding", "preflight", "outbox"])
 @pytest.mark.parametrize("entrypoint", ["start", "continue"])
 def test_missing_authority_record_aborts_changed_prefix_and_rolls_back(
@@ -613,7 +637,7 @@ def test_reconcile_uses_terminal_checkpoint_observed_at(tmp_path: Path) -> None:
     from overseer.backup_provisioning import _stored
 
     store_path, plan, _bundle = _approved(tmp_path)
-    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now="2026-08-05T12:00:00+00:00")
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now=_execution_time_at_or_after_approval(store_path, plan.plan_id))
     with SQLiteStore(store_path) as store:
         terminal = store.load_backup_execution_checkpoints(view.execution_id)[-1]
         assert _stored(store, plan.plan_id).executed_at == terminal.observed_at
@@ -624,7 +648,7 @@ def test_reconcile_reads_authoritative_chain_inside_transaction(tmp_path: Path, 
     from overseer.backup_provisioning import ProvisioningStatus, _stored
 
     store_path, plan, _bundle = _approved(tmp_path)
-    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now="2026-08-05T12:00:00+00:00")
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now=_execution_time_at_or_after_approval(store_path, plan.plan_id))
     with SQLiteStore(store_path) as store:
         terminal = SQLiteStore.load_backup_execution_checkpoints(store, view.execution_id)[-1]
         current = _stored(store, plan.plan_id)
@@ -658,7 +682,7 @@ def test_reconcile_repairs_only_terminal_timestamp_pair_and_rejects_digest_misma
     from overseer.backup_provisioning import _dump, _stored
 
     store_path, plan, _bundle = _approved(tmp_path)
-    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now="2026-08-05T12:00:00+00:00")
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now=_execution_time_at_or_after_approval(store_path, plan.plan_id))
     with SQLiteStore(store_path) as store:
         header = store.load_backup_execution_header(view.execution_id)
         terminal = store.load_backup_execution_checkpoints(view.execution_id)[-1]
@@ -758,6 +782,52 @@ def test_same_now_racing_starts_have_one_durable_claim_and_one_adapter_call(tmp_
     assert any(isinstance(item, ValueError) and "EXECUTION_IN_PROGRESS" in str(item) for item in results)
 
 
+def test_execute_plan_loser_serializes_its_captured_in_progress_snapshot(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_provisioning as provisioning
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    winner_started = threading.Event()
+    release_winner = threading.Event()
+    loser_snapshot = threading.Event()
+    winner_adapter = BlockingAdapter(winner_started, release_winner)
+    loser_adapter = RecordingAdapter()
+    results: dict[str, object] = {}
+    original_public = provisioning._typed_execution_public
+
+    def observe_loser_snapshot(*args, **kwargs):
+        if kwargs.get("mutation") is False:
+            loser_snapshot.set()
+            assert release_winner.wait(timeout=10)
+        return original_public(*args, **kwargs)
+
+    monkeypatch.setattr(provisioning, "_typed_execution_public", observe_loser_snapshot)
+
+    def run_winner() -> None:
+        results["winner"] = execute_plan(store_path, plan.plan_id, winner_adapter, acceptance_runner=Runner())
+
+    def run_loser() -> None:
+        results["loser"] = execute_plan(store_path, plan.plan_id, loser_adapter, acceptance_runner=Runner())
+
+    winner = threading.Thread(target=run_winner)
+    loser = threading.Thread(target=run_loser)
+    winner.start()
+    assert winner_started.wait(timeout=10)
+    loser.start()
+    assert loser_snapshot.wait(timeout=10)
+    release_winner.set()
+    winner.join(timeout=10)
+    loser.join(timeout=10)
+
+    assert len(winner_adapter.calls) == len(plan.steps)
+    assert loser_adapter.calls == []
+    assert results["winner"]["status"] == "executed"
+    assert results["winner"]["mutation_performed"] is True
+    assert results["loser"]["status"] == "in_progress"
+    assert results["loser"]["mutation_performed"] is False
+    assert results["loser"]["host_mutation_performed"] is False
+    assert results["loser"]["host_mutation_uncertain"] is False
+
+
 def test_pending_step_started_fails_closed_for_start_and_continue(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
 
@@ -796,6 +866,31 @@ def test_paused_changed_prefix_authority_drift_aborts_and_rolls_back_without_for
         checkpoints = store.load_backup_execution_checkpoints(paused.execution_id)
     assert any(item.event is CheckpointEvent.EXECUTION_ABORTED for item in checkpoints)
     assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_COMPLETED
+
+
+@pytest.mark.parametrize("entrypoint", ["start", "continue"])
+def test_unrelated_value_error_after_changed_prefix_propagates_without_cleanup(tmp_path: Path, entrypoint: str, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    paused = start_execution(store_path, plan.plan_id, adapter, None)
+    before_calls = list(adapter.calls)
+    before_checkpoints = _checkpoints(store_path, paused.execution_id)
+
+    def unrelated_failure(*_args, **_kwargs):
+        raise ValueError("injected unrelated validation failure")
+
+    monkeypatch.setattr(execution, "_load_authoritative_bundle", unrelated_failure)
+    with pytest.raises(ValueError, match="injected unrelated"):
+        if entrypoint == "start":
+            start_execution(store_path, plan.plan_id, adapter, Runner())
+        else:
+            continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert adapter.calls == before_calls
+    assert _checkpoints(store_path, paused.execution_id) == before_checkpoints
+    assert all(item.event is not CheckpointEvent.EXECUTION_ABORTED for item in before_checkpoints)
+    assert all(item.event not in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED) for item in before_checkpoints)
 
 
 def test_paused_verified_noop_prefix_authority_drift_fails_closed_without_rollback(tmp_path: Path) -> None:
@@ -911,9 +1006,11 @@ def test_tampered_execution_aborted_evidence_is_rejected_without_forward_claim(t
 
     monkeypatch.setattr(execution, "_append", tamper_abort)
     monkeypatch.setattr(execution, "_load_authoritative_bundle", drift_on_claim)
-    with pytest.raises(ValueError, match="execution abort|checkpoint"):
+    before_checkpoints = _checkpoints(store_path, paused.execution_id)
+    with pytest.raises(ValueError, match="review drift"):
         continue_execution(store_path, paused.execution_id, adapter, Runner())
     assert len(adapter.calls) == len(plan.steps)
+    assert _checkpoints(store_path, paused.execution_id) == before_checkpoints
 
 
 def test_exception_and_failed_forward_never_rerun_forward_or_persist_unsafe_text(tmp_path: Path) -> None:

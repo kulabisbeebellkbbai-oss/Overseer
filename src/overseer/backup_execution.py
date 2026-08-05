@@ -844,9 +844,7 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
             bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
             if _make_header(bundle, binding, source, header.created_at) != header:
                 raise _AuthorityMismatchError("stored execution header does not match current authority")
-        except ValueError as authority_error:
-            if isinstance(authority_error, _ExactApprovalSourceError):
-                raise
+        except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:
             if _bound_source_is_executed(store, header.plan_id):
                 raise ValueError("executed approval is not bound to a terminal execution")
             _verify_immutable_cleanup_identity(store, header, chain)
@@ -924,9 +922,7 @@ def _abort_paused_forward_on_authority_loss(store, header: ProvisioningExecution
             bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
             if _make_header(bundle, binding, source, header.created_at) != header:
                 raise _AuthorityMismatchError("stored execution header does not match current authority")
-        except ValueError as authority_error:
-            if isinstance(authority_error, _ExactApprovalSourceError):
-                raise
+        except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:
             if _bound_source_is_executed(store, header.plan_id):
                 raise ValueError("executed approval is not bound to a terminal execution") from authority_error
             _verify_immutable_cleanup_identity(store, header, chain)
@@ -1143,9 +1139,7 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
                     expected = _make_header(bundle, binding, source, header.created_at)
                     if expected != header:
                         raise _AuthorityMismatchError("stored execution header does not match current authority")
-                except ValueError as authority_error:
-                    if isinstance(authority_error, _ExactApprovalSourceError):
-                        raise
+                except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:
                     if not _abort_paused_forward_on_authority_loss(store, header, when):
                         raise authority_error
                     source = None
@@ -1177,9 +1171,7 @@ def _continue_execution_with_invocation(store_path: str, execution_id: str, adap
                 bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
                 if _make_header(bundle, binding, source, header.created_at) != header:
                     raise _AuthorityMismatchError("checkpoint header identity or manifest has drifted")
-            except ValueError as authority_error:
-                if isinstance(authority_error, _ExactApprovalSourceError):
-                    raise
+            except (_AuthorityRecordError, _AuthorityMismatchError) as authority_error:
                 if not _abort_paused_forward_on_authority_loss(store, header, when):
                     raise authority_error
                 source = None

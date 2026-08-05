@@ -923,6 +923,32 @@ def _verify_immutable_cleanup_identity(store, header: ProvisioningExecutionHeade
     verify_backup_execution_chain(header, chain)
 
 
+def _derive_rollback_frontier(header: ProvisioningExecutionHeader, checkpoints: tuple[ProvisioningCheckpoint, ...]) -> tuple[ExecutionStepIdentity, ...]:
+    """Purely derive exact pending rollback identities from a verified chain."""
+    verify_backup_execution_chain(header, checkpoints)
+    identities = {step.plan_step_ordinal: step for phase in header.phases for step in phase.steps}
+    changed: list[ExecutionStepIdentity] = []
+    for checkpoint in checkpoints:
+        if checkpoint.event is not CheckpointEvent.STEP_COMPLETED or checkpoint.step_evidence is None:
+            continue
+        if checkpoint.step_evidence.disposition is not StepDisposition.CHANGED:
+            continue
+        identity = identities.get(checkpoint.plan_step_ordinal)
+        if identity is None or identity.forward.step_digest != checkpoint.step_digest:
+            raise ValueError("changed forward checkpoint identity is invalid")
+        changed.append(identity)
+    completed_or_failed = {
+        (item.plan_step_ordinal, item.step_digest)
+        for item in checkpoints
+        if item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)
+    }
+    return tuple(
+        identity for identity in reversed(changed)
+        if identity.rollback is not None
+        and (identity.plan_step_ordinal, identity.rollback.step_digest) not in completed_or_failed
+    )
+
+
 def _bound_source_is_executed(store, plan_id: str) -> bool:
     from . import provisioning_bundle
     from .roadex_approval_status import load_roadex_human_plan
@@ -1054,7 +1080,7 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
             return None
 
         if any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED) for item in chain):
-            if chain[-1].event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.STEP_STARTED):
+            if chain[-1].event is CheckpointEvent.STEP_STARTED:
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             rollback_result = rollback_or_finish(len(chain))
             if rollback_result is not None:
@@ -1158,31 +1184,69 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
 
 def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: int, adapter) -> None:
     from .backup_provisioning import _stored
-    checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
-    if checkpoints and checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED:
-        raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
-    completed = [item for item in checkpoints if item.event is CheckpointEvent.STEP_COMPLETED and item.step_evidence is not None and item.step_evidence.disposition is StepDisposition.CHANGED]
-    rollback_done = {item.plan_step_ordinal for item in checkpoints if item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)}
-    identities = {step.plan_step_ordinal: step for phase in header.phases for step in phase.steps}
     plan = _stored(store, header.plan_id)
-    for checkpoint in reversed(completed):
-        identity = identities[checkpoint.plan_step_ordinal]
-        if identity.rollback is None:
-            continue
-        if identity.plan_step_ordinal in rollback_done:
-            continue
-        rollback_step = next(step for step in plan.rollback_steps if step.operation == identity.rollback.operation and canonical_arguments_digest(step.arguments) == identity.rollback.arguments_digest)
-        _append(store, header, ordinal, identity, CheckpointEvent.ROLLBACK_STARTED, when, rollback=True); ordinal += 1
+    while True:
+        checkpoints = store.load_backup_execution_checkpoints(header.execution_id)
+        frontier = _derive_rollback_frontier(header, checkpoints)
+        if not frontier:
+            return
+        requested = frontier[0]
+        rollback_step = next((step for step in plan.rollback_steps
+            if requested.rollback is not None
+            and step.operation == requested.rollback.operation
+            and canonical_arguments_digest(step.arguments) == requested.rollback.arguments_digest
+            and canonical_step_digest(plan.plan_digest, "rollback", requested.plan_step_ordinal, step.operation, step.arguments) == requested.rollback.step_digest), None)
+        if rollback_step is None:
+            raise ValueError("approved rollback identity is not present in the exact plan")
+        _claim_rollback(store, header, requested, when)
         try:
             result = adapter.execute(rollback_step)
             evidence = _normalize_result(rollback_step.operation, result)
-            if evidence.disposition is StepDisposition.FAILED:
-                raise ValueError("rollback failed")
-            _append(store, header, ordinal, identity, CheckpointEvent.ROLLBACK_COMPLETED, when, evidence=evidence, rollback=True); ordinal += 1
-        except Exception as error:
+            event = CheckpointEvent.ROLLBACK_FAILED if evidence.disposition is StepDisposition.FAILED else CheckpointEvent.ROLLBACK_COMPLETED
+        except Exception:
             code = "ROLLBACK_FAILED"
             evidence = ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(rollback_step.operation, False, code), True)
-            _append(store, header, ordinal, identity, CheckpointEvent.ROLLBACK_FAILED, when, evidence=evidence, rollback=True); ordinal += 1
+            event = CheckpointEvent.ROLLBACK_FAILED
+        current = store.load_backup_execution_checkpoints(header.execution_id)
+        verify_backup_execution_chain(header, current)
+        if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED:
+            raise ValueError("owned rollback claim is missing")
+        claimed = next(step for phase in header.phases for step in phase.steps if step.plan_step_ordinal == current[-1].plan_step_ordinal)
+        if claimed != requested or current[-1].step_digest != requested.rollback.step_digest:
+            raise ValueError("owned rollback claim identity changed")
+        _append(store, header, len(current), requested, event, when, evidence=evidence, rollback=True)
+
+
+def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str) -> bool:
+    """Atomically claim one exact rollback operation on the verified frontier."""
+    if requested.rollback is None:
+        raise ValueError("rollback is not approved for this operation")
+    deferred_error = None
+    with store.agent_transaction():
+        chain = store.load_backup_execution_checkpoints(header.execution_id)
+        verify_backup_execution_chain(header, chain)
+        _verify_immutable_cleanup_identity(store, header, chain)
+        frontier = _derive_rollback_frontier(header, chain)
+        done = {(item.plan_step_ordinal, item.step_digest) for item in chain
+                if item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)}
+        if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
+            if chain[-1].plan_step_ordinal == requested.plan_step_ordinal and chain[-1].step_digest == requested.rollback.step_digest:
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+            raise ValueError("rollback frontier has an impossible active identity")
+        if not frontier or frontier[0] != requested:
+            if (requested.plan_step_ordinal, requested.rollback.step_digest) in done:
+                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+            raise ValueError("requested rollback is outside the verified frontier")
+        try:
+            _append(store, header, len(chain), requested, CheckpointEvent.ROLLBACK_STARTED, when, rollback=True)
+        except BaseException as error:
+            # _append may have durably inserted the immutable row before an
+            # injected crash is raised by a test/instrumentation wrapper.
+            # Let the transaction commit that claim, then preserve the crash.
+            deferred_error = error
+    if deferred_error is not None:
+        raise deferred_error
+    return True
 
 
 def _reconcile_executed(store, header: ProvisioningExecutionHeader) -> None:
@@ -1246,8 +1310,6 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
                     initial_mutation = True
                     source = None
             if chain and chain[-1].event is CheckpointEvent.STEP_STARTED:
-                raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
-            if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             if source is not None and not _chain_requires_cleanup(chain) and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")

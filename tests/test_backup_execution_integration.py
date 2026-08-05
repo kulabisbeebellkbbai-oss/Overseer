@@ -187,6 +187,124 @@ def test_wrong_config_and_failed_acceptance_cannot_finalize(tmp_path: Path) -> N
     assert failed.rollback_status == "completed"
 
 
+def test_completed_rollback_pure_loser_performs_no_mutation_or_adapter_call(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    winner_adapter = RecordingAdapter()
+    winner = execute_plan(store_path, plan.plan_id, winner_adapter, acceptance_runner=Runner(wrong_runtime=True))
+    assert winner["status"] == "rolled_back"
+
+    loser_adapter = RecordingAdapter()
+    loser = execute_plan(store_path, plan.plan_id, loser_adapter, acceptance_runner=Runner(wrong_runtime=True))
+
+    assert loser["status"] == "rolled_back"
+    assert loser["mutation_performed"] is False
+    assert loser["host_mutation_performed"] is False
+    assert loser["host_mutation_uncertain"] is False
+    assert loser_adapter.calls == []
+
+
+def test_rollback_owner_retains_prior_changed_attribution_when_next_is_claimed(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+    import overseer.backup_provisioning as provisioning
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    first_rollback_completed = threading.Event()
+    next_rollback_claimed = threading.Event()
+    release_owner = threading.Event()
+    owner_adapter = RecordingAdapter()
+    contender_adapter = RecordingAdapter()
+    results: dict[str, object] = {}
+    captured: dict[str, object] = {}
+    original_append = execution._append
+    original_public = provisioning._typed_execution_public
+
+    rollback_operations = {step.operation for step in plan.rollback_steps}
+
+    def observe_append(store, header, ordinal, identity, event, when, **kwargs):
+        result = original_append(store, header, ordinal, identity, event, when, **kwargs)
+        if (
+            threading.current_thread().name == "rollback-owner"
+            and event is CheckpointEvent.ROLLBACK_COMPLETED
+            and identity.rollback is not None
+            and not first_rollback_completed.is_set()
+        ):
+            first_rollback_completed.set()
+            assert release_owner.wait(timeout=10)
+        return result
+
+    def observe_public(plan_arg, view, checkpoints, **kwargs):
+        if threading.current_thread().name == "rollback-owner":
+            captured["owner"] = (view, kwargs["invocation_checkpoints"])
+        return original_public(plan_arg, view, checkpoints, **kwargs)
+
+    def observe_execute(step):
+        if step.operation in rollback_operations and not next_rollback_claimed.is_set():
+            next_rollback_claimed.set()
+        return RecordingAdapter.execute(contender_adapter, step)
+
+    monkeypatch.setattr(execution, "_append", observe_append)
+    monkeypatch.setattr(provisioning, "_typed_execution_public", observe_public)
+    contender_adapter.execute = observe_execute
+
+    def run_owner() -> None:
+        results["owner"] = execute_plan(
+            store_path, plan.plan_id, owner_adapter, acceptance_runner=Runner(wrong_runtime=True)
+        )
+
+    def run_contender() -> None:
+        results["contender"] = execute_plan(
+            store_path, plan.plan_id, contender_adapter, acceptance_runner=Runner(wrong_runtime=True)
+        )
+
+    owner = threading.Thread(target=run_owner, name="rollback-owner")
+    contender = threading.Thread(target=run_contender, name="rollback-contender")
+    owner.start()
+    assert first_rollback_completed.wait(timeout=10)
+    contender.start()
+    assert next_rollback_claimed.wait(timeout=10)
+    release_owner.set()
+    owner.join(timeout=10)
+    contender.join(timeout=10)
+
+    assert not owner.is_alive()
+    assert not contender.is_alive()
+    assert results["owner"]["mutation_performed"] is True
+    assert results["owner"]["host_mutation_performed"] is True
+    owner_view, owner_checkpoints = captured["owner"]
+    assert owner_view.rollback_status == "in_progress"
+    assert any(item.event is CheckpointEvent.ROLLBACK_COMPLETED for item in owner_checkpoints)
+    assert sum(step.operation in rollback_operations for step in owner_adapter.calls) == 1
+    assert sum(step.operation in rollback_operations for step in contender_adapter.calls) == len(plan.rollback_steps) - 1
+
+
+def test_rollback_does_not_swallow_unrelated_tamper_error_as_contention(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+
+    original_append = execution._append
+    interrupted = {"value": False}
+
+    def interrupt_after_claim(*args, **kwargs):
+        result = original_append(*args, **kwargs)
+        if args[4] is CheckpointEvent.ROLLBACK_STARTED and not interrupted["value"]:
+            interrupted["value"] = True
+            raise BaseException("crash after rollback claim")
+        return result
+
+    monkeypatch.setattr(execution, "_append", interrupt_after_claim)
+    with pytest.raises(BaseException, match="crash after rollback claim"):
+        start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(wrong_runtime=True))
+    monkeypatch.setattr(execution, "_append", original_append)
+
+    def unrelated_claim_error(*args, **kwargs):
+        raise ValueError("rollback checkpoint persistence invariant was violated")
+
+    monkeypatch.setattr(execution, "_claim_rollback", unrelated_claim_error)
+    with pytest.raises(ValueError, match="persistence invariant"):
+        continue_execution(store_path, execution_id_for(store_path, plan.plan_id), RecordingAdapter(), Runner(wrong_runtime=True))
+
+
 def test_typed_execute_plan_delegates_to_runner_coordinator(tmp_path: Path) -> None:
     from overseer.backup_provisioning import execute_plan
 

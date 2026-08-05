@@ -386,10 +386,38 @@ def approve_plan(store_path: str, plan_id: str, approved_by: str, approved_at: s
     return _public(approved, mutation=True)
 
 
-def execute_plan(store_path: str, plan_id: str, adapter: ProvisioningAdapter | None = None, executed_at: str | None = None) -> Mapping[str, object]:
+def execute_plan(
+    store_path: str,
+    plan_id: str,
+    adapter: ProvisioningAdapter | None = None,
+    executed_at: str | None = None,
+    acceptance_runner=None,
+) -> Mapping[str, object]:
     if adapter is None:
         raise ValueError("an explicit dedicated provisioning adapter is required")
     now = executed_at or datetime.now(UTC).isoformat(); _time(now)
+    execution_id = None
+    with SQLiteStore(store_path) as store:
+        try:
+            store.load_provisioning_bundle_record(plan_id)
+            typed_execution = True
+        except KeyError:
+            typed_execution = False
+        if typed_execution:
+            if not callable(getattr(acceptance_runner, "attest", None)) or not callable(getattr(acceptance_runner, "accept", None)):
+                raise ValueError("typed provisioning execution requires an exact acceptance runner")
+            from .backup_execution import continue_execution, start_execution
+            try:
+                execution_id = store.load_backup_execution_header_for_plan(plan_id).execution_id
+            except KeyError:
+                execution_id = None
+            if execution_id is None:
+                view = start_execution(store_path, plan_id, adapter, acceptance_runner, now=now)
+            else:
+                view = continue_execution(store_path, execution_id, adapter, acceptance_runner, now=now)
+            with SQLiteStore(store_path) as store:
+                plan = _stored(store, plan_id)
+            return _public(plan, mutation=True, host_mutation=view.terminal_success)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)

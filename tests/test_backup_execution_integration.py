@@ -522,6 +522,118 @@ def test_rollback_completion_rejects_takeover_at_owner_boundary(tmp_path: Path, 
         assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED
 
 
+def test_rollback_completion_rejects_epoch_only_tampering(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    rollback_operations = {step.operation for step in plan.rollback_steps}
+    execution_id: str | None = None
+
+    class EpochTamperingAdapter(RecordingAdapter):
+        def execute(self, step):
+            if step.operation in rollback_operations:
+                with sqlite3.connect(store_path, timeout=30.0) as connection:
+                    connection.execute(
+                        "UPDATE backup_provisioning_execution_rollback_claims SET claim_epoch=8"
+                    )
+                    connection.commit()
+            return super().execute(step)
+
+    adapter = EpochTamperingAdapter()
+    with pytest.raises(ValueError, match="owner changed"):
+        start_execution(store_path, plan.plan_id, adapter, Runner(wrong_runtime=True))
+    assert sum(step.operation in rollback_operations for step in adapter.calls) == 1
+    with SQLiteStore(store_path) as store:
+        execution_id = store.load_backup_execution_header_for_plan(plan.plan_id).execution_id
+    assert execution_id is not None
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(execution_id)
+        claim = store._connection.execute(
+            "SELECT owner_id, claim_epoch FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
+            (execution_id,),
+        ).fetchone()
+    assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_STARTED
+    assert claim is not None and claim["claim_epoch"] == 8
+
+
+def test_live_owner_lock_prevents_expired_lease_takeover_during_adapter_call(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
+    claim_clock = datetime.fromisoformat(execution_time)
+    current_clock = {"value": claim_clock}
+    monkeypatch.setattr(execution, "_rollback_claim_clock", lambda: current_clock["value"].isoformat())
+    rollback_operations = {step.operation for step in plan.rollback_steps}
+    started = threading.Event()
+    release = threading.Event()
+    owner_adapter = RecordingAdapter()
+
+    def owner_execute(step):
+        if step.operation in rollback_operations and not started.is_set():
+            started.set()
+            assert release.wait(timeout=10)
+        return RecordingAdapter.execute(owner_adapter, step)
+
+    owner_adapter.execute = owner_execute
+    contender_adapter = RecordingAdapter()
+    results: dict[str, object] = {}
+
+    def run_owner() -> None:
+        results["owner"] = start_execution(
+            store_path, plan.plan_id, owner_adapter, Runner(wrong_runtime=True), now=execution_time
+        )
+
+    def run_contender() -> None:
+        try:
+            results["contender"] = continue_execution(
+                store_path, execution_id_for(store_path, plan.plan_id), contender_adapter,
+                Runner(wrong_runtime=True), now=(claim_clock + timedelta(seconds=31)).isoformat(),
+            )
+        except BaseException as error:
+            results["contender"] = error
+
+    owner = threading.Thread(target=run_owner, name="live-rollback-owner")
+    owner.start()
+    assert started.wait(timeout=10)
+    current_clock["value"] = claim_clock + timedelta(seconds=31)
+    contender = threading.Thread(target=run_contender, name="expired-lease-contender")
+    contender.start()
+    contender.join(timeout=10)
+    assert not contender.is_alive()
+    assert isinstance(results["contender"], ValueError)
+    assert str(results["contender"]) == "EXECUTION_IN_PROGRESS"
+    assert contender_adapter.calls == []
+    release.set()
+    owner.join(timeout=10)
+    assert not owner.is_alive()
+    assert sum(step.operation in rollback_operations for step in owner_adapter.calls) == len(plan.rollback_steps)
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(execution_id_for(store_path, plan.plan_id))
+    assert sum(item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED) for item in checkpoints) == len(plan.rollback_steps)
+
+
+@pytest.mark.parametrize("artifact_kind", ["symlink", "wrong_mode"])
+def test_rollback_owner_lock_rejects_unsafe_stable_artifact(tmp_path: Path, artifact_kind: str) -> None:
+    import hashlib
+    from types import SimpleNamespace
+    from overseer.backup_execution import _RollbackOwnerLock
+
+    store = SimpleNamespace(path=tmp_path / "state.sqlite3")
+    execution_id = "execution.lock.test"
+    lock_path = Path(f"{store.path}.rollback-owner-{hashlib.sha256(execution_id.encode()).hexdigest()}.lock")
+    if artifact_kind == "symlink":
+        target = tmp_path / "target.lock"
+        target.touch()
+        target.chmod(0o600)
+        lock_path.symlink_to(target)
+        with pytest.raises(OSError):
+            _RollbackOwnerLock.acquire(store, execution_id)
+    else:
+        lock_path.touch()
+        lock_path.chmod(0o644)
+        with pytest.raises(ValueError, match="unsafe"):
+            _RollbackOwnerLock.acquire(store, execution_id)
+
+
 def test_typed_execute_plan_delegates_to_runner_coordinator(tmp_path: Path) -> None:
     from overseer.backup_provisioning import execute_plan
 

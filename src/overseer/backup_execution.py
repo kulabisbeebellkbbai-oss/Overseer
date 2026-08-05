@@ -5,10 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+import fcntl
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import re
+import stat
+import threading
 import uuid
 from typing import Any, Literal, Mapping, TYPE_CHECKING
 
@@ -686,6 +691,70 @@ _ROLLBACK_FOR = {
 }
 
 _ROLLBACK_CLAIM_LEASE = timedelta(seconds=30)
+_ROLLBACK_OWNER_LOCKS: dict[str, threading.Lock] = {}
+_ROLLBACK_OWNER_LOCKS_GUARD = threading.Lock()
+
+
+class _RollbackOwnerLock:
+    """Hold an OS lock for the duration of one rollback adapter call.
+
+    The durable claim remains recoverable after process death because the OS
+    releases this lock, while a live owner cannot be taken over merely because
+    its initial lease elapsed.
+    """
+
+    def __init__(self, fd: int, thread_lock: threading.Lock) -> None:
+        self._fd = fd
+        self._thread_lock = thread_lock
+
+    @classmethod
+    def acquire(cls, store: SQLiteStore, execution_id: str) -> _RollbackOwnerLock:
+        lock_name = hashlib.sha256(execution_id.encode()).hexdigest()
+        path = Path(f"{store.path}.rollback-owner-{lock_name}.lock")
+        lock_key = str(path)
+        with _ROLLBACK_OWNER_LOCKS_GUARD:
+            thread_lock = _ROLLBACK_OWNER_LOCKS.setdefault(lock_key, threading.Lock())
+        if not thread_lock.acquire(blocking=False):
+            raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        flags |= nofollow
+        fd = None
+        try:
+            fd = os.open(path, flags, 0o600)
+            status = os.fstat(fd)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_nlink != 1
+                or status.st_uid != os.geteuid()
+                or stat.S_IMODE(status.st_mode) != 0o600
+            ):
+                raise ValueError("rollback owner lock artifact is unsafe")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if fd is not None:
+                os.close(fd)
+            thread_lock.release()
+            raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            thread_lock.release()
+            raise
+        return cls(fd, thread_lock)
+
+    def release(self) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+            self._thread_lock.release()
+
+    def __enter__(self) -> _RollbackOwnerLock:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
 
 
 def _rollback_claim_clock() -> str:
@@ -1206,39 +1275,48 @@ def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: in
             and canonical_step_digest(plan.plan_digest, "rollback", requested.plan_step_ordinal, step.operation, step.arguments) == requested.rollback.step_digest), None)
         if rollback_step is None:
             raise ValueError("approved rollback identity is not present in the exact plan")
-        _claim_rollback(store, header, requested, when, owner_id)
+        claim_epoch, owner_lock = _claim_rollback(store, header, requested, when, owner_id)
         try:
-            result = adapter.execute(rollback_step)
-            evidence = _normalize_result(rollback_step.operation, result)
-            event = CheckpointEvent.ROLLBACK_FAILED if evidence.disposition is StepDisposition.FAILED else CheckpointEvent.ROLLBACK_COMPLETED
-        except Exception:
-            code = "ROLLBACK_FAILED"
-            evidence = ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(rollback_step.operation, False, code), True)
-            event = CheckpointEvent.ROLLBACK_FAILED
-        deferred_error = None
-        with store.agent_transaction():
-            current = store.load_backup_execution_checkpoints(header.execution_id)
-            verify_backup_execution_chain(header, current)
-            if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED:
-                raise ValueError("owned rollback claim is missing")
-            claim = _load_rollback_claim(store, header.execution_id)
-            if claim is None or claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest or claim["owner_id"] != owner_id:
-                raise ValueError("owned rollback claim owner changed")
-            claimed = next(step for phase in header.phases for step in phase.steps if step.plan_step_ordinal == current[-1].plan_step_ordinal)
-            if claimed != requested or current[-1].step_digest != requested.rollback.step_digest:
-                raise ValueError("owned rollback claim identity changed")
             try:
-                _append(store, header, len(current), requested, event, when, evidence=evidence, rollback=True)
-            except BaseException as error:
-                completed = store.load_backup_execution_checkpoints(header.execution_id)
-                if not completed or completed[-1].event is not event or completed[-1].plan_step_ordinal != requested.plan_step_ordinal or completed[-1].step_digest != requested.rollback.step_digest:
-                    raise
-                _release_rollback_claim_locked(store, header, requested, owner_id)
-                deferred_error = error
-            else:
-                _release_rollback_claim_locked(store, header, requested, owner_id)
-        if deferred_error is not None:
-            raise deferred_error
+                result = adapter.execute(rollback_step)
+                evidence = _normalize_result(rollback_step.operation, result)
+                event = CheckpointEvent.ROLLBACK_FAILED if evidence.disposition is StepDisposition.FAILED else CheckpointEvent.ROLLBACK_COMPLETED
+            except Exception:
+                code = "ROLLBACK_FAILED"
+                evidence = ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(rollback_step.operation, False, code), True)
+                event = CheckpointEvent.ROLLBACK_FAILED
+            deferred_error = None
+            with store.agent_transaction():
+                current = store.load_backup_execution_checkpoints(header.execution_id)
+                verify_backup_execution_chain(header, current)
+                if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED:
+                    raise ValueError("owned rollback claim is missing")
+                claim = _load_rollback_claim(store, header.execution_id)
+                if (
+                    claim is None
+                    or claim["plan_step_ordinal"] != requested.plan_step_ordinal
+                    or claim["step_digest"] != requested.rollback.step_digest
+                    or claim["owner_id"] != owner_id
+                    or claim["claim_epoch"] != claim_epoch
+                ):
+                    raise ValueError("owned rollback claim owner changed")
+                claimed = next(step for phase in header.phases for step in phase.steps if step.plan_step_ordinal == current[-1].plan_step_ordinal)
+                if claimed != requested or current[-1].step_digest != requested.rollback.step_digest:
+                    raise ValueError("owned rollback claim identity changed")
+                try:
+                    _append(store, header, len(current), requested, event, when, evidence=evidence, rollback=True)
+                except BaseException as error:
+                    completed = store.load_backup_execution_checkpoints(header.execution_id)
+                    if not completed or completed[-1].event is not event or completed[-1].plan_step_ordinal != requested.plan_step_ordinal or completed[-1].step_digest != requested.rollback.step_digest:
+                        raise
+                    _release_rollback_claim_locked(store, header, requested, owner_id, claim_epoch)
+                    deferred_error = error
+                else:
+                    _release_rollback_claim_locked(store, header, requested, owner_id, claim_epoch)
+            if deferred_error is not None:
+                raise deferred_error
+        finally:
+            owner_lock.release()
 
 
 def _rollback_claim_expired(lease_expires_at: str, when: str) -> bool:
@@ -1274,25 +1352,26 @@ def _load_rollback_claim(store, execution_id: str):
     return row
 
 
-def _release_rollback_claim_locked(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, owner_id: str) -> None:
+def _release_rollback_claim_locked(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, owner_id: str, claim_epoch: int) -> None:
     claim = _load_rollback_claim(store, header.execution_id)
     if claim is None:
         return
     if claim["plan_step_ordinal"] != requested.plan_step_ordinal or claim["step_digest"] != requested.rollback.step_digest:
         raise ValueError("rollback claim completion identity is invalid")
-    if claim["owner_id"] != owner_id:
+    if claim["owner_id"] != owner_id or claim["claim_epoch"] != claim_epoch:
         raise ValueError("rollback claim owner changed before release")
     store._connection.execute(
-        "DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=?",
-        (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id),
+        "DELETE FROM backup_provisioning_execution_rollback_claims WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=? AND claim_epoch=?",
+        (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id, claim_epoch),
     )
 
 
-def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str) -> bool:
+def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: ExecutionStepIdentity, when: str, owner_id: str) -> tuple[int, _RollbackOwnerLock]:
     """Atomically claim one exact rollback operation on the verified frontier."""
     if requested.rollback is None:
         raise ValueError("rollback is not approved for this operation")
     deferred_error = None
+    owner_lock = None
     with store.agent_transaction():
         claim_now = _rollback_claim_clock()
         claim_expires = (datetime.fromisoformat(claim_now) + _ROLLBACK_CLAIM_LEASE).isoformat()
@@ -1314,15 +1393,23 @@ def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: Execu
                 raise ValueError("active rollback claim metadata is missing or mismatched")
             if not _rollback_claim_expired(str(claim["lease_expires_at"]), claim_now):
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
-            updated = store._connection.execute(
-                "UPDATE backup_provisioning_execution_rollback_claims "
-                "SET owner_id=?, claimed_at=?, lease_expires_at=?, claim_epoch=claim_epoch+1 "
-                "WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=? AND lease_expires_at=?",
-                (owner_id, claim_now, claim_expires, header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, claim["owner_id"], claim["lease_expires_at"]),
-            )
+            owner_lock = _RollbackOwnerLock.acquire(store, header.execution_id)
+            try:
+                updated = store._connection.execute(
+                    "UPDATE backup_provisioning_execution_rollback_claims "
+                    "SET owner_id=?, claimed_at=?, lease_expires_at=?, claim_epoch=claim_epoch+1 "
+                    "WHERE execution_id=? AND plan_step_ordinal=? AND step_digest=? AND owner_id=? AND lease_expires_at=? AND claim_epoch=?",
+                    (owner_id, claim_now, claim_expires, header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, claim["owner_id"], claim["lease_expires_at"], claim["claim_epoch"]),
+                )
+            except BaseException:
+                owner_lock.release()
+                owner_lock = None
+                raise
             if updated.rowcount != 1:
+                owner_lock.release()
+                owner_lock = None
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
-            return True
+            return int(claim["claim_epoch"]) + 1, owner_lock
         if claim is not None:
             claim_completed = any(
                 item.event in (CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED)
@@ -1338,24 +1425,35 @@ def _claim_rollback(store, header: ProvisioningExecutionHeader, requested: Execu
             if (requested.plan_step_ordinal, requested.rollback.step_digest) in done:
                 raise _ExecutionContentionError("EXECUTION_IN_PROGRESS")
             raise ValueError("requested rollback is outside the verified frontier")
-        store._connection.execute(
-            "INSERT INTO backup_provisioning_execution_rollback_claims "
-            "(execution_id, plan_step_ordinal, step_digest, owner_id, claimed_at, lease_expires_at, claim_epoch) VALUES (?, ?, ?, ?, ?, ?, 1)",
-            (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id, claim_now, claim_expires),
-        )
+        owner_lock = _RollbackOwnerLock.acquire(store, header.execution_id)
+        try:
+            store._connection.execute(
+                "INSERT INTO backup_provisioning_execution_rollback_claims "
+                "(execution_id, plan_step_ordinal, step_digest, owner_id, claimed_at, lease_expires_at, claim_epoch) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (header.execution_id, requested.plan_step_ordinal, requested.rollback.step_digest, owner_id, claim_now, claim_expires),
+            )
+        except BaseException:
+            owner_lock.release()
+            owner_lock = None
+            raise
         try:
             _append(store, header, len(chain), requested, CheckpointEvent.ROLLBACK_STARTED, when, rollback=True)
         except BaseException as error:
             current = store.load_backup_execution_checkpoints(header.execution_id)
             if not current or current[-1].event is not CheckpointEvent.ROLLBACK_STARTED or current[-1].plan_step_ordinal != requested.plan_step_ordinal or current[-1].step_digest != requested.rollback.step_digest:
+                owner_lock.release()
+                owner_lock = None
                 raise
             # _append may have durably inserted the immutable row before an
             # injected crash is raised by a test/instrumentation wrapper.
             # Commit the exact claim metadata with it, then preserve the crash.
             deferred_error = error
     if deferred_error is not None:
+        if owner_lock is not None:
+            owner_lock.release()
         raise deferred_error
-    return True
+    assert owner_lock is not None
+    return 1, owner_lock
 
 
 def _reconcile_executed(store, header: ProvisioningExecutionHeader) -> None:

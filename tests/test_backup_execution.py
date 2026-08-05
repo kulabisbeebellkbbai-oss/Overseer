@@ -165,7 +165,7 @@ def test_verified_chain_and_terminal_success_require_finalized_acceptance() -> N
 def test_store_persists_v4_header_and_append_only_chain(tmp_path) -> None:
     header = _header()
     checkpoints = _chain(header)
-    assert CURRENT_SCHEMA_VERSION == 5
+    assert CURRENT_SCHEMA_VERSION == 6
     assert header.schema_version == "2"
     assert checkpoints[0].schema_version == "2"
     with OverseerStore(tmp_path / "state.sqlite3") as store:
@@ -642,6 +642,43 @@ def test_rollback_claim_schema_corruption_is_rejected_on_reopen(tmp_path) -> Non
         store._connection.commit()
     with pytest.raises(ValueError, match="malformed backup execution"):
         OverseerStore(path)
+
+
+def test_preclaims_v5_database_migrates_claims_table_without_mutating_immutable_rows(tmp_path) -> None:
+    path = tmp_path / "preclaims-v5.sqlite3"
+    header = _header()
+    checkpoint = _chain(header)[0]
+    with OverseerStore(path) as store:
+        store.save_backup_execution(header, checkpoint)
+        immutable_before = (
+            store._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name IN (?, ?) ORDER BY name",
+                ("backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"),
+            ).fetchall(),
+            store._connection.execute(
+                "SELECT execution_id, checkpoint_ordinal, checkpoint_digest FROM backup_provisioning_execution_checkpoints"
+            ).fetchall(),
+        )
+        store._connection.execute("DROP TABLE backup_provisioning_execution_rollback_claims")
+        store._connection.execute("DELETE FROM schema_migrations WHERE version=6")
+        store._connection.commit()
+    with OverseerStore(path) as store:
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_execution_rollback_claims"
+        ).fetchone()[0] == 0
+        assert store._connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=6"
+        ).fetchone() is not None
+        immutable_after = (
+            store._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name IN (?, ?) ORDER BY name",
+                ("backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"),
+            ).fetchall(),
+            store._connection.execute(
+                "SELECT execution_id, checkpoint_ordinal, checkpoint_digest FROM backup_provisioning_execution_checkpoints"
+            ).fetchall(),
+        )
+    assert immutable_after == immutable_before
 
 
 def test_schema_rejects_commented_checks_and_partial_unique_indexes(tmp_path) -> None:

@@ -71,8 +71,9 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 BACKUP_EXECUTION_AUTHORITY_SCHEMA_VERSION = 5
+BACKUP_EXECUTION_ROLLBACK_CLAIMS_SCHEMA_VERSION = 6
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
@@ -403,7 +404,11 @@ class SQLiteStore:
             return False
         required = {"backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"}
         actual = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)", tuple(required)).fetchall()}
-        return actual == required and self._typed_execution_authority_schema_is_exact()
+        return (
+            actual == required
+            and self._typed_execution_authority_schema_is_exact()
+            and self._rollback_claims_table_is_exact()
+        )
 
     def _typed_execution_authority_schema_is_exact(self) -> bool:
         table = "backup_provisioning_plan_execution_modes"
@@ -763,16 +768,6 @@ class SQLiteStore:
                 UNIQUE(execution_id, checkpoint_ordinal),
                 FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
             );
-            CREATE TABLE IF NOT EXISTS backup_provisioning_execution_rollback_claims (
-                execution_id TEXT PRIMARY KEY,
-                plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
-                step_digest TEXT NOT NULL,
-                owner_id TEXT NOT NULL,
-                claimed_at TEXT NOT NULL,
-                lease_expires_at TEXT NOT NULL,
-                claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
-                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
-            );
             CREATE TRIGGER IF NOT EXISTS backup_execution_headers_no_update
             BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS backup_execution_headers_no_delete
@@ -790,6 +785,7 @@ class SQLiteStore:
         with self._connection:
             self._record_schema_migration(4, "append-only backup execution store")
             self._migrate_backup_execution_authority_v5()
+            self._migrate_backup_execution_rollback_claims_v6()
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_schema_migrations (
@@ -1124,6 +1120,106 @@ class SQLiteStore:
                 self._connection.commit()
             else:
                 self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+    def _migrate_backup_execution_rollback_claims_v6(self) -> None:
+        """Install the exact mutable rollback-claims table atomically."""
+        marker = BACKUP_EXECUTION_ROLLBACK_CLAIMS_SCHEMA_VERSION
+        if self._connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?", (marker,)
+        ).fetchone() is not None:
+            if not self._rollback_claims_table_is_exact():
+                raise ValueError("malformed backup execution rollback claims table")
+            return
+        savepoint = "backup_execution_rollback_claims_v6_migration"
+        owns_transaction = not self._connection.in_transaction
+        if owns_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
+        else:
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            table = "backup_provisioning_execution_rollback_claims"
+            existing = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if existing is None:
+                self._connection.execute(
+                    """
+                    CREATE TABLE backup_provisioning_execution_rollback_claims (
+                        execution_id TEXT PRIMARY KEY,
+                        plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+                        step_digest TEXT NOT NULL,
+                        owner_id TEXT NOT NULL,
+                        claimed_at TEXT NOT NULL,
+                        lease_expires_at TEXT NOT NULL,
+                        claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+                        FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+                    )
+                    """
+                )
+            elif not self._rollback_claims_table_is_exact():
+                raise ValueError("malformed backup execution rollback claims table")
+            self._record_schema_migration(
+                marker,
+                "durable rollback claim coordination table",
+            )
+        except BaseException:
+            if owns_transaction:
+                self._connection.rollback()
+            else:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            if owns_transaction:
+                self._connection.commit()
+            else:
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+    def _rollback_claims_table_is_exact(self) -> bool:
+        table = "backup_provisioning_execution_rollback_claims"
+        expected_columns = (
+            ("execution_id", "TEXT", 0, 1, None),
+            ("plan_step_ordinal", "INTEGER", 1, 0, None),
+            ("step_digest", "TEXT", 1, 0, None),
+            ("owner_id", "TEXT", 1, 0, None),
+            ("claimed_at", "TEXT", 1, 0, None),
+            ("lease_expires_at", "TEXT", 1, 0, None),
+            ("claim_epoch", "INTEGER", 1, 0, None),
+        )
+        row = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if row is None:
+            return False
+        actual_columns = tuple(
+            (str(item[1]), str(item[2]).upper(), int(item[3]), int(item[5]), item[4])
+            for item in self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        expected_sql = """CREATE TABLE backup_provisioning_execution_rollback_claims (
+            execution_id TEXT PRIMARY KEY,
+            plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+            step_digest TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+            FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+        )"""
+        normalize_sql = lambda value: " ".join(str(value).split()).lower()
+        if actual_columns != expected_columns or normalize_sql(row[0]) != normalize_sql(expected_sql):
+            return False
+        foreign_keys = tuple(
+            tuple(str(value) for value in item)
+            for item in self._connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+        )
+        if len(foreign_keys) != 1 or foreign_keys[0][2:7] != (
+            "backup_provisioning_execution_headers", "execution_id", "execution_id", "RESTRICT", "RESTRICT"
+        ):
+            return False
+        indexes = self._connection.execute(f"PRAGMA index_list({table})").fetchall()
+        if len(indexes) != 1 or int(indexes[0][2]) != 1 or int(indexes[0][4]) != 0 or str(indexes[0][3]) != "pk":
+            return False
+        return tuple(str(item[2]) for item in self._connection.execute(f"PRAGMA index_info({indexes[0][1]})").fetchall()) == ("execution_id",)
 
     def _typed_execution_authority_table_is_exact(self) -> bool:
         row = self._connection.execute(

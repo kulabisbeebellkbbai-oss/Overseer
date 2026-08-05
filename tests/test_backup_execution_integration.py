@@ -425,6 +425,44 @@ def test_valid_source_rewrite_cannot_downgrade_typed_execution(tmp_path: Path) -
         assert _typed_execution_enabled_for_plan_locked(store, plan.plan_id) is True
 
 
+@pytest.mark.parametrize(
+    ("source_kind", "source_id", "approval_ref", "expected"),
+    (
+        ("admin-plan", "backup-provision.donuthole", "approval.donuthole.backup-provision.donuthole", False),
+        ("roadex-human-decision", "other-plan", "approval.donuthole.backup-provision.donuthole", False),
+        ("roadex-human-decision", "backup-provision.donuthole", "approval.donuthole.other-plan", False),
+        ("roadex-human-decision", "backup-provision.donuthole", "approval.donuthole.backup-provision.donuthole", True),
+    ),
+)
+def test_typed_fallback_and_v5_backfill_require_exact_roadex_binding(
+    tmp_path: Path, source_kind: str, source_id: str, approval_ref: str, expected: bool,
+) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    source_id = plan.plan_id if source_id == "backup-provision.donuthole" else source_id
+    approval_ref = approval_ref.replace("backup-provision.donuthole", plan.plan_id)
+    with sqlite3.connect(store_path) as connection:
+        for table in ("provisioning_bundles", "provisioning_preflight_reports", "provisioning_review_outbox"):
+            connection.execute(f"DELETE FROM {table} WHERE plan_id=?", (plan.plan_id,))
+        connection.execute("DELETE FROM roadex_approval_bindings")
+        connection.execute("DROP TRIGGER backup_provisioning_plan_execution_modes_no_delete")
+        connection.execute("DELETE FROM backup_provisioning_plan_execution_modes")
+        connection.execute("DELETE FROM schema_migrations WHERE version=5")
+        connection.execute(
+            "INSERT INTO roadex_approval_bindings "
+            "(approval_ref, source_kind, source_id, payload) VALUES (?, ?, ?, '{}')",
+            (approval_ref, source_kind, source_id),
+        )
+        connection.commit()
+
+    with SQLiteStore(store_path) as store:
+        assert store.load_backup_provisioning_plan_execution_mode(plan.plan_id) == ("typed" if expected else "legacy")
+        assert _typed_execution_enabled_for_plan_locked(store, plan.plan_id) is expected
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_plan_execution_modes WHERE plan_id=?",
+            (plan.plan_id,),
+        ).fetchone()[0] == (1 if expected else 0)
+
+
 def test_pre_upgrade_plan_shape_loads_and_scoped_artifacts_select_mode(tmp_path: Path) -> None:
     store_path, typed_plan, _bundle = _approved(tmp_path)
     with SQLiteStore(store_path) as store:

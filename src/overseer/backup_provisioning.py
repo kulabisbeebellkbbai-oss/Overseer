@@ -616,7 +616,11 @@ def _typed_execution_enabled_for_plan_locked(store: SQLiteStore, plan_id: str) -
         ("SELECT 1 FROM backup_provisioning_execution_headers WHERE plan_id=? LIMIT 1", (plan_id,)),
         ("SELECT 1 FROM provisioning_preflight_reports WHERE plan_id=? LIMIT 1", (plan_id,)),
         ("SELECT 1 FROM provisioning_review_outbox WHERE plan_id=? LIMIT 1", (plan_id,)),
-        ("SELECT 1 FROM roadex_approval_bindings WHERE source_id=? OR approval_ref=? LIMIT 1", (plan_id, f"approval.donuthole.{plan_id}")),
+        (
+            "SELECT 1 FROM roadex_approval_bindings "
+            "WHERE source_kind=? AND source_id=? AND approval_ref=? LIMIT 1",
+            ("roadex-human-decision", plan_id, f"approval.donuthole.{plan_id}"),
+        ),
     )
     if any(store._connection.execute(sql, parameters).fetchone() is not None for sql, parameters in checks):
         store.mark_backup_provisioning_plan_typed(plan_id)

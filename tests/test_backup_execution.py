@@ -769,6 +769,45 @@ def test_v3_to_v4_migration_rolls_back_mid_statement_failure(tmp_path) -> None:
     raw.close()
 
 
+def test_v5_migration_rolls_back_authority_table_backfill_triggers_and_markers(
+    tmp_path, monkeypatch,
+) -> None:
+    path = tmp_path / "v5-failure.sqlite3"
+    original = OverseerStore._record_schema_migration
+
+    def fail_record(self, version, description):
+        if version == 5:
+            raise RuntimeError("injected v5 recording failure")
+        return original(self, version, description)
+
+    monkeypatch.setattr(OverseerStore, "_record_schema_migration", fail_record)
+    with pytest.raises(RuntimeError, match="injected v5 recording failure"):
+        OverseerStore(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("backup_provisioning_plan_execution_modes",),
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name LIKE 'backup_provisioning_plan_execution_modes_%'"
+        ).fetchone() is None
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version IN (4, 5)").fetchone()[0] == 0
+
+    monkeypatch.setattr(OverseerStore, "_record_schema_migration", original)
+    with OverseerStore(path) as store:
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_plan_execution_modes"
+        ).fetchone()[0] == 0
+        first_schema = store._connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE name LIKE 'backup_provisioning_plan_execution_modes%' ORDER BY name"
+        ).fetchall()
+    with OverseerStore(path) as store:
+        assert store._connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE name LIKE 'backup_provisioning_plan_execution_modes%' ORDER BY name"
+        ).fetchall() == first_schema
+
+
 def test_two_connections_racing_same_genesis_have_one_tail(tmp_path) -> None:
     path = tmp_path / "race.sqlite3"; header = _header(); checkpoint = _chain(header)[0]
     OverseerStore(path).close()

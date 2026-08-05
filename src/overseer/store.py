@@ -666,10 +666,6 @@ class SQLiteStore:
                 id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS backup_provisioning_plan_execution_modes (
-                plan_id TEXT PRIMARY KEY,
-                execution_mode TEXT NOT NULL CHECK (execution_mode = 'typed')
-            );
             CREATE TABLE IF NOT EXISTS provisioning_review_outbox (
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
@@ -766,7 +762,7 @@ class SQLiteStore:
             """
         )
         with self._connection:
-            self._record_schema_migration(4, "append-only backup execution store and typed plan execution authority")
+            self._record_schema_migration(4, "append-only backup execution store")
             self._migrate_backup_execution_authority_v5()
             self._connection.execute(
                 """
@@ -1043,15 +1039,12 @@ class SQLiteStore:
                 )
             for row in self._connection.execute(
                 "SELECT source_id, approval_ref FROM roadex_approval_bindings "
-                "WHERE source_kind='roadex-human-decision' "
-                "AND approval_ref LIKE 'approval.donuthole.%'"
+                "WHERE source_kind='roadex-human-decision'"
             ).fetchall():
                 source_id, approval_ref = str(row[0]), str(row[1])
-                if source_id:
+                prefix = "approval.donuthole."
+                if approval_ref.startswith(prefix) and approval_ref.removeprefix(prefix) == source_id:
                     plan_ids.add(source_id)
-                suffix = approval_ref.removeprefix("approval.donuthole.")
-                if suffix:
-                    plan_ids.add(suffix)
             self._connection.executemany(
                 "INSERT OR IGNORE INTO backup_provisioning_plan_execution_modes "
                 "(plan_id, execution_mode) VALUES (?, 'typed')",

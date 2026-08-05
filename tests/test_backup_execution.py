@@ -44,6 +44,8 @@ PLAN_DIGEST = "sha256:" + "1" * 64
 APPROVAL_DIGEST = "sha256:" + "2" * 64
 BUNDLE_DIGEST = "sha256:" + "3" * 64
 CONTRACT_DIGEST = "sha256:" + "4" * 64
+APPROVED_RUNTIME_DIGEST = "sha256:" + "5" * 64
+APPROVED_CONFIG_DIGEST = "sha256:" + "6" * 64
 
 
 def _header() -> ProvisioningExecutionHeader:
@@ -73,6 +75,8 @@ def _header() -> ProvisioningExecutionHeader:
         acceptance_contract_digest=CONTRACT_DIGEST,
         created_at="2026-08-05T12:00:01Z",
         phases=phases,
+        approved_runtime_digest=APPROVED_RUNTIME_DIGEST,
+        approved_config_digest=APPROVED_CONFIG_DIGEST,
     )
 
 
@@ -80,7 +84,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
     checkpoints: list[ProvisioningCheckpoint] = []
     previous = header.header_digest
     ordinal = 0
-    attestation = RuntimeAttestation(PLAN_DIGEST, PLAN_DIGEST, BUNDLE_DIGEST, BUNDLE_DIGEST, "process.1")
+    attestation = RuntimeAttestation(APPROVED_RUNTIME_DIGEST, APPROVED_RUNTIME_DIGEST, APPROVED_CONFIG_DIGEST, APPROVED_CONFIG_DIGEST, "process.1")
     acceptance = BehaviorAcceptance("contract.v1", CONTRACT_DIGEST, True, "ACCEPTANCE_PASSED", CONTRACT_DIGEST)
     for phase in header.phases:
         step = phase.steps[0]
@@ -162,6 +166,8 @@ def test_store_persists_v4_header_and_append_only_chain(tmp_path) -> None:
     header = _header()
     checkpoints = _chain(header)
     assert CURRENT_SCHEMA_VERSION == 4
+    assert header.schema_version == "2"
+    assert checkpoints[0].schema_version == "2"
     with OverseerStore(tmp_path / "state.sqlite3") as store:
         store.save_backup_execution(header, checkpoints[0])
         store.save_backup_execution(header, checkpoints[0])
@@ -296,6 +302,23 @@ def test_save_header_and_genesis_roll_back_as_one_transaction(tmp_path, monkeypa
         store.save_backup_execution(header, checkpoint)
 
 
+def test_caught_inner_save_backup_failure_rolls_back_to_savepoint(tmp_path, monkeypatch) -> None:
+    header = _header(); checkpoint = _chain(header)[0]
+    with OverseerStore(tmp_path / "nested-atomic-save.sqlite3") as store:
+        def fail_before_genesis(_checkpoint):
+            raise KeyboardInterrupt("injected inner failure")
+        monkeypatch.setattr(store, "_append_backup_execution_checkpoint_locked", fail_before_genesis)
+        with store.agent_transaction():
+            with pytest.raises(KeyboardInterrupt):
+                store.save_backup_execution(header, checkpoint)
+            assert store._agent_transaction_depth == 1
+        assert store._agent_transaction_depth == 0
+        assert store._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_headers").fetchone()[0] == 0
+        assert store._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_checkpoints").fetchone()[0] == 0
+        monkeypatch.undo()
+        store.save_backup_execution(header, checkpoint)
+
+
 def _payload_with_nested_extra(payload: str, path: tuple[str, ...]) -> str:
     value = json.loads(payload)
     target = value
@@ -401,6 +424,7 @@ def test_operation_digest_is_required_and_mismatch_cannot_be_bound() -> None:
             approved_by="operator.1", approved_at="2026-08-05T12:00:00Z", acceptance_contract_version="contract.v1",
             acceptance_contract_digest=CONTRACT_DIGEST, created_at="2026-08-05T12:00:01Z",
             phases=(phase, *(ExecutionPhaseSpec(i, p, (_header().phases[i].steps[0],)) for i, p in enumerate(ExecutionPhase) if i),),
+            approved_runtime_digest=APPROVED_RUNTIME_DIGEST, approved_config_digest=APPROVED_CONFIG_DIGEST,
         )
 
 
@@ -433,7 +457,7 @@ def _failed_rollback_chain(header: ProvisioningExecutionHeader, rollback_count: 
     evidence_failed = ProvisioningStepEvidence(StepDisposition.FAILED, "STEP_FAILED", CONTRACT_DIGEST, True)
     def add(step, event, *, rollback=False, evidence=None):
         nonlocal previous, ordinal, observed
-        runtime = RuntimeAttestation(PLAN_DIGEST, PLAN_DIGEST, BUNDLE_DIGEST, BUNDLE_DIGEST, "process.1") if step == 3 and event is CheckpointEvent.STEP_COMPLETED else None
+        runtime = RuntimeAttestation(APPROVED_RUNTIME_DIGEST, APPROVED_RUNTIME_DIGEST, APPROVED_CONFIG_DIGEST, APPROVED_CONFIG_DIGEST, "process.1") if step == 3 and event is CheckpointEvent.STEP_COMPLETED else None
         behavior = BehaviorAcceptance("contract.v1", CONTRACT_DIGEST, True, "ACCEPTANCE_PASSED", CONTRACT_DIGEST) if step == 4 and event is CheckpointEvent.STEP_COMPLETED else None
         item = build_checkpoint(checkpoint_id=f"rollback.{ordinal}", execution_id=header.execution_id, checkpoint_ordinal=ordinal,
             previous_digest=previous, phase=header.phases[step].phase, phase_ordinal=step, plan_step_ordinal=step,
@@ -467,6 +491,20 @@ def test_explicit_rollback_identity_and_projection_states() -> None:
     assert derive_backup_execution_view(header, tuple(failed)).rollback_status == "failed"
 
 
+def test_explicit_wrong_rollback_order_is_rejected() -> None:
+    header = _rollback_header()
+    chain = list(_failed_rollback_chain(header, 2))
+    chain[-4:] = [*chain[-2:], *chain[-4:-2]]
+    rebuilt = []
+    previous = header.header_digest
+    for ordinal, checkpoint in enumerate(chain):
+        checkpoint = _rebuild_checkpoint(checkpoint, checkpoint_ordinal=ordinal, previous_digest=previous)
+        rebuilt.append(checkpoint)
+        previous = checkpoint.checkpoint_digest
+    with pytest.raises(ValueError, match="reverse order"):
+        verify_backup_execution_chain(header, tuple(rebuilt))
+
+
 def test_replay_corrupt_prefix_is_rejected_before_matching_checkpoint_return(tmp_path) -> None:
     header = _header(); checkpoints = _chain(header)
     with OverseerStore(tmp_path / "corrupt.sqlite3") as store:
@@ -485,7 +523,7 @@ def test_store_rejects_append_after_finalization_and_rolls_back_baseexception(tm
         store.save_backup_execution(header, checkpoints[0])
         for checkpoint in checkpoints[1:]: store.append_backup_execution_checkpoint(checkpoint)
         with pytest.raises(ValueError):
-            store.append_backup_execution_checkpoint(build_checkpoint(checkpoint_id="after.final", execution_id=header.execution_id, checkpoint_ordinal=len(checkpoints), previous_digest=checkpoints[-1].checkpoint_digest, phase=ExecutionPhase.FINALIZE, phase_ordinal=5, plan_step_ordinal=5, step_digest=header.phases[-1].steps[0].forward.step_digest, event=CheckpointEvent.EXECUTION_FINALIZED, observed_at="2026-08-05T12:03:01+00:00"))
+            store.append_backup_execution_checkpoint(build_checkpoint(checkpoint_id="after.final", execution_id=header.execution_id, checkpoint_ordinal=len(checkpoints), previous_digest=checkpoints[-1].checkpoint_digest, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0, plan_step_ordinal=0, step_digest=header.phases[0].steps[0].forward.step_digest, event=CheckpointEvent.STEP_STARTED, observed_at="2026-08-05T12:03:01+00:00"))
         store._connection.execute("CREATE TABLE probe (value TEXT)")
         store._connection.commit()
         with pytest.raises(BaseException):
@@ -568,6 +606,56 @@ def test_schema_contract_fk_indexes_and_trigger_sql_are_exact(tmp_path) -> None:
         OverseerStore(tmp_path / "schema.sqlite3")
 
 
+def test_schema_rejects_commented_checks_and_partial_unique_indexes(tmp_path) -> None:
+    path = tmp_path / "adversarial-schema.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);
+            INSERT INTO schema_migrations VALUES (4, 'current', '2026-08-05T00:00:00+00:00');
+            CREATE TABLE agent_schema_migrations (version TEXT PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);
+            INSERT INTO agent_schema_migrations VALUES ('agent_driver_v9', 'current', '2026-08-05T00:00:00+00:00');
+            CREATE TABLE backup_provisioning_execution_headers (
+                execution_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, plan_digest TEXT NOT NULL,
+                bundle_id TEXT NOT NULL, bundle_digest TEXT NOT NULL,
+                approved_runtime_digest TEXT NOT NULL, approved_config_digest TEXT NOT NULL,
+                header_digest TEXT NOT NULL, payload TEXT NOT NULL
+            );
+            CREATE TABLE backup_provisioning_execution_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL,
+                checkpoint_ordinal INTEGER NOT NULL /* CHECK (checkpoint_ordinal >= 0) */,
+                phase_ordinal INTEGER NOT NULL /* CHECK (phase_ordinal >= 0) */,
+                plan_step_ordinal INTEGER NOT NULL /* CHECK (plan_step_ordinal >= 0) */,
+                step_digest TEXT NOT NULL, previous_digest TEXT NOT NULL,
+                checkpoint_digest TEXT NOT NULL, payload TEXT NOT NULL,
+                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            );
+            CREATE UNIQUE INDEX header_plan_id_partial ON backup_provisioning_execution_headers(plan_id) WHERE 0;
+            CREATE UNIQUE INDEX header_plan_digest_partial ON backup_provisioning_execution_headers(plan_digest) WHERE 0;
+            CREATE UNIQUE INDEX header_bundle_id_partial ON backup_provisioning_execution_headers(bundle_id) WHERE 0;
+            CREATE UNIQUE INDEX header_bundle_digest_partial ON backup_provisioning_execution_headers(bundle_digest) WHERE 0;
+            CREATE UNIQUE INDEX header_runtime_partial ON backup_provisioning_execution_headers(approved_runtime_digest) WHERE 0;
+            CREATE UNIQUE INDEX header_config_partial ON backup_provisioning_execution_headers(approved_config_digest) WHERE 0;
+            CREATE UNIQUE INDEX header_digest_partial ON backup_provisioning_execution_headers(header_digest) WHERE 0;
+            CREATE UNIQUE INDEX checkpoint_digest_partial ON backup_provisioning_execution_checkpoints(checkpoint_digest) WHERE 0;
+            CREATE UNIQUE INDEX checkpoint_execution_ordinal_partial ON backup_provisioning_execution_checkpoints(execution_id, checkpoint_ordinal) WHERE 0;
+            CREATE TRIGGER backup_execution_headers_no_update BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
+            CREATE TRIGGER backup_execution_headers_no_delete BEFORE DELETE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
+            CREATE TRIGGER backup_execution_checkpoints_no_update BEFORE UPDATE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END;
+            CREATE TRIGGER backup_execution_checkpoints_no_delete BEFORE DELETE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END;
+        """)
+    with pytest.raises(ValueError, match="malformed backup execution"):
+        OverseerStore(path)
+
+
+def test_schema_rejects_extra_duplicate_partial_unique_index(tmp_path) -> None:
+    path = tmp_path / "extra-index.sqlite3"
+    with OverseerStore(path) as store:
+        store._connection.execute("CREATE UNIQUE INDEX extra_partial_backup_header ON backup_provisioning_execution_headers(plan_id) WHERE 0")
+        store._connection.commit()
+    with pytest.raises(ValueError, match="schema indexes"):
+        OverseerStore(path)
+
+
 @pytest.mark.parametrize(
     ("table", "column", "value"),
     (
@@ -611,6 +699,10 @@ def test_v3_to_v4_migration_preserves_unrelated_rows_and_indexes(tmp_path) -> No
             INSERT INTO unrelated VALUES ('keep', 'value');
             CREATE TABLE backup_provisioning_execution_headers (execution_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, plan_digest TEXT NOT NULL UNIQUE, bundle_id TEXT NOT NULL UNIQUE, bundle_digest TEXT NOT NULL UNIQUE, header_digest TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);
             CREATE TABLE backup_provisioning_execution_checkpoints (checkpoint_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0), phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0), plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0), step_digest TEXT NOT NULL, previous_digest TEXT NOT NULL, checkpoint_digest TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, UNIQUE(execution_id, checkpoint_ordinal), FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id));
+            CREATE TRIGGER backup_execution_headers_no_update BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
+            CREATE TRIGGER backup_execution_headers_no_delete BEFORE DELETE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
+            CREATE TRIGGER backup_execution_checkpoints_no_update BEFORE UPDATE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END;
+            CREATE TRIGGER backup_execution_checkpoints_no_delete BEFORE DELETE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END;
         """)
     with OverseerStore(path) as store:
         assert store._connection.execute("SELECT value FROM unrelated WHERE id='keep'").fetchone()[0] == "value"
@@ -624,6 +716,10 @@ def test_v3_to_v4_migration_rolls_back_mid_statement_failure(tmp_path) -> None:
         connection.executescript("""
             CREATE TABLE backup_provisioning_execution_headers (execution_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, plan_digest TEXT NOT NULL UNIQUE, bundle_id TEXT NOT NULL UNIQUE, bundle_digest TEXT NOT NULL UNIQUE, header_digest TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);
             CREATE TABLE backup_provisioning_execution_checkpoints (checkpoint_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0), phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0), plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0), step_digest TEXT NOT NULL, previous_digest TEXT NOT NULL, checkpoint_digest TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, UNIQUE(execution_id, checkpoint_ordinal), FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id));
+            CREATE TRIGGER backup_execution_headers_no_update BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
+            CREATE TRIGGER backup_execution_headers_no_delete BEFORE DELETE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END;
+            CREATE TRIGGER backup_execution_checkpoints_no_update BEFORE UPDATE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END;
+            CREATE TRIGGER backup_execution_checkpoints_no_delete BEFORE DELETE ON backup_provisioning_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'backup execution checkpoints are immutable'); END;
         """)
 
     class FailingConnection:
@@ -635,7 +731,7 @@ def test_v3_to_v4_migration_rolls_back_mid_statement_failure(tmp_path) -> None:
             return self.connection.in_transaction
         def execute(self, sql, parameters=()):
             self.calls += 1
-            if self.calls == 8:
+            if self.calls == 9:
                 raise KeyboardInterrupt("injected migration failure")
             return self.connection.execute(sql, parameters)
         def rollback(self):
@@ -650,6 +746,9 @@ def test_v3_to_v4_migration_rolls_back_mid_statement_failure(tmp_path) -> None:
         store._migrate_backup_execution_v3()
     assert {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} == {"backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"}
     assert tuple(row[1] for row in raw.execute("PRAGMA table_info(backup_provisioning_execution_headers)")) == ("execution_id", "plan_id", "plan_digest", "bundle_id", "bundle_digest", "header_digest", "payload")
+    assert {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()} == {"backup_execution_headers_no_update", "backup_execution_headers_no_delete", "backup_execution_checkpoints_no_update", "backup_execution_checkpoints_no_delete"}
+    raw.execute("CREATE TABLE reusable_after_migration_failure (value TEXT NOT NULL)")
+    raw.commit()
     raw.close()
 
 

@@ -196,7 +196,7 @@ class ExecutionPhaseSpec:
 
 @dataclass(frozen=True)
 class ProvisioningExecutionHeader:
-    schema_version: Literal["1"]
+    schema_version: Literal["2"]
     execution_id: str
     plan_id: str
     plan_digest: str
@@ -215,8 +215,8 @@ class ProvisioningExecutionHeader:
     header_digest: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != "1":
-            raise ValueError("schema_version must be '1'")
+        if self.schema_version != "2":
+            raise ValueError("schema_version must be '2'")
         for name in ("execution_id", "plan_id", "bundle_id", "approval_ref", "approved_by"):
             _string(getattr(self, name), name, identifier=True)
         for name in ("plan_digest", "bundle_digest", "approval_scope_digest", "acceptance_contract_digest", "approved_runtime_digest", "approved_config_digest", "header_digest"):
@@ -295,7 +295,7 @@ class ProvisioningStepEvidence:
 
 @dataclass(frozen=True)
 class ProvisioningCheckpoint:
-    schema_version: Literal["1"]
+    schema_version: Literal["2"]
     checkpoint_id: str
     execution_id: str
     checkpoint_ordinal: int
@@ -312,8 +312,8 @@ class ProvisioningCheckpoint:
     checkpoint_digest: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != "1":
-            raise ValueError("schema_version must be '1'")
+        if self.schema_version != "2":
+            raise ValueError("schema_version must be '2'")
         _string(self.checkpoint_id, "checkpoint_id", identifier=True)
         _string(self.execution_id, "execution_id", identifier=True)
         _ordinal(self.checkpoint_ordinal, "checkpoint_ordinal")
@@ -428,17 +428,17 @@ def _validate_checkpoint_fields(checkpoint: ProvisioningCheckpoint) -> None:
     ProvisioningCheckpoint.__post_init__(checkpoint)
 
 
-def build_execution_header(*, schema_version: Literal["1"] = "1", execution_id: str, plan_id: str, plan_digest: str, bundle_id: str, bundle_digest: str, approval_ref: str, approval_scope_digest: str, approved_by: str, approved_at: str, acceptance_contract_version: str, acceptance_contract_digest: str, created_at: str, phases: tuple[ExecutionPhaseSpec, ...], approved_runtime_digest: str | None = None, approved_config_digest: str | None = None) -> ProvisioningExecutionHeader:
+def build_execution_header(*, schema_version: Literal["2"] = "2", execution_id: str, plan_id: str, plan_digest: str, bundle_id: str, bundle_digest: str, approval_ref: str, approval_scope_digest: str, approved_by: str, approved_at: str, acceptance_contract_version: str, acceptance_contract_digest: str, created_at: str, phases: tuple[ExecutionPhaseSpec, ...], approved_runtime_digest: str, approved_config_digest: str) -> ProvisioningExecutionHeader:
     approved_at = _canonical_timestamp(approved_at, "approved_at")
     created_at = _canonical_timestamp(created_at, "created_at")
-    _digest(approved_runtime_digest or plan_digest, "approved_runtime_digest")
-    _digest(approved_config_digest or bundle_digest, "approved_config_digest")
-    values = (schema_version, execution_id, plan_id, plan_digest, bundle_id, bundle_digest, approval_ref, approval_scope_digest, approved_by, approved_at, acceptance_contract_version, acceptance_contract_digest, approved_runtime_digest or plan_digest, approved_config_digest or bundle_digest, created_at, phases)
+    _digest(approved_runtime_digest, "approved_runtime_digest")
+    _digest(approved_config_digest, "approved_config_digest")
+    values = (schema_version, execution_id, plan_id, plan_digest, bundle_id, bundle_digest, approval_ref, approval_scope_digest, approved_by, approved_at, acceptance_contract_version, acceptance_contract_digest, approved_runtime_digest, approved_config_digest, created_at, phases)
     digest = _hash(_DOMAIN_HEADER, {field.name: _json_value(value) for field, value in zip(fields(ProvisioningExecutionHeader)[:-1], values)})
     return ProvisioningExecutionHeader(*values, digest)
 
 
-def build_checkpoint(*, schema_version: Literal["1"] = "1", checkpoint_id: str, execution_id: str, checkpoint_ordinal: int, previous_digest: str, phase: ExecutionPhase, phase_ordinal: int, plan_step_ordinal: int, step_digest: str, event: CheckpointEvent, observed_at: str, step_evidence: ProvisioningStepEvidence | None = None, runtime_attestation: RuntimeAttestation | None = None, behavior_acceptance: BehaviorAcceptance | None = None) -> ProvisioningCheckpoint:
+def build_checkpoint(*, schema_version: Literal["2"] = "2", checkpoint_id: str, execution_id: str, checkpoint_ordinal: int, previous_digest: str, phase: ExecutionPhase, phase_ordinal: int, plan_step_ordinal: int, step_digest: str, event: CheckpointEvent, observed_at: str, step_evidence: ProvisioningStepEvidence | None = None, runtime_attestation: RuntimeAttestation | None = None, behavior_acceptance: BehaviorAcceptance | None = None) -> ProvisioningCheckpoint:
     observed_at = _canonical_timestamp(observed_at, "observed_at")
     values = (schema_version, checkpoint_id, execution_id, checkpoint_ordinal, previous_digest, phase, phase_ordinal, plan_step_ordinal, step_digest, event, observed_at, step_evidence, runtime_attestation, behavior_acceptance)
     digest = _hash(_DOMAIN_CHECKPOINT, {field.name: _json_value(value) for field, value in zip(fields(ProvisioningCheckpoint)[:-1], values)})

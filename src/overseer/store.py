@@ -410,30 +410,68 @@ class SQLiteStore:
             "backup_provisioning_execution_headers": (("execution_id", "TEXT", 0, 1, None), ("plan_id", "TEXT", 1, 0, None), ("plan_digest", "TEXT", 1, 0, None), ("bundle_id", "TEXT", 1, 0, None), ("bundle_digest", "TEXT", 1, 0, None), ("approved_runtime_digest", "TEXT", 1, 0, None), ("approved_config_digest", "TEXT", 1, 0, None), ("header_digest", "TEXT", 1, 0, None), ("payload", "TEXT", 1, 0, None)),
             "backup_provisioning_execution_checkpoints": (("checkpoint_id", "TEXT", 0, 1, None), ("execution_id", "TEXT", 1, 0, None), ("checkpoint_ordinal", "INTEGER", 1, 0, None), ("phase_ordinal", "INTEGER", 1, 0, None), ("plan_step_ordinal", "INTEGER", 1, 0, None), ("step_digest", "TEXT", 1, 0, None), ("previous_digest", "TEXT", 1, 0, None), ("checkpoint_digest", "TEXT", 1, 0, None), ("payload", "TEXT", 1, 0, None)),
         }
+        expected_sql = {
+            "backup_provisioning_execution_headers": """CREATE TABLE backup_provisioning_execution_headers (
+                execution_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE,
+                plan_digest TEXT NOT NULL UNIQUE,
+                bundle_id TEXT NOT NULL UNIQUE,
+                bundle_digest TEXT NOT NULL UNIQUE,
+                approved_runtime_digest TEXT NOT NULL,
+                approved_config_digest TEXT NOT NULL,
+                header_digest TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL
+            )""",
+            "backup_provisioning_execution_checkpoints": """CREATE TABLE backup_provisioning_execution_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0),
+                phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0),
+                plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+                step_digest TEXT NOT NULL,
+                previous_digest TEXT NOT NULL,
+                checkpoint_digest TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                UNIQUE(execution_id, checkpoint_ordinal),
+                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            )""",
+        }
         for table, column_specs in expected.items():
             rows = self._connection.execute(f"PRAGMA table_info({table})").fetchall()
             actual = tuple((str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]), row[4]) for row in rows)
             if actual != column_specs:
                 raise ValueError(f"malformed backup execution schema: {table}")
+            row = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if row is None or " ".join(str(row[0]).split()).lower() != " ".join(expected_sql[table].split()).lower():
+                raise ValueError(f"malformed backup execution table definition: {table}")
         foreign_keys = tuple(tuple(str(value) for value in row) for row in self._connection.execute("PRAGMA foreign_key_list(backup_provisioning_execution_checkpoints)").fetchall())
         if len(foreign_keys) != 1 or foreign_keys[0][2:7] != ("backup_provisioning_execution_headers", "execution_id", "execution_id", "RESTRICT", "RESTRICT"):
             raise ValueError("malformed backup execution foreign key")
-        checkpoint_sql = str(self._connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='backup_provisioning_execution_checkpoints'").fetchone()[0])
-        normalized_checkpoint_sql = " ".join(checkpoint_sql.split()).lower()
-        for check in ("check (checkpoint_ordinal >= 0)", "check (phase_ordinal >= 0)", "check (plan_step_ordinal >= 0)"):
-            if check not in normalized_checkpoint_sql:
-                raise ValueError("malformed backup execution check constraints")
-        unique_tuples: dict[str, set[tuple[str, ...]]] = {}
-        for table in expected:
-            values: set[tuple[str, ...]] = set()
-            for row in self._connection.execute(f"PRAGMA index_list({table})").fetchall():
-                if int(row[2]) != 1:
-                    continue
+        expected_indexes = {
+            "backup_provisioning_execution_headers": {("execution_id",), ("plan_id",), ("plan_digest",), ("bundle_id",), ("bundle_digest",), ("header_digest",)},
+            "backup_provisioning_execution_checkpoints": {("checkpoint_id",), ("checkpoint_digest",), ("execution_id", "checkpoint_ordinal")},
+        }
+        expected_origins = {
+            "backup_provisioning_execution_headers": {("execution_id",): "pk", ("plan_id",): "u", ("plan_digest",): "u", ("bundle_id",): "u", ("bundle_digest",): "u", ("header_digest",): "u"},
+            "backup_provisioning_execution_checkpoints": {("checkpoint_id",): "pk", ("checkpoint_digest",): "u", ("execution_id", "checkpoint_ordinal"): "u"},
+        }
+        for table, required_indexes in expected_indexes.items():
+            rows = self._connection.execute(f"PRAGMA index_list({table})").fetchall()
+            if len(rows) != len(required_indexes):
+                raise ValueError("malformed backup execution schema indexes")
+            actual_indexes: set[tuple[str, ...]] = set()
+            for row in rows:
+                if int(row[2]) != 1 or int(row[4]) != 0:
+                    raise ValueError("malformed backup execution schema indexes")
                 name = str(row[1])
-                values.add(tuple(str(item[2]) for item in self._connection.execute(f"PRAGMA index_info({name})").fetchall()))
-            unique_tuples[table] = values
-        if unique_tuples["backup_provisioning_execution_headers"] != {("execution_id",), ("plan_id",), ("plan_digest",), ("bundle_id",), ("bundle_digest",), ("header_digest",)} or unique_tuples["backup_provisioning_execution_checkpoints"] != {("checkpoint_id",), ("checkpoint_digest",), ("execution_id", "checkpoint_ordinal")}:
-            raise ValueError("malformed backup execution schema indexes")
+                columns = tuple(str(item[2]) for item in self._connection.execute(f"PRAGMA index_info({name})").fetchall())
+                if columns not in required_indexes or str(row[3]) != expected_origins[table][columns]:
+                    raise ValueError("malformed backup execution schema indexes")
+                actual_indexes.add(columns)
+            if actual_indexes != required_indexes:
+                raise ValueError("malformed backup execution schema indexes")
         triggers = {str(row[0]) for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?, ?)", tuple(expected)).fetchall()}
         expected_trigger_sql = {
             "backup_execution_headers_no_update": "CREATE TRIGGER backup_execution_headers_no_update BEFORE UPDATE ON backup_provisioning_execution_headers BEGIN SELECT RAISE(ABORT, 'backup execution headers are immutable'); END",
@@ -1056,10 +1094,14 @@ class SQLiteStore:
 
     @contextmanager
     def agent_transaction(self) -> Iterable[None]:
-        outermost = self._agent_transaction_depth == 0
+        depth = self._agent_transaction_depth
+        outermost = depth == 0
+        savepoint = f"agent_transaction_{depth}"
         if outermost:
             self._connection.execute("BEGIN IMMEDIATE")
-        self._agent_transaction_depth += 1
+        else:
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+        self._agent_transaction_depth = depth + 1
         try:
             yield
         except BaseException:
@@ -1067,11 +1109,19 @@ class SQLiteStore:
             if outermost:
                 self._connection.rollback()
                 self._agent_transaction_depth = 0
+            else:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         else:
             self._agent_transaction_depth -= 1
             if outermost:
-                self._commit()
+                try:
+                    self._commit()
+                finally:
+                    self._agent_transaction_depth = 0
+            else:
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def _commit_agent_mutation(self) -> None:
         if self._agent_transaction_depth == 0:

@@ -398,30 +398,27 @@ def execute_plan(
     now = executed_at or datetime.now(UTC).isoformat(); _time(now)
     execution_id = None
     with SQLiteStore(store_path) as store:
-        try:
-            store.load_provisioning_bundle_record(plan_id)
-            typed_execution = True
-        except KeyError:
-            typed_execution = False
+        typed_execution = _typed_bundle_feature_enabled_locked(store)
         if typed_execution:
-            from .backup_execution import continue_execution, start_execution
-            before_plan = _stored(store, plan_id)
+            from .backup_execution import _start_execution_with_invocation, _continue_execution_with_invocation
+            _require_typed_execution_bundle(store, _stored(store, plan_id))
             try:
                 execution_id = store.load_backup_execution_header_for_plan(plan_id).execution_id
-                before_checkpoints = store.load_backup_execution_checkpoints(execution_id)
             except KeyError:
                 execution_id = None
-                before_checkpoints = ()
             if execution_id is None:
-                view = start_execution(store_path, plan_id, adapter, acceptance_runner, now=now)
+                invocation = _start_execution_with_invocation(store_path, plan_id, adapter, acceptance_runner, now=now)
             else:
-                view = continue_execution(store_path, execution_id, adapter, acceptance_runner, now=now)
+                invocation = _continue_execution_with_invocation(store_path, execution_id, adapter, acceptance_runner, now=now)
             with SQLiteStore(store_path) as store:
                 plan = _stored(store, plan_id)
-                checkpoints = store.load_backup_execution_checkpoints(view.execution_id)
-                header = store.load_backup_execution_header(view.execution_id)
-            delta = checkpoints[len(before_checkpoints):] if checkpoints[:len(before_checkpoints)] == before_checkpoints else checkpoints
-            return _typed_execution_public(plan, view, checkpoints, header=header, invocation_checkpoints=delta, mutation=bool(delta) or plan != before_plan)
+                checkpoints = store.load_backup_execution_checkpoints(invocation.view.execution_id)
+                header = store.load_backup_execution_header(invocation.view.execution_id)
+            prefix = invocation.entry_checkpoints
+            if checkpoints[:len(prefix)] != prefix:
+                raise ValueError("execution checkpoint prefix identity changed")
+            delta = checkpoints[len(prefix):]
+            return _typed_execution_public(plan, invocation.view, checkpoints, header=header, invocation_checkpoints=delta, mutation=bool(delta) or plan != invocation.entry_plan)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)
@@ -637,6 +634,30 @@ def _require_bundle_preflight_and_reviews(
         _require_terminal_evidence(store, plan)
     except (KeyError, ValueError) as error:
         raise ValueError("REVIEW_EVIDENCE_NOT_CURRENT") from error
+
+
+def _require_typed_execution_bundle(
+    store: SQLiteStore,
+    plan: DonutHoleBackupProvisioningPlan,
+) -> None:
+    """Require the exact typed execution records before entering the coordinator."""
+    from . import provisioning_bundle
+
+    try:
+        bundle = provisioning_bundle.load_provisioning_bundle(store, plan.plan_id)
+    except KeyError as error:
+        raise ValueError("SUCCESSOR_REQUIRED") from error
+    except ValueError as error:
+        raise ValueError("TYPED_BUNDLE_REQUIRED") from error
+    if bundle.plan.plan_digest != plan.plan_digest:
+        raise ValueError("TYPED_BUNDLE_REQUIRED")
+    try:
+        provisioning_bundle._load_exact_preflight_report(store, bundle)
+        provisioning_bundle._load_exact_outbox(store, bundle)
+        provisioning_bundle.verify_exact_completed_review_outbox_set(store, bundle)
+        _require_terminal_evidence(store, plan)
+    except (KeyError, ValueError) as error:
+        raise ValueError("TYPED_BUNDLE_REQUIRED") from error
 
 
 def _require_approval_readiness(

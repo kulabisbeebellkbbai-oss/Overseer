@@ -52,6 +52,10 @@ class CheckpointEvent(StrEnum):
     EXECUTION_FINALIZED = "execution_finalized"
 
 
+class _AuthorityRecordError(ValueError):
+    """A persisted authority record is missing or cannot be decoded."""
+
+
 def _string(value: object, label: str, *, identifier: bool = False) -> str:
     if type(value) is not str or not value or "\x00" in value:
         raise ValueError(f"{label} must be a non-empty string")
@@ -720,16 +724,25 @@ def _acceptance(value: object) -> BehaviorAcceptance:
 def _load_authoritative_bundle(store: SQLiteStore, plan_id: str, *, terminal: bool = False):
     from . import provisioning_bundle
     from .roadex_approval_status import RoadexApprovalBinding, load_exact_bound_source, project_decision
-    bundle = provisioning_bundle.load_provisioning_bundle(store, plan_id)
+    try:
+        bundle = provisioning_bundle.load_provisioning_bundle(store, plan_id)
+    except (KeyError, ValueError) as error:
+        raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
     if type(bundle) is not provisioning_bundle.ProvisioningBundleV1 or not bundle.preflight.passed:
         raise ValueError("exact passing typed provisioning bundle is required")
     provisioning_bundle._recheck_locked_authority_and_chain(store, bundle)
-    binding = store.load_roadex_approval_binding(provisioning_bundle.binding_draft_for_bundle(bundle).approval_ref)
+    try:
+        binding = store.load_roadex_approval_binding(provisioning_bundle.binding_draft_for_bundle(bundle).approval_ref)
+    except (KeyError, ValueError) as error:
+        raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
     if type(binding) is not RoadexApprovalBinding:
         raise ValueError("authoritative Roadex binding is required")
-    provisioning_bundle._load_exact_preflight_report(store, bundle)
-    provisioning_bundle._load_exact_outbox(store, bundle)
-    provisioning_bundle.verify_exact_completed_review_outbox_set(store, bundle)
+    try:
+        provisioning_bundle._load_exact_preflight_report(store, bundle)
+        provisioning_bundle._load_exact_outbox(store, bundle)
+        provisioning_bundle.verify_exact_completed_review_outbox_set(store, bundle)
+    except (KeyError, ValueError) as error:
+        raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
     source = load_exact_bound_source(store, binding)
     projected = project_decision(store, binding, source)
     expected_projection_time = source.executed_at if source.status.value == "executed" else source.approved_at
@@ -846,6 +859,25 @@ def _verify_immutable_cleanup_identity(store, header: ProvisioningExecutionHeade
         raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID")
     if bundle.intent.plan_id != header.bundle_id or bundle.bundle_digest != header.bundle_digest or bundle.plan.plan_id != header.plan_id or bundle.plan.plan_digest != header.plan_digest or _manifest(bundle.plan) != header.phases:
         raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID")
+    draft = provisioning_bundle.binding_draft_for_bundle(bundle)
+    if draft.source_kind != "roadex-human-decision" or draft.source_id != header.plan_id:
+        raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID")
+    from .roadex_approval_status import load_roadex_human_plan
+    try:
+        source = load_roadex_human_plan(store, draft.source_id)
+    except (KeyError, ValueError) as error:
+        raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID") from error
+    if (
+        source.status.value != "approved"
+        or source.plan_id != header.plan_id
+        or source.plan_digest != header.plan_digest
+        or source.provisioning_contract_version != header.acceptance_contract_version
+        or source.runtime_artifact_identity != header.approved_runtime_digest
+        or source.config_digest != header.approved_config_digest
+        or source.approved_by != header.approved_by
+        or source.approved_at != header.approved_at
+    ):
+        raise ValueError("EXECUTION_IMMUTABLE_IDENTITY_INVALID")
     verify_backup_execution_chain(header, chain)
 
 
@@ -903,7 +935,14 @@ def _view(store: SQLiteStore, execution_id: str) -> ProvisioningExecutionView:
     return derive_backup_execution_view(header, store.load_backup_execution_checkpoints(execution_id))
 
 
-def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, acceptance_runner, when: str, *, genesis_claimed: bool = False) -> ProvisioningExecutionView:
+@dataclass(frozen=True)
+class _InvocationResult:
+    view: ProvisioningExecutionView
+    entry_checkpoints: tuple[ProvisioningCheckpoint, ...]
+    entry_plan: object
+
+
+def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, acceptance_runner, when: str, *, genesis_claimed: bool = False) -> _InvocationResult:
     from .backup_provisioning import _stored
     from .store import SQLiteStore
     with SQLiteStore(store_path) as store:
@@ -912,19 +951,25 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
         if not chain:
             raise ValueError("execution has no atomic genesis")
         plan = _stored(store, header.plan_id)
+        entry_checkpoints = chain
+        entry_plan = plan
+
+        def finish() -> _InvocationResult:
+            return _InvocationResult(_view(store, header.execution_id), entry_checkpoints, entry_plan)
+
         if any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED) for item in chain):
             if chain[-1].event in (CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.STEP_STARTED):
                 raise ValueError("EXECUTION_IN_PROGRESS")
             _rollback(store, header, when, len(chain), adapter)
-            return _view(store, header.execution_id)
+            return finish()
         if chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED:
             _reconcile_executed(store, header)
-            return _view(store, header.execution_id)
+            return finish()
         if chain[-1].event is CheckpointEvent.STEP_COMPLETED and chain[-1].phase is ExecutionPhase.FINALIZE:
             identity = header.phases[-1].steps[-1]
             _append(store, header, len(chain), identity, CheckpointEvent.EXECUTION_FINALIZED, when)
             _reconcile_executed(store, header)
-            return _view(store, header.execution_id)
+            return finish()
         completed = {item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED}
         ordinal = len(chain)
         pending_claim = chain[-1].event is CheckpointEvent.STEP_STARTED
@@ -937,15 +982,15 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                 # Runner readiness is checked before the durable claim, so a paused
                 # execution retains a resumable prefix and cannot strand ATTEST/ACCEPT.
                 if identity.forward.operation == "verify_runtime_attestation" and (acceptance_runner is None or not callable(getattr(acceptance_runner, "attest", None))):
-                    return _view(store, header.execution_id)
+                    return finish()
                 if identity.forward.operation == "run_behavior_acceptance" and (acceptance_runner is None or not callable(getattr(acceptance_runner, "accept", None))):
-                    return _view(store, header.execution_id)
+                    return finish()
                 if pending_claim:
                     pending_claim = False
                 else:
                     if not _claim_forward(store, header, identity, when):
                         _rollback(store, header, when, len(store.load_backup_execution_checkpoints(header.execution_id)), adapter)
-                        return _view(store, header.execution_id)
+                        return finish()
                     ordinal += 1
                 operation = identity.forward.operation
                 try:
@@ -968,13 +1013,13 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                         _append(store, header, ordinal, identity, event, when, evidence=evidence, acceptance=acceptance); ordinal += 1
                         if not acceptance.passed:
                             _rollback(store, header, when, ordinal, adapter)
-                            return _view(store, header.execution_id)
+                            return finish()
                     elif operation == "finalize_execution":
                         evidence = ProvisioningStepEvidence(StepDisposition.CHANGED, "FINALIZATION_VERIFIED", _result_digest(operation, True, "FINALIZATION_VERIFIED"), True)
                         _append(store, header, ordinal, identity, CheckpointEvent.STEP_COMPLETED, when, evidence=evidence); ordinal += 1
                         _append(store, header, ordinal, identity, CheckpointEvent.EXECUTION_FINALIZED, when); ordinal += 1
                         _reconcile_executed(store, header)
-                        return _view(store, header.execution_id)
+                        return finish()
                     else:
                         step = plan.steps[identity.plan_step_ordinal]
                         if canonical_arguments_digest(step.arguments) != identity.forward.arguments_digest:
@@ -984,15 +1029,15 @@ def _drive(store_path: str, header: ProvisioningExecutionHeader, adapter, accept
                         if evidence.disposition is StepDisposition.FAILED:
                             _append(store, header, ordinal, identity, CheckpointEvent.STEP_FAILED, when, evidence=evidence); ordinal += 1
                             _rollback(store, header, when, ordinal, adapter)
-                            return _view(store, header.execution_id)
+                            return finish()
                         _append(store, header, ordinal, identity, CheckpointEvent.STEP_COMPLETED, when, evidence=evidence); ordinal += 1
                 except Exception as error:
                     code = "OPERATION_FAILED"
                     evidence = ProvisioningStepEvidence(StepDisposition.FAILED, code, _result_digest(operation, False, code), True)
                     _append(store, header, ordinal, identity, CheckpointEvent.STEP_FAILED, when, evidence=evidence); ordinal += 1
                     _rollback(store, header, when, ordinal, adapter)
-                    return _view(store, header.execution_id)
-        return _view(store, header.execution_id)
+                    return finish()
+        return finish()
 
 
 def _rollback(store, header: ProvisioningExecutionHeader, when: str, ordinal: int, adapter) -> None:
@@ -1051,7 +1096,7 @@ def _chain_requires_cleanup(chain: tuple[ProvisioningCheckpoint, ...]) -> bool:
     return any(item.event in (CheckpointEvent.STEP_FAILED, CheckpointEvent.EXECUTION_ABORTED, CheckpointEvent.ROLLBACK_STARTED, CheckpointEvent.ROLLBACK_COMPLETED, CheckpointEvent.ROLLBACK_FAILED) for item in chain)
 
 
-def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:
+def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acceptance_runner, now=None) -> _InvocationResult:
     when = _execution_time(now)
     from .store import SQLiteStore
     with SQLiteStore(store_path) as store:
@@ -1091,7 +1136,11 @@ def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, n
     return _drive(store_path, header, adapter, acceptance_runner, when, genesis_claimed=genesis_claimed)
 
 
-def continue_execution(store_path: str, execution_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:
+def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:
+    return _start_execution_with_invocation(store_path, plan_id, adapter, acceptance_runner, now=now).view
+
+
+def _continue_execution_with_invocation(store_path: str, execution_id: str, adapter, acceptance_runner, now=None) -> _InvocationResult:
     when = _execution_time(now)
     from .store import SQLiteStore
     with SQLiteStore(store_path) as store:
@@ -1112,6 +1161,10 @@ def continue_execution(store_path: str, execution_id: str, adapter, acceptance_r
             if source is not None and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
     return _drive(store_path, header, adapter, acceptance_runner, when)
+
+
+def continue_execution(store_path: str, execution_id: str, adapter, acceptance_runner, now=None) -> ProvisioningExecutionView:
+    return _continue_execution_with_invocation(store_path, execution_id, adapter, acceptance_runner, now=now).view
 
 
 __all__ = ["BehaviorAcceptance", "CheckpointEvent", "ExecutionOperationIdentity", "ExecutionPhase", "ExecutionPhaseSpec", "ExecutionStepIdentity", "ProvisioningCheckpoint", "ProvisioningExecutionHeader", "ProvisioningExecutionView", "ProvisioningStepEvidence", "RuntimeAttestation", "StepDisposition", "build_checkpoint", "build_execution_header", "canonical_arguments_digest", "canonical_json", "canonical_step_digest", "checkpoint_from_payload", "checkpoint_payload", "continue_execution", "derive_backup_execution_view", "execution_header_digest", "header_from_payload", "header_payload", "provisioning_checkpoint_digest", "start_execution", "verify_backup_execution_chain"]

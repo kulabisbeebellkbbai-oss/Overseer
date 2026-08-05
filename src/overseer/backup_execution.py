@@ -847,6 +847,38 @@ def _verify_immutable_cleanup_identity(store, header: ProvisioningExecutionHeade
     verify_backup_execution_chain(header, chain)
 
 
+def _abort_paused_forward_on_authority_loss(store, header: ProvisioningExecutionHeader, when: str) -> bool:
+    """Durably stop a paused mutable prefix when forward authority has drifted."""
+    with store.agent_transaction():
+        chain = store.load_backup_execution_checkpoints(header.execution_id)
+        verify_backup_execution_chain(header, chain)
+        try:
+            bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
+            if _make_header(bundle, binding, source, header.created_at) != header:
+                raise ValueError("stored execution header does not match current authority")
+        except ValueError as authority_error:
+            _verify_immutable_cleanup_identity(store, header, chain)
+            expected_steps = [step for phase in header.phases for step in phase.steps]
+            completed = [item for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]
+            if [item.plan_step_ordinal for item in completed] != [step.plan_step_ordinal for step in expected_steps[:len(completed)]]:
+                raise authority_error
+            next_index = len(completed)
+            if next_index >= len(expected_steps):
+                raise authority_error
+            next_identity = expected_steps[next_index]
+            if not any(
+                item.step_evidence is not None
+                and item.step_evidence.disposition is StepDisposition.CHANGED
+                and expected_steps[item.plan_step_ordinal].rollback is not None
+                for item in completed
+            ) or (chain and chain[-1].event is not CheckpointEvent.STEP_COMPLETED):
+                raise authority_error
+            evidence = ProvisioningStepEvidence(StepDisposition.FAILED, "FORWARD_AUTHORITY_LOST", _result_digest(next_identity.forward.operation, False, "FORWARD_AUTHORITY_LOST"), True)
+            _append(store, header, len(chain), next_identity, CheckpointEvent.EXECUTION_ABORTED, when, evidence=evidence)
+            return True
+        return False
+
+
 def _view(store: SQLiteStore, execution_id: str) -> ProvisioningExecutionView:
     header = store.load_backup_execution_header(execution_id)
     return derive_backup_execution_view(header, store.load_backup_execution_checkpoints(execution_id))
@@ -1020,15 +1052,20 @@ def start_execution(store_path: str, plan_id: str, adapter, acceptance_runner, n
             if _chain_requires_cleanup(chain):
                 _verify_immutable_cleanup_identity(store, header, chain)
             else:
-                bundle, binding, source = _load_authoritative_bundle(store, plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
-                expected = _make_header(bundle, binding, source, header.created_at)
-                if expected != header:
-                    raise ValueError("stored execution header does not match current authority")
+                try:
+                    bundle, binding, source = _load_authoritative_bundle(store, plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
+                    expected = _make_header(bundle, binding, source, header.created_at)
+                    if expected != header:
+                        raise ValueError("stored execution header does not match current authority")
+                except ValueError as authority_error:
+                    if not _abort_paused_forward_on_authority_loss(store, header, when):
+                        raise authority_error
+                    source = None
             if chain and chain[-1].event is CheckpointEvent.STEP_STARTED:
                 raise ValueError("EXECUTION_IN_PROGRESS")
             if chain and chain[-1].event is CheckpointEvent.ROLLBACK_STARTED:
                 raise ValueError("EXECUTION_IN_PROGRESS")
-            if not _chain_requires_cleanup(chain) and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
+            if source is not None and not _chain_requires_cleanup(chain) and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
             genesis_claimed = False
     return _drive(store_path, header, adapter, acceptance_runner, when, genesis_claimed=genesis_claimed)
@@ -1044,10 +1081,15 @@ def continue_execution(store_path: str, execution_id: str, adapter, acceptance_r
         if _chain_requires_cleanup(chain):
             _verify_immutable_cleanup_identity(store, header, chain)
         else:
-            bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
-            if _make_header(bundle, binding, source, header.created_at) != header:
-                raise ValueError("checkpoint header identity or manifest has drifted")
-            if source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
+            try:
+                bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
+                if _make_header(bundle, binding, source, header.created_at) != header:
+                    raise ValueError("checkpoint header identity or manifest has drifted")
+            except ValueError as authority_error:
+                if not _abort_paused_forward_on_authority_loss(store, header, when):
+                    raise authority_error
+                source = None
+            if source is not None and source.status.value == "executed" and (not chain or chain[-1].event is not CheckpointEvent.EXECUTION_FINALIZED):
                 raise ValueError("executed approval is not bound to a terminal execution")
     return _drive(store_path, header, adapter, acceptance_runner, when)
 

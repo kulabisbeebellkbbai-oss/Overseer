@@ -764,6 +764,17 @@ def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpo
     host_mutation = False
     host_mutation_uncertain = False
     failed_operation = None
+    for item in checkpoints:
+        event = getattr(item, "event", None)
+        if event in {CheckpointEvent.STEP_FAILED, CheckpointEvent.ROLLBACK_FAILED, CheckpointEvent.EXECUTION_ABORTED}:
+            ordinal = getattr(item, "plan_step_ordinal", non_synthetic)
+            failed_operation = (
+                plan.steps[ordinal].operation
+                if ordinal < non_synthetic
+                else synthetic_operations[ordinal - non_synthetic]
+                if ordinal - non_synthetic < len(synthetic_operations)
+                else None
+            )
     for index, item in enumerate(current):
         event = getattr(item, "event", None)
         evidence = getattr(item, "step_evidence", None)
@@ -771,7 +782,6 @@ def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpo
         later = current[index + 1:]
         if event is CheckpointEvent.STEP_FAILED and evidence is not None:
             operation = plan.steps[ordinal].operation if ordinal < non_synthetic else synthetic_operations[ordinal - non_synthetic] if ordinal - non_synthetic < len(synthetic_operations) else None
-            failed_operation = operation
             if ordinal < non_synthetic and operation not in read_only:
                 host_mutation_uncertain = True
         elif event is CheckpointEvent.STEP_STARTED and ordinal < non_synthetic:

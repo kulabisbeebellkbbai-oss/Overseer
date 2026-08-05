@@ -301,6 +301,40 @@ def test_typed_execute_plan_reports_only_current_invocation_mutation(tmp_path: P
     assert replay_adapter.calls == []
 
 
+def test_typed_failed_terminal_replay_preserves_failed_operation_without_calls(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    first = execute_plan(store_path, plan.plan_id, RecordingAdapter(fail_operation="install_runtime"), acceptance_runner=Runner())
+    assert first["failed_operation"] == "install_runtime"
+    replay_adapter = RecordingAdapter()
+    replay = execute_plan(store_path, plan.plan_id, replay_adapter, acceptance_runner=Runner())
+    assert replay["failed_operation"] == "install_runtime"
+    assert replay["mutation_performed"] is False
+    assert replay["host_mutation_performed"] is False
+    assert replay["host_mutation_uncertain"] is False
+    assert replay_adapter.calls == []
+
+
+def test_typed_execution_abort_response_attributes_exact_next_forward_operation(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    store_path, plan, _bundle = _approved(tmp_path)
+
+    class RevokingAdapter(RecordingAdapter):
+        def execute(self, step):
+            result = super().execute(step)
+            if len(self.calls) == 2:
+                with SQLiteStore(store_path) as store:
+                    item = store.load_crew_message(plan.evidence_ids["kira"])
+                    store.save_crew_message(replace(item, review_status=CrewReviewStatus.CORRECTION_REQUESTED))
+            return result
+
+    result = execute_plan(store_path, plan.plan_id, RevokingAdapter(), acceptance_runner=Runner())
+    assert result["failure_code"] == "FORWARD_AUTHORITY_LOST"
+    assert result["failed_operation"] == "verify_endpoint_migration_ready"
+
+
 def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
 
@@ -561,9 +595,29 @@ def test_pending_step_started_fails_closed_for_start_and_continue(tmp_path: Path
     assert adapter.calls == []
 
 
-def test_authority_and_bundle_drift_reject_continuation_before_adapter(tmp_path: Path) -> None:
+@pytest.mark.parametrize("entrypoint", ["start", "continue"])
+def test_paused_changed_prefix_authority_drift_aborts_and_rolls_back_without_forward_reexecution(tmp_path: Path, entrypoint: str) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
     adapter = RecordingAdapter()
+    paused = start_execution(store_path, plan.plan_id, adapter, None)
+    before = len(adapter.calls)
+    with SQLiteStore(store_path) as store:
+        item = store.load_crew_message(plan.evidence_ids["kira"])
+        store.save_crew_message(replace(item, review_status=CrewReviewStatus.CORRECTION_REQUESTED))
+    view = start_execution(store_path, plan.plan_id, adapter, Runner()) if entrypoint == "start" else continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert view.failure_code == "FORWARD_AUTHORITY_LOST"
+    assert view.rollback_status == "completed"
+    assert len(adapter.calls) == before + 14
+    assert all(step.operation not in {item.operation for item in plan.steps} for step in adapter.calls[before:])
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(paused.execution_id)
+    assert any(item.event is CheckpointEvent.EXECUTION_ABORTED for item in checkpoints)
+    assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_COMPLETED
+
+
+def test_paused_verified_noop_prefix_authority_drift_fails_closed_without_rollback(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = NoopAdapter()
     paused = start_execution(store_path, plan.plan_id, adapter, None)
     before = len(adapter.calls)
     with SQLiteStore(store_path) as store:
@@ -573,17 +627,19 @@ def test_authority_and_bundle_drift_reject_continuation_before_adapter(tmp_path:
         continue_execution(store_path, paused.execution_id, adapter, Runner())
     assert len(adapter.calls) == before
 
-    store_path, plan, _bundle = _approved(tmp_path / "bundle-drift")
+
+def test_authority_and_bundle_drift_reject_continuation_before_adapter(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
     adapter = RecordingAdapter()
     paused = start_execution(store_path, plan.plan_id, adapter, None)
+    before = len(adapter.calls)
     with sqlite3.connect(store_path) as connection:
         payload = connection.execute("SELECT payload FROM provisioning_bundles WHERE plan_id=?", (plan.plan_id,)).fetchone()[0]
         connection.execute("UPDATE provisioning_bundles SET payload=? WHERE plan_id=?", (payload + " ", plan.plan_id))
         connection.commit()
     with pytest.raises(ValueError):
         continue_execution(store_path, paused.execution_id, adapter, Runner())
-    assert len(adapter.calls) == len(plan.steps)
-
+    assert len(adapter.calls) == before
 
 def test_tampered_execution_aborted_evidence_is_rejected_without_forward_claim(tmp_path: Path, monkeypatch) -> None:
     import overseer.backup_execution as execution

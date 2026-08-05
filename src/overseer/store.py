@@ -925,43 +925,62 @@ class SQLiteStore:
             return
         if self._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_headers").fetchone()[0] or self._connection.execute("SELECT COUNT(*) FROM backup_provisioning_execution_checkpoints").fetchone()[0]:
             raise ValueError("v3 backup execution rows require an explicit v4 migration source")
-        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_headers_no_update")
-        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_headers_no_delete")
-        self._connection.execute("ALTER TABLE backup_provisioning_execution_headers RENAME TO backup_provisioning_execution_headers_v3")
-        self._connection.execute(f"""
-            CREATE TABLE backup_provisioning_execution_headers (
-                execution_id TEXT PRIMARY KEY,
-                plan_id TEXT NOT NULL UNIQUE,
-                plan_digest TEXT NOT NULL UNIQUE,
-                bundle_id TEXT NOT NULL UNIQUE,
-                bundle_digest TEXT NOT NULL UNIQUE,
-                approved_runtime_digest TEXT NOT NULL,
-                approved_config_digest TEXT NOT NULL,
-                header_digest TEXT NOT NULL UNIQUE,
-                payload TEXT NOT NULL
-            )
-        """)
-        self._connection.execute("DROP TABLE backup_provisioning_execution_headers_v3")
-        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_checkpoints_no_update")
-        self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_checkpoints_no_delete")
-        self._connection.execute("ALTER TABLE backup_provisioning_execution_checkpoints RENAME TO backup_provisioning_execution_checkpoints_v3")
-        self._connection.execute("""
-            CREATE TABLE backup_provisioning_execution_checkpoints (
-                checkpoint_id TEXT PRIMARY KEY,
-                execution_id TEXT NOT NULL,
-                checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0),
-                phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0),
-                plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
-                step_digest TEXT NOT NULL,
-                previous_digest TEXT NOT NULL,
-                checkpoint_digest TEXT NOT NULL UNIQUE,
-                payload TEXT NOT NULL,
-                UNIQUE(execution_id, checkpoint_ordinal),
-                FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
-            )
-        """)
-        self._connection.execute("INSERT INTO backup_provisioning_execution_checkpoints SELECT * FROM backup_provisioning_execution_checkpoints_v3")
-        self._connection.execute("DROP TABLE backup_provisioning_execution_checkpoints_v3")
+        savepoint = "backup_execution_v3_migration"
+        owns_transaction = not self._connection.in_transaction
+        if owns_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
+        else:
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_headers_no_update")
+            self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_headers_no_delete")
+            self._connection.execute("ALTER TABLE backup_provisioning_execution_headers RENAME TO backup_provisioning_execution_headers_v3")
+            self._connection.execute("""
+                CREATE TABLE backup_provisioning_execution_headers (
+                    execution_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL UNIQUE,
+                    plan_digest TEXT NOT NULL UNIQUE,
+                    bundle_id TEXT NOT NULL UNIQUE,
+                    bundle_digest TEXT NOT NULL UNIQUE,
+                    approved_runtime_digest TEXT NOT NULL,
+                    approved_config_digest TEXT NOT NULL,
+                    header_digest TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL
+                )
+            """)
+            self._connection.execute("DROP TABLE backup_provisioning_execution_headers_v3")
+            self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_checkpoints_no_update")
+            self._connection.execute("DROP TRIGGER IF EXISTS backup_execution_checkpoints_no_delete")
+            self._connection.execute("ALTER TABLE backup_provisioning_execution_checkpoints RENAME TO backup_provisioning_execution_checkpoints_v3")
+            self._connection.execute("""
+                CREATE TABLE backup_provisioning_execution_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL,
+                    checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0),
+                    phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0),
+                    plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0),
+                    step_digest TEXT NOT NULL,
+                    previous_digest TEXT NOT NULL,
+                    checkpoint_digest TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL,
+                    UNIQUE(execution_id, checkpoint_ordinal),
+                    FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+                )
+            """)
+            self._connection.execute("INSERT INTO backup_provisioning_execution_checkpoints SELECT * FROM backup_provisioning_execution_checkpoints_v3")
+            self._connection.execute("DROP TABLE backup_provisioning_execution_checkpoints_v3")
+        except BaseException:
+            if owns_transaction:
+                self._connection.rollback()
+            else:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            if owns_transaction:
+                self._connection.commit()
+            else:
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def _migrate_agent_activation_leases(self) -> None:
         columns = {

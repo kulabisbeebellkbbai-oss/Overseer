@@ -56,6 +56,14 @@ class _AuthorityRecordError(ValueError):
     """A persisted authority record is missing or cannot be decoded."""
 
 
+class _AuthorityMismatchError(ValueError):
+    """The exact persisted authority no longer matches the execution header."""
+
+
+class _ExactApprovalSourceError(ValueError):
+    """The exact approval source is missing or cannot be decoded."""
+
+
 def _string(value: object, label: str, *, identifier: bool = False) -> str:
     if type(value) is not str or not value or "\x00" in value:
         raise ValueError(f"{label} must be a non-empty string")
@@ -729,35 +737,44 @@ def _load_authoritative_bundle(store: SQLiteStore, plan_id: str, *, terminal: bo
     except (KeyError, ValueError) as error:
         raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
     if type(bundle) is not provisioning_bundle.ProvisioningBundleV1 or not bundle.preflight.passed:
-        raise ValueError("exact passing typed provisioning bundle is required")
-    provisioning_bundle._recheck_locked_authority_and_chain(store, bundle)
+        raise _AuthorityMismatchError("exact passing typed provisioning bundle is required")
+    try:
+        provisioning_bundle._recheck_locked_authority_and_chain(store, bundle)
+    except (KeyError, ValueError) as error:
+        raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
     try:
         binding = store.load_roadex_approval_binding(provisioning_bundle.binding_draft_for_bundle(bundle).approval_ref)
     except (KeyError, ValueError) as error:
         raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
     if type(binding) is not RoadexApprovalBinding:
-        raise ValueError("authoritative Roadex binding is required")
+        raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID")
     try:
         provisioning_bundle._load_exact_preflight_report(store, bundle)
         provisioning_bundle._load_exact_outbox(store, bundle)
         provisioning_bundle.verify_exact_completed_review_outbox_set(store, bundle)
     except (KeyError, ValueError) as error:
         raise _AuthorityRecordError("AUTHORITATIVE_RECORD_INVALID") from error
-    source = load_exact_bound_source(store, binding)
-    projected = project_decision(store, binding, source)
+    try:
+        source = load_exact_bound_source(store, binding)
+        projected = project_decision(store, binding, source)
+    except (KeyError, ValueError) as error:
+        # The approval source is the independent authorization record.  Its
+        # loss is fail-closed and must not become cleanup-eligible authority
+        # loss merely because the execution has a mutable prefix.
+        raise _ExactApprovalSourceError("EXACT_APPROVAL_SOURCE_INVALID") from error
     expected_projection_time = source.executed_at if source.status.value == "executed" else source.approved_at
     if projected.decision != "approved" or projected.source_status != source.status.value or projected.updated_at != expected_projection_time:
-        raise ValueError("current authoritative approval projection is not approved")
+        raise _AuthorityMismatchError("current authoritative approval projection is not approved")
     draft = provisioning_bundle.binding_draft_for_bundle(bundle)
     if any(getattr(binding, field) != getattr(draft, field) for field in ("approval_ref", "source_kind", "source_id", "project_id", "workspace_id", "resource_ref", "authority_class", "subject")):
-        raise ValueError("approval binding identity does not match the exact bundle")
+        raise _AuthorityMismatchError("approval binding identity does not match the exact bundle")
     allowed = {"approved", "executed"} if terminal else {"approved"}
     if source.plan_id != plan_id or source.status.value not in allowed or not source.approved_by or not source.approved_at:
-        raise ValueError("authoritative approved Roadex decision is required")
+        raise _AuthorityMismatchError("authoritative approved Roadex decision is required")
     if source.plan_digest != bundle.plan.plan_digest:
-        raise ValueError("approved plan digest does not match typed bundle")
+        raise _AuthorityMismatchError("approved plan digest does not match typed bundle")
     if source.provisioning_contract_version != bundle.plan.provisioning_contract_version or source.runtime_artifact_identity != bundle.plan.runtime_artifact_identity or source.config_digest != bundle.plan.config_digest:
-        raise ValueError("approved projection does not match the exact bundle")
+        raise _AuthorityMismatchError("approved projection does not match the exact bundle")
     return bundle, binding, source
 
 
@@ -826,8 +843,10 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
         try:
             bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
             if _make_header(bundle, binding, source, header.created_at) != header:
-                raise ValueError("stored execution header does not match current authority")
-        except ValueError:
+                raise _AuthorityMismatchError("stored execution header does not match current authority")
+        except ValueError as authority_error:
+            if isinstance(authority_error, _ExactApprovalSourceError):
+                raise
             if _bound_source_is_executed(store, header.plan_id):
                 raise ValueError("executed approval is not bound to a terminal execution")
             _verify_immutable_cleanup_identity(store, header, chain)
@@ -904,8 +923,10 @@ def _abort_paused_forward_on_authority_loss(store, header: ProvisioningExecution
         try:
             bundle, binding, source = _load_authoritative_bundle(store, header.plan_id)
             if _make_header(bundle, binding, source, header.created_at) != header:
-                raise ValueError("stored execution header does not match current authority")
+                raise _AuthorityMismatchError("stored execution header does not match current authority")
         except ValueError as authority_error:
+            if isinstance(authority_error, _ExactApprovalSourceError):
+                raise
             if _bound_source_is_executed(store, header.plan_id):
                 raise ValueError("executed approval is not bound to a terminal execution") from authority_error
             _verify_immutable_cleanup_identity(store, header, chain)
@@ -1121,8 +1142,10 @@ def _start_execution_with_invocation(store_path: str, plan_id: str, adapter, acc
                     bundle, binding, source = _load_authoritative_bundle(store, plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
                     expected = _make_header(bundle, binding, source, header.created_at)
                     if expected != header:
-                        raise ValueError("stored execution header does not match current authority")
+                        raise _AuthorityMismatchError("stored execution header does not match current authority")
                 except ValueError as authority_error:
+                    if isinstance(authority_error, _ExactApprovalSourceError):
+                        raise
                     if not _abort_paused_forward_on_authority_loss(store, header, when):
                         raise authority_error
                     source = None
@@ -1153,8 +1176,10 @@ def _continue_execution_with_invocation(store_path: str, execution_id: str, adap
             try:
                 bundle, binding, source = _load_authoritative_bundle(store, header.plan_id, terminal=bool(chain and chain[-1].event is CheckpointEvent.EXECUTION_FINALIZED))
                 if _make_header(bundle, binding, source, header.created_at) != header:
-                    raise ValueError("checkpoint header identity or manifest has drifted")
+                    raise _AuthorityMismatchError("checkpoint header identity or manifest has drifted")
             except ValueError as authority_error:
+                if isinstance(authority_error, _ExactApprovalSourceError):
+                    raise
                 if not _abort_paused_forward_on_authority_loss(store, header, when):
                     raise authority_error
                 source = None

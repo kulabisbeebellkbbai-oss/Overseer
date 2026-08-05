@@ -19,7 +19,7 @@ from overseer.backup_execution import (
     continue_execution,
     start_execution,
 )
-from overseer.backup_provisioning import ProvisioningStatus, ProvisioningStep, _dump, _stored, approve_plan
+from overseer.backup_provisioning import ProvisioningStatus, ProvisioningStep, _dump, _stored, approve_plan, execute_plan
 from overseer.crew import CrewReviewStatus
 from overseer.store import SQLiteStore
 from tests.test_backup_provisioning import _typed_bundle_with_reviews
@@ -341,6 +341,117 @@ def test_typed_execute_plan_reports_only_current_invocation_mutation(tmp_path: P
     assert replay["host_mutation_performed"] is False
     assert replay["host_mutation_uncertain"] is False
     assert replay_adapter.calls == []
+
+
+def test_deleted_typed_bundle_fails_closed_before_execution(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    with sqlite3.connect(store_path) as connection:
+        connection.execute("DELETE FROM provisioning_bundles WHERE plan_id=?", (plan.plan_id,))
+        connection.commit()
+    with SQLiteStore(store_path) as store:
+        before = _stored(store, plan.plan_id)
+    with pytest.raises(ValueError, match="SUCCESSOR_REQUIRED"):
+        execute_plan(store_path, plan.plan_id, adapter, acceptance_runner=Runner())
+    assert adapter.calls == []
+    with SQLiteStore(store_path) as store:
+        assert _stored(store, plan.plan_id) == before
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM backup_provisioning_execution_headers WHERE plan_id=?",
+            (plan.plan_id,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("artifact", ["binding", "preflight", "outbox"])
+@pytest.mark.parametrize("entrypoint", ["start", "continue"])
+def test_missing_authority_record_aborts_changed_prefix_and_rolls_back(
+    tmp_path: Path, artifact: str, entrypoint: str,
+) -> None:
+    store_path, plan, bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    paused = start_execution(store_path, plan.plan_id, adapter, None)
+    before = len(adapter.calls)
+    with sqlite3.connect(store_path) as connection:
+        if artifact == "binding":
+            connection.execute("DELETE FROM roadex_approval_bindings WHERE approval_ref=?", (f"approval.donuthole.{plan.plan_id}",))
+        elif artifact == "preflight":
+            connection.execute("DELETE FROM provisioning_preflight_reports WHERE id=?", (bundle.preflight.report_id,))
+        else:
+            connection.execute("DELETE FROM provisioning_review_outbox WHERE plan_id=?", (plan.plan_id,))
+        connection.commit()
+    view = start_execution(store_path, plan.plan_id, adapter, Runner()) if entrypoint == "start" else continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert view.failure_code == "FORWARD_AUTHORITY_LOST"
+    assert view.rollback_status == "completed"
+    assert len(adapter.calls) == before + 14
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(paused.execution_id)
+    assert any(item.event is CheckpointEvent.EXECUTION_ABORTED for item in checkpoints)
+    assert checkpoints[-1].event is CheckpointEvent.ROLLBACK_COMPLETED
+
+
+@pytest.mark.parametrize("source_state", ["missing", "malformed"])
+@pytest.mark.parametrize("entrypoint", ["start", "continue"])
+def test_missing_or_malformed_exact_source_fails_closed_after_changed_prefix(
+    tmp_path: Path, source_state: str, entrypoint: str,
+) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    paused = start_execution(store_path, plan.plan_id, adapter, None)
+    before_calls = list(adapter.calls)
+    with sqlite3.connect(store_path) as connection:
+        if source_state == "missing":
+            connection.execute("DELETE FROM backup_provisioning_plans WHERE id=?", (plan.plan_id,))
+        else:
+            connection.execute("UPDATE backup_provisioning_plans SET payload='{}' WHERE id=?", (plan.plan_id,))
+        connection.commit()
+    before_checkpoints = _checkpoints(store_path, paused.execution_id)
+    with pytest.raises(ValueError):
+        if entrypoint == "start":
+            start_execution(store_path, plan.plan_id, adapter, Runner())
+        else:
+            continue_execution(store_path, paused.execution_id, adapter, Runner())
+    assert adapter.calls == before_calls
+    assert _checkpoints(store_path, paused.execution_id) == before_checkpoints
+
+
+def _checkpoints(store_path: str, execution_id: str):
+    with SQLiteStore(store_path) as store:
+        return store.load_backup_execution_checkpoints(execution_id)
+
+
+def test_synchronized_execute_plan_loser_reports_no_mutation(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    winner_adapter = BlockingAdapter(started, release)
+    loser_adapter = RecordingAdapter()
+    results: dict[str, object] = {}
+
+    def run_winner() -> None:
+        results["winner"] = execute_plan(store_path, plan.plan_id, winner_adapter, acceptance_runner=Runner())
+
+    def run_loser() -> None:
+        results["loser"] = execute_plan(store_path, plan.plan_id, loser_adapter, acceptance_runner=Runner())
+
+    winner = threading.Thread(target=run_winner)
+    winner.start()
+    assert started.wait(timeout=10)
+    loser = threading.Thread(target=run_loser)
+    loser.start()
+    loser.join(timeout=10)
+    assert not loser.is_alive()
+    release.set()
+    winner.join(timeout=10)
+    assert not winner.is_alive()
+    assert not results.get("loser", {}).get("host_mutation_uncertain", True)
+    winner_result = results["winner"]
+    loser_result = results["loser"]
+    assert len(winner_adapter.calls) == 21
+    assert winner_result["host_mutation_performed"] is True
+    assert loser_adapter.calls == []
+    assert loser_result["mutation_performed"] is False
+    assert loser_result["host_mutation_performed"] is False
+    assert loser_result["host_mutation_uncertain"] is False
 
 
 def test_typed_failed_terminal_replay_preserves_failed_operation_without_calls(tmp_path: Path) -> None:

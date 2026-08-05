@@ -398,18 +398,37 @@ def execute_plan(
     now = executed_at or datetime.now(UTC).isoformat(); _time(now)
     execution_id = None
     with SQLiteStore(store_path) as store:
-        typed_execution = _typed_bundle_feature_enabled_locked(store)
+        typed_execution = _typed_execution_enabled_for_plan_locked(store, plan_id)
         if typed_execution:
-            from .backup_execution import _start_execution_with_invocation, _continue_execution_with_invocation
+            from .backup_execution import _InvocationResult, _start_execution_with_invocation, _continue_execution_with_invocation, derive_backup_execution_view
             _require_typed_execution_bundle(store, _stored(store, plan_id))
             try:
                 execution_id = store.load_backup_execution_header_for_plan(plan_id).execution_id
             except KeyError:
                 execution_id = None
-            if execution_id is None:
-                invocation = _start_execution_with_invocation(store_path, plan_id, adapter, acceptance_runner, now=now)
-            else:
-                invocation = _continue_execution_with_invocation(store_path, execution_id, adapter, acceptance_runner, now=now)
+            try:
+                if execution_id is None:
+                    invocation = _start_execution_with_invocation(store_path, plan_id, adapter, acceptance_runner, now=now)
+                else:
+                    invocation = _continue_execution_with_invocation(store_path, execution_id, adapter, acceptance_runner, now=now)
+            except ValueError as error:
+                # A concurrent caller may observe the winner's durable step
+                # claim.  It did not claim or execute anything itself.
+                if str(error) != "EXECUTION_IN_PROGRESS":
+                    raise
+                with SQLiteStore(store_path) as current_store:
+                    header = current_store.load_backup_execution_header_for_plan(plan_id)
+                    current_checkpoints = current_store.load_backup_execution_checkpoints(header.execution_id)
+                    if not current_checkpoints or current_checkpoints[-1].event.value != "step_started":
+                        raise
+                    invocation = _InvocationResult(
+                        view=derive_backup_execution_view(
+                            header,
+                            current_checkpoints,
+                        ),
+                        entry_checkpoints=current_checkpoints,
+                        entry_plan=_stored(current_store, plan_id),
+                    )
             with SQLiteStore(store_path) as store:
                 plan = _stored(store, plan_id)
                 checkpoints = store.load_backup_execution_checkpoints(invocation.view.execution_id)
@@ -581,6 +600,18 @@ def _typed_bundle_feature_enabled_locked(store: SQLiteStore) -> bool:
         "WHERE approval_ref LIKE 'approval.donuthole.%' LIMIT 1",
     )
     return any(store._connection.execute(sql).fetchone() is not None for sql in checks)
+
+
+def _typed_execution_enabled_for_plan_locked(store: SQLiteStore, plan_id: str) -> bool:
+    """Select typed execution only from artifacts belonging to this plan."""
+    checks = (
+        ("SELECT 1 FROM provisioning_bundles WHERE plan_id=? LIMIT 1", (plan_id,)),
+        ("SELECT 1 FROM backup_provisioning_execution_headers WHERE plan_id=? LIMIT 1", (plan_id,)),
+        ("SELECT 1 FROM provisioning_preflight_reports WHERE plan_id=? LIMIT 1", (plan_id,)),
+        ("SELECT 1 FROM provisioning_review_outbox WHERE plan_id=? LIMIT 1", (plan_id,)),
+        ("SELECT 1 FROM roadex_approval_bindings WHERE source_id=? OR approval_ref=? LIMIT 1", (plan_id, f"approval.donuthole.{plan_id}")),
+    )
+    return any(store._connection.execute(sql, parameters).fetchone() is not None for sql, parameters in checks)
 
 
 def _require_bundle_preflight_and_reviews(

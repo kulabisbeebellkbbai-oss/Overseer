@@ -23,9 +23,10 @@ tuple as `committed`. Strict reads and startup quarantine are unchanged.
 
 ## Tests
 
-- Deterministic exclusive/no-follow flags, real symlink resistance, owned temp
-  cleanup for write/close/rename failures, unrelated-path preservation, cleanup
-  error precedence, and no post-rename unlink.
+- Deterministic exclusive/no-follow flags, real symlink resistance, and explicit
+  owned-temp cleanup tests for write, file-fsync, close, and rename failures;
+  unrelated-path preservation, cleanup error precedence, and no post-rename
+  unlink.
 - Deterministic file-write/sync/close, rename, directory-open/sync/close order.
 - Parent-directory fsync failure after rename returns `indeterminate` despite
   exact readback; post-durable-save generic exceptions still reconcile as
@@ -35,7 +36,7 @@ tuple as `committed`. Strict reads and startup quarantine are unchanged.
 
 ## Roadex commit
 
-`99c484ad6af1c58c2f97a52cb9c4595b409b9172`
+`4b771b57cae84acf42261b50d37e33f99b0df664`
 
 No live services, deployment, restart, push, approval, or provisioning action
 was performed.

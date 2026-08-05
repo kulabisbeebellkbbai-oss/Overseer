@@ -245,6 +245,48 @@ def test_authority_is_rechecked_before_each_forward_claim(tmp_path: Path) -> Non
     assert sum(step.operation == "remove_runtime_if_unreferenced" for step in adapter.calls) == 1
 
 
+def test_uninterrupted_execute_plan_fails_closed_when_exact_source_executes_after_install_runtime(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    store_path, plan, _bundle = _approved(tmp_path)
+
+    class ExecutingSourceAdapter(RecordingAdapter):
+        def execute(self, step):
+            result = super().execute(step)
+            if step.operation == "install_runtime":
+                with SQLiteStore(store_path) as store:
+                    source = _stored(store, plan.plan_id)
+                    executed = replace(
+                        source,
+                        status=ProvisioningStatus.EXECUTED,
+                        executed_at="2026-08-05T12:00:00+00:00",
+                        evidence_digest="sha256:" + "e" * 64,
+                    )
+                    store._connection.execute(
+                        "UPDATE backup_provisioning_plans SET payload=? WHERE id=?",
+                        (_dump(executed), plan.plan_id),
+                    )
+                    store._connection.commit()
+            return result
+
+    adapter = ExecutingSourceAdapter()
+    with pytest.raises(ValueError, match="terminal execution"):
+        execute_plan(store_path, plan.plan_id, adapter, acceptance_runner=Runner())
+    assert [step.operation for step in adapter.calls] == [
+        "verify_published_adapter_source", "install_runtime",
+    ]
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(
+            store.load_backup_execution_header_for_plan(plan.plan_id).execution_id,
+        )
+    assert all(item.event is not CheckpointEvent.EXECUTION_ABORTED for item in checkpoints)
+    assert all(item.event not in (
+        CheckpointEvent.ROLLBACK_STARTED,
+        CheckpointEvent.ROLLBACK_COMPLETED,
+        CheckpointEvent.ROLLBACK_FAILED,
+    ) for item in checkpoints)
+
+
 def test_verified_noop_is_not_rolled_back_after_later_failure(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
     adapter = NoopAdapter()

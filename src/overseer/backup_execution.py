@@ -815,6 +815,8 @@ def _claim_forward(store, header: ProvisioningExecutionHeader, identity: Executi
             if _make_header(bundle, binding, source, header.created_at) != header:
                 raise ValueError("stored execution header does not match current authority")
         except ValueError:
+            if _bound_source_is_executed(store, header.plan_id):
+                raise ValueError("executed approval is not bound to a terminal execution")
             _verify_immutable_cleanup_identity(store, header, chain)
             expected_steps = [step for phase in header.phases for step in phase.steps]
             completed = [item.plan_step_ordinal for item in chain if item.event is CheckpointEvent.STEP_COMPLETED]

@@ -368,3 +368,46 @@ verification confirmed the main checkout returned to its original state:
 `src/server/approvalCoordinator.ts` and
 `tests/approvalLifecycleIntegration.test.ts` remain. No other main-checkout
 file was changed by this Task 3 slice.
+
+## Final Sol Important security-fix addendum: bounded staging response streams
+
+The final Sol review finding in the Roadex approval-staging transport is fixed
+in the isolated Roadex worktree. After fetch resolves, every rejected response
+now aborts the request controller and best-effort cancels the acquired body or
+reader. Content-Encoding and Transfer-Encoding framing are rejected before
+body consumption. The response is read through a bounded stream reader that
+counts decoded bytes incrementally, cancels immediately when the declared
+length or 16 KiB cap is exceeded, requires the exact final byte count, and
+retains strict UTF-8, exact locator, fixed loopback URL, authentication, exact
+intent-body, scope, and commit-fence behavior. Timeout and parent abort also
+cancel an acquired body. Transport failures remain redacted.
+
+TDD evidence:
+
+- RED: `npm test -- --run tests/overseerApprovalStageTransport.test.ts` did not
+  complete because the new endless-stream regression hung the old
+  `response.arrayBuffer()` path; the local test process was terminated.
+- GREEN: the focused transport/host/composition/race run passed 29 tests:
+  `npm test -- --run tests/overseerApprovalStageTransport.test.ts
+  tests/approvalWorkflowHost.test.ts tests/approvalWorkflowComposition.test.ts
+  tests/approvalWorkflowTimeoutRace.test.ts --pool=forks --maxWorkers=1`.
+- The serialized full suite passed 54 files and 555 tests:
+  `npm test -- --pool=forks --maxWorkers=1`.
+- `npm run lint`, `npm run build`, and `git diff --check` passed.
+
+The first default-worker `npm test` run passed 551 tests but had four timeout
+failures in unrelated controlled-operation/workspace/UI tests. Rerunning those
+four files serialized passed 28/28, and the serialized full suite passed as
+listed above; this worker-contention variance remains a verification concern,
+not a failure in the changed transport tests.
+
+Commits:
+
+- Roadex source/tests: `16333bada0be085a452332b24fb7836faefb346e` —
+  `fix: bound approval staging response streams`
+- Existing Overseer source: `556fddac47ee8ae5e80b94ddc847f1aaa8b0c13f`
+- This final report addendum is committed separately in the Overseer worktree.
+
+No Overseer source, main Roadex checkout, DonutHole checkout, live
+service/store, approval, deployment, gateway, firewall/IDS, or push was
+touched for this final security fix.

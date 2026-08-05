@@ -121,4 +121,19 @@ or provisioning execution is authorized by this source milestone.
   - Both Terra reviews: APPROVED.
   - Final Sol security review: APPROVED; no findings.
   - No live actions were performed.
-  - Task 2 — resumable phase coordinator — is next.
+- Capability C Task 2 — resumable phase coordinator: complete and
+  release-reviewed at `cf559e682e220c94d10f0c766b2c9a8410f6f4ea`.
+  - Independent exact five-file suite: 212 passed in 326.37s.
+  - Terra contract review APPROVE: 15 selected tests.
+  - Terra policy review APPROVE: 20 focused tests plus 3 additional
+    concurrency/completion tests.
+  - Final Sol security review APPROVE; no Critical, Important, or Minor
+    findings.
+  - Sol exact suite: 212 passed in 318.43s; focused trigger/readback probes:
+    5 passed in 15.18s.
+  - INSERT/UPDATE/DELETE trigger tamper, exact readback, v6 migration
+    atomicity, epoch fencing, process-liveness/scoping, orphan recovery,
+    authority revalidation, and transaction-exit cleanup were verified
+    fail-closed.
+  - No live actions were performed.
+  - Task 3 — structured host-operation outcomes — is next.

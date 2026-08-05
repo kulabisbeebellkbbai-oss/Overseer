@@ -4105,7 +4105,10 @@ def test_bundle_cli_accepts_sealed_intent_fd_for_preview_and_stage(
     )
     descriptor = _sealed_bundle_intent_fd()
     try:
-        before = os.fstat(descriptor), os.lseek(descriptor, 0, os.SEEK_CUR)
+        before = (
+            backup_provisioning_cli_module._file_identity(os.fstat(descriptor)),
+            os.lseek(descriptor, 0, os.SEEK_CUR),
+        )
         assert backup_provisioning_cli_module.main((
             "--store", store_path, "bundle-preflight", "--intent-fd", str(descriptor),
         )) == 0
@@ -4116,7 +4119,10 @@ def test_bundle_cli_accepts_sealed_intent_fd_for_preview_and_stage(
             "--expected-bundle-digest", preview["bundle_digest"],
         )) == 0
         json.loads(capsys.readouterr().out)
-        assert (os.fstat(descriptor), os.lseek(descriptor, 0, os.SEEK_CUR)) == before
+        assert (
+            backup_provisioning_cli_module._file_identity(os.fstat(descriptor)),
+            os.lseek(descriptor, 0, os.SEEK_CUR),
+        ) == before
     finally:
         os.close(descriptor)
 

@@ -404,8 +404,6 @@ def execute_plan(
         except KeyError:
             typed_execution = False
         if typed_execution:
-            if not callable(getattr(acceptance_runner, "attest", None)) or not callable(getattr(acceptance_runner, "accept", None)):
-                raise ValueError("typed provisioning execution requires an exact acceptance runner")
             from .backup_execution import continue_execution, start_execution
             try:
                 execution_id = store.load_backup_execution_header_for_plan(plan_id).execution_id
@@ -417,7 +415,8 @@ def execute_plan(
                 view = continue_execution(store_path, execution_id, adapter, acceptance_runner, now=now)
             with SQLiteStore(store_path) as store:
                 plan = _stored(store, plan_id)
-            return _public(plan, mutation=True, host_mutation=view.terminal_success)
+                checkpoints = store.load_backup_execution_checkpoints(view.execution_id)
+            return _typed_execution_public(plan, view, checkpoints)
     with SQLiteStore(store_path) as store:
         plan = _stored(store, plan_id); _validate_plan(plan)
         _require_terminal_evidence(store, plan)
@@ -747,6 +746,34 @@ def save_staged_plan_source(store: SQLiteStore, plan: DonutHoleBackupProvisionin
 
 def _public(plan: DonutHoleBackupProvisioningPlan, *, mutation: bool, host_mutation: bool = False) -> Mapping[str, object]:
     return {"ok": True, "plan_id": plan.plan_id, "kind": plan.kind, "plan_digest": plan.plan_digest, "status": plan.status.value, "approval_required": plan.status == ProvisioningStatus.STAGED, "approved_by": plan.approved_by, "evidence_ids": dict(plan.evidence_ids), "evidence_digest": plan.evidence_digest, "failed_operation": plan.failed_operation, "error_code": plan.error_code, "rollback_operations": [step.operation for step in plan.rollback_steps], "redactions_applied": True, "mutation_performed": mutation, "host_mutation_performed": host_mutation}
+
+
+def _typed_execution_public(plan: DonutHoleBackupProvisioningPlan, view, checkpoints: tuple[object, ...]) -> Mapping[str, object]:
+    non_synthetic = len(plan.steps)
+    host_mutation = any(
+        getattr(item, "plan_step_ordinal", non_synthetic) < non_synthetic
+        and getattr(getattr(item, "step_evidence", None), "disposition", None) is not None
+        for item in checkpoints
+    )
+    if view.terminal_success:
+        status = "executed"
+    elif view.rollback_status == "completed":
+        status = "rolled_back"
+    elif view.rollback_status == "failed" or view.failure_code:
+        status = "failed"
+    else:
+        status = "in_progress"
+    result = dict(_public(plan, mutation=True, host_mutation=host_mutation))
+    result.update({
+        "execution_id": view.execution_id,
+        "execution_status": view.status,
+        "rollback_status": view.rollback_status,
+        "status": status,
+        "failure_code": view.failure_code,
+        "error_code": view.failure_code,
+        "evidence_digest": view.evidence_digest,
+    })
+    return result
 
 
 def _redacted_error_code(error: Exception) -> str:

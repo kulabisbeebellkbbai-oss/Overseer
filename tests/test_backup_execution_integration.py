@@ -172,6 +172,133 @@ def test_typed_execute_plan_delegates_to_runner_coordinator(tmp_path: Path) -> N
     result = execute_plan(store_path, plan.plan_id, RecordingAdapter(), acceptance_runner=Runner())
     assert result["status"] == "executed"
     assert result["host_mutation_performed"] is True
+    assert result["execution_status"] == "succeeded"
+    assert result["execution_id"].startswith("execution.")
+    assert result["rollback_status"] == "not_started"
+    assert result["failure_code"] is None
+
+
+def test_typed_result_is_truthful_for_pause_failure_and_legacy(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import execute_plan
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    adapter = RecordingAdapter()
+    paused = execute_plan(store_path, plan.plan_id, adapter, acceptance_runner=None)
+    assert paused["status"] == "in_progress"
+    assert paused["execution_status"] == "in_progress"
+    assert paused["host_mutation_performed"] is True
+
+    store_path, plan, _bundle = _approved(tmp_path / "wrong-runtime")
+    failed = execute_plan(store_path, plan.plan_id, RecordingAdapter(), acceptance_runner=Runner(wrong_runtime=True))
+    assert failed["status"] == "rolled_back"
+    assert failed["status"] != "approved"
+    assert failed["failure_code"] == "OPERATION_FAILED"
+    assert failed["host_mutation_performed"] is True
+
+    store_path, plan, _bundle = _approved(tmp_path / "bad-acceptance")
+    failed = execute_plan(store_path, plan.plan_id, RecordingAdapter(), acceptance_runner=Runner(passed=False))
+    assert failed["status"] == "rolled_back"
+    assert failed["failure_code"] == "ACCEPTANCE_FAILED"
+    assert failed["host_mutation_performed"] is True
+
+
+def test_authority_is_rechecked_before_each_forward_claim(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+
+    class RevokingAdapter(RecordingAdapter):
+        def execute(self, step):
+            result = super().execute(step)
+            if len(self.calls) == 1:
+                with SQLiteStore(store_path) as store:
+                    item = store.load_crew_message(plan.evidence_ids["kira"])
+                    store.save_crew_message(replace(item, review_status=CrewReviewStatus.CORRECTION_REQUESTED))
+            return result
+
+    adapter = RevokingAdapter()
+    with pytest.raises(ValueError):
+        start_execution(store_path, plan.plan_id, adapter, Runner())
+    assert len(adapter.calls) == 1
+
+
+def test_normalizes_coordinator_codes_and_discards_adapter_secrets(tmp_path: Path) -> None:
+    store_path, plan, _bundle = _approved(tmp_path)
+
+    class SecretAdapter(RecordingAdapter):
+        def execute(self, step):
+            self.calls.append(step)
+            if step.operation == "install_runtime":
+                return {"ok": True, "operation": step.operation, "disposition": "changed", "safe_code": "SUPERSECRET123", "evidence": {"secret": "SUPERSECRET123"}, "redactions_applied": True}
+            return {"ok": True, "operation": step.operation, "disposition": "verified_noop", "safe_code": "SUPERSECRET123", "evidence": {}, "redactions_applied": True}
+
+    view = start_execution(store_path, plan.plan_id, SecretAdapter(), Runner())
+    assert view.terminal_success is True
+    with SQLiteStore(store_path) as store:
+        payload = " ".join(str(row[0]) for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints"))
+    assert "SUPERSECRET123" not in payload
+    assert "STEP_COMPLETED" in payload and "STEP_VERIFIED_NOOP" in payload
+
+    store_path, plan, _bundle = _approved(tmp_path / "dto-failure")
+
+    class FailedDtoAdapter(RecordingAdapter):
+        def execute(self, step):
+            self.calls.append(step)
+            return {"ok": False, "operation": step.operation, "disposition": "changed", "safe_code": "SUPERSECRET123", "evidence": {}, "redactions_applied": True}
+
+    view = start_execution(store_path, plan.plan_id, FailedDtoAdapter(), Runner())
+    assert view.failure_code == "OPERATION_REPORTED_FAILURE"
+
+    store_path, plan, _bundle = _approved(tmp_path / "exception")
+
+    class SecretError(RuntimeError):
+        code = "SUPERSECRET123"
+
+    class ExceptionAdapter(RecordingAdapter):
+        def execute(self, step):
+            self.calls.append(step)
+            raise SecretError("do not persist")
+
+    view = start_execution(store_path, plan.plan_id, ExceptionAdapter(), Runner())
+    assert view.failure_code == "OPERATION_FAILED"
+
+    store_path, plan, _bundle = _approved(tmp_path / "acceptance-secret")
+
+    class UnsafeAcceptanceRunner(Runner):
+        def accept(self, header, attestation):
+            return BehaviorAcceptance(header.acceptance_contract_version, header.acceptance_contract_digest, False, "SUPERSECRET123", "sha256:" + "a" * 64)
+
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), UnsafeAcceptanceRunner())
+    assert view.failure_code == "ACCEPTANCE_FAILED"
+    with SQLiteStore(store_path) as store:
+        payload = " ".join(str(row[0]) for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints"))
+    assert "SUPERSECRET123" not in payload and "SUPERSECRET123" not in repr(view)
+
+
+def test_genesis_header_and_claim_roll_back_together(tmp_path: Path, monkeypatch) -> None:
+    import overseer.backup_execution as execution
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    original = SQLiteStore.save_backup_execution
+
+    def fail_after_save(self, header, checkpoint):
+        original(self, header, checkpoint)
+        raise RuntimeError("injected genesis failure")
+
+    monkeypatch.setattr(SQLiteStore, "save_backup_execution", fail_after_save)
+    with pytest.raises(RuntimeError, match="injected genesis failure"):
+        execution.start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner())
+    with SQLiteStore(store_path) as store:
+        with pytest.raises(KeyError):
+            store.load_backup_execution_header_for_plan(plan.plan_id)
+
+
+def test_reconcile_uses_terminal_checkpoint_observed_at(tmp_path: Path) -> None:
+    from overseer.backup_provisioning import _stored
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    view = start_execution(store_path, plan.plan_id, RecordingAdapter(), Runner(), now="2026-08-05T12:00:00+00:00")
+    with SQLiteStore(store_path) as store:
+        terminal = store.load_backup_execution_checkpoints(view.execution_id)[-1]
+        assert _stored(store, plan.plan_id).executed_at == terminal.observed_at
 
 
 def test_same_now_racing_starts_have_one_durable_claim_and_one_adapter_call(tmp_path: Path) -> None:
@@ -332,14 +459,15 @@ def test_ambiguous_rollback_started_tail_fails_closed(tmp_path: Path, monkeypatc
     assert len(adapter.calls) == before
 
 
-def test_typed_execute_plan_requires_runner_before_adapter(tmp_path: Path) -> None:
+def test_typed_execute_plan_pauses_before_runner_only_after_forward_prefix(tmp_path: Path) -> None:
     from overseer.backup_provisioning import execute_plan
 
     store_path, plan, _bundle = _approved(tmp_path)
     adapter = RecordingAdapter()
-    with pytest.raises(ValueError, match="acceptance runner"):
-        execute_plan(store_path, plan.plan_id, adapter)
-    assert adapter.calls == []
+    result = execute_plan(store_path, plan.plan_id, adapter)
+    assert result["status"] == "in_progress"
+    assert result["host_mutation_performed"] is True
+    assert len(adapter.calls) == len(plan.steps)
 
 
 def test_finalize_step_crash_is_recovered_without_adapter_or_runner_calls(tmp_path: Path, monkeypatch) -> None:

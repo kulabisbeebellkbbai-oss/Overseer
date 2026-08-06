@@ -211,17 +211,20 @@ class SQLiteStore:
         self._connection = sqlite3.connect(self.path, timeout=30.0)
         try:
             self._harden_database_files()
-        except Exception:
-            self._connection.close()
+            self._connection.row_factory = sqlite3.Row
+            self._agent_transaction_depth = 0
+            self._configure_connection()
+            self._initialize_with_lock_retry()
+            self._validate_backup_execution_schema()
+            if not self._typed_execution_authority_schema_is_exact():
+                raise ValueError("typed execution authority schema is unavailable or malformed")
+            self._harden_database_files()
+        except BaseException:
+            try:
+                self._connection.close()
+            except BaseException:
+                pass
             raise
-        self._connection.row_factory = sqlite3.Row
-        self._agent_transaction_depth = 0
-        self._configure_connection()
-        self._initialize_with_lock_retry()
-        self._validate_backup_execution_schema()
-        if not self._typed_execution_authority_schema_is_exact():
-            raise ValueError("typed execution authority schema is unavailable or malformed")
-        self._harden_database_files()
 
     def _prepare_database_file(self) -> tuple[int, int]:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK

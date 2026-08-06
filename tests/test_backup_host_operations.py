@@ -4,6 +4,7 @@ import os
 import pwd
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -51,6 +52,23 @@ def test_exact_existing_root_registration_is_verified_noop():
 
     result = adapter([step], runner).execute(step)
     assert result["disposition"] == "verified_noop"
+
+
+def test_production_adapter_results_pass_execution_normalization_for_source_and_acl():
+    from overseer.backup_execution import _normalize_result
+    commit = "a" * 40
+    source = ProvisioningStep("verify_published_adapter_source", {"path": "/approved/source", "commit": commit, "capability_digest": capability_digest(commit, EXPECTED_BACKUP_TOOL_SCHEMAS), "provisioning_contract_version": PROVISIONING_CONTRACT_VERSION, "runtime_artifact_identity": runtime_artifact_identity(commit, EXPECTED_BACKUP_TOOL_SCHEMAS)})
+    source_result = adapter([source], lambda argv, **_kwargs: Result(stdout=(commit + "\n").encode())).execute(source)
+    assert _normalize_result(source.operation, source_result).evidence == {"source_commit_verified": True}
+    acl = ProvisioningStep("ensure_read_only_acl", {"path": "/approved/source", "principal": "backup", "permissions": "r-X"})
+    probes = []
+    def acl_runner(argv, **_kwargs):
+        if "/usr/bin/getfacl" in argv:
+            probes.append(True)
+            return Result(stdout=(b"user::rwx\n" if len(probes) == 1 else b"user::rwx\nuser:backup:r-X\n"))
+        return Result()
+    acl_result = adapter([acl], acl_runner).execute(acl)
+    assert _normalize_result(acl.operation, acl_result).evidence == {"acl_present_before": False, "acl_verified": True}
 
 
 def test_conflicting_existing_root_fails_closed():
@@ -171,17 +189,19 @@ def test_runtime_reference_probe_is_tree_scoped_and_valid_plan_removal_succeeds(
     root = tmp_path / "runtime"; root.mkdir(); (root / "app.py").write_text("runtime")
     commit = "a" * 40
     digest = runtime_digest(root, commit)
-    step = ProvisioningStep("remove_runtime_if_unreferenced", {"path": str(root), "runtime_digest": digest})
+    info = root.stat()
+    step = ProvisioningStep("remove_runtime_if_unreferenced", {"path": str(root), "runtime_digest": digest, "dev": str(info.st_dev), "ino": str(info.st_ino), "uid": str(info.st_uid), "gid": str(info.st_gid), "mode": str(stat.S_IMODE(info.st_mode))})
     plan = SimpleNamespace(steps=(step,), rollback_steps=(), adapter_commit=commit)
 
     def runner(argv, **kwargs):
         if argv[2] == "/usr/bin/python3":
             if argv[5] == "references":
                 return Result(stdout=b'{"count":0,"status":"clear"}')
+            if argv[5] == "remove_tree":
+                shutil.rmtree(root)
+                return Result(stdout=b'{"status":"removed"}')
             assert argv[5] == "absence"
             return Result(stdout=b'{"status":"absent"}')
-        if argv[2] == "/usr/bin/rm":
-            shutil.rmtree(root)
         return Result()
 
     result = ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION, runner=runner, euid_provider=lambda: 1000, username_provider=lambda _uid: "god").execute(step)
@@ -198,7 +218,7 @@ def test_runtime_reference_probe_blocks_reference_or_unreadable_inspection(tmp_p
 
     def runner(argv, **kwargs):
         if argv[2] == "/usr/bin/python3":
-            payload = {"status": reference_status} if reference_status == "error" else {"count": 1, "status": reference_status}
+            payload = {"status": "error"} if reference_status == "error" else {"status": "conflict"}
             return Result(stdout=json.dumps(payload).encode())
         return Result()
 
@@ -208,7 +228,15 @@ def test_runtime_reference_probe_blocks_reference_or_unreadable_inspection(tmp_p
 
 @pytest.mark.parametrize(("status", "expected"), [("absent", "DIRECTORY_ALREADY_ABSENT"), ("removed", "DIRECTORY_REMOVED"), ("conflict", "DIRECTORY_CONFLICT")])
 def test_privileged_directory_boundary_distinguishes_absent_removed_and_conflict(tmp_path, status, expected):
-    step = ProvisioningStep("remove_directory_if_empty", {"path": str(tmp_path / "state")})
+    target = tmp_path / "state"
+    arguments = {"path": str(target)}
+    if status != "absent":
+        target.mkdir()
+        info = target.stat()
+        arguments.update({key: str(value) for key, value in (("dev", info.st_dev), ("ino", info.st_ino), ("uid", info.st_uid), ("gid", info.st_gid), ("mode", stat.S_IMODE(info.st_mode)))})
+    else:
+        arguments.update({"dev": "0", "ino": "0", "uid": "0", "gid": "0", "mode": "448"})
+    step = ProvisioningStep("remove_directory_if_empty", arguments)
     def runner(argv, **kwargs):
         if argv[2] == "/usr/bin/python3":
             return Result(stdout=json.dumps({"status": status}).encode())
@@ -321,6 +349,114 @@ def test_real_boundary_helper_unlink_removes_exact_attested_identity(tmp_path):
     assert not path.exists()
 
 
+def test_real_boundary_helper_rmdir_rejects_replacement_and_preserves_foreign_directory(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "state"; path.mkdir()
+    original = path.stat()
+    path.rmdir(); path.mkdir(); (path / "foreign").write_text("foreign")
+    process = subprocess.run([sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "rmdir", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(process.stdout.decode("ascii")) == {"status": "conflict"}
+    assert (path / "foreign").read_text() == "foreign"
+
+
+def test_real_boundary_helper_rmdir_removes_exact_inode_and_is_idempotent(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "state"; path.mkdir(); original = path.stat()
+    argv = [sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "rmdir", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))]
+    first = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    second = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(first.stdout.decode("ascii")) == {"status": "removed"}
+    assert json.loads(second.stdout.decode("ascii")) == {"status": "absent"}
+
+
+def test_real_boundary_helper_remove_tree_removes_nonreferenced_exact_runtime(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "runtime"; nested = path / "package"; nested.mkdir(parents=True); (nested / "app.py").write_text("approved")
+    original = path.stat(); commit = "a" * 40; digest = runtime_digest(path, commit)
+    process = subprocess.run(["sudo", "-n", sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode)), digest, commit], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(process.stdout.decode("ascii")) == {"status": "removed"}
+    assert not path.exists()
+
+
+def test_real_boundary_helper_remove_staging_tree_claims_exact_incomplete_tree(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "staging"; path.mkdir(); (path / "partial.py").write_text("partial")
+    original = path.stat()
+    process = subprocess.run(["sudo", "-n", sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_staging_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(process.stdout.decode("ascii")) == {"status": "removed"}
+    assert not path.exists()
+
+
+def test_production_adapter_runtime_cleanup_uses_real_boundary_helper(tmp_path):
+    path = tmp_path / "runtime"; path.mkdir(); (path / "app.py").write_text("approved")
+    commit = "a" * 40
+    step = ProvisioningStep("remove_runtime_if_unreferenced", {"path": str(path), "runtime_digest": runtime_digest(path, commit), "dev": str(path.stat().st_dev), "ino": str(path.stat().st_ino), "uid": str(path.stat().st_uid), "gid": str(path.stat().st_gid), "mode": str(stat.S_IMODE(path.stat().st_mode))})
+    plan = SimpleNamespace(steps=(step,), rollback_steps=(), adapter_commit=commit)
+
+    def runner(argv, **kwargs):
+        if argv[:2] == ["/usr/bin/sudo", "--"] and argv[2] == "/usr/bin/python3":
+            return subprocess.run(["sudo", "-n", *argv[2:]], **kwargs)
+        return Result()
+
+    result = ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION, runner=runner, euid_provider=lambda: 1000, username_provider=lambda _uid: "god").execute(step)
+    assert result["safe_code"] == "RUNTIME_REMOVED"
+    assert not path.exists()
+
+
+def test_real_boundary_helper_rmdir_replacement_race_does_not_confuse_verified_inode(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "state"; path.mkdir(); original = path.stat(); saved = tmp_path / "verified-original"; barrier = tmp_path / "race"
+    process = subprocess.Popen([sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "rmdir", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode)), str(barrier)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(5000):
+        if Path(str(barrier) + ".ready").exists(): break
+        time.sleep(0.001)
+    else:
+        process.kill(); raise AssertionError("helper did not reach claim barrier")
+    os.rename(path, saved); path.mkdir(); (path / "foreign").write_text("foreign"); Path(str(barrier) + ".go").touch()
+    stdout, stderr = process.communicate(timeout=10)
+    assert json.loads(stdout.decode("ascii")) == {"status": "conflict"}, stderr.decode(errors="replace")
+    assert saved.exists() and (path / "foreign").read_text() == "foreign"
+
+
+def test_real_boundary_helper_runtime_removal_rejects_replacement(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "runtime"; path.mkdir(); (path / "approved").write_text("approved")
+    original = path.stat()
+    shutil.rmtree(path); path.mkdir(); (path / "foreign").write_text("foreign")
+    process = subprocess.run([sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(process.stdout.decode("ascii")) == {"status": "conflict"}
+    assert (path / "foreign").read_text() == "foreign"
+
+
+def test_real_boundary_helper_runtime_replacement_race_preserves_verified_original_and_foreign(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "runtime"; path.mkdir(); (path / "approved").write_text("approved"); original = path.stat(); saved = tmp_path / "verified-runtime"; barrier = tmp_path / "runtime-race"; commit = "a" * 40; digest = runtime_digest(path, commit)
+    process = subprocess.Popen(["sudo", "-n", sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode)), digest, commit, str(barrier)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(5000):
+        if Path(str(barrier) + ".ready").exists(): break
+        time.sleep(0.001)
+    else:
+        process.kill(); raise AssertionError("helper did not reach claim barrier")
+    os.rename(path, saved); path.mkdir(); (path / "foreign").write_text("foreign"); Path(str(barrier) + ".go").touch()
+    stdout, stderr = process.communicate(timeout=10)
+    assert json.loads(stdout.decode("ascii")) == {"status": "conflict"}, stderr.decode(errors="replace")
+    assert (saved / "approved").read_text() == "approved" and (path / "foreign").read_text() == "foreign"
+
+
+def test_real_boundary_helper_runtime_reference_ambiguity_restores_claimed_directory(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+    path = tmp_path / "runtime"; path.mkdir(); (path / "approved").write_text("approved")
+    info = path.stat(); commit = "a" * 40; digest = runtime_digest(path, commit)
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=path)
+    try:
+        process = subprocess.run(["sudo", "-n", sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_tree", str(path), str(info.st_dev), str(info.st_ino), str(info.st_uid), str(info.st_gid), str(stat.S_IMODE(info.st_mode)), digest, commit], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        assert json.loads(process.stdout.decode("ascii")) == {"status": "conflict"}
+        assert (path / "approved").read_text() == "approved"
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
 @pytest.mark.parametrize("identity", ("+1", " 1", "01", "-1", str(1 << 64), "True"))
 def test_real_boundary_helper_unlink_rejects_noncanonical_identity_arguments(tmp_path, identity):
     from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
@@ -354,11 +490,12 @@ def test_installed_runtime_exact_digest_is_verified_noop(tmp_path):
     destination = tmp_path / "destination"
     source.mkdir()
     destination.mkdir()
+    destination.chmod(0o755)
     (source / "runtime.py").write_text("runtime = 1\n")
     shutil.copy2(source / "runtime.py", destination / "runtime.py")
     commit = "a" * 40
     digest = runtime_digest(source, commit)
-    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": digest, "destination": str(destination), "owner": "root", "immutable": True})
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": digest, "destination": str(destination), "owner": pwd.getpwuid(os.getuid()).pw_name, "immutable": True})
     calls = []
     result = adapter([step], lambda argv, **kwargs: calls.append(argv) or Result()).execute(step)
     assert result["disposition"] == "verified_noop"
@@ -379,6 +516,178 @@ def test_installed_runtime_conflict_fails_closed_before_mutation(tmp_path):
     with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
         adapter([step], lambda argv, **kwargs: calls.append(argv) or Result()).execute(step)
     assert calls == []
+
+
+@pytest.mark.parametrize("failure", ("rsync", "venv", "pip", "verification", "promotion"))
+def test_runtime_install_failure_cleans_exact_staging_and_retry_converges(tmp_path, monkeypatch, failure):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); (source / "runtime.py").write_text("runtime\n")
+    destination = tmp_path / "destination"; commit = "a" * 40; expected = "sha256:" + "b" * 64
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": expected, "destination": str(destination), "owner": "root", "immutable": True})
+    monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
+    def make_runner(fail):
+        def runner(argv, **kwargs):
+            if argv[2] == "/usr/bin/install" and "-d" in argv:
+                Path(argv[-1]).mkdir(parents=True)
+            if argv[2] == "/usr/bin/chmod":
+                os.chmod(argv[-1], int(argv[-2], 8))
+            if fail == "rsync" and "/usr/bin/rsync" in argv:
+                return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
+            if fail == "venv" and argv[4:7] == ["/usr/bin/python3", "-m", "venv"]:
+                return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
+            if fail == "pip" and len(argv) > 4 and argv[4].endswith("/pip"):
+                return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
+            return Result()
+        return runner
+    action = adapter([step], make_runner(failure))
+    cleanup_calls = []
+    def boundary(operation, *args):
+        if operation in {"remove_tree", "remove_staging_tree"}:
+            cleanup_calls.append(args)
+            shutil.rmtree(args[0], ignore_errors=False); return {"status": "removed"}
+        if operation == "promote":
+            return {"status": "conflict"}
+        raise AssertionError(operation)
+    action._boundary = boundary
+    if failure == "verification":
+        values = iter((expected, "sha256:" + "c" * 64))
+        monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: next(values))
+    with pytest.raises(Exception):
+        action.execute(step)
+    assert not destination.exists()
+    assert not tuple(tmp_path.glob(".overseer-runtime-staging-*"))
+    if failure == "verification":
+        assert cleanup_calls and cleanup_calls[0][5] == str(0o755)
+
+    monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
+    retry = adapter([step], make_runner(None))
+    retry._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else {"status": "removed"}
+    result = retry.execute(step)
+    assert result["safe_code"] == "RUNTIME_INSTALLED"
+    assert destination.is_dir()
+
+
+def test_runtime_install_real_staging_cleanup_and_retry_uses_privileged_boundary(tmp_path):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); (source / "runtime.py").write_text("runtime\n")
+    destination = tmp_path / "destination"; commit = "a" * 40; expected = runtime_digest(source, commit); owner = pwd.getpwuid(os.getuid()).pw_name
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": expected, "destination": str(destination), "owner": owner, "immutable": True})
+    state = {"fail_once": True}
+
+    def runner(argv, **kwargs):
+        if argv[2] == "/usr/bin/install" and "-d" in argv:
+            Path(argv[-1]).mkdir(parents=True)
+        if "/usr/bin/rsync" in argv:
+            if state["fail_once"]:
+                state["fail_once"] = False
+                return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
+            source_path = Path(argv[-2].rstrip("/")); staging_path = Path(argv[-1].rstrip("/")); staging_path.mkdir(parents=True, exist_ok=True)
+            for item in source_path.iterdir():
+                if item.is_file(): shutil.copy2(item, staging_path / item.name)
+        if argv[2] == "/usr/bin/chmod":
+            os.chmod(argv[-1], int(argv[-2], 8))
+        if argv[:2] == ["/usr/bin/sudo", "--"] and argv[2:5] == ["/usr/bin/python3", "-c", host._PRIVILEGED_BOUNDARY_HELPER] and argv[5] in {"promote", "remove_staging_tree", "remove_tree", "absence"}:
+            return subprocess.run(["sudo", "-n", *argv[2:]], **kwargs)
+        return Result()
+
+    def cleanup_staging():
+        for candidate in tuple(tmp_path.glob(".overseer-runtime-staging-*")):
+            subprocess.run(["sudo", "-n", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(candidate)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            shutil.rmtree(candidate)
+
+    try:
+        action = adapter([step], runner)
+        with pytest.raises(Exception):
+            action.execute(step)
+        assert not destination.exists()
+        assert not tuple(tmp_path.glob(".overseer-runtime-staging-*"))
+        result = adapter([step], runner).execute(step)
+        assert result["safe_code"] == "RUNTIME_INSTALLED"
+        assert destination.is_dir()
+        assert not tuple(tmp_path.glob(".overseer-runtime-staging-*"))
+    finally:
+        cleanup_staging()
+
+
+def test_runtime_install_destination_race_preserves_foreign_destination_and_cleans_staging(tmp_path, monkeypatch):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); destination = tmp_path / "destination"
+    commit = "a" * 40; expected = "sha256:" + "b" * 64
+    monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": expected, "destination": str(destination), "owner": "root", "immutable": True})
+    def runner(argv, **kwargs):
+        if argv[2] == "/usr/bin/install" and "-d" in argv: Path(argv[-1]).mkdir(parents=True)
+        return Result()
+    action = adapter([step], runner)
+    def boundary(operation, *args):
+        if operation == "promote":
+            destination.mkdir(); (destination / "foreign").write_text("foreign"); return {"status": "conflict"}
+        shutil.rmtree(args[0]); return {"status": "removed"}
+    action._boundary = boundary
+    with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+        action.execute(step)
+    assert (destination / "foreign").read_text() == "foreign"
+    assert not tuple(tmp_path.glob(".overseer-runtime-staging-*"))
+
+
+def test_runtime_install_cleanup_ambiguity_fails_closed_without_touching_destination(tmp_path, monkeypatch):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); destination = tmp_path / "destination"
+    expected = "sha256:" + "b" * 64
+    monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": "a" * 40, "runtime_digest": expected, "destination": str(destination), "owner": "root", "immutable": True})
+    def runner(argv, **kwargs):
+        if argv[2] == "/usr/bin/install" and "-d" in argv: Path(argv[-1]).mkdir(parents=True)
+        return Result()
+    action = adapter([step], runner)
+    action._boundary = lambda operation, *args: {"status": "error"} if operation == "remove_tree" else {"status": "conflict"}
+    with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+        action.execute(step)
+    assert not destination.exists()
+
+
+def test_runtime_install_post_promotion_attestation_failure_removes_only_promoted_identity(tmp_path, monkeypatch):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); destination = tmp_path / "destination"
+    expected = "sha256:" + "b" * 64
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": "a" * 40, "runtime_digest": expected, "destination": str(destination), "owner": "root", "immutable": True})
+    monkeypatch.setattr(host, "runtime_digest", lambda path, _commit: "sha256:" + "c" * 64 if Path(path) == destination else expected)
+    def runner(argv, **kwargs):
+        if argv[2] == "/usr/bin/install" and "-d" in argv: Path(argv[-1]).mkdir(parents=True)
+        return Result()
+    action = adapter([step], runner)
+    action._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else (shutil.rmtree(args[0]) or {"status": "removed"})
+    with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+        action.execute(step)
+    assert not destination.exists()
+
+
+def test_runtime_install_cleanup_identity_race_preserves_foreign_staging_replacement(tmp_path, monkeypatch):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); destination = tmp_path / "destination"
+    expected = "sha256:" + "b" * 64
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": "a" * 40, "runtime_digest": expected, "destination": str(destination), "owner": "root", "immutable": True})
+    monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
+    captured = {}
+    def runner(argv, **kwargs):
+        if argv[2] == "/usr/bin/install" and "-d" in argv:
+            Path(argv[-1]).mkdir(parents=True); captured["staging"] = Path(argv[-1])
+        if "/usr/bin/rsync" in argv:
+            original = captured["staging"]; saved = tmp_path / "verified-staging"
+            os.rename(original, saved); original.mkdir(); (original / "foreign").write_text("foreign")
+            return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
+        return Result()
+    action = adapter([step], runner)
+    def boundary(operation, *args):
+        if operation != "remove_tree": raise AssertionError(operation)
+        current = Path(args[0]).stat()
+        if (str(current.st_dev), str(current.st_ino)) != (args[1], args[2]): return {"status": "conflict"}
+        shutil.rmtree(args[0]); return {"status": "removed"}
+    action._boundary = boundary
+    with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+        action.execute(step)
+    assert (captured["staging"] / "foreign").read_text() == "foreign"
+    assert (tmp_path / "verified-staging").exists() and not destination.exists()
 
 def test_construction_requires_explicit_confirmation_and_root():
     plan=SimpleNamespace(steps=(),rollback_steps=())
@@ -692,17 +1001,31 @@ def test_default_mcp_loader_initializes_session_then_lists_tools(monkeypatch):
     assert [item[0].get("method") for item in requests]==["initialize","notifications/initialized","tools/list"]
     assert requests[1][1]["Mcp-session-id"]=="session-1" and requests[2][2]==10
 
-def test_install_excludes_local_environments_and_caches(monkeypatch):
+def test_install_excludes_local_environments_and_caches(monkeypatch, tmp_path):
     import overseer.backup_host_operations as host
-    commit="a"*40; expected="sha256:"+"b"*64; step=ProvisioningStep("install_runtime",{"source":"/published","commit":commit,"runtime_digest":expected,"destination":"/installed","owner":"root","immutable":True}); calls=[]
+    commit="a"*40; expected="sha256:"+"b"*64; destination = tmp_path / "installed"; step=ProvisioningStep("install_runtime",{"source":"/published","commit":commit,"runtime_digest":expected,"destination":str(destination),"owner":pwd.getpwuid(os.getuid()).pw_name,"immutable":True}); calls=[]
     monkeypatch.setattr(host,"runtime_digest",lambda path,revision:expected)
-    adapter([step],lambda argv,**kwargs:calls.append(argv) or Result()).execute(step)
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[2] == "/usr/bin/install" and "-d" in argv:
+            Path(argv[-1]).mkdir(parents=True)
+        if argv[2] == "/usr/bin/chmod":
+            os.chmod(argv[-1], int(argv[-2], 8))
+        return Result()
+    action = adapter([step], runner)
+    action._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else {"status": "removed"}
+    action.execute(step)
     rsync=next(argv for argv in calls if "/usr/bin/rsync" in argv)
     assert {"--exclude=.git","--exclude=.venv","--exclude=.codex","--exclude=.agents","--exclude=__pycache__","--exclude=.pytest_cache","--exclude=tests","--exclude=docs"}<=set(rsync)
-    pip=next(argv for argv in calls if argv[-2:]==["install","/installed"])
+    pip=next(argv for argv in calls if argv[-2] == "install" and argv[-3].endswith("/pip"))
     assert "--no-deps" not in pip
     import_check=next(argv for argv in calls if argv[-2:]==["-c","import theunderdark.production_cli"])
     assert calls.index(pip)<calls.index(import_check)
+    assert destination.stat().st_mode & 0o777 == 0o755
+    before_retry_calls = len(calls)
+    retry = action.execute(step)
+    assert retry["safe_code"] == "RUNTIME_ALREADY_CURRENT"
+    assert len(calls) == before_retry_calls
 
 def test_runtime_digest_excludes_agent_metadata_tests_and_docs(tmp_path):
     for directory in (".codex",".agents","tests","docs"):

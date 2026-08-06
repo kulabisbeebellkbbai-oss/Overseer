@@ -49,7 +49,7 @@ MAX_WRAPPER_DIAGNOSTIC_BYTES=8192
 MAX_BOUNDARY_BYTES = 16 * 1024 * 1024
 MAX_BOUNDARY_COUNT = 64
 _PRIVILEGED_BOUNDARY_HELPER = r'''
-import hashlib, json, os, pwd, re, stat, sys, time
+import ctypes, errno, hashlib, json, os, pwd, re, secrets, stat, sys, time
 
 MAX_BYTES = 16 * 1024 * 1024
 
@@ -146,7 +146,77 @@ def unlink_exact(path, owner, mode, expected_dev, expected_ino, expected):
     finally:
         os.close(parent_fd)
 
-def rmdir_exact(path):
+def identity(value):
+    if not isinstance(value, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+        raise ValueError("noncanonical identity")
+    parsed = int(value, 10)
+    if parsed > (1 << 64) - 1:
+        raise ValueError("identity overflow")
+    return parsed
+
+def rename_noreplace(parent_fd, old_name, new_name):
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(parent_fd, old_name.encode(), parent_fd, new_name.encode(), 1)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+def runtime_digest_fd(root_fd, commit):
+    files = []
+    total = 0
+    excluded = {".git", ".venv", ".codex", ".agents", "__pycache__", ".pytest_cache", "tests", "docs"}
+    def walk(fd, prefix=()):
+        nonlocal total
+        entries = sorted(os.scandir(fd), key=lambda entry: entry.name)
+        for entry in entries:
+            relative = prefix + (entry.name,)
+            if any(part in excluded for part in relative):
+                continue
+            item = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISLNK(item.st_mode) or (not stat.S_ISDIR(item.st_mode) and not stat.S_ISREG(item.st_mode)):
+                raise OSError(errno.ELOOP, "unsupported runtime entry")
+            if stat.S_ISDIR(item.st_mode):
+                child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode)) != (item.st_dev, item.st_ino, item.st_uid, item.st_gid, stat.S_IMODE(item.st_mode)):
+                        raise OSError(errno.EAGAIN, "runtime entry replaced")
+                    walk(child_fd, relative)
+                finally:
+                    os.close(child_fd)
+            else:
+                file_fd = os.open(entry.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    opened = os.fstat(file_fd)
+                    if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode), opened.st_nlink) != (item.st_dev, item.st_ino, item.st_uid, item.st_gid, stat.S_IMODE(item.st_mode), item.st_nlink):
+                        raise OSError(errno.EAGAIN, "runtime entry replaced")
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(file_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_BYTES:
+                            raise ValueError("oversized")
+                        digest.update(chunk)
+                    files.append({"path": "/".join(relative), "mode": stat.S_IMODE(item.st_mode), "sha256": "sha256:" + digest.hexdigest()})
+                finally:
+                    os.close(file_fd)
+    walk(root_fd)
+    payload = json.dumps({"version": 1, "commit": commit, "files": files}, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+def claim_directory(path, expected_dev, expected_ino, expected_uid, expected_gid, expected_mode, recursive, expected_digest=None, commit=None, barrier=None, verify_digest=True):
+    expected_dev = identity(expected_dev)
+    expected_ino = identity(expected_ino)
+    expected_uid = identity(expected_uid)
+    expected_gid = identity(expected_gid)
+    expected_mode = identity(expected_mode)
     parent, name = os.path.split(path)
     parent_fd = os.open(parent or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -156,16 +226,150 @@ def rmdir_exact(path):
             return {"status": "absent"}
         if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
             return {"status": "unsafe"}
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-        except OSError as error:
-            if error.errno in (39, 66):
-                return {"status": "conflict"}
+        if (item.st_dev, item.st_ino, item.st_uid, item.st_gid, stat.S_IMODE(item.st_mode)) != (expected_dev, expected_ino, expected_uid, expected_gid, expected_mode):
+            return {"status": "conflict"}
+        if barrier is not None:
+            open(barrier + ".ready", "wb").close()
+            deadline = time.monotonic() + 10
+            while not os.path.exists(barrier + ".go"):
+                if time.monotonic() >= deadline:
+                    return {"status": "error"}
+                time.sleep(0.001)
+        for _ in range(8):
+            quarantine = ".overseer-claim-" + secrets.token_hex(16)
+            try:
+                rename_noreplace(parent_fd, name, quarantine)
+                break
+            except FileExistsError:
+                continue
+        else:
             return {"status": "error"}
+        claimed_fd = None
         try:
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
+            claimed_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+            claimed = os.fstat(claimed_fd)
+            if (claimed.st_dev, claimed.st_ino) != (expected_dev, expected_ino):
+                try:
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    rename_noreplace(parent_fd, quarantine, name)
+                return {"status": "conflict"}
+            if (claimed.st_uid, claimed.st_gid, stat.S_IMODE(claimed.st_mode)) != (expected_uid, expected_gid, expected_mode):
+                try:
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    rename_noreplace(parent_fd, quarantine, name)
+                return {"status": "conflict"}
+            if not recursive and os.listdir(claimed_fd):
+                try:
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    rename_noreplace(parent_fd, quarantine, name)
+                return {"status": "conflict"}
+            if recursive:
+                if verify_digest and (not isinstance(expected_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+                    try:
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        rename_noreplace(parent_fd, quarantine, name)
+                    return {"status": "conflict"}
+                digest = runtime_digest_fd(claimed_fd, commit) if verify_digest else None
+                if verify_digest and digest != expected_digest:
+                    try:
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        rename_noreplace(parent_fd, quarantine, name)
+                    return {"status": "conflict"}
+                references = runtime_references(os.path.abspath(os.path.join(parent or ".", quarantine)), ignored_pid=os.getpid())
+                if references.get("status") != "clear":
+                    try:
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        rename_noreplace(parent_fd, quarantine, name)
+                    return {"status": "conflict"}
+            def remove_tree(fd):
+                for entry in os.scandir(fd):
+                    child = entry.name
+                    child_stat = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISLNK(child_stat.st_mode) or (not stat.S_ISDIR(child_stat.st_mode) and not stat.S_ISREG(child_stat.st_mode)):
+                        raise OSError(errno.ELOOP, "unexpected entry")
+                    quarantine_child = ".overseer-child-" + secrets.token_hex(16)
+                    rename_noreplace(fd, child, quarantine_child)
+                    try:
+                        if stat.S_ISDIR(child_stat.st_mode):
+                            child_fd = os.open(quarantine_child, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+                            try:
+                                opened = os.fstat(child_fd)
+                                if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode)) != (child_stat.st_dev, child_stat.st_ino, child_stat.st_uid, child_stat.st_gid, stat.S_IMODE(child_stat.st_mode)):
+                                    raise OSError(errno.EAGAIN, "entry replaced")
+                                remove_tree(child_fd)
+                            finally:
+                                os.close(child_fd)
+                            os.rmdir(quarantine_child, dir_fd=fd)
+                        else:
+                            child_fd = os.open(quarantine_child, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+                            try:
+                                opened = os.fstat(child_fd)
+                                if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode)) != (child_stat.st_dev, child_stat.st_ino, child_stat.st_uid, child_stat.st_gid, stat.S_IMODE(child_stat.st_mode)):
+                                    raise OSError(errno.EAGAIN, "entry replaced")
+                            finally:
+                                os.close(child_fd)
+                            os.unlink(quarantine_child, dir_fd=fd)
+                    except OSError:
+                        try:
+                            rename_noreplace(fd, quarantine_child, child)
+                        except OSError:
+                            raise OSError(errno.EEXIST, "child restoration ambiguous")
+                        raise
+            if recursive:
+                remove_tree(claimed_fd)
+            os.rmdir(quarantine, dir_fd=parent_fd)
             return {"status": "removed"}
+        except OSError as error:
+            try:
+                if claimed_fd is not None:
+                    try:
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        rename_noreplace(parent_fd, quarantine, name)
+                    else:
+                        return {"status": "error"}
+            except OSError:
+                return {"status": "error"}
+            return {"status": "conflict" if error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EAGAIN, errno.ELOOP) else "error"}
+        finally:
+            if claimed_fd is not None:
+                os.close(claimed_fd)
+    finally:
+        os.close(parent_fd)
+
+def promote_exact(source, destination, expected_dev, expected_ino, expected_uid, expected_gid, expected_mode):
+    expected_dev = identity(expected_dev)
+    expected_ino = identity(expected_ino)
+    expected_uid = identity(expected_uid)
+    expected_gid = identity(expected_gid)
+    expected_mode = identity(expected_mode)
+    source_parent, source_name = os.path.split(source)
+    destination_parent, destination_name = os.path.split(destination)
+    if os.path.realpath(source_parent or ".") != os.path.realpath(destination_parent or "."):
+        return {"status": "conflict"}
+    parent_fd = os.open(source_parent or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        try:
+            item = os.stat(source_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"status": "conflict"}
+        if not stat.S_ISDIR(item.st_mode) or (item.st_dev, item.st_ino, item.st_uid, item.st_gid, stat.S_IMODE(item.st_mode)) != (expected_dev, expected_ino, expected_uid, expected_gid, expected_mode):
+            return {"status": "conflict"}
+        try:
+            os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+            return {"status": "conflict"}
+        except FileNotFoundError:
+            pass
+        rename_noreplace(parent_fd, source_name, destination_name)
+        final = os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+        return {"status": "promoted"} if (final.st_dev, final.st_ino, final.st_uid, final.st_gid, stat.S_IMODE(final.st_mode)) == (expected_dev, expected_ino, expected_uid, expected_gid, expected_mode) else {"status": "error"}
+    except FileExistsError:
         return {"status": "conflict"}
     finally:
         os.close(parent_fd)
@@ -202,11 +406,13 @@ def inside(root, candidate):
     resolved = os.path.realpath(candidate)
     return resolved == root or resolved.startswith(root + os.sep)
 
-def runtime_references(path):
+def runtime_references(path, ignored_pid=None):
     root = os.path.realpath(path)
     count = 0
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit():
+            continue
+        if ignored_pid is not None and int(entry.name) == ignored_pid:
             continue
         base = os.path.join("/proc", entry.name)
         for relative in ("cwd", "root", "exe"):
@@ -222,9 +428,7 @@ def runtime_references(path):
                 return {"status": "error"}
         try:
             fd_dir = os.path.join(base, "fd")
-            for index, descriptor in enumerate(os.scandir(fd_dir)):
-                if index >= 256:
-                    return {"status": "error"}
+            for descriptor in os.scandir(fd_dir):
                 try:
                     if inside(root, os.readlink(descriptor.path)):
                         count += 1
@@ -262,7 +466,13 @@ try:
     elif operation == "unlink":
         result = unlink_exact(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
     elif operation == "rmdir":
-        result = rmdir_exact(sys.argv[2])
+        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], False, None, None, sys.argv[8] if len(sys.argv) > 8 else None)
+    elif operation == "remove_tree":
+        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, sys.argv[8] if len(sys.argv) > 8 else None, sys.argv[9] if len(sys.argv) > 9 else None, sys.argv[10] if len(sys.argv) > 10 else None)
+    elif operation == "remove_staging_tree":
+        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, None, None, None, False)
+    elif operation == "promote":
+        result = promote_exact(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8])
     elif operation == "absence":
         result = absent(sys.argv[2])
     elif operation == "references":
@@ -313,7 +523,7 @@ _SAFE_CODES = frozenset({
 })
 _SAFE_EVIDENCE_KEYS = frozenset({
     "active_enter_timestamp_monotonic", "config_digest", "identity_digest", "runtime_digest",
-    "source_commit_verified", "unit_digest", "roots_added", "roots_verified", "acl_verified",
+    "source_commit_verified", "unit_digest", "roots_added", "roots_verified", "acl_verified", "dev", "ino", "uid", "gid", "mode",
         "enabled", "active", "metadata_verified", "size_bytes", "previously_enabled", "previously_active", "service_verified", "acl_present_before",
 })
 _FORBIDDEN_EVIDENCE_TERMS = ("stdout", "stderr", "secret", "token", "password", "private", "path", "content", "raw")
@@ -337,9 +547,13 @@ class HostOperationResult:
                 raise ValueError("host operation evidence key is unsafe")
             if isinstance(value, bool):
                 continue
+            if key in {"dev", "ino", "uid", "gid", "mode"} and isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+                if int(value) <= (1 << 64) - 1 and (key != "mode" or int(value) <= 0o7777):
+                    continue
+                raise ValueError("host operation identity evidence is unsafe")
             if type(value) is int and 0 <= value <= 1_000_000_000:
                 continue
-            if key == "active_enter_timestamp_monotonic" and isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,38}", value):
+            if key in {"active_enter_timestamp_monotonic", "dev", "ino", "uid", "gid", "mode"} and isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,38}", value):
                 continue
             if isinstance(value, str) and (_SAFE_DIGEST.fullmatch(value) or (key == "source_commit_verified" and value in {"true", "false"})):
                 continue
@@ -445,16 +659,58 @@ class ConcreteHostProvisioningAdapter:
         except FileNotFoundError: destination_info = None
         if destination_info is not None:
             if stat.S_ISLNK(destination_info.st_mode) or not stat.S_ISDIR(destination_info.st_mode): raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            try: expected_owner = pwd.getpwnam(a.get("owner", "root"))
+            except KeyError: raise RedactedHostOperationError("RUNTIME_CONFLICT") from None
+            if (destination_info.st_uid, destination_info.st_gid, stat.S_IMODE(destination_info.st_mode)) != (expected_owner.pw_uid, expected_owner.pw_gid, 0o755): raise RedactedHostOperationError("RUNTIME_CONFLICT")
             existing = runtime_digest(destination, a["commit"])
             if existing == a["runtime_digest"]:
-                return HostOperationResult.verified_noop("RUNTIME_ALREADY_CURRENT", {"runtime_digest": existing})
+                return HostOperationResult.verified_noop("RUNTIME_ALREADY_CURRENT", {"runtime_digest": existing, "metadata_verified": True, "dev": str(destination_info.st_dev), "ino": str(destination_info.st_ino), "uid": str(destination_info.st_uid), "gid": str(destination_info.st_gid), "mode": str(stat.S_IMODE(destination_info.st_mode))})
             raise RedactedHostOperationError("RUNTIME_CONFLICT")
         excludes=[f"--exclude={name}" for name in sorted(RUNTIME_EXCLUDED)]
-        self._sudo(["/usr/bin/install","-d","-m","0755",a["destination"]]); self._sudo(["/usr/bin/rsync","-a","--delete",*excludes,a["source"].rstrip("/")+"/",a["destination"].rstrip("/")+"/"])
-        self._sudo(["/usr/bin/python3","-m","venv",a["destination"]+"/.venv"]); self._sudo([a["destination"]+"/.venv/bin/pip","install",a["destination"]])
-        self._sudo([a["destination"]+"/.venv/bin/python","-c","import theunderdark.production_cli"])
-        if runtime_digest(a["destination"],a["commit"])!=a["runtime_digest"]: raise RuntimeError("installed runtime digest mismatch")
-        return HostOperationResult.changed("RUNTIME_INSTALLED", {"runtime_digest": a["runtime_digest"]})
+        staging = destination.parent / (".overseer-runtime-staging-" + secrets.token_hex(16))
+        creation_info = None
+        staging_info = None
+        promoted_info = None
+        try:
+            self._sudo(["/usr/bin/install","-d","-m","0700","-o",a.get("owner", "root"),"-g",a.get("owner", "root"),str(staging)])
+            creation_info = staging.lstat()
+            self._sudo(["/usr/bin/rsync","-a","--delete",*excludes,a["source"].rstrip("/")+"/",str(staging).rstrip("/")+"/"])
+            self._sudo(["/usr/bin/python3","-m","venv",str(staging)+"/.venv"])
+            self._sudo([str(staging)+"/.venv/bin/pip","install",str(staging)])
+            self._sudo([str(staging)+"/.venv/bin/python","-c","import theunderdark.production_cli"])
+            self._sudo(["/usr/bin/chown","-R",a.get("owner", "root")+":"+a.get("owner", "root"),str(staging)])
+            self._sudo(["/usr/bin/chmod","0755",str(staging)])
+            staging_info = staging.lstat()
+            if creation_info is None or (staging_info.st_dev, staging_info.st_ino) != (creation_info.st_dev, creation_info.st_ino): raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            if runtime_digest(staging,a["commit"])!=a["runtime_digest"]: raise RuntimeError("installed runtime digest mismatch")
+            promoted = self._boundary("promote", str(staging), str(destination), str(staging_info.st_dev), str(staging_info.st_ino), str(staging_info.st_uid), str(staging_info.st_gid), str(stat.S_IMODE(staging_info.st_mode)))
+            if promoted.get("status") != "promoted": raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            promoted_info = staging_info
+            final = destination.lstat()
+            if (final.st_dev, final.st_ino, final.st_uid, final.st_gid, stat.S_IMODE(final.st_mode)) != (staging_info.st_dev, staging_info.st_ino, staging_info.st_uid, staging_info.st_gid, stat.S_IMODE(staging_info.st_mode)) or runtime_digest(destination,a["commit"])!=a["runtime_digest"]: raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            return HostOperationResult.changed("RUNTIME_INSTALLED", {"runtime_digest": a["runtime_digest"], "metadata_verified": True, "dev": str(final.st_dev), "ino": str(final.st_ino), "uid": str(final.st_uid), "gid": str(final.st_gid), "mode": str(stat.S_IMODE(final.st_mode))})
+        except Exception:
+            try:
+                cleanup_path = destination if promoted_info is not None else staging
+                cleanup_info = promoted_info if promoted_info is not None else staging_info
+                if cleanup_info is None:
+                    if creation_info is None: raise RedactedHostOperationError("RUNTIME_CONFLICT")
+                    current_info = staging.lstat()
+                    if (current_info.st_dev, current_info.st_ino) != (creation_info.st_dev, creation_info.st_ino): raise RedactedHostOperationError("RUNTIME_CONFLICT")
+                    cleanup_info = current_info
+                if cleanup_info is None: raise RedactedHostOperationError("RUNTIME_CONFLICT")
+                cleanup_operation = "remove_tree" if promoted_info is not None else "remove_staging_tree"
+                cleanup_arguments = (str(cleanup_path), str(cleanup_info.st_dev), str(cleanup_info.st_ino), str(cleanup_info.st_uid), str(cleanup_info.st_gid), str(stat.S_IMODE(cleanup_info.st_mode)))
+                if cleanup_operation == "remove_tree":
+                    cleanup_arguments += (a["runtime_digest"], a["commit"])
+                cleaned = self._boundary(cleanup_operation, *cleanup_arguments)
+                if cleaned.get("status") not in {"removed", "absent"}:
+                    raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            except FileNotFoundError:
+                pass
+            except Exception as cleanup_error:
+                raise RedactedHostOperationError("RUNTIME_CONFLICT") from cleanup_error
+            raise
     def _verify_endpoint_migration_ready(self,a):
         if a.get("host") != "127.0.0.1" or a.get("port") != 8799 or a.get("forbid_simultaneous_user_and_system_service") is not True:
             raise RedactedHostOperationError("ENDPOINT_CONFLICT")
@@ -480,19 +736,23 @@ class ConcreteHostProvisioningAdapter:
     def _ensure_directory(self,a):
         local = self._directory_identity(a["path"], a["owner"], int(a["mode"]))
         if local is not None:
-            return HostOperationResult.verified_noop("DIRECTORY_ALREADY_CURRENT", {"metadata_verified": True})
+            return HostOperationResult.verified_noop("DIRECTORY_ALREADY_CURRENT", {"metadata_verified": True, **{key: str(local[key]) for key in ("dev", "ino", "uid", "gid", "mode")}})
         probe = self._run(["/usr/bin/stat", "-c", "%u:%g:%a:%h:%F", a["path"]], acceptable=(0, 1))
         if getattr(probe, "returncode", 1) == 0:
             fields = getattr(probe, "stdout", b"").decode("utf-8", "strict").strip().split(":")
             try: expected = pwd.getpwnam(a["owner"])
             except KeyError: raise RedactedHostOperationError("DIRECTORY_CONFLICT") from None
             if len(fields) == 5 and fields[0] == str(expected.pw_uid) and fields[1] == str(expected.pw_gid) and int(fields[2], 8) == int(a["mode"]) and int(fields[3]) >= 2 and fields[4] == "directory":
-                return HostOperationResult.verified_noop("DIRECTORY_ALREADY_CURRENT", {"metadata_verified": True})
+                identity = self._directory_identity(a["path"], a["owner"], int(a["mode"]))
+                if identity is None:
+                    raise RedactedHostOperationError("DIRECTORY_CONFLICT")
+                return HostOperationResult.verified_noop("DIRECTORY_ALREADY_CURRENT", {"metadata_verified": True, **{key: str(identity[key]) for key in ("dev", "ino", "uid", "gid", "mode")}})
             raise RedactedHostOperationError("DIRECTORY_CONFLICT")
         self._sudo(["/usr/bin/install","-d","-m",format(a["mode"],"04o"),"-o",a["owner"],"-g",a["owner"],a["path"]])
-        if self._directory_identity(a["path"], a["owner"], int(a["mode"])) is None:
+        identity = self._directory_identity(a["path"], a["owner"], int(a["mode"]))
+        if identity is None:
             raise RedactedHostOperationError("DIRECTORY_CONFLICT")
-        return HostOperationResult.changed("DIRECTORY_CREATED", {"metadata_verified": True})
+        return HostOperationResult.changed("DIRECTORY_CREATED", {"metadata_verified": True, **{key: str(identity[key]) for key in ("dev", "ino", "uid", "gid", "mode")}})
 
     def _directory_identity(self, path, owner, mode):
         try:
@@ -503,7 +763,7 @@ class ConcreteHostProvisioningAdapter:
                 return None
             if result.get("status") != "present":
                 raise RedactedHostOperationError("DIRECTORY_CONFLICT")
-            return {"dev": result["dev"], "ino": result["ino"], "privileged": True}
+            return {key: result[key] for key in ("dev", "ino", "uid", "gid", "mode")} | {"privileged": True}
     def _generate_secret_file(self,a): return self._secret(a,binary=False)
     def _generate_cursor_key(self,a): return self._secret(a,binary=True)
     def _secret(self,a,binary):
@@ -680,11 +940,13 @@ class ConcreteHostProvisioningAdapter:
         if getattr(result,"stdout",b"").strip(): return HostOperationResult.verified_noop("SECRET_RETAINED_WITH_BACKUPS")
         return self._remove_exact_file(a["path"], a.get("digest") or self._rollback_expected("identity_digest"), a.get("owner", getattr(self.plan, "system_user", "")), int(a.get("mode", 0o600)), "SECRET_REMOVED", "SECRET_ALREADY_ABSENT")
     def _remove_directory_if_empty(self,a):
+        identity = {key: a.get(key) or self._rollback_expected(key) for key in ("dev", "ino", "uid", "gid", "mode")}
+        if any(identity[key] is None for key in identity): raise RedactedHostOperationError("DIRECTORY_CONFLICT")
         try:
-            result = self._boundary("rmdir", a["path"])
+            result = self._boundary("rmdir", a["path"], *(str(identity[key]) for key in ("dev", "ino", "uid", "gid", "mode")))
         except RedactedHostOperationError as error:
             raise RedactedHostOperationError("DIRECTORY_CONFLICT") from error
-        if result.get("status") == "removed": return HostOperationResult.changed("DIRECTORY_REMOVED")
+        if result.get("status") == "removed": return HostOperationResult.changed("DIRECTORY_REMOVED", {"metadata_verified": True})
         if result.get("status") == "absent": return HostOperationResult.verified_noop("DIRECTORY_ALREADY_ABSENT")
         raise RedactedHostOperationError("DIRECTORY_CONFLICT")
     def _remove_system_user_if_unused(self,a):
@@ -700,30 +962,18 @@ class ConcreteHostProvisioningAdapter:
         if getattr(removed,"returncode",1)==6: return HostOperationResult.verified_noop("SYSTEM_USER_ALREADY_ABSENT")
         raise RedactedHostOperationError("SYSTEM_USER_CONFLICT")
     def _remove_runtime_if_unreferenced(self,a):
-        target = Path(a["path"])
-        try: info = target.lstat()
-        except FileNotFoundError: return HostOperationResult.verified_noop("RUNTIME_ALREADY_ABSENT")
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode): raise RedactedHostOperationError("RUNTIME_CONFLICT")
-        references = a.get("references")
-        if references is None:
-            try:
-                probe = self._boundary("references", a["path"])
-            except RedactedHostOperationError as error:
-                raise RedactedHostOperationError("RUNTIME_CONFLICT") from error
-            if probe.get("status") == "referenced":
-                raise RedactedHostOperationError("RUNTIME_CONFLICT")
-            if probe.get("status") != "clear":
-                raise RedactedHostOperationError("RUNTIME_CONFLICT")
-            references = ()
-        if not isinstance(references, (list, tuple)) or len(references) > 64 or any(not isinstance(item, str) or len(item) > 512 for item in references):
-            raise RedactedHostOperationError("RUNTIME_CONFLICT")
-        if references:
-            raise RedactedHostOperationError("RUNTIME_CONFLICT")
         expected = a.get("runtime_digest") or self._rollback_expected("runtime_digest", getattr(self.plan, "runtime_digest", None))
-        if isinstance(expected, str) and runtime_digest(target, getattr(self.plan, "adapter_commit", "")) != expected: raise RedactedHostOperationError("RUNTIME_CONFLICT")
-        self._sudo(["/usr/bin/rm","-r","--one-file-system","--",a["path"]],acceptable=(0,1))
+        if not isinstance(expected, str) or not _SAFE_DIGEST.fullmatch(expected): raise RedactedHostOperationError("RUNTIME_CONFLICT")
+        identity = {key: a.get(key) or self._rollback_expected(key) for key in ("dev", "ino", "uid", "gid", "mode")}
+        identity = {key: "0" if identity[key] is None else identity[key] for key in identity}
+        try:
+            result = self._boundary("remove_tree", a["path"], *(str(identity[key]) for key in ("dev", "ino", "uid", "gid", "mode")), expected, getattr(self.plan, "adapter_commit", ""))
+        except RedactedHostOperationError as error:
+            raise RedactedHostOperationError("RUNTIME_CONFLICT") from error
+        if result.get("status") == "absent": return HostOperationResult.verified_noop("RUNTIME_ALREADY_ABSENT")
+        if result.get("status") != "removed": raise RedactedHostOperationError("RUNTIME_CONFLICT")
         if self._boundary("absence", a["path"]).get("status") != "absent": raise RedactedHostOperationError("RUNTIME_CONFLICT")
-        return HostOperationResult.changed("RUNTIME_REMOVED")
+        return HostOperationResult.changed("RUNTIME_REMOVED", {"runtime_digest": expected, "metadata_verified": True})
     def _install_bytes(self,path,data,mode,owner):
         fd,name=tempfile.mkstemp(prefix="overseer-provision-"); staging=Path(name)
         try:
@@ -768,6 +1018,9 @@ class ConcreteHostProvisioningAdapter:
             "dir_attest": {"absent": {"status"}, "unsafe": {"status"}, "present": {"status", "dev", "ino", "uid", "gid", "mode", "nlink"}},
             "unlink": {"absent": {"status"}, "unsafe": {"status"}, "conflict": {"status"}, "removed": {"status", "size"}},
             "rmdir": {item: {"status"} for item in ("absent", "unsafe", "conflict", "removed", "error")},
+            "remove_tree": {item: {"status"} for item in ("absent", "unsafe", "conflict", "removed", "error")},
+            "remove_staging_tree": {item: {"status"} for item in ("absent", "unsafe", "conflict", "removed", "error")},
+            "promote": {item: {"status"} for item in ("conflict", "promoted", "error")},
             "absence": {item: {"status"} for item in ("absent", "unsafe", "present")},
             "references": {"error": {"status"}, "clear": {"status", "count"}, "referenced": {"status", "count"}},
         }
@@ -919,11 +1172,15 @@ def _safe_existing_directory_identity(path, owner, mode):
         raise
     try:
         info = os.fstat(fd)
+        parent_path = os.path.dirname(os.path.abspath(os.fspath(path))) or "."
+        parent_info = os.stat(parent_path, follow_symlinks=False)
+        if parent_info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(parent_info.st_mode) & 0o022:
+            raise RedactedHostOperationError("DIRECTORY_CONFLICT")
         try: expected = pwd.getpwnam(owner)
         except KeyError: raise RedactedHostOperationError("DIRECTORY_CONFLICT") from None
         if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 2 or info.st_uid != expected.pw_uid or info.st_gid != expected.pw_gid or stat.S_IMODE(info.st_mode) != mode:
             raise RedactedHostOperationError("DIRECTORY_CONFLICT")
-        return {"dev": info.st_dev, "ino": info.st_ino}
+        return {"dev": info.st_dev, "ino": info.st_ino, "uid": info.st_uid, "gid": info.st_gid, "mode": stat.S_IMODE(info.st_mode)}
     finally:
         os.close(fd)
 

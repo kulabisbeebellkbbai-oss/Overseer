@@ -331,7 +331,7 @@ class ProvisioningStepEvidence:
                 raise ValueError("persisted adapter evidence key is invalid")
             if any(term in key.lower() for term in ("stdout", "stderr", "secret", "token", "password", "private", "path", "content", "raw")):
                 raise ValueError("persisted adapter evidence key is unsafe")
-            if isinstance(value, bool) or (type(value) is int and 0 <= value <= 1_000_000_000) or (isinstance(value, str) and (re.fullmatch(r"sha256:[0-9a-f]{64}", value) or re.fullmatch(r"[1-9][0-9]{0,38}", value))):
+            if isinstance(value, bool) or (type(value) is int and 0 <= value <= 1_000_000_000) or (isinstance(value, str) and (re.fullmatch(r"sha256:[0-9a-f]{64}", value) or (re.fullmatch(r"(?:0|[1-9][0-9]*)", value) and int(value) <= (1 << 64) - 1))):
                 clean[key] = value
             else:
                 raise ValueError("persisted adapter evidence value is invalid")
@@ -519,7 +519,9 @@ def header_payload(header: ProvisioningExecutionHeader) -> str:
 
 def checkpoint_payload(checkpoint: ProvisioningCheckpoint) -> str:
     _validate_checkpoint_fields(checkpoint)
-    return canonical_json(checkpoint)
+    values = _checkpoint_values(checkpoint)
+    values["checkpoint_digest"] = checkpoint.checkpoint_digest
+    return _canonical(values)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -823,10 +825,10 @@ def _result_digest(operation: str, result: object, safe_code: str) -> str:
 
 _ADAPTER_RESULT_CONTRACT = {
     "verify_published_adapter_source": ({"verified_noop"}, {"SOURCE_ALREADY_PUBLISHED"}, {"source_commit_verified"}),
-    "install_runtime": ({"changed", "verified_noop"}, {"RUNTIME_INSTALLED", "RUNTIME_ALREADY_CURRENT"}, {"runtime_digest", "metadata_verified"}),
+    "install_runtime": ({"changed", "verified_noop"}, {"RUNTIME_INSTALLED", "RUNTIME_ALREADY_CURRENT"}, {"runtime_digest", "metadata_verified", "dev", "ino", "uid", "gid", "mode"}),
     "verify_endpoint_migration_ready": ({"verified_noop"}, {"ENDPOINT_READY"}, set()),
     "ensure_system_user": ({"changed", "verified_noop"}, {"SYSTEM_USER_CREATED", "SYSTEM_USER_ALREADY_CURRENT"}, {"metadata_verified"}),
-    "ensure_directory": ({"changed", "verified_noop"}, {"DIRECTORY_CREATED", "DIRECTORY_ALREADY_CURRENT"}, {"metadata_verified"}),
+    "ensure_directory": ({"changed", "verified_noop"}, {"DIRECTORY_CREATED", "DIRECTORY_ALREADY_CURRENT"}, {"metadata_verified", "dev", "ino", "uid", "gid", "mode"}),
     "generate_secret_file": ({"changed", "verified_noop"}, {"SECRET_CREATED", "SECRET_ALREADY_PRESENT"}, {"size_bytes", "metadata_verified", "identity_digest"}),
     "generate_cursor_key": ({"changed", "verified_noop"}, {"SECRET_CREATED", "SECRET_ALREADY_PRESENT"}, {"size_bytes", "metadata_verified", "identity_digest"}),
     "install_overseer_api_token": ({"changed", "verified_noop"}, {"TOKEN_INSTALLED", "TOKEN_ALREADY_PRESENT"}, {"identity_digest", "metadata_verified"}),
@@ -892,16 +894,22 @@ _ADAPTER_RESULT_PAIRS = {
 def _validate_adapter_evidence(evidence: Mapping[str, object]) -> None:
     """Apply the same bounded evidence vocabulary at the persistence boundary."""
     for key, value in evidence.items():
+        if key in {"dev", "ino", "uid", "gid", "mode"}:
+            if not isinstance(value, str) or re.fullmatch(r"(?:0|[1-9][0-9]*)", value) is None or int(value) > (1 << 64) - 1:
+                raise ValueError("adapter evidence identity is invalid")
+            if key == "mode" and int(value) > 0o7777:
+                raise ValueError("adapter evidence mode is invalid")
+            continue
         if key in {"config_digest", "identity_digest", "runtime_digest", "unit_digest"}:
             if not isinstance(value, str) or _ADAPTER_DIGEST.fullmatch(value) is None:
                 raise ValueError("adapter evidence digest is invalid")
-        elif key in {"metadata_verified", "acl_verified", "previously_enabled", "previously_active", "service_verified"}:
+        elif key in {"metadata_verified", "acl_verified", "previously_enabled", "previously_active", "service_verified", "source_commit_verified", "acl_present_before"}:
             if type(value) is not bool:
                 raise ValueError("adapter evidence boolean is invalid")
         elif key in {"roots_added", "roots_verified", "size_bytes"}:
             if type(value) is not int or not 0 <= value <= 1_000_000_000:
                 raise ValueError("adapter evidence count is invalid")
-        elif key == "active_enter_timestamp_monotonic":
+        elif key in {"active_enter_timestamp_monotonic", "dev", "ino", "uid", "gid", "mode"}:
             if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,38}", value) is None:
                 raise ValueError("adapter evidence timestamp is invalid")
         else:
@@ -927,6 +935,12 @@ def _normalize_result(operation: str, result: object) -> ProvisioningStepEvidenc
     evidence = result["evidence"]
     if not isinstance(evidence, Mapping) or not set(evidence).issubset(contract[2]):
         raise ValueError("adapter evidence does not match the operation contract")
+    required = {
+        ("install_runtime", "changed"): {"runtime_digest", "metadata_verified", "dev", "ino", "uid", "gid", "mode"},
+        ("ensure_directory", "changed"): {"metadata_verified", "dev", "ino", "uid", "gid", "mode"},
+    }.get((operation, result["disposition"]), set())
+    if not required.issubset(evidence):
+        raise ValueError("adapter evidence is missing required identity fields")
     _validate_adapter_evidence(evidence)
     code = "STEP_COMPLETED" if disposition is StepDisposition.CHANGED else "STEP_VERIFIED_NOOP"
     return ProvisioningStepEvidence(disposition, code, _result_digest(operation, result, code), True, evidence)

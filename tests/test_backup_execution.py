@@ -5,11 +5,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from threading import Barrier, Thread
 
 import pytest
 
+import overseer.store as store_module
 from overseer.backup_execution import (
     BehaviorAcceptance,
     CheckpointEvent,
@@ -40,17 +42,17 @@ from overseer.backup_execution import (
 )
 
 def test_adapter_success_evidence_is_persisted_and_bound_to_result_digest():
-    first = _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {"metadata_verified": True}, "redactions_applied": True})
-    second = _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {"metadata_verified": False}, "redactions_applied": True})
-    assert first.evidence == {"metadata_verified": True}
-    assert second.evidence == {"metadata_verified": False}
+    first = _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {"metadata_verified": True, "dev": "1", "ino": "2", "uid": "1000", "gid": "1000", "mode": "448"}, "redactions_applied": True})
+    second = _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {"metadata_verified": False, "dev": "1", "ino": "2", "uid": "1000", "gid": "1000", "mode": "448"}, "redactions_applied": True})
+    assert first.evidence == {"metadata_verified": True, "dev": "1", "ino": "2", "uid": "1000", "gid": "1000", "mode": "448"}
+    assert second.evidence == {"metadata_verified": False, "dev": "1", "ino": "2", "uid": "1000", "gid": "1000", "mode": "448"}
     assert first.result_digest != second.result_digest
     payload = json.loads(checkpoint_payload(build_checkpoint(
         checkpoint_id="evidence.1", execution_id="execution.evidence", checkpoint_ordinal=0,
         previous_digest="sha256:" + "1" * 64, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0,
         plan_step_ordinal=0, step_digest="sha256:" + "2" * 64, event=CheckpointEvent.STEP_COMPLETED,
         observed_at="2026-08-05T12:00:00Z", step_evidence=first)))
-    assert payload["step_evidence"]["evidence"] == {"metadata_verified": True}
+    assert payload["step_evidence"]["evidence"] == first.evidence
 
 
 @pytest.mark.parametrize("dto", [
@@ -68,6 +70,80 @@ def test_concrete_adapter_contract_rejects_ok_false_and_extra_fields():
     with pytest.raises(ValueError, match="exact safe DTO"):
         _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": {}, "redactions_applied": True, "extra": False})
 
+
+@pytest.mark.parametrize(
+    ("operation", "safe_code", "evidence"),
+    (
+        ("verify_published_adapter_source", "SOURCE_ALREADY_PUBLISHED", {"source_commit_verified": True}),
+        ("ensure_read_only_acl", "ACL_APPLIED", {"acl_present_before": False, "acl_verified": True}),
+    ),
+)
+def test_production_adapter_evidence_is_accepted_by_execution_normalizer(operation, safe_code, evidence):
+    result = {"ok": True, "operation": operation, "disposition": "verified_noop", "safe_code": safe_code, "evidence": evidence, "redactions_applied": True}
+    normalized = _normalize_result(operation, result)
+    assert normalized.evidence == evidence
+
+
+def test_unknown_adapter_evidence_is_rejected_by_execution_normalizer():
+    with pytest.raises(ValueError, match="adapter evidence"):
+        _normalize_result("verify_published_adapter_source", {"ok": True, "operation": "verify_published_adapter_source", "disposition": "verified_noop", "safe_code": "SOURCE_ALREADY_PUBLISHED", "evidence": {"unknown_marker": True}, "redactions_applied": True})
+
+
+@pytest.mark.parametrize(
+    ("operation", "evidence"),
+    (
+        ("install_runtime", {"runtime_digest": "sha256:" + "a" * 64, "metadata_verified": True, "dev": "1", "ino": "2", "uid": "0", "gid": "0"}),
+        ("ensure_directory", {"metadata_verified": True, "dev": "1", "ino": "2", "uid": "1000", "gid": "1000"}),
+    ),
+)
+def test_changed_identity_bound_operations_reject_missing_mode_evidence(operation, evidence):
+    safe_code = "RUNTIME_INSTALLED" if operation == "install_runtime" else "DIRECTORY_CREATED"
+    with pytest.raises(ValueError, match="required identity"):
+        _normalize_result(operation, {"ok": True, "operation": operation, "disposition": "changed", "safe_code": safe_code, "evidence": evidence, "redactions_applied": True})
+
+
+@pytest.mark.parametrize("identity", ("01", str(1 << 64), "9" * 40))
+def test_adapter_identity_evidence_requires_canonical_u64(identity):
+    evidence = {"metadata_verified": True, "dev": identity, "ino": "2", "uid": "0", "gid": "0", "mode": "448"}
+    with pytest.raises(ValueError, match="identity"):
+        _normalize_result("ensure_directory", {"ok": True, "operation": "ensure_directory", "disposition": "changed", "safe_code": "DIRECTORY_CREATED", "evidence": evidence, "redactions_applied": True})
+
+
+def test_real_concrete_adapter_evidence_is_normalized_and_persisted_in_sqlite(tmp_path):
+    from types import SimpleNamespace
+    from overseer.backup_contract import PROVISIONING_CONTRACT_VERSION, runtime_artifact_identity
+    from overseer.backup_host_operations import ConcreteHostProvisioningAdapter, EXPECTED_BACKUP_TOOL_SCHEMAS, PRIVILEGED_CONFIRMATION, capability_digest
+    from overseer.backup_provisioning import ProvisioningStep
+
+    commit = "a" * 40
+    source = ProvisioningStep("verify_published_adapter_source", {"path": "/approved/source", "commit": commit, "capability_digest": capability_digest(commit, EXPECTED_BACKUP_TOOL_SCHEMAS), "provisioning_contract_version": PROVISIONING_CONTRACT_VERSION, "runtime_artifact_identity": runtime_artifact_identity(commit, EXPECTED_BACKUP_TOOL_SCHEMAS)})
+    acl = ProvisioningStep("ensure_read_only_acl", {"path": "/approved/source", "principal": "backup", "permissions": "r-X"})
+    acl_probes = []
+    def runner(argv, **_kwargs):
+        if "/usr/bin/git" in argv:
+            return SimpleNamespace(returncode=0, stdout=(commit + "\n").encode(), stderr=b"")
+        if "/usr/bin/getfacl" in argv:
+            acl_probes.append(True)
+            output = b"user::rwx\n" if len(acl_probes) == 1 else b"user::rwx\nuser:backup:r-X\n"
+            return SimpleNamespace(returncode=0, stdout=output, stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    adapter = ConcreteHostProvisioningAdapter(SimpleNamespace(steps=(source, acl), rollback_steps=(), adapter_commit=commit), privileged_confirmation=PRIVILEGED_CONFIRMATION, runner=runner, euid_provider=lambda: 1000, username_provider=lambda _uid: "god")
+    source_evidence = _normalize_result(source.operation, adapter.execute(source))
+    acl_evidence = _normalize_result(acl.operation, adapter.execute(acl))
+    header = _header(source.operation, acl.operation)
+    checkpoints = []
+    previous = header.header_digest
+    for ordinal, (phase, evidence) in enumerate(((header.phases[0], source_evidence), (header.phases[1], acl_evidence))):
+        started = build_checkpoint(checkpoint_id=f"real.{ordinal * 2}", execution_id=header.execution_id, checkpoint_ordinal=ordinal * 2, previous_digest=previous, phase=phase.phase, phase_ordinal=phase.phase_ordinal, plan_step_ordinal=phase.steps[0].plan_step_ordinal, step_digest=phase.steps[0].forward.step_digest, event=CheckpointEvent.STEP_STARTED, observed_at=f"2026-08-05T12:01:0{ordinal * 2}Z")
+        completed = build_checkpoint(checkpoint_id=f"real.{ordinal * 2 + 1}", execution_id=header.execution_id, checkpoint_ordinal=ordinal * 2 + 1, previous_digest=started.checkpoint_digest, phase=phase.phase, phase_ordinal=phase.phase_ordinal, plan_step_ordinal=phase.steps[0].plan_step_ordinal, step_digest=phase.steps[0].forward.step_digest, event=CheckpointEvent.STEP_COMPLETED, observed_at=f"2026-08-05T12:01:0{ordinal * 2 + 1}Z", step_evidence=evidence)
+        checkpoints.extend((started, completed)); previous = completed.checkpoint_digest
+    with OverseerStore(tmp_path / "real-producer.sqlite3") as store:
+        store.save_backup_execution(header, checkpoints[0])
+        for checkpoint in checkpoints[1:]:
+            store.append_backup_execution_checkpoint(checkpoint)
+        loaded = store.load_backup_execution_checkpoints(header.execution_id)
+    assert loaded[-1].step_evidence == acl_evidence
+
 def test_historical_v2_checkpoint_without_evidence_preserves_digest_and_chain():
     header = _header()
     legacy = build_checkpoint(
@@ -78,7 +154,7 @@ def test_historical_v2_checkpoint_without_evidence_preserves_digest_and_chain():
         step_evidence=ProvisioningStepEvidence(StepDisposition.VERIFIED_NOOP, "STEP_VERIFIED_NOOP", "sha256:" + "1" * 64, True),
     )
     payload = json.loads(checkpoint_payload(legacy))
-    del payload["step_evidence"]["evidence"]
+    assert "evidence" not in payload["step_evidence"]
     decoded = checkpoint_from_payload(canonical_json(payload))
     assert decoded.schema_version == "2"
     assert decoded.checkpoint_digest == legacy.checkpoint_digest
@@ -98,6 +174,75 @@ def test_historical_v2_checkpoint_without_evidence_preserves_digest_and_chain():
     del current_payload["step_evidence"]["evidence"]
     with pytest.raises(ValueError):
         checkpoint_from_payload(canonical_json(current_payload))
+
+
+def test_historical_v2_sqlite_rows_round_trip_without_rewriting_terminal_payload(tmp_path):
+    header = _header()
+    checkpoints = _chain(header, schema_version="2")
+    with OverseerStore(tmp_path / "historical-v2.sqlite3") as store:
+        store.save_backup_execution(header, checkpoints[0])
+        for checkpoint in checkpoints[1:]:
+            store.append_backup_execution_checkpoint(checkpoint)
+        raw_payloads = tuple(row[0] for row in store._connection.execute(
+            "SELECT payload FROM backup_provisioning_execution_checkpoints ORDER BY checkpoint_ordinal"
+        ))
+        loaded = store.load_backup_execution_checkpoints(header.execution_id)
+        assert loaded == checkpoints
+        assert verify_backup_execution_chain(header, loaded) == checkpoints[-1].checkpoint_digest
+        assert derive_backup_execution_view(header, loaded).terminal_success is True
+    assert all("\"evidence\":" not in payload for payload in raw_payloads)
+
+
+def _independent_legacy_payload(checkpoint):
+    def encode(value):
+        if isinstance(value, (ExecutionPhase, CheckpointEvent, StepDisposition)):
+            return value.value
+        if dataclasses.is_dataclass(value):
+            return {field.name: encode(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        if isinstance(value, tuple):
+            return [encode(item) for item in value]
+        if isinstance(value, dict):
+            return {key: encode(item) for key, item in value.items()}
+        return value
+    payload = encode(checkpoint)
+    if isinstance(payload.get("step_evidence"), dict) and payload["step_evidence"].get("evidence") == {}:
+        del payload["step_evidence"]["evidence"]
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def test_legacy_v2_and_current_v3_sqlite_payload_bytes_are_exact_and_terminal_readable(tmp_path):
+    header = _header()
+    legacy = _chain(header, schema_version="2")
+    path = tmp_path / "legacy-independent.sqlite3"
+    with OverseerStore(path) as store:
+        store._connection.execute(
+            "INSERT INTO backup_provisioning_execution_headers (execution_id, plan_id, plan_digest, bundle_id, bundle_digest, approved_runtime_digest, approved_config_digest, header_digest, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (header.execution_id, header.plan_id, header.plan_digest, header.bundle_id, header.bundle_digest, header.approved_runtime_digest, header.approved_config_digest, header.header_digest, header_payload(header)),
+        )
+        for checkpoint in legacy:
+            payload = _independent_legacy_payload(checkpoint)
+            store._connection.execute(
+                "INSERT INTO backup_provisioning_execution_checkpoints (checkpoint_id, execution_id, checkpoint_ordinal, phase_ordinal, plan_step_ordinal, step_digest, previous_digest, checkpoint_digest, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (checkpoint.checkpoint_id, checkpoint.execution_id, checkpoint.checkpoint_ordinal, checkpoint.phase_ordinal, checkpoint.plan_step_ordinal, checkpoint.step_digest, checkpoint.previous_digest, checkpoint.checkpoint_digest, payload),
+            )
+        store._connection.commit()
+        loaded = store.load_backup_execution_checkpoints(header.execution_id)
+        stored = tuple(row[0].encode() for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints ORDER BY checkpoint_ordinal"))
+    assert stored == tuple(checkpoint_payload(item).encode() for item in loaded)
+    assert derive_backup_execution_view(header, loaded).terminal_success is True
+    assert all(b'"evidence":' not in payload for payload in stored)
+
+    v3_header = _header()
+    current = _chain(v3_header)
+    v3_path = tmp_path / "current-v3.sqlite3"
+    with OverseerStore(v3_path) as store:
+        store.save_backup_execution(v3_header, current[0])
+        for checkpoint in current[1:]:
+            store.append_backup_execution_checkpoint(checkpoint)
+        loaded_v3 = store.load_backup_execution_checkpoints(v3_header.execution_id)
+        stored_v3 = tuple(row[0].encode() for row in store._connection.execute("SELECT payload FROM backup_provisioning_execution_checkpoints ORDER BY checkpoint_ordinal"))
+    assert stored_v3 == tuple(checkpoint_payload(item).encode() for item in loaded_v3)
+    assert any(b'"evidence":{}' in payload for payload in stored_v3)
 from overseer.store import CURRENT_SCHEMA_VERSION, OverseerStore
 
 
@@ -109,14 +254,14 @@ APPROVED_RUNTIME_DIGEST = "sha256:" + "5" * 64
 APPROVED_CONFIG_DIGEST = "sha256:" + "6" * 64
 
 
-def _header() -> ProvisioningExecutionHeader:
+def _header(first_operation: str = "duplicate-operation", second_operation: str | None = None) -> ProvisioningExecutionHeader:
     steps = tuple(
         ExecutionStepIdentity(
             ordinal,
             ExecutionOperationIdentity(
-                "duplicate-operation",
+                first_operation if ordinal == 0 else second_operation if ordinal == 1 and second_operation is not None else "duplicate-operation",
                 canonical_arguments_digest({"ordinal": ordinal}),
-                canonical_step_digest(PLAN_DIGEST, "forward", ordinal, "duplicate-operation", {"ordinal": ordinal}),
+                canonical_step_digest(PLAN_DIGEST, "forward", ordinal, first_operation if ordinal == 0 else second_operation if ordinal == 1 and second_operation is not None else "duplicate-operation", {"ordinal": ordinal}),
             ),
         )
         for ordinal in range(6)
@@ -141,7 +286,7 @@ def _header() -> ProvisioningExecutionHeader:
     )
 
 
-def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint, ...]:
+def _chain(header: ProvisioningExecutionHeader, schema_version: str = "3") -> tuple[ProvisioningCheckpoint, ...]:
     checkpoints: list[ProvisioningCheckpoint] = []
     previous = header.header_digest
     ordinal = 0
@@ -150,7 +295,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
     for phase in header.phases:
         step = phase.steps[0]
         started = build_checkpoint(
-            checkpoint_id=f"checkpoint.{ordinal}", execution_id=header.execution_id,
+            schema_version=schema_version, checkpoint_id=f"checkpoint.{ordinal}", execution_id=header.execution_id,
             checkpoint_ordinal=ordinal, previous_digest=previous, phase=phase.phase,
             phase_ordinal=phase.phase_ordinal, plan_step_ordinal=step.plan_step_ordinal,
             step_digest=step.forward.step_digest, event=CheckpointEvent.STEP_STARTED,
@@ -161,7 +306,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
         ordinal += 1
         evidence = ProvisioningStepEvidence(StepDisposition.CHANGED, "STEP_COMPLETED", CONTRACT_DIGEST, True)
         completed = build_checkpoint(
-            checkpoint_id=f"checkpoint.{ordinal}", execution_id=header.execution_id,
+            schema_version=schema_version, checkpoint_id=f"checkpoint.{ordinal}", execution_id=header.execution_id,
             checkpoint_ordinal=ordinal, previous_digest=previous, phase=phase.phase,
             phase_ordinal=phase.phase_ordinal, plan_step_ordinal=step.plan_step_ordinal,
             step_digest=step.forward.step_digest, event=CheckpointEvent.STEP_COMPLETED,
@@ -174,7 +319,7 @@ def _chain(header: ProvisioningExecutionHeader) -> tuple[ProvisioningCheckpoint,
         ordinal += 1
     final_step = header.phases[-1].steps[0]
     checkpoints.append(build_checkpoint(
-        checkpoint_id=f"checkpoint.{ordinal}", execution_id=header.execution_id,
+        schema_version=schema_version, checkpoint_id=f"checkpoint.{ordinal}", execution_id=header.execution_id,
         checkpoint_ordinal=ordinal, previous_digest=previous, phase=ExecutionPhase.FINALIZE,
         phase_ordinal=5, plan_step_ordinal=final_step.plan_step_ordinal,
         step_digest=final_step.forward.step_digest, event=CheckpointEvent.EXECUTION_FINALIZED,
@@ -667,6 +812,29 @@ def test_schema_contract_fk_indexes_and_trigger_sql_are_exact(tmp_path) -> None:
         OverseerStore(tmp_path / "schema.sqlite3")
 
 
+def test_constructor_failure_closes_connection(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "constructor-failure.sqlite3"
+    with OverseerStore(path) as store:
+        store._connection.execute("DROP TRIGGER backup_execution_headers_no_update")
+        store._connection.commit()
+
+    real_connect = store_module.sqlite3.connect
+    connections = []
+
+    def tracking_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", tracking_connect)
+    with pytest.raises(ValueError, match="immutability triggers"):
+        OverseerStore(path)
+
+    assert len(connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+
+
 @pytest.mark.parametrize("corruption", ["missing_trigger", "missing_table"])
 def test_typed_execution_authority_schema_corruption_is_rejected_on_reopen(tmp_path, corruption) -> None:
     path = tmp_path / f"typed-authority-{corruption}.sqlite3"
@@ -757,7 +925,7 @@ def test_preclaims_v5_database_migrates_claims_table_without_mutating_immutable_
 
 def test_schema_rejects_commented_checks_and_partial_unique_indexes(tmp_path) -> None:
     path = tmp_path / "adversarial-schema.sqlite3"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript("""
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);
             INSERT INTO schema_migrations VALUES (4, 'current', '2026-08-05T00:00:00+00:00');
@@ -839,7 +1007,7 @@ def test_reopen_rejects_tampered_redundant_backup_fields(tmp_path, table, column
 
 def test_v3_to_v4_migration_preserves_unrelated_rows_and_indexes(tmp_path) -> None:
     path = tmp_path / "v3.sqlite3"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript("""
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);
             INSERT INTO schema_migrations VALUES (3, 'old', '2026-08-05T00:00:00+00:00');
@@ -861,7 +1029,7 @@ def test_v3_to_v4_migration_preserves_unrelated_rows_and_indexes(tmp_path) -> No
 
 def test_v3_to_v4_migration_rolls_back_mid_statement_failure(tmp_path) -> None:
     path = tmp_path / "v3-failure.sqlite3"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript("""
             CREATE TABLE backup_provisioning_execution_headers (execution_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, plan_digest TEXT NOT NULL UNIQUE, bundle_id TEXT NOT NULL UNIQUE, bundle_digest TEXT NOT NULL UNIQUE, header_digest TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);
             CREATE TABLE backup_provisioning_execution_checkpoints (checkpoint_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0), phase_ordinal INTEGER NOT NULL CHECK (phase_ordinal >= 0), plan_step_ordinal INTEGER NOT NULL CHECK (plan_step_ordinal >= 0), step_digest TEXT NOT NULL, previous_digest TEXT NOT NULL, checkpoint_digest TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, UNIQUE(execution_id, checkpoint_ordinal), FOREIGN KEY(execution_id) REFERENCES backup_provisioning_execution_headers(execution_id));
@@ -888,17 +1056,16 @@ def test_v3_to_v4_migration_rolls_back_mid_statement_failure(tmp_path) -> None:
         def commit(self):
             return self.connection.commit()
 
-    raw = sqlite3.connect(path)
-    store = OverseerStore.__new__(OverseerStore)
-    store._connection = FailingConnection(raw)
-    with pytest.raises(KeyboardInterrupt):
-        store._migrate_backup_execution_v3()
-    assert {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} == {"backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"}
-    assert tuple(row[1] for row in raw.execute("PRAGMA table_info(backup_provisioning_execution_headers)")) == ("execution_id", "plan_id", "plan_digest", "bundle_id", "bundle_digest", "header_digest", "payload")
-    assert {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()} == {"backup_execution_headers_no_update", "backup_execution_headers_no_delete", "backup_execution_checkpoints_no_update", "backup_execution_checkpoints_no_delete"}
-    raw.execute("CREATE TABLE reusable_after_migration_failure (value TEXT NOT NULL)")
-    raw.commit()
-    raw.close()
+    with closing(sqlite3.connect(path)) as raw, raw:
+        store = OverseerStore.__new__(OverseerStore)
+        store._connection = FailingConnection(raw)
+        with pytest.raises(KeyboardInterrupt):
+            store._migrate_backup_execution_v3()
+        assert {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} == {"backup_provisioning_execution_headers", "backup_provisioning_execution_checkpoints"}
+        assert tuple(row[1] for row in raw.execute("PRAGMA table_info(backup_provisioning_execution_headers)")) == ("execution_id", "plan_id", "plan_digest", "bundle_id", "bundle_digest", "header_digest", "payload")
+        assert {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()} == {"backup_execution_headers_no_update", "backup_execution_headers_no_delete", "backup_execution_checkpoints_no_update", "backup_execution_checkpoints_no_delete"}
+        raw.execute("CREATE TABLE reusable_after_migration_failure (value TEXT NOT NULL)")
+        raw.commit()
 
 
 def test_v5_migration_rolls_back_authority_table_backfill_triggers_and_markers(
@@ -916,7 +1083,7 @@ def test_v5_migration_rolls_back_authority_table_backfill_triggers_and_markers(
     with pytest.raises(RuntimeError, match="injected v5 recording failure"):
         OverseerStore(path)
 
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             ("backup_provisioning_plan_execution_modes",),

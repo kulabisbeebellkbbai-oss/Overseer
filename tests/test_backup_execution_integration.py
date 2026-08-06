@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 import hashlib
 import multiprocessing
@@ -83,12 +84,18 @@ class RecordingAdapter:
                 "evidence": {},
                 "redactions_applied": True,
             }
+        changed = step.operation not in {"verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service", "verify_codex_url", "verify_gpg_identity", "verify_backup_policy"}
+        evidence = {}
+        if changed and step.operation == "install_runtime":
+            evidence = {"runtime_digest": "sha256:" + "a" * 64, "metadata_verified": True, "dev": "1", "ino": "2", "uid": "0", "gid": "0", "mode": "493"}
+        elif changed and step.operation == "ensure_directory":
+            evidence = {"metadata_verified": True, "dev": "1", "ino": "2", "uid": "1000", "gid": "1000", "mode": "448"}
         return {
             "ok": True,
             "operation": step.operation,
             "disposition": _adapter_disposition(step.operation, changed=True),
             "safe_code": _adapter_code(step.operation, changed=step.operation not in {"verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service", "verify_codex_url", "verify_gpg_identity", "verify_backup_policy"}),
-            "evidence": {},
+            "evidence": evidence,
             "redactions_applied": True,
         }
 
@@ -177,7 +184,12 @@ def test_execution_persists_adapter_evidence_binding_in_checkpoint_digest(tmp_pa
         def execute(self, step):
             self.calls.append(step)
             changed = step.operation not in {"verify_published_adapter_source", "verify_endpoint_migration_ready", "verify_mcp_service", "verify_codex_url", "verify_gpg_identity", "verify_backup_policy"}
-            return {"ok": True, "operation": step.operation, "disposition": _adapter_disposition(step.operation, changed=changed), "safe_code": _adapter_code(step.operation, changed=changed), "evidence": {"metadata_verified": self.marker} if changed else {}, "redactions_applied": True}
+            evidence = {"metadata_verified": self.marker} if changed else {}
+            if changed and step.operation == "install_runtime":
+                evidence.update({"runtime_digest": "sha256:" + "a" * 64, "dev": "1", "ino": "2", "uid": "0", "gid": "0", "mode": "493"})
+            elif changed and step.operation == "ensure_directory":
+                evidence.update({"dev": "1", "ino": "2", "uid": "1000", "gid": "1000", "mode": "448"})
+            return {"ok": True, "operation": step.operation, "disposition": _adapter_disposition(step.operation, changed=changed), "safe_code": _adapter_code(step.operation, changed=changed), "evidence": evidence, "redactions_applied": True}
 
     path_a, plan_a, _ = _approved(tmp_path / "a")
     path_b, plan_b, _ = _approved(tmp_path / "b")
@@ -207,6 +219,27 @@ def test_exact_manifest_phase_order_and_arguments_are_used(tmp_path: Path) -> No
         assert header.approved_runtime_digest == plan.runtime_artifact_identity
         assert tuple(phase.phase for phase in header.phases) == tuple(ExecutionPhase)
         assert tuple(step.plan_step_ordinal for phase in header.phases for step in phase.steps) == tuple(range(len(plan.steps) + 3))
+
+
+def test_production_adapter_evidence_normalizes_and_checkpoints_for_manifest_operations(tmp_path: Path) -> None:
+    class ProductionEvidenceAdapter(RecordingAdapter):
+        def execute(self, step):
+            result = super().execute(step)
+            if step.operation == "verify_published_adapter_source":
+                result["evidence"] = {"source_commit_verified": True}
+            elif step.operation == "ensure_read_only_acl":
+                result["evidence"] = {"acl_present_before": False, "acl_verified": True}
+            return result
+
+    store_path, plan, _bundle = _approved(tmp_path)
+    view = start_execution(store_path, plan.plan_id, ProductionEvidenceAdapter(), Runner())
+    assert view.terminal_success is True
+    with SQLiteStore(store_path) as store:
+        checkpoints = store.load_backup_execution_checkpoints(view.execution_id)
+    source = next(item for item in checkpoints if item.plan_step_ordinal == 0 and item.event is CheckpointEvent.STEP_COMPLETED)
+    acl = next(item for item in checkpoints if item.plan_step_ordinal == 11 and item.event is CheckpointEvent.STEP_COMPLETED)
+    assert source.step_evidence is not None and source.step_evidence.evidence == {"source_commit_verified": True}
+    assert acl.step_evidence is not None and acl.step_evidence.evidence == {"acl_present_before": False, "acl_verified": True}
 
 
 def test_missing_runner_pauses_before_attest_and_later_resume_skips_prefix(tmp_path: Path) -> None:
@@ -615,7 +648,7 @@ def test_rollback_claim_ignored_takeover_update_is_non_contention(tmp_path: Path
         )
     assert not any(step.operation in {item.operation for item in plan.rollback_steps} for step in adapter.calls)
 
-    with sqlite3.connect(store_path, timeout=30.0) as connection:
+    with closing(sqlite3.connect(store_path, timeout=30.0)) as connection, connection:
         connection.row_factory = sqlite3.Row
         claim = connection.execute(
             "SELECT claim_epoch FROM backup_provisioning_execution_rollback_claims WHERE execution_id=?",
@@ -793,7 +826,7 @@ def test_runtime_delete_suppression_rolls_back_completion_and_preserves_claim(tm
         def execute(self, step: ProvisioningStep) -> dict[str, object]:
             if step.operation in rollback_operations and not self.triggered:
                 self.triggered = True
-                with sqlite3.connect(store_path, timeout=30.0) as connection:
+                with closing(sqlite3.connect(store_path, timeout=30.0)) as connection, connection:
                     connection.execute(
                         f"CREATE TRIGGER {trigger_name} BEFORE DELETE ON backup_provisioning_execution_rollback_claims "
                         "BEGIN SELECT RAISE(IGNORE); END"
@@ -806,7 +839,7 @@ def test_runtime_delete_suppression_rolls_back_completion_and_preserves_claim(tm
         start_execution(store_path, plan.plan_id, adapter, Runner(wrong_runtime=True))
     assert [step.operation for step in adapter.calls if step.operation in rollback_operations] == [first_rollback]
 
-    with sqlite3.connect(store_path, timeout=30.0) as connection:
+    with closing(sqlite3.connect(store_path, timeout=30.0)) as connection, connection:
         connection.row_factory = sqlite3.Row
         execution_id = connection.execute(
             "SELECT execution_id FROM backup_provisioning_execution_headers WHERE plan_id=?",
@@ -826,7 +859,7 @@ def test_runtime_delete_suppression_rolls_back_completion_and_preserves_claim(tm
         assert claim is not None
         assert claim["step_digest"] in checkpoint["payload"]
 
-    with sqlite3.connect(store_path, timeout=30.0) as connection:
+    with closing(sqlite3.connect(store_path, timeout=30.0)) as connection, connection:
         connection.execute(f"DROP TRIGGER {trigger_name}")
         connection.commit()
 
@@ -906,7 +939,7 @@ def test_rollback_completion_rejects_epoch_only_tampering(tmp_path: Path) -> Non
     class EpochTamperingAdapter(RecordingAdapter):
         def execute(self, step):
             if step.operation in rollback_operations:
-                with sqlite3.connect(store_path, timeout=30.0) as connection:
+                with closing(sqlite3.connect(store_path, timeout=30.0)) as connection, connection:
                     connection.execute(
                         "UPDATE backup_provisioning_execution_rollback_claims SET claim_epoch=8"
                     )
@@ -1283,7 +1316,7 @@ def test_typed_execute_plan_reports_only_current_invocation_mutation(tmp_path: P
 def test_deleted_typed_bundle_fails_closed_before_execution(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
     adapter = RecordingAdapter()
-    with sqlite3.connect(store_path) as connection:
+    with closing(sqlite3.connect(store_path)) as connection, connection:
         connection.execute("DELETE FROM provisioning_bundles WHERE plan_id=?", (plan.plan_id,))
         connection.commit()
     with SQLiteStore(store_path) as store:
@@ -1302,7 +1335,7 @@ def test_deleted_typed_bundle_fails_closed_before_execution(tmp_path: Path) -> N
 def test_all_typed_execution_artifacts_deleted_stays_typed_and_fails_before_adapter(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
     adapter = RecordingAdapter()
-    with sqlite3.connect(store_path) as connection:
+    with closing(sqlite3.connect(store_path)) as connection, connection:
         for table in ("provisioning_bundles", "provisioning_preflight_reports", "provisioning_review_outbox"):
             connection.execute(f"DELETE FROM {table} WHERE plan_id=?", (plan.plan_id,))
         connection.execute("DELETE FROM roadex_approval_bindings WHERE approval_ref=?", (f"approval.donuthole.{plan.plan_id}",))
@@ -1369,7 +1402,7 @@ def test_typed_fallback_and_v5_backfill_require_exact_roadex_binding(
     store_path, plan, _bundle = _approved(tmp_path)
     source_id = plan.plan_id if source_id == "backup-provision.donuthole" else source_id
     approval_ref = approval_ref.replace("backup-provision.donuthole", plan.plan_id)
-    with sqlite3.connect(store_path) as connection:
+    with closing(sqlite3.connect(store_path)) as connection, connection:
         for table in ("provisioning_bundles", "provisioning_preflight_reports", "provisioning_review_outbox"):
             connection.execute(f"DELETE FROM {table} WHERE plan_id=?", (plan.plan_id,))
         connection.execute("DELETE FROM roadex_approval_bindings")
@@ -1481,7 +1514,7 @@ def test_missing_authority_record_aborts_changed_prefix_and_rolls_back(
     adapter = RecordingAdapter()
     paused = start_execution(store_path, plan.plan_id, adapter, None)
     before = len(adapter.calls)
-    with sqlite3.connect(store_path) as connection:
+    with closing(sqlite3.connect(store_path)) as connection, connection:
         if artifact == "binding":
             connection.execute("DELETE FROM roadex_approval_bindings WHERE approval_ref=?", (f"approval.donuthole.{plan.plan_id}",))
         elif artifact == "preflight":
@@ -1508,7 +1541,7 @@ def test_missing_or_malformed_exact_source_fails_closed_after_changed_prefix(
     adapter = RecordingAdapter()
     paused = start_execution(store_path, plan.plan_id, adapter, None)
     before_calls = list(adapter.calls)
-    with sqlite3.connect(store_path) as connection:
+    with closing(sqlite3.connect(store_path)) as connection, connection:
         if source_state == "missing":
             connection.execute("DELETE FROM backup_provisioning_plans WHERE id=?", (plan.plan_id,))
         else:
@@ -1843,6 +1876,7 @@ def test_typed_mutation_truth_and_failed_operation_are_bound_to_this_invocation(
 
 def test_same_now_racing_starts_have_one_durable_claim_and_one_adapter_call(tmp_path: Path) -> None:
     store_path, plan, _bundle = _approved(tmp_path)
+    execution_time = _execution_time_at_or_after_approval(store_path, plan.plan_id)
     started = threading.Event()
     release = threading.Event()
     first_adapter = BlockingAdapter(started, release)
@@ -1851,7 +1885,7 @@ def test_same_now_racing_starts_have_one_durable_claim_and_one_adapter_call(tmp_
 
     def run(adapter):
         try:
-            results.append(start_execution(store_path, plan.plan_id, adapter, Runner(), now="2026-08-06T00:00:00+00:00"))
+            results.append(start_execution(store_path, plan.plan_id, adapter, Runner(), now=execution_time))
         except Exception as error:
             results.append(error)
 
@@ -2599,7 +2633,7 @@ def test_authority_and_bundle_drift_reject_continuation_before_adapter(tmp_path:
     adapter = RecordingAdapter()
     paused = start_execution(store_path, plan.plan_id, adapter, None)
     before = len(adapter.calls)
-    with sqlite3.connect(store_path) as connection:
+    with closing(sqlite3.connect(store_path)) as connection, connection:
         payload = connection.execute("SELECT payload FROM provisioning_bundles WHERE plan_id=?", (plan.plan_id,)).fetchone()[0]
         connection.execute("UPDATE provisioning_bundles SET payload=? WHERE plan_id=?", (payload + " ", plan.plan_id))
         connection.commit()

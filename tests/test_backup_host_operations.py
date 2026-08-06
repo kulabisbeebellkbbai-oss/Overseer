@@ -521,6 +521,82 @@ def test_real_boundary_helper_runtime_references_accepts_empty_cmdline(tmp_path)
     assert json.loads(result.stdout.decode("ascii")) == {"count": 0, "status": "clear"}
 
 
+@pytest.mark.parametrize(
+    ("processes", "expected"),
+    [
+        (1024, "clear"),
+        (1025, "error"),
+    ],
+)
+def test_real_boundary_helper_runtime_references_bounds_process_scan(tmp_path, processes, expected):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER, MAX_RUNTIME_REFERENCE_PROCESSES
+
+    assert processes in (MAX_RUNTIME_REFERENCE_PROCESSES, MAX_RUNTIME_REFERENCE_PROCESSES + 1)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    for process in range(1, processes + 1):
+        (proc_root / str(process)).mkdir()
+    result = subprocess.run(
+        [sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "references", str(tmp_path / "runtime"), str(proc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert json.loads(result.stdout.decode("ascii"))["status"] == expected
+
+
+def test_real_boundary_helper_runtime_references_excludes_non_numeric_and_ignored_process_entries(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER, MAX_RUNTIME_REFERENCE_PROCESSES
+
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    ignored_pid = MAX_RUNTIME_REFERENCE_PROCESSES + 1
+    for process in range(1, MAX_RUNTIME_REFERENCE_PROCESSES + 1):
+        (proc_root / str(process)).mkdir()
+    (proc_root / str(ignored_pid)).mkdir()
+    (proc_root / "not-a-pid").mkdir()
+    definitions = _PRIVILEGED_BOUNDARY_HELPER.split("\ntry:\n    operation = sys.argv[1]", 1)[0]
+    command = definitions + "\nemit(runtime_references({!r}, ignored_pid={}, proc_root={!r}))".format(
+        str(tmp_path / "runtime"),
+        ignored_pid,
+        str(proc_root),
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert json.loads(result.stdout.decode("ascii")) == {"count": 0, "status": "clear"}
+
+
+@pytest.mark.parametrize(
+    ("descriptors", "expected"),
+    [
+        (512, "clear"),
+        (513, "error"),
+    ],
+)
+def test_real_boundary_helper_runtime_references_bounds_descriptor_scan(tmp_path, descriptors, expected):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER, MAX_RUNTIME_REFERENCE_DESCRIPTORS
+
+    assert descriptors in (MAX_RUNTIME_REFERENCE_DESCRIPTORS, MAX_RUNTIME_REFERENCE_DESCRIPTORS + 1)
+    proc_root = tmp_path / "proc"
+    fd_root = proc_root / "1" / "fd"
+    fd_root.mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.write_text("outside")
+    for descriptor in range(descriptors):
+        (fd_root / str(descriptor)).symlink_to(target)
+    result = subprocess.run(
+        [sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "references", str(tmp_path / "runtime"), str(proc_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert json.loads(result.stdout.decode("ascii"))["status"] == expected
+
+
 def test_real_boundary_helper_recursive_cleanup_rejects_descendant_device_boundary(tmp_path):
     from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
 

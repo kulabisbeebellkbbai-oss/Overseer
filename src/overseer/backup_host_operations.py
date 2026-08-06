@@ -48,10 +48,14 @@ MAX_REDACTED_DIAGNOSTIC_LINE_BYTES=4096
 MAX_WRAPPER_DIAGNOSTIC_BYTES=8192
 MAX_BOUNDARY_BYTES = 16 * 1024 * 1024
 MAX_BOUNDARY_COUNT = 64
+MAX_RUNTIME_REFERENCE_PROCESSES = 1024
+MAX_RUNTIME_REFERENCE_DESCRIPTORS = 512
 _PRIVILEGED_BOUNDARY_HELPER = r'''
 import ctypes, errno, hashlib, json, os, pwd, re, secrets, stat, sys, time
 
 MAX_BYTES = 16 * 1024 * 1024
+MAX_RUNTIME_REFERENCE_PROCESSES = 1024
+MAX_RUNTIME_REFERENCE_DESCRIPTORS = 512
 
 def emit(value):
     sys.stdout.write(json.dumps(value, sort_keys=True, separators=(",", ":")))
@@ -449,11 +453,15 @@ def runtime_references(path, ignored_pid=None, proc_root="/proc", logical_path=N
     root = os.path.realpath(path)
     lexical_root = os.path.abspath(os.path.normpath(logical_path or path))
     count = 0
+    process_count = 0
     for entry in stream_scandir(proc_root):
         if not entry.name.isdigit():
             continue
         if ignored_pid is not None and int(entry.name) == ignored_pid:
             continue
+        process_count += 1
+        if process_count > MAX_RUNTIME_REFERENCE_PROCESSES:
+            return {"status": "error"}
         base = os.path.join(proc_root, entry.name)
         for relative in ("cwd", "root", "exe"):
             try:
@@ -468,7 +476,11 @@ def runtime_references(path, ignored_pid=None, proc_root="/proc", logical_path=N
                 return {"status": "error"}
         try:
             fd_dir = os.path.join(base, "fd")
+            descriptor_count = 0
             for descriptor in stream_scandir(fd_dir):
+                descriptor_count += 1
+                if descriptor_count > MAX_RUNTIME_REFERENCE_DESCRIPTORS:
+                    return {"status": "error"}
                 try:
                     if inside(root, os.readlink(descriptor.path)):
                         count += 1

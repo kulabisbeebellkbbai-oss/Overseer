@@ -136,4 +136,22 @@ or provisioning execution is authorized by this source milestone.
     authority revalidation, and transaction-exit cleanup were verified
     fail-closed.
   - No live actions were performed.
-  - Task 3 — structured host-operation outcomes — is next.
+- Capability C Task 3 — structured, convergent, evidence-bearing host
+  operations: complete and release-reviewed at
+  `e613f2f2413ae70e590a15091f2775d815a49f35`.
+  - Production hardening commits:
+    - `8293254b5bca30d87b387aa5605483018d220914` — real adapter evidence,
+      virtualenv-safe cleanup, physical/logical runtime-reference checks,
+      bounded fail-closed proc parsing, child-symlink race handling, and
+      descendant device-boundary enforcement.
+    - `e613f2f2413ae70e590a15091f2775d815a49f35` — finite streaming runtime
+      reference scans capped at 1,024 processes and 512 descriptors per
+      process, with limit-plus-one failure and ignored/non-numeric accounting.
+  - Focused host-operation suite: 118 passed with warnings as errors.
+  - Full affected five-file suite: 349 passed with warnings as errors.
+  - Both Terra reviews: APPROVED.
+  - Final Sol security review: APPROVED; no P0 or P1 findings.
+  - Root-visible `/proc` smoke returned a clear, zero-reference result for an
+    unrelated runtime path.
+  - No live actions were performed.
+  - Task 4 — TheUnderdark active runtime attestation — is next.

@@ -154,4 +154,19 @@ or provisioning execution is authorized by this source milestone.
   - Root-visible `/proc` smoke returned a clear, zero-reference result for an
     unrelated runtime path.
   - No live actions were performed.
-  - Task 4 — TheUnderdark active runtime attestation — is next.
+- Capability C Task 4 — TheUnderdark active runtime attestation: complete and
+  release-reviewed at `98d02c193e8fa00bf232b0f7adcfeb41e2e1e107`.
+  - Immutable range SHA-256:
+    `94ed198c608522620dc192c8ab2847aa0715d6c503469dad17b0b9ec455b5a92`.
+  - Warning-strict focused suite: 67 passed.
+  - Warning-strict full TheUnderdark suite: 247 passed, 1 documented skip.
+  - Capability A owner/consumer runtime-digest parity: verified equal.
+  - Contract and Terra security reviews: APPROVED.
+  - Final Sol security review: APPROVED; no P0 or P1 findings.
+  - Task 5 integration must run the package from the attested
+    `/opt/theunderdark/src/theunderdark` tree, normalize the complete deployment
+    root as root-owned and non-group/world-writable, validate it before
+    promotion and on verified no-op, and bind the exact runtime root, source
+    commit, runtime digest, and configuration digest into `ExecStart`.
+  - No live actions were performed.
+  - Task 5 — Overseer attestation and behavior acceptance — is next.

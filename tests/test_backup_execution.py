@@ -144,6 +144,73 @@ def test_real_concrete_adapter_evidence_is_normalized_and_persisted_in_sqlite(tm
         loaded = store.load_backup_execution_checkpoints(header.execution_id)
     assert loaded[-1].step_evidence == acl_evidence
 
+
+def test_real_directory_removal_evidence_is_normalized_and_persisted_in_sqlite(tmp_path):
+    import subprocess
+    from types import SimpleNamespace
+    from overseer.backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
+    from overseer.backup_provisioning import ProvisioningStep
+
+    target = tmp_path / "empty"
+    target.mkdir()
+    identity = target.stat()
+    arguments = {
+        "path": str(target),
+        "dev": str(identity.st_dev), "ino": str(identity.st_ino),
+        "uid": str(identity.st_uid), "gid": str(identity.st_gid),
+        "mode": str(identity.st_mode & 0o7777),
+    }
+    step = ProvisioningStep("remove_directory_if_empty", arguments)
+    noop_target = tmp_path / "already-absent"
+    noop_step = ProvisioningStep("remove_directory_if_empty", {"path": str(noop_target), "dev": "1", "ino": "1", "uid": "0", "gid": "0", "mode": "448"})
+
+    def runner(argv, **kwargs):
+        return subprocess.run(argv[2:], **kwargs)
+
+    adapter = ConcreteHostProvisioningAdapter(
+        SimpleNamespace(steps=(step, noop_step), rollback_steps=(), adapter_commit="a" * 40),
+        privileged_confirmation=PRIVILEGED_CONFIRMATION,
+        runner=runner, euid_provider=lambda: 1000, username_provider=lambda _uid: "god",
+    )
+    result = adapter.execute(step)
+    evidence = _normalize_result(step.operation, result)
+    assert result["disposition"] == "changed"
+    assert result["safe_code"] == "DIRECTORY_REMOVED"
+    assert result["evidence"] == {"metadata_verified": True}
+    assert evidence.evidence == {"metadata_verified": True}
+    assert not target.exists()
+
+    noop_result = adapter.execute(noop_step)
+    assert noop_result["disposition"] == "verified_noop"
+    assert noop_result["safe_code"] == "DIRECTORY_ALREADY_ABSENT"
+    assert noop_result["evidence"] == {}
+    assert _normalize_result(noop_step.operation, noop_result).evidence == {}
+
+    with pytest.raises(ValueError, match="adapter evidence"):
+        _normalize_result(
+            step.operation,
+            {"ok": True, "operation": step.operation, "disposition": "changed", "safe_code": "DIRECTORY_REMOVED", "evidence": {"unknown_marker": True}, "redactions_applied": True},
+        )
+
+    header = _header(step.operation)
+    started = build_checkpoint(
+        checkpoint_id="directory-removal.started", execution_id=header.execution_id, checkpoint_ordinal=0,
+        previous_digest=header.header_digest, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0,
+        plan_step_ordinal=0, step_digest=header.phases[0].steps[0].forward.step_digest,
+        event=CheckpointEvent.STEP_STARTED, observed_at="2026-08-05T12:01:00Z",
+    )
+    completed = build_checkpoint(
+        checkpoint_id="directory-removal.completed", execution_id=header.execution_id, checkpoint_ordinal=1,
+        previous_digest=started.checkpoint_digest, phase=ExecutionPhase.MATERIALIZE, phase_ordinal=0,
+        plan_step_ordinal=0, step_digest=header.phases[0].steps[0].forward.step_digest,
+        event=CheckpointEvent.STEP_COMPLETED, observed_at="2026-08-05T12:01:01Z", step_evidence=evidence,
+    )
+    with OverseerStore(tmp_path / "directory-removal.sqlite3") as store:
+        store.save_backup_execution(header, started)
+        store.append_backup_execution_checkpoint(completed)
+        loaded = store.load_backup_execution_checkpoints(header.execution_id)
+    assert loaded[-1].step_evidence == evidence
+
 def test_historical_v2_checkpoint_without_evidence_preserves_digest_and_chain():
     header = _header()
     legacy = build_checkpoint(

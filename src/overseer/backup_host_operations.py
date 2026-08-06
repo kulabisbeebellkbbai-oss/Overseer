@@ -166,6 +166,13 @@ def rename_noreplace(parent_fd, old_name, new_name):
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
 
+def stream_scandir(path):
+    entries = os.scandir(path)
+    try:
+        yield from entries
+    finally:
+        entries.close()
+
 def runtime_digest_fd(root_fd, commit):
     files = []
     total = 0
@@ -211,7 +218,7 @@ def runtime_digest_fd(root_fd, commit):
     payload = json.dumps({"version": 1, "commit": commit, "files": files}, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
-def claim_directory(path, expected_dev, expected_ino, expected_uid, expected_gid, expected_mode, recursive, expected_digest=None, commit=None, barrier=None, verify_digest=True):
+def claim_directory(path, expected_dev, expected_ino, expected_uid, expected_gid, expected_mode, recursive, expected_digest=None, commit=None, barrier=None, verify_digest=True, child_barrier=None):
     expected_dev = identity(expected_dev)
     expected_ino = identity(expected_ino)
     expected_uid = identity(expected_uid)
@@ -280,22 +287,41 @@ def claim_directory(path, expected_dev, expected_ino, expected_uid, expected_gid
                     except FileNotFoundError:
                         rename_noreplace(parent_fd, quarantine, name)
                     return {"status": "conflict"}
-                references = runtime_references(os.path.abspath(os.path.join(parent or ".", quarantine)), ignored_pid=os.getpid())
+                references = runtime_references(os.path.abspath(os.path.join(parent or ".", quarantine)), ignored_pid=os.getpid(), logical_path=os.path.abspath(path))
                 if references.get("status") != "clear":
                     try:
                         os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                     except FileNotFoundError:
                         rename_noreplace(parent_fd, quarantine, name)
                     return {"status": "conflict"}
+            root_device = claimed.st_dev
+            child_pause_used = False
             def remove_tree(fd):
-                for entry in os.scandir(fd):
+                nonlocal child_pause_used
+                for entry in stream_scandir(fd):
                     child = entry.name
                     child_stat = os.stat(child, dir_fd=fd, follow_symlinks=False)
-                    if stat.S_ISLNK(child_stat.st_mode) or (not stat.S_ISDIR(child_stat.st_mode) and not stat.S_ISREG(child_stat.st_mode)):
+                    if child_stat.st_dev != root_device:
+                        raise OSError(errno.EXDEV, "descendant device differs")
+                    if not stat.S_ISLNK(child_stat.st_mode) and (not stat.S_ISDIR(child_stat.st_mode) and not stat.S_ISREG(child_stat.st_mode)):
                         raise OSError(errno.ELOOP, "unexpected entry")
                     quarantine_child = ".overseer-child-" + secrets.token_hex(16)
                     rename_noreplace(fd, child, quarantine_child)
                     try:
+                        if child_barrier is not None and not child_pause_used:
+                            child_pause_used = True
+                            open(child_barrier + ".ready", "wb").close()
+                            deadline = time.monotonic() + 10
+                            while not os.path.exists(child_barrier + ".go"):
+                                if time.monotonic() >= deadline:
+                                    raise OSError(errno.ETIMEDOUT, "child barrier timed out")
+                                time.sleep(0.001)
+                            try:
+                                os.stat(child, dir_fd=fd, follow_symlinks=False)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                raise OSError(errno.EEXIST, "child name replaced")
                         if stat.S_ISDIR(child_stat.st_mode):
                             child_fd = os.open(quarantine_child, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
                             try:
@@ -306,6 +332,11 @@ def claim_directory(path, expected_dev, expected_ino, expected_uid, expected_gid
                             finally:
                                 os.close(child_fd)
                             os.rmdir(quarantine_child, dir_fd=fd)
+                        elif stat.S_ISLNK(child_stat.st_mode):
+                            opened = os.stat(quarantine_child, dir_fd=fd, follow_symlinks=False)
+                            if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid) != (child_stat.st_dev, child_stat.st_ino, child_stat.st_mode, child_stat.st_uid, child_stat.st_gid):
+                                raise OSError(errno.EAGAIN, "symlink replaced")
+                            os.unlink(quarantine_child, dir_fd=fd)
                         else:
                             child_fd = os.open(quarantine_child, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
                             try:
@@ -336,7 +367,7 @@ def claim_directory(path, expected_dev, expected_ino, expected_uid, expected_gid
                         return {"status": "error"}
             except OSError:
                 return {"status": "error"}
-            return {"status": "conflict" if error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EAGAIN, errno.ELOOP) else "error"}
+            return {"status": "conflict" if error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EAGAIN, errno.ELOOP, errno.EXDEV) else "error"}
         finally:
             if claimed_fd is not None:
                 os.close(claimed_fd)
@@ -406,15 +437,24 @@ def inside(root, candidate):
     resolved = os.path.realpath(candidate)
     return resolved == root or resolved.startswith(root + os.sep)
 
-def runtime_references(path, ignored_pid=None):
+def lexical_inside(root, candidate):
+    if candidate.endswith(" (deleted)"):
+        candidate = candidate[:-10]
+    if not candidate.startswith("/"):
+        return False
+    normalized = os.path.normpath(candidate)
+    return normalized == root or normalized.startswith(root + os.sep)
+
+def runtime_references(path, ignored_pid=None, proc_root="/proc", logical_path=None):
     root = os.path.realpath(path)
+    lexical_root = os.path.abspath(os.path.normpath(logical_path or path))
     count = 0
-    for entry in os.scandir("/proc"):
+    for entry in stream_scandir(proc_root):
         if not entry.name.isdigit():
             continue
         if ignored_pid is not None and int(entry.name) == ignored_pid:
             continue
-        base = os.path.join("/proc", entry.name)
+        base = os.path.join(proc_root, entry.name)
         for relative in ("cwd", "root", "exe"):
             try:
                 if inside(root, os.readlink(os.path.join(base, relative))):
@@ -428,7 +468,7 @@ def runtime_references(path, ignored_pid=None):
                 return {"status": "error"}
         try:
             fd_dir = os.path.join(base, "fd")
-            for descriptor in os.scandir(fd_dir):
+            for descriptor in stream_scandir(fd_dir):
                 try:
                     if inside(root, os.readlink(descriptor.path)):
                         count += 1
@@ -438,7 +478,7 @@ def runtime_references(path, ignored_pid=None):
                 except OSError:
                     return {"status": "error"}
         except FileNotFoundError:
-            continue
+            pass
         except OSError:
             return {"status": "error"}
         try:
@@ -451,6 +491,24 @@ def runtime_references(path, ignored_pid=None):
                 if len(fields) >= 6 and inside(root, " ".join(fields[5:])):
                     count += 1
                     return {"status": "referenced", "count": count}
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            return {"status": "error"}
+        try:
+            with open(os.path.join(base, "cmdline"), "rb", buffering=0) as cmdline:
+                data = cmdline.read(128 * 1024 + 1)
+            if not data:
+                continue
+            if len(data) > 128 * 1024 or not data.endswith(b"\0"):
+                return {"status": "error"}
+            arguments = data.rstrip(b"\0").split(b"\0")
+            if not arguments or not arguments[0]:
+                return {"status": "error"}
+            decoded = arguments[0].decode("utf-8", "strict")
+            if lexical_inside(lexical_root, decoded):
+                count += 1
+                return {"status": "referenced", "count": count}
         except FileNotFoundError:
             continue
         except (OSError, UnicodeError):
@@ -468,15 +526,15 @@ try:
     elif operation == "rmdir":
         result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], False, None, None, sys.argv[8] if len(sys.argv) > 8 else None)
     elif operation == "remove_tree":
-        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, sys.argv[8] if len(sys.argv) > 8 else None, sys.argv[9] if len(sys.argv) > 9 else None, sys.argv[10] if len(sys.argv) > 10 else None)
+        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, sys.argv[8] if len(sys.argv) > 8 else None, sys.argv[9] if len(sys.argv) > 9 else None, sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else None, True, sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else None)
     elif operation == "remove_staging_tree":
-        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, None, None, None, False)
+        result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, None, None, sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else None, False, sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else None)
     elif operation == "promote":
         result = promote_exact(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8])
     elif operation == "absence":
         result = absent(sys.argv[2])
     elif operation == "references":
-        result = runtime_references(sys.argv[2])
+        result = runtime_references(sys.argv[2], ignored_pid=os.getpid(), proc_root=sys.argv[3] if len(sys.argv) > 3 else "/proc")
     else:
         result = {"status": "error"}
     emit(result)

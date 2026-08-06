@@ -850,7 +850,7 @@ _ADAPTER_RESULT_CONTRACT = {
     "remove_secret_file_if_no_backups": ({"changed", "verified_noop"}, {"SECRET_REMOVED", "SECRET_ALREADY_ABSENT", "SECRET_RETAINED_WITH_BACKUPS"}, {"metadata_verified"}),
     "remove_systemd_unit": ({"changed", "verified_noop"}, {"SYSTEMD_UNIT_REMOVED", "SYSTEMD_UNIT_ALREADY_ABSENT"}, {"metadata_verified"}),
     "remove_read_only_acl": ({"changed", "verified_noop"}, {"ACL_REMOVED"}, {"acl_verified"}),
-    "remove_directory_if_empty": ({"changed", "verified_noop"}, {"DIRECTORY_REMOVED", "DIRECTORY_ALREADY_ABSENT"}, set()),
+    "remove_directory_if_empty": ({"changed", "verified_noop"}, {"DIRECTORY_REMOVED", "DIRECTORY_ALREADY_ABSENT"}, {"metadata_verified"}),
     "remove_system_user_if_unused": ({"changed", "verified_noop"}, {"SYSTEM_USER_REMOVED", "SYSTEM_USER_ALREADY_ABSENT", "SYSTEM_USER_RETAINED_WITH_STATE"}, set()),
     "remove_runtime_if_unreferenced": ({"changed", "verified_noop"}, {"RUNTIME_REMOVED", "RUNTIME_ALREADY_ABSENT"}, {"runtime_digest", "metadata_verified"}),
 }

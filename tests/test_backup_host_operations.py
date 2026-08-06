@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import contextlib
 import json
 import os
 import pwd
@@ -385,6 +386,186 @@ def test_real_boundary_helper_remove_staging_tree_claims_exact_incomplete_tree(t
     process = subprocess.run(["sudo", "-n", sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_staging_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert json.loads(process.stdout.decode("ascii")) == {"status": "removed"}
     assert not path.exists()
+
+
+def test_real_boundary_helper_remove_staging_tree_rejects_live_venv_process_then_removes(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    path = tmp_path / "staging"
+    subprocess.run([sys.executable, "-m", "venv", str(path / ".venv")], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (path / "partial.py").write_text("partial")
+    original = path.stat()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    process = subprocess.Popen([str(path / ".venv" / "bin" / "python"), "-c", "import time; time.sleep(5)"], cwd=outside)
+    args = [sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_staging_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))]
+    try:
+        conflict = subprocess.run(["sudo", "-n", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        assert json.loads(conflict.stdout.decode("ascii")) == {"status": "conflict"}, conflict.stderr.decode(errors="replace")
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+    removed = subprocess.run(["sudo", "-n", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(removed.stdout.decode("ascii")) == {"status": "removed"}, removed.stderr.decode(errors="replace")
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("operation", ("remove_staging_tree", "remove_tree"))
+def test_real_boundary_helper_removes_symlinked_venv_entries_without_following_targets(tmp_path, operation):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    path = tmp_path / operation
+    subprocess.run([sys.executable, "-m", "venv", str(path / ".venv")], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    python_target = Path(sys.executable)
+    (path / "approved.py").write_text("approved")
+    original = path.stat()
+    commit = "a" * 40
+    args = [sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, operation, str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode))]
+    if operation == "remove_tree":
+        args.extend((runtime_digest(path, commit), commit))
+    process = subprocess.run(["sudo", "-n", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(process.stdout.decode("ascii")) == {"status": "removed"}, process.stderr.decode(errors="replace")
+    assert not path.exists()
+    assert python_target.exists()
+
+
+def test_real_boundary_helper_child_symlink_swap_preserves_foreign_tree_and_target(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    path = tmp_path / "runtime"
+    target = tmp_path / "approved-target"
+    target.write_text("approved")
+    path.mkdir()
+    (path / "venv-python").symlink_to(target)
+    original = path.stat()
+    barrier = tmp_path / "child-swap"
+    process = subprocess.Popen(["sudo", "-n", sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "remove_staging_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode)), "", "", "", str(barrier)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for _ in range(5000):
+            if Path(str(barrier) + ".ready").exists():
+                break
+            time.sleep(0.001)
+        else:
+            process.kill()
+            raise AssertionError("helper did not reach claim barrier")
+        claimed = next(tmp_path.glob(".overseer-claim-*"))
+        foreign_target = tmp_path / "foreign-target"
+        foreign_target.write_text("foreign")
+        (claimed / "venv-python").symlink_to(foreign_target)
+        Path(str(barrier) + ".go").touch()
+        stdout, stderr = process.communicate(timeout=10)
+        assert json.loads(stdout.decode("ascii")) == {"status": "conflict"}, stderr.decode(errors="replace")
+        assert path.is_dir() and (path / "venv-python").is_symlink()
+        assert (path / "venv-python").resolve() == foreign_target
+        assert foreign_target.read_text() == "foreign"
+        preserved = list(path.glob(".overseer-child-*"))
+        assert len(preserved) == 1 and preserved[0].is_symlink()
+        assert preserved[0].resolve() == target
+    finally:
+        if process.poll() is None:
+            process.kill(); process.wait()
+
+
+def test_real_boundary_helper_runtime_references_symlinked_venv_process_with_external_cwd(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    runtime = tmp_path / "runtime"
+    subprocess.run([sys.executable, "-m", "venv", str(runtime / ".venv")], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    python_link = runtime / ".venv" / "bin" / "python"
+    (runtime / "approved.py").write_text("approved")
+    commit = "a" * 40
+    digest = runtime_digest(runtime, commit)
+    original = runtime.stat()
+    step = ProvisioningStep("remove_runtime_if_unreferenced", {"path": str(runtime), "runtime_digest": digest, "dev": str(original.st_dev), "ino": str(original.st_ino), "uid": str(original.st_uid), "gid": str(original.st_gid), "mode": str(stat.S_IMODE(original.st_mode))})
+    plan = SimpleNamespace(steps=(step,), rollback_steps=(), adapter_commit=commit)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    process = subprocess.Popen([str(python_link), "-c", "import time; time.sleep(5)"], cwd=outside)
+
+    def runner(argv, **kwargs):
+        if argv[:2] == ["/usr/bin/sudo", "--"] and argv[2] == "/usr/bin/python3":
+            return subprocess.run(["sudo", "-n", *argv[2:]], **kwargs)
+        return Result()
+
+    try:
+        result = ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION, runner=runner, euid_provider=lambda: 1000, username_provider=lambda _uid: "god").execute(step)
+        pytest.fail(f"active runtime unexpectedly removed: {result}")
+    except RedactedHostOperationError as error:
+        assert error.code == "RUNTIME_CONFLICT"
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+    result = ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION, runner=runner, euid_provider=lambda: 1000, username_provider=lambda _uid: "god").execute(step)
+    assert result["safe_code"] == "RUNTIME_REMOVED"
+    assert not runtime.exists()
+
+
+@pytest.mark.parametrize("payload", (pytest.param(b"unterminated", id="unterminated"), pytest.param(b"\xff\x00", id="invalid-utf8"), pytest.param(b"x" * (128 * 1024 + 1), id="oversize")))
+def test_real_boundary_helper_runtime_references_fails_closed_on_malformed_cmdline(tmp_path, payload):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    proc = tmp_path / "proc" / "123"
+    proc.mkdir(parents=True)
+    (proc / "cmdline").write_bytes(payload)
+    result = subprocess.run([sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "references", str(tmp_path / "runtime"), str(tmp_path / "proc")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(result.stdout.decode("ascii"))["status"] == "error"
+
+
+def test_real_boundary_helper_runtime_references_accepts_empty_cmdline(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    proc = tmp_path / "proc" / "123"
+    proc.mkdir(parents=True)
+    (proc / "cmdline").write_bytes(b"")
+    result = subprocess.run([sys.executable, "-c", _PRIVILEGED_BOUNDARY_HELPER, "references", str(tmp_path / "runtime"), str(tmp_path / "proc")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert json.loads(result.stdout.decode("ascii")) == {"count": 0, "status": "clear"}
+
+
+def test_real_boundary_helper_recursive_cleanup_rejects_descendant_device_boundary(tmp_path):
+    from overseer.backup_host_operations import _PRIVILEGED_BOUNDARY_HELPER
+
+    path = tmp_path / "runtime"
+    path.mkdir()
+    (path / "file").write_text("approved")
+    original = path.stat()
+    commit = "a" * 40
+    digest = runtime_digest(path, commit)
+    original_dev = original.st_dev
+    real_stat = os.stat
+    real_scandir = os.scandir
+    file_stat_calls = []
+    empty_proc = tmp_path / "proc"
+    empty_proc.mkdir()
+
+    def fake_stat(target, *args, **kwargs):
+        result = real_stat(target, *args, **kwargs)
+        if kwargs.get("dir_fd") is not None and target == "file":
+            file_stat_calls.append(result)
+            if len(file_stat_calls) >= 2:
+                values = list(result)
+                values[2] = original_dev + 1
+                return os.stat_result(values)
+        return result
+
+    # This seam exercises the helper's descendant-device check without a mount.
+    import io
+    import overseer.backup_host_operations as host
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(host.os, "stat", fake_stat)
+    monkeypatch.setattr(host.os, "scandir", lambda target: real_scandir(empty_proc) if target == "/proc" else real_scandir(target))
+    original_argv = sys.argv
+    output = io.StringIO()
+    try:
+        sys.argv = ["python", "remove_tree", str(path), str(original.st_dev), str(original.st_ino), str(original.st_uid), str(original.st_gid), str(stat.S_IMODE(original.st_mode)), digest, commit]
+        with contextlib.redirect_stdout(output):
+            exec(_PRIVILEGED_BOUNDARY_HELPER, {"__name__": "__main__"})
+    finally:
+        sys.argv = original_argv
+        monkeypatch.undo()
+    assert json.loads(output.getvalue()) == {"status": "conflict"}
+    assert len(file_stat_calls) >= 2
+    assert path.is_dir()
+    assert (path / "file").read_text() == "approved"
 
 
 def test_production_adapter_runtime_cleanup_uses_real_boundary_helper(tmp_path):

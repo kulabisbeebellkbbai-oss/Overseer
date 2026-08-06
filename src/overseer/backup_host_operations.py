@@ -409,6 +409,83 @@ def promote_exact(source, destination, expected_dev, expected_ino, expected_uid,
     finally:
         os.close(parent_fd)
 
+def normalize_runtime_tree(path, expected_dev, expected_ino):
+    """Normalize one freshly staged runtime without pathname recursion."""
+    expected_dev = identity(expected_dev)
+    expected_ino = identity(expected_ino)
+    parent, name = os.path.split(path)
+    parent_fd = os.open(parent or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    root_fd = None
+    try:
+        root_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        root = os.fstat(root_fd)
+        if not stat.S_ISDIR(root.st_mode) or (root.st_dev, root.st_ino) != (expected_dev, expected_ino):
+            return {"status": "conflict"}
+        if root.st_dev != expected_dev:
+            return {"status": "unsafe"}
+        root_uid, root_gid = owner_ids("root")
+        count = 0
+        stack = [(root_fd, ())]
+        while stack:
+            directory_fd, prefix = stack.pop()
+            entries = sorted(os.scandir(directory_fd), key=lambda item: item.name, reverse=True)
+            for entry in entries:
+                count += 1
+                if count > 10000:
+                    return {"status": "unsafe"}
+                relative = prefix + (entry.name,)
+                if len(relative) > 32:
+                    return {"status": "unsafe"}
+                item = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                if item.st_dev != expected_dev:
+                    return {"status": "unsafe"}
+                is_link = stat.S_ISLNK(item.st_mode)
+                if is_link:
+                    if relative != (".venv", "lib64") or os.readlink(entry.name, dir_fd=directory_fd) != "lib":
+                        return {"status": "unsafe"}
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                    os.mkdir(entry.name, mode=0o755, dir_fd=directory_fd)
+                    lib_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+                    try:
+                        os.fchown(lib_fd, root_uid, root_gid)
+                        os.fchmod(lib_fd, 0o755)
+                    finally:
+                        os.close(lib_fd)
+                    continue
+                if not stat.S_ISDIR(item.st_mode) and not stat.S_ISREG(item.st_mode):
+                    return {"status": "unsafe"}
+                if stat.S_ISREG(item.st_mode) and item.st_nlink != 1:
+                    return {"status": "unsafe"}
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                child_fd = os.open(entry.name, flags | (os.O_DIRECTORY if stat.S_ISDIR(item.st_mode) else 0), dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink) != (item.st_dev, item.st_ino, item.st_mode, item.st_nlink):
+                        return {"status": "conflict"}
+                    os.fchown(child_fd, root_uid, root_gid)
+                    mode = stat.S_IMODE(opened.st_mode) & ~0o022
+                    if stat.S_ISDIR(opened.st_mode):
+                        mode |= 0o755
+                    os.fchmod(child_fd, mode)
+                    if stat.S_ISDIR(opened.st_mode):
+                        stack.append((child_fd, relative))
+                        child_fd = None
+                finally:
+                    if child_fd is not None:
+                        os.close(child_fd)
+        os.fchown(root_fd, root_uid, root_gid)
+        os.fchmod(root_fd, 0o755)
+        final = os.fstat(root_fd)
+        if (final.st_dev, final.st_ino) != (expected_dev, expected_ino):
+            return {"status": "conflict"}
+        return {"status": "normalized"}
+    except (OSError, KeyError, ValueError):
+        return {"status": "error"}
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
 def absent(path):
     parent, name = os.path.split(path)
     parent_fd = os.open(parent or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -543,6 +620,8 @@ try:
         result = claim_directory(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], True, None, None, sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else None, False, sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else None)
     elif operation == "promote":
         result = promote_exact(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8])
+    elif operation == "normalize_runtime_tree":
+        result = normalize_runtime_tree(sys.argv[2], sys.argv[3], sys.argv[4])
     elif operation == "absence":
         result = absent(sys.argv[2])
     elif operation == "references":
@@ -729,10 +808,20 @@ class ConcreteHostProvisioningAdapter:
         except FileNotFoundError: destination_info = None
         if destination_info is not None:
             if stat.S_ISLNK(destination_info.st_mode) or not stat.S_ISDIR(destination_info.st_mode): raise RedactedHostOperationError("RUNTIME_CONFLICT")
-            try: expected_owner = pwd.getpwnam(a.get("owner", "root"))
+            try: expected_owner = pwd.getpwnam("root")
             except KeyError: raise RedactedHostOperationError("RUNTIME_CONFLICT") from None
             if (destination_info.st_uid, destination_info.st_gid, stat.S_IMODE(destination_info.st_mode)) != (expected_owner.pw_uid, expected_owner.pw_gid, 0o755): raise RedactedHostOperationError("RUNTIME_CONFLICT")
-            existing = runtime_digest(destination, a["commit"])
+            try:
+                runtime_venv = destination / ".venv"
+                runtime_python = runtime_venv / "bin" / "python"
+                venv_info = runtime_venv.lstat()
+                python_info = runtime_python.lstat()
+                if not stat.S_ISDIR(venv_info.st_mode) or stat.S_ISLNK(venv_info.st_mode) or not stat.S_ISREG(python_info.st_mode) or stat.S_ISLNK(python_info.st_mode) or not python_info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                    raise RedactedHostOperationError("RUNTIME_CONFLICT")
+                self._validate_installed_runtime(runtime_python, destination)
+                existing = runtime_digest(destination, a["commit"])
+            except Exception as error:
+                raise RedactedHostOperationError("RUNTIME_CONFLICT") from error
             if existing == a["runtime_digest"]:
                 return HostOperationResult.verified_noop("RUNTIME_ALREADY_CURRENT", {"runtime_digest": existing, "metadata_verified": True, "dev": str(destination_info.st_dev), "ino": str(destination_info.st_ino), "uid": str(destination_info.st_uid), "gid": str(destination_info.st_gid), "mode": str(stat.S_IMODE(destination_info.st_mode))})
             raise RedactedHostOperationError("RUNTIME_CONFLICT")
@@ -742,16 +831,21 @@ class ConcreteHostProvisioningAdapter:
         staging_info = None
         promoted_info = None
         try:
-            self._sudo(["/usr/bin/install","-d","-m","0700","-o",a.get("owner", "root"),"-g",a.get("owner", "root"),str(staging)])
+            self._sudo(["/usr/bin/install","-d","-m","0700","-o","root","-g","root",str(staging)])
             creation_info = staging.lstat()
             self._sudo(["/usr/bin/rsync","-a","--delete",*excludes,a["source"].rstrip("/")+"/",str(staging).rstrip("/")+"/"])
-            self._sudo(["/usr/bin/python3","-m","venv",str(staging)+"/.venv"])
-            self._sudo([str(staging)+"/.venv/bin/pip","install",str(staging)])
-            self._sudo([str(staging)+"/.venv/bin/python","-c","import theunderdark.production_cli"])
-            self._sudo(["/usr/bin/chown","-R",a.get("owner", "root")+":"+a.get("owner", "root"),str(staging)])
-            self._sudo(["/usr/bin/chmod","0755",str(staging)])
+            venv = staging / ".venv"
+            lib64 = venv / "lib64"
+            self._sudo(["/usr/bin/python3","-m","venv","--copies",str(venv)])
+            self._sudo([str(venv / "bin" / "python"), "-I", "-m", "pip", "install", "--no-deps", "--no-build-isolation", str(staging)])
             staging_info = staging.lstat()
-            if creation_info is None or (staging_info.st_dev, staging_info.st_ino) != (creation_info.st_dev, creation_info.st_ino): raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            if creation_info is None or (staging_info.st_dev, staging_info.st_ino) != (creation_info.st_dev, creation_info.st_ino):
+                raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            normalized = self._boundary("normalize_runtime_tree", str(staging), str(creation_info.st_dev), str(creation_info.st_ino))
+            if normalized.get("status") != "normalized":
+                raise RedactedHostOperationError("RUNTIME_CONFLICT")
+            self._validate_installed_runtime(venv / "bin" / "python", staging)
+            staging_info = staging.lstat()
             if runtime_digest(staging,a["commit"])!=a["runtime_digest"]: raise RuntimeError("installed runtime digest mismatch")
             promoted = self._boundary("promote", str(staging), str(destination), str(staging_info.st_dev), str(staging_info.st_ino), str(staging_info.st_uid), str(staging_info.st_gid), str(stat.S_IMODE(staging_info.st_mode)))
             if promoted.get("status") != "promoted": raise RedactedHostOperationError("RUNTIME_CONFLICT")
@@ -781,6 +875,14 @@ class ConcreteHostProvisioningAdapter:
             except Exception as cleanup_error:
                 raise RedactedHostOperationError("RUNTIME_CONFLICT") from cleanup_error
             raise
+    def _validate_installed_runtime(self, python, root):
+        validation = (
+            "import os, sys; "
+            "sys.path.insert(0, os.path.join(sys.argv[1], 'src')); "
+            "from theunderdark.production_cli import validate_production_runtime_root; "
+            "validate_production_runtime_root(sys.argv[1])"
+        )
+        self._sudo([str(python), "-I", "-c", validation, str(root)])
     def _verify_endpoint_migration_ready(self,a):
         if a.get("host") != "127.0.0.1" or a.get("port") != 8799 or a.get("forbid_simultaneous_user_and_system_service") is not True:
             raise RedactedHostOperationError("ENDPOINT_CONFLICT")
@@ -1091,6 +1193,7 @@ class ConcreteHostProvisioningAdapter:
             "remove_tree": {item: {"status"} for item in ("absent", "unsafe", "conflict", "removed", "error")},
             "remove_staging_tree": {item: {"status"} for item in ("absent", "unsafe", "conflict", "removed", "error")},
             "promote": {item: {"status"} for item in ("conflict", "promoted", "error")},
+            "normalize_runtime_tree": {item: {"status"} for item in ("normalized", "unsafe", "conflict", "error")},
             "absence": {item: {"status"} for item in ("absent", "unsafe", "present")},
             "references": {"error": {"status"}, "clear": {"status", "count"}, "referenced": {"status", "count"}},
         }

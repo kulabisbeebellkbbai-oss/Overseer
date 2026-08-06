@@ -170,3 +170,44 @@ or provisioning execution is authorized by this source milestone.
     commit, runtime digest, and configuration digest into `ExecStart`.
   - No live actions were performed.
   - Task 5 — Overseer attestation and behavior acceptance — is next.
+
+## Pause checkpoint — 2026-08-05
+
+- Development is paused at the user's request because of the approaching usage
+  limit. Do not resume source changes, merges, deployments, restarts, approval
+  actions, or live provisioning until the user explicitly resumes this project.
+- The exact paused checkout is protected by active Overseer checkout claim
+  `claim.overseer.reusable-approval-facility.pause.20260805` on resource
+  `checkout.overseer.feature.reusable-approval-facility`. Release it only after
+  the user resumes the project and checkout ownership is re-established.
+- Task 4 is complete, committed, and independently release-reviewed. Task 5 is
+  an intentionally incomplete work-in-progress checkpoint.
+- Task 5's strict read-only acceptance slice is locally green: 10 focused tests
+  passed. Its runtime installation/provisioning slice is not green: the first
+  reproducible affected-suite failure occurs after 65 passes in
+  `test_runtime_install_failure_cleans_exact_staging_and_retry_converges` because
+  the test boundary stub leaves the staged root at mode 0775 instead of modeling
+  the production normalizer's 0755 result. The interrupted broader run showed
+  additional failures, so the WIP commit must not be treated as reviewed or
+  deployable.
+- Known Task 5 work on resume:
+  - finish and adversarially test the bounded descriptor-relative runtime-tree
+    normalizer, including descriptor closure, post-mutation identity checks,
+    exact `lib64 -> lib` handling, depth/count/device limits, and cleanup races;
+  - finalize a non-editable dependency/install strategy whose controlled import
+    path loads `theunderdark` only from the attested `ROOT/src/theunderdark`;
+  - add the v3 execution header/plan binding: runtime tree digest, configuration
+    digest, and full canonical acceptance-fixture digest remain distinct from
+    source runtime-artifact identity and capability digest;
+  - preserve legacy v2 records as read-only history and require a freshly
+    reviewed successor execution before any v2 continuation;
+  - preserve exact behavior-acceptance failure codes instead of collapsing them;
+  - run focused, affected, full, and cross-repository verification, then dual
+    Terra review and final Sol security review before marking Task 5 complete.
+- Adopted process improvements remain in force: capability-sized release trains,
+  root-cause correction batches, focused-to-affected-to-full test escalation,
+  exact frozen-fingerprint reviews, immutable commit before final security
+  review, and separate source/deployment/live status. Merging to `main` and live
+  approval-policy changes remain deferred.
+- No deployment, restart, protected-host mutation, publication, approval action,
+  or provisioning execution was performed by this checkpoint.

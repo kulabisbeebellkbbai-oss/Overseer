@@ -742,22 +742,45 @@ def test_boundary_integer_fields_use_explicit_bounds():
             adapter([], lambda *_a, payload=payload, **_k: Result(stdout=json.dumps(payload).encode()))._boundary("references", "/unused")
 
 
-def test_installed_runtime_exact_digest_is_verified_noop(tmp_path):
+def test_installed_runtime_exact_digest_is_verified_noop(tmp_path, monkeypatch):
     source = tmp_path / "source"
     destination = tmp_path / "destination"
     source.mkdir()
     destination.mkdir()
     destination.chmod(0o755)
+    (destination / ".venv" / "bin").mkdir(parents=True)
+    (destination / ".venv" / "bin" / "python").write_bytes(b"python")
+    (destination / ".venv" / "bin" / "python").chmod(0o755)
     (source / "runtime.py").write_text("runtime = 1\n")
     shutil.copy2(source / "runtime.py", destination / "runtime.py")
     commit = "a" * 40
     digest = runtime_digest(source, commit)
     step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": digest, "destination": str(destination), "owner": pwd.getpwuid(os.getuid()).pw_name, "immutable": True})
     calls = []
+    import overseer.backup_host_operations as host
+    monkeypatch.setattr(host.pwd, "getpwnam", lambda _name: pwd.getpwuid(os.getuid()))
     result = adapter([step], lambda argv, **kwargs: calls.append(argv) or Result()).execute(step)
     assert result["disposition"] == "verified_noop"
     assert result["safe_code"] == "RUNTIME_ALREADY_CURRENT"
-    assert calls == []
+    assert len(calls) == 1 and any("validate_production_runtime_root" in item for item in calls[0])
+
+
+@pytest.mark.parametrize("failure", ("missing", "validation"))
+def test_existing_runtime_validation_failures_map_to_runtime_conflict(tmp_path, failure):
+    source = tmp_path / "source"; source.mkdir(); (source / "runtime.py").write_text("runtime = 1\n")
+    destination = tmp_path / "destination"; shutil.copytree(source, destination); destination.chmod(0o755)
+    if failure == "validation":
+        (destination / ".venv" / "bin").mkdir(parents=True)
+        python = destination / ".venv" / "bin" / "python"; python.write_bytes(b"python"); python.chmod(0o755)
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": "a" * 40, "runtime_digest": runtime_digest(source, "a" * 40), "destination": str(destination), "owner": pwd.getpwuid(os.getuid()).pw_name, "immutable": True})
+
+    def runner(argv, **kwargs):
+        if failure == "validation" and any("validate_production_runtime_root" in item for item in argv):
+            return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
+        return Result()
+
+    with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+        adapter([step], runner).execute(step)
 
 
 def test_installed_runtime_conflict_fails_closed_before_mutation(tmp_path):
@@ -786,19 +809,24 @@ def test_runtime_install_failure_cleans_exact_staging_and_retry_converges(tmp_pa
         def runner(argv, **kwargs):
             if argv[2] == "/usr/bin/install" and "-d" in argv:
                 Path(argv[-1]).mkdir(parents=True)
+            if argv[2:6] == ["/usr/bin/python3", "-m", "venv", "--copies"]:
+                venv = Path(argv[-1]); (venv / "bin").mkdir(parents=True, exist_ok=True)
+                (venv / "bin" / "python").write_bytes(b"python"); (venv / "bin" / "python").chmod(0o755)
             if argv[2] == "/usr/bin/chmod":
                 os.chmod(argv[-1], int(argv[-2], 8))
             if fail == "rsync" and "/usr/bin/rsync" in argv:
                 return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
-            if fail == "venv" and argv[4:7] == ["/usr/bin/python3", "-m", "venv"]:
+            if fail == "venv" and argv[2:6] == ["/usr/bin/python3", "-m", "venv", "--copies"]:
                 return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
-            if fail == "pip" and len(argv) > 4 and argv[4].endswith("/pip"):
+            if fail == "pip" and len(argv) > 5 and argv[4].endswith("/python") and argv[5:7] == ["-m", "pip"]:
                 return Result(returncode=1, stderr=b'{"ok":false,"error":{"code":"PROCESS_FAILED"},"redactions_applied":true}')
             return Result()
         return runner
     action = adapter([step], make_runner(failure))
     cleanup_calls = []
     def boundary(operation, *args):
+        if operation == "normalize_runtime_tree":
+            return {"status": "normalized"}
         if operation in {"remove_tree", "remove_staging_tree"}:
             cleanup_calls.append(args)
             shutil.rmtree(args[0], ignore_errors=False); return {"status": "removed"}
@@ -818,7 +846,7 @@ def test_runtime_install_failure_cleans_exact_staging_and_retry_converges(tmp_pa
 
     monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
     retry = adapter([step], make_runner(None))
-    retry._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else {"status": "removed"}
+    retry._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else {"status": "normalized"} if operation == "normalize_runtime_tree" else {"status": "removed"}
     result = retry.execute(step)
     assert result["safe_code"] == "RUNTIME_INSTALLED"
     assert destination.is_dir()
@@ -834,6 +862,9 @@ def test_runtime_install_real_staging_cleanup_and_retry_uses_privileged_boundary
     def runner(argv, **kwargs):
         if argv[2] == "/usr/bin/install" and "-d" in argv:
             Path(argv[-1]).mkdir(parents=True)
+        if argv[2:6] == ["/usr/bin/python3", "-m", "venv", "--copies"]:
+            venv = Path(argv[-1]); (venv / "bin").mkdir(parents=True, exist_ok=True)
+            (venv / "bin" / "python").write_bytes(b"python"); (venv / "bin" / "python").chmod(0o755)
         if "/usr/bin/rsync" in argv:
             if state["fail_once"]:
                 state["fail_once"] = False
@@ -843,7 +874,7 @@ def test_runtime_install_real_staging_cleanup_and_retry_uses_privileged_boundary
                 if item.is_file(): shutil.copy2(item, staging_path / item.name)
         if argv[2] == "/usr/bin/chmod":
             os.chmod(argv[-1], int(argv[-2], 8))
-        if argv[:2] == ["/usr/bin/sudo", "--"] and argv[2:5] == ["/usr/bin/python3", "-c", host._PRIVILEGED_BOUNDARY_HELPER] and argv[5] in {"promote", "remove_staging_tree", "remove_tree", "absence"}:
+        if argv[:2] == ["/usr/bin/sudo", "--"] and argv[2:5] == ["/usr/bin/python3", "-c", host._PRIVILEGED_BOUNDARY_HELPER] and argv[5] in {"promote", "normalize_runtime_tree", "remove_staging_tree", "remove_tree", "absence"}:
             return subprocess.run(["sudo", "-n", *argv[2:]], **kwargs)
         return Result()
 
@@ -877,6 +908,8 @@ def test_runtime_install_destination_race_preserves_foreign_destination_and_clea
         return Result()
     action = adapter([step], runner)
     def boundary(operation, *args):
+        if operation == "normalize_runtime_tree":
+            return {"status": "normalized"}
         if operation == "promote":
             destination.mkdir(); (destination / "foreign").write_text("foreign"); return {"status": "conflict"}
         shutil.rmtree(args[0]); return {"status": "removed"}
@@ -897,7 +930,7 @@ def test_runtime_install_cleanup_ambiguity_fails_closed_without_touching_destina
         if argv[2] == "/usr/bin/install" and "-d" in argv: Path(argv[-1]).mkdir(parents=True)
         return Result()
     action = adapter([step], runner)
-    action._boundary = lambda operation, *args: {"status": "error"} if operation == "remove_tree" else {"status": "conflict"}
+    action._boundary = lambda operation, *args: {"status": "normalized"} if operation == "normalize_runtime_tree" else {"status": "error"} if operation == "remove_tree" else {"status": "conflict"}
     with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
         action.execute(step)
     assert not destination.exists()
@@ -913,7 +946,7 @@ def test_runtime_install_post_promotion_attestation_failure_removes_only_promote
         if argv[2] == "/usr/bin/install" and "-d" in argv: Path(argv[-1]).mkdir(parents=True)
         return Result()
     action = adapter([step], runner)
-    action._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else (shutil.rmtree(args[0]) or {"status": "removed"})
+    action._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else {"status": "normalized"} if operation == "normalize_runtime_tree" else (shutil.rmtree(args[0]) or {"status": "removed"})
     with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
         action.execute(step)
     assert not destination.exists()
@@ -936,6 +969,8 @@ def test_runtime_install_cleanup_identity_race_preserves_foreign_staging_replace
         return Result()
     action = adapter([step], runner)
     def boundary(operation, *args):
+        if operation == "normalize_runtime_tree":
+            return {"status": "normalized"}
         if operation != "remove_tree": raise AssertionError(operation)
         current = Path(args[0]).stat()
         if (str(current.st_dev), str(current.st_ino)) != (args[1], args[2]): return {"status": "conflict"}
@@ -1266,23 +1301,33 @@ def test_install_excludes_local_environments_and_caches(monkeypatch, tmp_path):
         calls.append(argv)
         if argv[2] == "/usr/bin/install" and "-d" in argv:
             Path(argv[-1]).mkdir(parents=True)
+        if argv[2:6] == ["/usr/bin/python3", "-m", "venv", "--copies"]:
+            venv = Path(argv[-1]); (venv / "bin").mkdir(parents=True, exist_ok=True)
+            (venv / "bin" / "python").write_bytes(b"python"); (venv / "bin" / "python").chmod(0o755)
         if argv[2] == "/usr/bin/chmod":
             os.chmod(argv[-1], int(argv[-2], 8))
         return Result()
     action = adapter([step], runner)
-    action._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else {"status": "removed"}
+    boundary_calls = []
+    def boundary(operation, *args):
+        boundary_calls.append((operation, args))
+        if operation == "normalize_runtime_tree": return {"status": "normalized"}
+        if operation == "promote": return os.rename(args[0], args[1]) or {"status": "promoted"}
+        return {"status": "removed"}
+    action._boundary = boundary
     action.execute(step)
     rsync=next(argv for argv in calls if "/usr/bin/rsync" in argv)
     assert {"--exclude=.git","--exclude=.venv","--exclude=.codex","--exclude=.agents","--exclude=__pycache__","--exclude=.pytest_cache","--exclude=tests","--exclude=docs"}<=set(rsync)
-    pip=next(argv for argv in calls if argv[-2] == "install" and argv[-3].endswith("/pip"))
-    assert "--no-deps" not in pip
-    import_check=next(argv for argv in calls if argv[-2:]==["-c","import theunderdark.production_cli"])
+    pip=next(argv for argv in calls if "-m" in argv and "pip" in argv)
+    assert "--editable" not in pip and "--no-deps" in pip
+    import_check=next(argv for argv in calls if any("validate_production_runtime_root" in item for item in argv))
     assert calls.index(pip)<calls.index(import_check)
     assert destination.stat().st_mode & 0o777 == 0o755
     before_retry_calls = len(calls)
     retry = action.execute(step)
     assert retry["safe_code"] == "RUNTIME_ALREADY_CURRENT"
-    assert len(calls) == before_retry_calls
+    assert len(calls) == before_retry_calls + 1
+    assert any("validate_production_runtime_root" in item for item in calls[-1])
 
 def test_runtime_digest_excludes_agent_metadata_tests_and_docs(tmp_path):
     for directory in (".codex",".agents","tests","docs"):
@@ -1317,6 +1362,106 @@ def test_systemd_rendering_quotes_paths_with_spaces():
     rendered=host._unit({"user":"backup","exec_start":('/path with space/app','serve','--config','/config with space'),"umask":"0077","read_only_paths":('/source with space',),"read_write_paths":('/state with space',),"restrict_address_families":('AF_UNIX','AF_INET')})
     assert 'ExecStart="/path with space/app" "serve" "--config" "/config with space"' in rendered
     assert 'ReadOnlyPaths="/source with space"' in rendered and 'ReadWritePaths="/state with space"' in rendered
+
+
+def test_runtime_install_uses_copies_non_editable_install_and_production_root_validation(tmp_path):
+    source = tmp_path / "source"; source.mkdir(); (source / "src").mkdir(); (source / "src" / "theunderdark").mkdir()
+    (source / "src" / "theunderdark" / "production_cli.py").write_text("def validate_production_runtime_root(root): pass\n")
+    commit = "a" * 40
+    digest = runtime_digest(source, commit)
+    destination = tmp_path / "destination"
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": digest, "destination": str(destination), "owner": "root", "immutable": True})
+    calls = []
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if "/usr/bin/install" in argv and "-d" in argv:
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+        if "/usr/bin/rsync" in argv:
+            target = Path(argv[-1].rstrip("/")); shutil.copytree(source, target, dirs_exist_ok=True)
+        elif "/usr/bin/python3" in argv and "venv" in argv:
+            venv = Path(argv[-1]); (venv / "bin").mkdir(parents=True, exist_ok=True)
+            (venv / "bin" / "python").touch(); (venv / "bin" / "python").chmod(0o755)
+        elif "-m" in argv and "pip" in argv:
+            pass
+        if "promote" in argv:
+            staging = Path(argv[argv.index("promote") + 1]); os.replace(staging, destination)
+            return Result(stdout=b'{"status":"promoted"}')
+        return Result()
+    # This deliberately describes the exact child commands; the implementation
+    # must not fall back to PYTHONPATH or a bare import-only probe.
+    result = adapter([step], runner).execute(step)
+    assert result["safe_code"] == "RUNTIME_INSTALLED"
+    rsync_index = next(index for index, argv in enumerate(calls) if "/usr/bin/rsync" in argv)
+    venv_index = next(index for index, argv in enumerate(calls) if argv[2:6] == ["/usr/bin/python3", "-m", "venv", "--copies"])
+    installs = [argv for argv in calls if "-m" in argv and "pip" in argv]
+    assert installs and "--editable" not in installs[0] and "--no-deps" in installs[0]
+    validation = [argv for argv in calls if any("validate_production_runtime_root" in item for item in argv)]
+    pip_index = calls.index(installs[0])
+    normalize_index = next(index for index, argv in enumerate(calls) if "normalize_runtime_tree" in argv)
+    validation_index = next(index for index, argv in enumerate(calls) if any("validate_production_runtime_root" in item for item in argv))
+    promotion_index = next(index for index, argv in enumerate(calls) if "promote" in argv)
+    assert rsync_index < venv_index < pip_index < normalize_index < validation_index < promotion_index
+    assert validation and validation[0][-1] == next(item for item in validation[0] if item.startswith(str(destination.parent / ".overseer-runtime-staging-")))
+    assert not any(any(token in argv for token in ("--editable", "/usr/bin/chown", "/usr/bin/find", "/usr/bin/rm", "/usr/bin/test")) for argv in calls)
+    assert "PYTHONPATH" not in repr(calls)
+
+
+@pytest.mark.parametrize("lib64_kind", ("symlink", "absent", "directory", "file"))
+def test_runtime_install_normalizes_lib64_only_for_symlink_or_absence(tmp_path, monkeypatch, lib64_kind):
+    import overseer.backup_host_operations as host
+    source = tmp_path / "source"; source.mkdir(); (source / "runtime.py").write_text("runtime\n")
+    destination = tmp_path / "destination"; expected = "sha256:" + "b" * 64
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": "a" * 40, "runtime_digest": expected, "destination": str(destination), "owner": "root", "immutable": True})
+    monkeypatch.setattr(host, "runtime_digest", lambda _path, _commit: expected)
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[2] == "/usr/bin/install" and "-d" in argv:
+            target = Path(argv[-1])
+            if target.is_symlink(): target.unlink()
+            target.mkdir(parents=True, exist_ok=True)
+        if argv[2:6] == ["/usr/bin/python3", "-m", "venv", "--copies"]:
+            venv = Path(argv[-1]); (venv / "bin").mkdir(parents=True, exist_ok=True)
+            (venv / "bin" / "python").write_bytes(b"python"); (venv / "bin" / "python").chmod(0o755)
+            lib64 = venv / "lib64"
+            if lib64_kind == "symlink": lib64.symlink_to("lib")
+            elif lib64_kind == "directory": lib64.mkdir()
+            elif lib64_kind == "file": lib64.write_text("wrong")
+        if argv[2] == "/usr/bin/test" and argv[3] == "-L":
+            return Result(returncode=0 if lib64_kind == "symlink" else 1)
+        if argv[2] == "/usr/bin/test" and argv[3] == "-e":
+            return Result(returncode=0 if lib64_kind in {"directory", "file"} else 1)
+        if argv[2] == "/usr/bin/test" and argv[3] == "-d":
+            return Result(returncode=0 if lib64_kind == "directory" else 1)
+        return Result()
+
+    action = adapter([step], runner)
+    action._boundary = lambda operation, *args: (os.rename(args[0], args[1]) or {"status": "promoted"}) if operation == "promote" else ({"status": "unsafe"} if lib64_kind == "file" and operation == "normalize_runtime_tree" else {"status": "normalized"} if operation == "normalize_runtime_tree" else {"status": "removed"})
+    if lib64_kind == "file":
+        with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+            action.execute(step)
+        assert not any(any(token in argv for token in ("/usr/bin/chown", "/usr/bin/find", "/usr/bin/rm", "/usr/bin/test")) for argv in calls)
+    else:
+        assert action.execute(step)["safe_code"] == "RUNTIME_INSTALLED"
+        assert any("normalize_runtime_tree" in argv for argv in calls)
+        assert not any(any(token in argv for token in ("/usr/bin/chown", "/usr/bin/find", "/usr/bin/rm", "/usr/bin/test")) for argv in calls)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "wrong-provenance", "old-layout"])
+def test_current_runtime_requires_real_installed_provenance_and_immutability(tmp_path, kind):
+    source = tmp_path / "source"; source.mkdir(); (source / "src").mkdir(); (source / "src" / "theunderdark").mkdir()
+    (source / "src" / "theunderdark" / "production_cli.py").write_text("def validate_production_runtime_root(root): pass\n")
+    commit = "a" * 40; digest = runtime_digest(source, commit); destination = tmp_path / "destination"
+    if kind == "symlink":
+        target = tmp_path / "target"; target.mkdir(); destination.symlink_to(target, target_is_directory=True)
+    else:
+        shutil.copytree(source, destination)
+        if kind == "wrong-provenance": (destination / "src" / "theunderdark" / "production_cli.py").write_text("wrong\n")
+        if kind == "old-layout": (destination / "theunderdark").mkdir()
+    step = ProvisioningStep("install_runtime", {"source": str(source), "commit": commit, "runtime_digest": digest, "destination": str(destination), "owner": pwd.getpwuid(os.getuid()).pw_name, "immutable": True})
+    with pytest.raises(RedactedHostOperationError, match="RUNTIME_CONFLICT"):
+        adapter([step], lambda *_a, **_k: Result()).execute(step)
 
 def test_operator_cli_wires_concrete_adapter_without_root_owned_control_store(tmp_path,monkeypatch,capsys):
     import os

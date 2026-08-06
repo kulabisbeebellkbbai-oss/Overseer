@@ -168,19 +168,6 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         raise ValueError("exact plan, published source, capability, GPG identity, and evidence roles are required")
     if any(not isinstance(value, str) or not OPAQUE_ID.fullmatch(value) for value in evidence_ids.values()):
         raise ValueError("evidence IDs must be opaque identifiers")
-    unit = {
-        "user": SYSTEM_USER,
-        "exec_start": (EXECUTABLE_PATH, "serve", "--config", CONFIG_PATH),
-        "read_only_paths": (SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file),
-        "read_write_paths": (ARTIFACT_PATH, STATE_PATH),
-        "umask": "0077",
-        "private_tmp": True,
-        "private_state": True,
-        "protect_system": "strict",
-        "protect_home": "read-only",
-        "no_new_privileges": True,
-        "restrict_address_families": ("AF_UNIX", "AF_INET"),
-    }
     config = {
         "host": LISTEN_HOST, "port": LISTEN_PORT, "state_dir": STATE_PATH,
         "journal_path": f"{STATE_PATH}/journal.sqlite3", "admission_path": f"{STATE_PATH}/admission.sqlite3",
@@ -193,7 +180,25 @@ def build_plan(plan_id: str, gpg_sha256: str, adapter_commit: str, runtime_diges
         "limits": {"max_storage_bytes": 1073741824, "max_concurrent_operations": 1, "max_requests_per_window": 12, "rate_window_seconds": 3600, "lease_seconds": 300},
         "backup_bindings": [{"project_id": "project.donuthole", "root_id": "backup-root", "policy_revision": "1", "source_root": SOURCE_PATH, "artifact_dir": ARTIFACT_PATH, "passphrase_file": KEY_PATH, "gpg_executable": GPG_PATH}],
     }
-    config_digest = _object_digest(config); unit_digest = _object_digest(unit)
+    config_digest = _object_digest(config)
+    unit = {
+        "user": SYSTEM_USER,
+        "exec_start": (EXECUTABLE_PATH, "serve", "--config", CONFIG_PATH,
+                        "--runtime-root", "/opt/theunderdark",
+                        "--expected-runtime-digest", runtime_digest,
+                        "--expected-config-digest", config_digest,
+                        "--source-commit", adapter_commit),
+        "read_only_paths": (SOURCE_PATH, CONFIG_PATH, KEY_PATH, overseer_token_file, cursor_key_file),
+        "read_write_paths": (ARTIFACT_PATH, STATE_PATH),
+        "umask": "0077",
+        "private_tmp": True,
+        "private_state": True,
+        "protect_system": "strict",
+        "protect_home": "read-only",
+        "no_new_privileges": True,
+        "restrict_address_families": ("AF_UNIX", "AF_INET"),
+    }
+    unit_digest = _object_digest(unit)
     steps = (
         ProvisioningStep("verify_published_adapter_source", {"path": ADAPTER_SOURCE_PATH, "commit": adapter_commit, "capability_digest": reviewed_capability, "provisioning_contract_version": provisioning_contract_version, "runtime_artifact_identity": planned_runtime_identity}),
         ProvisioningStep("install_runtime", {"source": ADAPTER_SOURCE_PATH, "commit": adapter_commit, "runtime_digest": runtime_digest, "destination": "/opt/theunderdark", "owner": "root", "immutable": True}),

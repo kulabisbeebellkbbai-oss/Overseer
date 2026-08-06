@@ -964,7 +964,13 @@ def test_plan_has_exact_boundaries_sandbox_rollback_and_retention(tmp_path):
     assert unit.arguments["properties"]["read_write_paths"] == (f"{plan.backup_path}/artifacts", f"{plan.backup_path}/state")
     assert unit.arguments["properties"]["umask"] == "0077"
     assert unit.arguments["properties"]["restrict_address_families"] == ("AF_UNIX", "AF_INET")
-    assert unit.arguments["properties"]["exec_start"] == ("/opt/theunderdark/.venv/bin/theunderdark-production", "serve", "--config", plan.config_path)
+    assert unit.arguments["properties"]["exec_start"] == (
+        "/opt/theunderdark/.venv/bin/theunderdark-production", "serve",
+        "--config", plan.config_path, "--runtime-root", "/opt/theunderdark",
+        "--expected-runtime-digest", plan.runtime_digest,
+        "--expected-config-digest", plan.config_digest,
+        "--source-commit", plan.adapter_commit,
+    )
     assert plan.key_path == "/etc/codex-development-backups/keys/donuthole.gpg-passphrase"
     assert "load_credential" not in unit.arguments["properties"]
     key = next(step for step in plan.steps if step.operation == "generate_secret_file")

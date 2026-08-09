@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 from collections.abc import Callable, Sequence
@@ -30,6 +32,71 @@ class PackageInspectionSnapshot:
 
     def succeeded(self) -> bool:
         return self.exit_code == 0
+
+
+@dataclass(frozen=True)
+class PackageInspectionRecord:
+    id: str
+    captured_at: str
+    command: tuple[str, ...]
+    exit_code: int
+    updates: tuple[PackageUpdate, ...]
+    state_fingerprint: str
+    stderr: str = ""
+
+    def succeeded(self) -> bool:
+        return self.exit_code == 0
+
+
+@dataclass(frozen=True)
+class PackageReconciliationEvidence:
+    id: str
+    snapshot_id: str
+    maintenance_batch_id: str
+    observed_at: str
+    outcome: str
+    plan_ids: tuple[str, ...] = ()
+    message_ids: tuple[str, ...] = ()
+
+
+def package_state_fingerprint(snapshot: PackageInspectionSnapshot) -> str:
+    rows = [
+        {
+            "architecture": item.architecture or "",
+            "candidate_version": item.candidate_version or "",
+            "installed_version": item.installed_version or "",
+            "name": item.name or "",
+            "repository": item.repository or "",
+        }
+        for item in sorted(snapshot.updates, key=lambda value: (value.name, value.architecture))
+    ]
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def package_inspection_record(snapshot: PackageInspectionSnapshot) -> PackageInspectionRecord:
+    fingerprint = package_state_fingerprint(snapshot)
+    record_payload = json.dumps(
+        {
+            "captured_at": snapshot.captured_at,
+            "command": snapshot.command,
+            "exit_code": snapshot.exit_code,
+            "fingerprint": fingerprint,
+            "stderr": snapshot.stderr,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    digest = hashlib.sha256(record_payload).hexdigest()
+    return PackageInspectionRecord(
+        id=f"{snapshot.id}.{digest[:16]}",
+        captured_at=snapshot.captured_at,
+        command=snapshot.command,
+        exit_code=snapshot.exit_code,
+        updates=snapshot.updates,
+        state_fingerprint=fingerprint,
+        stderr=snapshot.stderr,
+    )
 
 
 @dataclass(frozen=True)

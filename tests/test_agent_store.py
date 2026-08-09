@@ -509,6 +509,7 @@ def test_existing_integer_schema_migration_rows_and_indexes_are_preserved(tmp_pa
         assert [row.version for row in store.list_schema_migrations()] == [
             1,
             2,
+            3,
             10,
             "agent_driver_v1",
             "agent_driver_v2",
@@ -517,8 +518,8 @@ def test_existing_integer_schema_migration_rows_and_indexes_are_preserved(tmp_pa
             "agent_driver_v5",
             "agent_driver_v6",
             "agent_driver_v7",
-                "agent_driver_v8",
-                "agent_driver_v9",
+            "agent_driver_v8",
+            "agent_driver_v9",
         ]
 
     with sqlite3.connect(path) as connection:

@@ -51,6 +51,7 @@ from .host import HostInspectionSnapshot
 from .ids_review import HostSecurityIDSReviewPackage
 from .key_broker import KeyBrokerTokenGrant, KeyBrokerTokenRequest, KeyProviderRecord
 from .maintenance_schedule import MaintenanceSchedule
+from .packages import PackageInspectionRecord, PackageReconciliationEvidence
 from .ops_records import OperationRecord
 from .physical import PhysicalIdentity
 from .runtime_state import RuntimeHeartbeat
@@ -60,7 +61,7 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
@@ -499,6 +500,20 @@ class SQLiteStore:
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS package_inspection_records (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS package_reconciliation_evidence (
+                id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL,
+                maintenance_batch_id TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_reconciliation_snapshot
+            ON package_reconciliation_evidence (snapshot_id);
+            CREATE INDEX IF NOT EXISTS idx_package_reconciliation_batch
+            ON package_reconciliation_evidence (maintenance_batch_id);
             CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
                 approval_ref TEXT PRIMARY KEY,
                 source_kind TEXT NOT NULL,
@@ -2088,13 +2103,75 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO admin_executions (id, plan_id, payload) VALUES (?, ?, ?)",
             (result.id, result.plan_id, _dump(result)),
         )
-        self._commit()
+        self._commit_agent_mutation()
 
     def load_admin_execution(self, result_id: str) -> AdminExecutionResult:
         return _load_dataclass(AdminExecutionResult, self._get_payload("admin_executions", result_id))
 
     def list_admin_executions(self) -> tuple[AdminExecutionResult, ...]:
         return tuple(_load_dataclass(AdminExecutionResult, payload) for payload in self._list_payloads("admin_executions"))
+
+    def save_package_inspection_record(self, record: PackageInspectionRecord) -> None:
+        payload = _dump(record)
+        existing = self._connection.execute(
+            "SELECT payload FROM package_inspection_records WHERE id = ?", (record.id,)
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload"]) != payload:
+                raise ValueError("immutable package inspection collision")
+            return
+        self._connection.execute(
+            "INSERT INTO package_inspection_records (id, payload) VALUES (?, ?)",
+            (record.id, payload),
+        )
+        self._commit_agent_mutation()
+
+    def load_package_inspection_record(self, record_id: str) -> PackageInspectionRecord:
+        return _load_dataclass(
+            PackageInspectionRecord,
+            self._get_payload("package_inspection_records", record_id),
+        )
+
+    def list_package_inspection_records(self) -> tuple[PackageInspectionRecord, ...]:
+        return tuple(
+            _load_dataclass(PackageInspectionRecord, payload)
+            for payload in self._list_payloads("package_inspection_records")
+        )
+
+    def save_package_reconciliation_evidence(
+        self, evidence: PackageReconciliationEvidence
+    ) -> None:
+        payload = _dump(evidence)
+        existing = self._connection.execute(
+            "SELECT payload FROM package_reconciliation_evidence WHERE id = ?",
+            (evidence.id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload"]) != payload:
+                raise ValueError("immutable package reconciliation evidence collision")
+            return
+        self._connection.execute(
+            "INSERT INTO package_reconciliation_evidence "
+            "(id, snapshot_id, maintenance_batch_id, payload) VALUES (?, ?, ?, ?)",
+            (evidence.id, evidence.snapshot_id, evidence.maintenance_batch_id, payload),
+        )
+        self._commit_agent_mutation()
+
+    def load_package_reconciliation_evidence(
+        self, evidence_id: str
+    ) -> PackageReconciliationEvidence:
+        return _load_dataclass(
+            PackageReconciliationEvidence,
+            self._get_payload("package_reconciliation_evidence", evidence_id),
+        )
+
+    def list_package_reconciliation_evidence(
+        self,
+    ) -> tuple[PackageReconciliationEvidence, ...]:
+        return tuple(
+            _load_dataclass(PackageReconciliationEvidence, payload)
+            for payload in self._list_payloads("package_reconciliation_evidence")
+        )
 
     def save_admin_history_archive(self, archive: AdminHistoryArchiveRecord) -> None:
         self._connection.execute(

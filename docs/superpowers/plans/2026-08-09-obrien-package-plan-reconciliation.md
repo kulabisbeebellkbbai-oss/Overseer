@@ -71,21 +71,14 @@ def initialized_store(tmp_path: Path) -> SQLiteStore:
     return store
 ```
 
-The same fixture module owns every builder used below, with these exact
-signatures: `blocked_execution(plan_id)`, `execution_for(plan_id, status)`,
-`persisted_record(store, fingerprint)`, `seed_provenance_plan(store,
-fingerprint)`, `seed_legacy_apt_plan(store)`,
-`seed_package_plan_and_record(store, kind, approved)`,
-`seed_open_linked_messages(store, plan_id, count)`, `close_message(store,
-message_id)`, `seed_current_sisko_workflow(store, activated)`,
-`load_record_for(plan)`, `seed_closed_package_message(tmp_path)`,
-`seed_current_sisko_message(tmp_path)`,
-`seed_human_plan_sisko_message(tmp_path)`,
-`seed_obrien_backup_message(tmp_path)`, `seed_sisko_backup_message(tmp_path)`,
-`seed_ready_package_plan(store, activated)`,
-`seed_ready_execution_workflow(store, **fresh_state)`, and
-`seed_non_package_admin_plan(store)`. Each builder uses only temporary SQLite
-stores, `StaticPackageInspector`, and `RecordingRunner`; none calls live APT.
+Task 1 defines only builders supported by Task 1 production types:
+`bash_update(candidate_version)`, `package_snapshot(captured_at, *updates)`,
+`initialized_store(tmp_path)`, and `blocked_execution(plan_id)`. Each later
+task must add its provenance, message, activation, or API builder to this
+fixture module in the same RED commit that first uses it; no task may add a
+builder before its production type exists. All builders use only temporary
+SQLite stores, `StaticPackageInspector`, and `RecordingRunner`; none calls live
+APT.
 
 ```python
 def test_package_record_identity_is_content_addressed_when_timestamps_match():

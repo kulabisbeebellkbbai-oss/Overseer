@@ -53,6 +53,23 @@ migration cycle. New callers should use `POST /agent-sessions/discover`; see
 - No external address is exposed.
 - It uses the same explicit SQLite store path as the CLI and user service.
 
+## Psychlo private coordinator bridge
+
+When the separately approved bridge credential is configured, Overseer also
+accepts exact loopback HMAC requests from Psychlo at `POST /psychlo/rounds`,
+`POST /psychlo/rounds/reconcile`, and `POST /psychlo/decisions`. Project-lead
+results return through a one-use capability URL under
+`POST /psychlo/round-results/`. These routes never use the browser bearer token
+and reject gateway/forwarded traffic. The bridge persists replay nonces,
+single-stream round receipts, result state, and Roadex decisions in its own
+owner-only SQLite database.
+
+The inactive `overseer-psychlo-usage.timer` template sends the newest
+reset-aware weekly Codex usage projection every 15 minutes. Activation requires
+an exact service plan, one private shared credential, and an explicit
+project-lead-to-Codex-conversation binding file. Roadex decisions appear in the
+existing Overview card and resume only the exact staged Psychlo decision.
+
 ## Run
 
 ```bash

@@ -19,6 +19,7 @@ from .roadex_approval_status import (
 )
 
 from .codex_usage import CodexUsageTracker
+from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, verify_peer_request, MAX_BODY_BYTES
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
@@ -310,7 +311,7 @@ def _project_path_for_store(store_path: str) -> Path:
     return Path.cwd()
 
 
-def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None, roadex_decision_adapter_factory=None):
+def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None, roadex_decision_adapter_factory=None, psychlo_bridge: PsychloBridge | None = None):
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
 
@@ -647,7 +648,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 self._handle(lambda: list_backup_provisioning_plans(store_path))
                 return
             if path == "/roadex/human-decisions":
-                self._handle(lambda: list_roadex_human_decisions(store_path))
+                self._handle(lambda: _combined_roadex_decisions(store_path, psychlo_bridge))
                 return
             if path == "/roadex/approval-status":
                 refs = query.get("approval_ref", [])
@@ -665,6 +666,17 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             route = urlsplit(self.path)
             raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
+            peer_kinds = {
+                "/psychlo/rounds": "round-request",
+                "/psychlo/rounds/reconcile": "round-reconcile",
+                "/psychlo/decisions": "decision-stage",
+            }
+            if raw_path in peer_kinds:
+                self._handle_psychlo_peer(peer_kinds[raw_path])
+                return
+            if raw_path.startswith("/psychlo/round-results/"):
+                self._handle_psychlo_round_result(raw_path.removeprefix("/psychlo/round-results/"))
+                return
             if path == "/usage/remote-testing/authorize":
                 header = self.headers.get("authorization", "")
                 prefix = "Bearer "
@@ -699,7 +711,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 self._handle_json(lambda payload: execute_backup_provisioning_plan_api(store_path, payload, backup_provisioning_adapter_factory))
                 return
             if path == "/roadex/human-decisions/decide":
-                self._handle_json(lambda payload: decide_roadex_human_plan_api(store_path, payload, roadex_decision_adapter_factory))
+                self._handle_json(lambda payload: _decide_roadex_human(store_path, payload, roadex_decision_adapter_factory, psychlo_bridge))
                 return
             if path == "/storage/authorizations/verify":
                 self._handle_json(lambda payload: verify_storage_authorization_status(store_path, payload))
@@ -1241,6 +1253,54 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     headers=response_headers,
                 )
 
+        def _handle_psychlo_peer(self, kind: str) -> None:
+            if psychlo_bridge is None:
+                self._write_json({"accepted": False, "error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                return
+            try:
+                body = self._read_bounded_body()
+                headers = self._singleton_headers()
+                if not isinstance(psychlo_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
+                message = verify_peer_request(psychlo_bridge.peer_secret, psychlo_bridge.store, kind, body, headers)
+                if kind == "round-request":
+                    result = psychlo_bridge.request_round(message["payload"])
+                elif kind == "round-reconcile":
+                    result = psychlo_bridge.reconcile_round(message["payload"])
+                else:
+                    result = psychlo_bridge.stage_decision(message["payload"])
+                self._write_json(dict(result), HTTPStatus.ACCEPTED)
+            except ValueError as error:
+                code = str(error)
+                status = HTTPStatus.CONFLICT if code in {"replay", "single_stream_busy"} else HTTPStatus.UNAUTHORIZED if code == "invalid_signature" else HTTPStatus.BAD_REQUEST
+                self._write_json({"accepted": False, "error": code}, status)
+
+        def _handle_psychlo_round_result(self, capability: str) -> None:
+            if psychlo_bridge is None or self.headers.get("host") != "127.0.0.1:8766" or any(self.headers.get(name) for name in ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")):
+                self._write_json({"accepted": False, "error": "loopback_required"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                body = self._read_bounded_body()
+                payload = json.loads(body)
+                if not isinstance(payload, dict): raise ValueError("round result must be an object")
+                self._write_json(dict(psychlo_bridge.receive_round_result(capability, payload)), HTTPStatus.ACCEPTED)
+            except (JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+                self._write_json({"accepted": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+        def _read_bounded_body(self) -> bytes:
+            text = self.headers.get("content-length", "")
+            if not text.isdigit() or int(text) < 1 or int(text) > MAX_BODY_BYTES:
+                raise ValueError("invalid_content_length")
+            body = self.rfile.read(int(text))
+            if len(body) != int(text): raise ValueError("invalid_content_length")
+            return body
+
+        def _singleton_headers(self) -> dict[str, str]:
+            names = ("host", "content-type", "content-length", "x-psychlo-peer-kind", "x-psychlo-peer-message-id", "x-psychlo-peer-timestamp", "x-psychlo-peer-nonce", "x-psychlo-peer-signature")
+            result = {}
+            for name in names:
+                values = self.headers.get_all(name) or []
+                result[name] = values[0] if len(values) == 1 else ",".join(values)
+            return result
         def _handle_admin_execute(self) -> None:
             try:
                 payload = self._read_json()
@@ -1298,12 +1358,32 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
     return OverseerApiHandler
 
 
+def _combined_roadex_decisions(store_path: str, psychlo_bridge: PsychloBridge | None) -> dict[str, Any]:
+    existing = dict(list_roadex_human_decisions(store_path))
+    items = list(existing.get("items", []))
+    if psychlo_bridge is not None:
+        items.extend(psychlo_bridge.list_decisions())
+    existing["items"] = items
+    existing["pending_count"] = sum(item.get("human_approval_required") is True for item in items)
+    return existing
+
+
+def _decide_roadex_human(store_path: str, payload: dict[str, Any], adapter_factory, psychlo_bridge: PsychloBridge | None) -> dict[str, Any]:
+    plan_id = str(payload.get("plan_id", ""))
+    if psychlo_bridge is not None and psychlo_bridge.store.decision(plan_id) is not None:
+        if set(payload) != {"plan_id", "decision", "decided_by", "reason"}:
+            raise ValueError("exact Roadex human decision fields are required")
+        return psychlo_bridge.decide(plan_id, str(payload["decision"]), str(payload["decided_by"]), str(payload["reason"]))
+    return dict(decide_roadex_human_plan_api(store_path, payload, adapter_factory))
+
+
 def run_api_server(store_path: str, host: str = "127.0.0.1", port: int = 8766, auth_token: str | None = None) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
     from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
     decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
-    server = ThreadingHTTPServer((host, port), make_api_handler(store_path, auth_token, roadex_decision_adapter_factory=decision_factory))
+    psychlo_bridge = create_bridge_from_environment() if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE") else None
+    server = ThreadingHTTPServer((host, port), make_api_handler(store_path, auth_token, roadex_decision_adapter_factory=decision_factory, psychlo_bridge=psychlo_bridge))
     try:
         server.serve_forever()
     finally:

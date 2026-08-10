@@ -1,0 +1,22 @@
+[Unit]
+Description=Send one authenticated Codex usage snapshot to Psychlo
+After=overseer.service psychlo.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=
+Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
+Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=%h/.local/share/overseer/psychlo-bridge.sqlite3
+Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=%h/.config/overseer/psychlo-project-bindings.json
+Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-overseer-peer-secret
+LoadCredential=psychlo-overseer-peer-secret:%h/.config/psychlo/overseer-peer-secret
+ExecStart=%h/.local/share/overseer/venv/bin/overseer-psychlo-bridge emit-usage
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.config/overseer/psychlo-project-bindings.json
+BindReadOnlyPaths=%h/.local/share/overseer/codex-usage-mcp/state.sqlite3
+BindPaths=%h/.local/share/overseer
+UMask=0077
+

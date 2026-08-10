@@ -7670,20 +7670,20 @@ def _dispatch_obrien_message(store_path: str | Path, message, dispatched_by: str
             "O'Brien package maintenance has no bounded storage execution adapter; provide an approved storage adapter or exact admin plan",
             [],
         )
-    packages = (message.related_resource_id,) if message.related_resource_id else ()
-    plan = plan_package_updates_status(store_path, captured_at=dispatched_at, packages=packages)
-    actions: list[dict[str, object]] = [plan]
-    for item in plan.get("items", []):
-        if not isinstance(item, dict) or not item.get("id"):
-            continue
-        advancement = _advance_obrien_package_plan(store_path, str(item["id"]), dispatched_at)
-        if advancement:
-            actions.append(advancement)
+    resource_id = message.related_resource_id
+    if resource_id not in (None, ""):
+        return _crew_dispatch_result(
+            message,
+            "skipped",
+            "O'Brien related_resource_id is opaque and cannot select an APT package; exact related_plan_id package authority is required",
+            [],
+        )
+    inspection = inspect_packages_status(captured_at=dispatched_at)
     return _crew_dispatch_result(
         message,
         "dispatched",
-        "O'Brien inspected packages, staged update plans, and advanced package maintenance through allowed gates",
-        actions,
+        "O'Brien completed read-only package inspection; exact related_plan_id is required for package work",
+        [inspection],
     )
 
 

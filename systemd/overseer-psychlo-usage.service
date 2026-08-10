@@ -6,9 +6,10 @@ After=overseer-api.service psychlo.service
 Type=oneshot
 Environment="PYTHONPATH=%h/Documents/Codex Workspace/Overseer/src"
 Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
-Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=%h/.local/share/overseer/psychlo-bridge.sqlite3
+Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=%h/.local/share/overseer/psychlo/bridge.sqlite3
 Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=%h/.config/overseer/psychlo-project-bindings.json
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-overseer-peer-secret
+Environment=OVERSEER_PSYCHLO_POLICY_VERSION=2026-08-08
 LoadCredential=psychlo-overseer-peer-secret:%h/.config/psychlo/overseer-peer-secret
 ExecStartPre=/usr/bin/python3 -m overseer.psychlo_bridge_cli sync-projects
 ExecStart=/usr/bin/python3 -m overseer.psychlo_bridge_cli emit-usage
@@ -20,5 +21,5 @@ BindReadOnlyPaths=%h/.config/overseer/psychlo-project-bindings.json
 BindReadOnlyPaths="%h/Documents/Codex Workspace/Overseer/src"
 BindReadOnlyPaths=%h/.local/share/overseer/codex-usage-mcp/state.sqlite3
 BindReadOnlyPaths="%h/Documents/Codex Workspace/The A-Team/data/handoffs.json"
-BindPaths=%h/.local/share/overseer
+BindPaths=%h/.local/share/overseer/psychlo
 UMask=0077

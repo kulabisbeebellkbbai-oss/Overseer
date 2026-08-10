@@ -49,6 +49,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
+            CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
         """)
 
     def claim_nonce(self, nonce: str, message_id: str, claimed_at: str) -> bool:
@@ -100,6 +101,13 @@ class PsychloBridgeStore:
         cursor = self.connection.execute("UPDATE decisions SET status=?,decided_by=?,decided_at=?,reason=? WHERE decision_id=? AND status='staged'", (status, decided_by, decided_at, reason, decision_id))
         if cursor.rowcount != 1:
             raise ValueError("an exact staged Psychlo decision is required")
+
+    def project(self, project_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        row = self.connection.execute("SELECT registration_json,scheduling_json FROM projects WHERE project_id=?", (project_id,)).fetchone()
+        return None if row is None else (json.loads(row[0]), json.loads(row[1]))
+
+    def record_project(self, project_id: str, registration: Mapping[str, Any], scheduling: Mapping[str, Any]) -> None:
+        self.connection.execute("INSERT INTO projects VALUES (?,?,?)", (project_id, _dump(registration), _dump(scheduling)))
 
 
 def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind: str, body: bytes, headers: Mapping[str, str], *, now: str | None = None) -> dict[str, Any]:
@@ -176,6 +184,33 @@ class PsychloBridge:
         receipt["provenanceId"] = str(provider_reference)
         self.store.record_round(request, receipt, capability)
         return {"accepted": True, "receipt": receipt}
+
+    def register_project(self, registration: Mapping[str, Any]) -> dict[str, Any]:
+        envelope = registration.get("envelope")
+        receipt = registration.get("receipt")
+        if not isinstance(envelope, dict) or not isinstance(receipt, dict): raise ValueError("project registration is invalid")
+        project = envelope.get("project"); lead = envelope.get("projectLead"); plan = envelope.get("plan")
+        if not isinstance(project, dict) or not isinstance(lead, dict) or not isinstance(plan, dict): raise ValueError("project registration is invalid")
+        project_id = _required_string(project, "id"); project_lead_id = _required_string(lead, "id"); receipt_id = _required_string(receipt, "receiptId")
+        existing = self.store.project(project_id)
+        if existing:
+            if existing[0] != dict(registration): raise ValueError("project registration conflict")
+            return {"accepted": True}
+        tasks = plan.get("tasks")
+        constraints = plan.get("constraints", [])
+        if not isinstance(tasks, list) or not tasks or len(tasks) > 128 or not isinstance(constraints, list): raise ValueError("project registration is invalid")
+        scheduling = {
+            "projectId": project_id, "projectLeadId": project_lead_id, "state": "managed",
+            "remainingEffort": "trivial" if len(tasks) == 1 else "standard",
+            "hasSecurityImpact": any("security" in str(item).lower() for item in constraints),
+            "hasDependencyImpact": any(isinstance(item, dict) and bool(item.get("dependencyIds")) for item in tasks),
+            "gateDistance": len(tasks), "expectedUsageCost": max(1, min(10, (len(tasks) + 1) // 2)),
+            "correlationId": f"psychlo-scheduling:{receipt_id}", "idempotencyKey": f"psychlo-scheduling:{receipt_id}", "occurredAt": self.clock(),
+        }
+        response = self.sender("scheduling-input", scheduling["idempotencyKey"], scheduling)
+        if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
+        self.store.record_project(project_id, registration, scheduling)
+        return {"accepted": True}
 
     def reconcile_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         existing = self.store.get_round(str(request.get("roundId", "")))

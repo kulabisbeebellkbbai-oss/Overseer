@@ -99,6 +99,22 @@ def test_stages_and_completes_roadex_decision(tmp_path: Path):
     assert forwarded[0][2]["status"] == "approved"
 
 
+def test_registers_an_admitted_plan_and_publishes_initial_scheduling(tmp_path: Path):
+    sent = []
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    envelope = {"project": {"id": "arcade", "planId": "arcade-plan", "planVersion": "v1"}, "projectLead": {"id": "member-hermione"}, "plan": {"constraints": ["security review required"], "tasks": [{"id": "t1", "dependencyIds": []}, {"id": "t2", "dependencyIds": ["t1"]}]}}
+    result = bridge.register_project({"envelope": envelope, "receipt": {"receiptId": "receipt-arcade"}})
+    assert result == {"accepted": True}
+    assert sent[0][0] == "scheduling-input"
+    assert sent[0][2] == {"projectId": "arcade", "projectLeadId": "member-hermione", "state": "managed", "remainingEffort": "standard", "hasSecurityImpact": True, "hasDependencyImpact": True, "gateDistance": 2, "expectedUsageCost": 1, "correlationId": "psychlo-scheduling:receipt-arcade", "idempotencyKey": "psychlo-scheduling:receipt-arcade", "occurredAt": NOW}
+    bridge.register_project({"envelope": envelope, "receipt": {"receiptId": "receipt-arcade"}})
+    assert len(sent) == 1
+
+
 def test_private_http_round_route_uses_hmac_not_admin_bearer(tmp_path: Path):
     class Sender:
         secret = SECRET

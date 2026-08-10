@@ -667,6 +667,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             raw_path = route.path
             path = _strip_protected_gateway_prefix(route.path)
             peer_kinds = {
+                "/psychlo/projects": "project-register",
                 "/psychlo/rounds": "round-request",
                 "/psychlo/rounds/reconcile": "round-reconcile",
                 "/psychlo/decisions": "decision-stage",
@@ -1262,7 +1263,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 headers = self._singleton_headers()
                 if not isinstance(psychlo_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
                 message = verify_peer_request(psychlo_bridge.peer_secret, psychlo_bridge.store, kind, body, headers)
-                if kind == "round-request":
+                if kind == "project-register":
+                    result = psychlo_bridge.register_project(message["payload"])
+                elif kind == "round-request":
                     result = psychlo_bridge.request_round(message["payload"])
                 elif kind == "round-reconcile":
                     result = psychlo_bridge.reconcile_round(message["payload"])

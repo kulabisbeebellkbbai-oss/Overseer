@@ -43,7 +43,7 @@ def test_derives_prior_day_unused_weekly_capacity_from_provider_delta_only():
         {"observed_at": "2026-08-10T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
         {"observed_at": "2026-08-09T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
     ]
-    snapshot = derive_usage_snapshot(history, policy_version="2026-08-09", psychlo_attributed_usage=100)
+    snapshot = derive_usage_snapshot(history, policy_version="2026-08-09")
     assert round(snapshot["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 5, 6)
     assert snapshot["snapshot"]["weeklyRemainingCapacity"] == 70
 
@@ -56,6 +56,27 @@ def test_usage_snapshot_denies_missing_same_reset_prior_day_history():
         assert "prior-day" in str(error)
     else:
         raise AssertionError("missing history was accepted")
+
+
+def test_emit_usage_ignores_malformed_lead_result_and_uses_provider_snapshot(tmp_path: Path):
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    store.record_round({"roundId": "round-bad"}, {}, "capability-bad")
+    store.record_result("round-bad", {"occurredAt": "not-a-timestamp", "actualUsageCost": "not-a-number"})
+    bridge = PsychloBridge(
+        store=store,
+        dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    history = [
+        {"observed_at": "2026-08-10T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
+        {"observed_at": "2026-08-09T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
+    ]
+    bridge.emit_usage(history, "2026-08-09")
+    assert sent[0][0] == "usage-snapshot"
+    assert round(sent[0][2]["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 5, 6)
 
 
 def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: Path):

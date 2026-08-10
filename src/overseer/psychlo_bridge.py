@@ -90,15 +90,6 @@ class PsychloBridgeStore:
     def mark_forwarded(self, round_id: str) -> None:
         self.connection.execute("UPDATE rounds SET result_forwarded=1 WHERE round_id=?", (round_id,))
 
-    def attributed_usage_between(self, start: datetime, end: datetime) -> float:
-        total = 0.0
-        for (payload,) in self.connection.execute("SELECT result_json FROM rounds WHERE result_json IS NOT NULL"):
-            result = json.loads(payload)
-            occurred_at = _time(str(result["occurredAt"]))
-            if start <= occurred_at <= end:
-                total += float(result.get("actualUsageCost", 0))
-        return total
-
     def record_decision(self, request: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
         self.connection.execute("INSERT OR IGNORE INTO decisions VALUES (?,?,?,'staged',NULL,NULL,NULL)", (request["decisionId"], _dump(request), _dump(receipt)))
 
@@ -153,7 +144,7 @@ def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind:
     return message
 
 
-def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, psychlo_attributed_usage: float = 0, now: str | None = None) -> dict[str, Any]:
+def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, now: str | None = None) -> dict[str, Any]:
     if not history:
         raise ValueError("Codex usage history is required")
     newest = history[0]
@@ -298,12 +289,7 @@ class PsychloBridge:
 
     def emit_usage(self, history: list[dict[str, Any]], policy_version: str) -> Mapping[str, Any]:
         if not history: raise ValueError("Codex usage history is required")
-        end = _time(str(history[0]["observed_at"]))
-        payload = derive_usage_snapshot(
-            history,
-            policy_version=policy_version,
-            psychlo_attributed_usage=self.store.attributed_usage_between(end - timedelta(days=1), end),
-        )
+        payload = derive_usage_snapshot(history, policy_version=policy_version)
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
 
 

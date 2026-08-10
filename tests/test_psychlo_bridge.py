@@ -38,13 +38,13 @@ def test_verifies_exact_signed_psychlo_request_once(tmp_path: Path):
         raise AssertionError("replay was accepted")
 
 
-def test_derives_prior_day_unused_weekly_capacity_with_reserve_floor():
+def test_derives_prior_day_unused_weekly_capacity_from_provider_delta_only():
     history = [
         {"observed_at": "2026-08-10T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
         {"observed_at": "2026-08-09T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
     ]
-    snapshot = derive_usage_snapshot(history, policy_version="2026-08-09", psychlo_attributed_usage=2)
-    assert round(snapshot["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 3, 6)
+    snapshot = derive_usage_snapshot(history, policy_version="2026-08-09", psychlo_attributed_usage=100)
+    assert round(snapshot["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 5, 6)
     assert snapshot["snapshot"]["weeklyRemainingCapacity"] == 70
 
 

@@ -165,7 +165,9 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
     prior = min(candidates, key=lambda item: abs((_time(str(item["observed_at"])) - target).total_seconds()))
     prior_used = float(_weekly_window(prior).get("used_percent") or 0)
     current_used = float(newest_window.get("used_percent") or 0)
-    prior_day_used = max(0.0, current_used - prior_used - max(0.0, psychlo_attributed_usage))
+    # Provider rolling usage is authoritative.  Lead-reported round costs are
+    # an audit signal only and must not be subtracted from that delta.
+    prior_day_used = max(0.0, current_used - prior_used)
     unused = max(0.0, 100.0 / 7.0 - prior_day_used)
     captured = str(newest["observed_at"])
     snapshot_id = "codex-usage-" + hashlib.sha256((captured + str(newest_window.get("resets_at"))).encode()).hexdigest()[:24]

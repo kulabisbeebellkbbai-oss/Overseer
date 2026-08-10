@@ -42,9 +42,19 @@ def test_derives_prior_day_unused_weekly_capacity_with_reserve_floor():
         {"observed_at": "2026-08-10T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
         {"observed_at": "2026-08-09T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
     ]
-    snapshot = derive_usage_snapshot(history, policy_version="2026-08-09")
-    assert round(snapshot["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 5, 6)
+    snapshot = derive_usage_snapshot(history, policy_version="2026-08-09", psychlo_attributed_usage=2)
+    assert round(snapshot["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 3, 6)
     assert snapshot["snapshot"]["weeklyRemainingCapacity"] == 70
+
+
+def test_usage_snapshot_denies_missing_same_reset_prior_day_history():
+    history = [{"observed_at": "2026-08-10T02:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"window_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}]
+    try:
+        derive_usage_snapshot(history, policy_version="2026-08-09")
+    except ValueError as error:
+        assert "prior-day" in str(error)
+    else:
+        raise AssertionError("missing history was accepted")
 
 
 def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):

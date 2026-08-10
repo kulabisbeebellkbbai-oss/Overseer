@@ -76,6 +76,15 @@ class PsychloBridgeStore:
     def mark_forwarded(self, round_id: str) -> None:
         self.connection.execute("UPDATE rounds SET result_forwarded=1 WHERE round_id=?", (round_id,))
 
+    def attributed_usage_between(self, start: datetime, end: datetime) -> float:
+        total = 0.0
+        for (payload,) in self.connection.execute("SELECT result_json FROM rounds WHERE result_json IS NOT NULL"):
+            result = json.loads(payload)
+            occurred_at = _time(str(result["occurredAt"]))
+            if start <= occurred_at <= end:
+                total += float(result.get("actualUsageCost", 0))
+        return total
+
     def record_decision(self, request: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
         self.connection.execute("INSERT OR IGNORE INTO decisions VALUES (?,?,?,'staged',NULL,NULL,NULL)", (request["decisionId"], _dump(request), _dump(receipt)))
 
@@ -123,7 +132,7 @@ def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind:
     return message
 
 
-def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, now: str | None = None) -> dict[str, Any]:
+def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, psychlo_attributed_usage: float = 0, now: str | None = None) -> dict[str, Any]:
     if not history:
         raise ValueError("Codex usage history is required")
     newest = history[0]
@@ -131,10 +140,11 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
     newest_window = _weekly_window(newest)
     target = newest_at - timedelta(days=1)
     candidates = [item for item in history[1:] if _weekly_window(item).get("resets_at") == newest_window.get("resets_at") and _time(str(item["observed_at"])) <= target]
-    prior = min(candidates, key=lambda item: abs((_time(str(item["observed_at"])) - target).total_seconds())) if candidates else None
-    prior_used = float(_weekly_window(prior).get("used_percent") or 0) if prior else float(newest_window.get("used_percent") or 0)
+    if not candidates: raise ValueError("same-reset prior-day usage history is required")
+    prior = min(candidates, key=lambda item: abs((_time(str(item["observed_at"])) - target).total_seconds()))
+    prior_used = float(_weekly_window(prior).get("used_percent") or 0)
     current_used = float(newest_window.get("used_percent") or 0)
-    prior_day_used = max(0.0, current_used - prior_used)
+    prior_day_used = max(0.0, current_used - prior_used - max(0.0, psychlo_attributed_usage))
     unused = max(0.0, 100.0 / 7.0 - prior_day_used)
     captured = str(newest["observed_at"])
     snapshot_id = "codex-usage-" + hashlib.sha256((captured + str(newest_window.get("resets_at"))).encode()).hexdigest()[:24]
@@ -230,7 +240,13 @@ class PsychloBridge:
         ))
 
     def emit_usage(self, history: list[dict[str, Any]], policy_version: str) -> Mapping[str, Any]:
-        payload = derive_usage_snapshot(history, policy_version=policy_version)
+        if not history: raise ValueError("Codex usage history is required")
+        end = _time(str(history[0]["observed_at"]))
+        payload = derive_usage_snapshot(
+            history,
+            policy_version=policy_version,
+            psychlo_attributed_usage=self.store.attributed_usage_between(end - timedelta(days=1), end),
+        )
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
 
 

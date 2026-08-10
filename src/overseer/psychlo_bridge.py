@@ -10,6 +10,7 @@ from pathlib import Path
 import os
 import secrets
 import sqlite3
+import stat
 from typing import Any, Callable, Mapping
 from urllib.request import Request, urlopen
 
@@ -40,14 +41,20 @@ class PsychloBridgeStore:
     def __init__(self, filename: str | Path):
         self.filename = Path(filename)
         self.filename.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.filename.parent.chmod(0o700)
+        parent = self.filename.parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
+            raise ValueError("Psychlo bridge directory must be private")
+        if self.filename.exists() or self.filename.is_symlink():
+            metadata = self.filename.stat(follow_symlinks=False)
+            if self.filename.is_symlink() or not self.filename.is_file() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                raise ValueError("Psychlo bridge database must be private")
         self.connection = sqlite3.connect(self.filename, check_same_thread=False, isolation_level=None)
         self.filename.chmod(0o600)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=1000")
         self.connection.executescript("""
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
         """)
@@ -56,20 +63,26 @@ class PsychloBridgeStore:
         cursor = self.connection.execute("INSERT OR IGNORE INTO peer_nonces VALUES (?,?,?)", (nonce, message_id, claimed_at))
         return cursor.rowcount == 1
 
-    def get_round(self, round_id: str) -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any] | None, bool] | None:
-        row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,result_json,result_forwarded FROM rounds WHERE round_id=?", (round_id,)).fetchone()
-        return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], json.loads(row[3]) if row[3] else None, bool(row[4]))
+    def get_round(self, round_id: str):
+        row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+        return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def active_round(self) -> str | None:
         row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone()
         return None if row is None else str(row[0])
 
     def record_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
-        self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability)))
+        self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
 
-    def round_for_capability(self, capability: str) -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any] | None, bool] | None:
-        row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,result_json,result_forwarded FROM rounds WHERE capability_hash=?", (_token_hash(capability),)).fetchone()
-        return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], json.loads(row[3]) if row[3] else None, bool(row[4]))
+    def mark_dispatch_started(self, round_id: str) -> None:
+        self.connection.execute("UPDATE rounds SET dispatch_state='started' WHERE round_id=? AND dispatch_state='pending'", (round_id,))
+
+    def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
+        self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump(receipt), round_id))
+
+    def round_for_capability(self, capability: str):
+        row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded FROM rounds WHERE capability_hash=?", (_token_hash(capability),)).fetchone()
+        return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def record_result(self, round_id: str, result: Mapping[str, Any]) -> None:
         self.connection.execute("UPDATE rounds SET result_json=? WHERE round_id=? AND result_json IS NULL", (_dump(result), round_id))
@@ -175,15 +188,13 @@ class PsychloBridge:
         existing = self.store.get_round(str(request["roundId"]))
         if existing:
             if existing[0] != dict(request): raise ValueError("round identity conflict")
+            if existing[4] != "dispatched": return self._dispatch_reserved(existing[0], existing[3], existing[1])
             return {"accepted": True, "receipt": existing[1]}
         if self.store.active_round() is not None: raise ValueError("single_stream_busy")
         capability = self.token_factory()
         receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": f"overseer-dispatch:{request['roundId']}", "status": "accepted"}
-        prompt = self._round_prompt(request, capability)
-        provider_reference = self.dispatcher(str(request["projectLeadId"]), prompt)
-        receipt["provenanceId"] = str(provider_reference)
         self.store.record_round(request, receipt, capability)
-        return {"accepted": True, "receipt": receipt}
+        return self._dispatch_reserved(dict(request), capability, receipt)
 
     def register_project(self, registration: Mapping[str, Any]) -> dict[str, Any]:
         envelope = registration.get("envelope")
@@ -214,13 +225,15 @@ class PsychloBridge:
 
     def reconcile_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         existing = self.store.get_round(str(request.get("roundId", "")))
-        if existing and existing[0] == dict(request): return {"accepted": True, "receipt": existing[1]}
+        if existing and existing[0] == dict(request):
+            if existing[4] != "dispatched": return self._dispatch_reserved(existing[0], existing[3], existing[1])
+            return {"accepted": True, "receipt": existing[1]}
         return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-unknown:{request.get('roundId')}", "status": "unknown"}}
 
     def receive_round_result(self, capability: str, result: Mapping[str, Any]) -> dict[str, Any]:
         record = self.store.round_for_capability(capability)
         if record is None: raise ValueError("unknown round capability")
-        request, _, _, stored_result, forwarded = record
+        request, _, _, _, _, stored_result, forwarded = record
         _require_bound_result(request, result)
         if stored_result is not None and stored_result != dict(result): raise ValueError("round result conflict")
         if stored_result is None: self.store.record_result(str(request["roundId"]), result)
@@ -229,6 +242,13 @@ class PsychloBridge:
             if response.get("accepted") is not True: raise ValueError("Psychlo rejected round result")
             self.store.mark_forwarded(str(request["roundId"]))
         return {"accepted": True}
+
+    def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        self.store.mark_dispatch_started(str(request["roundId"]))
+        provider_reference = self.dispatcher(str(request["projectLeadId"]), self._round_prompt(request, capability))
+        delivered = {**receipt, "provenanceId": str(provider_reference)}
+        self.store.mark_dispatched(str(request["roundId"]), delivered)
+        return {"accepted": True, "receipt": delivered}
 
     def stage_decision(self, request: Mapping[str, Any]) -> dict[str, Any]:
         decision_id = _required_string(request, "decisionId")
@@ -311,7 +331,7 @@ class CodexProjectDispatcher:
     """Dispatch one prompt to the explicitly bound existing Codex conversation."""
 
     def __init__(self, bindings_file: str | Path):
-        bindings = json.loads(Path(bindings_file).read_text(encoding="utf-8"))
+        bindings = json.loads(_read_private_file(Path(bindings_file)).decode("utf-8"))
         if not isinstance(bindings, dict): raise ValueError("Psychlo project bindings must be an object")
         self.bindings = bindings
 
@@ -379,11 +399,30 @@ def _dump(value: Mapping[str, Any]) -> str:
 
 
 def _read_secret(path: Path) -> bytes:
-    if not path.is_absolute() or path.is_symlink(): raise ValueError("Psychlo peer secret is unavailable")
-    metadata = path.stat()
-    if not path.is_file() or metadata.st_mode & 0o077 or metadata.st_uid != os.getuid() or metadata.st_size > 4096:
-        raise ValueError("Psychlo peer secret is unavailable")
-    value = path.read_bytes()
+    try:
+        value = _read_private_file(path, maximum_bytes=4096)
+    except (OSError, ValueError):
+        raise ValueError("Psychlo peer secret is unavailable") from None
     if len(value) < 32 or len(value) > 4096 or any(byte < 0x20 or byte == 0x7F for byte in value):
         raise ValueError("Psychlo peer secret is unavailable")
     return value
+
+
+def _read_private_file(path: Path, *, maximum_bytes: int = MAX_BODY_BYTES) -> bytes:
+    if not path.is_absolute(): raise ValueError("private file path must be absolute")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077 or metadata.st_size > maximum_bytes:
+            raise ValueError("private file is unsafe")
+        chunks = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk: break
+            chunks.append(chunk); remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > maximum_bytes: raise ValueError("private file is too large")
+        return value
+    finally:
+        os.close(descriptor)

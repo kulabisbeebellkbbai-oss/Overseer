@@ -17,6 +17,7 @@ from overseer.psychlo_bridge import (
     derive_usage_snapshot,
     sign_peer_message,
     verify_peer_request,
+    _read_secret,
 )
 
 
@@ -57,6 +58,25 @@ def test_usage_snapshot_denies_missing_same_reset_prior_day_history():
         raise AssertionError("missing history was accepted")
 
 
+def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: Path):
+    secret = tmp_path / "secret"
+    secret.write_bytes(SECRET); secret.chmod(0o640)
+    try:
+        _read_secret(secret)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("group-readable secret was accepted")
+    secret.chmod(0o600)
+    link = tmp_path / "secret-link"; link.symlink_to(secret)
+    try:
+        _read_secret(link)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("symlink secret was accepted")
+
+
 def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
     dispatched = []
     forwarded = []
@@ -79,6 +99,25 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
     assert accepted == {"accepted": True}
     assert forwarded == [("round-result", "result:1", result)]
     assert bridge.request_round(request) == receipt
+
+
+def test_retries_a_durably_reserved_round_after_dispatch_failure(tmp_path: Path):
+    attempts = []
+    def dispatch(_lead, _prompt):
+        attempts.append("attempt")
+        if len(attempts) == 1: raise ValueError("provider unavailable")
+        return "dispatch:recovered"
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatch, sender=lambda *_args: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability_retry_1234567890abcdef")
+    request = {"roundId": "round-retry", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-retry", "idempotencyKey": "round-retry", "snapshotId": "snapshot-retry", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    try:
+        bridge.request_round(request)
+    except ValueError as error:
+        assert str(error) == "provider unavailable"
+    else:
+        raise AssertionError("dispatch failure was hidden")
+    recovered = bridge.reconcile_round(request)
+    assert recovered["receipt"]["provenanceId"] == "dispatch:recovered"
+    assert len(attempts) == 2
 
 
 def test_stages_and_completes_roadex_decision(tmp_path: Path):

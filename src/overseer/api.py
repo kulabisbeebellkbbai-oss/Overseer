@@ -1278,7 +1278,10 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 self._write_json({"accepted": False, "error": code}, status)
 
         def _handle_psychlo_round_result(self, capability: str) -> None:
-            if psychlo_bridge is None or self.headers.get("host") != "127.0.0.1:8766" or any(self.headers.get(name) for name in ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")):
+            forbidden = ("authorization", "cookie", "origin", "transfer-encoding", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")
+            hosts = self.headers.get_all("host") or []
+            content_types = self.headers.get_all("content-type") or []
+            if psychlo_bridge is None or hosts != ["127.0.0.1:8766"] or content_types != ["application/json"] or any(self.headers.get(name) for name in forbidden):
                 self._write_json({"accepted": False, "error": "loopback_required"}, HTTPStatus.FORBIDDEN)
                 return
             try:
@@ -1298,6 +1301,8 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             return body
 
         def _singleton_headers(self) -> dict[str, str]:
+            forbidden = ("authorization", "cookie", "origin", "transfer-encoding", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")
+            if any(self.headers.get_all(name) for name in forbidden): raise ValueError("forbidden_header")
             names = ("host", "content-type", "content-length", "x-psychlo-peer-kind", "x-psychlo-peer-message-id", "x-psychlo-peer-timestamp", "x-psychlo-peer-nonce", "x-psychlo-peer-signature")
             result = {}
             for name in names:

@@ -1,6 +1,7 @@
 [Unit]
 Description=Send one authenticated Codex usage snapshot to Psychlo
-After=overseer-api.service psychlo.service
+Requires=overseer-codex-usage-snapshot.service
+After=overseer-api.service psychlo.service overseer-codex-usage-snapshot.service
 
 [Service]
 Type=oneshot

@@ -46,13 +46,17 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS learning_advisories(digest TEXT PRIMARY KEY, payload_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS registry_candidates(candidate_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, inserted_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
         """)
         for column in ("delivery_skiller", "delivery_memory"):
             try:
                 self.connection.execute(f"ALTER TABLE learning_observations ADD COLUMN {column} TEXT NOT NULL DEFAULT 'pending'")
             except sqlite3.OperationalError:
                 pass
+        try:
+            self.connection.execute("ALTER TABLE external_executions ADD COLUMN gate_workflow_id TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -134,6 +138,9 @@ class PsychloBridgeStore:
             external = self.external_execution(reconciliation_id)
             if external is None or external.get("gateDecisionId") != decision_id:
                 raise ValueError("external decision identity conflict")
+            request_row = self.connection.execute("SELECT request_json FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
+            if external.get("gateWorkflowId") is None or request_row is None or json.loads(request_row[0]).get("workflowId") != external["gateWorkflowId"]:
+                raise ValueError("external decision workflow conflict")
             prior = external["receipt"].get("decisionStatus")
             if prior not in {None, "pending", "stage-pending", status}:
                 raise ValueError("external decision conflict")
@@ -243,20 +250,30 @@ class PsychloBridgeStore:
             raise ValueError("adoption evidence conflict")
 
     def external_execution(self, reconciliation_id: str):
-        row = self.connection.execute("SELECT payload_json,digest,receipt_json,status,forwarded,gate_decision_id FROM external_executions WHERE reconciliation_id=?", (reconciliation_id,)).fetchone()
+        row = self.connection.execute("SELECT payload_json,digest,receipt_json,status,forwarded,gate_decision_id,gate_workflow_id FROM external_executions WHERE reconciliation_id=?", (reconciliation_id,)).fetchone()
         if row is None:
             return None
-        return {"payload": json.loads(row[0]), "digest": row[1], "receipt": json.loads(row[2]), "status": row[3], "forwarded": bool(row[4]), "gateDecisionId": row[5]}
+        return {"payload": json.loads(row[0]), "digest": row[1], "receipt": json.loads(row[2]), "status": row[3], "forwarded": bool(row[4]), "gateDecisionId": row[5], "gateWorkflowId": row[6]}
 
     def record_external(self, payload: Mapping[str, Any], digest: str, receipt: Mapping[str, Any], gate_decision_id: str | None) -> bool:
         try:
-            self.connection.execute("INSERT INTO external_executions VALUES (?,?,?,?,?,?,'reconciled',0,?,?)", (payload["reconciliationId"], payload["externalExecutionId"], payload["idempotencyKey"], _dump(payload), digest, _dump(receipt), gate_decision_id, self._now()))
+            self.connection.execute("INSERT INTO external_executions(reconciliation_id,external_execution_id,idempotency_key,payload_json,digest,receipt_json,status,forwarded,gate_decision_id,gate_workflow_id,inserted_at) VALUES (?,?,?,?,?,?,'reconciled',0,?,NULL,?)", (payload["reconciliationId"], payload["externalExecutionId"], payload["idempotencyKey"], _dump(payload), digest, _dump(receipt), gate_decision_id, self._now()))
             return True
         except sqlite3.IntegrityError:
             existing = self.external_execution(str(payload["reconciliationId"]))
             if existing and existing["digest"] == digest and existing["payload"] == dict(payload):
                 return False
             raise ValueError("external round conflict")
+
+    def link_external_gate(self, reconciliation_id: str, decision_id: str, workflow_id: str) -> None:
+        record = self.external_execution(reconciliation_id)
+        if record is None or record.get("gateDecisionId") != decision_id:
+            raise ValueError("external decision identity conflict")
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            raise ValueError("external decision workflow is invalid")
+        if record.get("gateWorkflowId") not in {None, workflow_id}:
+            raise ValueError("external decision workflow conflict")
+        self.connection.execute("UPDATE external_executions SET gate_workflow_id=? WHERE reconciliation_id=?", (workflow_id, reconciliation_id))
 
     def mark_external_forwarded(self, reconciliation_id: str, status: str = "reconciled") -> None:
         record = self.external_execution(reconciliation_id)

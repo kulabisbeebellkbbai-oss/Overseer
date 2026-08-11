@@ -267,6 +267,14 @@ class PsychloBridge:
 
     def stage_decision(self, request: Mapping[str, Any]) -> dict[str, Any]:
         decision_id = _required_string(request, "decisionId")
+        if decision_id.startswith("roadex:external:"):
+            reconciliation_id = decision_id.removeprefix("roadex:external:")
+            external = self.store.external_execution(reconciliation_id)
+            if external is not None:
+                workflow_id = request.get("workflowId")
+                if not isinstance(workflow_id, str) or not workflow_id.strip():
+                    raise ValueError("external decision workflow is invalid")
+                self.store.link_external_gate(reconciliation_id, decision_id, workflow_id)
         existing = self.store.decision(decision_id)
         if existing:
             if existing[0] != dict(request): raise ValueError("decision identity conflict")
@@ -308,7 +316,10 @@ class PsychloBridge:
         if external is None or external.get("gateDecisionId") != request["decisionId"]:
             raise ValueError("external decision identity conflict")
         envelope = external["payload"]
-        expected = self._external_decision_request(envelope)
+        workflow_id = external.get("gateWorkflowId")
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            raise ValueError("external decision workflow conflict")
+        expected = self._external_decision_request(envelope, workflow_id)
         if dict(request) != expected:
             raise ValueError("external decision identity conflict")
         prior_decision = self.store.decision(str(request["decisionId"]))
@@ -582,19 +593,22 @@ class PsychloBridge:
 
     reconcile_external_round = receive_external_round
 
-    def _external_decision_request(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
-        return {"decisionId": f"roadex:external:{envelope['reconciliationId']}", "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": "roadex-external-round", "decisionVersion": envelope["planVersion"], "correlationId": envelope["correlationId"], "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}", "question": envelope["explicitGate"], "resultProvenanceId": envelope["digest"]}
+    def _external_decision_request(self, envelope: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
+        return {"decisionId": f"roadex:external:{envelope['reconciliationId']}", "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": workflow_id, "decisionVersion": envelope["planVersion"], "correlationId": envelope["correlationId"], "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}", "question": envelope["explicitGate"], "resultProvenanceId": envelope["digest"]}
 
     def _ensure_external_decision(self, envelope: Mapping[str, Any], decision_id: str) -> None:
-        expected = self._external_decision_request(envelope)
-        if expected["decisionId"] != decision_id:
+        if f"roadex:external:{envelope['reconciliationId']}" != decision_id:
             raise ValueError("external decision identity conflict")
         existing = self.store.decision(decision_id)
-        if existing is not None:
-            if existing[0] != expected:
-                raise ValueError("external decision identity conflict")
+        if existing is None:
             return
-        self.stage_decision(expected)
+        workflow_id = existing[0].get("workflowId")
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            raise ValueError("external decision workflow conflict")
+        self.store.link_external_gate(envelope["reconciliationId"], decision_id, workflow_id)
+        expected = self._external_decision_request(envelope, workflow_id)
+        if existing[0] != expected:
+            raise ValueError("external decision identity conflict")
 
     def receive_external_decision_outcome(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         decision_id = payload.get("decisionId")
@@ -606,10 +620,16 @@ class PsychloBridge:
         if record is None or record.get("gateDecisionId") != decision_id:
             raise ValueError("external decision outcome identity conflict")
         envelope = record["payload"]
+        decision_record = self.store.decision(decision_id)
+        if decision_record is None:
+            raise ValueError("an exact staged Psychlo decision is required")
+        workflow_id = decision_record[0].get("workflowId")
+        if not isinstance(workflow_id, str) or not workflow_id.strip() or record.get("gateWorkflowId") != workflow_id:
+            raise ValueError("external decision workflow conflict")
         expected = {
             "projectId": envelope["projectId"],
             "planId": envelope["planId"],
-            "workflowId": "roadex-external-round",
+            "workflowId": workflow_id,
             "decisionVersion": envelope["planVersion"],
             "correlationId": envelope["correlationId"],
             "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}",

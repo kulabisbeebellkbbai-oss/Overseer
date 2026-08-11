@@ -20,6 +20,7 @@ from .roadex_approval_status import (
 
 from .codex_usage import CodexUsageTracker
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, verify_peer_request, MAX_BODY_BYTES
+from .store import SQLiteStore
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
     activate_claim_status,
@@ -312,6 +313,17 @@ def _project_path_for_store(store_path: str) -> Path:
 
 
 def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None, roadex_decision_adapter_factory=None, psychlo_bridge: PsychloBridge | None = None):
+    if psychlo_bridge is not None:
+        def load_bridge_approval(approval_id: str):
+            try:
+                with SQLiteStore(store_path) as primary:
+                    approval = primary.load_approval(approval_id)
+                    from dataclasses import asdict
+                    return asdict(approval)
+            except (KeyError, OSError, ValueError):
+                return psychlo_bridge.store.load_authorization_record(approval_id)
+        psychlo_bridge.approval_loader = load_bridge_approval
+
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
 
@@ -686,6 +698,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/psychlo/external-round": "external-round",
                 "/psychlo/external-rounds": "external-round",
                 "/psychlo/coordination/work": "coordination-work-request",
+                "/psychlo/coordination/work/results": "coordination-participant-result",
+                "/psychlo/coordination/work/reviews": "coordination-supervisor-review",
+                "/psychlo/concurrency/canary-result": "concurrency-canary-result",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])
@@ -716,6 +731,32 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path == "/roadex/human-decisions/decide") and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
+            initiator_routes = {
+                "/psychlo/admin/external-round-binding": "external-round-binding",
+                "/psychlo/admin/ingress-conflict-reconciliation": "ingress-conflict-reconciliation",
+                "/psychlo/admin/cross-project-team-binding": "cross-project-team-binding",
+                "/psychlo/admin/concurrency-canary-authorization": "concurrency-canary-authorization",
+                "/psychlo/admin/concurrency-ceiling-authorization": "concurrency-ceiling-authorization",
+                "/admin/psychlo/external-round-binding": "external-round-binding",
+                "/admin/psychlo/ingress-conflict-reconciliation": "ingress-conflict-reconciliation",
+                "/admin/psychlo/cross-project-team-binding": "cross-project-team-binding",
+                "/admin/psychlo/concurrency-canary-authorization": "concurrency-canary-authorization",
+                "/admin/psychlo/concurrency-ceiling-authorization": "concurrency-ceiling-authorization",
+                "/roadex/psychlo/external-round-binding": "external-round-binding",
+                "/roadex/psychlo/ingress-conflict-reconciliation": "ingress-conflict-reconciliation",
+                "/roadex/psychlo/cross-project-team-binding": "cross-project-team-binding",
+                "/roadex/psychlo/concurrency-canary-authorization": "concurrency-canary-authorization",
+                "/roadex/psychlo/concurrency-ceiling-authorization": "concurrency-ceiling-authorization",
+            }
+            if path in initiator_routes:
+                if psychlo_bridge is None:
+                    self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                    return
+                if auth_context.get("auth_type") != "admin_token":
+                    self._write_json({"error": "admin_token_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                self._handle_json(lambda payload: psychlo_bridge.initiate_authorized(initiator_routes[path], payload))
                 return
             if path == "/backup-provisioning/stage":
                 self._handle_json(lambda payload: stage_backup_provisioning_plan_api(store_path, payload))
@@ -1302,6 +1343,12 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     result = psychlo_bridge.receive_external_round(message["payload"])
                 elif kind == "coordination-work-request":
                     result = psychlo_bridge.receive_coordination_work_request(message["payload"])
+                elif kind == "coordination-participant-result":
+                    result = psychlo_bridge.receive_cross_project_participant_result(message["payload"])
+                elif kind == "coordination-supervisor-review":
+                    result = psychlo_bridge.receive_cross_project_supervisor_review(message["payload"])
+                elif kind == "concurrency-canary-result":
+                    result = psychlo_bridge.receive_concurrency_canary_result(message["payload"])
                 elif kind == "decision-outcome":
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:

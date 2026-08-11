@@ -281,9 +281,9 @@ def parse_external_round(payload: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _strict_protocol(value: Any, *, required: set[str], name: str, schema: str | None = None) -> dict[str, Any]:
+def _strict_protocol(value: Any, *, required: set[str], name: str, schema: str | None = None, allowed: set[str] | None = None) -> dict[str, Any]:
     result = _object(value, name=name)
-    _keys(result, required, name=name)
+    _keys(result, allowed or required, name=name)
     if schema is not None and result.get("schemaVersion") != schema:
         raise ContractError(f"{name} schema version is invalid")
     for field in ("correlationId", "idempotencyKey", "occurredAt"):
@@ -311,8 +311,7 @@ def parse_external_round_binding(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def parse_ingress_conflict_reconciliation(payload: Mapping[str, Any]) -> dict[str, Any]:
     required = {"sourceId", "scope", "ingressSourceId", "ingressIdempotencyKey", "correlationId", "idempotencyKey", "occurredAt", "provenanceId", "status", "ingressType"}
-    value = _strict_protocol(payload, required=required, name="ingress conflict reconciliation")
-    _keys(value, required | {"projectId"}, name="ingress conflict reconciliation")
+    value = _strict_protocol(payload, required=required, allowed=required | {"projectId"}, name="ingress conflict reconciliation")
     if value["sourceId"] != "overseer" or value["scope"] not in {"project", "global"} or value["status"] != "resolved": raise ContractError("ingress reconciliation identity is invalid")
     if value["scope"] == "project":
         if "projectId" not in value: raise ContractError("projectId is required")
@@ -320,6 +319,85 @@ def parse_ingress_conflict_reconciliation(payload: Mapping[str, Any]) -> dict[st
     elif "projectId" in value: raise ContractError("global reconciliation must not bind a project")
     for field in ("ingressSourceId", "ingressIdempotencyKey", "provenanceId", "ingressType"): _id(value[field], name=field)
     if value["ingressType"] not in {"plan.admitted", "plan.changed", "project.decommissioned", "project.takeover-imported", "project.scheduling-input-recorded", "overseer.usage-snapshot", "handoff.receipt-recorded", "external-round-binding-authorized", "external-round-reconciled", "cross-project.team-binding-authorized", "coordinator.concurrency-canary-authorized", "coordinator.concurrency-ceiling-authorized"}: raise ContractError("ingress type is invalid")
+    return value
+
+
+def parse_concurrency_canary_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the exact Psychlo-derived successful canary result contract."""
+    value = _object(payload, name="concurrency canary result")
+    required = {"resultId", "authorizationId", "targetCeiling", "expectedRevision", "executions", "concurrencyObserved", "occurredAt", "digest"}
+    _keys(value, required, name="concurrency canary result")
+    for field in ("resultId", "authorizationId"):
+        _id(value.get(field), name=field)
+    if value.get("resultId") != f"canary-result:{value.get('authorizationId')}" or value.get("targetCeiling") != 2 or value.get("concurrencyObserved") is not True:
+        raise ContractError("canary result identity is invalid")
+    if not isinstance(value.get("expectedRevision"), int) or isinstance(value["expectedRevision"], bool) or value["expectedRevision"] < 0:
+        raise ContractError("canary result revision is invalid")
+    _timestamp(value.get("occurredAt"), name="occurredAt")
+    _digest(value.get("digest"), name="digest")
+    executions = value.get("executions")
+    if not isinstance(executions, list) or len(executions) != 2:
+        raise ContractError("canary result executions are invalid")
+    for execution in executions:
+        item = _object(execution, name="canary execution")
+        _keys(item, {"executionId", "started", "completed"}, name="canary execution")
+        _id(item.get("executionId"), name="executionId")
+        started = _object(item.get("started"), name="canary execution start")
+        completed = _object(item.get("completed"), name="canary execution completion")
+        start_required = {"executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId", "startedAt", "digest"}
+        completion_required = {"executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId", "settledAt", "terminalStatus", "resultDigest", "evidenceId", "evidenceDigest", "digest"}
+        _keys(started, start_required, name="canary execution start")
+        _keys(completed, completion_required, name="canary execution completion")
+        for field in ("executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId"):
+            _id(started.get(field), name=field)
+            _id(completed.get(field), name=field)
+        if started["executionId"] != item["executionId"] or completed["executionId"] != item["executionId"] or started["roundId"] != completed["roundId"]:
+            raise ContractError("canary execution binding is invalid")
+        if started["authorizationId"] != value["authorizationId"] or completed["authorizationId"] != value["authorizationId"] or started["projectId"] == completed["projectId"] and False:
+            raise ContractError("canary execution authorization is invalid")
+        _timestamp(started["startedAt"], name="startedAt"); _timestamp(completed["settledAt"], name="settledAt")
+        if completed["terminalStatus"] != "completed":
+            raise ContractError("canary execution was not successful")
+        for field in ("resultDigest", "evidenceDigest", "digest"):
+            _digest(completed[field], name=field)
+        _id(completed["evidenceId"], name="evidenceId"); _digest(started["digest"], name="digest")
+        start_base = {key: started[key] for key in ("executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId", "startedAt")}
+        completed_base = {key: completed[key] for key in ("executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId", "settledAt", "terminalStatus", "resultDigest", "evidenceId", "evidenceDigest")}
+        if hashlib.sha256(json.dumps(start_base, separators=(",", ":")).encode()).hexdigest() != started["digest"] or hashlib.sha256(json.dumps(completed_base, separators=(",", ":")).encode()).hexdigest() != completed["digest"]:
+            raise ContractError("canary execution digest mismatch")
+    first, second = executions
+    if first["executionId"] == second["executionId"] or first["started"]["projectId"] == second["started"]["projectId"]:
+        raise ContractError("canary executions must be distinct projects")
+    first_start = datetime.fromisoformat(first["started"]["startedAt"].replace("Z", "+00:00"))
+    second_start = datetime.fromisoformat(second["started"]["startedAt"].replace("Z", "+00:00"))
+    first_end = datetime.fromisoformat(first["completed"]["settledAt"].replace("Z", "+00:00"))
+    second_end = datetime.fromisoformat(second["completed"]["settledAt"].replace("Z", "+00:00"))
+    occurred = datetime.fromisoformat(value["occurredAt"].replace("Z", "+00:00"))
+    if not (first_start < second_end and second_start < first_end) or first_end > occurred or second_end > occurred:
+        raise ContractError("canary executions do not prove overlap")
+    result_base = {key: value[key] for key in ("resultId", "authorizationId", "targetCeiling", "expectedRevision", "executions", "concurrencyObserved", "occurredAt")}
+    if hashlib.sha256(json.dumps(result_base, separators=(",", ":")).encode()).hexdigest() != value["digest"]:
+        raise ContractError("canary result digest mismatch")
+    return value
+
+
+def parse_concurrency_ceiling_authorization(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"authorizationId", "ceiling", "expectedRevision", "revision", "canaryResultId", "projectId", "planId", "workflowId", "decisionVersion", "decisionId", "question", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    value = _strict_protocol(payload, required=required, name="concurrency ceiling authorization")
+    for field in required - {"ceiling", "expectedRevision", "revision", "occurredAt", "digest", "question"}:
+        _id(value.get(field), name=field)
+    _text(value["question"], name="question")
+    for field in ("ceiling", "expectedRevision", "revision"):
+        if not isinstance(value.get(field), int) or isinstance(value[field], bool) or value[field] < 0:
+            raise ContractError(f"{field} is invalid")
+    if value["ceiling"] < 1 or value["revision"] != value["expectedRevision"] + 1:
+        raise ContractError("concurrency ceiling revision is invalid")
+    _timestamp(value["occurredAt"]); _digest(value["digest"], name="digest")
+    if value["decisionId"] != f"roadex:concurrency:{value['authorizationId']}" or value["question"] != f"Approve the exact global concurrency operation {value['digest']}":
+        raise ContractError("concurrency ceiling decision binding is invalid")
+    base = {key: value[key] for key in ("authorizationId", "ceiling", "expectedRevision", "revision", "canaryResultId", "projectId", "planId", "workflowId", "decisionVersion", "correlationId", "idempotencyKey", "occurredAt")}
+    if hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest() != value["digest"]:
+        raise ContractError("concurrency ceiling digest mismatch")
     return value
 
 

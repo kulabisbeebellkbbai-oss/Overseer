@@ -48,6 +48,9 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
+            CREATE TABLE IF NOT EXISTS authorization_records(authorization_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
         """)
         for column in ("delivery_skiller", "delivery_memory"):
             try:
@@ -61,6 +64,77 @@ class PsychloBridgeStore:
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
+
+    def save_authorization_record(self, record: Mapping[str, Any]) -> None:
+        """Persist an immutable approval used by bridge initiators in tests/local mode."""
+        value = dict(record)
+        identifier = value.get("id", value.get("approvalId"))
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise ValueError("authorization record id is required")
+        value["id"] = identifier
+        digest = str(value.get("payloadDigest", value.get("payload_digest", "")))
+        if not digest:
+            raise ValueError("authorization record payload digest is required")
+        existing = self.connection.execute("SELECT payload_json,payload_digest FROM authorization_records WHERE authorization_id=?", (identifier,)).fetchone()
+        if existing is not None:
+            if str(existing[0]) != _dump(value) or str(existing[1]) != digest:
+                raise ValueError("authorization record is immutable")
+            return
+        self.connection.execute("INSERT INTO authorization_records VALUES (?,?,?,?)", (identifier, _dump(value), digest, self._now()))
+
+    def load_authorization_record(self, authorization_id: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT payload_json FROM authorization_records WHERE authorization_id=?", (authorization_id,)).fetchone()
+        if row is None:
+            raise KeyError(authorization_id)
+        return json.loads(row[0])
+
+    def save_coordination_dispatch(self, request_id: str, dispatch_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not request_id or not dispatch_id:
+            raise ValueError("coordination dispatch identity is required")
+        value = dict(payload)
+        existing = self.coordination_dispatch(request_id)
+        if existing is not None:
+            if existing["dispatchId"] != dispatch_id or existing["payload"] != value:
+                raise ValueError("coordination dispatch conflict")
+            return existing
+        self.connection.execute("INSERT INTO coordination_dispatches VALUES (?,?,?,?,?)", (request_id, dispatch_id, _dump(value), "pending", self._now()))
+        return self.coordination_dispatch(request_id)
+
+    def coordination_dispatch(self, request_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT dispatch_id,payload_json,state,updated_at FROM coordination_dispatches WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        return {"requestId": request_id, "dispatchId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3]}
+
+    def save_coordination_review(self, request_id: str, review_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        existing = self.coordination_review(request_id)
+        if existing is not None:
+            if existing["reviewId"] != review_id or existing["payload"] != value:
+                raise ValueError("coordination review conflict")
+            return existing
+        self.connection.execute("INSERT INTO coordination_reviews VALUES (?,?,?,?,?)", (request_id, review_id, _dump(value), "pending", self._now()))
+        return self.coordination_review(request_id)
+
+    def coordination_review(self, request_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT review_id,payload_json,state,updated_at FROM coordination_reviews WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        return {"requestId": request_id, "reviewId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3]}
+
+    def transition_coordination_dispatch(self, request_id: str, state: str) -> dict[str, Any]:
+        self.connection.execute("UPDATE coordination_dispatches SET state=?,updated_at=? WHERE request_id=?", (state, self._now(), request_id))
+        result = self.coordination_dispatch(request_id)
+        if result is None:
+            raise ValueError("coordination dispatch is missing")
+        return result
+
+    def transition_coordination_review(self, request_id: str, state: str) -> dict[str, Any]:
+        self.connection.execute("UPDATE coordination_reviews SET state=?,updated_at=? WHERE request_id=?", (state, self._now(), request_id))
+        result = self.coordination_review(request_id)
+        if result is None:
+            raise ValueError("coordination review is missing")
+        return result
 
     def claim_nonce(self, nonce: str, message_id: str, claimed_at: str) -> bool:
         cursor = self.connection.execute("INSERT OR IGNORE INTO peer_nonces VALUES (?,?,?)", (nonce, message_id, claimed_at))

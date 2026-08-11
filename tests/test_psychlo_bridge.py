@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 from http.server import ThreadingHTTPServer
 from http.client import HTTPConnection
+import pytest
 
 from overseer.api import make_api_handler
 
@@ -19,6 +20,7 @@ from overseer.psychlo_bridge import (
     verify_peer_request,
     _read_secret,
 )
+from overseer.psychlo_contracts import canonical_digest
 
 
 SECRET = b"0123456789abcdef0123456789abcdef"
@@ -29,13 +31,64 @@ def test_admin_canary_and_later_ceiling_initiators_require_separate_approvals(tm
     sent = []
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda kind, mid, payload: sent.append((kind, mid, payload)) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
-    approval = {"status": "approved", "kind": "concurrency-canary", "provenanceId": "admin-canary-approval"}
     canary = {"authorizationId": "canary-1", "targetTemporaryCeiling": 2, "expectedGlobalCeiling": 1, "expectedRevision": 0, "projects": [{"projectId": "p1", "planId": "plan-1", "planVersion": "v1", "leadId": "lead-1"}, {"projectId": "p2", "planId": "plan-2", "planVersion": "v1", "leadId": "lead-2"}], "workflowId": "roadex-test", "decisionVersion": "v1", "deadline": "2026-08-10T03:00:00+00:00", "correlationId": "canary-corr", "idempotencyKey": "canary-key", "occurredAt": NOW}
-    assert bridge.initiate_concurrency_canary_authorization(approval, canary)["inserted"] is True
+    store.save_authorization_record({"id": "admin-canary-approval", "status": "approved", "action": "concurrency-canary", "owner": "sisko", "target": "canary-1", "payloadDigest": canonical_digest(canary), "evidence": [canonical_digest(canary)], "approvedBy": "human-user"})
+    assert bridge.initiate_concurrency_canary_authorization("admin-canary-approval", canary)["inserted"] is True
     assert sent[-1][0] == "concurrency-canary-authorization"
     store.record_protocol("concurrency-canary-result", "canary-result-1", "canary-result-key", "a" * 64, {"resultId": "canary-result-1"})
     ceiling = {"authorizationId": "ceiling-1", "ceiling": 2, "expectedRevision": 0, "revision": 1, "canaryResultId": "canary-result-1", "projectId": "p1", "planId": "plan-1", "workflowId": "roadex-test", "decisionVersion": "v1", "correlationId": "ceiling-corr", "idempotencyKey": "ceiling-key", "occurredAt": NOW}
-    assert bridge.initiate_concurrency_ceiling_authorization({"status": "approved", "kind": "concurrency-ceiling", "provenanceId": "admin-ceiling"}, ceiling)["inserted"] is True
+    store.save_authorization_record({"id": "admin-ceiling", "status": "approved", "action": "concurrency-ceiling", "owner": "sisko", "target": "ceiling-1", "payloadDigest": canonical_digest(ceiling), "evidence": [canonical_digest(ceiling)], "approvedBy": "human-user"})
+    with pytest.raises(ValueError, match="delivered canary"):
+        bridge.initiate_concurrency_ceiling_authorization("admin-ceiling", ceiling)
+
+
+def test_initiators_reject_caller_supplied_approval_objects(tmp_path: Path):
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="persisted approval record ID"):
+        bridge.initiate_concurrency_canary_authorization({"status": "approved"}, {})
+
+
+def test_coordination_dispatch_id_is_pending_until_authenticated_lead_result(tmp_path: Path):
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    store.record_project("arcade", {"projectLead": {"id": "lead-arcade"}}, {})
+    bridge = PsychloBridge(store=store, dispatcher=lambda lead, scope: "dispatch-1", sender=lambda kind, mid, payload: sent.append((kind, mid, payload)) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    request = {"linkId": "link-1", "version": "v1", "projectId": "arcade", "leadId": "lead-arcade", "supervisorLeadId": "supervisor-1", "requestId": "request-1", "scope": "update shared contract", "evidenceIds": ["evidence-1"], "expectedResultDigest": "a" * 64, "correlationId": "coord-1", "idempotencyKey": "coord-1", "occurredAt": NOW}
+    accepted = bridge.receive_coordination_work_request(request)
+    assert accepted["status"] == "pending" and accepted["dispatchId"] == "dispatch-1"
+    assert store.protocol_record("cross-project-participant-result", "request-1") is None
+    result = {"linkId": "link-1", "version": "v1", "projectId": "arcade", "leadId": "lead-arcade", "requestId": "request-1", "dispatchId": "dispatch-1", "resultId": "result-1", "scope": request["scope"], "status": "completed", "evidenceId": "evidence-result", "digest": "a" * 64, "correlationId": "coord-1", "idempotencyKey": "result-1", "occurredAt": NOW}
+    stored = bridge.receive_cross_project_participant_result(result)
+    assert stored["record"]["state"] == "delivered"
+    assert store.coordination_dispatch("request-1")["state"] == "delivered"
+    assert sent[-1][0] == "cross-project-participant-result"
+
+
+def test_admin_initiator_route_loads_only_persisted_approval_id(tmp_path: Path):
+    class Sender:
+        secret = SECRET
+        def __call__(self, *_args):
+            return {"accepted": True}
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    operation = {"authorizationId": "auth-1", "externalExecutionId": "exec-1", "reconciliationId": "recon-1", "projectId": "arcade", "aTeamId": "team-1", "planId": "plan-1", "planVersion": "v1", "projectLeadId": "lead-1", "threadId": "thread-1", "repository": {"pathIdentity": "/tmp/arcade", "beforeHead": "a" * 40, "afterHead": "b" * 40, "dirtyDigest": "c" * 64}, "startingCheckpoint": "checkpoint-start", "terminalCheckpoint": "checkpoint-end"}
+    digest = canonical_digest(operation)
+    store.save_authorization_record({"id": "approval-1", "status": "approved", "action": "external-work", "owner": "sisko", "target": "recon-1", "payloadDigest": digest, "evidence": [digest], "approvedBy": "human-user"})
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=Sender(), callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(str(tmp_path / "overseer.sqlite3"), "admin-secret", psychlo_bridge=bridge))
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    body = json.dumps({"approval_id": "approval-1", "input": operation}, separators=(",", ":")).encode()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("POST", "/psychlo/admin/external-round-binding", body=body, headers={"Authorization": "Bearer admin-secret", "Content-Type": "application/json"})
+        response = connection.getresponse(); response_body = response.read()
+        assert response.status == 200, response_body
+        assert json.loads(response_body)["record"]["state"] == "delivered"
+        connection.request("POST", "/psychlo/admin/external-round-binding", body=json.dumps({"approval_id": {"status": "approved"}, "input": operation}).encode(), headers={"Authorization": "Bearer admin-secret", "Content-Type": "application/json"})
+        rejected = connection.getresponse(); rejected.read()
+        assert rejected.status == 400
+        connection.close()
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
 def test_verifies_exact_signed_psychlo_request_once(tmp_path: Path):

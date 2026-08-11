@@ -10,6 +10,8 @@ from overseer.psychlo_contracts import (
     ContractError,
     canonical_digest,
     parse_adoption_evidence,
+    parse_concurrency_canary_result,
+    parse_ingress_conflict_reconciliation,
     parse_external_round,
     parse_learning_observation,
     parse_registry_candidate,
@@ -60,3 +62,17 @@ def test_adoption_evidence_is_registry_bound_and_strict():
     assert parse_adoption_evidence(evidence)["registry"]["canonical"] is True
     with pytest.raises(ContractError):
         parse_adoption_evidence({**evidence, "repository": {"path": "/private"}})
+
+
+def test_ingress_project_id_is_the_only_exact_optional_key():
+    base = {"sourceId": "overseer", "scope": "global", "ingressSourceId": "psychlo", "ingressIdempotencyKey": "ingress-1", "correlationId": "corr", "idempotencyKey": "reconcile-1", "occurredAt": NOW, "provenanceId": "prov-1", "status": "resolved", "ingressType": "overseer.usage-snapshot"}
+    assert parse_ingress_conflict_reconciliation(base)["scope"] == "global"
+    with pytest.raises(ContractError):
+        parse_ingress_conflict_reconciliation({**base, "unexpected": "nope"})
+    with pytest.raises(ContractError):
+        parse_ingress_conflict_reconciliation({**base, "scope": "project"})
+
+
+def test_canary_result_contract_rejects_arbitrary_protocol_shape():
+    with pytest.raises(ContractError):
+        parse_concurrency_canary_result({"resultId": "canary-result-1"})

@@ -510,6 +510,10 @@ class SQLiteStore:
                 source_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS roadex_approval_fixtures (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS host_security_source_reviews (
                 id TEXT PRIMARY KEY,
                 remote_address TEXT NOT NULL,
@@ -2084,6 +2088,63 @@ class SQLiteStore:
         if not isinstance(binding, RoadexApprovalBinding):
             raise ValueError("roadex approval binding is malformed")
         return binding
+
+    def save_roadex_approval_fixture(self, fixture) -> None:
+        from .roadex_approval_fixture import RoadexApprovalFixture
+
+        if not isinstance(fixture, RoadexApprovalFixture):
+            raise ValueError("Roadex approval fixture must be exact RoadexApprovalFixture")
+        if (
+            fixture.status != "pending"
+            or fixture.approved_at is not None
+            or fixture.approved_by is not None
+        ):
+            raise ValueError("new Roadex approval fixture must be pending")
+        self._connection.execute(
+            "INSERT INTO roadex_approval_fixtures (id, payload) VALUES (?, ?)",
+            (fixture.id, _dump(fixture)),
+        )
+        self._commit_agent_mutation()
+
+    def approve_roadex_approval_fixture(self, fixture) -> None:
+        from .roadex_approval_fixture import RoadexApprovalFixture
+
+        if not isinstance(fixture, RoadexApprovalFixture):
+            raise ValueError("Roadex approval fixture must be exact RoadexApprovalFixture")
+        if (
+            fixture.status != "approved"
+            or not fixture.approved_at
+            or not fixture.approved_by
+        ):
+            raise ValueError("Roadex approval fixture must have exact approval evidence")
+        existing = self.load_roadex_approval_fixture(fixture.id)
+        if existing.status != "pending":
+            if existing == fixture:
+                return
+            raise ValueError("Roadex approval fixture decision is immutable")
+        if existing.created_at != fixture.created_at:
+            raise ValueError("Roadex approval fixture immutable evidence changed")
+        self._connection.execute(
+            "UPDATE roadex_approval_fixtures SET payload=? WHERE id=?",
+            (_dump(fixture), fixture.id),
+        )
+        self._commit_agent_mutation()
+
+    def load_roadex_approval_fixture(self, fixture_id: str):
+        from .roadex_approval_fixture import RoadexApprovalFixture
+
+        return _load_dataclass(
+            RoadexApprovalFixture,
+            self._get_payload("roadex_approval_fixtures", fixture_id),
+        )
+
+    def list_roadex_approval_fixtures(self) -> tuple[object, ...]:
+        from .roadex_approval_fixture import RoadexApprovalFixture
+
+        return tuple(
+            _load_dataclass(RoadexApprovalFixture, payload)
+            for payload in self._list_payloads("roadex_approval_fixtures")
+        )
 
     def list_admin_change_plans(self) -> tuple[AdminChangePlan, ...]:
         return tuple(_load_dataclass(AdminChangePlan, payload) for payload in self._list_payloads("admin_change_plans"))

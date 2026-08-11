@@ -10796,6 +10796,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     api_parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
     api_parser.add_argument("--port", type=int, default=8766)
     api_parser.add_argument("--auth-token-file", help="local file containing the bearer token required for API access")
+    api_parser.add_argument("--human-approval-token-file", help="separate local bearer token for independent Human fixture approval")
+    api_parser.add_argument("--human-approval-identity", help="server-owned Human identity recorded on fixture approval")
     health_summary_parser = subparsers.add_parser("health-summary", help="summarize latest health evidence per target")
     health_summary_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     health_summary_parser.add_argument("--fail-on-unhealthy", action="store_true", help="exit non-zero when any target is unhealthy")
@@ -12182,7 +12184,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve-api":
         from .api import load_auth_token, run_api_server
 
-        run_api_server(args.store, args.host, args.port, load_auth_token(args.auth_token_file))
+        run_api_server(
+            args.store,
+            args.host,
+            args.port,
+            load_auth_token(args.auth_token_file),
+            load_auth_token(args.human_approval_token_file),
+            args.human_approval_identity,
+        )
         return 0
 
     if args.command == "health-summary":

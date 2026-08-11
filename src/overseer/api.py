@@ -17,6 +17,10 @@ from .roadex_approval_status import (
     MissingRoadexApprovalError,
     roadex_approval_status,
 )
+from .roadex_approval_fixture import (
+    approve_roadex_approval_fixture_api,
+    stage_roadex_approval_fixture_api,
+)
 
 from .codex_usage import CodexUsageTracker
 from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, verify_peer_request, MAX_BODY_BYTES
@@ -312,7 +316,16 @@ def _project_path_for_store(store_path: str) -> Path:
     return Path.cwd()
 
 
-def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None, roadex_decision_adapter_factory=None, psychlo_bridge: PsychloBridge | None = None):
+def make_api_handler(
+    store_path: str,
+    auth_token: str | None = None,
+    backup_provisioning_adapter_factory=None,
+    roadex_decision_adapter_factory=None,
+    *,
+    human_approval_token: str | None = None,
+    human_approval_identity: str | None = None,
+    psychlo_bridge: PsychloBridge | None = None,
+):
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
             with SQLiteStore(store_path) as primary:
@@ -729,11 +742,33 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     or {"authorized": False, "auth_type": "unknown", "reason": "invalid_token"}
                 )
                 return
+            if path == "/roadex/approval-fixtures/approve":
+                header = self.headers.get("authorization", "")
+                prefix = "Bearer "
+                if (
+                    human_approval_token is None
+                    or human_approval_identity is None
+                    or not header.startswith(prefix)
+                    or not secrets.compare_digest(header[len(prefix) :], human_approval_token)
+                ):
+                    self._write_json(
+                        {"error": "unauthorized", "reason": "independent_human_token_required"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                self._handle_json(
+                    lambda payload: approve_roadex_approval_fixture_api(
+                        store_path,
+                        payload,
+                        human_identity=human_approval_identity,
+                    )
+                )
+                return
             auth_context = self._authorize_request("POST", raw_path, path)
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path == "/roadex/human-decisions/decide") and auth_context.get("auth_type") != "admin_token":
+            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path in {"/roadex/human-decisions/decide", "/roadex/approval-fixtures/stage"}) and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
                 return
             initiator_routes = {
@@ -773,6 +808,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 return
             if path == "/roadex/human-decisions/decide":
                 self._handle_json(lambda payload: _decide_roadex_human(store_path, payload, roadex_decision_adapter_factory, psychlo_bridge))
+                return
+            if path == "/roadex/approval-fixtures/stage":
+                self._handle_json(lambda payload: stage_roadex_approval_fixture_api(store_path, payload))
                 return
             if path == "/storage/authorizations/verify":
                 self._handle_json(lambda payload: verify_storage_authorization_status(store_path, payload))
@@ -1467,13 +1505,34 @@ def _decide_roadex_human(store_path: str, payload: dict[str, Any], adapter_facto
     return dict(decide_roadex_human_plan_api(store_path, payload, adapter_factory))
 
 
-def run_api_server(store_path: str, host: str = "127.0.0.1", port: int = 8766, auth_token: str | None = None) -> None:
+def run_api_server(
+    store_path: str,
+    host: str = "127.0.0.1",
+    port: int = 8766,
+    auth_token: str | None = None,
+    human_approval_token: str | None = None,
+    human_approval_identity: str | None = None,
+) -> None:
     if host not in LOOPBACK_HOSTS:
         raise ValueError("Overseer API may only bind to 127.0.0.1 or localhost")
+    if (human_approval_token is None) != (human_approval_identity is None):
+        raise ValueError("Human approval token and identity must be configured together")
+    if human_approval_token is not None and auth_token is not None and secrets.compare_digest(human_approval_token, auth_token):
+        raise ValueError("Human approval token must be independent from the agent token")
     from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
     decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
     psychlo_bridge = create_bridge_from_environment() if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE") else None
-    server = ThreadingHTTPServer((host, port), make_api_handler(store_path, auth_token, roadex_decision_adapter_factory=decision_factory, psychlo_bridge=psychlo_bridge))
+    server = ThreadingHTTPServer(
+        (host, port),
+        make_api_handler(
+            store_path,
+            auth_token,
+            roadex_decision_adapter_factory=decision_factory,
+            human_approval_token=human_approval_token,
+            human_approval_identity=human_approval_identity,
+            psychlo_bridge=psychlo_bridge,
+        ),
+    )
     try:
         server.serve_forever()
     finally:

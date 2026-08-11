@@ -211,7 +211,7 @@ def parse_project_registration(payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(criteria, list) or len(criteria) > 32: raise ContractError("task acceptance criteria are invalid")
         for item in criteria: _text(item, name="task acceptance criterion")
     _validate_task_graph(task_ids, dependencies)
-    if version.endswith(".v2"): _parse_handoff_lifecycle(envelope.get("lifecycle"), project)
+    if version.endswith(".v2"): _parse_handoff_lifecycle(envelope.get("lifecycle"), project, lead["id"])
     _digest(envelope.get("digest"), name="handoff digest")
     if canonical_digest(envelope) != envelope["digest"]: raise ContractError("handoff envelope digest does not match canonical content")
     receipt = _object(registration["receipt"], name="handoff receipt")
@@ -251,7 +251,7 @@ def _validate_task_graph(task_ids: set[str], dependencies: Mapping[str, list[str
     for task_id in task_ids: visit(task_id)
 
 
-def _parse_handoff_lifecycle(raw: Any, project: Mapping[str, Any]) -> None:
+def _parse_handoff_lifecycle(raw: Any, project: Mapping[str, Any], lead_id: str) -> None:
     value = _object(raw, name="handoff lifecycle"); kind = value.get("kind")
     if kind == "change":
         if set(value) != {"kind", "supersedesPlanId", "supersedesVersion"}: raise ContractError("handoff lifecycle is invalid")
@@ -263,6 +263,19 @@ def _parse_handoff_lifecycle(raw: Any, project: Mapping[str, Any]) -> None:
         if set(value) != {"kind", "repositoryPath", "repositoryHead", "dirtyStateDigest", "currentStateEvidence"} or not isinstance(value.get("repositoryPath"), str) or not value["repositoryPath"].startswith("/") or value["repositoryPath"] != value["repositoryPath"].strip() or len(value["repositoryPath"]) > 2_048 or GIT_RE.fullmatch(str(value.get("repositoryHead"))) is None: raise ContractError("handoff lifecycle is invalid")
         _digest(value.get("dirtyStateDigest"), name="dirtyStateDigest"); evidence = _bounded_id_array(value.get("currentStateEvidence"), name="currentStateEvidence", maximum=32)
         if not evidence: raise ContractError("handoff lifecycle is invalid")
+    elif kind in {"reconstruction", "onboarding", "cleanup"}:
+        keys = {"kind", "assessmentId", "assessmentDigest", "classification", "teamId", "projectLeadId", "artifactActions"}
+        expected = {"reconstruction": "recover-active", "onboarding": "adopt-baseline", "cleanup": "cleanup-required"}
+        if set(value) != keys or value.get("classification") != expected[kind] or value.get("projectLeadId") != lead_id:
+            raise ContractError("handoff lifecycle is invalid")
+        for field in ("assessmentId", "teamId", "projectLeadId"): _id(value.get(field), name=field)
+        _digest(value.get("assessmentDigest"), name="assessmentDigest")
+        actions = value.get("artifactActions")
+        if not isinstance(actions, list) or len(actions) > 64: raise ContractError("artifact actions are invalid")
+        for raw_action in actions:
+            action = _object(raw_action, name="artifact action")
+            if set(action) != {"artifactId", "artifactDigest", "action"} or action.get("action") not in {"restore", "replace"}: raise ContractError("artifact action is invalid")
+            _id(action.get("artifactId"), name="artifactId"); _digest(action.get("artifactDigest"), name="artifactDigest")
     else: raise ContractError("handoff lifecycle is invalid")
 
 

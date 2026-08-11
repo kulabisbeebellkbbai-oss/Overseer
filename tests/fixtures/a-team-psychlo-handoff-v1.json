@@ -1,36 +1,93 @@
 {
-  "sourceContract": "Psychlo src/contracts/a-team-handoff.ts",
   "envelope": {
     "contractVersion": "a-team.psychlo.handoff.v1",
     "source": "a-team",
-    "aTeamId": "team-arcade",
-    "approval": {"status": "approved", "approvedAt": "2026-08-10T02:00:00+00:00"},
-    "project": {"id": "arcade", "planId": "plan-arcade", "planVersion": "v7", "provenancePath": "/a-team/team-arcade/arcade/plan-arcade/v7"},
-    "projectLead": {"id": "lead-arcade"},
-    "plan": {
-      "title": "Arcade",
-      "summary": "Approved Arcade delivery plan",
-      "goals": ["Deliver Arcade"],
-      "constraints": [],
-      "deliverables": ["Working Arcade"],
-      "tasks": [{"id": "task-1", "ownerMemberId": "lead-arcade", "title": "Implement", "description": "Implement approved Arcade scope", "dependencyIds": [], "acceptanceCriteria": ["Verified"]}]
+    "aTeamId": "team-psychlo-01",
+    "approval": {
+      "status": "approved",
+      "approvedAt": "2026-08-09T14:00:00.000Z"
     },
-    "correlationId": "registration-arcade",
-    "idempotencyKey": "registration-arcade",
-    "occurredAt": "2026-08-10T02:00:00+00:00",
-    "digest": "6afb03df5d61550d474c9e33c193574e778c9007dd93a8f8f51af7950c80021a"
+    "project": {
+      "id": "psychlo-handoff",
+      "planId": "plan-handoff-v1",
+      "planVersion": "v1",
+      "provenancePath": "/plans/psychlo/handoff-v1.md"
+    },
+    "projectLead": {
+      "id": "lead-psychlo-01"
+    },
+    "plan": {
+      "title": "Psychlo handoff",
+      "summary": "Define and deliver the approved handoff contract.",
+      "goals": [
+        "Define a canonical envelope",
+        "Preserve task dependency order"
+      ],
+      "constraints": [
+        "No live service changes"
+      ],
+      "deliverables": [
+        "Versioned handoff contract"
+      ],
+      "tasks": [
+        {
+          "id": "task-discovery",
+          "ownerMemberId": "lead-psychlo-01",
+          "title": "Define contract",
+          "description": "Define the canonical handoff contract.",
+          "dependencyIds": [],
+          "acceptanceCriteria": [
+            "Contract fields are versioned"
+          ]
+        },
+        {
+          "id": "task-implementation",
+          "ownerMemberId": "member-implementation",
+          "title": "Implement contract",
+          "description": "Implement strict parsing and canonicalization.",
+          "dependencyIds": [
+            "task-discovery"
+          ],
+          "acceptanceCriteria": [
+            "Digest is verified"
+          ]
+        },
+        {
+          "id": "task-verification",
+          "ownerMemberId": "member-verification",
+          "title": "Verify contract",
+          "description": "Verify both repositories share the fixture.",
+          "dependencyIds": [
+            "task-implementation"
+          ],
+          "acceptanceCriteria": [
+            "Fixtures are byte-identical"
+          ]
+        }
+      ]
+    },
+    "correlationId": "corr-psychlo-handoff-01",
+    "idempotencyKey": "handoff-psychlo-v1-01",
+    "occurredAt": "2026-08-09T14:05:00.000Z",
+    "digest": "41355516bd649af1d162a657abf2f16f24fda85a0ddcf871742ecd6072624b2d"
   },
+  "expectedCanonical": "{\"aTeamId\":\"team-psychlo-01\",\"approval\":{\"approvedAt\":\"2026-08-09T14:00:00.000Z\",\"status\":\"approved\"},\"contractVersion\":\"a-team.psychlo.handoff.v1\",\"correlationId\":\"corr-psychlo-handoff-01\",\"idempotencyKey\":\"handoff-psychlo-v1-01\",\"occurredAt\":\"2026-08-09T14:05:00.000Z\",\"plan\":{\"constraints\":[\"No live service changes\"],\"deliverables\":[\"Versioned handoff contract\"],\"goals\":[\"Define a canonical envelope\",\"Preserve task dependency order\"],\"summary\":\"Define and deliver the approved handoff contract.\",\"tasks\":[{\"acceptanceCriteria\":[\"Contract fields are versioned\"],\"dependencyIds\":[],\"description\":\"Define the canonical handoff contract.\",\"id\":\"task-discovery\",\"ownerMemberId\":\"lead-psychlo-01\",\"title\":\"Define contract\"},{\"acceptanceCriteria\":[\"Digest is verified\"],\"dependencyIds\":[\"task-discovery\"],\"description\":\"Implement strict parsing and canonicalization.\",\"id\":\"task-implementation\",\"ownerMemberId\":\"member-implementation\",\"title\":\"Implement contract\"},{\"acceptanceCriteria\":[\"Fixtures are byte-identical\"],\"dependencyIds\":[\"task-implementation\"],\"description\":\"Verify both repositories share the fixture.\",\"id\":\"task-verification\",\"ownerMemberId\":\"member-verification\",\"title\":\"Verify contract\"}],\"title\":\"Psychlo handoff\"},\"project\":{\"id\":\"psychlo-handoff\",\"planId\":\"plan-handoff-v1\",\"planVersion\":\"v1\",\"provenancePath\":\"/plans/psychlo/handoff-v1.md\"},\"projectLead\":{\"id\":\"lead-psychlo-01\"},\"source\":\"a-team\"}",
+  "expectedDigest": "41355516bd649af1d162a657abf2f16f24fda85a0ddcf871742ecd6072624b2d",
   "receipt": {
     "contractVersion": "a-team.psychlo.receipt.v1",
     "handoffContractVersion": "a-team.psychlo.handoff.v1",
     "source": "psychlo",
     "status": "admitted",
-    "receiptId": "receipt-arcade",
-    "aTeamId": "team-arcade",
-    "project": {"id": "arcade", "planId": "plan-arcade", "planVersion": "v7"},
-    "correlationId": "registration-arcade",
-    "idempotencyKey": "registration-arcade",
-    "envelopeDigest": "6afb03df5d61550d474c9e33c193574e778c9007dd93a8f8f51af7950c80021a",
-    "receivedAt": "2026-08-10T02:00:00+00:00"
+    "receiptId": "receipt-psychlo-handoff-01",
+    "aTeamId": "team-psychlo-01",
+    "project": {
+      "id": "psychlo-handoff",
+      "planId": "plan-handoff-v1",
+      "planVersion": "v1"
+    },
+    "correlationId": "corr-psychlo-handoff-01",
+    "idempotencyKey": "handoff-psychlo-v1-01",
+    "envelopeDigest": "41355516bd649af1d162a657abf2f16f24fda85a0ddcf871742ecd6072624b2d",
+    "receivedAt": "2026-08-09T14:05:01.000Z"
   }
 }

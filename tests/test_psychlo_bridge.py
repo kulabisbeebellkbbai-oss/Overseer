@@ -1374,8 +1374,11 @@ def test_registers_an_admitted_plan_and_publishes_initial_scheduling(tmp_path: P
 
 def test_coordination_dispatch_accepts_exact_real_registration_shape_after_restart(tmp_path: Path):
     store_path = tmp_path / "bridge.sqlite3"
-    frozen = json.loads((Path(__file__).parent / "fixtures" / "a-team-psychlo-handoff-v1.json").read_text(encoding="utf-8"))
-    assert frozen["sourceContract"] == "Psychlo src/contracts/a-team-handoff.ts"
+    fixture_path = Path(__file__).parent / "fixtures" / "a-team-psychlo-handoff-v1.json"
+    fixture_bytes = fixture_path.read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == "99f0279dc1be40836f8e6f5420cb069d66d34f9c30effd123e365099e2d5d751"
+    frozen = json.loads(fixture_bytes)
+    assert canonical_digest(frozen["envelope"]) == frozen["expectedDigest"] == frozen["envelope"]["digest"]
     registration = {"envelope": frozen["envelope"], "receipt": frozen["receipt"]}
     bridge = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_PreparedDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     assert bridge.register_project(registration) == {"accepted": True}
@@ -1383,9 +1386,9 @@ def test_coordination_dispatch_accepts_exact_real_registration_shape_after_resta
     store.record_protocol("cross-project-team-binding", "binding-1", "binding-1", "b" * 64, {"bindingId": "binding-1", "coordinationTeamId": "coordination-team", "supervisorMemberId": "member-supervisor", "supervisorLeadId": "lead-supervisor"}, state="delivered")
     dispatcher = _PreparedDispatcher(identity=lambda *_: "dispatch-real-registration")
     restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
-    request = _coord_request("binding-1", "link-real", "v1", "arcade", "lead-arcade", "lead-supervisor", ["arcade", "hermione"])
+    request = _coord_request("binding-1", "link-real", "v1", "psychlo-handoff", "lead-psychlo-01", "lead-supervisor", ["psychlo-handoff", "peer-project"])
     assert restarted.receive_coordination_work_request(request)["receipt"]["status"] == "accepted"
-    assert dispatcher.calls[0][0] == "lead-arcade"
+    assert dispatcher.calls[0][0] == "lead-psychlo-01"
 
 
 @pytest.mark.parametrize("defect", ["missing", "digest", "version", "source", "approval", "approved_timestamp", "occurred_timestamp", "receipt_timestamp", "receipt_version"])
@@ -1419,18 +1422,49 @@ def test_register_project_accepts_exact_lifecycle_handoff_version(tmp_path: Path
     assert bridge.register_project(registration) == {"accepted": True}
 
 
-def test_register_project_rejects_adoption_only_lifecycle_kind(tmp_path: Path):
-    registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade-v2", plan_version="v2")
+@pytest.mark.parametrize(("kind", "classification"), [("reconstruction", "recover-active"), ("onboarding", "adopt-baseline"), ("cleanup", "cleanup-required")])
+def test_register_project_accepts_exact_adoption_lifecycle_and_dispatches_after_restart(tmp_path: Path, kind: str, classification: str):
+    project_id = f"arcade-{kind}"
+    lead_id = f"lead-{kind}"
+    store_path = tmp_path / "bridge.sqlite3"
+    registration = _registration_payload(project_id, lead_id, plan_id=f"plan-{kind}", plan_version="v2")
     registration["envelope"]["contractVersion"] = "a-team.psychlo.handoff.v2"
     registration["envelope"]["lifecycle"] = {
-        "kind": "cleanup", "assessmentId": "assessment-1", "assessmentDigest": "a" * 64,
-        "classification": "cleanup-required", "teamId": "team-arcade", "projectLeadId": "lead-arcade", "artifactActions": [],
+        "kind": kind, "assessmentId": f"assessment-{kind}", "assessmentDigest": "a" * 64,
+        "classification": classification, "teamId": f"team-{kind}", "projectLeadId": lead_id,
+        "artifactActions": [{"artifactId": f"artifact-{kind}", "artifactDigest": "b" * 64, "action": "restore"}],
     }
     registration["envelope"]["digest"] = canonical_digest(registration["envelope"])
     registration["receipt"]["handoffContractVersion"] = registration["envelope"]["contractVersion"]
     registration["receipt"]["envelopeDigest"] = registration["envelope"]["digest"]
+    bridge = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_PreparedDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    assert bridge.register_project(registration) == {"accepted": True}
+    store = PsychloBridgeStore(store_path)
+    store.record_protocol("cross-project-team-binding", "binding-1", "binding-1", "b" * 64, {"bindingId": "binding-1", "coordinationTeamId": "coordination-team", "supervisorMemberId": "member-supervisor", "supervisorLeadId": "lead-supervisor"}, state="delivered")
+    dispatcher = _PreparedDispatcher(identity=lambda *_: f"dispatch-{kind}")
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    request = _coord_request("binding-1", f"link-{kind}", "v1", project_id, lead_id, "lead-supervisor", [project_id, f"peer-{kind}"])
+    assert restarted.receive_coordination_work_request(request)["receipt"]["status"] == "accepted"
+    assert dispatcher.calls[0][0] == lead_id
+
+
+@pytest.mark.parametrize("defect", ["classification", "lead", "artifact_digest", "artifact_action", "artifact_extra", "reject"])
+def test_register_project_rejects_malformed_adoption_lifecycle(tmp_path: Path, defect: str):
+    registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade-v2", plan_version="v2")
+    registration["envelope"]["contractVersion"] = "a-team.psychlo.handoff.v2"
+    lifecycle = {"kind": "cleanup", "assessmentId": "assessment-1", "assessmentDigest": "a" * 64, "classification": "cleanup-required", "teamId": "team-arcade", "projectLeadId": "lead-arcade", "artifactActions": [{"artifactId": "artifact-1", "artifactDigest": "b" * 64, "action": "restore"}]}
+    if defect == "classification": lifecycle["classification"] = "recover-active"
+    elif defect == "lead": lifecycle["projectLeadId"] = "lead-other"
+    elif defect == "artifact_digest": lifecycle["artifactActions"][0]["artifactDigest"] = "invalid"
+    elif defect == "artifact_action": lifecycle["artifactActions"][0]["action"] = "delete"
+    elif defect == "artifact_extra": lifecycle["artifactActions"][0]["extra"] = True
+    else: lifecycle = {"kind": "reject", "assessmentId": "assessment-1", "assessmentDigest": "a" * 64, "candidateId": "candidate-1"}
+    registration["envelope"]["lifecycle"] = lifecycle
+    registration["envelope"]["digest"] = canonical_digest(registration["envelope"])
+    registration["receipt"]["handoffContractVersion"] = registration["envelope"]["contractVersion"]
+    registration["receipt"]["envelopeDigest"] = registration["envelope"]["digest"]
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=_PreparedDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
-    with pytest.raises(ValueError, match="lifecycle"):
+    with pytest.raises(ValueError, match="lifecycle|digest|artifact"):
         bridge.register_project(registration)
 
 

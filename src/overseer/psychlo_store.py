@@ -15,9 +15,22 @@ import stat
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
+from .psychlo_contracts import canonical_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, ContractError
+
+
+def _round_result_digest(result: Mapping[str, Any]) -> str:
+    fields = ("roundId", "projectId", "projectLeadId", "planId", "planVersion", "threadId", "model", "featureClass", "correlationId", "idempotencyKey", "snapshotId", "policyVersion", "expectedUsageCost", "scope", "selectionReason", "priorityRationale", "sourceId", "provenanceId", "status", "actualUsageCost", "deliveredScope", "remainingEstimate", "blockers", "questions", "reachedExplicitGates", "occurredAt")
+    import hashlib
+    return hashlib.sha256(json.dumps({key: result[key] for key in fields if key in result}, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
 
 def _dump(value: Mapping[str, Any]) -> str:
     return json.dumps(dict(value), sort_keys=True, separators=(",", ":"))
+
+
+def _dump_wire(value: Mapping[str, Any]) -> str:
+    """Retain authenticated contract insertion order for cross-language digests."""
+    return json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"))
 
 
 class PsychloBridgeStore:
@@ -236,10 +249,15 @@ class PsychloBridgeStore:
         """
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            auth_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (authorization_id,)).fetchone()
+            auth_row = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (authorization_id,)).fetchone()
             if auth_row is None or auth_row[1] != "delivered":
                 raise ValueError("concurrency canary authorization is unavailable")
-            authorization = json.loads(auth_row[0])
+            try:
+                authorization = parse_canary_authorization(json.loads(auth_row[0]))
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("concurrency canary authorization is invalid") from error
+            if authorization["digest"] != auth_row[2]:
+                raise ValueError("concurrency canary authorization digest conflict")
             if authorization.get("expectedRevision") != expected_revision:
                 raise ValueError("concurrency canary authorization revision conflict")
             try:
@@ -268,11 +286,28 @@ class PsychloBridgeStore:
                 identity = (item.get("projectId"), item.get("planId"), item.get("planVersion"), item.get("projectLeadId"))
                 if identity not in allowed or item.get("projectId") == request.get("projectId"):
                     raise ValueError("single_stream_busy")
-            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
+
+    def _verify_canary_execution_rounds(self, canary: Mapping[str, Any]) -> None:
+        for execution in canary["executions"]:
+            started = execution["started"]
+            row = self.connection.execute("SELECT request_json,result_json FROM rounds WHERE round_id=?", (started["roundId"],)).fetchone()
+            if row is None:
+                raise ValueError("canary result round is unavailable")
+            request = json.loads(row[0]); stored_result = json.loads(row[1]) if row[1] else None
+            if request.get("roundId") != started["roundId"] or any(request.get(key) != started.get(source) for key, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
+                raise ValueError("canary result round identity conflict")
+            if not isinstance(stored_result, dict) or stored_result.get("status") != "completed":
+                raise ValueError("canary result round is not completed")
+            completed = execution["completed"]
+            result_digest = _round_result_digest(stored_result)
+            evidence_digest = canonical_digest({"provenanceId": stored_result.get("provenanceId"), "resultDigest": result_digest})
+            if completed.get("evidenceId") != stored_result.get("provenanceId") or completed.get("resultDigest") != result_digest or completed.get("evidenceDigest") != evidence_digest:
+                raise ValueError("canary result evidence does not bind to stored round result")
 
     def record_durable_ceiling_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, now: str) -> None:
         """Reserve an eligible round under the persisted global ceiling.
@@ -284,28 +319,47 @@ class PsychloBridgeStore:
         """
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            change = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-change' AND state IN ('delivered','settled') ORDER BY updated_at DESC, rowid DESC LIMIT 1").fetchone()
+            change = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-ceiling-change' AND state IN ('delivered','settled') ORDER BY updated_at DESC, rowid DESC LIMIT 1").fetchone()
             if change is None:
                 raise ValueError("concurrency ceiling is unavailable")
             change_payload = json.loads(change[0])
+            if canonical_digest(change_payload) != change[2]:
+                raise ValueError("concurrency ceiling change digest conflict")
             authorization_id = change_payload.get("authorizationId")
             if set(change_payload) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"} or not isinstance(authorization_id, str) or not authorization_id.strip():
                 raise ValueError("concurrency ceiling change binding is invalid")
-            auth = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
+            auth = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
             if auth is None or auth[1] not in {"delivered", "settled"}:
                 raise ValueError("concurrency ceiling authorization is unavailable")
-            authorization = json.loads(auth[0])
+            try:
+                authorization = parse_concurrency_ceiling_authorization(json.loads(auth[0]))
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("concurrency ceiling authorization is invalid") from error
+            if authorization["digest"] != auth[2]:
+                raise ValueError("concurrency ceiling authorization digest conflict")
             if authorization.get("ceiling") != 2 or authorization.get("revision") != authorization.get("expectedRevision", -1) + 1:
                 raise ValueError("concurrency ceiling is invalid")
-            canary_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-result' AND record_id=?", (authorization.get("canaryResultId"),)).fetchone()
+            canary_row = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-canary-result' AND record_id=?", (authorization.get("canaryResultId"),)).fetchone()
             if canary_row is None or canary_row[1] != "delivered":
                 raise ValueError("successful delivered canary evidence is required")
-            canary = json.loads(canary_row[0])
-            canary_authorization = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (canary.get("authorizationId"),)).fetchone()
-            expected_projects = canary_authorization and json.loads(canary_authorization[0]).get("projects")
+            try:
+                canary = parse_concurrency_canary_result(json.loads(canary_row[0]))
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("successful canary evidence is invalid") from error
+            if canary["digest"] != canary_row[2]:
+                raise ValueError("concurrency canary result digest conflict")
+            canary_authorization = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (canary.get("authorizationId"),)).fetchone()
+            try:
+                parsed_canary_authorization = parse_canary_authorization(json.loads(canary_authorization[0])) if canary_authorization else None
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("canary authorization is invalid") from error
+            if canary_authorization and parsed_canary_authorization["digest"] != canary_authorization[2]:
+                raise ValueError("canary authorization digest conflict")
+            expected_projects = parsed_canary_authorization and parsed_canary_authorization.get("projects")
             observed_projects = [{"projectId": item.get("started", {}).get("projectId"), "planId": item.get("started", {}).get("planId"), "planVersion": item.get("started", {}).get("planVersion"), "leadId": item.get("started", {}).get("leadId")} for item in canary.get("executions", [])] if isinstance(canary.get("executions"), list) else []
             if canary_authorization is None or canary_authorization[1] not in {"delivered", "settled"} or canary.get("resultId") != authorization.get("canaryResultId") or canary.get("targetCeiling") != authorization.get("ceiling") or canary.get("expectedRevision") != authorization.get("expectedRevision") or canary.get("concurrencyObserved") is not True or len(observed_projects) != 2 or sorted(observed_projects, key=lambda item: item["projectId"]) != sorted(expected_projects or [], key=lambda item: item.get("projectId")):
                 raise ValueError("successful canary evidence does not bind to ceiling authorization")
+            self._verify_canary_execution_rounds(canary)
             decision_row = self.connection.execute("SELECT request_json,status FROM decisions WHERE decision_id=?", (authorization.get("decisionId"),)).fetchone()
             if decision_row is None or decision_row[1] != "approved":
                 raise ValueError("concurrency ceiling authorization is not approved")
@@ -316,8 +370,70 @@ class PsychloBridgeStore:
             active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")
-            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def record_concurrency_ceiling_change(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Validate and durably queue one exact, approved ceiling change."""
+        if set(payload) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"}:
+            raise ValueError("concurrency ceiling change is invalid")
+        authorization_id = payload.get("authorizationId")
+        if any(not isinstance(payload.get(field), str) or not payload[field].strip() for field in payload):
+            raise ValueError("concurrency ceiling change is invalid")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            auth_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
+            if auth_row is None or auth_row[1] not in {"delivered", "settled"}:
+                raise ValueError("concurrency ceiling authorization is unavailable")
+            try:
+                authorization = parse_concurrency_ceiling_authorization(json.loads(auth_row[0]))
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("concurrency ceiling authorization is invalid") from error
+            canary_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-result' AND record_id=?", (authorization["canaryResultId"],)).fetchone()
+            if canary_row is None or canary_row[1] != "delivered":
+                raise ValueError("successful delivered canary evidence is required")
+            try:
+                canary = parse_concurrency_canary_result(json.loads(canary_row[0]))
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("successful canary evidence is invalid") from error
+            canary_auth_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (canary["authorizationId"],)).fetchone()
+            if canary_auth_row is None or canary_auth_row[1] not in {"delivered", "settled"}:
+                raise ValueError("canary authorization is unavailable")
+            try:
+                canary_authorization = parse_canary_authorization(json.loads(canary_auth_row[0]))
+            except (ContractError, TypeError, ValueError) as error:
+                raise ValueError("canary authorization is invalid") from error
+            expected_projects = {(item["projectId"], item["planId"], item["planVersion"], item["leadId"]) for item in canary_authorization["projects"]}
+            observed_projects = {(item["started"]["projectId"], item["started"]["planId"], item["started"]["planVersion"], item["started"]["leadId"]) for item in canary["executions"]}
+            if canary["resultId"] != authorization["canaryResultId"] or canary["targetCeiling"] != authorization["ceiling"] or canary["expectedRevision"] != authorization["expectedRevision"] or observed_projects != expected_projects:
+                raise ValueError("successful canary evidence does not bind to ceiling")
+            self._verify_canary_execution_rounds(canary)
+            decision_row = self.connection.execute("SELECT request_json,status FROM decisions WHERE decision_id=?", (authorization["decisionId"],)).fetchone()
+            if decision_row is None or decision_row[1] != "approved":
+                raise ValueError("concurrency ceiling authorization is not approved")
+            decision = json.loads(decision_row[0])
+            for field in ("decisionId", "projectId", "planId", "workflowId", "decisionVersion", "question"):
+                if decision.get(field) != authorization[field]:
+                    raise ValueError("concurrency ceiling decision binding is invalid")
+            if decision.get("resultProvenanceId") != authorization["digest"] or decision.get("idempotencyKey") not in {authorization["idempotencyKey"], f"decision:{authorization['idempotencyKey']}"}:
+                raise ValueError("concurrency ceiling decision binding is invalid")
+            digest = canonical_digest(payload)
+            existing = self.protocol_record("concurrency-ceiling-change", authorization_id)
+            if existing is not None:
+                if existing["digest"] != digest or existing["payload"] != dict(payload):
+                    raise ValueError("concurrency ceiling change conflict")
+                self.connection.execute("COMMIT")
+                return existing, False
+            by_key = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind='concurrency-ceiling-change' AND idempotency_key=?", (payload["idempotencyKey"],)).fetchone()
+            if by_key is not None and by_key[0] != authorization_id:
+                raise ValueError("concurrency ceiling change idempotency conflict")
+            self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at) VALUES (?,?,?,?,?,?,?)", ("concurrency-ceiling-change", authorization_id, payload["idempotencyKey"], digest, _dump_wire(payload), "queued", self._now()))
+            record = self.protocol_record("concurrency-ceiling-change", authorization_id)
+            self.connection.execute("COMMIT")
+            return record, True
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
@@ -328,27 +444,27 @@ class PsychloBridgeStore:
         try:
             if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
-            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
 
     def record_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
-        self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+        self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
 
     def mark_dispatch_started(self, round_id: str) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='started' WHERE round_id=? AND dispatch_state='pending'", (round_id,))
 
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
-        self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump(receipt), round_id))
+        self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
 
     def round_for_capability(self, capability: str):
         row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded FROM rounds WHERE capability_hash=?", (_token_hash(capability),)).fetchone()
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def record_result(self, round_id: str, result: Mapping[str, Any]) -> None:
-        self.connection.execute("UPDATE rounds SET result_json=? WHERE round_id=? AND result_json IS NULL", (_dump(result), round_id))
+        self.connection.execute("UPDATE rounds SET result_json=? WHERE round_id=? AND result_json IS NULL", (_dump_wire(result), round_id))
 
     def mark_forwarded(self, round_id: str) -> None:
         self.connection.execute("UPDATE rounds SET result_forwarded=1 WHERE round_id=?", (round_id,))
@@ -629,7 +745,7 @@ class PsychloBridgeStore:
         by_key = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? AND idempotency_key=?", (kind, idempotency_key)).fetchone()
         if by_key is not None and by_key[0] != record_id: raise ValueError(f"{kind} idempotency conflict")
         try:
-            self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at) VALUES (?,?,?,?,?,?,?)", (kind, record_id, idempotency_key, digest, _dump(payload), state, self._now()))
+            self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at) VALUES (?,?,?,?,?,?,?)", (kind, record_id, idempotency_key, digest, _dump_wire(payload), state, self._now()))
         except sqlite3.IntegrityError as error:
             winner = self.protocol_record(kind, record_id)
             if winner is not None and winner["digest"] == digest and winner["payload"] == dict(payload):

@@ -84,7 +84,7 @@ def test_approved_external_decide_settles_one_gate_and_releases_only_a_fresh_bou
         return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}} if kind == "external-round" else {"accepted": True}
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda lead, prompt: dispatched.append((lead, prompt)) or "fresh-dispatch", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "fresh-capability-1234567890abcdef")
     bridge.receive_external_round(external_payload())
-    request = {"roundId": "fresh-round", "projectId": "arcade", "projectLeadId": "lead-1", "planId": "plan-1", "planVersion": "v1", "correlationId": "fresh-corr", "idempotencyKey": "fresh-round", "snapshotId": "snapshot-2", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "approved continuation"}
+    request = {"roundId": "fresh-round", "projectId": "arcade", "projectLeadId": "lead-1", "planId": "plan-1", "planVersion": "v1", "correlationId": "fresh-corr", "idempotencyKey": "fresh-round", "snapshotId": "snapshot-2", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "gate-proximity"}
     try:
         bridge.request_round(request)
     except ValueError as error:
@@ -122,7 +122,7 @@ def test_rejected_and_expired_external_decisions_remain_blocked(tmp_path: Path):
         assert bridge.store.decision("roadex:external:reconcile-1")[2] == "rejected"
         assert bridge.store.external_execution("reconcile-1")["receipt"]["decisionStatus"] == "rejected"
         try:
-            bridge.request_round({"roundId": "fresh-round", "projectId": "arcade", "projectLeadId": "lead-1", "planId": "plan-1", "planVersion": "v1", "correlationId": "fresh-corr", "idempotencyKey": "fresh-round", "snapshotId": "snapshot-2", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "blocked"})
+            bridge.request_round({"roundId": "fresh-round", "projectId": "arcade", "projectLeadId": "lead-1", "planId": "plan-1", "planVersion": "v1", "correlationId": "fresh-corr", "idempotencyKey": "fresh-round", "snapshotId": "snapshot-2", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "gate-proximity"})
         except ValueError as error:
             assert str(error) == "decision_pending"
         else:

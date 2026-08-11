@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 from pathlib import Path
 import os
 import re
@@ -292,8 +293,14 @@ class PsychloBridge:
             if record is None or record.get("state") != "delivered":
                 continue
             value = record.get("payload")
-            if not isinstance(value, dict) or value.get("targetTemporaryCeiling") != 2 or value.get("expectedGlobalCeiling") != 1:
-                continue
+            if not isinstance(value, dict):
+                raise ValueError("concurrency canary authorization is invalid")
+            try:
+                value = parse_canary_authorization(value)
+            except ContractError as error:
+                raise ValueError("concurrency canary authorization is invalid") from error
+            if value["digest"] != record.get("digest"):
+                raise ValueError("concurrency canary authorization digest conflict")
             try:
                 deadline = _time(str(value["deadline"]))
             except (KeyError, TypeError, ValueError):
@@ -314,10 +321,20 @@ class PsychloBridge:
         for change in reversed([item for item in changes if item is not None]):
             if change.get("state") not in {"delivered", "settled"}:
                 continue
-            authorization_id = change.get("payload", {}).get("authorizationId")
+            change_payload = change.get("payload")
+            if not isinstance(change_payload, dict) or set(change_payload) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"} or canonical_digest(change_payload) != change.get("digest"):
+                raise ValueError("concurrency ceiling change is invalid")
+            authorization_id = change_payload.get("authorizationId")
             authorization = self.store.protocol_record("concurrency-ceiling-authorization", str(authorization_id)) if authorization_id else None
-            if authorization and authorization.get("state") in {"delivered", "settled"} and authorization.get("payload", {}).get("ceiling") == 2:
-                return True
+            if authorization and authorization.get("state") in {"delivered", "settled"}:
+                try:
+                    value = parse_concurrency_ceiling_authorization(authorization["payload"])
+                except ContractError as error:
+                    raise ValueError("concurrency ceiling authorization is invalid") from error
+                if value["digest"] != authorization.get("digest"):
+                    raise ValueError("concurrency ceiling authorization digest conflict")
+                if value["ceiling"] == 2:
+                    return True
         return False
 
     def register_project(self, registration: Mapping[str, Any]) -> dict[str, Any]:
@@ -1150,13 +1167,38 @@ class PsychloBridge:
             value = parse_concurrency_canary_result(payload)
         except ContractError as error:
             raise ValueError(str(error)) from error
+        existing_result = self.store.protocol_record("concurrency-canary-result", value["resultId"])
+        if existing_result is not None:
+            if existing_result["payload"] != value:
+                raise ValueError("concurrency canary result conflict")
+            return {"accepted": True, "receipt": {"resultId": value["resultId"], "digest": value["digest"], "status": "accepted", "provenanceId": f"overseer:{value['resultId']}"}}
         authorization = self.store.protocol_record("concurrency-canary-authorization", value["authorizationId"])
-        if authorization is None:
+        if authorization is None or authorization["state"] != "delivered":
             raise ValueError("canary authorization is unavailable")
-        auth = authorization["payload"]
-        decision = self.store.decision(str(auth.get("decisionId", "")))
-        if auth.get("targetTemporaryCeiling") != value["targetCeiling"] or auth.get("expectedRevision") != value["expectedRevision"] or decision is None or decision[2] != "approved":
+        try:
+            auth = parse_canary_authorization(authorization["payload"])
+        except ContractError as error:
+            raise ValueError("canary authorization is invalid") from error
+        decision = self.store.decision(str(auth["decisionId"]))
+        expected_identities = {(item["projectId"], item["planId"], item["planVersion"], item["leadId"]) for item in auth["projects"]}
+        actual_identities = {(item["started"]["projectId"], item["started"]["planId"], item["started"]["planVersion"], item["started"]["leadId"]) for item in value["executions"]}
+        if auth["targetTemporaryCeiling"] != value["targetCeiling"] or auth["expectedRevision"] != value["expectedRevision"] or actual_identities != expected_identities or decision is None or decision[2] != "approved":
             raise ValueError("canary result requires its exact approved authorization")
+        for execution in value["executions"]:
+            round_record = self.store.get_round(str(execution["started"]["roundId"]))
+            if round_record is None:
+                raise ValueError("canary result round is unavailable")
+            request, _, _, _, _, stored_result, _ = round_record
+            expected = execution["started"]
+            if request.get("roundId") != expected.get("roundId") or any(request.get(key) != expected.get(source) for key, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
+                raise ValueError("canary result round identity conflict")
+            if stored_result is None or stored_result.get("status") != "completed":
+                raise ValueError("canary result round is not completed")
+            completed = execution["completed"]
+            result_digest = _round_result_digest(stored_result)
+            evidence_digest = canonical_digest({"provenanceId": stored_result.get("provenanceId"), "resultDigest": result_digest})
+            if completed.get("evidenceId") != stored_result.get("provenanceId") or completed.get("resultDigest") != result_digest or completed.get("evidenceDigest") != evidence_digest:
+                raise ValueError("canary result evidence does not bind to stored round result")
         record, inserted = self.store.record_protocol("concurrency-canary-result", value["resultId"], value["resultId"], value["digest"], value, state="delivered")
         if record["state"] != "delivered":
             record = self.store.transition_protocol("concurrency-canary-result", value["resultId"], "delivered")
@@ -1167,8 +1209,17 @@ class PsychloBridge:
 
     def change_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         value = dict(payload)
-        if set(value) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"}: raise ValueError("concurrency ceiling change is invalid")
-        return self._persist_protocol("concurrency-ceiling-change", value["authorizationId"], value)
+        record, inserted = self.store.record_concurrency_ceiling_change(value)
+        if record["state"] not in {"delivered", "settled"}:
+            try:
+                response = self.sender("concurrency-ceiling-change", record["id"], record["payload"])
+                if response.get("accepted") is not True:
+                    raise ValueError("Psychlo rejected concurrency ceiling change")
+                record = self.store.transition_protocol("concurrency-ceiling-change", record["id"], "delivered")
+            except Exception as error:
+                self.store.transition_protocol("concurrency-ceiling-change", record["id"], "forward-pending", "forward-failed")
+                raise ValueError("forward-pending") from error
+        return {"inserted": inserted, "replay": not inserted, "record": record}
 
     receive_concurrency_ceiling_change = change_concurrency_ceiling
 
@@ -1396,9 +1447,32 @@ def _weekly_window(snapshot: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 
 def _require_round(request: Mapping[str, Any]) -> None:
-    for name in ("roundId", "projectId", "projectLeadId", "planId", "planVersion", "correlationId", "idempotencyKey", "snapshotId", "policyVersion"):
+    if not isinstance(request, Mapping):
+        raise ValueError("invalid round request")
+    required = {"roundId", "projectId", "projectLeadId", "planId", "planVersion", "correlationId", "idempotencyKey", "snapshotId", "policyVersion", "expectedUsageCost", "scope"}
+    optional = {"threadId", "model", "featureClass", "selectionReason", "priorityRationale"}
+    if set(request) - required - optional or any(name not in request for name in required):
+        raise ValueError("invalid round request")
+    for name in required - {"expectedUsageCost", "scope"}:
         _required_string(request, name)
-    if request.get("scope") != "one bounded round" or request.get("selectionReason") != "priority-selected": raise ValueError("invalid round request")
+    expected_usage = request.get("expectedUsageCost")
+    if isinstance(expected_usage, bool) or not isinstance(expected_usage, (int, float)) or not math.isfinite(expected_usage) or expected_usage < 0:
+        raise ValueError("invalid round request")
+    if request.get("scope") != "one bounded round":
+        raise ValueError("invalid round request")
+    if request.get("selectionReason", "priority-selected") != "priority-selected":
+        raise ValueError("invalid round request")
+    if request.get("priorityRationale", "legacy-unknown") not in {"sole-eligible-project", "trivial-effort", "security-impact", "dependency-impact", "manual-priority", "gate-proximity", "project-id", "legacy-unknown"}:
+        raise ValueError("invalid round request")
+    models = {"gpt-5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}
+    feature_classes = {"typescript-feature", "javascript-feature", "python-feature", "rust-feature", "go-feature", "java-feature", "kotlin-feature", "swift-feature", "cpp-feature", "csharp-feature", "round-result", "unknown"}
+    for name, choices in (("model", models), ("featureClass", feature_classes)):
+        if name in request and (not isinstance(request[name], str) or not request[name].strip() or request[name] not in choices):
+            raise ValueError("invalid round request")
+    if "threadId" in request:
+        _required_string(request, "threadId")
+        if len(request["threadId"]) > 200:
+            raise ValueError("invalid round request")
 
 
 def _require_bound_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
@@ -1406,6 +1480,12 @@ def _require_bound_result(request: Mapping[str, Any], result: Mapping[str, Any])
         if result.get(key) != value: raise ValueError("round result does not bind to request")
     if result.get("sourceId") != request["projectLeadId"] or result.get("status") not in {"completed", "blocked"}: raise ValueError("round result is invalid")
     _required_string(result, "provenanceId")
+
+
+def _round_result_digest(result: Mapping[str, Any]) -> str:
+    """Reproduce Psychlo's JSON.stringify order for a parsed RoundResult."""
+    fields = ("roundId", "projectId", "projectLeadId", "planId", "planVersion", "threadId", "model", "featureClass", "correlationId", "idempotencyKey", "snapshotId", "policyVersion", "expectedUsageCost", "scope", "selectionReason", "priorityRationale", "sourceId", "provenanceId", "status", "actualUsageCost", "deliveredScope", "remainingEstimate", "blockers", "questions", "reachedExplicitGates", "occurredAt")
+    return hashlib.sha256(json.dumps({key: result[key] for key in fields if key in result}, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 
 def _required_string(value: Mapping[str, Any], name: str) -> str:

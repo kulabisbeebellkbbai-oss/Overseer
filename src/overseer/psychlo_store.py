@@ -60,7 +60,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS registry_candidates(candidate_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
+            CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key));
             CREATE TABLE IF NOT EXISTS approval_authority_snapshots(approval_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
@@ -80,6 +80,8 @@ class PsychloBridgeStore:
             self.connection.execute("ALTER TABLE protocol_records ADD COLUMN receipt_json TEXT")
         except sqlite3.OperationalError:
             pass
+        self._migrate_protocol_digest_uniqueness()
+        self._backfill_coordination_terminals()
         for table in ("coordination_dispatches", "coordination_reviews"):
             for column in ("owner_id", "idempotency_key"):
                 try:
@@ -95,6 +97,40 @@ class PsychloBridgeStore:
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
+
+    def _migrate_protocol_digest_uniqueness(self) -> None:
+        schema = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='protocol_records'").fetchone()
+        normalized_schema = "" if schema is None else "".join(str(schema[0]).lower().split())
+        if "unique(kind,digest)" in normalized_schema:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute("ALTER TABLE protocol_records RENAME TO protocol_records_legacy_digest_unique")
+                self.connection.execute("CREATE TABLE protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key))")
+                self.connection.execute("INSERT INTO protocol_records SELECT kind,record_id,idempotency_key,digest,payload_json,state,attempts,last_error,updated_at,receipt_json FROM protocol_records_legacy_digest_unique")
+                self.connection.execute("DROP TABLE protocol_records_legacy_digest_unique")
+                self.connection.execute("COMMIT")
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS protocol_kind_digest_unique ON protocol_records(kind,digest) WHERE kind != 'cross-project-participant-result'")
+
+    def _backfill_coordination_terminals(self) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute("SELECT record_id,digest,payload_json,updated_at FROM protocol_records WHERE kind='cross-project-participant-result'").fetchall()
+            for result_id, digest, encoded, inserted_at in rows:
+                payload = json.loads(encoded)
+                request_id = payload.get("requestId")
+                if not isinstance(request_id, str) or not request_id.strip() or payload.get("resultId") != result_id or payload.get("digest") != digest:
+                    continue
+                existing = self.connection.execute("SELECT result_id,digest,payload_json FROM coordination_terminals WHERE request_id=?", (request_id,)).fetchone()
+                if existing is not None and existing != (result_id, digest, encoded):
+                    raise ValueError("participant result terminal conflict")
+                self.connection.execute("INSERT OR IGNORE INTO coordination_terminals VALUES (?,?,?,?,?)", (request_id, result_id, digest, encoded, inserted_at))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def save_approval_snapshot(self, approval_id: str, payload: Mapping[str, Any], digest: str) -> dict[str, Any]:
         if not isinstance(approval_id, str) or not approval_id.strip() or not isinstance(digest, str) or not digest.strip():
@@ -792,6 +828,29 @@ class PsychloBridgeStore:
         rows = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? ORDER BY updated_at,record_id LIMIT ?", (kind, max(1, min(1000, int(limit))))).fetchall()
         return [self.protocol_record(kind, str(row[0])) for row in rows]
 
+    def protocol_records_for_ids(self, kind: str, record_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(record_ids))
+        if not ids:
+            return {}
+        if len(ids) > 64 or any(not isinstance(item, str) or not item.strip() for item in ids):
+            raise ValueError("protocol record scope is invalid")
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.connection.execute(f"SELECT record_id FROM protocol_records WHERE kind=? AND record_id IN ({placeholders})", (kind, *ids)).fetchall()
+        return {str(row[0]): self.protocol_record(kind, str(row[0])) for row in rows}
+
+    def coordination_requests_for_link(self, link_id: str, version: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind='coordination-work-request' AND json_extract(payload_json,'$.linkId')=? AND json_extract(payload_json,'$.version')=? ORDER BY record_id", (link_id, version)).fetchall()
+        return [self.protocol_record("coordination-work-request", str(row[0])) for row in rows]
+
+    def coordination_participant_terminal(self, request_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT result_id,digest,payload_json FROM coordination_terminals WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        record = self.protocol_record("cross-project-participant-result", str(row[0]))
+        if record is None or record["digest"] != row[1] or record["payload"] != json.loads(row[2]) or record["payload"].get("requestId") != request_id:
+            raise ValueError("participant result terminal record is invalid")
+        return record
+
     def record_protocol(self, kind: str, record_id: str, idempotency_key: str, digest: str, payload: Mapping[str, Any], *, state: str = "queued") -> tuple[dict[str, Any], bool]:
         existing = self.protocol_record(kind, record_id)
         if existing is not None:
@@ -821,16 +880,12 @@ class PsychloBridgeStore:
                     raise ValueError("participant result terminal conflict")
                 inserted = False
             else:
-                rows = self.connection.execute("SELECT record_id,idempotency_key,digest,payload_json FROM protocol_records WHERE kind='cross-project-participant-result'").fetchall()
-                existing_for_request = next((row for row in rows if json.loads(row[3]).get("requestId") == request_id), None)
-                if existing_for_request is not None and existing_for_request != (result_id, idempotency_key, digest, encoded):
+                conflict = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind='cross-project-participant-result' AND (record_id=? OR idempotency_key=?)", (result_id, idempotency_key)).fetchone()
+                if conflict is not None:
                     raise ValueError("participant result terminal conflict")
-                if existing_for_request is None and any(row[0] == result_id or row[1] == idempotency_key or row[2] == digest for row in rows):
-                    raise ValueError("participant result terminal conflict")
-                if existing_for_request is None:
-                    self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at,receipt_json) VALUES ('cross-project-participant-result',?,?,?,?, 'queued',?,NULL)", (result_id, idempotency_key, digest, encoded, self._now()))
+                self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at,receipt_json) VALUES ('cross-project-participant-result',?,?,?,?, 'queued',?,NULL)", (result_id, idempotency_key, digest, encoded, self._now()))
                 self.connection.execute("INSERT INTO coordination_terminals VALUES (?,?,?,?,?)", (request_id, result_id, digest, encoded, self._now()))
-                inserted = existing_for_request is None
+                inserted = True
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")

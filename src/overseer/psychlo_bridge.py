@@ -1069,7 +1069,7 @@ class PsychloBridge:
         if project is None or project[0].get("projectLead", {}).get("id", project[0].get("projectLeadId")) != value["leadId"]: raise ValueError("coordination work lead is not registered")
         binding = self.store.protocol_record("cross-project-team-binding", value["coordinationBindingId"])
         if binding is None or binding["state"] != "delivered" or binding["payload"].get("bindingId") != value["coordinationBindingId"] or not binding["payload"].get("coordinationTeamId") or not binding["payload"].get("supervisorMemberId") or binding["payload"].get("supervisorLeadId") != value["supervisorLeadId"]: raise ValueError("approved coordination team binding is required")
-        for existing in self.store.list_protocol("coordination-work-request"):
+        for existing in self.store.coordination_requests_for_link(value["linkId"], value["version"]):
             candidate = existing["payload"]
             if candidate.get("linkId") == value["linkId"] and candidate.get("version") == value["version"] and (candidate.get("coordinationBindingId") != value["coordinationBindingId"] or candidate.get("requiredRequestIds") != request_ids or candidate.get("supervisorLeadId") != value["supervisorLeadId"]):
                 raise ValueError("coordination request set conflict")
@@ -1196,7 +1196,7 @@ class PsychloBridge:
         request = request_record["payload"]
         binding = self._binding_for_request(request)
         required_ids = request["requiredRequestIds"]
-        request_map = {item["id"]: item for item in self.store.list_protocol("coordination-work-request") if item["id"] in required_ids}
+        request_map = self.store.protocol_records_for_ids("coordination-work-request", required_ids)
         requests = [request_map[item] for item in required_ids if item in request_map]
         if any(item["payload"].get("coordinationBindingId") != request["coordinationBindingId"] or item["payload"].get("linkId") != request["linkId"] or item["payload"].get("version") != request["version"] or item["payload"].get("requiredRequestIds") != required_ids or item["payload"].get("supervisorLeadId") != request["supervisorLeadId"] for item in requests):
             raise ValueError("coordination request set conflict")
@@ -1209,7 +1209,8 @@ class PsychloBridge:
             listed = context.get("participantResults")
             if not isinstance(listed, list) or not listed:
                 raise ValueError("coordination review conflict")
-            result_records = {item["payload"].get("resultId"): item for item in self.store.list_protocol("cross-project-participant-result") if item["state"] == "delivered"}
+            result_ids = [item.get("resultId") for item in listed if isinstance(item, Mapping) and isinstance(item.get("resultId"), str)]
+            result_records = self.store.protocol_records_for_ids("cross-project-participant-result", result_ids)
             listed_request_ids = []
             for participant in listed:
                 if not isinstance(participant, Mapping) or set(participant) != {"resultId", "digest"}:
@@ -1227,17 +1228,13 @@ class PsychloBridge:
             return review
         participants = []
         trigger_result = None
-        participant_records = self.store.list_protocol("cross-project-participant-result")
         for required_id in required_ids:
             item = request_map.get(required_id)
             if item is None:
                 continue
-            matches = [candidate for candidate in participant_records if candidate["payload"].get("requestId") == item["id"] and candidate["state"] == "delivered"]
-            if not matches:
+            result = self.store.coordination_participant_terminal(required_id)
+            if result is None or result["state"] != "delivered":
                 continue
-            if len(matches) != 1:
-                raise ValueError("participant result terminal conflict")
-            result = matches[0]
             result_payload = result["payload"]
             if result["digest"] != result_payload.get("digest") or result["digest"] != item["payload"].get("expectedResultDigest") or any(result_payload.get(field) != item["payload"].get(field) for field in ("linkId", "version", "projectId", "leadId", "scope")) or result_payload.get("requestId") != item["id"]:
                 raise ValueError("participant result stored binding is invalid")

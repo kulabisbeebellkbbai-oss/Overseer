@@ -995,7 +995,7 @@ def test_supervisor_reviews_progress_after_each_exact_result_with_cumulative_evi
     supervisor_dispatcher = _PreparedDispatcher(identity=lambda _lead, context, _key: f"review-{context['projectId']}")
     bridge = PsychloBridge(store=store, dispatcher=_PreparedDispatcher(identity=lambda lead, _scope, _key: f"dispatch-{lead}"), sender=lambda kind, mid, payload: sent.append((kind, mid, payload)) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, project_result_collector=lambda dispatch, _request: results.get(dispatch), supervisor_dispatcher=supervisor_dispatcher, supervisor_result_collector=lambda review_id, _context: reviews.get(review_id))
     first = _coord_request("binding-1", "link-1", "v1", "arcade", "lead-arcade", "lead-supervisor", ["arcade", "hermione"], expected_digest="a" * 64)
-    second = _coord_request("binding-1", "link-1", "v1", "hermione", "lead-hermione", "lead-supervisor", ["arcade", "hermione"], expected_digest="c" * 64)
+    second = _coord_request("binding-1", "link-1", "v1", "hermione", "lead-hermione", "lead-supervisor", ["arcade", "hermione"], expected_digest="a" * 64)
     assert bridge.receive_coordination_work_request(first)["receipt"]["status"] == "accepted"
     results["dispatch-lead-arcade"] = {"linkId": "link-1", "version": "v1", "projectId": "arcade", "leadId": "lead-arcade", "requestId": first["id"], "dispatchId": "dispatch-lead-arcade", "resultId": "result-1", "scope": first["scope"], "status": "completed", "evidenceId": "evidence-result-1", "digest": "a" * 64, "correlationId": "coord-arcade", "idempotencyKey": "result-1", "occurredAt": NOW}
     bridge.receive_coordination_work_request(first)
@@ -1009,16 +1009,64 @@ def test_supervisor_reviews_progress_after_each_exact_result_with_cumulative_evi
     assert store.protocol_record("coordination-work-request", second["id"]) is None
 
     assert bridge.receive_coordination_work_request(second)["receipt"]["status"] == "accepted"
-    results["dispatch-lead-hermione"] = {"linkId": "link-1", "version": "v1", "projectId": "hermione", "leadId": "lead-hermione", "requestId": second["id"], "dispatchId": "dispatch-lead-hermione", "resultId": "result-2", "scope": second["scope"], "status": "completed", "evidenceId": "evidence-result-2", "digest": "c" * 64, "correlationId": "coord-hermione", "idempotencyKey": "result-2", "occurredAt": NOW}
+    results["dispatch-lead-hermione"] = {"linkId": "link-1", "version": "v1", "projectId": "hermione", "leadId": "lead-hermione", "requestId": second["id"], "dispatchId": "dispatch-lead-hermione", "resultId": "result-2", "scope": second["scope"], "status": "completed", "evidenceId": "evidence-result-2", "digest": "a" * 64, "correlationId": "coord-hermione", "idempotencyKey": "result-2", "occurredAt": NOW}
     bridge.receive_coordination_work_request(second)
     second_dispatch = supervisor_dispatcher.calls[1]
     assert second_dispatch[0] == "lead-supervisor"
     assert second_dispatch[1]["requestId"] == second["id"]
-    assert second_dispatch[1]["participantResults"] == [{"resultId": "result-1", "digest": "a" * 64}, {"resultId": "result-2", "digest": "c" * 64}]
+    assert second_dispatch[1]["participantResults"] == [{"resultId": "result-1", "digest": "a" * 64}, {"resultId": "result-2", "digest": "a" * 64}]
     reviews["review-hermione"] = {"accepted": True, "evidence": ["review-hermione-evidence"], "occurredAt": NOW}
     bridge.receive_coordination_work_request(second)
     assert store.protocol_record("coordination-work-request", second["id"])["state"] == "settled"
     assert [item[1] for item in sent if item[0] == "cross-project-supervisor-review"] == ["review-arcade", "review-hermione"]
+
+
+def test_progressive_review_uses_exact_scoped_terminal_lookup_beyond_global_page(tmp_path: Path):
+    results = {}
+    reviews = {}
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    store.record_project("arcade", {"projectLead": {"id": "lead-arcade"}}, {})
+    store.record_project("hermione", {"projectLead": {"id": "lead-hermione"}}, {})
+    store.record_protocol("cross-project-team-binding", "binding-1", "binding-1", "b" * 64, {"bindingId": "binding-1", "coordinationTeamId": "team-1", "supervisorMemberId": "member-supervisor", "supervisorLeadId": "lead-supervisor"}, state="delivered")
+    for index in range(101):
+        digest = hashlib.sha256(f"unrelated-{index}".encode()).hexdigest()
+        payload = {"requestId": f"unrelated-request-{index}", "resultId": f"unrelated-result-{index}", "digest": digest}
+        store.record_protocol("cross-project-participant-result", payload["resultId"], payload["resultId"], digest, payload, state="delivered")
+    supervisor = _PreparedDispatcher(identity=lambda _lead, context, _key: f"review-{context['projectId']}")
+    def make_bridge():
+        return PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_PreparedDispatcher(identity=lambda lead, *_: f"dispatch-{lead}"), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, project_result_collector=lambda dispatch, _request: results.get(dispatch), supervisor_dispatcher=supervisor, supervisor_result_collector=lambda review_id, _context: reviews.get(review_id))
+    first = _coord_request("binding-1", "link-exact", "v1", "arcade", "lead-arcade", "lead-supervisor", ["arcade", "hermione"], expected_digest="a" * 64)
+    second = _coord_request("binding-1", "link-exact", "v1", "hermione", "lead-hermione", "lead-supervisor", ["arcade", "hermione"], expected_digest="a" * 64)
+    bridge = make_bridge()
+    bridge.receive_coordination_work_request(first)
+    results["dispatch-lead-arcade"] = {"linkId": "link-exact", "version": "v1", "projectId": "arcade", "leadId": "lead-arcade", "requestId": first["id"], "dispatchId": "dispatch-lead-arcade", "resultId": "result-exact-arcade", "scope": first["scope"], "status": "completed", "evidenceId": "evidence-exact-arcade", "digest": "a" * 64, "correlationId": "coord-exact-arcade", "idempotencyKey": "result-exact-arcade", "occurredAt": NOW}
+    bridge.receive_coordination_work_request(first)
+    assert supervisor.calls[0][1]["participantResults"] == [{"resultId": "result-exact-arcade", "digest": "a" * 64}]
+    reviews["review-arcade"] = {"accepted": True, "evidence": ["review-exact-arcade"], "occurredAt": NOW}
+    restarted = make_bridge()
+    restarted.receive_coordination_work_request(first)
+    restarted.receive_coordination_work_request(second)
+    results["dispatch-lead-hermione"] = {"linkId": "link-exact", "version": "v1", "projectId": "hermione", "leadId": "lead-hermione", "requestId": second["id"], "dispatchId": "dispatch-lead-hermione", "resultId": "result-exact-hermione", "scope": second["scope"], "status": "completed", "evidenceId": "evidence-exact-hermione", "digest": "a" * 64, "correlationId": "coord-exact-hermione", "idempotencyKey": "result-exact-hermione", "occurredAt": NOW}
+    restarted.receive_coordination_work_request(second)
+    assert supervisor.calls[1][1]["participantResults"] == [{"resultId": "result-exact-arcade", "digest": "a" * 64}, {"resultId": "result-exact-hermione", "digest": "a" * 64}]
+
+
+def test_legacy_protocol_digest_constraint_is_rebuilt_and_terminal_index_backfilled(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    connection = sqlite3.connect(store_path)
+    connection.execute("CREATE TABLE protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind,record_id), UNIQUE(kind,idempotency_key), UNIQUE(kind,digest))")
+    first = {"requestId": "legacy-request-1", "resultId": "legacy-result-1", "digest": "a" * 64}
+    connection.execute("INSERT INTO protocol_records VALUES (?,?,?,?,?,'delivered',0,NULL,?,NULL)", ("cross-project-participant-result", first["resultId"], first["resultId"], first["digest"], json.dumps(first, separators=(",", ":")), NOW))
+    connection.commit(); connection.close(); store_path.chmod(0o600)
+    store = PsychloBridgeStore(store_path)
+    assert store.coordination_participant_terminal(first["requestId"])["id"] == first["resultId"]
+    second = {"requestId": "legacy-request-2", "resultId": "legacy-result-2", "digest": "a" * 64}
+    record, inserted = store.record_coordination_participant_terminal(second["requestId"], second["resultId"], second["resultId"], second["digest"], second)
+    assert inserted is True and record["digest"] == first["digest"]
+    store.record_protocol("cross-project-command", "command-1", "command-1", "c" * 64, {"digest": "c" * 64})
+    with pytest.raises(ValueError, match="cross-project-command conflict"):
+        store.record_protocol("cross-project-command", "command-2", "command-2", "c" * 64, {"digest": "c" * 64, "other": True})
 
 
 def test_rejected_progressive_review_blocks_only_its_trigger_and_is_not_resent_after_restart(tmp_path: Path):

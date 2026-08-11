@@ -101,18 +101,25 @@ class PsychloBridgeStore:
     def _migrate_protocol_digest_uniqueness(self) -> None:
         schema = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='protocol_records'").fetchone()
         normalized_schema = "" if schema is None else "".join(str(schema[0]).lower().split())
-        if "unique(kind,digest)" in normalized_schema:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            if "unique(kind,digest)" in normalized_schema:
                 self.connection.execute("ALTER TABLE protocol_records RENAME TO protocol_records_legacy_digest_unique")
                 self.connection.execute("CREATE TABLE protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key))")
                 self.connection.execute("INSERT INTO protocol_records SELECT kind,record_id,idempotency_key,digest,payload_json,state,attempts,last_error,updated_at,receipt_json FROM protocol_records_legacy_digest_unique")
                 self.connection.execute("DROP TABLE protocol_records_legacy_digest_unique")
-                self.connection.execute("COMMIT")
-            except Exception:
-                self.connection.execute("ROLLBACK")
-                raise
+            self._create_protocol_digest_index()
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def _create_protocol_digest_index(self) -> None:
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS protocol_kind_digest_unique ON protocol_records(kind,digest) WHERE kind != 'cross-project-participant-result'")
+        row = self.connection.execute("SELECT tbl_name,sql FROM sqlite_master WHERE type='index' AND name='protocol_kind_digest_unique'").fetchone()
+        normalized = "" if row is None else "".join(str(row[1]).lower().split())
+        if row is None or row[0] != "protocol_records" or "onprotocol_records(kind,digest)" not in normalized or "wherekind!='cross-project-participant-result'" not in normalized:
+            raise ValueError("protocol digest index binding is invalid")
 
     def _backfill_coordination_terminals(self) -> None:
         self.connection.execute("BEGIN IMMEDIATE")

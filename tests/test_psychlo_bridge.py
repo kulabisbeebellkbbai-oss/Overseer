@@ -1069,6 +1069,25 @@ def test_legacy_protocol_digest_constraint_is_rebuilt_and_terminal_index_backfil
         store.record_protocol("cross-project-command", "command-2", "command-2", "c" * 64, {"digest": "c" * 64, "other": True})
 
 
+def test_legacy_protocol_migration_rolls_back_if_replacement_index_cannot_bind(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    connection = sqlite3.connect(store_path)
+    connection.execute("CREATE TABLE protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind,record_id), UNIQUE(kind,idempotency_key), UNIQUE(kind,digest))")
+    connection.execute("CREATE TABLE unrelated(value TEXT)")
+    connection.execute("CREATE UNIQUE INDEX protocol_kind_digest_unique ON unrelated(value)")
+    payload = {"requestId": "legacy-request", "resultId": "legacy-result", "digest": "a" * 64}
+    connection.execute("INSERT INTO protocol_records VALUES (?,?,?,?,?,'delivered',0,NULL,?,NULL)", ("cross-project-participant-result", payload["resultId"], payload["resultId"], payload["digest"], json.dumps(payload, separators=(",", ":")), NOW))
+    connection.commit(); connection.close(); store_path.chmod(0o600)
+    with pytest.raises(ValueError, match="protocol digest index binding is invalid"):
+        PsychloBridgeStore(store_path)
+    connection = sqlite3.connect(store_path)
+    schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='protocol_records'").fetchone()[0]
+    assert "UNIQUE(kind,digest)" in "".join(schema.split())
+    assert connection.execute("SELECT record_id FROM protocol_records").fetchall() == [("legacy-result",)]
+    assert connection.execute("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='protocol_kind_digest_unique'").fetchone() == ("unrelated",)
+    connection.close()
+
+
 def test_rejected_progressive_review_blocks_only_its_trigger_and_is_not_resent_after_restart(tmp_path: Path):
     results = {}
     reviews = {}

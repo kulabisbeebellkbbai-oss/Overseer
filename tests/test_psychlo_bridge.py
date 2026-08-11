@@ -29,13 +29,36 @@ def test_verifies_exact_signed_psychlo_request_once(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     body = json.dumps({"kind": "round-request", "messageId": "round-1", "occurredAt": NOW, "payload": {"roundId": "round-1"}}, separators=(",", ":")).encode()
     headers = sign_peer_message(SECRET, "psychlo-to-overseer", "round-request", "round-1", NOW, "nonce_1234567890abcdef", body)
-    assert verify_peer_request(SECRET, store, "round-request", body, headers, now=NOW)["messageId"] == "round-1"
+    assert verify_peer_request(SECRET, store, "round-request", body, headers, now=NOW, expected_authority="127.0.0.1:8766")["messageId"] == "round-1"
     try:
-        verify_peer_request(SECRET, store, "round-request", body, headers, now=NOW)
+        verify_peer_request(SECRET, store, "round-request", body, headers, now=NOW, expected_authority="127.0.0.1:8766")
     except ValueError as error:
         assert str(error) == "replay"
     else:
         raise AssertionError("replay was accepted")
+
+
+def test_peer_verification_accepts_one_exact_injected_authority_only(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    body = json.dumps({"kind": "round-request", "messageId": "round-dynamic", "occurredAt": NOW, "payload": {"roundId": "round-dynamic"}}, separators=(",", ":")).encode()
+    authority = "127.0.0.1:43127"
+    headers = sign_peer_message(SECRET, "psychlo-to-overseer", "round-request", "round-dynamic", NOW, "nonce_dynamic_123456", body, authority=authority)
+    assert verify_peer_request(SECRET, store, "round-request", body, headers, now=NOW, expected_authority=authority)["messageId"] == "round-dynamic"
+
+
+def test_peer_verification_rejects_wrong_or_missing_injected_authority(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    body = json.dumps({"kind": "round-request", "messageId": "round-host", "occurredAt": NOW, "payload": {"roundId": "round-host"}}, separators=(",", ":")).encode()
+    authority = "127.0.0.1:43128"
+    headers = sign_peer_message(SECRET, "psychlo-to-overseer", "round-request", "round-host", NOW, "nonce_host_123456789", body, authority=authority)
+    wrong = {**headers, "host": "127.0.0.1:43129"}
+    for candidate in (wrong, {key: value for key, value in headers.items() if key != "host"}):
+        try:
+            verify_peer_request(SECRET, store, "round-request", body, candidate, now=NOW, expected_authority=authority)
+        except ValueError as error:
+            assert str(error) == "invalid_headers"
+        else:
+            raise AssertionError("wrong or missing authority was accepted")
 
 
 def test_derives_prior_day_unused_weekly_capacity_from_provider_delta_only():

@@ -133,13 +133,16 @@ class _LegacyPsychloBridgeStore:
 from .psychlo_store import PsychloBridgeStore
 
 
-def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind: str, body: bytes, headers: Mapping[str, str], *, now: str | None = None) -> dict[str, Any]:
+def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind: str, body: bytes, headers: Mapping[str, str], *, now: str | None = None, expected_authority: str) -> dict[str, Any]:
     if len(secret) < 32 or len(secret) > 4096 or not body or len(body) > MAX_BODY_BYTES:
         raise ValueError("invalid_request")
+    host, separator, port = expected_authority.partition(":")
+    if host != "127.0.0.1" or separator != ":" or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("invalid_authority")
     required = ("host", "content-type", "content-length", "x-psychlo-peer-kind", "x-psychlo-peer-message-id", "x-psychlo-peer-timestamp", "x-psychlo-peer-nonce", "x-psychlo-peer-signature")
     if any(not isinstance(headers.get(name), str) or "," in headers[name] for name in required):
         raise ValueError("invalid_headers")
-    if headers["host"] != "127.0.0.1:8766" or headers["content-type"] != "application/json" or headers["x-psychlo-peer-kind"] != expected_kind or headers["content-length"] != str(len(body)):
+    if headers["host"] != expected_authority or headers["content-type"] != "application/json" or headers["x-psychlo-peer-kind"] != expected_kind or headers["content-length"] != str(len(body)):
         raise ValueError("invalid_headers")
     timestamp = _time(headers["x-psychlo-peer-timestamp"])
     current = _time(now or datetime.now(UTC).isoformat())

@@ -547,11 +547,9 @@ class PsychloBridge:
             observation = parse_learning_observation(payload)
         except ContractError as error:
             raise ValueError(str(error)) from error
-        if supplied_digest is not None:
-            expected_digest = learning_observation_digest(observation)
-            if supplied_digest != expected_digest:
-                raise ValueError("learning observation digest mismatch")
-        digest = canonical_digest(observation)
+        digest = learning_observation_digest(observation)
+        if supplied_digest is not None and supplied_digest != digest:
+            raise ValueError("learning observation digest mismatch")
         inserted = self.store.record_learning(observation, digest)
         return {"inserted": inserted, "replay": not inserted, "observation": self.store.learning_observation(observation["id"])}
 

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "psychlo.cross-project-review-anchor-fixture.v1",
+  "sourceCommit": "f0015d654a106db4fc67fb8dd193ada9f57c3e3c",
+  "sourceValidation": "src/internal/sqlite-event-store.ts:2147",
+  "parentResult": {
+    "resultId": "result-1",
+    "projectId": "arcade",
+    "leadId": "lead-arcade",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "participantResults": [
+    {
+      "resultId": "result-1",
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "resultId": "result-2",
+      "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ]
+}

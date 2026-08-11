@@ -49,8 +49,8 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
             CREATE TABLE IF NOT EXISTS approval_authority_snapshots(approval_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
+            CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
             CREATE TABLE IF NOT EXISTS coordination_operation_claims(kind TEXT NOT NULL, operation_id TEXT NOT NULL, owner_id TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, operation_id), UNIQUE(kind, idempotency_key));
         """)
         for column in ("delivery_skiller", "delivery_memory"):
@@ -62,6 +62,13 @@ class PsychloBridgeStore:
             self.connection.execute("ALTER TABLE external_executions ADD COLUMN gate_workflow_id TEXT")
         except sqlite3.OperationalError:
             pass
+        for table in ("coordination_dispatches", "coordination_reviews"):
+            for column in ("owner_id", "idempotency_key"):
+                try:
+                    self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+            self.connection.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_idempotency ON {table}(idempotency_key) WHERE idempotency_key IS NOT NULL")
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -130,14 +137,17 @@ class PsychloBridgeStore:
             if existing["dispatchId"] != dispatch_id or existing["payload"] != value:
                 raise ValueError("coordination dispatch conflict")
             return existing
-        self.connection.execute("INSERT INTO coordination_dispatches VALUES (?,?,?,?,?)", (request_id, dispatch_id, _dump(value), state, self._now()))
+        self.connection.execute("INSERT INTO coordination_dispatches(request_id,dispatch_id,payload_json,state,updated_at) VALUES (?,?,?,?,?)", (request_id, dispatch_id, _dump(value), state, self._now()))
         return self.coordination_dispatch(request_id)
 
+    def create_coordination_dispatch_intent(self, request_id: str, dispatch_id: str, payload: Mapping[str, Any], *, owner_id: str, idempotency_key: str) -> dict[str, Any]:
+        return self._create_coordination_intent("dispatch", request_id, dispatch_id, payload, owner_id, idempotency_key)
+
     def coordination_dispatch(self, request_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT dispatch_id,payload_json,state,updated_at FROM coordination_dispatches WHERE request_id=?", (request_id,)).fetchone()
+        row = self.connection.execute("SELECT dispatch_id,payload_json,state,updated_at,owner_id,idempotency_key FROM coordination_dispatches WHERE request_id=?", (request_id,)).fetchone()
         if row is None:
             return None
-        return {"requestId": request_id, "dispatchId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3]}
+        return {"requestId": request_id, "dispatchId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3], "ownerId": row[4], "idempotencyKey": row[5]}
 
     def save_coordination_review(self, request_id: str, review_id: str, payload: Mapping[str, Any], *, state: str = "pending") -> dict[str, Any]:
         if state not in {"uncertain", "pending"}:
@@ -148,14 +158,38 @@ class PsychloBridgeStore:
             if existing["reviewId"] != review_id or existing["payload"] != value:
                 raise ValueError("coordination review conflict")
             return existing
-        self.connection.execute("INSERT INTO coordination_reviews VALUES (?,?,?,?,?)", (request_id, review_id, _dump(value), state, self._now()))
+        self.connection.execute("INSERT INTO coordination_reviews(request_id,review_id,payload_json,state,updated_at) VALUES (?,?,?,?,?)", (request_id, review_id, _dump(value), state, self._now()))
         return self.coordination_review(request_id)
 
+    def create_coordination_review_intent(self, request_id: str, review_id: str, payload: Mapping[str, Any], *, owner_id: str, idempotency_key: str) -> dict[str, Any]:
+        return self._create_coordination_intent("review", request_id, review_id, payload, owner_id, idempotency_key)
+
+    def _create_coordination_intent(self, kind: str, operation_id: str, external_id: str, payload: Mapping[str, Any], owner_id: str, idempotency_key: str) -> dict[str, Any]:
+        if kind not in {"dispatch", "review"} or not all(isinstance(item, str) and item.strip() for item in (operation_id, external_id, owner_id, idempotency_key)):
+            raise ValueError("coordination intent identity is invalid")
+        table = "coordination_dispatches" if kind == "dispatch" else "coordination_reviews"
+        id_column = "dispatch_id" if kind == "dispatch" else "review_id"
+        encoded = _dump(payload)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(f"SELECT {id_column},payload_json,owner_id,idempotency_key FROM {table} WHERE request_id=?", (operation_id,)).fetchone()
+            inserted = row is None
+            if inserted:
+                self.connection.execute(f"INSERT INTO {table}(request_id,{id_column},payload_json,state,updated_at,owner_id,idempotency_key) VALUES (?,?,?,'uncertain',?,?,?)", (operation_id, external_id, encoded, self._now(), owner_id, idempotency_key))
+            elif row[0] != external_id or row[1] != encoded or row[3] != idempotency_key:
+                raise ValueError("coordination intent conflict")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        intent = self.coordination_dispatch(operation_id) if kind == "dispatch" else self.coordination_review(operation_id)
+        return {"inserted": inserted, "winner": inserted, "intent": intent}
+
     def coordination_review(self, request_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT review_id,payload_json,state,updated_at FROM coordination_reviews WHERE request_id=?", (request_id,)).fetchone()
+        row = self.connection.execute("SELECT review_id,payload_json,state,updated_at,owner_id,idempotency_key FROM coordination_reviews WHERE request_id=?", (request_id,)).fetchone()
         if row is None:
             return None
-        return {"requestId": request_id, "reviewId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3]}
+        return {"requestId": request_id, "reviewId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3], "ownerId": row[4], "idempotencyKey": row[5]}
 
     def coordination_review_for_review_id(self, review_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT request_id FROM coordination_reviews WHERE review_id=?", (review_id,)).fetchone()

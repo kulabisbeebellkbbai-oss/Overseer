@@ -20,12 +20,13 @@ systemd-analyze verify \
 The unit reads the existing private project bindings and peer credential,
 writes only the private bridge database and the configured authoritative
 Overseer state directory, and invokes `python3 -m overseer.psychlo_bridge_cli
-tick`. Each lead or supervisor dispatch is protected by a database-backed
-lease and a stable idempotency key, so concurrent API, CLI, and runtime ticks
-cannot dispatch the same operation simultaneously. Before a prompt can be
-submitted, the bridge also persists its deterministic dispatch identity in an
-`uncertain` state. A crash after submission therefore resumes collection by
-that identity and never submits the prompt again. Only an authoritative
-terminal lead or supervisor result advances the corresponding work record;
-missing supervisor dispatch configuration fails closed and leaves work
-pending.
+tick`. Each lead or supervisor dispatcher first derives a stable identity
+without an external effect. An immediate database transaction then inserts
+that identity in an `uncertain` state with its owner and idempotency key. Only
+the process that inserted the immutable intent may submit the prompt; an
+existing intent is never taken over or resubmitted, regardless of elapsed
+time. A crash before or after submission therefore resumes collection by the
+stable identity and fails closed if the external outcome remains uncertain.
+Only an authoritative terminal lead or supervisor result advances the
+corresponding work record; missing supervisor dispatch configuration leaves
+work pending.

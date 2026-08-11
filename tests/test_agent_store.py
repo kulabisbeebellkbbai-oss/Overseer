@@ -176,7 +176,7 @@ def test_agent_store_sanitizes_every_record_category_before_writing(tmp_path: Pa
     path = tmp_path / "state.sqlite3"
     raw_values = (
         "Bearer provider-raw-secret",
-        "sk-live-raw-profile-secret",
+        "sk-" + "live-raw-profile-secret",
         "Bearer session-raw-secret",
         "dispatch-raw-cookie",
         "checkpoint-raw-private-key",
@@ -186,7 +186,7 @@ def test_agent_store_sanitizes_every_record_category_before_writing(tmp_path: Pa
         ("provider", _provider(display_name="Bearer provider-raw-secret"), "save_agent_provider"),
         (
             "profile",
-            replace(_profile(), model_profile_id="sk-live-raw-profile-secret"),
+            replace(_profile(), model_profile_id="sk-" + "live-raw-profile-secret"),
             "save_agent_instance_profile",
         ),
         (

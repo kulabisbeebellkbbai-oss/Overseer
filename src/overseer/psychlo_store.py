@@ -39,6 +39,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
+            CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS telemetry_checkpoints(checkpoint_id TEXT PRIMARY KEY, round_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS learning_observations(observation_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, attempts_skiller INTEGER NOT NULL DEFAULT 0, attempts_memory INTEGER NOT NULL DEFAULT 0, last_error_skiller TEXT, last_error_memory TEXT, delivery_skiller TEXT NOT NULL DEFAULT 'pending', delivery_memory TEXT NOT NULL DEFAULT 'pending', updated_at TEXT NOT NULL);
@@ -102,6 +103,45 @@ class PsychloBridgeStore:
         cursor = self.connection.execute("UPDATE decisions SET status=?,decided_by=?,decided_at=?,reason=? WHERE decision_id=? AND status='staged'", (status, decided_by, decided_at, reason, decision_id))
         if cursor.rowcount != 1:
             raise ValueError("an exact staged Psychlo decision is required")
+
+    def decision_intent(self, decision_id: str):
+        row = self.connection.execute("SELECT request_json,outcome_json,status,decided_by,decided_at,reason FROM decision_intents WHERE decision_id=?", (decision_id,)).fetchone()
+        if row is None:
+            return None
+        return {"request": json.loads(row[0]), "outcome": json.loads(row[1]), "status": row[2], "decidedBy": row[3], "decidedAt": row[4], "reason": row[5]}
+
+    def pending_decision_intents(self) -> list[str]:
+        return [str(row[0]) for row in self.connection.execute("SELECT decision_id FROM decision_intents WHERE status='pending' ORDER BY updated_at, decision_id").fetchall()]
+
+    def record_decision_intent(self, request: Mapping[str, Any], outcome: Mapping[str, Any], decided_by: str, decided_at: str, reason: str) -> dict[str, Any]:
+        decision_id = str(request["decisionId"])
+        existing = self.decision_intent(decision_id)
+        if existing is not None:
+            if existing["request"] != dict(request) or existing["outcome"] != dict(outcome) or existing["decidedBy"] != decided_by or existing["reason"] != reason:
+                raise ValueError("external decision conflict")
+            return existing
+        self.connection.execute("INSERT INTO decision_intents VALUES (?,?,?,?,?,?,?,?)", (decision_id, _dump(request), _dump(outcome), "pending", decided_by, decided_at, reason, self._now()))
+        return self.decision_intent(decision_id)
+
+    def settle_external_decision(self, decision_id: str, status: str, decided_by: str, decided_at: str, reason: str, reconciliation_id: str) -> dict[str, Any]:
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            decision_row = self.connection.execute("SELECT status FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
+            if decision_row is None:
+                raise ValueError("an exact staged Psychlo decision is required")
+            if decision_row[0] not in {"staged", status}:
+                raise ValueError("external decision conflict")
+            external = self.external_execution(reconciliation_id)
+            if external is None or external.get("gateDecisionId") != decision_id:
+                raise ValueError("external decision identity conflict")
+            prior = external["receipt"].get("decisionStatus")
+            if prior not in {None, "pending", "stage-pending", status}:
+                raise ValueError("external decision conflict")
+            receipt = {**external["receipt"], "decisionId": decision_id, "decisionStatus": status, "status": status}
+            self.connection.execute("UPDATE decisions SET status=?,decided_by=?,decided_at=?,reason=? WHERE decision_id=? AND status='staged'", (status, decided_by, decided_at, reason, decision_id))
+            self.connection.execute("UPDATE external_executions SET receipt_json=?,status=? WHERE reconciliation_id=?", (_dump(receipt), status, reconciliation_id))
+            self.connection.execute("UPDATE decision_intents SET status='settled',updated_at=? WHERE decision_id=?", (self._now(), decision_id))
+        return {"decision": self.decision(decision_id), "external": self.external_execution(reconciliation_id)}
 
     def project(self, project_id: str):
         row = self.connection.execute("SELECT registration_json,scheduling_json FROM projects WHERE project_id=?", (project_id,)).fetchone()
@@ -232,6 +272,14 @@ class PsychloBridgeStore:
         for payload_json, receipt_json in rows:
             payload = json.loads(payload_json); receipt = json.loads(receipt_json)
             if payload.get("projectId") == project_id and payload.get("explicitGate") and receipt.get("decisionStatus") not in {"approved", "rejected", "expired"}:
+                return True
+        return False
+
+    def external_gate_blocked(self, project_id: str) -> bool:
+        rows = self.connection.execute("SELECT payload_json,receipt_json FROM external_executions WHERE status IN ('rejected','expired')").fetchall()
+        for payload_json, receipt_json in rows:
+            payload = json.loads(payload_json); receipt = json.loads(receipt_json)
+            if payload.get("projectId") == project_id and payload.get("explicitGate") and receipt.get("decisionStatus") in {"rejected", "expired"}:
                 return True
         return False
 

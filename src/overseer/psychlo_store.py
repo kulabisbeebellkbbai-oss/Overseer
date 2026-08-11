@@ -15,7 +15,7 @@ import stat
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
-from .psychlo_contracts import canonical_digest, learning_observation_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, ContractError
+from .psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, ContractError
 
 
 def _round_result_digest(result: Mapping[str, Any]) -> str:
@@ -651,8 +651,9 @@ class PsychloBridgeStore:
             if observation["id"] != observation_id:
                 raise ValueError("learning observation identity conflict")
             wire_digest = learning_observation_digest(observation)
+            legacy_selected_digest = learning_observation_legacy_selected_digest(observation)
             legacy_digest = canonical_digest(observation)
-            if row[1] not in {wire_digest, legacy_digest}:
+            if row[1] not in {wire_digest, legacy_selected_digest, legacy_digest}:
                 raise ValueError("learning observation digest conflict")
         except (ContractError, TypeError, ValueError, json.JSONDecodeError):
             self._quarantine_learning(observation_id, "learning-observation-integrity-failed")

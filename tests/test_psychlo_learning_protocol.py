@@ -5,7 +5,7 @@ import pytest
 
 from overseer.psychlo_bridge import PsychloBridge
 from overseer.psychlo_store import PsychloBridgeStore
-from overseer.psychlo_contracts import canonical_digest, learning_observation_digest
+from overseer.psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest
 
 
 NOW = "2026-08-10T02:00:00+00:00"
@@ -114,6 +114,22 @@ def test_legacy_learning_digest_remains_readable_and_deliverable(tmp_path: Path)
     calls = []
     assert bridge.deliver_learning_pending({"skiller": lambda item: calls.append(item)}) == {"delivered": 1, "failed": 0}
     assert calls[0]["digest"] == legacy_digest
+
+
+def test_pre_60abc40_selected_field_digest_survives_restart_read_delivery_and_replay(tmp_path: Path):
+    payload = {"id": "observation-123", "featureProfile": {"taskClass": "python-feature"}, "outcome": {"status": "completed", "usage": 3, "observedAt": NOW}, "sourceId": "overseer", "correlationId": "corr-learning-123", "idempotencyKey": "learning:observation:observation-123", "occurredAt": NOW, "schemaVersion": "psychlo.learning.v1"}
+    selected_digest = "7a0fa2c5cb00763562a3a2696555447398a8708bf137c4299b2df11a9e7751d5"
+    assert learning_observation_legacy_selected_digest(payload) == selected_digest
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    assert store.record_learning(payload, selected_digest) is True
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    assert restarted.store.learning_observation(payload["id"])["digest"] == selected_digest
+    calls = []
+    assert restarted.deliver_learning_pending({"skiller": lambda item: calls.append(item)}) == {"delivered": 1, "failed": 0}
+    assert calls[0]["digest"] == selected_digest
+    with pytest.raises(ValueError, match="conflict"):
+        restarted.store.record_learning({**payload, "outcome": {**payload["outcome"], "usage": 4}}, selected_digest)
 
 
 def test_learning_pull_delivers_sanitized_observations_then_acks(tmp_path: Path):

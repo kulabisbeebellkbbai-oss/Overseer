@@ -98,6 +98,12 @@ def learning_observation_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def learning_observation_legacy_selected_digest(value: Mapping[str, Any]) -> str:
+    """Digest used by the pre-60abc40 selected-field wire contract."""
+    content = {"id": value["id"], "featureProfile": dict(sorted(value["featureProfile"].items())), "outcome": dict(sorted(value["outcome"].items()))}
+    return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
+
+
 def _object(value: Any, *, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ContractError(f"{name} must be an object")

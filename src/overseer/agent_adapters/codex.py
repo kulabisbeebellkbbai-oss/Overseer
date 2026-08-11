@@ -350,6 +350,29 @@ class CodexDriver:
     ) -> AgentDispatchResult:
         """Dispatch the exact legacy prompt without weakening the generic DTO."""
 
+        request = self.prepare_legacy_dispatch(
+            session,
+            prompt,
+            idempotency_key=idempotency_key,
+        )
+        resolved = self._validated_session(session)
+        if resolved is None:
+            raise ValueError("cannot dispatch to an unknown Codex session")
+        return self._dispatch_session(
+            resolved,
+            request,
+            prompt_text=prompt,
+        )
+
+    def prepare_legacy_dispatch(
+        self,
+        session: AgentSession,
+        prompt: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> AgentDispatchRequest:
+        """Return the stable dispatch identity without producing an external effect."""
+
         if not isinstance(prompt, str):
             raise TypeError("legacy prompt must be a string")
         resolved = self._validated_session(session)
@@ -358,18 +381,13 @@ class CodexDriver:
         dispatch_key = idempotency_key or f"legacy.dispatch.{resolved.id}"
         if not isinstance(dispatch_key, str) or not dispatch_key.strip():
             raise ValueError("legacy dispatch idempotency key must be non-empty")
-        request = AgentDispatchRequest(
+        return AgentDispatchRequest(
             id=(f"legacy.dispatch.{resolved.id}" if idempotency_key is None else f"legacy.dispatch.{hashlib.sha256(dispatch_key.encode()).hexdigest()}"),
             instance_id=self.profile.id,
             session_id=resolved.id,
             driver_epoch_id="legacy.codex",
             idempotency_key=dispatch_key,
             prompt="legacy compatibility dispatch",
-        )
-        return self._dispatch_session(
-            resolved,
-            request,
-            prompt_text=prompt,
         )
 
     def inspect(self, session: AgentSession) -> AgentDispatchResult:

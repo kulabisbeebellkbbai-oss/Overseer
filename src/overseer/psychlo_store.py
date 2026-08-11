@@ -119,16 +119,18 @@ class PsychloBridgeStore:
         if row is None: return None
         return {"kind": kind, "operationId": operation_id, "ownerId": row[0], "leaseExpiresAt": row[1], "attempts": row[2], "idempotencyKey": row[3], "state": row[4], "updatedAt": row[5]}
 
-    def save_coordination_dispatch(self, request_id: str, dispatch_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def save_coordination_dispatch(self, request_id: str, dispatch_id: str, payload: Mapping[str, Any], *, state: str = "pending") -> dict[str, Any]:
         if not request_id or not dispatch_id:
             raise ValueError("coordination dispatch identity is required")
+        if state not in {"uncertain", "pending"}:
+            raise ValueError("coordination dispatch state is invalid")
         value = dict(payload)
         existing = self.coordination_dispatch(request_id)
         if existing is not None:
             if existing["dispatchId"] != dispatch_id or existing["payload"] != value:
                 raise ValueError("coordination dispatch conflict")
             return existing
-        self.connection.execute("INSERT INTO coordination_dispatches VALUES (?,?,?,?,?)", (request_id, dispatch_id, _dump(value), "pending", self._now()))
+        self.connection.execute("INSERT INTO coordination_dispatches VALUES (?,?,?,?,?)", (request_id, dispatch_id, _dump(value), state, self._now()))
         return self.coordination_dispatch(request_id)
 
     def coordination_dispatch(self, request_id: str) -> dict[str, Any] | None:
@@ -137,14 +139,16 @@ class PsychloBridgeStore:
             return None
         return {"requestId": request_id, "dispatchId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3]}
 
-    def save_coordination_review(self, request_id: str, review_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def save_coordination_review(self, request_id: str, review_id: str, payload: Mapping[str, Any], *, state: str = "pending") -> dict[str, Any]:
+        if state not in {"uncertain", "pending"}:
+            raise ValueError("coordination review state is invalid")
         value = dict(payload)
         existing = self.coordination_review(request_id)
         if existing is not None:
             if existing["reviewId"] != review_id or existing["payload"] != value:
                 raise ValueError("coordination review conflict")
             return existing
-        self.connection.execute("INSERT INTO coordination_reviews VALUES (?,?,?,?,?)", (request_id, review_id, _dump(value), "pending", self._now()))
+        self.connection.execute("INSERT INTO coordination_reviews VALUES (?,?,?,?,?)", (request_id, review_id, _dump(value), state, self._now()))
         return self.coordination_review(request_id)
 
     def coordination_review(self, request_id: str) -> dict[str, Any] | None:

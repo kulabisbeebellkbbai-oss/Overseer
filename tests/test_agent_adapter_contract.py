@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
 import json
 import os
 import shutil
@@ -479,6 +480,26 @@ def test_dispatch_preserves_request_bindings_and_exact_tmux_sequence(
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
     ]
     assert runner.inputs[3] == request.prompt
+
+
+def test_prepare_legacy_dispatch_is_stable_and_has_no_external_effect(codex_csv: Path) -> None:
+    runner = RecordingRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+    )
+    session = adapter.discover()[0]
+    prepared = adapter.prepare_legacy_dispatch(session, "bounded coordination", idempotency_key="coordination:key")
+    repeated = adapter.prepare_legacy_dispatch(session, "bounded coordination", idempotency_key="coordination:key")
+    assert prepared == repeated
+    assert prepared.id == f"legacy.dispatch.{hashlib.sha256(b'coordination:key').hexdigest()}"
+    assert runner.commands == []
+    result = adapter.dispatch_legacy(session, "bounded coordination", idempotency_key="coordination:key")
+    assert result.id == f"result.{prepared.id}"
 
 
 def test_codex_all_tmux_operations_use_bounded_capture_and_normalized_failures(

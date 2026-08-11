@@ -447,9 +447,10 @@ def parse_cross_project_work(payload: Mapping[str, Any], *, kind: str) -> dict[s
 
 
 def parse_cross_project_supervisor_review(payload: Mapping[str, Any]) -> dict[str, Any]:
-    required = {"projectId", "leadId", "supervisorLeadId", "decision", "evidenceId", "linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "digest", "correlationId", "idempotencyKey", "occurredAt"}
+    required = {"projectId", "leadId", "supervisorLeadId", "decision", "evidenceId", "linkId", "version", "reviewId", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "digest", "correlationId", "idempotencyKey", "occurredAt"}
     value = _strict_protocol(payload, required=required, name="cross-project supervisor review")
-    for field in ("projectId", "leadId", "supervisorLeadId", "linkId", "version", "resultId", "coordinationTeamId", "supervisorMemberId", "correlationId", "idempotencyKey", "evidenceId"):
+    if not required.issubset(value): raise ContractError("cross-project supervisor review is missing required fields")
+    for field in ("projectId", "leadId", "supervisorLeadId", "linkId", "version", "reviewId", "resultId", "coordinationTeamId", "supervisorMemberId", "correlationId", "idempotencyKey", "evidenceId"):
         _id(value[field], name=field)
     if value["decision"] not in {"accepted", "rejected"} or value["decision"] != ("accepted" if value["accepted"] else "rejected"):
         raise ContractError("supervisor review decision is invalid")
@@ -464,7 +465,7 @@ def parse_cross_project_supervisor_review(payload: Mapping[str, Any]) -> dict[st
     if not isinstance(value["evidence"], list) or not value["evidence"] or any(not isinstance(item, str) or not item.strip() for item in value["evidence"]):
         raise ContractError("supervisor review evidence is required")
     _timestamp(value["occurredAt"]); _digest(value["digest"], name="digest")
-    base = {key: value[key] for key in ("projectId", "leadId", "supervisorLeadId", "decision", "evidenceId", "linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "correlationId", "idempotencyKey", "occurredAt")}
+    base = {key: value[key] for key in ("projectId", "leadId", "supervisorLeadId", "decision", "evidenceId", "linkId", "version", "reviewId", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "correlationId", "idempotencyKey", "occurredAt")}
     if canonical_digest(base) != value["digest"]:
         raise ContractError("supervisor review digest mismatch")
     return value

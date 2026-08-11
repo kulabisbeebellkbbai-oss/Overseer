@@ -933,15 +933,24 @@ class PsychloBridge:
             if not self.store.claim_coordination_operation("lead-dispatch", value["id"], self.coordination_owner_id, expires, value["id"], now=now):
                 return {"accepted": True, "requestId": value["id"], "status": "pending"}
             try:
-                raw_dispatch = self.dispatcher(value["leadId"], value["scope"], value["id"])
-                dispatch_id = str(raw_dispatch.get("dispatchId")) if isinstance(raw_dispatch, Mapping) else str(raw_dispatch)
-                if not dispatch_id.strip():
-                    raise ValueError("lead dispatch identity is missing")
-                dispatch = self.store.save_coordination_dispatch(value["id"], dispatch_id, {"request": value, "leadId": value["leadId"], "scope": value["scope"], "idempotencyKey": value["id"]})
-                self.store.complete_coordination_operation("lead-dispatch", value["id"], self.coordination_owner_id, now=self.clock())
+                prepare = getattr(self.dispatcher, "prepare", None)
+                if not callable(prepare): raise ValueError("durable lead dispatcher preparation is unavailable")
+                dispatch_id = str(prepare(value["leadId"], value["scope"], value["id"]))
+                if not dispatch_id.strip(): raise ValueError("lead dispatch identity is missing")
             except Exception as error:
                 self.store.release_coordination_operation("lead-dispatch", value["id"], self.coordination_owner_id, now=self.clock())
                 self.store.transition_protocol("coordination-work-request", value["id"], "forward-pending", "dispatch-failed")
+                raise ValueError("dispatch-pending") from error
+            dispatch = self.store.save_coordination_dispatch(value["id"], dispatch_id, {"request": value, "leadId": value["leadId"], "scope": value["scope"], "idempotencyKey": value["id"]}, state="uncertain")
+            try:
+                raw_dispatch = self.dispatcher(value["leadId"], value["scope"], value["id"])
+                sent_dispatch_id = str(raw_dispatch.get("dispatchId")) if isinstance(raw_dispatch, Mapping) else str(raw_dispatch)
+                if sent_dispatch_id != dispatch_id: raise ValueError("lead dispatch identity conflict")
+                dispatch = self.store.transition_coordination_dispatch(value["id"], "pending")
+                self.store.complete_coordination_operation("lead-dispatch", value["id"], self.coordination_owner_id, now=self.clock())
+            except Exception as error:
+                self.store.complete_coordination_operation("lead-dispatch", value["id"], self.coordination_owner_id, now=self.clock())
+                self.store.transition_protocol("coordination-work-request", value["id"], "forward-pending", "dispatch-uncertain")
                 raise ValueError("dispatch-pending") from error
         result = self._collect_project_result(value)
         if result is not None:
@@ -965,7 +974,7 @@ class PsychloBridge:
         if set(value) != required or not isinstance(value["accepted"], bool) or not isinstance(value["evidence"], list) or not value["evidence"] or any(not isinstance(item, str) or not item.strip() for item in value["evidence"]):
             raise ValueError("authoritative supervisor result is invalid")
         context = review["payload"]
-        base = {"projectId": context["projectId"], "leadId": context["leadId"], "supervisorLeadId": context["supervisorLeadId"], "decision": "accepted" if value["accepted"] else "rejected", "evidenceId": value["evidence"][0], "linkId": context["linkId"], "version": context["version"], "resultId": review["reviewId"], "participantResults": context["participantResults"], "coordinationTeamId": context["coordinationTeamId"], "supervisorMemberId": context["supervisorMemberId"], "accepted": value["accepted"], "evidence": value["evidence"], "correlationId": f"cross-project:{context['linkId']}:{context['version']}", "idempotencyKey": f"supervisor:{review['reviewId']}", "occurredAt": value["occurredAt"]}
+        base = {"projectId": context["projectId"], "leadId": context["leadId"], "supervisorLeadId": context["supervisorLeadId"], "decision": "accepted" if value["accepted"] else "rejected", "evidenceId": value["evidence"][0], "linkId": context["linkId"], "version": context["version"], "reviewId": review["reviewId"], "resultId": review["reviewId"], "participantResults": context["participantResults"], "coordinationTeamId": context["coordinationTeamId"], "supervisorMemberId": context["supervisorMemberId"], "accepted": value["accepted"], "evidence": value["evidence"], "correlationId": f"cross-project:{context['linkId']}:{context['version']}", "idempotencyKey": f"supervisor:{review['reviewId']}", "occurredAt": value["occurredAt"]}
         final = {**base, "digest": canonical_digest(base)}
         try:
             parse_cross_project_supervisor_review(final)
@@ -1000,9 +1009,7 @@ class PsychloBridge:
         if stored["record"]["state"] != "delivered":
             return
         self.store.transition_coordination_dispatch(str(request["id"]), "delivered")
-        review = self._maybe_dispatch_supervisor(str(request["id"]))
-        if review is None and self.supervisor_dispatcher is None:
-            self.store.transition_protocol("coordination-work-request", str(request["id"]), "settled")
+        self._maybe_dispatch_supervisor(str(request["id"]))
 
     def _binding_for_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
         binding = self.store.protocol_record("cross-project-team-binding", str(request["coordinationBindingId"]))
@@ -1041,14 +1048,23 @@ class PsychloBridge:
             return self.store.coordination_review(group_id)
         context = {"coordinationBindingId": request["coordinationBindingId"], "linkId": request["linkId"], "version": request["version"], "projectId": request["projectId"], "leadId": request["leadId"], "supervisorLeadId": request["supervisorLeadId"], "coordinationTeamId": binding["coordinationTeamId"], "supervisorMemberId": binding["supervisorMemberId"], "participantResults": participants, "requiredRequestIds": required_ids, "requestId": request_id}
         try:
-            review_id = str(self.supervisor_dispatcher(str(request["supervisorLeadId"]), context, idempotency_key))
+            prepare = getattr(self.supervisor_dispatcher, "prepare", None)
+            if not callable(prepare): raise ValueError("durable supervisor dispatcher preparation is unavailable")
+            review_id = str(prepare(str(request["supervisorLeadId"]), context, idempotency_key))
             if not review_id.strip(): raise ValueError("supervisor review dispatch is missing")
-            review = self.store.save_coordination_review(group_id, review_id, context)
-            self.store.complete_coordination_operation("supervisor-dispatch", group_id, self.coordination_owner_id, now=self.clock())
-            return review
         except Exception:
             self.store.release_coordination_operation("supervisor-dispatch", group_id, self.coordination_owner_id, now=self.clock())
             raise
+        review = self.store.save_coordination_review(group_id, review_id, context, state="uncertain")
+        try:
+            sent_review_id = str(self.supervisor_dispatcher(str(request["supervisorLeadId"]), context, idempotency_key))
+            if sent_review_id != review_id: raise ValueError("supervisor review dispatch identity conflict")
+            review = self.store.transition_coordination_review(group_id, "pending")
+            self.store.complete_coordination_operation("supervisor-dispatch", group_id, self.coordination_owner_id, now=self.clock())
+            return review
+        except Exception:
+            self.store.complete_coordination_operation("supervisor-dispatch", group_id, self.coordination_owner_id, now=self.clock())
+            return review
 
     def _forward_protocol_record(self, record: Mapping[str, Any]) -> None:
         try:
@@ -1260,6 +1276,19 @@ class CodexProjectDispatcher:
         self.bindings = bindings
 
     def __call__(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:
+        driver, session = self._resolve(project_lead_id)
+        result = driver.dispatch_legacy(session, prompt, idempotency_key=idempotency_key)
+        if result.state.value not in {"acknowledged", "running", "succeeded"}:
+            raise ValueError("project lead dispatch was not acknowledged")
+        return result.id
+
+    def prepare(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:
+        """Resolve the exact stable result identity without dispatching a prompt."""
+        driver, session = self._resolve(project_lead_id)
+        request = driver.prepare_legacy_dispatch(session, prompt, idempotency_key=idempotency_key)
+        return f"result.{request.id}"
+
+    def _resolve(self, project_lead_id: str):
         binding = self.bindings.get(project_lead_id)
         if not isinstance(binding, dict) or not isinstance(binding.get("conversationId"), str):
             raise ValueError("project lead has no approved Codex conversation binding")
@@ -1267,10 +1296,7 @@ class CodexProjectDispatcher:
         driver = CodexDriver.from_legacy_registry()
         session = next((item for item in driver.discover() if item.external_session_id == binding["conversationId"] or item.id == binding["conversationId"]), None)
         if session is None: raise ValueError("bound project lead conversation is unavailable")
-        result = driver.dispatch_legacy(session, prompt, idempotency_key=idempotency_key)
-        if result.state.value not in {"acknowledged", "running", "succeeded"}:
-            raise ValueError("project lead dispatch was not acknowledged")
-        return result.id
+        return driver, session
 
 
 class AuthoritativeAgentResultCollector:

@@ -15,6 +15,7 @@ from overseer.psychlo_contracts import (
     parse_adoption_evidence,
     parse_concurrency_canary_result,
     parse_cross_project_team_binding,
+    parse_cross_project_supervisor_review,
     parse_ingress_conflict_reconciliation,
     parse_external_round,
     parse_learning_observation,
@@ -94,3 +95,12 @@ def test_cross_project_work_identity_and_digest_match_psychlo_3d178b6_fixture():
     fixture = json.loads((Path(__file__).parent / "fixtures" / "psychlo-3d178b6-cross-project-work.json").read_text(encoding="utf-8"))
     assert cross_project_work_request_id(fixture["linkId"], fixture["version"], fixture["projectId"]) == fixture["id"]
     assert cross_project_work_request_digest(fixture) == fixture["requestDigest"]
+
+
+def test_supervisor_review_requires_current_psychlo_receiver_review_id():
+    base = {"projectId": "fixture-alpha", "leadId": "lead-fixture-alpha", "supervisorLeadId": "lead-fixture-supervisor", "decision": "accepted", "evidenceId": "evidence:review", "linkId": "fixture-link", "version": "v1", "reviewId": "review-fixture", "resultId": "result-fixture", "participantResults": [{"resultId": "result-fixture", "digest": "a" * 64}], "coordinationTeamId": "team-fixture", "supervisorMemberId": "member-fixture", "accepted": True, "evidence": ["evidence:review"], "correlationId": "review-fixture", "idempotencyKey": "review-fixture", "occurredAt": NOW}
+    review = {**base, "digest": canonical_digest(base)}
+    assert parse_cross_project_supervisor_review(review) == review
+    without_review_id = {key: value for key, value in review.items() if key != "reviewId"}
+    with pytest.raises(ContractError, match="missing"):
+        parse_cross_project_supervisor_review(without_review_id)

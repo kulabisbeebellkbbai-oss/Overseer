@@ -82,6 +82,11 @@ class PsychloBridgeStore:
                 except sqlite3.OperationalError:
                     pass
             self.connection.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_idempotency ON {table}(idempotency_key) WHERE idempotency_key IS NOT NULL")
+        for column, definition in (("canary_authorization_id", "TEXT"), ("started_at", "TEXT"), ("completed_at", "TEXT")):
+            try:
+                self.connection.execute(f"ALTER TABLE rounds ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -286,18 +291,30 @@ class PsychloBridgeStore:
                 identity = (item.get("projectId"), item.get("planId"), item.get("planVersion"), item.get("projectLeadId"))
                 if identity not in allowed or item.get("projectId") == request.get("projectId"):
                     raise ValueError("single_stream_busy")
-            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
+            self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded,canary_authorization_id) VALUES (?,?,?,?,?,'pending',NULL,0,?)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability, authorization_id))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
 
     def _verify_canary_execution_rounds(self, canary: Mapping[str, Any]) -> None:
+        intervals = []
         for execution in canary["executions"]:
             started = execution["started"]
             row = self.connection.execute("SELECT request_json,result_json FROM rounds WHERE round_id=?", (started["roundId"],)).fetchone()
             if row is None:
                 raise ValueError("canary result round is unavailable")
+            timing = self.connection.execute("SELECT canary_authorization_id,started_at,completed_at FROM rounds WHERE round_id=?", (started["roundId"],)).fetchone()
+            if timing is None or timing[0] != canary["authorizationId"] or not timing[1] or not timing[2]:
+                raise ValueError("canary result timing or authorization conflict")
+            try:
+                local_started = datetime.fromisoformat(str(timing[1]).replace("Z", "+00:00"))
+                local_completed = datetime.fromisoformat(str(timing[2]).replace("Z", "+00:00"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("canary result timing or authorization conflict") from error
+            if local_started.tzinfo is None or local_completed.tzinfo is None or local_completed < local_started:
+                raise ValueError("canary result timing or authorization conflict")
+            intervals.append((local_started, local_completed))
             request = json.loads(row[0]); stored_result = json.loads(row[1]) if row[1] else None
             if request.get("roundId") != started["roundId"] or any(request.get(key) != started.get(source) for key, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
                 raise ValueError("canary result round identity conflict")
@@ -308,6 +325,8 @@ class PsychloBridgeStore:
             evidence_digest = canonical_digest({"provenanceId": stored_result.get("provenanceId"), "resultDigest": result_digest})
             if completed.get("evidenceId") != stored_result.get("provenanceId") or completed.get("resultDigest") != result_digest or completed.get("evidenceDigest") != evidence_digest:
                 raise ValueError("canary result evidence does not bind to stored round result")
+        if len(intervals) != 2 or not (intervals[0][0] < intervals[1][1] and intervals[1][0] < intervals[0][1]):
+            raise ValueError("canary result timing does not show trusted overlap")
 
     def record_durable_ceiling_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, now: str) -> None:
         """Reserve an eligible round under the persisted global ceiling.
@@ -370,7 +389,7 @@ class PsychloBridgeStore:
             active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")
-            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
+            self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
@@ -385,27 +404,33 @@ class PsychloBridgeStore:
             raise ValueError("concurrency ceiling change is invalid")
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            auth_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
+            auth_row = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
             if auth_row is None or auth_row[1] not in {"delivered", "settled"}:
                 raise ValueError("concurrency ceiling authorization is unavailable")
             try:
                 authorization = parse_concurrency_ceiling_authorization(json.loads(auth_row[0]))
             except (ContractError, TypeError, ValueError) as error:
                 raise ValueError("concurrency ceiling authorization is invalid") from error
-            canary_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-result' AND record_id=?", (authorization["canaryResultId"],)).fetchone()
+            if authorization["digest"] != auth_row[2]:
+                raise ValueError("concurrency ceiling authorization digest conflict")
+            canary_row = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-canary-result' AND record_id=?", (authorization["canaryResultId"],)).fetchone()
             if canary_row is None or canary_row[1] != "delivered":
                 raise ValueError("successful delivered canary evidence is required")
             try:
                 canary = parse_concurrency_canary_result(json.loads(canary_row[0]))
             except (ContractError, TypeError, ValueError) as error:
                 raise ValueError("successful canary evidence is invalid") from error
-            canary_auth_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (canary["authorizationId"],)).fetchone()
+            if canary["digest"] != canary_row[2]:
+                raise ValueError("concurrency canary result digest conflict")
+            canary_auth_row = self.connection.execute("SELECT payload_json,state,digest FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (canary["authorizationId"],)).fetchone()
             if canary_auth_row is None or canary_auth_row[1] not in {"delivered", "settled"}:
                 raise ValueError("canary authorization is unavailable")
             try:
                 canary_authorization = parse_canary_authorization(json.loads(canary_auth_row[0]))
             except (ContractError, TypeError, ValueError) as error:
                 raise ValueError("canary authorization is invalid") from error
+            if canary_authorization["digest"] != canary_auth_row[2]:
+                raise ValueError("canary authorization digest conflict")
             expected_projects = {(item["projectId"], item["planId"], item["planVersion"], item["leadId"]) for item in canary_authorization["projects"]}
             observed_projects = {(item["started"]["projectId"], item["started"]["planId"], item["started"]["planVersion"], item["started"]["leadId"]) for item in canary["executions"]}
             if canary["resultId"] != authorization["canaryResultId"] or canary["targetCeiling"] != authorization["ceiling"] or canary["expectedRevision"] != authorization["expectedRevision"] or observed_projects != expected_projects:
@@ -444,17 +469,17 @@ class PsychloBridgeStore:
         try:
             if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
-            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
+            self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
 
     def record_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
-        self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
+        self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
 
-    def mark_dispatch_started(self, round_id: str) -> None:
-        self.connection.execute("UPDATE rounds SET dispatch_state='started' WHERE round_id=? AND dispatch_state='pending'", (round_id,))
+    def mark_dispatch_started(self, round_id: str, started_at: str) -> None:
+        self.connection.execute("UPDATE rounds SET dispatch_state='started',started_at=COALESCE(started_at,?) WHERE round_id=? AND dispatch_state='pending'", (started_at, round_id))
 
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
@@ -463,8 +488,14 @@ class PsychloBridgeStore:
         row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded FROM rounds WHERE capability_hash=?", (_token_hash(capability),)).fetchone()
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
-    def record_result(self, round_id: str, result: Mapping[str, Any]) -> None:
-        self.connection.execute("UPDATE rounds SET result_json=? WHERE round_id=? AND result_json IS NULL", (_dump_wire(result), round_id))
+    def record_result(self, round_id: str, result: Mapping[str, Any], completed_at: str | None = None) -> None:
+        self.connection.execute("UPDATE rounds SET result_json=?,completed_at=COALESCE(completed_at,?) WHERE round_id=? AND result_json IS NULL", (_dump_wire(result), completed_at or result.get("occurredAt"), round_id))
+
+    def round_timing(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT canary_authorization_id,started_at,completed_at FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            return None
+        return {"authorizationId": row[0], "startedAt": row[1], "completedAt": row[2]}
 
     def mark_forwarded(self, round_id: str) -> None:
         self.connection.execute("UPDATE rounds SET result_forwarded=1 WHERE round_id=?", (round_id,))

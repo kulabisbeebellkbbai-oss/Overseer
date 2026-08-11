@@ -185,8 +185,10 @@ def _bind_canary_result_to_rounds(store: PsychloBridgeStore, canary: dict, proje
     for execution, (project_id, plan_id, plan_version, lead_id) in zip(canary["executions"], projects):
         request = _canary_round(execution["started"]["roundId"], project_id, plan_id, lead_id)
         stored_result = {**request, "sourceId": lead_id, "provenanceId": f"result:{request['roundId']}", "status": "completed", "actualUsageCost": 1, "deliveredScope": "bounded canary work", "remainingEstimate": 1, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": execution["completed"]["settledAt"]}
-        store.record_round(request, {**request, "sourceId": lead_id, "provenanceId": f"dispatch:{request['roundId']}", "status": "accepted"}, f"cap-{request['roundId']}-1234567890abcdef")
-        store.record_result(request["roundId"], stored_result)
+        receipt = {**request, "sourceId": lead_id, "provenanceId": f"dispatch:{request['roundId']}", "status": "accepted"}
+        store.record_canary_round(request, receipt, f"cap-{request['roundId']}-1234567890abcdef", canary["authorizationId"], canary["expectedRevision"], NOW)
+        store.mark_dispatch_started(request["roundId"], execution["started"]["startedAt"])
+        store.record_result(request["roundId"], stored_result, execution["completed"]["settledAt"])
         result_digest = _round_result_digest(stored_result)
         evidence_digest = canonical_digest({"provenanceId": stored_result["provenanceId"], "resultDigest": result_digest})
         started = execution["started"]
@@ -194,6 +196,19 @@ def _bind_canary_result_to_rounds(store: PsychloBridgeStore, canary: dict, proje
         completed = {**completed_base, "digest": hashlib.sha256(json.dumps(completed_base, separators=(",", ":")).encode()).hexdigest()}
         executions.append({"executionId": execution["executionId"], "started": started, "completed": completed})
     result_base = {"resultId": canary["resultId"], "authorizationId": canary["authorizationId"], "targetCeiling": canary["targetCeiling"], "expectedRevision": canary["expectedRevision"], "executions": executions, "concurrencyObserved": canary["concurrencyObserved"], "occurredAt": canary["occurredAt"]}
+    return {**result_base, "digest": hashlib.sha256(json.dumps(result_base, separators=(",", ":")).encode()).hexdigest()}
+
+
+def _retimestamp_canary_result(canary: dict) -> dict:
+    executions = []
+    for index, execution in enumerate(canary["executions"], start=1):
+        started_base = {**execution["started"], "startedAt": f"2026-08-11T00:00:0{index}+00:00"}
+        started = {**started_base, "digest": hashlib.sha256(json.dumps({key: started_base[key] for key in ("executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId", "startedAt")}, separators=(",", ":")).encode()).hexdigest()}
+        completed_base = {**execution["completed"], "settledAt": f"2026-08-11T00:00:1{index}+00:00"}
+        completed = {**completed_base, "digest": hashlib.sha256(json.dumps({key: completed_base[key] for key in ("executionId", "authorizationId", "projectId", "planId", "planVersion", "roundId", "leadId", "settledAt", "terminalStatus", "resultDigest", "evidenceId", "evidenceDigest")}, separators=(",", ":")).encode()).hexdigest()}
+        executions.append({"executionId": execution["executionId"], "started": started, "completed": completed})
+    result_base = {**canary, "executions": executions, "occurredAt": "2026-08-11T00:00:30+00:00"}
+    result_base.pop("digest")
     return {**result_base, "digest": hashlib.sha256(json.dumps(result_base, separators=(",", ":")).encode()).hexdigest()}
 
 
@@ -243,6 +258,30 @@ def test_durable_ceiling_keeps_two_streams_after_restart_and_denies_third(tmp_pa
     assert restarted.request_round(_canary_round("round-two", "beta", "plan-beta", "lead-beta"))["accepted"] is True
     with pytest.raises(ValueError, match="single_stream_busy"):
         restarted.request_round(_canary_round("round-three", "gamma", "plan-gamma", "lead-gamma"))
+
+
+@pytest.mark.parametrize("stale_kind", ("concurrency-ceiling-authorization", "concurrency-canary-result", "concurrency-canary-authorization"))
+def test_ceiling_change_rejects_stale_protocol_row_digest_before_persistence(tmp_path: Path, stale_kind: str):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    authorization = _persist_approved_canary(store)
+    projects = (("arcade", "plan-arcade", "v1", "lead-arcade"), ("hermione", "plan-hermione", "v1", "lead-hermione"))
+    canary = _bind_canary_result_to_rounds(store, _successful_canary_result(authorization["authorizationId"], projects), projects)
+    store.record_protocol("concurrency-canary-result", canary["resultId"], canary["resultId"], canary["digest"], canary, state="delivered")
+    ceiling_base = {"authorizationId": "ceiling-stale-digest", "ceiling": 2, "expectedRevision": 0, "revision": 1, "canaryResultId": canary["resultId"], "projectId": "arcade", "planId": "plan-arcade", "workflowId": authorization["workflowId"], "decisionVersion": "v1", "correlationId": "ceiling-stale-digest", "idempotencyKey": "ceiling-stale-digest", "occurredAt": NOW}
+    ceiling_digest = hashlib.sha256(json.dumps(ceiling_base, separators=(",", ":")).encode()).hexdigest()
+    ceiling = {**ceiling_base, "decisionId": "roadex:concurrency:ceiling-stale-digest", "question": f"Approve the exact global concurrency operation {ceiling_digest}", "digest": ceiling_digest}
+    store.record_protocol("concurrency-ceiling-authorization", ceiling["authorizationId"], ceiling["idempotencyKey"], ceiling_digest, ceiling, state="delivered")
+    decision = {"decisionId": ceiling["decisionId"], "projectId": ceiling["projectId"], "planId": ceiling["planId"], "workflowId": ceiling["workflowId"], "decisionVersion": ceiling["decisionVersion"], "correlationId": ceiling["correlationId"], "idempotencyKey": ceiling["idempotencyKey"], "question": ceiling["question"], "resultProvenanceId": ceiling_digest}
+    store.record_decision(decision, {**decision, "status": "staged"})
+    store.decide(ceiling["decisionId"], "approved", "human-user", NOW, "approved ceiling")
+    stale_ids = {"concurrency-ceiling-authorization": ceiling["authorizationId"], "concurrency-canary-result": canary["resultId"], "concurrency-canary-authorization": authorization["authorizationId"]}
+    store.connection.execute("UPDATE protocol_records SET digest=? WHERE kind=? AND record_id=?", ("0" * 64, stale_kind, stale_ids[stale_kind]))
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    change = {"authorizationId": ceiling["authorizationId"], "correlationId": "ceiling-change", "idempotencyKey": "ceiling-change", "occurredAt": NOW}
+
+    with pytest.raises(ValueError, match="digest conflict"):
+        bridge.change_concurrency_ceiling(change)
+    assert store.protocol_record("concurrency-ceiling-change", ceiling["authorizationId"]) is None
 
 
 def test_default_single_stream_admission_is_cross_process_atomic(tmp_path: Path):
@@ -452,6 +491,43 @@ def test_canary_result_derived_from_recorded_completed_rounds_is_terminal_and_re
     with pytest.raises(ValueError):
         bridge.receive_concurrency_canary_result(corrupt)
     assert store.protocol_record("concurrency-canary-result", canary["resultId"])["payload"] == canary
+
+
+def test_canary_result_rejects_stale_authorization_row_digest_before_persistence(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    authorization = _persist_approved_canary(store)
+    projects = (("arcade", "plan-arcade", "v1", "lead-arcade"), ("hermione", "plan-hermione", "v1", "lead-hermione"))
+    canary = _bind_canary_result_to_rounds(store, _successful_canary_result(authorization["authorizationId"], projects), projects)
+    store.connection.execute("UPDATE protocol_records SET digest=? WHERE kind='concurrency-canary-authorization' AND record_id=?", ("0" * 64, authorization["authorizationId"]))
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="authorization digest conflict"):
+        bridge.receive_concurrency_canary_result(canary)
+    assert store.protocol_record("concurrency-canary-result", canary["resultId"]) is None
+
+
+def test_canary_result_binds_trusted_local_overlap_without_cross_service_timestamp_equality(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    authorization = _persist_approved_canary(store)
+    projects = (("arcade", "plan-arcade", "v1", "lead-arcade"), ("hermione", "plan-hermione", "v1", "lead-hermione"))
+    canary = _bind_canary_result_to_rounds(store, _successful_canary_result(authorization["authorizationId"], projects), projects)
+    submitted = _retimestamp_canary_result(canary)
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    assert bridge.receive_concurrency_canary_result(submitted)["accepted"] is True
+    assert store.protocol_record("concurrency-canary-result", submitted["resultId"])["payload"] == submitted
+
+
+def test_canary_result_rejects_sender_invented_overlap_against_persisted_sequential_timing(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    authorization = _persist_approved_canary(store)
+    projects = (("arcade", "plan-arcade", "v1", "lead-arcade"), ("hermione", "plan-hermione", "v1", "lead-hermione"))
+    canary = _bind_canary_result_to_rounds(store, _successful_canary_result(authorization["authorizationId"], projects), projects)
+    store.connection.execute("UPDATE rounds SET started_at=? WHERE round_id=?", ("2026-08-10T02:00:20+00:00", "round-2"))
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="timing"):
+        bridge.receive_concurrency_canary_result(canary)
+    assert store.protocol_record("concurrency-canary-result", canary["resultId"]) is None
 
 
 def test_round_request_matches_psychlo_strict_shape_and_closed_values(tmp_path: Path):
@@ -800,6 +876,26 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
     assert accepted == {"accepted": True}
     assert forwarded == [("round-result", "result:1", result)]
     assert bridge.request_round(request) == receipt
+
+
+def test_round_completion_timing_uses_trusted_receipt_time_not_lead_occurred_at(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(
+        store=store,
+        dispatcher=lambda *_: "dispatch:trusted-time",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        token_factory=lambda: "capability_trusted_time_1234567890abcdef",
+    )
+    request = {"roundId": "round-trusted-time", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-trusted-time", "idempotencyKey": "round-trusted-time", "snapshotId": "snapshot-trusted-time", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "project-id"}
+    bridge.request_round(request)
+    result = {**request, "sourceId": "member-hermione", "provenanceId": "result:trusted-time", "status": "completed", "actualUsageCost": 1, "deliveredScope": "bounded work", "remainingEstimate": 0, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": "2026-08-10T02:59:59+00:00"}
+
+    bridge.receive_round_result("capability_trusted_time_1234567890abcdef", result)
+
+    timing = store.round_timing("round-trusted-time")
+    assert timing == {"authorizationId": None, "startedAt": NOW, "completedAt": NOW}
 
 
 def test_retries_a_durably_reserved_round_after_dispatch_failure(tmp_path: Path):

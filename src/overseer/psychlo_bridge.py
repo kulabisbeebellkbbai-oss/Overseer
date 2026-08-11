@@ -377,7 +377,7 @@ class PsychloBridge:
         request, _, _, _, _, stored_result, forwarded = record
         _require_bound_result(request, result)
         if stored_result is not None and stored_result != dict(result): raise ValueError("round result conflict")
-        if stored_result is None: self.store.record_result(str(request["roundId"]), result)
+        if stored_result is None: self.store.record_result(str(request["roundId"]), result, self.clock())
         if not forwarded:
             response = dict(self.sender("round-result", str(result["provenanceId"]), result))
             if response.get("accepted") is not True: raise ValueError("Psychlo rejected round result")
@@ -385,7 +385,7 @@ class PsychloBridge:
         return {"accepted": True}
 
     def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
-        self.store.mark_dispatch_started(str(request["roundId"]))
+        self.store.mark_dispatch_started(str(request["roundId"]), self.clock())
         provider_reference = self.dispatcher(str(request["projectLeadId"]), self._round_prompt(request, capability))
         delivered = {**receipt, "provenanceId": str(provider_reference)}
         self.store.mark_dispatched(str(request["roundId"]), delivered)
@@ -1169,12 +1169,14 @@ class PsychloBridge:
             raise ValueError(str(error)) from error
         existing_result = self.store.protocol_record("concurrency-canary-result", value["resultId"])
         if existing_result is not None:
-            if existing_result["payload"] != value:
+            if existing_result["payload"] != value or existing_result.get("digest") != value["digest"]:
                 raise ValueError("concurrency canary result conflict")
             return {"accepted": True, "receipt": {"resultId": value["resultId"], "digest": value["digest"], "status": "accepted", "provenanceId": f"overseer:{value['resultId']}"}}
         authorization = self.store.protocol_record("concurrency-canary-authorization", value["authorizationId"])
         if authorization is None or authorization["state"] != "delivered":
             raise ValueError("canary authorization is unavailable")
+        if not isinstance(authorization.get("payload"), dict) or authorization.get("digest") != authorization["payload"].get("digest"):
+            raise ValueError("canary authorization digest conflict")
         try:
             auth = parse_canary_authorization(authorization["payload"])
         except ContractError as error:
@@ -1184,10 +1186,22 @@ class PsychloBridge:
         actual_identities = {(item["started"]["projectId"], item["started"]["planId"], item["started"]["planVersion"], item["started"]["leadId"]) for item in value["executions"]}
         if auth["targetTemporaryCeiling"] != value["targetCeiling"] or auth["expectedRevision"] != value["expectedRevision"] or actual_identities != expected_identities or decision is None or decision[2] != "approved":
             raise ValueError("canary result requires its exact approved authorization")
+        local_intervals = []
         for execution in value["executions"]:
             round_record = self.store.get_round(str(execution["started"]["roundId"]))
             if round_record is None:
                 raise ValueError("canary result round is unavailable")
+            timing = self.store.round_timing(str(execution["started"]["roundId"]))
+            if timing is None or timing.get("authorizationId") != value["authorizationId"] or not timing.get("startedAt") or not timing.get("completedAt"):
+                raise ValueError("canary result timing or authorization conflict")
+            try:
+                local_started = _time(str(timing["startedAt"]))
+                local_completed = _time(str(timing["completedAt"]))
+            except (TypeError, ValueError) as error:
+                raise ValueError("canary result timing or authorization conflict") from error
+            if local_completed < local_started:
+                raise ValueError("canary result timing or authorization conflict")
+            local_intervals.append((local_started, local_completed))
             request, _, _, _, _, stored_result, _ = round_record
             expected = execution["started"]
             if request.get("roundId") != expected.get("roundId") or any(request.get(key) != expected.get(source) for key, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
@@ -1199,6 +1213,8 @@ class PsychloBridge:
             evidence_digest = canonical_digest({"provenanceId": stored_result.get("provenanceId"), "resultDigest": result_digest})
             if completed.get("evidenceId") != stored_result.get("provenanceId") or completed.get("resultDigest") != result_digest or completed.get("evidenceDigest") != evidence_digest:
                 raise ValueError("canary result evidence does not bind to stored round result")
+        if len(local_intervals) != 2 or not (local_intervals[0][0] < local_intervals[1][1] and local_intervals[1][0] < local_intervals[0][1]):
+            raise ValueError("canary result timing does not show trusted overlap")
         record, inserted = self.store.record_protocol("concurrency-canary-result", value["resultId"], value["resultId"], value["digest"], value, state="delivered")
         if record["state"] != "delivered":
             record = self.store.transition_protocol("concurrency-canary-result", value["resultId"], "delivered")

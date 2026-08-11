@@ -685,15 +685,6 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/psychlo/adoption-evidence": "adoption-evidence",
                 "/psychlo/external-round": "external-round",
                 "/psychlo/external-rounds": "external-round",
-                "/psychlo/external-round-binding": "external-round-binding",
-                "/psychlo/ingress-conflict-reconciliation": "ingress-conflict-reconciliation",
-                "/psychlo/cross-project-team-binding": "cross-project-team-binding",
-                "/psychlo/cross-project-command": "cross-project-command",
-                "/psychlo/cross-project-participant-result": "cross-project-participant-result",
-                "/psychlo/cross-project-supervisor-review": "cross-project-supervisor-review",
-                "/psychlo/concurrency-canary-authorization": "concurrency-canary-authorization",
-                "/psychlo/concurrency-ceiling-authorization": "concurrency-ceiling-authorization",
-                "/psychlo/concurrency-ceiling-change": "concurrency-ceiling-change",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])
@@ -1308,24 +1299,6 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     result = psychlo_bridge.receive_adoption_evidence(message["payload"])
                 elif kind == "external-round":
                     result = psychlo_bridge.receive_external_round(message["payload"])
-                elif kind == "external-round-binding":
-                    result = psychlo_bridge.authorize_external_round_binding(message["payload"])
-                elif kind == "ingress-conflict-reconciliation":
-                    result = psychlo_bridge.reconcile_ingress_conflict(message["payload"])
-                elif kind == "cross-project-team-binding":
-                    result = psychlo_bridge.authorize_cross_project_team_binding(message["payload"])
-                elif kind == "cross-project-command":
-                    result = psychlo_bridge.coordinate_cross_project(message["payload"])
-                elif kind == "cross-project-participant-result":
-                    result = psychlo_bridge.receive_cross_project_participant_result(message["payload"])
-                elif kind == "cross-project-supervisor-review":
-                    result = psychlo_bridge.receive_cross_project_supervisor_review(message["payload"])
-                elif kind == "concurrency-canary-authorization":
-                    result = psychlo_bridge.authorize_concurrency_canary(message["payload"])
-                elif kind == "concurrency-ceiling-authorization":
-                    result = psychlo_bridge.authorize_concurrency_ceiling(message["payload"])
-                elif kind == "concurrency-ceiling-change":
-                    result = psychlo_bridge.change_concurrency_ceiling(message["payload"])
                 elif kind == "decision-outcome":
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:

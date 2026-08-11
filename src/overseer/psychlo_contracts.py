@@ -314,7 +314,9 @@ def parse_ingress_conflict_reconciliation(payload: Mapping[str, Any]) -> dict[st
     value = _strict_protocol(payload, required=required, name="ingress conflict reconciliation")
     _keys(value, required | {"projectId"}, name="ingress conflict reconciliation")
     if value["sourceId"] != "overseer" or value["scope"] not in {"project", "global"} or value["status"] != "resolved": raise ContractError("ingress reconciliation identity is invalid")
-    if value["scope"] == "project": _id(value.get("projectId"), name="projectId")
+    if value["scope"] == "project":
+        if "projectId" not in value: raise ContractError("projectId is required")
+        _id(value.get("projectId"), name="projectId")
     elif "projectId" in value: raise ContractError("global reconciliation must not bind a project")
     for field in ("ingressSourceId", "ingressIdempotencyKey", "provenanceId", "ingressType"): _id(value[field], name=field)
     if value["ingressType"] not in {"plan.admitted", "plan.changed", "project.decommissioned", "project.takeover-imported", "project.scheduling-input-recorded", "overseer.usage-snapshot", "handoff.receipt-recorded", "external-round-binding-authorized", "external-round-reconciled", "cross-project.team-binding-authorized", "coordinator.concurrency-canary-authorized", "coordinator.concurrency-ceiling-authorized"}: raise ContractError("ingress type is invalid")

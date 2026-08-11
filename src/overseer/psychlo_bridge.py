@@ -204,6 +204,7 @@ class PsychloBridge:
         self.clock = clock or (lambda: datetime.now(UTC).isoformat())
         self.token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._recover_decision_intents()
+        self.recover_protocol_records()
 
     def request_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         _require_round(request)
@@ -583,7 +584,7 @@ class PsychloBridge:
             raise ValueError("external round binding authorization is required")
         if binding is not None:
             bound = binding["payload"]
-            if bound.get("externalExecutionId") != envelope["externalExecutionId"] or bound.get("projectId") != envelope["projectId"] or bound.get("planId") != envelope["planId"] or bound.get("planVersion") != envelope["planVersion"] or bound.get("projectLeadId") != envelope["projectLeadId"] or bound.get("threadId") != envelope["threadId"] or bound.get("repository") != envelope["repository"] or bound.get("startingCheckpoint") != envelope["startingCheckpoint"] or bound.get("terminalCheckpoint") != envelope["terminalCheckpoint"]:
+            if bound.get("externalExecutionId") != envelope["externalExecutionId"] or bound.get("projectId") != envelope["projectId"] or bound.get("aTeamId") != envelope["aTeamId"] or bound.get("planId") != envelope["planId"] or bound.get("planVersion") != envelope["planVersion"] or bound.get("projectLeadId") != envelope["projectLeadId"] or bound.get("threadId") != envelope["threadId"] or bound.get("repository") != envelope["repository"] or bound.get("startingCheckpoint") != envelope["startingCheckpoint"] or bound.get("terminalCheckpoint") != envelope["terminalCheckpoint"]:
                 raise ValueError("external round binding conflict")
         existing = self.store.external_execution(envelope["reconciliationId"])
         if existing is not None:
@@ -629,11 +630,11 @@ class PsychloBridge:
         try: authorization = parse_external_round_binding(payload)
         except ContractError as error: raise ValueError(str(error)) from error
         external = self.store.external_execution(authorization["reconciliationId"])
-        if external is None: raise ValueError("external execution must be persisted before binding")
-        envelope = external["payload"]
-        for field in ("externalExecutionId", "projectId", "planId", "planVersion", "projectLeadId", "threadId", "startingCheckpoint", "terminalCheckpoint"):
-            if authorization[field] != envelope[field]: raise ValueError("external round binding conflict")
-        if authorization["repository"] != envelope["repository"]: raise ValueError("external round binding conflict")
+        if external is not None:
+            envelope = external["payload"]
+            for field in ("externalExecutionId", "projectId", "aTeamId", "planId", "planVersion", "projectLeadId", "threadId", "startingCheckpoint", "terminalCheckpoint"):
+                if authorization[field] != envelope[field]: raise ValueError("external round binding conflict")
+            if authorization["repository"] != envelope["repository"]: raise ValueError("external round binding conflict")
         return self._persist_protocol("external-round-binding", authorization["reconciliationId"], authorization)
 
     receive_external_round_binding = authorize_external_round_binding
@@ -693,7 +694,7 @@ class PsychloBridge:
 
     def change_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         value = dict(payload)
-        if set(value) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt", "digest"}: raise ValueError("concurrency ceiling change is invalid")
+        if set(value) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"}: raise ValueError("concurrency ceiling change is invalid")
         return self._persist_protocol("concurrency-ceiling-change", value["authorizationId"], value)
 
     receive_concurrency_ceiling_change = change_concurrency_ceiling

@@ -212,6 +212,21 @@ def _retimestamp_canary_result(canary: dict) -> dict:
     return {**result_base, "digest": hashlib.sha256(json.dumps(result_base, separators=(",", ":")).encode()).hexdigest()}
 
 
+def _canary_result_from_bridge_rounds(authorization_id: str, requests: list[dict], results: list[dict]) -> dict:
+    executions = []
+    for index, (request, result) in enumerate(zip(requests, results), start=1):
+        execution_id = request["roundId"]
+        started_base = {"executionId": execution_id, "authorizationId": authorization_id, "projectId": request["projectId"], "planId": request["planId"], "planVersion": request["planVersion"], "roundId": execution_id, "leadId": request["projectLeadId"], "startedAt": f"2026-08-10T02:01:0{index}+00:00"}
+        started = {**started_base, "digest": hashlib.sha256(json.dumps(started_base, separators=(",", ":")).encode()).hexdigest()}
+        result_digest = _round_result_digest(result)
+        evidence_digest = canonical_digest({"provenanceId": result["provenanceId"], "resultDigest": result_digest})
+        completed_base = {"executionId": execution_id, "authorizationId": authorization_id, "projectId": request["projectId"], "planId": request["planId"], "planVersion": request["planVersion"], "roundId": execution_id, "leadId": request["projectLeadId"], "settledAt": f"2026-08-10T02:01:1{index}+00:00", "terminalStatus": "completed", "resultDigest": result_digest, "evidenceId": result["provenanceId"], "evidenceDigest": evidence_digest}
+        completed = {**completed_base, "digest": hashlib.sha256(json.dumps(completed_base, separators=(",", ":")).encode()).hexdigest()}
+        executions.append({"executionId": execution_id, "started": started, "completed": completed})
+    base = {"resultId": f"canary-result:{authorization_id}", "authorizationId": authorization_id, "targetCeiling": 2, "expectedRevision": 0, "executions": executions, "concurrencyObserved": True, "occurredAt": "2026-08-10T02:01:30+00:00"}
+    return {**base, "digest": hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest()}
+
+
 def test_approved_canary_admits_exactly_two_independent_rounds_atomically(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     _persist_approved_canary(store)
@@ -222,6 +237,87 @@ def test_approved_canary_admits_exactly_two_independent_rounds_atomically(tmp_pa
         bridge.request_round(_canary_round("round-third", "other", "plan-other", "lead-other"))
     with pytest.raises(ValueError, match="single_stream_busy"):
         bridge.request_round(_canary_round("round-same", "arcade", "plan-arcade", "lead-arcade"))
+
+
+def test_recovery_rejects_stale_concurrency_authorization_before_forwarding(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    authorization = _persist_approved_canary(store)
+    store.connection.execute("UPDATE protocol_records SET state='queued',digest=? WHERE kind='concurrency-canary-authorization' AND record_id=?", ("0" * 64, authorization["authorizationId"]))
+    sent = []
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    assert sent == []
+    assert bridge.store.protocol_record("concurrency-canary-authorization", authorization["authorizationId"])["state"] == "forward-pending"
+
+
+def test_bridge_canary_lifecycle_uses_real_rounds_then_restarts_under_persisted_ceiling(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    authorization = _persist_approved_canary(store)
+    sent = []
+    capabilities = []
+    trusted_times = iter((
+        "2026-08-10T02:00:00+00:00", "2026-08-10T02:00:01+00:00", "2026-08-10T02:00:02+00:00",
+        "2026-08-10T02:00:03+00:00", "2026-08-10T02:00:04+00:00", "2026-08-10T02:00:05+00:00",
+        "2026-08-10T02:00:06+00:00", "2026-08-10T02:00:07+00:00", "2026-08-10T02:00:08+00:00",
+        "2026-08-10T02:00:09+00:00",
+    ))
+    def clock():
+        return next(trusted_times)
+    def token_factory():
+        token = f"cap-lifecycle-{len(capabilities) + 1}-1234567890abcdef"
+        capabilities.append(token)
+        return token
+    bridge = PsychloBridge(store=store, dispatcher=lambda lead, _prompt: f"dispatch:{lead}", sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=clock, token_factory=token_factory)
+    requests = [_canary_round("lifecycle-arcade", "arcade", "plan-arcade", "lead-arcade"), _canary_round("lifecycle-hermione", "hermione", "plan-hermione", "lead-hermione")]
+    receipts = [bridge.request_round(request) for request in requests]
+    assert [receipt["receipt"]["status"] for receipt in receipts] == ["accepted", "accepted"]
+    results = [{**request, "sourceId": request["projectLeadId"], "provenanceId": f"result:{request['roundId']}", "status": "completed", "actualUsageCost": 1, "deliveredScope": "canary work", "remainingEstimate": 0, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": "2026-08-10T02:01:20+00:00"} for request in requests]
+    assert bridge.receive_round_result(capabilities[0], results[0]) == {"accepted": True}
+    assert bridge.receive_round_result(capabilities[1], results[1]) == {"accepted": True}
+    canary = _canary_result_from_bridge_rounds(authorization["authorizationId"], requests, results)
+    assert bridge.receive_concurrency_canary_result(canary)["accepted"] is True
+
+    ceiling_base = {"authorizationId": "ceiling-lifecycle", "ceiling": 2, "expectedRevision": 0, "revision": 1, "canaryResultId": canary["resultId"], "projectId": "arcade", "planId": "plan-arcade", "workflowId": authorization["workflowId"], "decisionVersion": "v1", "correlationId": "ceiling-lifecycle", "idempotencyKey": "ceiling-lifecycle", "occurredAt": NOW}
+    ceiling_digest = hashlib.sha256(json.dumps(ceiling_base, separators=(",", ":")).encode()).hexdigest()
+    ceiling = {**ceiling_base, "decisionId": "roadex:concurrency:ceiling-lifecycle", "question": f"Approve the exact global concurrency operation {ceiling_digest}", "digest": ceiling_digest}
+    decision = {"decisionId": ceiling["decisionId"], "projectId": ceiling["projectId"], "planId": ceiling["planId"], "workflowId": ceiling["workflowId"], "decisionVersion": ceiling["decisionVersion"], "correlationId": ceiling["correlationId"], "idempotencyKey": ceiling["idempotencyKey"], "question": ceiling["question"], "resultProvenanceId": ceiling_digest}
+    store.record_decision(decision, {**decision, "status": "staged"})
+    store.decide(ceiling["decisionId"], "approved", "human-user", NOW, "approved ceiling")
+    assert bridge.authorize_concurrency_ceiling(ceiling)["record"]["state"] == "delivered"
+    change = {"authorizationId": ceiling["authorizationId"], "correlationId": "ceiling-change-lifecycle", "idempotencyKey": "ceiling-change-lifecycle", "occurredAt": NOW}
+    assert bridge.change_concurrency_ceiling(change)["record"]["state"] == "delivered"
+
+    restarted_sent = []
+    post_tokens = iter(("cap-post-ceiling-1-1234567890abcdef", "cap-post-ceiling-2-1234567890abcdef", "cap-post-ceiling-3-1234567890abcdef"))
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda lead, _prompt: restarted_sent.append(lead) or f"dispatch:{lead}", sender=lambda *args: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: "2026-08-10T02:00:10+00:00", token_factory=lambda: next(post_tokens))
+    ordinary = _canary_round("ordinary-after-restart", "ordinary", "plan-ordinary", "lead-ordinary")
+    second_ordinary = _canary_round("second-ordinary-after-restart", "second-ordinary", "plan-second-ordinary", "lead-second-ordinary")
+    ordinary_receipt = restarted.request_round(ordinary)
+    assert ordinary_receipt["receipt"]["status"] == "accepted"
+    assert restarted.request_round(second_ordinary)["receipt"]["status"] == "accepted"
+    with pytest.raises(ValueError, match="single_stream_busy"):
+        restarted.request_round(_canary_round("third-ordinary-after-restart", "third-ordinary", "plan-third-ordinary", "lead-third-ordinary"))
+    assert restarted.request_round(ordinary) == ordinary_receipt
+    assert restarted_sent == ["lead-ordinary", "lead-second-ordinary"]
+
+
+def test_canary_result_rejects_real_completed_noncanary_rounds(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    capabilities = iter(("cap-ordinary-1-1234567890abcdef", "cap-ordinary-2-1234567890abcdef"))
+    bridge = PsychloBridge(store=store, dispatcher=lambda lead, _prompt: f"dispatch:{lead}", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: next(capabilities))
+    requests = [_canary_round("noncanary-arcade", "arcade", "plan-arcade", "lead-arcade"), _canary_round("noncanary-hermione", "hermione", "plan-hermione", "lead-hermione")]
+    results = [{**request, "sourceId": request["projectLeadId"], "provenanceId": f"result:{request['roundId']}", "status": "completed", "actualUsageCost": 1, "deliveredScope": "ordinary work", "remainingEstimate": 0, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": NOW} for request in requests]
+    assert bridge.request_round(requests[0])["accepted"] is True
+    assert bridge.receive_round_result("cap-ordinary-1-1234567890abcdef", results[0]) == {"accepted": True}
+    assert bridge.request_round(requests[1])["accepted"] is True
+    assert bridge.receive_round_result("cap-ordinary-2-1234567890abcdef", results[1]) == {"accepted": True}
+    authorization = _persist_approved_canary(store)
+    canary = _canary_result_from_bridge_rounds(authorization["authorizationId"], requests, results)
+
+    with pytest.raises(ValueError, match="authorization conflict"):
+        bridge.receive_concurrency_canary_result(canary)
+    assert store.protocol_record("concurrency-canary-result", canary["resultId"]) is None
 
 
 def test_canary_admission_rejects_expired_or_unapproved_authority_and_preserves_single_stream(tmp_path: Path):
@@ -504,6 +600,23 @@ def test_canary_result_rejects_stale_authorization_row_digest_before_persistence
     with pytest.raises(ValueError, match="authorization digest conflict"):
         bridge.receive_concurrency_canary_result(canary)
     assert store.protocol_record("concurrency-canary-result", canary["resultId"]) is None
+
+
+def test_ceiling_authorization_rejects_stale_canary_result_before_forwarding(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    authorization = _persist_approved_canary(store)
+    projects = (("arcade", "plan-arcade", "v1", "lead-arcade"), ("hermione", "plan-hermione", "v1", "lead-hermione"))
+    canary = _bind_canary_result_to_rounds(store, _successful_canary_result(authorization["authorizationId"], projects), projects)
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    assert bridge.receive_concurrency_canary_result(canary)["accepted"] is True
+    store.connection.execute("UPDATE protocol_records SET digest=? WHERE kind='concurrency-canary-result' AND record_id=?", ("0" * 64, canary["resultId"]))
+    ceiling_base = {"authorizationId": "ceiling-stale-canary", "ceiling": 2, "expectedRevision": 0, "revision": 1, "canaryResultId": canary["resultId"], "projectId": "arcade", "planId": "plan-arcade", "workflowId": authorization["workflowId"], "decisionVersion": "v1", "correlationId": "ceiling-stale-canary", "idempotencyKey": "ceiling-stale-canary", "occurredAt": NOW}
+    ceiling_digest = hashlib.sha256(json.dumps(ceiling_base, separators=(",", ":")).encode()).hexdigest()
+    ceiling = {**ceiling_base, "decisionId": "roadex:concurrency:ceiling-stale-canary", "question": f"Approve the exact global concurrency operation {ceiling_digest}", "digest": ceiling_digest}
+
+    with pytest.raises(ValueError, match="digest conflict"):
+        bridge.authorize_concurrency_ceiling(ceiling)
+    assert store.protocol_record("concurrency-ceiling-authorization", ceiling["authorizationId"]) is None
 
 
 def test_canary_result_binds_trusted_local_overlap_without_cross_service_timestamp_equality(tmp_path: Path):

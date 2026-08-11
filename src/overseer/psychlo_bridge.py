@@ -722,9 +722,83 @@ class PsychloBridge:
     reconcile_external_round = receive_external_round
 
     # ---- Psychlo final peer projections -------------------------------
+    def _revalidate_concurrency_protocol_record(self, record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """Fail closed on stale/corrupt concurrency records before forwarding."""
+        kind = record.get("kind")
+        if kind not in {"concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"}:
+            return None
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"{kind} payload is invalid")
+        try:
+            if kind == "concurrency-canary-authorization":
+                value = parse_canary_authorization(payload)
+                if value["digest"] != record.get("digest"):
+                    raise ValueError("concurrency canary authorization digest conflict")
+                return value
+            if kind == "concurrency-ceiling-authorization":
+                value = parse_concurrency_ceiling_authorization(payload)
+                if value["digest"] != record.get("digest"):
+                    raise ValueError("concurrency ceiling authorization digest conflict")
+                canary_record = self.store.protocol_record("concurrency-canary-result", str(value["canaryResultId"]))
+                canary = self._revalidate_canary_result_record(canary_record)
+                if canary["resultId"] != value["canaryResultId"] or canary["targetCeiling"] != value["ceiling"] or canary["expectedRevision"] != value["expectedRevision"]:
+                    raise ValueError("successful canary evidence does not bind to ceiling")
+                return value
+            if set(payload) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"} or any(not isinstance(payload.get(field), str) or not payload[field].strip() for field in payload):
+                raise ValueError("concurrency ceiling change is invalid")
+            if canonical_digest(payload) != record.get("digest"):
+                raise ValueError("concurrency ceiling change digest conflict")
+            ceiling_record = self.store.protocol_record("concurrency-ceiling-authorization", str(payload["authorizationId"]))
+            if ceiling_record is None or ceiling_record.get("state") not in {"delivered", "settled"}:
+                raise ValueError("concurrency ceiling authorization is unavailable")
+            ceiling = self._revalidate_concurrency_protocol_record(ceiling_record)
+            decision = self.store.decision(str(ceiling["decisionId"]))
+            if decision is None or decision[2] != "approved":
+                raise ValueError("concurrency ceiling authorization is not approved")
+            expected_decision = {"decisionId": ceiling["decisionId"], "projectId": ceiling["projectId"], "planId": ceiling["planId"], "workflowId": ceiling["workflowId"], "decisionVersion": ceiling["decisionVersion"], "question": ceiling["question"], "resultProvenanceId": ceiling["digest"]}
+            if any(decision[0].get(field) != expected for field, expected in expected_decision.items()):
+                raise ValueError("concurrency ceiling decision binding is invalid")
+            return payload
+        except ContractError as error:
+            raise ValueError(f"{kind} payload is invalid") from error
+
+    def _revalidate_canary_result_record(self, record: Mapping[str, Any] | None) -> dict[str, Any]:
+        if record is None or record.get("state") != "delivered" or not isinstance(record.get("payload"), dict):
+            raise ValueError("successful delivered canary evidence is required")
+        try:
+            value = parse_concurrency_canary_result(record["payload"])
+        except ContractError as error:
+            raise ValueError("successful delivered canary evidence is invalid") from error
+        if value["digest"] != record.get("digest"):
+            raise ValueError("concurrency canary result digest conflict")
+        authorization = self.store.protocol_record("concurrency-canary-authorization", value["authorizationId"])
+        if authorization is None or authorization.get("state") not in {"delivered", "settled"} or not isinstance(authorization.get("payload"), dict):
+            raise ValueError("canary authorization is unavailable")
+        try:
+            auth = parse_canary_authorization(authorization["payload"])
+        except ContractError as error:
+            raise ValueError("canary authorization is invalid") from error
+        if auth["digest"] != authorization.get("digest"):
+            raise ValueError("canary authorization digest conflict")
+        identities = {(item["projectId"], item["planId"], item["planVersion"], item["leadId"]) for item in auth["projects"]}
+        observed = {(item["started"]["projectId"], item["started"]["planId"], item["started"]["planVersion"], item["started"]["leadId"]) for item in value["executions"]}
+        if value["targetCeiling"] != auth["targetTemporaryCeiling"] or value["expectedRevision"] != auth["expectedRevision"] or observed != identities:
+            raise ValueError("successful canary evidence does not bind to authorization")
+        self.store._verify_canary_execution_rounds(value)
+        return value
+
     def _persist_protocol(self, kind: str, record_id: str, payload: Mapping[str, Any], *, forward: bool = True) -> dict[str, Any]:
         digest = str(payload.get("digest") or canonical_digest(payload))
+        synthetic = {"kind": kind, "id": record_id, "digest": digest, "payload": dict(payload), "state": "queued"}
+        self._revalidate_concurrency_protocol_record(synthetic)
         record, inserted = self.store.record_protocol(kind, record_id, str(payload.get("idempotencyKey", record_id)), digest, payload)
+        try:
+            self._revalidate_concurrency_protocol_record(record)
+        except Exception:
+            if record.get("state") not in {"delivered", "settled", "forward-pending"}:
+                self.store.transition_protocol(kind, record_id, "forward-pending", "protocol-integrity-failed")
+            raise
         if inserted and forward:
             try:
                 response = self.sender(kind, record_id, payload)
@@ -1149,15 +1223,8 @@ class PsychloBridge:
     def authorize_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try: value = parse_concurrency_ceiling_authorization(payload)
         except ContractError as error: raise ValueError(str(error)) from error
-        canary = self.store.protocol_record("concurrency-canary-result", value["canaryResultId"])
-        if canary is None or canary["state"] != "delivered":
-            raise ValueError("successful delivered canary evidence is required")
-        try:
-            proof = parse_concurrency_canary_result(canary["payload"])
-        except ContractError as error:
-            raise ValueError("successful delivered canary evidence is invalid") from error
-        if proof["targetCeiling"] != value["ceiling"] or proof["expectedRevision"] != value["expectedRevision"]:
-            raise ValueError("successful canary evidence does not bind to ceiling")
+        synthetic = {"kind": "concurrency-ceiling-authorization", "id": value["authorizationId"], "digest": value["digest"], "payload": value, "state": "queued"}
+        self._revalidate_concurrency_protocol_record(synthetic)
         return self._persist_protocol("concurrency-ceiling-authorization", value["authorizationId"], value)
 
     receive_concurrency_ceiling_authorization = authorize_concurrency_ceiling
@@ -1226,6 +1293,12 @@ class PsychloBridge:
     def change_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         value = dict(payload)
         record, inserted = self.store.record_concurrency_ceiling_change(value)
+        try:
+            self._revalidate_concurrency_protocol_record(record)
+        except Exception:
+            if record.get("state") not in {"delivered", "settled", "forward-pending"}:
+                self.store.transition_protocol("concurrency-ceiling-change", record["id"], "forward-pending", "protocol-integrity-failed")
+            raise
         if record["state"] not in {"delivered", "settled"}:
             try:
                 response = self.sender("concurrency-ceiling-change", record["id"], record["payload"])
@@ -1259,6 +1332,8 @@ class PsychloBridge:
                             self.store.transition_protocol("coordination-work-request", str(request_id), "settled")
                         recovered += 1
                         continue
+                    if kind in {"concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"}:
+                        self._revalidate_concurrency_protocol_record(record)
                     response = self.sender(kind, record["id"], record["payload"])
                     if response.get("accepted") is not True: raise ValueError("rejected")
                     self.store.transition_protocol(kind, record["id"], "delivered")

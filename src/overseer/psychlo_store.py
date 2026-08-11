@@ -64,6 +64,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS approval_authority_snapshots(approval_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
+            CREATE TABLE IF NOT EXISTS coordination_terminals(request_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_operation_claims(kind TEXT NOT NULL, operation_id TEXT NOT NULL, owner_id TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, operation_id), UNIQUE(kind, idempotency_key));
         """)
         for column in ("delivery_skiller", "delivery_memory"):
@@ -806,6 +807,38 @@ class PsychloBridgeStore:
                 return winner, False
             raise ValueError(f"{kind} conflict") from error
         return self.protocol_record(kind, record_id), True
+
+    def record_coordination_participant_terminal(self, request_id: str, result_id: str, idempotency_key: str, digest: str, payload: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Atomically admit the one immutable terminal result for a work request."""
+        if payload.get("requestId") != request_id or payload.get("resultId") != result_id:
+            raise ValueError("participant result terminal binding is invalid")
+        encoded = _dump_wire(payload)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            terminal = self.connection.execute("SELECT result_id,digest,payload_json FROM coordination_terminals WHERE request_id=?", (request_id,)).fetchone()
+            if terminal is not None:
+                if terminal != (result_id, digest, encoded):
+                    raise ValueError("participant result terminal conflict")
+                inserted = False
+            else:
+                rows = self.connection.execute("SELECT record_id,idempotency_key,digest,payload_json FROM protocol_records WHERE kind='cross-project-participant-result'").fetchall()
+                existing_for_request = next((row for row in rows if json.loads(row[3]).get("requestId") == request_id), None)
+                if existing_for_request is not None and existing_for_request != (result_id, idempotency_key, digest, encoded):
+                    raise ValueError("participant result terminal conflict")
+                if existing_for_request is None and any(row[0] == result_id or row[1] == idempotency_key or row[2] == digest for row in rows):
+                    raise ValueError("participant result terminal conflict")
+                if existing_for_request is None:
+                    self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at,receipt_json) VALUES ('cross-project-participant-result',?,?,?,?, 'queued',?,NULL)", (result_id, idempotency_key, digest, encoded, self._now()))
+                self.connection.execute("INSERT INTO coordination_terminals VALUES (?,?,?,?,?)", (request_id, result_id, digest, encoded, self._now()))
+                inserted = existing_for_request is None
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        record = self.protocol_record("cross-project-participant-result", result_id)
+        if record is None:
+            raise ValueError("participant result terminal record is missing")
+        return record, inserted
 
     def transition_protocol(self, kind: str, record_id: str, state: str, error: str | None = None, receipt: Mapping[str, Any] | None = None) -> dict[str, Any]:
         with self.connection:

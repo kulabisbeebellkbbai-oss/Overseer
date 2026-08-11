@@ -1125,8 +1125,13 @@ class PsychloBridge:
         request = self.store.protocol_record("coordination-work-request", request_id)
         if request is None:
             raise ValueError("coordination work request is missing")
-        group_id = str(request["payload"]["requiredRequestIds"][0])
-        review = self.store.coordination_review(group_id)
+        review = self.store.coordination_review(request_id)
+        if review is not None:
+            review = self._maybe_dispatch_supervisor(request_id)
+        if review is not None and review["state"] == "delivered":
+            return review
+        if review is not None and review["state"] == "rejected":
+            return None
         if review is None or self.supervisor_result_collector is None:
             return None
         result = self.supervisor_result_collector(str(review["reviewId"]), dict(review["payload"]))
@@ -1145,10 +1150,11 @@ class PsychloBridge:
             raise ValueError(str(error)) from error
         persisted = self._persist_protocol("cross-project-supervisor-review", str(review["reviewId"]), final)
         if persisted["record"]["state"] == "delivered":
-            self.store.transition_coordination_review(group_id, "delivered")
-            for required_id in context["requiredRequestIds"]:
-                self.store.transition_protocol("coordination-work-request", str(required_id), "settled")
-        return self.store.coordination_review(group_id)
+            review_state = "delivered" if value["accepted"] else "rejected"
+            self.store.transition_coordination_review(request_id, review_state)
+            if value["accepted"]:
+                self.store.transition_protocol("coordination-work-request", request_id, "settled")
+        return self.store.coordination_review(request_id) if value["accepted"] else None
 
     def _collect_project_result(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
         dispatch = self.store.coordination_dispatch(str(request["id"]))
@@ -1159,7 +1165,7 @@ class PsychloBridge:
             return None
         value = dict(result)
         required = {"linkId", "version", "projectId", "leadId", "requestId", "dispatchId", "resultId", "scope", "status", "evidenceId", "digest", "correlationId", "idempotencyKey", "occurredAt"}
-        if set(value) != required or value.get("status") != "completed" or any(not isinstance(value.get(field), str) or not value[field].strip() for field in required):
+        if set(value) != required or value.get("status") not in {"completed", "blocked"} or any(not isinstance(value.get(field), str) or not value[field].strip() for field in required):
             raise ValueError("authoritative participant result is invalid")
         if value["requestId"] != request["id"] or value["dispatchId"] != dispatch["dispatchId"]:
             raise ValueError("participant result dispatch binding is invalid")
@@ -1168,8 +1174,11 @@ class PsychloBridge:
         return value
 
     def _persist_participant_result(self, request: Mapping[str, Any], value: Mapping[str, Any]) -> None:
-        stored = self._persist_protocol("cross-project-participant-result", value["resultId"], value)
-        if stored["record"]["state"] != "delivered":
+        record, inserted = self.store.record_coordination_participant_terminal(str(request["id"]), str(value["resultId"]), str(value["idempotencyKey"]), str(value["digest"]), value)
+        if inserted or record["state"] not in {"delivered", "settled"}:
+            self._forward_protocol_record(record)
+            record = self.store.protocol_record("cross-project-participant-result", str(value["resultId"]))
+        if record is None or record["state"] != "delivered":
             return
         self.store.transition_coordination_dispatch(str(request["id"]), "delivered")
         self._maybe_dispatch_supervisor(str(request["id"]))
@@ -1188,25 +1197,59 @@ class PsychloBridge:
         binding = self._binding_for_request(request)
         required_ids = request["requiredRequestIds"]
         request_map = {item["id"]: item for item in self.store.list_protocol("coordination-work-request") if item["id"] in required_ids}
-        if set(request_map) != set(required_ids): return None
-        requests = [request_map[item] for item in required_ids]
+        requests = [request_map[item] for item in required_ids if item in request_map]
         if any(item["payload"].get("coordinationBindingId") != request["coordinationBindingId"] or item["payload"].get("linkId") != request["linkId"] or item["payload"].get("version") != request["version"] or item["payload"].get("requiredRequestIds") != required_ids or item["payload"].get("supervisorLeadId") != request["supervisorLeadId"] for item in requests):
             raise ValueError("coordination request set conflict")
-        participants = []
-        for item in requests:
-            result = next((candidate for candidate in self.store.list_protocol("cross-project-participant-result") if candidate["payload"].get("requestId") == item["id"] and candidate["state"] == "delivered"), None)
-            if result is None:
-                return None
-            participants.append({"resultId": result["payload"]["resultId"], "digest": result["digest"]})
-        group_id = str(required_ids[0])
-        review = self.store.coordination_review(group_id)
+        review = self.store.coordination_review(request_id)
         if review is not None:
+            context = review["payload"]
+            fixed = {"coordinationBindingId": request["coordinationBindingId"], "linkId": request["linkId"], "version": request["version"], "projectId": request["projectId"], "leadId": request["leadId"], "supervisorLeadId": request["supervisorLeadId"], "coordinationTeamId": binding["coordinationTeamId"], "supervisorMemberId": binding["supervisorMemberId"], "requiredRequestIds": required_ids, "requestId": request_id}
+            if any(context.get(key) != value for key, value in fixed.items()):
+                raise ValueError("coordination review conflict")
+            listed = context.get("participantResults")
+            if not isinstance(listed, list) or not listed:
+                raise ValueError("coordination review conflict")
+            result_records = {item["payload"].get("resultId"): item for item in self.store.list_protocol("cross-project-participant-result") if item["state"] == "delivered"}
+            listed_request_ids = []
+            for participant in listed:
+                if not isinstance(participant, Mapping) or set(participant) != {"resultId", "digest"}:
+                    raise ValueError("coordination review conflict")
+                result = result_records.get(participant["resultId"])
+                if result is None or result["digest"] != participant["digest"] or result["payload"].get("digest") != participant["digest"]:
+                    raise ValueError("coordination review conflict")
+                listed_request_ids.append(result["payload"].get("requestId"))
+            if len(set(listed_request_ids)) != len(listed_request_ids) or any(item not in required_ids for item in listed_request_ids) or listed_request_ids != sorted(listed_request_ids, key=required_ids.index) or context.get("resultId") not in {item["resultId"] for item in listed}:
+                raise ValueError("coordination review conflict")
+            trigger = result_records.get(context["resultId"])
+            expected_key = f"cross-project-supervisor:{request['coordinationBindingId']}:{request['linkId']}:{request['version']}:{request_id}:{context['resultId']}"
+            if trigger is None or trigger["payload"].get("requestId") != request_id or review.get("idempotencyKey") != expected_key:
+                raise ValueError("coordination review conflict")
             return review
+        participants = []
+        trigger_result = None
+        participant_records = self.store.list_protocol("cross-project-participant-result")
+        for required_id in required_ids:
+            item = request_map.get(required_id)
+            if item is None:
+                continue
+            matches = [candidate for candidate in participant_records if candidate["payload"].get("requestId") == item["id"] and candidate["state"] == "delivered"]
+            if not matches:
+                continue
+            if len(matches) != 1:
+                raise ValueError("participant result terminal conflict")
+            result = matches[0]
+            result_payload = result["payload"]
+            if result["digest"] != result_payload.get("digest") or result["digest"] != item["payload"].get("expectedResultDigest") or any(result_payload.get(field) != item["payload"].get(field) for field in ("linkId", "version", "projectId", "leadId", "scope")) or result_payload.get("requestId") != item["id"]:
+                raise ValueError("participant result stored binding is invalid")
+            participants.append({"resultId": result["payload"]["resultId"], "digest": result["digest"]})
+            if required_id == request_id:
+                trigger_result = result
+        if trigger_result is None:
+            return None
+        idempotency_key = f"cross-project-supervisor:{request['coordinationBindingId']}:{request['linkId']}:{request['version']}:{request_id}:{trigger_result['payload']['resultId']}"
+        context = {"coordinationBindingId": request["coordinationBindingId"], "linkId": request["linkId"], "version": request["version"], "projectId": request["projectId"], "leadId": request["leadId"], "supervisorLeadId": request["supervisorLeadId"], "coordinationTeamId": binding["coordinationTeamId"], "supervisorMemberId": binding["supervisorMemberId"], "participantResults": participants, "resultId": trigger_result["payload"]["resultId"], "requiredRequestIds": required_ids, "requestId": request_id}
         if self.supervisor_dispatcher is None:
             return None
-        idempotency_key = f"cross-project-supervisor:{request['coordinationBindingId']}:{request['linkId']}:{request['version']}"
-        anchor = requests[0]["payload"]
-        context = {"coordinationBindingId": request["coordinationBindingId"], "linkId": request["linkId"], "version": request["version"], "projectId": anchor["projectId"], "leadId": anchor["leadId"], "supervisorLeadId": request["supervisorLeadId"], "coordinationTeamId": binding["coordinationTeamId"], "supervisorMemberId": binding["supervisorMemberId"], "participantResults": participants, "resultId": participants[0]["resultId"], "requiredRequestIds": required_ids, "requestId": anchor["id"]}
         try:
             prepare = getattr(self.supervisor_dispatcher, "prepare", None)
             if not callable(prepare): raise ValueError("durable supervisor dispatcher preparation is unavailable")
@@ -1214,14 +1257,14 @@ class PsychloBridge:
             if not review_id.strip(): raise ValueError("supervisor review dispatch is missing")
         except Exception:
             raise
-        created = self.store.create_coordination_review_intent(group_id, review_id, context, owner_id=self.coordination_owner_id, idempotency_key=idempotency_key)
+        created = self.store.create_coordination_review_intent(request_id, review_id, context, owner_id=self.coordination_owner_id, idempotency_key=idempotency_key)
         review = created["intent"]
         if not created["winner"]:
             return review
         try:
             sent_review_id = str(self.supervisor_dispatcher(str(request["supervisorLeadId"]), context, idempotency_key))
             if sent_review_id != review_id: raise ValueError("supervisor review dispatch identity conflict")
-            review = self.store.transition_coordination_review(group_id, "pending")
+            review = self.store.transition_coordination_review(request_id, "pending")
             return review
         except Exception:
             return review
@@ -1357,9 +1400,10 @@ class PsychloBridge:
                         self._forward_protocol_record(record)
                         review = self.store.coordination_review_for_review_id(str(record["id"]))
                         if review is None: raise ValueError("coordination review is missing")
-                        self.store.transition_coordination_review(str(review["requestId"]), "delivered")
-                        for request_id in review["payload"]["requiredRequestIds"]:
-                            self.store.transition_protocol("coordination-work-request", str(request_id), "settled")
+                        accepted = record["payload"].get("accepted") is True
+                        self.store.transition_coordination_review(str(review["requestId"]), "delivered" if accepted else "rejected")
+                        if accepted:
+                            self.store.transition_protocol("coordination-work-request", str(review["requestId"]), "settled")
                         recovered += 1
                         continue
                     if kind in {"registry-candidate", "adoption-evidence"}:

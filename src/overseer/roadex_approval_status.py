@@ -65,6 +65,13 @@ _ROADEX_EVIDENCE_REQUESTERS = frozenset(
     }
 )
 _ROADEX_EVIDENCE_ROLES = ("kira", "obrien", "security", "sisko")
+_SOURCE_AUTHORITY_CLASSES = {
+    "admin-plan": "privileged-operation",
+    # Preserve the existing privileged DonutHole provisioning source contract;
+    # the harmless fixture below is the non-operational project-workflow path.
+    "roadex-human-decision": "privileged-operation",
+    "roadex-approval-fixture": "project-workflow",
+}
 
 
 def validate_opaque_ref(value: str) -> None:
@@ -271,7 +278,7 @@ def _decode_roadex_binding_payload(payload: str) -> RoadexApprovalBinding:
             _require_truthy_str(data[field.name], field.name)
             continue
         if field.name == "source_kind":
-            _require_enum(data[field.name], {"admin-plan", "roadex-human-decision"}, field.name)
+            _require_enum(data[field.name], set(_SOURCE_AUTHORITY_CLASSES), field.name)
             continue
         if field.name == "authority_class":
             _require_enum(
@@ -321,7 +328,7 @@ def _load_roadex_plan_payload(store, source_id: str) -> DonutHoleBackupProvision
 @dataclass(frozen=True)
 class RoadexApprovalBindingDraft:
     approval_ref: str
-    source_kind: Literal["admin-plan", "roadex-human-decision"]
+    source_kind: str
     source_id: str
     project_id: str
     workspace_id: str
@@ -333,7 +340,7 @@ class RoadexApprovalBindingDraft:
 @dataclass(frozen=True)
 class RoadexApprovalBinding:
     approval_ref: str
-    source_kind: Literal["admin-plan", "roadex-human-decision"]
+    source_kind: str
     source_id: str
     project_id: str
     workspace_id: str
@@ -372,6 +379,7 @@ def _source_exists_for_draft(store, draft: RoadexApprovalBindingDraft) -> bool:
     table = {
         "admin-plan": "admin_change_plans",
         "roadex-human-decision": "backup_provisioning_plans",
+        "roadex-approval-fixture": "roadex_approval_fixtures",
     }[draft.source_kind]
     table_exists = store._connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -421,6 +429,8 @@ def load_exact_bound_source(store, binding: RoadexApprovalBinding):
             return _load_admin_change_payload(store, binding.source_id)
         if binding.source_kind == "roadex-human-decision":
             return _load_roadex_plan_payload(store, binding.source_id)
+        if binding.source_kind == "roadex-approval-fixture":
+            return _load_roadex_approval_fixture_payload(store, binding.source_id)
     except KeyError as error:
         raise RoadexApprovalProjectionError("source reference is malformed") from error
     raise ValueError("unsupported source_kind")
@@ -466,6 +476,18 @@ def project_decision(
             )
         _require_admin_pending_plan_evidence(source_plan)
         return ("pending", "pending", binding.created_at)
+
+    if binding.source_kind == "roadex-approval-fixture":
+        source_fixture = _require_roadex_approval_fixture(source)
+        if source_fixture.status == "pending":
+            if source_fixture.approved_at is not None or source_fixture.approved_by is not None:
+                raise ValueError("fixture pending evidence is malformed")
+            return ("pending", "pending", source_fixture.created_at)
+        if source_fixture.status == "approved":
+            _require_truthy_str(source_fixture.approved_by, "approved_by")
+            approved_at = _require_iso8601(source_fixture.approved_at, "approved_at")
+            return ("approved", "approved", approved_at)
+        raise ValueError("unsupported fixture decision status")
 
     if binding.source_kind != "roadex-human-decision":
         raise ValueError("unsupported source_kind")
@@ -576,7 +598,7 @@ def _validate_approval_binding_draft(draft: object) -> None:
     validate_opaque_ref(draft.approval_ref)
     _require_enum(
         draft.source_kind,
-        {"admin-plan", "roadex-human-decision"},
+        set(_SOURCE_AUTHORITY_CLASSES),
         "source_kind",
     )
     _require_truthy_str(draft.source_id, "source_id")
@@ -588,6 +610,8 @@ def _validate_approval_binding_draft(draft: object) -> None:
         {"privileged-operation", "project-workflow"},
         "authority_class",
     )
+    if draft.authority_class != _SOURCE_AUTHORITY_CLASSES[draft.source_kind]:
+        raise ValueError("source_kind and authority_class pairing is invalid")
     _require_truthy_str(draft.subject, "subject")
     if (
         draft.source_kind == "admin-plan"
@@ -638,6 +662,16 @@ def _require_initial_source_state(source_kind: str, source: object) -> None:
                 "roadex binding source must be staged for initial projection binding"
             )
         _require_roadex_staged_plan_evidence(source_plan)
+        return
+    if source_kind == "roadex-approval-fixture":
+        source_fixture = _require_roadex_approval_fixture(source)
+        if (
+            source_fixture.status != "pending"
+            or source_fixture.approved_at is not None
+            or source_fixture.approved_by is not None
+        ):
+            raise ValueError("fixture binding source must be pending")
+        _require_iso8601(source_fixture.created_at, "created_at")
         return
     raise ValueError("unsupported source_kind")
 
@@ -712,6 +746,8 @@ def load_source_from_draft(store, draft: RoadexApprovalBindingDraft):
         return _load_admin_change_payload(store, draft.source_id)
     if draft.source_kind == "roadex-human-decision":
         return _load_roadex_plan_payload(store, draft.source_id)
+    if draft.source_kind == "roadex-approval-fixture":
+        return _load_roadex_approval_fixture_payload(store, draft.source_id)
     raise ValueError("unsupported source_kind")
 
 
@@ -724,6 +760,9 @@ def exact_source_evidence_digest(source: object) -> str:
         return source_digest_from_admin_plan(source)
     if isinstance(source, DonutHoleBackupProvisioningPlan):
         return source.plan_digest
+    from .roadex_approval_fixture import RoadexApprovalFixture, fixture_source_evidence_digest_payload
+    if isinstance(source, RoadexApprovalFixture):
+        return _digest(fixture_source_evidence_digest_payload(source))
     return _digest(to_jsonable(source))
 
 
@@ -826,6 +865,10 @@ def _validate_source(source: object, binding: RoadexApprovalBinding) -> None:
             raise ValueError("admin source id must match source payload")
     elif binding.source_kind == "roadex-human-decision":
         _require_roadex_plan(source)
+    elif binding.source_kind == "roadex-approval-fixture":
+        fixture = _require_roadex_approval_fixture(source)
+        if fixture.id != binding.source_id:
+            raise ValueError("fixture source id must match source payload")
     else:
         raise ValueError("unsupported source_kind")
 
@@ -838,6 +881,32 @@ def _require_roadex_plan(source: object) -> DonutHoleBackupProvisioningPlan:
     if source.kind != PLAN_KIND:
         raise ValueError("exact kind must be preserved")
     _validate_plan(source)
+    return source
+
+
+def _load_roadex_approval_fixture_payload(store, source_id: str):
+    from .roadex_approval_fixture import RoadexApprovalFixture
+
+    row = store._connection.execute(
+        "SELECT payload FROM roadex_approval_fixtures WHERE id=?",
+        (source_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(source_id)
+    fixture = _decode_dataclass_payload(
+        str(row["payload"]), RoadexApprovalFixture, "fixture source"
+    )
+    if fixture.id != source_id:
+        raise ValueError("fixture source id must match source payload")
+    return fixture
+
+
+def _require_roadex_approval_fixture(source: object):
+    from .roadex_approval_fixture import RoadexApprovalFixture
+
+    if not isinstance(source, RoadexApprovalFixture):
+        raise ValueError("fixture source must be exact RoadexApprovalFixture")
+    _require_iso8601(source.created_at, "created_at")
     return source
 
 
@@ -989,7 +1058,7 @@ def _validate_binding_object_types(binding: RoadexApprovalBinding) -> None:
     _require_truthy_str(binding.approval_ref, "approval_ref")
     _require_enum(
         binding.source_kind,
-        {"admin-plan", "roadex-human-decision"},
+        set(_SOURCE_AUTHORITY_CLASSES),
         "source_kind",
     )
     _require_truthy_str(binding.source_id, "source_id")
@@ -1001,6 +1070,8 @@ def _validate_binding_object_types(binding: RoadexApprovalBinding) -> None:
         {"privileged-operation", "project-workflow"},
         "authority_class",
     )
+    if binding.authority_class != _SOURCE_AUTHORITY_CLASSES[binding.source_kind]:
+        raise ValueError("source_kind and authority_class pairing is invalid")
     _require_truthy_str(binding.subject, "subject")
     _require_truthy_str(binding.scope_digest, "scope_digest")
     _require_iso8601(binding.created_at, "created_at")
@@ -1010,6 +1081,8 @@ def _validate_roadex_source_state(source_kind: str, source: object) -> None:
     if source_kind == "admin-plan":
         return
     if source_kind == "roadex-human-decision":
+        return
+    if source_kind == "roadex-approval-fixture":
         return
     raise ValueError("unsupported source_kind")
 

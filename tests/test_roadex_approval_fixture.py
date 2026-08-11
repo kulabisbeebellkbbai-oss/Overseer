@@ -18,6 +18,55 @@ from overseer.store import SQLiteStore
 
 
 class RoadexApprovalFixtureTests(unittest.TestCase):
+    def test_c901_schema_is_upgraded_idempotently_before_fixture_use(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = str(Path(directory) / "state.sqlite3")
+            with SQLiteStore(store_path) as store:
+                store._connection.execute("DROP TABLE roadex_approval_fixtures")
+                store._connection.execute("DELETE FROM schema_migrations")
+                store._connection.execute(
+                    "INSERT INTO schema_migrations(version, description, applied_at) "
+                    "VALUES (2, 'bootstrap JSON payload store', '2026-08-09T00:00:00+00:00')"
+                )
+                store._connection.commit()
+
+            payload = {
+                "projectId": "project.fixture",
+                "workspaceId": "workspace.fixture",
+                "resourceRef": "fixture.harmless",
+                "subject": "C901 schema migration",
+            }
+            locator = stage_roadex_approval_fixture_api(store_path, payload)
+            with SQLiteStore(store_path) as store:
+                table = store._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    ("roadex_approval_fixtures",),
+                ).fetchone()
+                self.assertIsNotNone(table)
+                self.assertEqual(store.list_roadex_approval_fixtures()[0].status, "pending")
+                self.assertEqual(
+                    [row.version for row in store.list_schema_migrations()[:2]],
+                    [2, 3],
+                )
+            approved = approve_roadex_approval_fixture_api(
+                store_path,
+                {"approvalRef": locator["approvalRef"]},
+                human_identity="fixture-human",
+            )
+            self.assertEqual(approved["decision"], "approved")
+            replay = approve_roadex_approval_fixture_api(
+                store_path,
+                {"approvalRef": locator["approvalRef"]},
+                human_identity="fixture-human",
+            )
+            self.assertEqual(replay["decision"], "approved")
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                approve_roadex_approval_fixture_api(
+                    store_path,
+                    {"approvalRef": locator["approvalRef"]},
+                    human_identity="different-human",
+                )
+
     def test_stage_rolls_back_source_when_binding_persistence_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = str(Path(directory) / "state.sqlite3")

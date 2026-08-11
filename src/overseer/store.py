@@ -60,7 +60,8 @@ from .storage_adapter import StorageAdapterRegistration, StorageAuthorizationRec
 from .usage_limits import UsageContinuationDispatch, UsageContinuationRequest, UsageLimit
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
+ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION = 3
 AGENT_DRIVER_SCHEMA_VERSION = "agent_driver_v1"
 AGENT_DRIVER_SCHEMA_V2 = "agent_driver_v2"
 AGENT_DRIVER_SCHEMA_V3 = "agent_driver_v3"
@@ -373,10 +374,15 @@ class SQLiteStore:
             str(row[0])
             for row in self._connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('schema_migrations', 'agent_schema_migrations')"
+                "AND name IN ('schema_migrations', 'agent_schema_migrations', "
+                "'roadex_approval_fixtures')"
             ).fetchall()
         }
-        if tables != {"schema_migrations", "agent_schema_migrations"}:
+        if tables != {
+            "schema_migrations",
+            "agent_schema_migrations",
+            "roadex_approval_fixtures",
+        }:
             return False
         schema_current = self._connection.execute(
             "SELECT 1 FROM schema_migrations WHERE version = ?",
@@ -510,10 +516,6 @@ class SQLiteStore:
                 source_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS roadex_approval_fixtures (
-                id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS host_security_source_reviews (
                 id TEXT PRIMARY KEY,
                 remote_address TEXT NOT NULL,
@@ -569,7 +571,15 @@ class SQLiteStore:
             """
         )
         with self._connection:
-            self._record_schema_migration(CURRENT_SCHEMA_VERSION, "bootstrap JSON payload store")
+            has_schema_history = self._connection.execute(
+                "SELECT 1 FROM schema_migrations LIMIT 1"
+            ).fetchone() is not None
+            if not has_schema_history:
+                self._record_schema_migration(
+                    CURRENT_SCHEMA_VERSION,
+                    "bootstrap JSON payload store",
+                )
+            self._migrate_roadex_approval_fixture_schema()
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_schema_migrations (
@@ -799,6 +809,25 @@ class SQLiteStore:
             self._record_agent_schema_migration(
                 AGENT_DRIVER_SCHEMA_V9,
                 "attest new handoffs; legacy unsigned packages remain fail-safe invalid",
+            )
+
+    def _migrate_roadex_approval_fixture_schema(self) -> None:
+        """Install the non-operational Roadex fixture table across schema versions."""
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS roadex_approval_fixtures (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        highest = self._connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        if highest is None or int(highest) < ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION:
+            self._record_schema_migration(
+                ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION,
+                "persist non-operational Roadex approval fixtures",
             )
 
     def _migrate_agent_activation_leases(self) -> None:

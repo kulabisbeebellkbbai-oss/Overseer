@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -14,10 +15,96 @@ from overseer.roadex_approval_fixture import (
     stage_roadex_approval_fixture_api,
 )
 from overseer.roadex_approval_status import roadex_approval_status
-from overseer.store import SQLiteStore
+from overseer.store import (
+    ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION,
+    SQLiteStore,
+)
 
 
 class RoadexApprovalFixtureTests(unittest.TestCase):
+    def test_forward_schema_history_is_current_without_repeated_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = str(Path(directory) / "state.sqlite3")
+            with SQLiteStore(store_path) as store:
+                store._connection.execute("DROP TABLE roadex_approval_fixtures")
+                store._connection.execute("DELETE FROM schema_migrations")
+                store._connection.executemany(
+                    "INSERT INTO schema_migrations(version, description, applied_at) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        (1, "first migration", "2026-08-01T00:00:00+00:00"),
+                        (2, "bootstrap JSON payload store", "2026-08-02T00:00:00+00:00"),
+                        (10, "future migration", "2026-08-10T00:00:00+00:00"),
+                    ),
+                )
+                store._connection.commit()
+
+            with SQLiteStore(store_path) as store:
+                first_history = store.list_schema_migrations()
+                self.assertIsNotNone(
+                    store._connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='roadex_approval_fixtures'"
+                    ).fetchone()
+                )
+
+            with patch.object(
+                SQLiteStore,
+                "initialize",
+                side_effect=AssertionError("forward schema history was rerun"),
+            ):
+                with SQLiteStore(store_path) as store:
+                    second_history = store.list_schema_migrations()
+
+            self.assertEqual(first_history, second_history)
+            self.assertEqual([row.version for row in first_history[:3]], [1, 2, 10])
+
+    def test_fixture_schema_migration_rolls_back_ddl_and_history_then_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = str(Path(directory) / "state.sqlite3")
+            with SQLiteStore(store_path) as store:
+                store._connection.execute("DROP TABLE roadex_approval_fixtures")
+                store._connection.execute("DELETE FROM schema_migrations")
+                store._connection.execute(
+                    "INSERT INTO schema_migrations(version, description, applied_at) "
+                    "VALUES (2, 'bootstrap JSON payload store', '2026-08-09T00:00:00+00:00')"
+                )
+                store._connection.commit()
+
+            class FailingMigrationStore(SQLiteStore):
+                def _record_schema_migration(self, version, description):
+                    if version == ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION:
+                        raise RuntimeError("injected fixture migration failure")
+                    return super()._record_schema_migration(version, description)
+
+            with self.assertRaisesRegex(RuntimeError, "injected fixture migration failure"):
+                FailingMigrationStore(store_path)
+
+            with sqlite3.connect(store_path) as connection:
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    ("roadex_approval_fixtures",),
+                ).fetchone()
+                self.assertIsNone(table)
+                self.assertEqual(
+                    [row[0] for row in connection.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version"
+                    ).fetchall()],
+                    [2],
+                )
+
+            with SQLiteStore(store_path) as store:
+                self.assertIsNotNone(
+                    store._connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='roadex_approval_fixtures'"
+                    ).fetchone()
+                )
+                self.assertEqual(
+                    [row.version for row in store.list_schema_migrations()[:2]],
+                    [2, 3],
+                )
+
     def test_c901_schema_is_upgraded_idempotently_before_fixture_use(self):
         with tempfile.TemporaryDirectory() as directory:
             store_path = str(Path(directory) / "state.sqlite3")

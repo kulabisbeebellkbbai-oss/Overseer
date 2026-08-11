@@ -385,14 +385,18 @@ class SQLiteStore:
         }:
             return False
         schema_current = self._connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = ?",
-            (CURRENT_SCHEMA_VERSION,),
+            "SELECT MAX(version) AS version FROM schema_migrations"
         ).fetchone()
         agent_current = self._connection.execute(
             "SELECT 1 FROM agent_schema_migrations WHERE version = ?",
             (AGENT_DRIVER_SCHEMA_V9,),
         ).fetchone()
-        return schema_current is not None and agent_current is not None
+        return (
+            schema_current is not None
+            and schema_current["version"] is not None
+            and int(schema_current["version"]) >= CURRENT_SCHEMA_VERSION
+            and agent_current is not None
+        )
 
     def close(self) -> None:
         failure: Exception | None = None
@@ -813,22 +817,31 @@ class SQLiteStore:
 
     def _migrate_roadex_approval_fixture_schema(self) -> None:
         """Install the non-operational Roadex fixture table across schema versions."""
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS roadex_approval_fixtures (
-                id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL
+        savepoint = "roadex_approval_fixture_schema"
+        self._connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS roadex_approval_fixtures (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        highest = self._connection.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0]
-        if highest is None or int(highest) < ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION:
-            self._record_schema_migration(
-                ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION,
-                "persist non-operational Roadex approval fixtures",
-            )
+            highest = self._connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            if highest is None or int(highest) < ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION:
+                self._record_schema_migration(
+                    ROADEX_APPROVAL_FIXTURE_SCHEMA_VERSION,
+                    "persist non-operational Roadex approval fixtures",
+                )
+        except Exception:
+            self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def _migrate_agent_activation_leases(self) -> None:
         columns = {

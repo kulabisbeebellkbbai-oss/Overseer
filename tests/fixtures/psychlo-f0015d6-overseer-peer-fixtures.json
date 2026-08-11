@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "psychlo.overseer-peer-fixtures.v1",
+  "crossProjectWork": {
+    "request": {
+      "schemaVersion": "psychlo.event.v1",
+      "id": "cross-project-work:a192d95f0d1bc533ddf37ee3f1b09e8da549be31d2a5a96fc2e0540845e8db42",
+      "linkId": "fixture-link",
+      "version": "v1",
+      "projectId": "fixture-alpha",
+      "leadId": "lead-fixture-alpha",
+      "coordinationBindingId": "fixture-binding",
+      "requiredRequestIds": [
+        "cross-project-work:a192d95f0d1bc533ddf37ee3f1b09e8da549be31d2a5a96fc2e0540845e8db42",
+        "cross-project-work:3358fa18b507bbc5601e382b8c780f3deeed0c0279ee0043412015993ab44cd6"
+      ],
+      "supervisorLeadId": "lead-fixture-supervisor",
+      "scope": "bounded fixture producer work",
+      "evidenceIds": ["evidence:fixture-request"],
+      "expectedResultDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requestDigest": "141f47b4548afdaa07ac26166b08256b0ea712d57a94787edbb11ccda5ede3ba"
+    },
+    "response": {
+      "accepted": true,
+      "receipt": {
+        "requestId": "cross-project-work:a192d95f0d1bc533ddf37ee3f1b09e8da549be31d2a5a96fc2e0540845e8db42",
+        "projectId": "fixture-alpha",
+        "leadId": "lead-fixture-alpha",
+        "status": "accepted",
+        "provenanceId": "overseer:cross-project-work:a192d95f0d1bc533ddf37ee3f1b09e8da549be31d2a5a96fc2e0540845e8db42"
+      }
+    }
+  },
+  "concurrencyCanaryResult": {
+    "request": {
+      "resultId": "canary-result:fixture-canary",
+      "authorizationId": "fixture-canary",
+      "targetCeiling": 2,
+      "expectedRevision": 0,
+      "executions": [
+        {
+          "executionId": "fixture-round-1",
+          "started": {
+            "executionId": "fixture-round-1",
+            "authorizationId": "fixture-canary",
+            "projectId": "fixture-alpha",
+            "planId": "plan-fixture-alpha",
+            "planVersion": "v1",
+            "roundId": "fixture-round-1",
+            "leadId": "lead-fixture-alpha",
+            "startedAt": "2026-08-11T12:00:01.000Z",
+            "digest": "118ef76e328e126490198e2cb9842ee18f7c103643cdc12de6ab79ae83dd0d55"
+          },
+          "completed": {
+            "executionId": "fixture-round-1",
+            "authorizationId": "fixture-canary",
+            "projectId": "fixture-alpha",
+            "planId": "plan-fixture-alpha",
+            "planVersion": "v1",
+            "roundId": "fixture-round-1",
+            "leadId": "lead-fixture-alpha",
+            "settledAt": "2026-08-11T12:00:05.000Z",
+            "terminalStatus": "completed",
+            "resultDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "evidenceId": "evidence:fixture-round-1",
+            "evidenceDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "digest": "d7e23f44e8c2a2c6c74c68e0ca5c7c629e4384c82a73fab2194fcdf3eb3f0733"
+          }
+        },
+        {
+          "executionId": "fixture-round-2",
+          "started": {
+            "executionId": "fixture-round-2",
+            "authorizationId": "fixture-canary",
+            "projectId": "fixture-beta",
+            "planId": "plan-fixture-beta",
+            "planVersion": "v1",
+            "roundId": "fixture-round-2",
+            "leadId": "lead-fixture-beta",
+            "startedAt": "2026-08-11T12:00:02.000Z",
+            "digest": "543ec594bddf89db4cfede66db29e869e3212540523831fd390a4f2102ee4c0f"
+          },
+          "completed": {
+            "executionId": "fixture-round-2",
+            "authorizationId": "fixture-canary",
+            "projectId": "fixture-beta",
+            "planId": "plan-fixture-beta",
+            "planVersion": "v1",
+            "roundId": "fixture-round-2",
+            "leadId": "lead-fixture-beta",
+            "settledAt": "2026-08-11T12:00:06.000Z",
+            "terminalStatus": "completed",
+            "resultDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "evidenceId": "evidence:fixture-round-2",
+            "evidenceDigest": "4444444444444444444444444444444444444444444444444444444444444444",
+            "digest": "76e23b41e8d5fdaeaaeb0c5944f5e6652b376b46c240f855c6d8beb20eed3a52"
+          }
+        }
+      ],
+      "concurrencyObserved": true,
+      "occurredAt": "2026-08-11T12:00:06.000Z",
+      "digest": "47d90eed78aacdf203ba0a09269f6ca327bc0ca887abac6b8bbe18cd863cffe2"
+    },
+    "response": {
+      "accepted": true,
+      "receipt": {
+        "resultId": "canary-result:fixture-canary",
+        "digest": "47d90eed78aacdf203ba0a09269f6ca327bc0ca887abac6b8bbe18cd863cffe2",
+        "status": "accepted",
+        "provenanceId": "overseer:canary-result:fixture-canary"
+      }
+    }
+  }
+}

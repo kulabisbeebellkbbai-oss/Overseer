@@ -80,6 +80,10 @@ def _successful_canary_result(authorization_id: str = "canary-1") -> dict:
     return {**base, "digest": hashed(base)}
 
 
+def _peer_fixtures() -> dict:
+    return json.loads((Path(__file__).parent / "fixtures" / "psychlo-f0015d6-overseer-peer-fixtures.json").read_text(encoding="utf-8"))
+
+
 def test_admin_canary_and_later_ceiling_initiators_require_separate_approvals(tmp_path: Path):
     sent = []
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
@@ -110,23 +114,24 @@ def test_coordination_dispatch_id_is_pending_until_authenticated_lead_result(tmp
     request = _coord_request("binding-1", "link-1", "v1", "arcade", "lead-arcade", "lead-supervisor", ["arcade", "hermione"])
     store.record_protocol("cross-project-team-binding", "binding-1", "binding-1", "b" * 64, {"bindingId": "binding-1", "coordinationTeamId": "team-1", "supervisorMemberId": "member-supervisor", "supervisorLeadId": "lead-supervisor"}, state="delivered")
     accepted = bridge.receive_coordination_work_request(request)
-    assert accepted == {"accepted": True, "receipt": {"requestId": request["id"], "projectId": "arcade", "leadId": "lead-arcade", "status": "accepted", "provenanceId": f"overseer:coordination-work-request:{request['id']}"}}
+    assert accepted["accepted"] is True
+    assert accepted["receipt"]["status"] == "accepted"
     assert store.protocol_record("cross-project-participant-result", request["id"]) is None
     with pytest.raises(ValueError, match="authoritative result collector"):
         bridge.receive_cross_project_participant_result({})
 
 
-def test_coordination_accepts_exact_psychlo_3d178b6_fixture_and_replays_receipt(tmp_path: Path):
-    request = json.loads((Path(__file__).parent / "fixtures" / "psychlo-3d178b6-cross-project-work.json").read_text(encoding="utf-8"))
+def test_coordination_accepts_exact_psychlo_f0015d6_fixture_and_replays_receipt(tmp_path: Path):
+    fixture = _peer_fixtures()["crossProjectWork"]
+    request = fixture["request"]
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
-    store.record_project("producer", {"projectLead": {"id": "lead-p"}}, {})
-    store.record_protocol("cross-project-team-binding", "binding-runtime", "binding-runtime", "b" * 64, {"bindingId": "binding-runtime", "coordinationTeamId": "team-runtime", "supervisorMemberId": "member-runtime", "supervisorLeadId": "supervisor-runtime"}, state="delivered")
+    store.record_project(request["projectId"], {"projectLead": {"id": request["leadId"]}}, {})
+    store.record_protocol("cross-project-team-binding", request["coordinationBindingId"], request["coordinationBindingId"], "b" * 64, {"bindingId": request["coordinationBindingId"], "coordinationTeamId": "team-runtime", "supervisorMemberId": "member-runtime", "supervisorLeadId": request["supervisorLeadId"]}, state="delivered")
     calls = []
     bridge = PsychloBridge(store=store, dispatcher=lambda lead, scope, key: calls.append((lead, scope, key)) or "dispatch-1", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
-    expected = {"accepted": True, "receipt": {"requestId": request["id"], "projectId": "producer", "leadId": "lead-p", "status": "accepted", "provenanceId": f"overseer:coordination-work-request:{request['id']}"}}
-    assert bridge.receive_coordination_work_request(request) == expected
-    assert bridge.receive_coordination_work_request(request) == expected
-    assert calls == [("lead-p", "bounded producer work", request["id"])]
+    assert bridge.receive_coordination_work_request(request) == fixture["response"]
+    assert bridge.receive_coordination_work_request(request) == fixture["response"]
+    assert calls == [(request["leadId"], request["scope"], request["id"])]
 
 
 def test_coordination_dispatch_claim_is_cross_process_and_idempotent(tmp_path: Path):
@@ -163,18 +168,18 @@ def test_coordination_operation_lease_expires_and_preserves_idempotency(tmp_path
     assert renewed is not None and renewed["ownerId"] == "owner-2" and renewed["attempts"] == 2 and renewed["idempotencyKey"] == "request-1"
 
 
-def test_canary_result_is_terminal_inbound_only_with_exact_replay_receipt(tmp_path: Path):
+def test_canary_result_matches_exact_psychlo_f0015d6_fixture_and_is_terminal_inbound_only(tmp_path: Path):
+    fixture = _peer_fixtures()["concurrencyCanaryResult"]
+    result = fixture["request"]
     sent = []
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
-    authorization = {"authorizationId": "canary-1", "targetTemporaryCeiling": 2, "expectedRevision": 0, "decisionId": "roadex:concurrency-canary:canary-1"}
-    store.record_protocol("concurrency-canary-authorization", "canary-1", "canary-1", "b" * 64, authorization, state="delivered")
+    authorization = {"authorizationId": result["authorizationId"], "targetTemporaryCeiling": result["targetCeiling"], "expectedRevision": result["expectedRevision"], "decisionId": f"roadex:concurrency-canary:{result['authorizationId']}"}
+    store.record_protocol("concurrency-canary-authorization", result["authorizationId"], result["authorizationId"], "b" * 64, authorization, state="delivered")
     store.record_decision({"decisionId": authorization["decisionId"]}, {"decisionId": authorization["decisionId"]})
     store.decide(authorization["decisionId"], "approved", "human-user", NOW, "approved")
     bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda kind, mid, payload: sent.append((kind, mid, payload)) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
-    result = _successful_canary_result()
-    expected = {"accepted": True, "receipt": {"resultId": result["resultId"], "digest": result["digest"], "status": "accepted", "provenanceId": f"overseer:concurrency-canary-result:{result['resultId']}"}}
-    assert bridge.receive_concurrency_canary_result(result) == expected
-    assert bridge.receive_concurrency_canary_result(result) == expected
+    assert bridge.receive_concurrency_canary_result(result) == fixture["response"]
+    assert bridge.receive_concurrency_canary_result(result) == fixture["response"]
     assert sent == []
     assert store.protocol_record("concurrency-canary-result", result["resultId"])["state"] == "delivered"
 

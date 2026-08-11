@@ -911,7 +911,7 @@ class PsychloBridge:
             self._drive_coordination_request(value["id"])
         except ValueError as error:
             if str(error) != "dispatch-pending": raise
-        receipt = {"requestId": value["id"], "projectId": value["projectId"], "leadId": value["leadId"], "status": "accepted", "provenanceId": f"overseer:coordination-work-request:{value['id']}"}
+        receipt = {"requestId": value["id"], "projectId": value["projectId"], "leadId": value["leadId"], "status": "accepted", "provenanceId": f"overseer:{value['id']}"}
         return {"accepted": True, "receipt": receipt}
 
     def _drive_coordination_request(self, request_id: str) -> dict[str, Any]:
@@ -1107,7 +1107,7 @@ class PsychloBridge:
             record = self.store.transition_protocol("concurrency-canary-result", value["resultId"], "delivered")
         if inserted or record["state"] == "delivered":
             self.store.transition_protocol("concurrency-canary-authorization", value["authorizationId"], "settled")
-        receipt = {"resultId": value["resultId"], "digest": value["digest"], "status": "accepted", "provenanceId": f"overseer:concurrency-canary-result:{value['resultId']}"}
+        receipt = {"resultId": value["resultId"], "digest": value["digest"], "status": "accepted", "provenanceId": f"overseer:{value['resultId']}"}
         return {"accepted": True, "receipt": receipt}
 
     def change_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:

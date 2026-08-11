@@ -339,12 +339,9 @@ class PsychloBridge:
         return False
 
     def register_project(self, registration: Mapping[str, Any]) -> dict[str, Any]:
-        envelope = registration.get("envelope")
-        receipt = registration.get("receipt")
-        if not isinstance(envelope, dict) or not isinstance(receipt, dict): raise ValueError("project registration is invalid")
-        project = envelope.get("project"); lead = envelope.get("projectLead"); plan = envelope.get("plan")
-        if not isinstance(project, dict) or not isinstance(lead, dict) or not isinstance(plan, dict): raise ValueError("project registration is invalid")
-        project_id = _required_string(project, "id"); project_lead_id = _required_string(lead, "id"); receipt_id = _required_string(receipt, "receiptId")
+        identity = self._project_registration_identity(registration)
+        envelope = registration["envelope"]; receipt = registration["receipt"]; plan = envelope["plan"]
+        project_id = identity["projectId"]; project_lead_id = identity["projectLeadId"]; receipt_id = identity["receiptId"]
         existing = self.store.project(project_id)
         if existing:
             if existing[0] != dict(registration): raise ValueError("project registration conflict")
@@ -364,6 +361,20 @@ class PsychloBridge:
         if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
         self.store.record_project(project_id, registration, scheduling)
         return {"accepted": True}
+
+    @staticmethod
+    def _project_registration_identity(registration: Mapping[str, Any], scheduling: Mapping[str, Any] | None = None) -> dict[str, str]:
+        envelope = registration.get("envelope"); receipt = registration.get("receipt")
+        if not isinstance(envelope, dict) or not isinstance(receipt, dict): raise ValueError("project registration is invalid")
+        project = envelope.get("project"); lead = envelope.get("projectLead"); plan = envelope.get("plan"); receipt_project = receipt.get("project")
+        if not all(isinstance(item, dict) for item in (project, lead, plan, receipt_project)): raise ValueError("project registration is invalid")
+        identity = {"projectId": _required_string(project, "id"), "planId": _required_string(project, "planId"), "planVersion": _required_string(project, "planVersion"), "aTeamId": _required_string(envelope, "aTeamId"), "projectLeadId": _required_string(lead, "id"), "receiptId": _required_string(receipt, "receiptId")}
+        digest = envelope.get("digest")
+        if not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None or receipt.get("source") != "psychlo" or receipt.get("status") != "admitted" or receipt.get("handoffContractVersion") != envelope.get("contractVersion") or receipt.get("aTeamId") != identity["aTeamId"] or receipt.get("envelopeDigest") != digest or receipt.get("correlationId") != envelope.get("correlationId") or receipt.get("idempotencyKey") != envelope.get("idempotencyKey") or receipt_project.get("id") != identity["projectId"] or receipt_project.get("planId") != identity["planId"] or receipt_project.get("planVersion") != identity["planVersion"]:
+            raise ValueError("project registration identity is invalid")
+        if scheduling is not None and (scheduling.get("projectId") != identity["projectId"] or scheduling.get("projectLeadId") != identity["projectLeadId"] or scheduling.get("state") != "managed" or scheduling.get("correlationId") != f"psychlo-scheduling:{identity['receiptId']}" or scheduling.get("idempotencyKey") != f"psychlo-scheduling:{identity['receiptId']}"):
+            raise ValueError("project scheduling identity is invalid")
+        return identity
 
     def reconcile_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         existing = self.store.get_round(str(request.get("roundId", "")))
@@ -1066,7 +1077,9 @@ class PsychloBridge:
         if value["id"] != expected_id or value["id"] not in request_ids or value["coordinationBindingId"] == value["linkId"]: raise ValueError("coordination binding identity is invalid")
         if value["requestDigest"] != cross_project_work_request_digest(value): raise ValueError("coordination request digest is invalid")
         project = self.store.project(value["projectId"])
-        if project is None or project[0].get("projectLead", {}).get("id", project[0].get("projectLeadId")) != value["leadId"]: raise ValueError("coordination work lead is not registered")
+        if project is None: raise ValueError("coordination work lead is not registered")
+        identity = self._project_registration_identity(project[0], project[1])
+        if identity["projectId"] != value["projectId"] or identity["projectLeadId"] != value["leadId"]: raise ValueError("coordination work lead is not registered")
         binding = self.store.protocol_record("cross-project-team-binding", value["coordinationBindingId"])
         if binding is None or binding["state"] != "delivered" or binding["payload"].get("bindingId") != value["coordinationBindingId"] or not binding["payload"].get("coordinationTeamId") or not binding["payload"].get("supervisorMemberId") or binding["payload"].get("supervisorLeadId") != value["supervisorLeadId"]: raise ValueError("approved coordination team binding is required")
         for existing in self.store.coordination_requests_for_link(value["linkId"], value["version"]):

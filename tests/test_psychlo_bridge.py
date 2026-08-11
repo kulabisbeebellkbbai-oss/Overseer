@@ -176,7 +176,7 @@ def _persist_approved_canary(store: PsychloBridgeStore, *, deadline: str = "2026
 
 
 def _canary_round(round_id: str, project_id: str, plan_id: str, lead_id: str) -> dict:
-    return {"roundId": round_id, "projectId": project_id, "projectLeadId": lead_id, "planId": plan_id, "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": round_id, "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": project_id}
+    return {"roundId": round_id, "projectId": project_id, "projectLeadId": lead_id, "planId": plan_id, "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": round_id, "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "project-id"}
 
 
 def test_approved_canary_admits_exactly_two_independent_rounds_atomically(tmp_path: Path):

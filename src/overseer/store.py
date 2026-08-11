@@ -292,7 +292,12 @@ class SQLiteStore:
         if expected == path_identity and stat.S_IMODE(path_status.st_mode) == 0o600:
             return path_identity
 
-        status = sidecar.lstat()
+        try:
+            status = sidecar.lstat()
+        except FileNotFoundError:
+            # A checkpoint may remove a sidecar between the initial
+            # inspection and this identity re-check.
+            return None
         self._validate_artifact_status(sidecar, status)
         identity = (status.st_dev, status.st_ino)
         if expected is not None and identity != expected:

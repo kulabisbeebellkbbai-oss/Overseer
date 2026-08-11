@@ -833,6 +833,35 @@ def test_store_accepts_owner_only_sidecar_rotation_from_nested_connection(
         assert reopened.load_agent_checkpoint("checkpoint.outer").id == "checkpoint.outer"
 
 
+def test_sidecar_disappearance_during_recheck_is_treated_as_checkpoint_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = OverseerStore(path)
+    store._connection.close()
+    sidecar = Path(f"{path}-journal")
+    sidecar.write_bytes(b"journal removed by checkpoint")
+    sidecar.chmod(0o644)
+    original_lstat = Path.lstat
+    calls = 0
+
+    def disappear_on_recheck(candidate: Path) -> os.stat_result:
+        nonlocal calls
+        if candidate == sidecar:
+            calls += 1
+            if calls == 2:
+                raise FileNotFoundError(candidate)
+        return original_lstat(candidate)
+
+    monkeypatch.setattr(Path, "lstat", disappear_on_recheck)
+    try:
+        assert store._inspect_sidecar_and_harden(sidecar, "-journal") is None
+    finally:
+        sidecar.unlink(missing_ok=True)
+
+    assert calls == 2
+
+
 def test_store_preserves_integrity_with_concurrent_process_readers_and_writers(
     tmp_path: Path,
 ) -> None:

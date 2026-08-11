@@ -268,11 +268,57 @@ class PsychloBridge:
             if existing[0] != dict(request): raise ValueError("round identity conflict")
             if existing[4] != "dispatched": return self._dispatch_reserved(existing[0], existing[3], existing[1])
             return {"accepted": True, "receipt": existing[1]}
-        if self.store.active_round() is not None: raise ValueError("single_stream_busy")
         capability = self.token_factory()
         receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": f"overseer-dispatch:{request['roundId']}", "status": "accepted"}
-        self.store.record_round(request, receipt, capability)
+        if self._durable_ceiling_available():
+            self.store.record_durable_ceiling_round(request, receipt, capability, self.clock())
+        else:
+            canary = self._canary_authorization_for_request(request)
+            if canary is not None:
+                self.store.record_canary_round(request, receipt, capability, canary["authorizationId"], canary["expectedRevision"], self.clock())
+            else:
+                self.store.record_single_stream_round(request, receipt, capability)
         return self._dispatch_reserved(dict(request), capability, receipt)
+
+    def _canary_authorization_for_request(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Select only an exact, currently approved canary authorization.
+
+        This is merely a candidate lookup.  ``record_canary_round`` repeats
+        every check while holding SQLite's write lock, so concurrent callers
+        cannot rely on this process-local view to obtain a second slot.
+        """
+        now = _time(self.clock())
+        for record in self.store.list_protocol("concurrency-canary-authorization"):
+            if record is None or record.get("state") != "delivered":
+                continue
+            value = record.get("payload")
+            if not isinstance(value, dict) or value.get("targetTemporaryCeiling") != 2 or value.get("expectedGlobalCeiling") != 1:
+                continue
+            try:
+                deadline = _time(str(value["deadline"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if deadline <= now or not isinstance(value.get("projects"), list) or len(value["projects"]) != 2:
+                continue
+            if not any(isinstance(project, dict) and project.get("projectId") == request.get("projectId") and project.get("planId") == request.get("planId") and project.get("planVersion") == request.get("planVersion") and project.get("leadId") == request.get("projectLeadId") for project in value["projects"]):
+                continue
+            decision = self.store.decision(str(value.get("decisionId", "")))
+            if decision is None or decision[2] != "approved":
+                continue
+            return value
+        return None
+
+    def _durable_ceiling_available(self) -> bool:
+        """Return a hint only; the store repeats the check under its lock."""
+        changes = self.store.list_protocol("concurrency-ceiling-change")
+        for change in reversed([item for item in changes if item is not None]):
+            if change.get("state") not in {"delivered", "settled"}:
+                continue
+            authorization_id = change.get("payload", {}).get("authorizationId")
+            authorization = self.store.protocol_record("concurrency-ceiling-authorization", str(authorization_id)) if authorization_id else None
+            if authorization and authorization.get("state") in {"delivered", "settled"} and authorization.get("payload", {}).get("ceiling") == 2:
+                return True
+        return False
 
     def register_project(self, registration: Mapping[str, Any]) -> dict[str, Any]:
         envelope = registration.get("envelope")

@@ -221,6 +221,104 @@ class PsychloBridgeStore:
         row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone()
         return None if row is None else str(row[0])
 
+    def active_rounds(self) -> list[dict[str, Any]]:
+        """Return the immutable request identity for every unfinished round."""
+        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def record_canary_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, authorization_id: str, expected_revision: int, now: str) -> None:
+        """Atomically reserve one of the two authorized canary streams.
+
+        The authorization and Roadex outcome are read inside the same
+        ``BEGIN IMMEDIATE`` transaction as the active-round check.  This is
+        intentionally a store operation: a caller cannot turn an assertion
+        about authorization into a second stream or win a cross-process race.
+        """
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            auth_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (authorization_id,)).fetchone()
+            if auth_row is None or auth_row[1] != "delivered":
+                raise ValueError("concurrency canary authorization is unavailable")
+            authorization = json.loads(auth_row[0])
+            if authorization.get("expectedRevision") != expected_revision:
+                raise ValueError("concurrency canary authorization revision conflict")
+            try:
+                deadline = datetime.fromisoformat(str(authorization["deadline"]).replace("Z", "+00:00"))
+                observed = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("concurrency canary authorization timestamp is invalid") from error
+            if deadline <= observed:
+                raise ValueError("concurrency canary authorization expired")
+            decision_id = authorization.get("decisionId")
+            decision_row = self.connection.execute("SELECT status FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
+            if decision_row is None or decision_row[0] != "approved":
+                raise ValueError("concurrency canary authorization is not approved")
+            projects = authorization.get("projects")
+            if not isinstance(projects, list) or len(projects) != 2:
+                raise ValueError("concurrency canary authorization project binding is invalid")
+            bound = next((item for item in projects if isinstance(item, dict) and item.get("projectId") == request.get("projectId")), None)
+            if bound is None or any(request.get(field) != bound.get(source) for field, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
+                raise ValueError("concurrency canary round identity is not authorized")
+            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()
+            active = [json.loads(row[0]) for row in rows]
+            if len(active) >= 2:
+                raise ValueError("single_stream_busy")
+            allowed = {(item.get("projectId"), item.get("planId"), item.get("planVersion"), item.get("leadId")) for item in projects if isinstance(item, dict)}
+            for item in active:
+                identity = (item.get("projectId"), item.get("planId"), item.get("planVersion"), item.get("projectLeadId"))
+                if identity not in allowed or item.get("projectId") == request.get("projectId"):
+                    raise ValueError("single_stream_busy")
+            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def record_durable_ceiling_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, now: str) -> None:
+        """Reserve an eligible round under the persisted global ceiling.
+
+        The change record and its exact authorization are re-read under the
+        same write lock as the unresolved-round count.  This keeps a restart
+        or two bridge processes from observing a stale ceiling or admitting a
+        third stream.
+        """
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            change = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-change' AND state IN ('delivered','settled') ORDER BY updated_at DESC, rowid DESC LIMIT 1").fetchone()
+            if change is None:
+                raise ValueError("concurrency ceiling is unavailable")
+            change_payload = json.loads(change[0])
+            authorization_id = change_payload.get("authorizationId")
+            auth = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
+            if auth is None or auth[1] not in {"delivered", "settled"}:
+                raise ValueError("concurrency ceiling authorization is unavailable")
+            authorization = json.loads(auth[0])
+            if authorization.get("ceiling") != 2 or authorization.get("revision") != authorization.get("expectedRevision", -1) + 1:
+                raise ValueError("concurrency ceiling is invalid")
+            decision_row = self.connection.execute("SELECT status FROM decisions WHERE decision_id=?", (authorization.get("decisionId"),)).fetchone()
+            if decision_row is None or decision_row[0] != "approved":
+                raise ValueError("concurrency ceiling authorization is not approved")
+            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()]
+            if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
+                raise ValueError("single_stream_busy")
+            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def record_single_stream_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
+        """Atomically preserve the default global ceiling of one."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone() is not None:
+                raise ValueError("single_stream_busy")
+            self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def record_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
         self.connection.execute("INSERT INTO rounds VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump(request), _dump(receipt), _token_hash(capability), capability))
 

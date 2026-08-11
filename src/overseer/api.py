@@ -685,6 +685,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/psychlo/adoption-evidence": "adoption-evidence",
                 "/psychlo/external-round": "external-round",
                 "/psychlo/external-rounds": "external-round",
+                "/psychlo/coordination/work": "coordination-work-request",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])
@@ -1299,6 +1300,8 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     result = psychlo_bridge.receive_adoption_evidence(message["payload"])
                 elif kind == "external-round":
                     result = psychlo_bridge.receive_external_round(message["payload"])
+                elif kind == "coordination-work-request":
+                    result = psychlo_bridge.receive_coordination_work_request(message["payload"])
                 elif kind == "decision-outcome":
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:

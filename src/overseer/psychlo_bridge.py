@@ -639,6 +639,32 @@ class PsychloBridge:
 
     receive_external_round_binding = authorize_external_round_binding
 
+    @staticmethod
+    def _approved_admin_record(record: Mapping[str, Any], kind: str) -> None:
+        if record.get("status") != "approved" or record.get("kind") != kind or not isinstance(record.get("provenanceId"), str) or not record["provenanceId"].strip() or record.get("cancelled") is True:
+            raise ValueError("approved administrative provenance is required")
+
+    def initiate_external_round_binding(self, approval: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._approved_admin_record(approval, "external-work")
+        value = dict(payload)
+        value.setdefault("correlationId", f"external-binding:{value.get('reconciliationId', '')}")
+        value.setdefault("idempotencyKey", f"external-binding:{value.get('reconciliationId', '')}")
+        value.setdefault("occurredAt", self.clock())
+        value.setdefault("schemaVersion", "psychlo.external-round-binding.v1")
+        value["digest"] = canonical_digest({key: item for key, item in value.items() if key != "digest"})
+        return self.authorize_external_round_binding(value)
+
+    def initiate_ingress_conflict_reconciliation(self, approval: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._approved_admin_record(approval, "conflict-reconciliation")
+        value = dict(payload); value.setdefault("sourceId", "overseer"); value.setdefault("status", "resolved"); value.setdefault("provenanceId", approval["provenanceId"]); value.setdefault("correlationId", f"reconcile:{value.get('idempotencyKey', '')}"); value.setdefault("occurredAt", self.clock())
+        return self.reconcile_ingress_conflict(value)
+
+    def initiate_cross_project_team_binding(self, approval: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._approved_admin_record(approval, "cross-project-team-binding")
+        value = dict(payload); value.setdefault("approvalProvenanceId", approval["provenanceId"]); value.setdefault("correlationId", f"team-binding:{value.get('bindingId', '')}"); value.setdefault("idempotencyKey", f"team-binding:{value.get('bindingId', '')}"); value.setdefault("occurredAt", self.clock())
+        ordered = {key: value[key] for key in ("bindingId", "coordinationTeamId", "supervisorMemberId", "supervisorLeadId", "approvalId", "approvalProvenanceId", "approvedAt", "correlationId", "idempotencyKey", "occurredAt")}; value["digest"] = hashlib.sha256(json.dumps(ordered, separators=(",", ":")).encode()).hexdigest()
+        return self.authorize_cross_project_team_binding(value)
+
     def reconcile_ingress_conflict(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try: value = parse_ingress_conflict_reconciliation(payload)
         except ContractError as error: raise ValueError(str(error)) from error
@@ -660,6 +686,41 @@ class PsychloBridge:
         key = inner.get("idempotencyKey")
         if not isinstance(key, str) or not key.strip(): raise ValueError("cross-project command idempotency is required")
         return self._persist_protocol("cross-project-command", key, value)
+
+    def receive_coordination_work_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Handle one signed bounded lead request without creating a normal round."""
+        value = dict(payload)
+        required = {"linkId", "version", "projectId", "leadId", "requestId", "scope", "evidenceIds", "expectedResultDigest", "correlationId", "idempotencyKey", "occurredAt"}
+        if set(value) != required or any(not isinstance(value.get(field), str) or not value[field].strip() for field in required - {"evidenceIds"}): raise ValueError("coordination work request is invalid")
+        if not isinstance(value["evidenceIds"], list) or not 0 < len(value["evidenceIds"] ) <= 64 or any(not isinstance(item, str) or not item.strip() for item in value["evidenceIds"]): raise ValueError("coordination work evidence is invalid")
+        project = self.store.project(value["projectId"])
+        if project is None or project[0].get("projectLead", {}).get("id", project[0].get("projectLeadId")) != value["leadId"]: raise ValueError("coordination work lead is not registered")
+        record = self._persist_protocol("coordination-work-request", value["requestId"], value, forward=False)
+        existing_result = self.store.protocol_record("cross-project-participant-result", value["requestId"])
+        if existing_result is not None:
+            if existing_result["state"] != "delivered":
+                self._forward_protocol_record(existing_result)
+            return existing_result
+        try:
+            result = self.dispatcher(value["leadId"], value["scope"])
+            if isinstance(result, Mapping):
+                status = result.get("status", "completed") if result.get("status") in {"completed", "blocked"} else "completed"
+                evidence_id = str(result.get("evidenceId", f"lead-evidence:{value['requestId']}"))
+                result_digest = str(result.get("digest", value["expectedResultDigest"]))
+            else:
+                status, evidence_id, result_digest = "completed", f"lead-evidence:{value['requestId']}", value["expectedResultDigest"]
+            participant = {"linkId": value["linkId"], "version": value["version"], "projectId": value["projectId"], "leadId": value["leadId"], "resultId": value["requestId"], "requestId": value["requestId"], "status": status, "evidenceId": evidence_id, "digest": result_digest, "correlationId": value["correlationId"], "idempotencyKey": f"participant-result:{value['idempotencyKey']}", "occurredAt": self.clock()}
+            stored = self._persist_protocol("cross-project-participant-result", participant["resultId"], participant)
+            self.store.transition_protocol("coordination-work-request", value["requestId"], "settled")
+            return stored
+        except Exception:
+            self.store.transition_protocol("coordination-work-request", value["requestId"], "failed", "lead-adapter-failed")
+            raise
+
+    def _forward_protocol_record(self, record: Mapping[str, Any]) -> None:
+        response = self.sender(str(record["kind"]), str(record["id"]), record["payload"])
+        if response.get("accepted") is not True: raise ValueError("Psychlo rejected protocol record")
+        self.store.transition_protocol(str(record["kind"]), str(record["id"]), "delivered")
 
     receive_cross_project_command = coordinate_cross_project
 
@@ -701,9 +762,13 @@ class PsychloBridge:
 
     def recover_protocol_records(self) -> dict[str, int]:
         recovered = failed = 0
-        for kind in ("external-round-binding", "ingress-conflict-reconciliation", "cross-project-team-binding", "cross-project-command", "cross-project-participant-result", "cross-project-supervisor-review", "concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"):
+        for kind in ("external-round-binding", "ingress-conflict-reconciliation", "cross-project-team-binding", "cross-project-command", "coordination-work-request", "cross-project-participant-result", "cross-project-supervisor-review", "concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"):
             for record in self.store.pending_protocol(kind):
                 try:
+                    if kind == "coordination-work-request":
+                        self.receive_coordination_work_request(record["payload"])
+                        recovered += 1
+                        continue
                     response = self.sender(kind, record["id"], record["payload"])
                     if response.get("accepted") is not True: raise ValueError("rejected")
                     self.store.transition_protocol(kind, record["id"], "delivered")

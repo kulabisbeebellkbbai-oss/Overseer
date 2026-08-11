@@ -221,9 +221,19 @@ def test_task11_telemetry_sampling_keeps_cumulative_counters_and_provider_bindin
         raise AssertionError("provider binding changed")
 
 
+def test_task11_telemetry_exact_replay_returns_stored_derived_delta_after_restart(tmp_path: Path):
+    payload = {"checkpointId": "checkpoint-replay", "projectId": "arcade", "planId": "plan-1", "roundId": "round-replay", "threadId": "thread-1", "model": "gpt-5.6-luna", "featureClass": "backend", "sampleKind": "baseline", "cumulative": {"cachedInput": 1, "uncachedInput": 1, "output": 1, "reasoning": 1, "total": 4}, "activeMs": 1, "waitingMs": 0, "providerSnapshotId": "snapshot-1", "providerCapturedAt": NOW, "attribution": "isolated", "sourceId": "overseer", "correlationId": "corr", "idempotencyKey": "checkpoint-replay", "occurredAt": NOW}
+    first_bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    first = first_bridge.record_telemetry_checkpoint(payload)
+    restarted = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    replay = restarted.record_telemetry_checkpoint(payload)
+    assert replay["replay"] is True
+    assert replay["checkpoint"] == first["checkpoint"]
+
+
 def test_task11_learning_adapter_failure_isolated_and_retry_attempts_monotonic(tmp_path: Path):
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
-    observation = {"id": "observation-1", "featureProfile": {"taskClass": "backend", "model": "gpt-5.6-luna"}, "outcome": {"status": "completed", "observedAt": NOW}, "sourceId": "overseer", "correlationId": "corr", "idempotencyKey": "observation-1", "occurredAt": NOW}
+    observation = {"id": "observation-1", "featureProfile": {"taskClass": "python-feature", "model": "gpt-5.6-luna"}, "outcome": {"status": "completed", "observedAt": NOW}, "sourceId": "overseer", "correlationId": "corr", "idempotencyKey": "observation-1", "occurredAt": NOW}
     bridge.record_learning_observation(observation)
     calls = []
     assert bridge.deliver_learning_pending({"skiller": lambda item: calls.append(item) or (_ for _ in ()).throw(RuntimeError("down"))})["failed"] == 1

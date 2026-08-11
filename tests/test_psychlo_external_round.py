@@ -24,7 +24,21 @@ def test_external_round_persists_separately_before_forward_and_creates_gate(tmp_
     assert bridge.store.external_execution("reconcile-1") is not None
     assert bridge.store.active_round() is None
     assert forwarded[0][0] == "external-round"
-    assert any(item[0] == "decision-stage" for item in forwarded)
+    assert not any(item[0] == "decision-stage" for item in forwarded)
+    assert bridge.store.decision("roadex:external:reconcile-1") is None
+
+
+def test_external_round_uses_exact_psychlo_gate_receipt_once(tmp_path: Path):
+    forwarded = []
+    def send(kind, message_id, payload):
+        forwarded.append((kind, message_id, payload))
+        return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}}
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    first = bridge.receive_external_round(external_payload())
+    replay = bridge.receive_external_round(external_payload())
+    assert first["decisionId"] == replay["decisionId"] == "roadex:external:reconcile-1"
+    assert [item[0] for item in forwarded] == ["external-round"]
+    assert bridge.store.decision("roadex:external:reconcile-1") is None
 
 
 def test_external_round_exact_replay_conflict_and_forward_retry_survive_restart(tmp_path: Path):
@@ -47,3 +61,19 @@ def test_external_round_exact_replay_conflict_and_forward_retry_survive_restart(
         assert "conflict" in str(error)
     else:
         raise AssertionError("conflicting external identity was accepted")
+
+
+def test_approved_external_outcome_releases_only_a_fresh_bounded_round(tmp_path: Path):
+    dispatched = []
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda lead, prompt: dispatched.append((lead, prompt)) or "fresh-dispatch", sender=lambda *_: {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "fresh-capability-1234567890abcdef")
+    bridge.receive_external_round(external_payload())
+    request = {"roundId": "fresh-round", "projectId": "arcade", "projectLeadId": "lead-1", "planId": "plan-1", "planVersion": "v1", "correlationId": "fresh-corr", "idempotencyKey": "fresh-round", "snapshotId": "snapshot-2", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "approved continuation"}
+    try:
+        bridge.request_round(request)
+    except ValueError as error:
+        assert str(error) == "decision_pending"
+    else:
+        raise AssertionError("pending external decision did not block dispatch")
+    bridge.receive_external_decision_outcome({"decisionId": "roadex:external:reconcile-1", "status": "approved"})
+    bridge.request_round(request)
+    assert len(dispatched) == 1

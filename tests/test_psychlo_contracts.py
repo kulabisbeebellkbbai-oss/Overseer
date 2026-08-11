@@ -37,7 +37,7 @@ def test_telemetry_contract_accepts_hybrid_checkpoint_and_digest_is_stable():
 
 
 def test_contracts_reject_unknown_fields_and_nonmonotonic_or_bad_digest():
-    payload = {"id": "observation-1", "featureProfile": {"taskClass": "backend"}, "outcome": {"status": "completed"}, "sourceId": "overseer", "correlationId": "corr", "idempotencyKey": "observation-1", "occurredAt": NOW, "schemaVersion": "psychlo.learning.v1"}
+    payload = {"id": "observation-1", "featureProfile": {"taskClass": "python-feature"}, "outcome": {"status": "completed"}, "sourceId": "overseer", "correlationId": "corr", "idempotencyKey": "observation-1", "occurredAt": NOW, "schemaVersion": "psychlo.learning.v1"}
     with pytest.raises(ContractError):
         parse_learning_observation({**payload, "prompt": "secret"})
     candidate = {"candidateId": "candidate-1", "targetProjectId": "arcade", "registryId": "registry-1", "registryDigest": "a" * 64, "evidenceIds": ["evidence-1"], "evidenceDigests": ["b" * 64], "evidenceKinds": ["registry"], "canonical": True, "sourceId": "overseer", "messageId": "candidate-1", "correlationId": "corr", "idempotencyKey": "candidate-1", "occurredAt": NOW, "schemaVersion": "psychlo.registry-candidate.v1"}

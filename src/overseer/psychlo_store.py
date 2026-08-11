@@ -42,6 +42,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS telemetry_checkpoints(checkpoint_id TEXT PRIMARY KEY, round_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS learning_observations(observation_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, attempts_skiller INTEGER NOT NULL DEFAULT 0, attempts_memory INTEGER NOT NULL DEFAULT 0, last_error_skiller TEXT, last_error_memory TEXT, delivery_skiller TEXT NOT NULL DEFAULT 'pending', delivery_memory TEXT NOT NULL DEFAULT 'pending', updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS learning_advisories(digest TEXT PRIMARY KEY, payload_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS registry_candidates(candidate_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, inserted_at TEXT NOT NULL);
@@ -113,6 +114,10 @@ class PsychloBridgeStore:
         row = self.connection.execute("SELECT payload_json FROM telemetry_checkpoints WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()
         return None if row is None else json.loads(row[0])
 
+    def telemetry_digest(self, checkpoint_id: str) -> str | None:
+        row = self.connection.execute("SELECT digest FROM telemetry_checkpoints WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()
+        return None if row is None else str(row[0])
+
     def telemetry_stream(self, round_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT payload_json FROM telemetry_checkpoints WHERE round_id=? ORDER BY rowid", (round_id,)).fetchall()
         return [json.loads(row[0]) for row in rows]
@@ -123,7 +128,7 @@ class PsychloBridgeStore:
             return True
         except sqlite3.IntegrityError:
             existing = self.telemetry_checkpoint(str(checkpoint["checkpointId"]))
-            if existing == dict(checkpoint):
+            if existing == dict(checkpoint) or self.telemetry_digest(str(checkpoint["checkpointId"])) == digest:
                 return False
             raise ValueError("telemetry checkpoint conflict")
 
@@ -140,7 +145,7 @@ class PsychloBridgeStore:
             return True
         except sqlite3.IntegrityError:
             existing = self.learning_observation(str(observation["id"]))
-            if existing and existing["digest"] == digest and {key: value for key, value in existing.items() if key not in {"digest", "state", "attempts", "lastError"}} == dict(observation):
+            if existing and existing["digest"] == digest and {key: value for key, value in existing.items() if key not in {"digest", "state", "attempts", "lastError", "deliveries"}} == dict(observation):
                 return False
             raise ValueError("learning observation conflict")
 
@@ -161,6 +166,13 @@ class PsychloBridgeStore:
         if result is None:
             raise ValueError("learning observation was not found")
         return result
+
+    def learning_advisory(self, digest: str):
+        row = self.connection.execute("SELECT payload_json FROM learning_advisories WHERE digest=?", (digest,)).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def record_learning_advisory(self, advisory: Mapping[str, Any]) -> None:
+        self.connection.execute("INSERT OR IGNORE INTO learning_advisories VALUES (?,?)", (advisory["digest"], _dump(advisory)))
 
     def registry_candidate(self, candidate_id: str):
         row = self.connection.execute("SELECT payload_json FROM registry_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
@@ -211,6 +223,17 @@ class PsychloBridgeStore:
         receipt = dict(record["receipt"])
         receipt["status"] = status
         self.connection.execute("UPDATE external_executions SET forwarded=1,status=?,receipt_json=? WHERE reconciliation_id=?", (status, _dump(receipt), reconciliation_id))
+
+    def update_external_receipt(self, reconciliation_id: str, receipt: Mapping[str, Any], *, status: str | None = None) -> None:
+        self.connection.execute("UPDATE external_executions SET receipt_json=?,status=? WHERE reconciliation_id=?", (_dump(receipt), status or str(receipt.get("status", "reconciled")), reconciliation_id))
+
+    def external_gate_pending(self, project_id: str) -> bool:
+        rows = self.connection.execute("SELECT payload_json,receipt_json FROM external_executions WHERE status NOT IN ('approved','rejected','expired')").fetchall()
+        for payload_json, receipt_json in rows:
+            payload = json.loads(payload_json); receipt = json.loads(receipt_json)
+            if payload.get("projectId") == project_id and payload.get("explicitGate") and receipt.get("decisionStatus") not in {"approved", "rejected", "expired"}:
+                return True
+        return False
 
     def projection_counts(self) -> dict[str, int]:
         return {name: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for name, table in (("telemetry", "telemetry_checkpoints"), ("learning", "learning_observations"), ("registry", "registry_candidates"), ("adoption", "adoption_evidence"), ("external", "external_executions"))}

@@ -18,9 +18,11 @@ from urllib.request import Request, urlopen
 from .psychlo_contracts import (
     ContractError,
     canonical_digest,
+    learning_observation_digest,
     parse_adoption_evidence,
     parse_external_round,
     parse_learning_observation,
+    parse_learning_advisory,
     parse_registry_candidate,
     parse_telemetry_checkpoint,
 )
@@ -195,7 +197,7 @@ class PsychloBridge:
 
     def request_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         _require_round(request)
-        if any(item["request"].get("projectId") == request["projectId"] for item in self.store.list_staged_decisions()):
+        if any(item["request"].get("projectId") == request["projectId"] for item in self.store.list_staged_decisions()) or self.store.external_gate_pending(str(request["projectId"])):
             raise ValueError("decision_pending")
         existing = self.store.get_round(str(request["roundId"]))
         if existing:
@@ -322,9 +324,12 @@ class PsychloBridge:
             checkpoint = parse_telemetry_checkpoint(payload)
         except ContractError as error:
             raise ValueError(str(error)) from error
-        digest = canonical_digest(checkpoint)
+        identity = {key: value for key, value in checkpoint.items() if key != "delta"}
+        digest = canonical_digest(identity)
         existing = self.store.telemetry_checkpoint(checkpoint["checkpointId"])
         if existing is not None:
+            if self.store.telemetry_digest(checkpoint["checkpointId"]) == digest:
+                return {"inserted": False, "replay": True, "checkpoint": existing}
             if existing != checkpoint:
                 raise ValueError("telemetry checkpoint conflict")
             return {"inserted": False, "replay": True, "checkpoint": existing}
@@ -364,7 +369,7 @@ class PsychloBridge:
         except ContractError as error:
             raise ValueError(str(error)) from error
         if supplied_digest is not None:
-            expected_digest = hashlib.sha256(json.dumps({"id": observation["id"], "featureProfile": dict(sorted(observation["featureProfile"].items())), "outcome": dict(sorted(observation["outcome"].items()))}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            expected_digest = learning_observation_digest(observation)
             if supplied_digest != expected_digest:
                 raise ValueError("learning observation digest mismatch")
         digest = canonical_digest(observation)
@@ -397,6 +402,70 @@ class PsychloBridge:
                     self.store.transition_learning(observation["id"], destination, "failed", "adapter-failed")
                     failed += 1
         return {"delivered": delivered, "failed": failed}
+
+    def pull_learning(self, destination: str, adapters: Mapping[str, Callable[[Mapping[str, Any]], Any]], *, limit: int = 100) -> dict[str, int]:
+        """Pull bounded observations, deliver them, and ack only successful deliveries."""
+        if destination not in {"skiller", "private-memory"}:
+            raise ValueError("learning destination is invalid")
+        bounded = max(1, min(100, int(limit)))
+        response = self.sender("learning-pull", f"learning-pull:{destination}:{self.clock()}", {"destination": destination, "limit": bounded})
+        observations = response.get("observations", [])
+        if not isinstance(observations, list) or len(observations) > bounded:
+            raise ValueError("learning pull response is invalid")
+        adapter = adapters.get(destination)
+        if adapter is None:
+            return {"delivered": 0, "failed": len(observations)}
+        delivered = failed = 0
+        for raw in observations:
+            record = None
+            try:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("learning observation is invalid")
+                record = self.record_learning_observation(raw)["observation"]
+                result = adapter(record)
+                if inspect.isawaitable(result):
+                    import asyncio
+                    asyncio.run(result)
+                ack = self.sender("learning-ack", f"learning-ack:{destination}:{record['id']}:{record['digest']}", {"destination": destination, "id": record["id"], "digest": record["digest"]})
+                if ack.get("accepted") is not True:
+                    raise ValueError("learning acknowledgment rejected")
+                self.store.transition_learning(record["id"], destination, "delivered")
+                delivered += 1
+            except Exception:
+                if record is not None:
+                    self.store.transition_learning(record["id"], destination, "failed", "adapter-failed")
+                failed += 1
+        return {"delivered": delivered, "failed": failed}
+
+    def receive_learning_advisory(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        prior = payload.get("prior", payload)
+        try:
+            advisory = parse_learning_advisory(prior)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        digest = advisory["digest"]
+        existing = self.store.learning_advisory(digest)
+        if existing is not None and existing != advisory:
+            raise ValueError("learning advisory conflict")
+        if existing is None:
+            self.store.record_learning_advisory(advisory)
+        return {"prior": self.store.learning_advisory(digest), "replay": existing is not None}
+
+    def receive_learning_pull(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        destination = payload.get("destination")
+        limit = payload.get("limit", 100)
+        if destination not in {"skiller", "private-memory"} or not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("learning pull is invalid")
+        return {"observations": self.store.pending_learning(destination, min(100, limit))}
+
+    def receive_learning_ack(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        destination, observation_id, digest = payload.get("destination"), payload.get("id"), payload.get("digest")
+        if destination not in {"skiller", "private-memory"} or not isinstance(observation_id, str) or not isinstance(digest, str):
+            raise ValueError("learning acknowledgment is invalid")
+        record = self.store.learning_observation(observation_id)
+        if record is None or record["digest"] != digest:
+            raise ValueError("learning acknowledgment digest mismatch")
+        return {"observation": self.store.transition_learning(observation_id, destination, "delivered")}
 
     def register_candidate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         payload = {**payload, "sourceId": payload.get("sourceId", "overseer"), "messageId": payload.get("messageId", payload.get("candidateId", "")), "correlationId": payload.get("correlationId", f"registry:{payload.get('candidateId', '')}"), "idempotencyKey": payload.get("idempotencyKey", f"registry:{payload.get('candidateId', '')}"), "occurredAt": payload.get("occurredAt", self.clock()), "schemaVersion": payload.get("schemaVersion", "psychlo.registry-candidate.v1")}
@@ -453,31 +522,48 @@ class PsychloBridge:
                 raise ValueError("external round identity conflict")
             if not existing["forwarded"]:
                 self._forward_external(envelope["reconciliationId"], envelope)
-            if envelope.get("explicitGate") and existing.get("gateDecisionId") and self.store.decision(existing["gateDecisionId"]) is None:
-                self._stage_external_decision(envelope, existing["gateDecisionId"])
             return self.store.external_execution(envelope["reconciliationId"])["receipt"]
-        decision_id = f"psychlo-external-gate:{envelope['reconciliationId']}" if envelope.get("explicitGate") else None
+        decision_id = f"roadex:external:{envelope['reconciliationId']}" if envelope.get("explicitGate") else None
         receipt = {"receiptId": f"external-receipt:{envelope['reconciliationId']}", "reconciliationId": envelope["reconciliationId"], "idempotencyKey": envelope["idempotencyKey"], "envelopeDigest": digest, "receivedAt": self.clock(), "status": "reconciled", **({"decisionId": decision_id, "decisionStatus": "pending"} if decision_id else {})}
         self.store.record_external(envelope, digest, receipt, decision_id)
         self._forward_external(envelope["reconciliationId"], envelope)
-        if decision_id:
-            self._stage_external_decision(envelope, decision_id)
         return self.store.external_execution(envelope["reconciliationId"])["receipt"]
 
-    def _stage_external_decision(self, envelope: Mapping[str, Any], decision_id: str) -> None:
-        request = {"decisionId": decision_id, "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": "psychlo-external-round", "decisionVersion": "psychlo.external-round.v1", "correlationId": envelope["correlationId"], "idempotencyKey": f"{decision_id}:stage", "question": envelope["explicitGate"]}
-        self.stage_decision(request)
-        try:
-            response = self.sender("decision-stage", decision_id, request)
-            if response.get("accepted") is not True:
-                raise ValueError("Psychlo rejected external decision stage")
-        except Exception:
-            record = self.store.external_execution(envelope["reconciliationId"])
-            receipt = dict(record["receipt"])
-            receipt["status"] = "decision-stage-pending"
-            self.store.connection.execute("UPDATE external_executions SET status='decision-stage-pending',receipt_json=? WHERE reconciliation_id=?", (_dump(receipt), envelope["reconciliationId"]))
-
     reconcile_external_round = receive_external_round
+
+    def receive_external_decision_outcome(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        decision_id = payload.get("decisionId")
+        status = payload.get("status")
+        if not isinstance(decision_id, str) or not decision_id.startswith("roadex:external:") or status not in {"approved", "rejected", "expired"}:
+            raise ValueError("external decision outcome is invalid")
+        reconciliation_id = decision_id.removeprefix("roadex:external:")
+        record = self.store.external_execution(reconciliation_id)
+        if record is None or record.get("gateDecisionId") != decision_id:
+            raise ValueError("external decision outcome identity conflict")
+        envelope = record["payload"]
+        expected = {
+            "projectId": envelope["projectId"],
+            "planId": envelope["planId"],
+            "workflowId": "roadex-external-round",
+            "decisionVersion": envelope["planVersion"],
+            "correlationId": envelope["correlationId"],
+            "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}",
+            "question": envelope["explicitGate"],
+            "resultProvenanceId": envelope["digest"],
+        }
+        allowed = {"decisionId", "status", "sourceId", "provenanceId", *expected}
+        if set(payload) - allowed or any(field in payload and payload[field] != value for field, value in expected.items()):
+            raise ValueError("external decision outcome identity conflict")
+        if "sourceId" in payload and payload["sourceId"] != "overseer":
+            raise ValueError("external decision outcome identity conflict")
+        if "provenanceId" in payload and (not isinstance(payload["provenanceId"], str) or not payload["provenanceId"].strip()):
+            raise ValueError("external decision outcome is invalid")
+        prior_status = record["receipt"].get("decisionStatus")
+        if prior_status in {"approved", "rejected", "expired"} and prior_status != status:
+            raise ValueError("external decision outcome conflict")
+        receipt = {**record["receipt"], "decisionId": decision_id, "decisionStatus": status, "status": status}
+        self.store.update_external_receipt(reconciliation_id, receipt, status=status)
+        return {"accepted": True, "receipt": receipt, "continuation": "fresh-round-required" if status == "approved" else "blocked"}
 
     def _forward_external(self, reconciliation_id: str, envelope: Mapping[str, Any]) -> None:
         try:
@@ -490,6 +576,14 @@ class PsychloBridge:
             receipt["status"] = "forward-pending"
             self.store.connection.execute("UPDATE external_executions SET status='forward-pending',receipt_json=? WHERE reconciliation_id=?", (_dump(receipt), reconciliation_id))
             return
+        receipt = response.get("receipt")
+        record = self.store.external_execution(reconciliation_id)
+        if isinstance(receipt, Mapping):
+            expected = record["receipt"].get("decisionId") if record else None
+            if expected and receipt.get("decisionId") not in {None, expected}:
+                raise ValueError("external decision identity conflict")
+            merged = {**(record["receipt"] if record else {}), **dict(receipt)}
+            self.store.update_external_receipt(reconciliation_id, merged, status=str(merged.get("status", "reconciled")))
         self.store.mark_external_forwarded(reconciliation_id)
 
 

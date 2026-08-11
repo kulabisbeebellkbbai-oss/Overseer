@@ -50,6 +50,11 @@ def canonical_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
 
 
+def learning_observation_digest(value: Mapping[str, Any]) -> str:
+    content = {"id": value["id"], "featureProfile": dict(sorted(value["featureProfile"].items())), "outcome": dict(sorted(value["outcome"].items()))}
+    return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
+
+
 def _object(value: Any, *, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ContractError(f"{name} must be an object")
@@ -140,7 +145,7 @@ def parse_learning_observation(payload: Mapping[str, Any]) -> dict[str, Any]:
     value = _object(payload, name="learning observation")
     required = {"id", "featureProfile", "outcome", "sourceId", "correlationId", "idempotencyKey", "occurredAt", "schemaVersion"}
     _common(value, schema=LEARNING_SCHEMA, required=required, name="learning observation")
-    if not isinstance(value["id"], str) or not value["id"].startswith("observation-"):
+    if not isinstance(value["id"], str) or not re.fullmatch(r"observation-(?:[0-9]+|[a-f0-9]{32})", value["id"]):
         raise ContractError("learning observation id is invalid")
     profile = _object(value["featureProfile"], name="featureProfile")
     outcome = _object(value["outcome"], name="outcome")
@@ -148,16 +153,58 @@ def parse_learning_observation(payload: Mapping[str, Any]) -> dict[str, Any]:
     allowed_outcome = {"usage", "actualUsage", "remainingUsage", "activeMs", "waitingMs", "status", "observedAt", "policyVersion", "censored"}
     _keys(profile, allowed_profile, name="featureProfile")
     _keys(outcome, allowed_outcome, name="outcome")
-    if "taskClass" in profile and profile["taskClass"] not in {"frontend", "backend", "fullstack", "library", "service", "cli", "unknown"}:
+    if "taskClass" in profile and (not isinstance(profile["taskClass"], str) or profile["taskClass"] not in {"typescript-feature", "javascript-feature", "python-feature", "rust-feature", "go-feature", "java-feature", "kotlin-feature", "swift-feature", "cpp-feature", "csharp-feature", "round-result", "unknown"}):
         raise ContractError("taskClass is invalid")
-    if "model" in profile:
-        _id(profile["model"], name="model")
-    if "expectedComponents" in profile and (not isinstance(profile["expectedComponents"], int) or profile["expectedComponents"] < 0 or profile["expectedComponents"] > 100):
+    if "model" in profile and (not isinstance(profile["model"], str) or profile["model"] not in {"gpt-5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}):
+        raise ContractError("model is invalid")
+    if "expectedComponents" in profile and (not isinstance(profile["expectedComponents"], int) or isinstance(profile["expectedComponents"], bool) or profile["expectedComponents"] < 0 or profile["expectedComponents"] > 100):
         raise ContractError("expectedComponents is invalid")
+    enum_values = {"attribution": ATTRIBUTIONS, "sampleKind": TELEMETRY_KINDS}
+    identifier_values = {"projectClass": {"frontend", "backend", "fullstack", "library", "service", "cli", "unknown"}, "dependencyClass": {"none", "direct", "transitive", "unknown"}, "executionPattern": {"single-round", "multi-round", "bounded", "unknown"}, "similarityClass": {"exact", "near", "none", "unknown"}}
+    for key, values in enum_values.items():
+        if key in profile and (not isinstance(profile[key], str) or profile[key] not in values):
+            raise ContractError(f"{key} is invalid")
+    for key, values in identifier_values.items():
+        if key in profile and (not isinstance(profile[key], str) or profile[key] not in values):
+            raise ContractError(f"{key} is invalid")
+    for key in {"buildGate", "testGate", "browserGate", "securityGate", "deploymentGate"}:
+        if key in profile and not isinstance(profile[key], bool):
+            raise ContractError(f"{key} is invalid")
     if "status" in outcome and outcome["status"] not in {"completed", "blocked"}:
         raise ContractError("status is invalid")
     if "observedAt" in outcome:
         _timestamp(outcome["observedAt"], name="observedAt")
+    for key in {"usage", "actualUsage", "remainingUsage"}:
+        if key in outcome and (not isinstance(outcome[key], (int, float)) or isinstance(outcome[key], bool) or outcome[key] < 0):
+            raise ContractError(f"{key} is invalid")
+    for key in {"activeMs", "waitingMs"}:
+        if key in outcome and (not isinstance(outcome[key], int) or isinstance(outcome[key], bool) or outcome[key] < 0):
+            raise ContractError(f"{key} is invalid")
+    if "policyVersion" in outcome and outcome["policyVersion"] != "psychlo-estimate-v1":
+        raise ContractError("policyVersion is invalid")
+    if "censored" in outcome and outcome["censored"] not in {"true", "false"}:
+        raise ContractError("censored is invalid")
+    return value
+
+
+def parse_learning_advisory(payload: Mapping[str, Any]) -> dict[str, Any]:
+    value = _object(payload, name="learning advisory")
+    _keys(value, {"source", "version", "digest", "confidence", "evidenceLineage", "featureClass", "expectedUsage", "signatureValid", "compatible", "observedAt"}, name="learning advisory")
+    if value.get("source") not in {"skiller", "private-memory"} or value.get("version") != "psychlo-estimate-v1" or value.get("signatureValid") is not True:
+        raise ContractError("learning advisory identity is invalid")
+    _digest(value.get("digest"), name="advisory digest")
+    if not isinstance(value.get("confidence"), (int, float)) or isinstance(value.get("confidence"), bool) or not 0 <= value["confidence"] <= 1:
+        raise ContractError("advisory confidence is invalid")
+    lineage = value.get("evidenceLineage")
+    if not isinstance(lineage, list) or not lineage or len(lineage) > MAX_ARRAY or any(not isinstance(item, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", item) for item in lineage):
+        raise ContractError("advisory evidence lineage is invalid")
+    if value.get("featureClass") not in {"typescript-feature", "javascript-feature", "python-feature", "rust-feature", "go-feature", "java-feature", "kotlin-feature", "swift-feature", "cpp-feature", "csharp-feature", "round-result", "unknown"}:
+        raise ContractError("advisory feature class is invalid")
+    if not isinstance(value.get("expectedUsage"), (int, float)) or isinstance(value["expectedUsage"], bool) or value["expectedUsage"] < 0:
+        raise ContractError("advisory expected usage is invalid")
+    _timestamp(value.get("observedAt"), name="observedAt")
+    if "compatible" in value and not isinstance(value["compatible"], bool):
+        raise ContractError("advisory compatibility is invalid")
     return value
 
 

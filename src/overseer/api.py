@@ -315,13 +315,10 @@ def _project_path_for_store(store_path: str) -> Path:
 def make_api_handler(store_path: str, auth_token: str | None = None, backup_provisioning_adapter_factory=None, roadex_decision_adapter_factory=None, psychlo_bridge: PsychloBridge | None = None):
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
-            try:
-                with SQLiteStore(store_path) as primary:
-                    approval = primary.load_approval(approval_id)
-                    from dataclasses import asdict
-                    return asdict(approval)
-            except (KeyError, OSError, ValueError):
-                return psychlo_bridge.store.load_authorization_record(approval_id)
+            with SQLiteStore(store_path) as primary:
+                approval = primary.load_approval(approval_id)
+                subject = primary.load_admin_change_plan(approval.subject_id)
+                return approval, subject
         psychlo_bridge.approval_loader = load_bridge_approval
 
     class OverseerApiHandler(BaseHTTPRequestHandler):
@@ -698,8 +695,6 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/psychlo/external-round": "external-round",
                 "/psychlo/external-rounds": "external-round",
                 "/psychlo/coordination/work": "coordination-work-request",
-                "/psychlo/coordination/work/results": "coordination-participant-result",
-                "/psychlo/coordination/work/reviews": "coordination-supervisor-review",
                 "/psychlo/concurrency/canary-result": "concurrency-canary-result",
             }
             if raw_path in peer_kinds:
@@ -1343,10 +1338,6 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     result = psychlo_bridge.receive_external_round(message["payload"])
                 elif kind == "coordination-work-request":
                     result = psychlo_bridge.receive_coordination_work_request(message["payload"])
-                elif kind == "coordination-participant-result":
-                    result = psychlo_bridge.receive_cross_project_participant_result(message["payload"])
-                elif kind == "coordination-supervisor-review":
-                    result = psychlo_bridge.receive_cross_project_supervisor_review(message["payload"])
                 elif kind == "concurrency-canary-result":
                     result = psychlo_bridge.receive_concurrency_canary_result(message["payload"])
                 elif kind == "decision-outcome":

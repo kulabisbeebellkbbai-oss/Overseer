@@ -48,7 +48,6 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
-            CREATE TABLE IF NOT EXISTS authorization_records(authorization_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
         """)
@@ -64,29 +63,6 @@ class PsychloBridgeStore:
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
-
-    def save_authorization_record(self, record: Mapping[str, Any]) -> None:
-        """Persist an immutable approval used by bridge initiators in tests/local mode."""
-        value = dict(record)
-        identifier = value.get("id", value.get("approvalId"))
-        if not isinstance(identifier, str) or not identifier.strip():
-            raise ValueError("authorization record id is required")
-        value["id"] = identifier
-        digest = str(value.get("payloadDigest", value.get("payload_digest", "")))
-        if not digest:
-            raise ValueError("authorization record payload digest is required")
-        existing = self.connection.execute("SELECT payload_json,payload_digest FROM authorization_records WHERE authorization_id=?", (identifier,)).fetchone()
-        if existing is not None:
-            if str(existing[0]) != _dump(value) or str(existing[1]) != digest:
-                raise ValueError("authorization record is immutable")
-            return
-        self.connection.execute("INSERT INTO authorization_records VALUES (?,?,?,?)", (identifier, _dump(value), digest, self._now()))
-
-    def load_authorization_record(self, authorization_id: str) -> dict[str, Any]:
-        row = self.connection.execute("SELECT payload_json FROM authorization_records WHERE authorization_id=?", (authorization_id,)).fetchone()
-        if row is None:
-            raise KeyError(authorization_id)
-        return json.loads(row[0])
 
     def save_coordination_dispatch(self, request_id: str, dispatch_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not request_id or not dispatch_id:
@@ -430,6 +406,10 @@ class PsychloBridgeStore:
         row = self.connection.execute("SELECT idempotency_key,digest,payload_json,state,attempts,last_error,updated_at FROM protocol_records WHERE kind=? AND record_id=?", (kind, record_id)).fetchone()
         if row is None: return None
         return {"kind": kind, "id": record_id, "idempotencyKey": row[0], "digest": row[1], "payload": json.loads(row[2]), "state": row[3], "attempts": row[4], "lastError": row[5], "updatedAt": row[6]}
+
+    def list_protocol(self, kind: str, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? ORDER BY updated_at,record_id LIMIT ?", (kind, max(1, min(1000, int(limit))))).fetchall()
+        return [self.protocol_record(kind, str(row[0])) for row in rows]
 
     def record_protocol(self, kind: str, record_id: str, idempotency_key: str, digest: str, payload: Mapping[str, Any], *, state: str = "queued") -> tuple[dict[str, Any], bool]:
         existing = self.protocol_record(kind, record_id)

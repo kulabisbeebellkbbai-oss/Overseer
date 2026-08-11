@@ -422,6 +422,28 @@ def parse_cross_project_work(payload: Mapping[str, Any], *, kind: str) -> dict[s
     return value
 
 
+def parse_cross_project_supervisor_review(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "digest", "correlationId", "idempotencyKey", "occurredAt"}
+    value = _strict_protocol(payload, required=required, name="cross-project supervisor review")
+    for field in ("linkId", "version", "resultId", "coordinationTeamId", "supervisorMemberId", "correlationId", "idempotencyKey"):
+        _id(value[field], name=field)
+    if not isinstance(value["accepted"], bool):
+        raise ContractError("supervisor review acceptance is invalid")
+    if not isinstance(value["participantResults"], list) or not value["participantResults"]:
+        raise ContractError("supervisor review participants are required")
+    for participant in value["participantResults"]:
+        item = _object(participant, name="supervisor participant result")
+        _keys(item, {"resultId", "digest"}, name="supervisor participant result")
+        _id(item["resultId"], name="participant resultId"); _digest(item["digest"], name="participant digest")
+    if not isinstance(value["evidence"], list) or not value["evidence"] or any(not isinstance(item, str) or not item.strip() for item in value["evidence"]):
+        raise ContractError("supervisor review evidence is required")
+    _timestamp(value["occurredAt"]); _digest(value["digest"], name="digest")
+    base = {key: value[key] for key in ("linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "correlationId", "idempotencyKey", "occurredAt")}
+    if hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest() != value["digest"]:
+        raise ContractError("supervisor review digest mismatch")
+    return value
+
+
 def parse_canary_authorization(payload: Mapping[str, Any]) -> dict[str, Any]:
     required = {"authorizationId", "targetTemporaryCeiling", "expectedGlobalCeiling", "expectedRevision", "projects", "workflowId", "decisionVersion", "decisionId", "question", "deadline", "correlationId", "idempotencyKey", "occurredAt", "digest"}
     value = _strict_protocol(payload, required=required, name="concurrency canary authorization")

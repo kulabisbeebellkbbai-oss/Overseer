@@ -32,6 +32,8 @@ REGISTRY_SCHEMA = "psychlo.registry-candidate.v1"
 ADOPTION_SCHEMA = "psychlo.adoption-evidence.v1"
 EXTERNAL_SCHEMA = "psychlo.external-round.v1"
 EXTERNAL_BINDING_SCHEMA = "psychlo.external-round-binding.v1"
+HANDOFF_VERSIONS = {"a-team.psychlo.handoff.v1", "a-team.psychlo.handoff.v2"}
+HANDOFF_RECEIPT_VERSION = "a-team.psychlo.receipt.v1"
 TELEMETRY_KINDS = {"baseline", "completed-turn", "durable-checkpoint", "bounded-long-turn", "terminal"}
 ATTRIBUTIONS = {"isolated", "shared", "censored", "unknown"}
 LEARNING_DESTINATIONS = {"skiller", "private-memory"}
@@ -164,6 +166,104 @@ def _common(value: Mapping[str, Any], *, schema: str, required: set[str], name: 
     _timestamp(value.get("occurredAt"))
     if value.get("schemaVersion") != schema:
         raise ContractError(f"{name} schema version is invalid")
+
+
+def parse_project_registration(payload: Mapping[str, Any]) -> dict[str, Any]:
+    registration = _object(payload, name="project registration")
+    if set(registration) != {"envelope", "receipt"}:
+        raise ContractError("project registration fields are invalid")
+    envelope = _object(registration["envelope"], name="handoff envelope")
+    version = envelope.get("contractVersion")
+    base = {"contractVersion", "source", "aTeamId", "approval", "project", "projectLead", "plan", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    if version not in HANDOFF_VERSIONS or set(envelope) != (base | ({"lifecycle"} if version.endswith(".v2") else set())) or envelope.get("source") != "a-team":
+        raise ContractError("handoff envelope contract is invalid")
+    _id(envelope.get("aTeamId"), name="aTeamId"); _id(envelope.get("correlationId"), name="correlationId"); _id(envelope.get("idempotencyKey"), name="idempotencyKey")
+    _offset_timestamp(envelope.get("occurredAt"), name="occurredAt")
+    approval = _object(envelope.get("approval"), name="handoff approval")
+    if set(approval) != {"status", "approvedAt"} or approval.get("status") != "approved": raise ContractError("handoff approval is invalid")
+    _offset_timestamp(approval.get("approvedAt"), name="approvedAt")
+    project = _object(envelope.get("project"), name="handoff project")
+    if set(project) != {"id", "planId", "planVersion", "provenancePath"}: raise ContractError("handoff project is invalid")
+    for field in ("id", "planId", "planVersion"): _id(project.get(field), name=field)
+    path = project.get("provenancePath")
+    if not isinstance(path, str) or not path.startswith("/") or "\0" in path or path != path.strip() or len(path) > 2_048: raise ContractError("handoff provenance path is invalid")
+    lead = _object(envelope.get("projectLead"), name="handoff lead")
+    if set(lead) != {"id"}: raise ContractError("handoff lead is invalid")
+    _id(lead.get("id"), name="projectLead.id")
+    plan = _object(envelope.get("plan"), name="handoff plan")
+    if set(plan) != {"title", "summary", "goals", "constraints", "deliverables", "tasks"}: raise ContractError("handoff plan is invalid")
+    _text(plan.get("title"), name="plan title", maximum=160); _text(plan.get("summary"), name="plan summary")
+    for field in ("goals", "constraints", "deliverables"):
+        values = plan.get(field)
+        if not isinstance(values, list) or len(values) > 32: raise ContractError(f"plan {field} is invalid")
+        for item in values: _text(item, name=f"plan {field} item")
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list) or not 0 < len(tasks) <= 128: raise ContractError("handoff tasks are invalid")
+    task_ids: set[str] = set(); dependencies: dict[str, list[str]] = {}
+    for raw in tasks:
+        task = _object(raw, name="handoff task")
+        if set(task) != {"id", "ownerMemberId", "title", "description", "dependencyIds", "acceptanceCriteria"}: raise ContractError("handoff task is invalid")
+        task_id = _id(task.get("id"), name="task id")
+        if task_id in task_ids: raise ContractError("handoff task ID is duplicated")
+        task_ids.add(task_id); _id(task.get("ownerMemberId"), name="task owner"); _text(task.get("title"), name="task title", maximum=160); _text(task.get("description"), name="task description")
+        dependencies[task_id] = _bounded_id_array(task.get("dependencyIds"), name="task dependencies", maximum=32)
+        criteria = task.get("acceptanceCriteria")
+        if not isinstance(criteria, list) or len(criteria) > 32: raise ContractError("task acceptance criteria are invalid")
+        for item in criteria: _text(item, name="task acceptance criterion")
+    _validate_task_graph(task_ids, dependencies)
+    if version.endswith(".v2"): _parse_handoff_lifecycle(envelope.get("lifecycle"), project)
+    _digest(envelope.get("digest"), name="handoff digest")
+    if canonical_digest(envelope) != envelope["digest"]: raise ContractError("handoff envelope digest does not match canonical content")
+    receipt = _object(registration["receipt"], name="handoff receipt")
+    receipt_keys = {"contractVersion", "handoffContractVersion", "source", "status", "receiptId", "aTeamId", "project", "correlationId", "idempotencyKey", "envelopeDigest", "receivedAt"}
+    if set(receipt) != receipt_keys or receipt.get("contractVersion") != HANDOFF_RECEIPT_VERSION or receipt.get("handoffContractVersion") != version or receipt.get("source") != "psychlo" or receipt.get("status") != "admitted": raise ContractError("handoff receipt contract is invalid")
+    for field in ("receiptId", "aTeamId", "correlationId", "idempotencyKey"): _id(receipt.get(field), name=f"receipt {field}")
+    _digest(receipt.get("envelopeDigest"), name="receipt envelopeDigest"); _offset_timestamp(receipt.get("receivedAt"), name="receivedAt")
+    receipt_project = _object(receipt.get("project"), name="receipt project")
+    if set(receipt_project) != {"id", "planId", "planVersion"}: raise ContractError("receipt project is invalid")
+    for field in ("id", "planId", "planVersion"): _id(receipt_project.get(field), name=f"receipt project {field}")
+    if receipt["aTeamId"] != envelope["aTeamId"] or receipt_project != {key: project[key] for key in ("id", "planId", "planVersion")} or receipt["correlationId"] != envelope["correlationId"] or receipt["idempotencyKey"] != envelope["idempotencyKey"] or receipt["envelopeDigest"] != envelope["digest"]: raise ContractError("handoff receipt does not bind envelope")
+    return registration
+
+
+def _offset_timestamp(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value) is None: raise ContractError(f"{name} is invalid")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None: raise ContractError(f"{name} is invalid")
+    return value
+
+
+def _bounded_id_array(value: Any, *, name: str, maximum: int) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum: raise ContractError(f"{name} is invalid")
+    return [_id(item, name=f"{name} item") for item in value]
+
+
+def _validate_task_graph(task_ids: set[str], dependencies: Mapping[str, list[str]]) -> None:
+    for task_id, items in dependencies.items():
+        if any(item not in task_ids or item == task_id for item in items): raise ContractError("handoff task dependency is invalid")
+    state: dict[str, str] = {}
+    def visit(task_id: str) -> None:
+        if state.get(task_id) == "visiting": raise ContractError("handoff task dependency is cyclic")
+        if state.get(task_id) == "visited": return
+        state[task_id] = "visiting"
+        for item in dependencies[task_id]: visit(item)
+        state[task_id] = "visited"
+    for task_id in task_ids: visit(task_id)
+
+
+def _parse_handoff_lifecycle(raw: Any, project: Mapping[str, Any]) -> None:
+    value = _object(raw, name="handoff lifecycle"); kind = value.get("kind")
+    if kind == "change":
+        if set(value) != {"kind", "supersedesPlanId", "supersedesVersion"}: raise ContractError("handoff lifecycle is invalid")
+        _id(value.get("supersedesPlanId"), name="supersedesPlanId"); _id(value.get("supersedesVersion"), name="supersedesVersion")
+        if value["supersedesPlanId"] == project["planId"] and value["supersedesVersion"] == project["planVersion"]: raise ContractError("handoff plan change is unchanged")
+    elif kind == "decommission":
+        if set(value) != {"kind", "deploymentAvailability"} or value.get("deploymentAvailability") not in {"available", "unavailable"}: raise ContractError("handoff lifecycle is invalid")
+    elif kind == "takeover":
+        if set(value) != {"kind", "repositoryPath", "repositoryHead", "dirtyStateDigest", "currentStateEvidence"} or not isinstance(value.get("repositoryPath"), str) or not value["repositoryPath"].startswith("/") or value["repositoryPath"] != value["repositoryPath"].strip() or len(value["repositoryPath"]) > 2_048 or GIT_RE.fullmatch(str(value.get("repositoryHead"))) is None: raise ContractError("handoff lifecycle is invalid")
+        _digest(value.get("dirtyStateDigest"), name="dirtyStateDigest"); evidence = _bounded_id_array(value.get("currentStateEvidence"), name="currentStateEvidence", maximum=32)
+        if not evidence: raise ContractError("handoff lifecycle is invalid")
+    else: raise ContractError("handoff lifecycle is invalid")
 
 
 def parse_telemetry_checkpoint(payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -36,6 +36,7 @@ from .psychlo_contracts import (
     parse_concurrency_ceiling_authorization,
     parse_learning_observation,
     parse_learning_advisory,
+    parse_project_registration,
     parse_registry_candidate,
     parse_telemetry_checkpoint,
 )
@@ -364,16 +365,18 @@ class PsychloBridge:
 
     @staticmethod
     def _project_registration_identity(registration: Mapping[str, Any], scheduling: Mapping[str, Any] | None = None) -> dict[str, str]:
-        envelope = registration.get("envelope"); receipt = registration.get("receipt")
-        if not isinstance(envelope, dict) or not isinstance(receipt, dict): raise ValueError("project registration is invalid")
-        project = envelope.get("project"); lead = envelope.get("projectLead"); plan = envelope.get("plan"); receipt_project = receipt.get("project")
-        if not all(isinstance(item, dict) for item in (project, lead, plan, receipt_project)): raise ValueError("project registration is invalid")
+        try: parsed = parse_project_registration(registration)
+        except ContractError as error: raise ValueError(str(error)) from error
+        envelope = parsed["envelope"]; receipt = parsed["receipt"]; project = envelope["project"]; lead = envelope["projectLead"]
         identity = {"projectId": _required_string(project, "id"), "planId": _required_string(project, "planId"), "planVersion": _required_string(project, "planVersion"), "aTeamId": _required_string(envelope, "aTeamId"), "projectLeadId": _required_string(lead, "id"), "receiptId": _required_string(receipt, "receiptId")}
-        digest = envelope.get("digest")
-        if not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None or receipt.get("source") != "psychlo" or receipt.get("status") != "admitted" or receipt.get("handoffContractVersion") != envelope.get("contractVersion") or receipt.get("aTeamId") != identity["aTeamId"] or receipt.get("envelopeDigest") != digest or receipt.get("correlationId") != envelope.get("correlationId") or receipt.get("idempotencyKey") != envelope.get("idempotencyKey") or receipt_project.get("id") != identity["projectId"] or receipt_project.get("planId") != identity["planId"] or receipt_project.get("planVersion") != identity["planVersion"]:
-            raise ValueError("project registration identity is invalid")
-        if scheduling is not None and (scheduling.get("projectId") != identity["projectId"] or scheduling.get("projectLeadId") != identity["projectLeadId"] or scheduling.get("state") != "managed" or scheduling.get("correlationId") != f"psychlo-scheduling:{identity['receiptId']}" or scheduling.get("idempotencyKey") != f"psychlo-scheduling:{identity['receiptId']}"):
-            raise ValueError("project scheduling identity is invalid")
+        scheduling_keys = {"projectId", "projectLeadId", "state", "remainingEffort", "hasSecurityImpact", "hasDependencyImpact", "gateDistance", "expectedUsageCost", "correlationId", "idempotencyKey", "occurredAt"}
+        if scheduling is not None:
+            tasks = envelope["plan"]["tasks"]; constraints = envelope["plan"]["constraints"]
+            expected = {"projectId": identity["projectId"], "projectLeadId": identity["projectLeadId"], "state": "managed", "remainingEffort": "trivial" if len(tasks) == 1 else "standard", "hasSecurityImpact": any("security" in str(item).lower() for item in constraints), "hasDependencyImpact": any(bool(item["dependencyIds"]) for item in tasks), "gateDistance": len(tasks), "expectedUsageCost": max(1, min(10, (len(tasks) + 1) // 2)), "correlationId": f"psychlo-scheduling:{identity['receiptId']}", "idempotencyKey": f"psychlo-scheduling:{identity['receiptId']}"}
+            try: scheduling_time = datetime.fromisoformat(str(scheduling.get("occurredAt", "")).replace("Z", "+00:00"))
+            except ValueError as error: raise ValueError("project scheduling identity is invalid") from error
+            if set(scheduling) != scheduling_keys or any(scheduling.get(key) != item for key, item in expected.items()) or scheduling_time.tzinfo is None:
+                raise ValueError("project scheduling identity is invalid")
         return identity
 
     def reconcile_round(self, request: Mapping[str, Any]) -> dict[str, Any]:

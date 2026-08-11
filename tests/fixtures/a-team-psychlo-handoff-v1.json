@@ -1,0 +1,36 @@
+{
+  "sourceContract": "Psychlo src/contracts/a-team-handoff.ts",
+  "envelope": {
+    "contractVersion": "a-team.psychlo.handoff.v1",
+    "source": "a-team",
+    "aTeamId": "team-arcade",
+    "approval": {"status": "approved", "approvedAt": "2026-08-10T02:00:00+00:00"},
+    "project": {"id": "arcade", "planId": "plan-arcade", "planVersion": "v7", "provenancePath": "/a-team/team-arcade/arcade/plan-arcade/v7"},
+    "projectLead": {"id": "lead-arcade"},
+    "plan": {
+      "title": "Arcade",
+      "summary": "Approved Arcade delivery plan",
+      "goals": ["Deliver Arcade"],
+      "constraints": [],
+      "deliverables": ["Working Arcade"],
+      "tasks": [{"id": "task-1", "ownerMemberId": "lead-arcade", "title": "Implement", "description": "Implement approved Arcade scope", "dependencyIds": [], "acceptanceCriteria": ["Verified"]}]
+    },
+    "correlationId": "registration-arcade",
+    "idempotencyKey": "registration-arcade",
+    "occurredAt": "2026-08-10T02:00:00+00:00",
+    "digest": "6afb03df5d61550d474c9e33c193574e778c9007dd93a8f8f51af7950c80021a"
+  },
+  "receipt": {
+    "contractVersion": "a-team.psychlo.receipt.v1",
+    "handoffContractVersion": "a-team.psychlo.handoff.v1",
+    "source": "psychlo",
+    "status": "admitted",
+    "receiptId": "receipt-arcade",
+    "aTeamId": "team-arcade",
+    "project": {"id": "arcade", "planId": "plan-arcade", "planVersion": "v7"},
+    "correlationId": "registration-arcade",
+    "idempotencyKey": "registration-arcade",
+    "envelopeDigest": "6afb03df5d61550d474c9e33c193574e778c9007dd93a8f8f51af7950c80021a",
+    "receivedAt": "2026-08-10T02:00:00+00:00"
+  }
+}

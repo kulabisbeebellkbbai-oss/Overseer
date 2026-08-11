@@ -59,16 +59,20 @@ def _coord_request(binding: str, link: str, version: str, project: str, lead: st
 def _registration_payload(project_id: str, lead_id: str, *, plan_id: str | None = None, plan_version: str = "v1", team_id: str | None = None) -> dict:
     plan_id = plan_id or f"plan-{project_id}"
     team_id = team_id or f"team-{project_id}"
-    envelope = {"contractVersion": "a-team.handoff.v1", "source": "the-a-team", "aTeamId": team_id, "approval": {"status": "approved", "approvedAt": NOW}, "project": {"id": project_id, "planId": plan_id, "planVersion": plan_version, "provenancePath": f"/a-team/{team_id}/{project_id}/{plan_id}/{plan_version}"}, "projectLead": {"id": lead_id}, "plan": {"title": project_id, "summary": "approved plan", "goals": ["deliver"], "constraints": [], "deliverables": ["working result"], "tasks": [{"id": "task-1", "ownerMemberId": lead_id, "title": "Implement", "description": "Implement the approved scope", "dependencyIds": [], "acceptanceCriteria": ["verified"]}]}, "correlationId": f"registration-{project_id}", "idempotencyKey": f"registration-{project_id}", "occurredAt": NOW, "digest": hashlib.sha256(project_id.encode()).hexdigest()}
-    receipt = {"contractVersion": "psychlo.handoff-receipt.v1", "handoffContractVersion": envelope["contractVersion"], "source": "psychlo", "status": "admitted", "receiptId": f"receipt-{project_id}", "aTeamId": team_id, "project": {"id": project_id, "planId": plan_id, "planVersion": plan_version}, "correlationId": envelope["correlationId"], "idempotencyKey": envelope["idempotencyKey"], "envelopeDigest": envelope["digest"], "receivedAt": NOW}
+    envelope = {"contractVersion": "a-team.psychlo.handoff.v1", "source": "a-team", "aTeamId": team_id, "approval": {"status": "approved", "approvedAt": NOW}, "project": {"id": project_id, "planId": plan_id, "planVersion": plan_version, "provenancePath": f"/a-team/{team_id}/{project_id}/{plan_id}/{plan_version}"}, "projectLead": {"id": lead_id}, "plan": {"title": project_id, "summary": "approved plan", "goals": ["deliver"], "constraints": [], "deliverables": ["working result"], "tasks": [{"id": "task-1", "ownerMemberId": lead_id, "title": "Implement", "description": "Implement the approved scope", "dependencyIds": [], "acceptanceCriteria": ["verified"]}]}, "correlationId": f"registration-{project_id}", "idempotencyKey": f"registration-{project_id}", "occurredAt": NOW}
+    envelope["digest"] = canonical_digest(envelope)
+    receipt = {"contractVersion": "a-team.psychlo.receipt.v1", "handoffContractVersion": envelope["contractVersion"], "source": "psychlo", "status": "admitted", "receiptId": f"receipt-{project_id}", "aTeamId": team_id, "project": {"id": project_id, "planId": plan_id, "planVersion": plan_version}, "correlationId": envelope["correlationId"], "idempotencyKey": envelope["idempotencyKey"], "envelopeDigest": envelope["digest"], "receivedAt": NOW}
     return {"envelope": envelope, "receipt": receipt}
 
 
 def _record_registered_project(store: PsychloBridgeStore, project_id: str, lead_id: str) -> None:
     registration = _registration_payload(project_id, lead_id)
-    receipt_id = registration["receipt"]["receiptId"]
-    scheduling = {"projectId": project_id, "projectLeadId": lead_id, "state": "managed", "correlationId": f"psychlo-scheduling:{receipt_id}", "idempotencyKey": f"psychlo-scheduling:{receipt_id}"}
-    store.record_project(project_id, registration, scheduling)
+    store.record_project(project_id, registration, _scheduling_payload(registration))
+
+
+def _scheduling_payload(registration: dict) -> dict:
+    envelope = registration["envelope"]; receipt_id = registration["receipt"]["receiptId"]; tasks = envelope["plan"]["tasks"]; constraints = envelope["plan"]["constraints"]
+    return {"projectId": envelope["project"]["id"], "projectLeadId": envelope["projectLead"]["id"], "state": "managed", "remainingEffort": "trivial" if len(tasks) == 1 else "standard", "hasSecurityImpact": any("security" in str(item).lower() for item in constraints), "hasDependencyImpact": any(bool(item["dependencyIds"]) for item in tasks), "gateDistance": len(tasks), "expectedUsageCost": max(1, min(10, (len(tasks) + 1) // 2)), "correlationId": f"psychlo-scheduling:{receipt_id}", "idempotencyKey": f"psychlo-scheduling:{receipt_id}", "occurredAt": NOW}
 
 
 def _coordination_process(store_path: str, calls_path: str, request: dict, barrier) -> None:
@@ -1358,6 +1362,8 @@ def test_registers_an_admitted_plan_and_publishes_initial_scheduling(tmp_path: P
     registration = _registration_payload("arcade", "member-hermione", plan_id="arcade-plan")
     registration["envelope"]["plan"]["constraints"] = ["security review required"]
     registration["envelope"]["plan"]["tasks"].append({"id": "task-2", "ownerMemberId": "member-hermione", "title": "Verify", "description": "Verify the approved scope", "dependencyIds": ["task-1"], "acceptanceCriteria": ["tests pass"]})
+    registration["envelope"]["digest"] = canonical_digest(registration["envelope"])
+    registration["receipt"]["envelopeDigest"] = registration["envelope"]["digest"]
     result = bridge.register_project(registration)
     assert result == {"accepted": True}
     assert sent[0][0] == "scheduling-input"
@@ -1368,7 +1374,9 @@ def test_registers_an_admitted_plan_and_publishes_initial_scheduling(tmp_path: P
 
 def test_coordination_dispatch_accepts_exact_real_registration_shape_after_restart(tmp_path: Path):
     store_path = tmp_path / "bridge.sqlite3"
-    registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade", plan_version="v7", team_id="team-arcade")
+    frozen = json.loads((Path(__file__).parent / "fixtures" / "a-team-psychlo-handoff-v1.json").read_text(encoding="utf-8"))
+    assert frozen["sourceContract"] == "Psychlo src/contracts/a-team-handoff.ts"
+    registration = {"envelope": frozen["envelope"], "receipt": frozen["receipt"]}
     bridge = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_PreparedDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     assert bridge.register_project(registration) == {"accepted": True}
     store = PsychloBridgeStore(store_path)
@@ -1380,21 +1388,69 @@ def test_coordination_dispatch_accepts_exact_real_registration_shape_after_resta
     assert dispatcher.calls[0][0] == "lead-arcade"
 
 
-@pytest.mark.parametrize("field", ["project", "plan", "version", "team", "lead"])
+@pytest.mark.parametrize("defect", ["missing", "digest", "version", "source", "approval", "approved_timestamp", "occurred_timestamp", "receipt_timestamp", "receipt_version"])
+def test_register_project_rejects_malformed_real_handoff_before_persistence(tmp_path: Path, defect: str):
+    registration = _registration_payload("arcade", "lead-arcade")
+    if defect == "missing": del registration["envelope"]["plan"]["summary"]
+    elif defect == "digest": registration["envelope"]["digest"] = "f" * 64
+    elif defect == "version": registration["envelope"]["contractVersion"] = "a-team.psychlo.handoff.v9"
+    elif defect == "source": registration["envelope"]["source"] = "other"
+    elif defect == "approval": registration["envelope"]["approval"]["status"] = "pending"
+    elif defect == "approved_timestamp": registration["envelope"]["approval"]["approvedAt"] = "2026-08-10T02:00:00"
+    elif defect == "occurred_timestamp": registration["envelope"]["occurredAt"] = "not-a-time"
+    elif defect == "receipt_timestamp": registration["receipt"]["receivedAt"] = "2026-08-10T02:00:00"
+    else: registration["receipt"]["contractVersion"] = "a-team.psychlo.receipt.v9"
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(store=store, dispatcher=_PreparedDispatcher(), sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError):
+        bridge.register_project(registration)
+    assert store.project("arcade") is None and sent == []
+
+
+def test_register_project_accepts_exact_lifecycle_handoff_version(tmp_path: Path):
+    registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade-v2", plan_version="v2")
+    registration["envelope"]["contractVersion"] = "a-team.psychlo.handoff.v2"
+    registration["envelope"]["lifecycle"] = {"kind": "change", "supersedesPlanId": "plan-arcade", "supersedesVersion": "v1"}
+    registration["envelope"]["digest"] = canonical_digest(registration["envelope"])
+    registration["receipt"]["handoffContractVersion"] = registration["envelope"]["contractVersion"]
+    registration["receipt"]["envelopeDigest"] = registration["envelope"]["digest"]
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=_PreparedDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    assert bridge.register_project(registration) == {"accepted": True}
+
+
+def test_register_project_rejects_adoption_only_lifecycle_kind(tmp_path: Path):
+    registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade-v2", plan_version="v2")
+    registration["envelope"]["contractVersion"] = "a-team.psychlo.handoff.v2"
+    registration["envelope"]["lifecycle"] = {
+        "kind": "cleanup", "assessmentId": "assessment-1", "assessmentDigest": "a" * 64,
+        "classification": "cleanup-required", "teamId": "team-arcade", "projectLeadId": "lead-arcade", "artifactActions": [],
+    }
+    registration["envelope"]["digest"] = canonical_digest(registration["envelope"])
+    registration["receipt"]["handoffContractVersion"] = registration["envelope"]["contractVersion"]
+    registration["receipt"]["envelopeDigest"] = registration["envelope"]["digest"]
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=_PreparedDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="lifecycle"):
+        bridge.register_project(registration)
+
+
+@pytest.mark.parametrize("field", ["project", "plan", "version", "team", "lead", "scheduling"])
 def test_coordination_rejects_registration_identity_conflict_before_dispatch(tmp_path: Path, field: str):
     registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade", plan_version="v7", team_id="team-arcade")
     if field == "project": registration["receipt"]["project"]["id"] = "other-project"
     elif field == "plan": registration["receipt"]["project"]["planId"] = "other-plan"
     elif field == "version": registration["receipt"]["project"]["planVersion"] = "v8"
     elif field == "team": registration["receipt"]["aTeamId"] = "other-team"
-    else: registration["envelope"]["projectLead"]["id"] = "other-lead"
+    elif field == "lead": registration["envelope"]["projectLead"]["id"] = "other-lead"
+    scheduling = _scheduling_payload(registration)
+    if field == "scheduling": del scheduling["gateDistance"]
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
-    store.record_project("arcade", registration, {"projectId": "arcade", "projectLeadId": "lead-arcade", "state": "managed", "correlationId": "psychlo-scheduling:receipt-arcade", "idempotencyKey": "psychlo-scheduling:receipt-arcade"})
+    store.record_project("arcade", registration, scheduling)
     store.record_protocol("cross-project-team-binding", "binding-1", "binding-1", "b" * 64, {"bindingId": "binding-1", "coordinationTeamId": "coordination-team", "supervisorMemberId": "member-supervisor", "supervisorLeadId": "lead-supervisor"}, state="delivered")
     dispatcher = _PreparedDispatcher(identity=lambda *_: "must-not-dispatch")
     bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     request = _coord_request("binding-1", "link-real", "v1", "arcade", "lead-arcade", "lead-supervisor", ["arcade", "hermione"])
-    with pytest.raises(ValueError, match="registration|scheduling|lead"):
+    with pytest.raises(ValueError, match="handoff|registration|scheduling|lead"):
         bridge.receive_coordination_work_request(request)
     assert dispatcher.calls == []
 

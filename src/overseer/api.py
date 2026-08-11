@@ -342,6 +342,14 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
+            if path == "/psychlo/tick":
+                if psychlo_bridge is None:
+                    self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                elif auth_context.get("auth_type") != "admin_token":
+                    self._write_json({"error": "admin_token_required"}, HTTPStatus.FORBIDDEN)
+                else:
+                    self._handle(lambda: psychlo_bridge.tick())
+                return
             if path.startswith("/storage/control/") and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
                 return
@@ -696,6 +704,7 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/psychlo/external-rounds": "external-round",
                 "/psychlo/coordination/work": "coordination-work-request",
                 "/psychlo/concurrency/canary-result": "concurrency-canary-result",
+                "/psychlo/concurrency/canary-results": "concurrency-canary-result",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])

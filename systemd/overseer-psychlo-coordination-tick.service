@@ -1,0 +1,23 @@
+[Unit]
+Description=Poll bounded Psychlo coordination dispatches and authoritative results
+After=overseer-api.service psychlo.service
+
+[Service]
+Type=oneshot
+Environment="PYTHONPATH=%h/Documents/Codex Workspace/Overseer/src"
+Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
+Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=%h/.local/share/overseer/psychlo/bridge.sqlite3
+Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=%h/.config/overseer/psychlo-project-bindings.json
+Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-overseer-peer-secret
+Environment=OVERSEER_STORE_DATABASE=%h/.local/share/overseer/project/state/overseer.sqlite3
+LoadCredential=psychlo-overseer-peer-secret:%h/.config/psychlo/overseer-peer-secret
+ExecStart=/usr/bin/python3 -m overseer.psychlo_bridge_cli tick
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.config/overseer/psychlo-project-bindings.json
+BindReadOnlyPaths="%h/Documents/Codex Workspace/Overseer/src"
+BindPaths=%h/.local/share/overseer/psychlo
+BindPaths=%h/.local/share/overseer/project/state
+UMask=0077

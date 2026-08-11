@@ -64,6 +64,7 @@ class OverseerRuntime:
         audit_station: bool = False,
         station_auditor: Callable[[str, str | None], dict[str, Any]] | None = None,
         station_audit_interval_ticks: int = 120,
+        psychlo_bridge: Any | None = None,
     ) -> None:
         self.store = store
         self.service_name = service_name
@@ -82,12 +83,15 @@ class OverseerRuntime:
         self.audit_station = audit_station
         self.station_auditor = station_auditor
         self.station_audit_interval_ticks = max(1, station_audit_interval_ticks)
+        self.psychlo_bridge = psychlo_bridge
         self.started_at = _utc_now()
         self.tick_count = 0
 
     def tick(self) -> RuntimeTick:
         self.tick_count += 1
         self._save_heartbeat()
+        if self.psychlo_bridge is not None:
+            self.psychlo_bridge.tick()
         health_probes = self._probe_health_targets()
         (
             host_inspections,

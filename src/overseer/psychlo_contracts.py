@@ -51,6 +51,30 @@ def canonical_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
 
 
+def cross_project_work_request_id(link_id: str, version: str, project_id: str) -> str:
+    """Match Psychlo's JSON.stringify field order for work request identity."""
+    selected = {"linkId": link_id, "version": version, "projectId": project_id}
+    return "cross-project-work:" + hashlib.sha256(json.dumps(selected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def cross_project_work_request_digest(payload: Mapping[str, Any]) -> str:
+    """Match Psychlo 3d178b6's selected-field work request digest exactly."""
+    selected = {
+        "coordinationBindingId": payload.get("coordinationBindingId"),
+        "linkId": payload.get("linkId"),
+        "version": payload.get("version"),
+        "projectId": payload.get("projectId"),
+        "leadId": payload.get("leadId"),
+        "requestId": payload.get("id"),
+        "requiredRequestIds": payload.get("requiredRequestIds"),
+        "supervisorLeadId": payload.get("supervisorLeadId"),
+        "scope": payload.get("scope"),
+        "evidenceIds": payload.get("evidenceIds"),
+        "expectedResultDigest": payload.get("expectedResultDigest"),
+    }
+    return hashlib.sha256(json.dumps(selected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def learning_observation_digest(value: Mapping[str, Any]) -> str:
     content = {"id": value["id"], "featureProfile": dict(sorted(value["featureProfile"].items())), "outcome": dict(sorted(value["outcome"].items()))}
     return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
@@ -423,10 +447,12 @@ def parse_cross_project_work(payload: Mapping[str, Any], *, kind: str) -> dict[s
 
 
 def parse_cross_project_supervisor_review(payload: Mapping[str, Any]) -> dict[str, Any]:
-    required = {"linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "digest", "correlationId", "idempotencyKey", "occurredAt"}
+    required = {"projectId", "leadId", "supervisorLeadId", "decision", "evidenceId", "linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "digest", "correlationId", "idempotencyKey", "occurredAt"}
     value = _strict_protocol(payload, required=required, name="cross-project supervisor review")
-    for field in ("linkId", "version", "resultId", "coordinationTeamId", "supervisorMemberId", "correlationId", "idempotencyKey"):
+    for field in ("projectId", "leadId", "supervisorLeadId", "linkId", "version", "resultId", "coordinationTeamId", "supervisorMemberId", "correlationId", "idempotencyKey", "evidenceId"):
         _id(value[field], name=field)
+    if value["decision"] not in {"accepted", "rejected"} or value["decision"] != ("accepted" if value["accepted"] else "rejected"):
+        raise ContractError("supervisor review decision is invalid")
     if not isinstance(value["accepted"], bool):
         raise ContractError("supervisor review acceptance is invalid")
     if not isinstance(value["participantResults"], list) or not value["participantResults"]:
@@ -438,8 +464,8 @@ def parse_cross_project_supervisor_review(payload: Mapping[str, Any]) -> dict[st
     if not isinstance(value["evidence"], list) or not value["evidence"] or any(not isinstance(item, str) or not item.strip() for item in value["evidence"]):
         raise ContractError("supervisor review evidence is required")
     _timestamp(value["occurredAt"]); _digest(value["digest"], name="digest")
-    base = {key: value[key] for key in ("linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "correlationId", "idempotencyKey", "occurredAt")}
-    if hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest() != value["digest"]:
+    base = {key: value[key] for key in ("projectId", "leadId", "supervisorLeadId", "decision", "evidenceId", "linkId", "version", "resultId", "participantResults", "coordinationTeamId", "supervisorMemberId", "accepted", "evidence", "correlationId", "idempotencyKey", "occurredAt")}
+    if canonical_digest(base) != value["digest"]:
         raise ContractError("supervisor review digest mismatch")
     return value
 

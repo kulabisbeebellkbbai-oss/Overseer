@@ -18,6 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     emit.add_argument("--policy-version", default=os.environ.get("OVERSEER_PSYCHLO_POLICY_VERSION", "2026-08-09"))
     sync = subparsers.add_parser("sync-projects")
     sync.add_argument("--handoff-file", default=os.environ.get("OVERSEER_A_TEAM_HANDOFF_FILE", "/home/god/Documents/Codex Workspace/The A-Team/data/handoffs.json"))
+    subparsers.add_parser("tick")
     args = parser.parse_args(argv)
     if args.command == "emit-usage":
         bridge = create_bridge_from_environment()
@@ -37,6 +38,10 @@ def main(argv: list[str] | None = None) -> int:
             bridge.register_project({"envelope": record.get("envelope"), "receipt": record["receipt"]})
             synchronized += 1
         print(json.dumps({"accepted": True, "synchronized": synchronized}, sort_keys=True))
+        return 0
+    if args.command == "tick":
+        bridge = create_bridge_from_environment()
+        print(json.dumps(bridge.tick(), sort_keys=True))
         return 0
     return 2
 

@@ -48,8 +48,10 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
+            CREATE TABLE IF NOT EXISTS approval_authority_snapshots(approval_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS coordination_operation_claims(kind TEXT NOT NULL, operation_id TEXT NOT NULL, owner_id TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, operation_id), UNIQUE(kind, idempotency_key));
         """)
         for column in ("delivery_skiller", "delivery_memory"):
             try:
@@ -63,6 +65,59 @@ class PsychloBridgeStore:
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
+
+    def save_approval_snapshot(self, approval_id: str, payload: Mapping[str, Any], digest: str) -> dict[str, Any]:
+        if not isinstance(approval_id, str) or not approval_id.strip() or not isinstance(digest, str) or not digest.strip():
+            raise ValueError("approval snapshot identity is required")
+        encoded = _dump(payload)
+        existing = self.approval_snapshot(approval_id)
+        if existing is not None:
+            if existing["digest"] != digest or existing["payload"] != dict(payload):
+                raise ValueError("approval authority snapshot is immutable")
+            return existing
+        self.connection.execute("INSERT INTO approval_authority_snapshots VALUES (?,?,?,?)", (approval_id, digest, encoded, self._now()))
+        return self.approval_snapshot(approval_id)
+
+    def approval_snapshot(self, approval_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT digest,payload_json,created_at FROM approval_authority_snapshots WHERE approval_id=?", (approval_id,)).fetchone()
+        if row is None: return None
+        return {"approvalId": approval_id, "digest": row[0], "payload": json.loads(row[1]), "createdAt": row[2]}
+
+    def claim_coordination_operation(self, kind: str, operation_id: str, owner_id: str, lease_expires_at: str, idempotency_key: str, *, now: str) -> bool:
+        if kind not in {"lead-dispatch", "supervisor-dispatch"} or not all(isinstance(item, str) and item.strip() for item in (operation_id, owner_id, lease_expires_at, idempotency_key, now)):
+            raise ValueError("coordination operation claim is invalid")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT owner_id,lease_expires_at,state,idempotency_key FROM coordination_operation_claims WHERE kind=? AND operation_id=?", (kind, operation_id)).fetchone()
+            if row is None:
+                self.connection.execute("INSERT INTO coordination_operation_claims VALUES (?,?,?,?,1,?,'claimed',?)", (kind, operation_id, owner_id, lease_expires_at, idempotency_key, now))
+                acquired = True
+            elif row[3] != idempotency_key:
+                raise ValueError("coordination operation idempotency conflict")
+            elif row[2] == "completed" or (row[2] == "claimed" and row[1] is not None and datetime.fromisoformat(str(row[1]).replace("Z", "+00:00")) > datetime.fromisoformat(now.replace("Z", "+00:00"))):
+                acquired = False
+            else:
+                self.connection.execute("UPDATE coordination_operation_claims SET owner_id=?,lease_expires_at=?,attempts=attempts+1,state='claimed',updated_at=? WHERE kind=? AND operation_id=?", (owner_id, lease_expires_at, now, kind, operation_id))
+                acquired = True
+            self.connection.execute("COMMIT")
+            return acquired
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def complete_coordination_operation(self, kind: str, operation_id: str, owner_id: str, *, now: str) -> None:
+        cursor = self.connection.execute("UPDATE coordination_operation_claims SET state='completed',lease_expires_at=NULL,updated_at=? WHERE kind=? AND operation_id=? AND owner_id=? AND state='claimed'", (now, kind, operation_id, owner_id))
+        if cursor.rowcount != 1:
+            row = self.connection.execute("SELECT state FROM coordination_operation_claims WHERE kind=? AND operation_id=?", (kind, operation_id)).fetchone()
+            if row is None or row[0] != "completed": raise ValueError("coordination operation claim is unavailable")
+
+    def release_coordination_operation(self, kind: str, operation_id: str, owner_id: str, *, now: str) -> None:
+        self.connection.execute("UPDATE coordination_operation_claims SET owner_id=NULL,lease_expires_at=NULL,state='pending',updated_at=? WHERE kind=? AND operation_id=? AND owner_id=? AND state='claimed'", (now, kind, operation_id, owner_id))
+
+    def coordination_operation_claim(self, kind: str, operation_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT owner_id,lease_expires_at,attempts,idempotency_key,state,updated_at FROM coordination_operation_claims WHERE kind=? AND operation_id=?", (kind, operation_id)).fetchone()
+        if row is None: return None
+        return {"kind": kind, "operationId": operation_id, "ownerId": row[0], "leaseExpiresAt": row[1], "attempts": row[2], "idempotencyKey": row[3], "state": row[4], "updatedAt": row[5]}
 
     def save_coordination_dispatch(self, request_id: str, dispatch_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not request_id or not dispatch_id:
@@ -97,6 +152,10 @@ class PsychloBridgeStore:
         if row is None:
             return None
         return {"requestId": request_id, "reviewId": row[0], "payload": json.loads(row[1]), "state": row[2], "updatedAt": row[3]}
+
+    def coordination_review_for_review_id(self, review_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT request_id FROM coordination_reviews WHERE review_id=?", (review_id,)).fetchone()
+        return None if row is None else self.coordination_review(str(row[0]))
 
     def transition_coordination_dispatch(self, request_id: str, state: str) -> dict[str, Any]:
         self.connection.execute("UPDATE coordination_dispatches SET state=?,updated_at=? WHERE request_id=?", (state, self._now(), request_id))
@@ -421,6 +480,9 @@ class PsychloBridgeStore:
         try:
             self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at) VALUES (?,?,?,?,?,?,?)", (kind, record_id, idempotency_key, digest, _dump(payload), state, self._now()))
         except sqlite3.IntegrityError as error:
+            winner = self.protocol_record(kind, record_id)
+            if winner is not None and winner["digest"] == digest and winner["payload"] == dict(payload):
+                return winner, False
             raise ValueError(f"{kind} conflict") from error
         return self.protocol_record(kind, record_id), True
 

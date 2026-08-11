@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "psychlo.event.v1",
+  "id": "cross-project-work:3519c5161f0d67795531941ed099b590c449cab47241bb0c9b2b9014f4b1dd05",
+  "linkId": "link-runtime",
+  "version": "v1",
+  "projectId": "producer",
+  "leadId": "lead-p",
+  "coordinationBindingId": "binding-runtime",
+  "requiredRequestIds": [
+    "cross-project-work:6a75045c2c9eeee2d60279f84f5aba60d2f1ea634e1a84afbc765e77c837f249",
+    "cross-project-work:3519c5161f0d67795531941ed099b590c449cab47241bb0c9b2b9014f4b1dd05"
+  ],
+  "supervisorLeadId": "supervisor-runtime",
+  "scope": "bounded producer work",
+  "evidenceIds": ["request-evidence"],
+  "expectedResultDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "requestDigest": "e5a4c4d3cfbc03e44a6b6d052ec4a58a0b49211e27cc8b37df9407a32d34a37c"
+}

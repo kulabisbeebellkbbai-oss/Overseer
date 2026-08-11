@@ -3,14 +3,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
 from overseer.psychlo_contracts import (
     ContractError,
     canonical_digest,
+    cross_project_work_request_digest,
+    cross_project_work_request_id,
     parse_adoption_evidence,
     parse_concurrency_canary_result,
+    parse_cross_project_team_binding,
     parse_ingress_conflict_reconciliation,
     parse_external_round,
     parse_learning_observation,
@@ -76,3 +80,17 @@ def test_ingress_project_id_is_the_only_exact_optional_key():
 def test_canary_result_contract_rejects_arbitrary_protocol_shape():
     with pytest.raises(ContractError):
         parse_concurrency_canary_result({"resultId": "canary-result-1"})
+
+
+def test_team_binding_contract_matches_exact_psychlo_schema_without_link_request_fields():
+    base = {"bindingId": "binding-1", "coordinationTeamId": "team-1", "supervisorMemberId": "member-1", "supervisorLeadId": "lead-1", "approvalId": "approval-1", "approvalProvenanceId": "provenance-1", "approvedAt": NOW, "correlationId": "binding-1", "idempotencyKey": "binding-1", "occurredAt": NOW}
+    binding = {**base, "digest": hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest()}
+    assert parse_cross_project_team_binding(binding) == binding
+    with pytest.raises(ContractError, match="unknown"):
+        parse_cross_project_team_binding({**binding, "linkId": "link-1"})
+
+
+def test_cross_project_work_identity_and_digest_match_psychlo_3d178b6_fixture():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "psychlo-3d178b6-cross-project-work.json").read_text(encoding="utf-8"))
+    assert cross_project_work_request_id(fixture["linkId"], fixture["version"], fixture["projectId"]) == fixture["id"]
+    assert cross_project_work_request_digest(fixture) == fixture["requestDigest"]

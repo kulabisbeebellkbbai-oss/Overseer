@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -344,6 +345,8 @@ class CodexDriver:
         self,
         session: AgentSession,
         prompt: str,
+        *,
+        idempotency_key: str | None = None,
     ) -> AgentDispatchResult:
         """Dispatch the exact legacy prompt without weakening the generic DTO."""
 
@@ -352,12 +355,15 @@ class CodexDriver:
         resolved = self._validated_session(session)
         if resolved is None:
             raise ValueError("cannot dispatch to an unknown Codex session")
+        dispatch_key = idempotency_key or f"legacy.dispatch.{resolved.id}"
+        if not isinstance(dispatch_key, str) or not dispatch_key.strip():
+            raise ValueError("legacy dispatch idempotency key must be non-empty")
         request = AgentDispatchRequest(
-            id=f"legacy.dispatch.{resolved.id}",
+            id=(f"legacy.dispatch.{resolved.id}" if idempotency_key is None else f"legacy.dispatch.{hashlib.sha256(dispatch_key.encode()).hexdigest()}"),
             instance_id=self.profile.id,
             session_id=resolved.id,
             driver_epoch_id="legacy.codex",
-            idempotency_key=f"legacy.dispatch.{resolved.id}",
+            idempotency_key=dispatch_key,
             prompt="legacy compatibility dispatch",
         )
         return self._dispatch_session(

@@ -58,6 +58,7 @@ from .agent_contracts import (
     RECOVERABLE_FAILOVER_EXECUTION_STATES,
 )
 from .agent_manager import AgentAuthorizationError, AgentManager
+from .psychlo_bridge import create_bridge_from_environment
 from .agent_registry import AgentRegistry
 from .core import ApprovalLevel, Claim, ClaimType, ConflictOutcome, OwnerDomain, Resource, ResourceType, RiskLevel
 from .core import ClaimStatus, ResourceState
@@ -2593,6 +2594,11 @@ def run_status(
 ) -> dict[str, object]:
     store = SQLiteStore(store_path)
     try:
+        psychlo_bridge = None
+        if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE"):
+            bridge_environment = dict(os.environ)
+            bridge_environment.setdefault("OVERSEER_STORE_DATABASE", str(store.path))
+            psychlo_bridge = create_bridge_from_environment(bridge_environment)
         tick = OverseerRuntime(
             store,
             probe_health_targets=probe_health_targets,
@@ -2608,6 +2614,7 @@ def run_status(
             audit_station=audit_station,
             station_auditor=lambda path, snapshot_id: audit_station_status(path, snapshot_id=snapshot_id),
             station_audit_interval_ticks=station_audit_interval_ticks,
+            psychlo_bridge=psychlo_bridge,
         ).run(interval_seconds=interval_seconds, once=once)
         return {
             "store": str(store.path),

@@ -108,14 +108,14 @@ def _single_stream_race_process(store_path: str, barrier, result_queue, suffix: 
         result_queue.put("accepted")
 
 
-def _successful_canary_result(authorization_id: str = "canary-1") -> dict:
+def _successful_canary_result(authorization_id: str = "canary-1", projects=(('arcade', 'plan-1', 'v1', 'lead-1'), ('hermione', 'plan-2', 'v1', 'lead-2'))) -> dict:
     def hashed(value: dict) -> str:
         return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
     executions = []
-    for index, project_id in enumerate(("arcade", "hermione"), start=1):
+    for index, (project_id, plan_id, plan_version, lead_id) in enumerate(projects, start=1):
         execution_id = f"round-{index}"
-        started = {"executionId": execution_id, "authorizationId": authorization_id, "projectId": project_id, "planId": f"plan-{index}", "planVersion": "v1", "roundId": execution_id, "leadId": f"lead-{index}", "startedAt": f"2026-08-10T02:00:0{index}+00:00"}
-        completed = {"executionId": execution_id, "authorizationId": authorization_id, "projectId": project_id, "planId": f"plan-{index}", "planVersion": "v1", "roundId": execution_id, "leadId": f"lead-{index}", "settledAt": f"2026-08-10T02:00:1{index}+00:00", "terminalStatus": "completed", "resultDigest": str(index) * 64, "evidenceId": f"evidence-{index}", "evidenceDigest": chr(96 + index) * 64}
+        started = {"executionId": execution_id, "authorizationId": authorization_id, "projectId": project_id, "planId": plan_id, "planVersion": plan_version, "roundId": execution_id, "leadId": lead_id, "startedAt": f"2026-08-10T02:00:0{index}+00:00"}
+        completed = {"executionId": execution_id, "authorizationId": authorization_id, "projectId": project_id, "planId": plan_id, "planVersion": plan_version, "roundId": execution_id, "leadId": lead_id, "settledAt": f"2026-08-10T02:00:1{index}+00:00", "terminalStatus": "completed", "resultDigest": str(index) * 64, "evidenceId": f"evidence-{index}", "evidenceDigest": chr(96 + index) * 64}
         executions.append({"executionId": execution_id, "started": {**started, "digest": hashed(started)}, "completed": {**completed, "digest": hashed(completed)}})
     base = {"resultId": f"canary-result:{authorization_id}", "authorizationId": authorization_id, "targetCeiling": 2, "expectedRevision": 0, "executions": executions, "concurrencyObserved": True, "occurredAt": "2026-08-10T02:00:30+00:00"}
     return {**base, "digest": hashed(base)}
@@ -176,7 +176,7 @@ def _persist_approved_canary(store: PsychloBridgeStore, *, deadline: str = "2026
 
 
 def _canary_round(round_id: str, project_id: str, plan_id: str, lead_id: str) -> dict:
-    return {"roundId": round_id, "projectId": project_id, "projectLeadId": lead_id, "planId": plan_id, "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": round_id, "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "authorized canary"}
+    return {"roundId": round_id, "projectId": project_id, "projectLeadId": lead_id, "planId": plan_id, "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": round_id, "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": project_id}
 
 
 def test_approved_canary_admits_exactly_two_independent_rounds_atomically(tmp_path: Path):
@@ -208,6 +208,8 @@ def test_canary_admission_rejects_expired_or_unapproved_authority_and_preserves_
 def test_durable_ceiling_keeps_two_streams_after_restart_and_denies_third(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     authorization = _persist_approved_canary(store)
+    canary = _successful_canary_result("canary-round-admission", (("arcade", "plan-arcade", "v1", "lead-arcade"), ("hermione", "plan-hermione", "v1", "lead-hermione")))
+    store.record_protocol("concurrency-canary-result", canary["resultId"], canary["resultId"], canary["digest"], canary, state="delivered")
     ceiling_base = {"authorizationId": "ceiling-round-admission", "ceiling": 2, "expectedRevision": 0, "revision": 1, "canaryResultId": "canary-result:canary-round-admission", "projectId": "arcade", "planId": "plan-arcade", "workflowId": authorization["workflowId"], "decisionVersion": "v1", "correlationId": "ceiling-round-admission", "idempotencyKey": "ceiling-round-admission", "occurredAt": NOW}
     ceiling_digest = hashlib.sha256(json.dumps(ceiling_base, separators=(",", ":")).encode()).hexdigest()
     ceiling = {**ceiling_base, "decisionId": f"roadex:concurrency:{ceiling_base['authorizationId']}", "question": f"Approve the exact global concurrency operation {ceiling_digest}", "digest": ceiling_digest}

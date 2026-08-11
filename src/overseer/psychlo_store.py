@@ -289,15 +289,30 @@ class PsychloBridgeStore:
                 raise ValueError("concurrency ceiling is unavailable")
             change_payload = json.loads(change[0])
             authorization_id = change_payload.get("authorizationId")
+            if set(change_payload) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt"} or not isinstance(authorization_id, str) or not authorization_id.strip():
+                raise ValueError("concurrency ceiling change binding is invalid")
             auth = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-ceiling-authorization' AND record_id=?", (authorization_id,)).fetchone()
             if auth is None or auth[1] not in {"delivered", "settled"}:
                 raise ValueError("concurrency ceiling authorization is unavailable")
             authorization = json.loads(auth[0])
             if authorization.get("ceiling") != 2 or authorization.get("revision") != authorization.get("expectedRevision", -1) + 1:
                 raise ValueError("concurrency ceiling is invalid")
-            decision_row = self.connection.execute("SELECT status FROM decisions WHERE decision_id=?", (authorization.get("decisionId"),)).fetchone()
-            if decision_row is None or decision_row[0] != "approved":
+            canary_row = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-result' AND record_id=?", (authorization.get("canaryResultId"),)).fetchone()
+            if canary_row is None or canary_row[1] != "delivered":
+                raise ValueError("successful delivered canary evidence is required")
+            canary = json.loads(canary_row[0])
+            canary_authorization = self.connection.execute("SELECT payload_json,state FROM protocol_records WHERE kind='concurrency-canary-authorization' AND record_id=?", (canary.get("authorizationId"),)).fetchone()
+            expected_projects = canary_authorization and json.loads(canary_authorization[0]).get("projects")
+            observed_projects = [{"projectId": item.get("started", {}).get("projectId"), "planId": item.get("started", {}).get("planId"), "planVersion": item.get("started", {}).get("planVersion"), "leadId": item.get("started", {}).get("leadId")} for item in canary.get("executions", [])] if isinstance(canary.get("executions"), list) else []
+            if canary_authorization is None or canary_authorization[1] not in {"delivered", "settled"} or canary.get("resultId") != authorization.get("canaryResultId") or canary.get("targetCeiling") != authorization.get("ceiling") or canary.get("expectedRevision") != authorization.get("expectedRevision") or canary.get("concurrencyObserved") is not True or len(observed_projects) != 2 or sorted(observed_projects, key=lambda item: item["projectId"]) != sorted(expected_projects or [], key=lambda item: item.get("projectId")):
+                raise ValueError("successful canary evidence does not bind to ceiling authorization")
+            decision_row = self.connection.execute("SELECT request_json,status FROM decisions WHERE decision_id=?", (authorization.get("decisionId"),)).fetchone()
+            if decision_row is None or decision_row[1] != "approved":
                 raise ValueError("concurrency ceiling authorization is not approved")
+            decision = json.loads(decision_row[0])
+            expected_decision = {"decisionId": authorization.get("decisionId"), "projectId": authorization.get("projectId"), "planId": authorization.get("planId"), "workflowId": authorization.get("workflowId"), "decisionVersion": authorization.get("decisionVersion"), "question": authorization.get("question"), "resultProvenanceId": authorization.get("digest")}
+            if any(decision.get(field) != value for field, value in expected_decision.items()):
+                raise ValueError("concurrency ceiling decision binding is invalid")
             active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")

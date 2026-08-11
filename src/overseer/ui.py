@@ -829,6 +829,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       crewMessages: "/crew/messages",
       audit: "/audit-summary",
       approvals: "/approvals-summary",
+      psychloStatus: "/psychlo/status",
       claims: "/claims/review",
       claimCleanup: "/claims/cleanup-plan",
       listenerReviewQueue: "/host/security/listener-review-queue",
@@ -2215,10 +2216,12 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       const crewSummary = (state.data.crewMessages || {}).summary || {};
       const dispatches = (state.data.crewMessages || {}).recent_dispatches || [];
       const humanDecisions = (state.data.roadexHumanDecisions || {}).items || [];
+      const psychlo = state.data.psychloStatus || {};
       document.getElementById("overview").innerHTML = `
         <div class="grid">
           ${stationIntro("Sisko", "Strategic Operations", "Command routing, runtime cadence, and crew dispatch.", ["authorizations", "crew queue", "runtime"])}
           ${humanDecisions.length ? humanDecisions.map(roadexHumanDecisionCard).join("") : `<div class="panel span-12 good"><div class="toolbar"><h3>Roadex final human decisions</h3><span class="pill good">clear</span></div><p class="muted">No Roadex decisions currently require independent human action.</p></div>`}
+          <div class="panel span-12"><div class="toolbar"><h3>Psychlo 1.0 Bridge</h3><span class="pill ${psychlo.configured ? "good" : "inactive"}">${psychlo.configured ? "configured" : "not configured"}</span></div>${kv("Immutable projections", psychlo.projections || {})}<p class="muted">External executions remain separate from normal rounds; bridge status is read-only.</p></div>
           ${metric("Sisko", attention.pending_authorizations, "pending authorizations", "span-3", attention.pending_authorizations ? "warn" : "good", "admin")}
           ${metric("Odo", attention.high_security_findings, "high findings", "span-3", attention.high_security_findings ? "bad" : "good", "security")}
           ${metric("Julian", attention.unhealthy_health_targets, "unhealthy targets", "span-3", attention.unhealthy_health_targets ? "bad" : "good", "health")}

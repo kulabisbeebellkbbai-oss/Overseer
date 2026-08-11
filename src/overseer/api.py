@@ -660,6 +660,9 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     redact_projection_errors=True,
                 )
                 return
+            if path == "/psychlo/status":
+                self._handle(lambda: psychlo_bridge.status() if psychlo_bridge is not None else {"configured": False})
+                return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
@@ -671,6 +674,14 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                 "/psychlo/rounds": "round-request",
                 "/psychlo/rounds/reconcile": "round-reconcile",
                 "/psychlo/decisions": "decision-stage",
+                "/psychlo/telemetry": "telemetry-checkpoint",
+                "/psychlo/telemetry-checkpoints": "telemetry-checkpoint",
+                "/psychlo/learning": "learning-observation",
+                "/psychlo/learning-observations": "learning-observation",
+                "/psychlo/registry-candidates": "registry-candidate",
+                "/psychlo/adoption-evidence": "adoption-evidence",
+                "/psychlo/external-round": "external-round",
+                "/psychlo/external-rounds": "external-round",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])
@@ -1269,8 +1280,20 @@ def make_api_handler(store_path: str, auth_token: str | None = None, backup_prov
                     result = psychlo_bridge.request_round(message["payload"])
                 elif kind == "round-reconcile":
                     result = psychlo_bridge.reconcile_round(message["payload"])
-                else:
+                elif kind == "decision-stage":
                     result = psychlo_bridge.stage_decision(message["payload"])
+                elif kind == "telemetry-checkpoint":
+                    result = psychlo_bridge.receive_telemetry_checkpoint(message["payload"])
+                elif kind == "learning-observation":
+                    result = psychlo_bridge.receive_learning_observation(message["payload"])
+                elif kind == "registry-candidate":
+                    result = psychlo_bridge.receive_registry_candidate(message["payload"])
+                elif kind == "adoption-evidence":
+                    result = psychlo_bridge.receive_adoption_evidence(message["payload"])
+                elif kind == "external-round":
+                    result = psychlo_bridge.receive_external_round(message["payload"])
+                else:
+                    raise ValueError("unsupported Psychlo peer kind")
                 self._write_json(dict(result), HTTPStatus.ACCEPTED)
             except ValueError as error:
                 code = str(error)

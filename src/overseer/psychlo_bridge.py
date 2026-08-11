@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
+import inspect
 import json
 from pathlib import Path
 import os
@@ -13,6 +14,16 @@ import sqlite3
 import stat
 from typing import Any, Callable, Mapping
 from urllib.request import Request, urlopen
+
+from .psychlo_contracts import (
+    ContractError,
+    canonical_digest,
+    parse_adoption_evidence,
+    parse_external_round,
+    parse_learning_observation,
+    parse_registry_candidate,
+    parse_telemetry_checkpoint,
+)
 
 
 MAX_BODY_BYTES = 256 * 1024
@@ -37,7 +48,7 @@ def sign_peer_message(secret: bytes, direction: str, kind: str, message_id: str,
     }
 
 
-class PsychloBridgeStore:
+class _LegacyPsychloBridgeStore:
     def __init__(self, filename: str | Path):
         self.filename = Path(filename)
         self.filename.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -114,6 +125,12 @@ class PsychloBridgeStore:
         self.connection.execute("INSERT INTO projects VALUES (?,?,?)", (project_id, _dump(registration), _dump(scheduling)))
 
 
+# Keep the historical import stable while the 1.0 bridge uses the expanded
+# isolated projection store.  The new store retains all legacy round/decision
+# methods, so existing callers do not cross the external-execution boundary.
+from .psychlo_store import PsychloBridgeStore
+
+
 def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind: str, body: bytes, headers: Mapping[str, str], *, now: str | None = None) -> dict[str, Any]:
     if len(secret) < 32 or len(secret) > 4096 or not body or len(body) > MAX_BODY_BYTES:
         raise ValueError("invalid_request")
@@ -178,6 +195,8 @@ class PsychloBridge:
 
     def request_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         _require_round(request)
+        if any(item["request"].get("projectId") == request["projectId"] for item in self.store.list_staged_decisions()):
+            raise ValueError("decision_pending")
         existing = self.store.get_round(str(request["roundId"]))
         if existing:
             if existing[0] != dict(request): raise ValueError("round identity conflict")
@@ -291,6 +310,187 @@ class PsychloBridge:
         if not history: raise ValueError("Codex usage history is required")
         payload = derive_usage_snapshot(history, policy_version=policy_version)
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
+
+    def status(self) -> dict[str, Any]:
+        return {"configured": True, "projections": self.store.projection_counts(), "activeRound": self.store.active_round(), "pendingDecisions": len(self.store.list_staged_decisions())}
+
+    # ---- Psychlo 1.0 immutable bridge projections ---------------------
+    def record_telemetry_checkpoint(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist one hybrid token sample with monotonic/provider-bound counters."""
+        payload = {**payload, "schemaVersion": payload.get("schemaVersion", "psychlo.telemetry.v1")}
+        try:
+            checkpoint = parse_telemetry_checkpoint(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        digest = canonical_digest(checkpoint)
+        existing = self.store.telemetry_checkpoint(checkpoint["checkpointId"])
+        if existing is not None:
+            if existing != checkpoint:
+                raise ValueError("telemetry checkpoint conflict")
+            return {"inserted": False, "replay": True, "checkpoint": existing}
+        stream = self.store.telemetry_stream(checkpoint["roundId"])
+        prior = stream[-1] if stream else None
+        if prior is None and checkpoint["sampleKind"] != "baseline":
+            raise ValueError("telemetry baseline is required")
+        if prior is not None and (prior["sampleKind"] == "terminal" or checkpoint["sampleKind"] == "baseline"):
+            raise ValueError("telemetry stream is terminal or baseline already exists")
+        if prior is not None:
+            previous = prior["cumulative"]
+            current = checkpoint["cumulative"]
+            if any(current[key] < previous[key] for key in previous):
+                raise ValueError("telemetry cumulative counters must be monotonic")
+            if prior.get("providerSnapshotId") != checkpoint.get("providerSnapshotId"):
+                raise ValueError("telemetry provider snapshot binding changed")
+            checkpoint = {**checkpoint, "delta": {key: current[key] - previous[key] for key in previous}}
+        else:
+            checkpoint = {**checkpoint, "delta": {key: 0 for key in checkpoint["cumulative"]}}
+        inserted = self.store.record_telemetry(checkpoint, digest)
+        return {"inserted": inserted, "replay": not inserted, "checkpoint": checkpoint}
+
+    receive_telemetry_checkpoint = record_telemetry_checkpoint
+
+    # Boundary-neutral aliases used by round drivers for baseline, turn,
+    # durable-checkpoint, bounded-long-turn, and terminal samples.
+    sample_token_checkpoint = record_telemetry_checkpoint
+    record_token_sample = record_telemetry_checkpoint
+
+    def record_learning_observation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        payload = {**payload, "sourceId": payload.get("sourceId", "overseer"), "messageId": payload.get("messageId", payload.get("id", "")), "correlationId": payload.get("correlationId", f"learning:{payload.get('id', '')}"), "idempotencyKey": payload.get("idempotencyKey", f"learning:observation:{payload.get('id', '')}"), "occurredAt": payload.get("occurredAt", self.clock()), "schemaVersion": payload.get("schemaVersion", "psychlo.learning.v1")}
+        supplied_digest = payload.pop("digest", None)
+        payload.pop("state", None)
+        payload.pop("messageId", None)
+        try:
+            observation = parse_learning_observation(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        if supplied_digest is not None:
+            expected_digest = hashlib.sha256(json.dumps({"id": observation["id"], "featureProfile": dict(sorted(observation["featureProfile"].items())), "outcome": dict(sorted(observation["outcome"].items()))}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if supplied_digest != expected_digest:
+                raise ValueError("learning observation digest mismatch")
+        digest = canonical_digest(observation)
+        inserted = self.store.record_learning(observation, digest)
+        return {"inserted": inserted, "replay": not inserted, "observation": self.store.learning_observation(observation["id"])}
+
+    receive_learning_observation = record_learning_observation
+
+    def deliver_learning_pending(self, adapters: Mapping[str, Callable[[Mapping[str, Any]], Any]], *, limit: int = 100) -> dict[str, int]:
+        """Deliver sanitized observations; adapter errors are durable and isolated."""
+        delivered = failed = 0
+        for destination in ("skiller", "private-memory"):
+            adapter = adapters.get(destination)
+            if adapter is None:
+                continue
+            for observation in self.store.pending_learning(destination, limit):
+                try:
+                    result = adapter(observation)
+                    if inspect.isawaitable(result):
+                        import asyncio
+                        try:
+                            asyncio.get_running_loop()
+                        except RuntimeError:
+                            asyncio.run(result)
+                        else:
+                            raise RuntimeError("async adapter requires an async delivery boundary")
+                    self.store.transition_learning(observation["id"], destination, "delivered")
+                    delivered += 1
+                except Exception:
+                    self.store.transition_learning(observation["id"], destination, "failed", "adapter-failed")
+                    failed += 1
+        return {"delivered": delivered, "failed": failed}
+
+    def register_candidate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        payload = {**payload, "sourceId": payload.get("sourceId", "overseer"), "messageId": payload.get("messageId", payload.get("candidateId", "")), "correlationId": payload.get("correlationId", f"registry:{payload.get('candidateId', '')}"), "idempotencyKey": payload.get("idempotencyKey", f"registry:{payload.get('candidateId', '')}"), "occurredAt": payload.get("occurredAt", self.clock()), "schemaVersion": payload.get("schemaVersion", "psychlo.registry-candidate.v1")}
+        try:
+            candidate = parse_registry_candidate(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        inserted = self.store.record_registry(candidate, canonical_digest(candidate))
+        return {"inserted": inserted, "replay": not inserted, "candidate": self.store.registry_candidate(candidate["candidateId"])}
+
+    receive_registry_candidate = register_candidate
+
+    def record_adoption_evidence(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        payload = {**payload, "sourceId": payload.get("sourceId", "overseer"), "messageId": payload.get("messageId", payload.get("assessmentId", "")), "correlationId": payload.get("correlationId", f"adoption:{payload.get('assessmentId', '')}"), "idempotencyKey": payload.get("idempotencyKey", f"adoption:{payload.get('assessmentId', '')}"), "occurredAt": payload.get("occurredAt", self.clock()), "schemaVersion": payload.get("schemaVersion", "psychlo.adoption-evidence.v1")}
+        try:
+            evidence = parse_adoption_evidence(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        candidate = self.store.registry_candidate(evidence["candidateId"])
+        if candidate is None or candidate["registryId"] != evidence["registry"]["registryId"] or candidate["registryDigest"] != evidence["registry"]["registryDigest"]:
+            raise ValueError("adoption evidence is not bound to a canonical registry candidate")
+        registered = {item: (evidence_digest, evidence_kind) for item, evidence_digest, evidence_kind in zip(candidate["evidenceIds"], candidate["evidenceDigests"], candidate["evidenceKinds"])}
+        for reference in evidence["evidence"]:
+            if registered.get(reference["evidenceId"]) != (reference["digest"], reference["kind"]):
+                raise ValueError("adoption evidence registry reference conflict")
+        assessment_id = evidence["messageId"]
+        inserted = self.store.record_adoption(assessment_id, evidence["candidateId"], evidence, canonical_digest(evidence))
+        return {"inserted": inserted, "replay": not inserted, "evidence": self.store.adoption_evidence(assessment_id)}
+
+    receive_adoption_evidence = record_adoption_evidence
+
+    def discover_adoption_evidence(self, candidate_id: str, reader: Callable[[str], Mapping[str, Any]], *, limit: int = 64) -> dict[str, Any]:
+        """Perform bounded registry-only discovery; the reader receives no write API."""
+        if not isinstance(candidate_id, str) or not candidate_id or limit < 1:
+            raise ValueError("bounded adoption discovery is invalid")
+        result = reader(candidate_id)
+        if not isinstance(result, Mapping):
+            raise ValueError("adoption discovery result is invalid")
+        evidence = dict(result)
+        records = evidence.get("evidence", [])
+        if not isinstance(records, list) or len(records) > min(64, limit):
+            raise ValueError("adoption discovery is oversized")
+        return evidence
+
+    def receive_external_round(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            envelope = parse_external_round(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        digest = envelope["digest"]
+        existing = self.store.external_execution(envelope["reconciliationId"])
+        if existing is not None:
+            if existing["digest"] != digest or existing["payload"] != envelope:
+                raise ValueError("external round identity conflict")
+            if not existing["forwarded"]:
+                self._forward_external(envelope["reconciliationId"], envelope)
+            if envelope.get("explicitGate") and existing.get("gateDecisionId") and self.store.decision(existing["gateDecisionId"]) is None:
+                self._stage_external_decision(envelope, existing["gateDecisionId"])
+            return self.store.external_execution(envelope["reconciliationId"])["receipt"]
+        decision_id = f"psychlo-external-gate:{envelope['reconciliationId']}" if envelope.get("explicitGate") else None
+        receipt = {"receiptId": f"external-receipt:{envelope['reconciliationId']}", "reconciliationId": envelope["reconciliationId"], "idempotencyKey": envelope["idempotencyKey"], "envelopeDigest": digest, "receivedAt": self.clock(), "status": "reconciled", **({"decisionId": decision_id, "decisionStatus": "pending"} if decision_id else {})}
+        self.store.record_external(envelope, digest, receipt, decision_id)
+        self._forward_external(envelope["reconciliationId"], envelope)
+        if decision_id:
+            self._stage_external_decision(envelope, decision_id)
+        return self.store.external_execution(envelope["reconciliationId"])["receipt"]
+
+    def _stage_external_decision(self, envelope: Mapping[str, Any], decision_id: str) -> None:
+        request = {"decisionId": decision_id, "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": "psychlo-external-round", "decisionVersion": "psychlo.external-round.v1", "correlationId": envelope["correlationId"], "idempotencyKey": f"{decision_id}:stage", "question": envelope["explicitGate"]}
+        self.stage_decision(request)
+        try:
+            response = self.sender("decision-stage", decision_id, request)
+            if response.get("accepted") is not True:
+                raise ValueError("Psychlo rejected external decision stage")
+        except Exception:
+            record = self.store.external_execution(envelope["reconciliationId"])
+            receipt = dict(record["receipt"])
+            receipt["status"] = "decision-stage-pending"
+            self.store.connection.execute("UPDATE external_executions SET status='decision-stage-pending',receipt_json=? WHERE reconciliation_id=?", (_dump(receipt), envelope["reconciliationId"]))
+
+    reconcile_external_round = receive_external_round
+
+    def _forward_external(self, reconciliation_id: str, envelope: Mapping[str, Any]) -> None:
+        try:
+            response = self.sender("external-round", reconciliation_id, envelope)
+            if response.get("accepted") is not True:
+                raise ValueError("Psychlo rejected external round")
+        except Exception as error:
+            record = self.store.external_execution(reconciliation_id)
+            receipt = dict(record["receipt"]) if record else {}
+            receipt["status"] = "forward-pending"
+            self.store.connection.execute("UPDATE external_executions SET status='forward-pending',receipt_json=? WHERE reconciliation_id=?", (_dump(receipt), reconciliation_id))
+            return
+        self.store.mark_external_forwarded(reconciliation_id)
 
 
 class PsychloPeerSender:

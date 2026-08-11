@@ -205,3 +205,27 @@ def test_private_http_round_route_uses_hmac_not_admin_bearer(tmp_path: Path):
         connection.close()
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_task11_telemetry_sampling_keeps_cumulative_counters_and_provider_binding(tmp_path: Path):
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    base = {"projectId": "arcade", "planId": "plan-1", "roundId": "round-1", "threadId": "thread-1", "model": "gpt-5.6-luna", "featureClass": "backend", "activeMs": 1, "waitingMs": 0, "providerSnapshotId": "snapshot-1", "providerCapturedAt": NOW, "attribution": "isolated", "sourceId": "overseer", "correlationId": "corr", "occurredAt": NOW}
+    first = bridge.record_telemetry_checkpoint({**base, "checkpointId": "checkpoint-1", "idempotencyKey": "checkpoint-1", "sampleKind": "baseline", "cumulative": {"cachedInput": 1, "uncachedInput": 1, "output": 1, "reasoning": 1, "total": 4}})
+    second = bridge.record_telemetry_checkpoint({**base, "checkpointId": "checkpoint-2", "idempotencyKey": "checkpoint-2", "sampleKind": "completed-turn", "cumulative": {"cachedInput": 2, "uncachedInput": 2, "output": 2, "reasoning": 2, "total": 8}})
+    assert first["inserted"] is True and second["checkpoint"]["delta"]["total"] == 4
+    try:
+        bridge.record_telemetry_checkpoint({**base, "checkpointId": "checkpoint-3", "idempotencyKey": "checkpoint-3", "sampleKind": "terminal", "providerSnapshotId": "snapshot-2", "cumulative": {"cachedInput": 3, "uncachedInput": 3, "output": 3, "reasoning": 3, "total": 12}})
+    except ValueError as error:
+        assert "provider" in str(error)
+    else:
+        raise AssertionError("provider binding changed")
+
+
+def test_task11_learning_adapter_failure_isolated_and_retry_attempts_monotonic(tmp_path: Path):
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    observation = {"id": "observation-1", "featureProfile": {"taskClass": "backend", "model": "gpt-5.6-luna"}, "outcome": {"status": "completed", "observedAt": NOW}, "sourceId": "overseer", "correlationId": "corr", "idempotencyKey": "observation-1", "occurredAt": NOW}
+    bridge.record_learning_observation(observation)
+    calls = []
+    assert bridge.deliver_learning_pending({"skiller": lambda item: calls.append(item) or (_ for _ in ()).throw(RuntimeError("down"))})["failed"] == 1
+    assert bridge.deliver_learning_pending({"skiller": lambda item: calls.append(item)})["delivered"] == 1
+    assert bridge.store.learning_observation("observation-1")["attempts"]["skiller"] == 2

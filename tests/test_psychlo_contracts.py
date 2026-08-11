@@ -12,6 +12,7 @@ from overseer.psychlo_contracts import (
     canonical_digest,
     cross_project_work_request_digest,
     cross_project_work_request_id,
+    learning_observation_digest,
     parse_adoption_evidence,
     parse_concurrency_canary_result,
     parse_cross_project_team_binding,
@@ -25,6 +26,19 @@ from overseer.psychlo_contracts import (
 
 
 NOW = "2026-08-10T02:00:00+00:00"
+
+
+def test_learning_digest_matches_frozen_psychlo_numeric_normalization_fixtures():
+    fixtures = [
+        ({"id": "observation-101", "featureProfile": {"taskClass": "python-feature", "expectedComponents": 2}, "outcome": {"status": "completed", "usage": 3, "observedAt": NOW}}, "ef84a116e022acb151adffc683a8b6303a3f32f5529d8c2b8c4a33f2c4e0dcd1"),
+        ({"id": "observation-102", "featureProfile": {"taskClass": "python-feature"}, "outcome": {"status": "completed", "actualUsage": 0.5, "observedAt": NOW}}, "4a09c49c48a2018260df77289e432cc43624db09ca7b044d7e0d7f0ab0840b00"),
+        ({"id": "observation-103", "featureProfile": {"taskClass": "python-feature"}, "outcome": {"status": "blocked", "remainingUsage": 1e3, "observedAt": NOW}}, "aad3005b5200248490e7bc7603daf525e95bf6dcec23032cf7d072ca15f4b3d8"),
+        ({"id": "observation-104", "featureProfile": {"taskClass": "python-feature", "buildGate": True}, "outcome": {"status": "completed", "actualUsage": -0.0, "observedAt": NOW}}, "c00e79828eff536d72db3641e4219911f55f1edc5096c27799fd2fb4beb3c985"),
+    ]
+    for payload, expected in fixtures:
+        assert learning_observation_digest(payload) == expected
+    zero = fixtures[-1][0]
+    assert learning_observation_digest({**zero, "outcome": {**zero["outcome"], "actualUsage": 0.0}}) == fixtures[-1][1]
 
 
 def test_telemetry_contract_accepts_hybrid_checkpoint_and_digest_is_stable():

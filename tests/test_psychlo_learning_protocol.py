@@ -5,7 +5,7 @@ import pytest
 
 from overseer.psychlo_bridge import PsychloBridge
 from overseer.psychlo_store import PsychloBridgeStore
-from overseer.psychlo_contracts import learning_observation_digest
+from overseer.psychlo_contracts import canonical_digest, learning_observation_digest
 
 
 NOW = "2026-08-10T02:00:00+00:00"
@@ -57,6 +57,63 @@ def test_learning_wire_digest_replay_conflict_restart_and_corruption_fail_closed
     restarted.store.connection.execute("UPDATE learning_observations SET digest=? WHERE observation_id=?", ("0" * 64, wire["id"]))
     with pytest.raises(ValueError, match="conflict"):
         restarted.record_learning_observation(wire)
+
+
+def test_learning_pull_rejects_corrupt_wire_digest_without_ack(tmp_path: Path):
+    wire = {"id": "observation-123", "featureProfile": {"taskClass": "python-feature"}, "outcome": {"status": "completed", "observedAt": NOW}, "sourceId": "overseer", "correlationId": "corr-learning-123", "idempotencyKey": "learning:observation:observation-123", "occurredAt": NOW, "schemaVersion": "psychlo.learning.v1", "digest": "0" * 64}
+    calls = []
+    def send(kind, message_id, payload):
+        calls.append((kind, message_id, payload))
+        return {"accepted": True, "observations": [wire]} if kind == "learning-pull" else {"accepted": True}
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    assert bridge.pull_learning("skiller", {"skiller": lambda _: None}) == {"delivered": 0, "failed": 1}
+    assert [call[0] for call in calls] == ["learning-pull"]
+    assert bridge.store.learning_observation(wire["id"]) is None
+
+
+@pytest.mark.parametrize("corruption", ("digest", "payload"))
+def test_persisted_learning_corruption_is_quarantined_before_read_or_delivery(tmp_path: Path, corruption: str):
+    wire = {
+        "id": "observation-123",
+        "featureProfile": {"taskClass": "python-feature", "model": "gpt-5.6-luna"},
+        "outcome": {"status": "completed", "observedAt": NOW},
+        "sourceId": "overseer",
+        "correlationId": "corr-learning-123",
+        "idempotencyKey": "learning:observation:observation-123",
+        "occurredAt": NOW,
+        "schemaVersion": "psychlo.learning.v1",
+        "digest": "64685baacab629cc64903337f9689d8e4fff47e3cbc10dd875771fa788c430ef",
+    }
+    store_path = tmp_path / "bridge.sqlite3"
+    first = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    first.record_learning_observation(wire)
+    if corruption == "digest":
+        first.store.connection.execute("UPDATE learning_observations SET digest=? WHERE observation_id=?", ("0" * 64, wire["id"]))
+    else:
+        first.store.connection.execute("UPDATE learning_observations SET payload_json=? WHERE observation_id=?", ('{"id":"observation-123"}', wire["id"]))
+    adapter_calls = []
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    assert restarted.store.learning_observation(wire["id"]) is None
+    assert restarted.store.pending_learning("skiller") == []
+    assert restarted.deliver_learning_pending({"skiller": lambda item: adapter_calls.append(item)}) == {"delivered": 0, "failed": 0}
+    state = restarted.store.connection.execute("SELECT state,delivery_skiller,delivery_memory FROM learning_observations WHERE observation_id=?", (wire["id"],)).fetchone()
+    assert state == ("corrupt", "corrupt", "corrupt")
+    assert adapter_calls == []
+
+
+def test_legacy_learning_digest_remains_readable_and_deliverable(tmp_path: Path):
+    payload = {"id": "observation-123", "featureProfile": {"taskClass": "python-feature"}, "outcome": {"status": "completed", "usage": 3, "observedAt": NOW}, "sourceId": "overseer", "correlationId": "corr-learning-123", "idempotencyKey": "learning:observation:observation-123", "occurredAt": NOW, "schemaVersion": "psychlo.learning.v1"}
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    legacy_digest = canonical_digest(payload)
+    assert legacy_digest != learning_observation_digest(payload)
+    assert store.record_learning(payload, legacy_digest) is True
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    assert bridge.store.learning_observation(payload["id"])["digest"] == legacy_digest
+    calls = []
+    assert bridge.deliver_learning_pending({"skiller": lambda item: calls.append(item)}) == {"delivered": 1, "failed": 0}
+    assert calls[0]["digest"] == legacy_digest
 
 
 def test_learning_pull_delivers_sanitized_observations_then_acks(tmp_path: Path):

@@ -15,7 +15,7 @@ import stat
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
-from .psychlo_contracts import canonical_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, ContractError
+from .psychlo_contracts import canonical_digest, learning_observation_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, ContractError
 
 
 def _round_result_digest(result: Mapping[str, Any]) -> str:
@@ -635,11 +635,29 @@ class PsychloBridgeStore:
                 return False
             raise ValueError("telemetry checkpoint conflict")
 
+    def _quarantine_learning(self, observation_id: str, error: str) -> None:
+        with self.connection:
+            self.connection.execute("UPDATE learning_observations SET state='corrupt',delivery_skiller='corrupt',delivery_memory='corrupt',last_error_skiller=?,last_error_memory=?,updated_at=? WHERE observation_id=?", (error, error, self._now(), observation_id))
+
     def learning_observation(self, observation_id: str):
         row = self.connection.execute("SELECT payload_json,digest,state,attempts_skiller,attempts_memory,last_error_skiller,last_error_memory,delivery_skiller,delivery_memory FROM learning_observations WHERE observation_id=?", (observation_id,)).fetchone()
         if row is None:
             return None
-        payload = json.loads(row[0]); payload.update({"digest": row[1], "state": row[2], "attempts": {"skiller": row[3], "private-memory": row[4]}, "deliveries": {"skiller": row[7], "private-memory": row[8]}, "lastError": {key: value for key, value in (("skiller", row[5]), ("private-memory", row[6])) if value}})
+        if row[2] == "corrupt" or row[7] == "corrupt" or row[8] == "corrupt":
+            return None
+        try:
+            payload = json.loads(row[0])
+            observation = parse_learning_observation(payload)
+            if observation["id"] != observation_id:
+                raise ValueError("learning observation identity conflict")
+            wire_digest = learning_observation_digest(observation)
+            legacy_digest = canonical_digest(observation)
+            if row[1] not in {wire_digest, legacy_digest}:
+                raise ValueError("learning observation digest conflict")
+        except (ContractError, TypeError, ValueError, json.JSONDecodeError):
+            self._quarantine_learning(observation_id, "learning-observation-integrity-failed")
+            return None
+        payload.update({"digest": row[1], "state": row[2], "attempts": {"skiller": row[3], "private-memory": row[4]}, "deliveries": {"skiller": row[7], "private-memory": row[8]}, "lastError": {key: value for key, value in (("skiller", row[5]), ("private-memory", row[6])) if value}})
         return payload
 
     def record_learning(self, observation: Mapping[str, Any], digest: str) -> bool:
@@ -655,8 +673,8 @@ class PsychloBridgeStore:
     def pending_learning(self, destination: str, limit: int = 100) -> list[dict[str, Any]]:
         column = "attempts_skiller" if destination == "skiller" else "attempts_memory"
         delivery = "delivery_skiller" if destination == "skiller" else "delivery_memory"
-        rows = self.connection.execute(f"SELECT observation_id FROM learning_observations WHERE {delivery} != 'delivered' ORDER BY rowid LIMIT ?", (max(1, min(100, int(limit))),)).fetchall()
-        return [self.learning_observation(row[0]) for row in rows]
+        rows = self.connection.execute(f"SELECT observation_id FROM learning_observations WHERE {delivery} NOT IN ('delivered','corrupt') ORDER BY rowid LIMIT ?", (max(1, min(100, int(limit))),)).fetchall()
+        return [observation for row in rows if (observation := self.learning_observation(row[0])) is not None]
 
     def transition_learning(self, observation_id: str, destination: str, state: str, error: str | None = None) -> dict[str, Any]:
         column = "attempts_skiller" if destination == "skiller" else "attempts_memory"

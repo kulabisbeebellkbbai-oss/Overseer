@@ -11,7 +11,9 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 import json
+import math
 import re
+import struct
 from typing import Any, Mapping
 
 
@@ -76,8 +78,24 @@ def cross_project_work_request_digest(payload: Mapping[str, Any]) -> str:
 
 
 def learning_observation_digest(value: Mapping[str, Any]) -> str:
-    content = {"id": value["id"], "featureProfile": dict(sorted(value["featureProfile"].items())), "outcome": dict(sorted(value["outcome"].items()))}
-    return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
+    def normalize(item: Any) -> Any:
+        if isinstance(item, bool) or isinstance(item, str):
+            return item
+        if isinstance(item, (int, float)):
+            numeric = float(item)
+            if not math.isfinite(numeric):
+                raise ValueError("learning observation numeric value is not finite")
+            if numeric == 0:
+                bits = 0
+            else:
+                bits = struct.unpack(">Q", struct.pack(">d", numeric))[0]
+            return {"$f64": f"{bits:016x}"}
+        if isinstance(item, Mapping):
+            return {key: normalize(item[key]) for key in sorted(item, key=lambda key: str(key).encode("ascii"))}
+        raise ValueError("learning observation digest value is invalid")
+
+    content = normalize({"id": value["id"], "featureProfile": value["featureProfile"], "outcome": value["outcome"]})
+    return hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _object(value: Any, *, name: str) -> dict[str, Any]:
@@ -200,7 +218,11 @@ def parse_learning_observation(payload: Mapping[str, Any]) -> dict[str, Any]:
     if "observedAt" in outcome:
         _timestamp(outcome["observedAt"], name="observedAt")
     for key in {"usage", "actualUsage", "remainingUsage"}:
-        if key in outcome and (not isinstance(outcome[key], (int, float)) or isinstance(outcome[key], bool) or outcome[key] < 0):
+        try:
+            finite = math.isfinite(float(outcome[key])) if key in outcome else True
+        except (OverflowError, TypeError, ValueError):
+            finite = False
+        if key in outcome and (not isinstance(outcome[key], (int, float)) or isinstance(outcome[key], bool) or not finite or outcome[key] < 0):
             raise ContractError(f"{key} is invalid")
     for key in {"activeMs", "waitingMs"}:
         if key in outcome and (not isinstance(outcome[key], int) or isinstance(outcome[key], bool) or outcome[key] < 0):

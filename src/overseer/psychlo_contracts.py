@@ -260,7 +260,7 @@ def _parse_handoff_lifecycle(raw: Any, project: Mapping[str, Any], lead_id: str)
     elif kind == "decommission":
         if set(value) != {"kind", "deploymentAvailability"} or value.get("deploymentAvailability") not in {"available", "unavailable"}: raise ContractError("handoff lifecycle is invalid")
     elif kind == "takeover":
-        if set(value) != {"kind", "repositoryPath", "repositoryHead", "dirtyStateDigest", "currentStateEvidence"} or not isinstance(value.get("repositoryPath"), str) or not value["repositoryPath"].startswith("/") or value["repositoryPath"] != value["repositoryPath"].strip() or len(value["repositoryPath"]) > 2_048 or GIT_RE.fullmatch(str(value.get("repositoryHead"))) is None: raise ContractError("handoff lifecycle is invalid")
+        if set(value) != {"kind", "repositoryPath", "repositoryHead", "dirtyStateDigest", "currentStateEvidence"} or not isinstance(value.get("repositoryPath"), str) or not value["repositoryPath"].startswith("/") or "\0" in value["repositoryPath"] or value["repositoryPath"] != value["repositoryPath"].strip() or len(value["repositoryPath"]) > 2_048 or GIT_RE.fullmatch(str(value.get("repositoryHead"))) is None: raise ContractError("handoff lifecycle is invalid")
         _digest(value.get("dirtyStateDigest"), name="dirtyStateDigest"); evidence = _bounded_id_array(value.get("currentStateEvidence"), name="currentStateEvidence", maximum=32)
         if not evidence: raise ContractError("handoff lifecycle is invalid")
     elif kind in {"reconstruction", "onboarding", "cleanup"}:

@@ -1468,6 +1468,29 @@ def test_register_project_rejects_malformed_adoption_lifecycle(tmp_path: Path, d
         bridge.register_project(registration)
 
 
+def test_takeover_registration_rejects_nul_repository_path_before_scheduling_and_after_restart(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-takeover", plan_version="v2")
+    registration["envelope"]["contractVersion"] = "a-team.psychlo.handoff.v2"
+    registration["envelope"]["lifecycle"] = {
+        "kind": "takeover", "repositoryPath": "/srv/arcade\0/private", "repositoryHead": "a" * 40,
+        "dirtyStateDigest": "b" * 64, "currentStateEvidence": ["evidence-takeover"],
+    }
+    registration["envelope"]["digest"] = canonical_digest(registration["envelope"])
+    registration["receipt"]["handoffContractVersion"] = registration["envelope"]["contractVersion"]
+    registration["receipt"]["envelopeDigest"] = registration["envelope"]["digest"]
+    sent = []
+    bridge = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_PreparedDispatcher(), sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="lifecycle"):
+        bridge.register_project(registration)
+    assert bridge.store.project("arcade") is None and sent == []
+    restarted_sent = []
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_PreparedDispatcher(), sender=lambda *args: restarted_sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="lifecycle"):
+        restarted.register_project(registration)
+    assert restarted.store.project("arcade") is None and restarted_sent == []
+
+
 @pytest.mark.parametrize("field", ["project", "plan", "version", "team", "lead", "scheduling"])
 def test_coordination_rejects_registration_identity_conflict_before_dispatch(tmp_path: Path, field: str):
     registration = _registration_payload("arcade", "lead-arcade", plan_id="plan-arcade", plan_version="v7", team_id="team-arcade")

@@ -670,10 +670,7 @@ class PsychloBridge:
         candidate = self.store.registry_candidate(evidence["candidateId"])
         if candidate is None or candidate["registryId"] != evidence["registry"]["registryId"] or candidate["registryDigest"] != evidence["registry"]["registryDigest"]:
             raise ValueError("adoption evidence is not bound to a canonical registry candidate")
-        registered = {item: (evidence_digest, evidence_kind) for item, evidence_digest, evidence_kind in zip(candidate["evidenceIds"], candidate["evidenceDigests"], candidate["evidenceKinds"])}
-        for reference in evidence["evidence"]:
-            if registered.get(reference["evidenceId"]) != (reference["digest"], reference["kind"]):
-                raise ValueError("adoption evidence registry reference conflict")
+        _validate_adoption_registry_bindings(candidate, evidence)
         # A registry candidate is always delivered before its assessment.  If
         # this bridge was restarted after the registry row was recorded but
         # before its outbox record was created, recover that producer seam
@@ -1605,6 +1602,40 @@ def _adoption_wire_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
     return {**{key: evidence[key] for key in allowed if key in evidence}, "evidence": inner}
 
 
+def _stable_adoption_json(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return "{" + ",".join(json.dumps(str(key), ensure_ascii=False, separators=(",", ":")) + ":" + _stable_adoption_json(value[key]) for key in sorted(value, key=lambda item: str(item))) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stable_adoption_json(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _stable_adoption_digest(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_stable_adoption_json(value).encode("utf-8")).hexdigest()
+
+
+def _validate_adoption_registry_bindings(candidate: Mapping[str, Any], evidence: Mapping[str, Any]) -> None:
+    if evidence["registry"].get("evidenceIds") != candidate.get("evidenceIds"):
+        raise ValueError("adoption evidence registry reference conflict")
+    registered = {item: (evidence_digest, evidence_kind) for item, evidence_digest, evidence_kind in zip(candidate.get("evidenceIds", []), candidate.get("evidenceDigests", []), candidate.get("evidenceKinds", []))}
+    listed = {(reference["kind"], reference["evidenceId"], reference["digest"]) for reference in evidence["evidence"]}
+    references = list(evidence["evidence"])
+    for field in ("repository", "artifact", "application", "team", "ownership", "plan", "lead", "checkpoint"):
+        fact = evidence.get(field)
+        if isinstance(fact, Mapping):
+            if isinstance(fact.get("evidenceRef"), Mapping):
+                references.append(fact["evidenceRef"])
+            if field == "ownership" and isinstance(fact.get("licenseEvidenceRef"), Mapping):
+                references.append(fact["licenseEvidenceRef"])
+    security = evidence.get("security")
+    if isinstance(security, Mapping):
+        references.extend(item for item in security.get("evidence", []) if isinstance(item, Mapping))
+    for reference in references:
+        identity = (reference["kind"], reference["evidenceId"], reference["digest"])
+        if registered.get(reference["evidenceId"]) != (reference["digest"], reference["kind"]) or identity not in listed:
+            raise ValueError("adoption evidence registry reference conflict")
+
+
 def _validate_adoption_peer_response(kind: str, payload: Mapping[str, Any], response: Mapping[str, Any]) -> None:
     if not isinstance(response, Mapping) or response.get("accepted") is not True:
         raise ValueError("Psychlo rejected adoption evidence")
@@ -1643,7 +1674,8 @@ def _validate_adoption_peer_response(kind: str, payload: Mapping[str, Any], resp
         raise ValueError("adoption receipt classification is invalid")
     if "repositoryDigest" in response and (not isinstance(response["repositoryDigest"], str) or not SHA256_RE.fullmatch(response["repositoryDigest"])):
         raise ValueError("adoption receipt repository digest is invalid")
-    if not isinstance(response.get("evidenceDigest"), str) or not SHA256_RE.fullmatch(response["evidenceDigest"]):
+    expected_digest = _stable_adoption_digest(payload["evidence"])
+    if not isinstance(response.get("evidenceDigest"), str) or not SHA256_RE.fullmatch(response["evidenceDigest"]) or response["evidenceDigest"] != expected_digest:
         raise ValueError("adoption receipt digest is invalid")
 
 

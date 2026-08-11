@@ -177,7 +177,7 @@ def test_adoption_producer_persists_registry_then_exact_signed_receipt_and_repla
         calls.append((kind, message_id, dict(payload)))
         if kind == "registry-candidate":
             return {"accepted": True, "inserted": True, "registration": {**payload, "sourceId": "overseer", "messageId": payload["candidateId"], "sourceEventSequence": 1}}
-        return {"accepted": True, "assessmentId": payload["assessmentId"], "candidateId": payload["candidateId"], "classification": "insufficient-evidence", "confidence": "low", "evidence": payload["evidence"]["evidence"], "missingArtifacts": ["repository-missing"], "contradictions": [], "recommendedWorkflow": "reject", "evidenceDigest": "b" * 64}
+        return {"accepted": True, "assessmentId": payload["assessmentId"], "candidateId": payload["candidateId"], "classification": "insufficient-evidence", "confidence": "low", "evidence": payload["evidence"]["evidence"], "missingArtifacts": ["repository-missing"], "contradictions": [], "recommendedWorkflow": "reject", "evidenceDigest": canonical_digest(payload["evidence"])}
 
     store_path = tmp_path / "adoption.sqlite3"
     bridge = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda *_: "unused", sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
@@ -186,16 +186,16 @@ def test_adoption_producer_persists_registry_then_exact_signed_receipt_and_repla
     assert [call[0] for call in calls] == ["registry-candidate", "adoption-evidence"]
     assert set(calls[1][2]) == {"candidateId", "assessmentId", "evidence", "correlationId", "idempotencyKey", "occurredAt"}
     assert set(calls[1][2]["evidence"]) == {"candidateId", "registry", "evidence"}
-    assert result["receipt"]["evidenceDigest"] == "b" * 64
+    assert result["receipt"]["evidenceDigest"] == canonical_digest(calls[1][2]["evidence"])
     stored = bridge.store.protocol_record("adoption-evidence", "assessment-adoption")
-    assert stored is not None and stored["state"] == "delivered" and stored["receipt"]["evidenceDigest"] == "b" * 64
+    assert stored is not None and stored["state"] == "delivered" and stored["receipt"]["evidenceDigest"] == canonical_digest(calls[1][2]["evidence"])
     bridge.store.connection.close()
 
     replay_calls = []
     restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda *_: "unused", sender=lambda *args: replay_calls.append(args) or {"accepted": False}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     replay = restarted.record_adoption_evidence(evidence)
     assert replay["replay"] is True
-    assert replay["receipt"]["evidenceDigest"] == "b" * 64
+    assert replay["receipt"]["evidenceDigest"] == canonical_digest(calls[1][2]["evidence"])
     assert replay_calls == []
 
     with pytest.raises(ValueError, match="conflict"):
@@ -223,12 +223,51 @@ def test_adoption_producer_recovers_forward_pending_after_restart(tmp_path: Path
 
     def recovered_sender(kind, _message_id, payload):
         if kind == "adoption-evidence":
-            return {"accepted": True, "assessmentId": payload["assessmentId"], "candidateId": payload["candidateId"], "classification": "insufficient-evidence", "confidence": "low", "evidence": payload["evidence"]["evidence"], "missingArtifacts": ["repository-missing"], "contradictions": [], "recommendedWorkflow": "reject", "evidenceDigest": "c" * 64}
+            return {"accepted": True, "assessmentId": payload["assessmentId"], "candidateId": payload["candidateId"], "classification": "insufficient-evidence", "confidence": "low", "evidence": payload["evidence"]["evidence"], "missingArtifacts": ["repository-missing"], "contradictions": [], "recommendedWorkflow": "reject", "evidenceDigest": canonical_digest(payload["evidence"])}
         return {"accepted": True}
 
     restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=lambda *_: "unused", sender=recovered_sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     recovered = restarted.store.protocol_record("adoption-evidence", "assessment-adoption")
-    assert recovered is not None and recovered["state"] == "delivered" and recovered["receipt"]["evidenceDigest"] == "c" * 64
+    assert recovered is not None and recovered["state"] == "delivered" and recovered["receipt"]["evidenceDigest"] == canonical_digest(restarted.store.protocol_record("adoption-evidence", "assessment-adoption")["payload"]["evidence"])
+
+
+def test_adoption_producer_rejects_receipt_with_wrong_stable_evidence_digest(tmp_path: Path):
+    candidate = _adoption_candidate_payload()
+    evidence = _adoption_evidence_payload()
+
+    def sender(kind, _message_id, payload):
+        if kind == "registry-candidate":
+            return {"accepted": True}
+        return {"accepted": True, "assessmentId": payload["assessmentId"], "candidateId": payload["candidateId"], "classification": "insufficient-evidence", "confidence": "low", "evidence": payload["evidence"]["evidence"], "missingArtifacts": ["repository-missing"], "contradictions": [], "recommendedWorkflow": "reject", "evidenceDigest": "f" * 64}
+
+    store = PsychloBridgeStore(tmp_path / "wrong-digest.sqlite3")
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    bridge.register_candidate(candidate)
+    with pytest.raises(ValueError, match="forward-pending"):
+        bridge.record_adoption_evidence(evidence)
+    record = store.protocol_record("adoption-evidence", "assessment-adoption")
+    assert record is not None and record["state"] == "forward-pending" and record["receipt"] is None
+
+
+def test_adoption_producer_requires_fact_references_to_be_registered_and_listed(tmp_path: Path):
+    candidate = _adoption_candidate_payload()
+    evidence = _adoption_evidence_payload()
+    digest = "a" * 64
+    fact_ref = {"reason": "canonical-repository", "kind": "repository", "evidenceId": "repository-evidence", "digest": digest}
+    evidence["repository"] = {"present": True, "canonical": True, "clean": True, "status": "known", "digest": digest, "evidenceRef": fact_ref}
+
+    calls = []
+    def sender(kind, _message_id, payload):
+        calls.append(kind)
+        return {"accepted": True}
+
+    store = PsychloBridgeStore(tmp_path / "unbound-fact.sqlite3")
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    bridge.register_candidate(candidate)
+    with pytest.raises(ValueError, match="registry reference"):
+        bridge.record_adoption_evidence(evidence)
+    assert store.adoption_evidence("assessment-adoption") is None
+    assert calls == ["registry-candidate"]
 
 
 def test_initiators_reject_caller_supplied_approval_objects(tmp_path: Path):

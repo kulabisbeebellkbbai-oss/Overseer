@@ -95,6 +95,54 @@ class PsychloBridgeStore:
     def record_decision(self, request: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
         self.connection.execute("INSERT OR IGNORE INTO decisions VALUES (?,?,?,'staged',NULL,NULL,NULL)", (request["decisionId"], _dump(request), _dump(receipt)))
 
+    def stage_external_decision(self, request: Mapping[str, Any], receipt: Mapping[str, Any]) -> dict[str, Any]:
+        decision_id = str(request.get("decisionId", ""))
+        reconciliation_id = decision_id.removeprefix("roadex:external:")
+        workflow_id = request.get("workflowId")
+        required = {
+            "decisionId": decision_id,
+            "projectId": request.get("projectId"),
+            "planId": request.get("planId"),
+            "decisionVersion": request.get("decisionVersion"),
+            "correlationId": request.get("correlationId"),
+            "idempotencyKey": request.get("idempotencyKey"),
+            "question": request.get("question"),
+            "resultProvenanceId": request.get("resultProvenanceId"),
+        }
+        if not isinstance(workflow_id, str) or not workflow_id.strip() or any(not isinstance(value, str) or not value for value in required.values()):
+            raise ValueError("external decision identity conflict")
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            external = self.external_execution(reconciliation_id)
+            if external is None or external.get("gateDecisionId") != decision_id:
+                raise ValueError("external decision identity conflict")
+            envelope = external["payload"]
+            expected = {
+                "decisionId": decision_id,
+                "projectId": envelope["projectId"],
+                "planId": envelope["planId"],
+                "decisionVersion": envelope["planVersion"],
+                "correlationId": envelope["correlationId"],
+                "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}",
+                "question": envelope["explicitGate"],
+                "resultProvenanceId": envelope["digest"],
+            }
+            if set(request) != set(expected) | {"workflowId"}:
+                raise ValueError("external decision identity conflict")
+            if any(request.get(field) != value for field, value in expected.items()):
+                raise ValueError("external decision identity conflict")
+            if external.get("gateWorkflowId") not in {None, workflow_id}:
+                raise ValueError("external decision workflow conflict")
+            existing = self.decision(decision_id)
+            if existing is not None:
+                if existing[0] != dict(request):
+                    raise ValueError("external decision identity conflict")
+                self.connection.execute("UPDATE external_executions SET gate_workflow_id=? WHERE reconciliation_id=?", (workflow_id, reconciliation_id))
+                return {"accepted": True, "receipt": existing[1]}
+            self.connection.execute("INSERT INTO decisions VALUES (?,?,?,'staged',NULL,NULL,NULL)", (decision_id, _dump(request), _dump(receipt)))
+            self.connection.execute("UPDATE external_executions SET gate_workflow_id=? WHERE reconciliation_id=?", (workflow_id, reconciliation_id))
+        return {"accepted": True, "receipt": dict(receipt)}
+
     def decision(self, decision_id: str):
         row = self.connection.execute("SELECT request_json,receipt_json,status FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), str(row[2]))

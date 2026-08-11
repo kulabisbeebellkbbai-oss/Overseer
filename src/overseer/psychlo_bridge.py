@@ -268,13 +268,8 @@ class PsychloBridge:
     def stage_decision(self, request: Mapping[str, Any]) -> dict[str, Any]:
         decision_id = _required_string(request, "decisionId")
         if decision_id.startswith("roadex:external:"):
-            reconciliation_id = decision_id.removeprefix("roadex:external:")
-            external = self.store.external_execution(reconciliation_id)
-            if external is not None:
-                workflow_id = request.get("workflowId")
-                if not isinstance(workflow_id, str) or not workflow_id.strip():
-                    raise ValueError("external decision workflow is invalid")
-                self.store.link_external_gate(reconciliation_id, decision_id, workflow_id)
+            receipt = {**request, "sourceId": "overseer", "provenanceId": f"roadex:{decision_id}", "status": "staged"}
+            return self.store.stage_external_decision(request, receipt)
         existing = self.store.decision(decision_id)
         if existing:
             if existing[0] != dict(request): raise ValueError("decision identity conflict")
@@ -605,10 +600,10 @@ class PsychloBridge:
         workflow_id = existing[0].get("workflowId")
         if not isinstance(workflow_id, str) or not workflow_id.strip():
             raise ValueError("external decision workflow conflict")
-        self.store.link_external_gate(envelope["reconciliationId"], decision_id, workflow_id)
         expected = self._external_decision_request(envelope, workflow_id)
         if existing[0] != expected:
             raise ValueError("external decision identity conflict")
+        self.store.link_external_gate(envelope["reconciliationId"], decision_id, workflow_id)
 
     def receive_external_decision_outcome(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         decision_id = payload.get("decisionId")

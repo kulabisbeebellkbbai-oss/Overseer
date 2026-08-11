@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from overseer.psychlo_bridge import PsychloBridge
@@ -180,3 +181,41 @@ def test_external_gate_binds_callback_workflow_and_rejects_conflicting_workflow(
         assert "workflow" in str(error)
     else:
         raise AssertionError("conflicting callback workflow was accepted")
+
+
+def test_external_callback_validates_before_mutation_wrong_first_then_correct_retry_and_restart(tmp_path: Path):
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    bridge.receive_external_round(external_payload())
+    malformed = {"decisionId": "roadex:external:reconcile-1", "projectId": "wrong-project", "planId": "plan-1", "workflowId": "configured-roadex-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]}
+    try:
+        bridge.stage_decision(malformed)
+    except ValueError as error:
+        assert "identity" in str(error)
+    else:
+        raise AssertionError("malformed first callback was accepted")
+    assert bridge.store.decision("roadex:external:reconcile-1") is None
+    assert bridge.store.external_execution("reconcile-1")["gateWorkflowId"] is None
+    correct = {**malformed, "projectId": "arcade"}
+    assert bridge.stage_decision(correct)["accepted"] is True
+    restarted = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    assert restarted.stage_decision(correct)["accepted"] is True
+    assert restarted.store.external_execution("reconcile-1")["gateWorkflowId"] == "configured-roadex-workflow"
+
+
+def test_external_first_callbacks_serialize_one_exact_winner_and_conflicting_loser(tmp_path: Path):
+    seed = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    seed.receive_external_round(external_payload())
+    requests = []
+    for workflow in ("workflow-a", "workflow-b"):
+        requests.append({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": workflow, "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+    def callback(request):
+        bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+        try:
+            return bridge.stage_decision(request)
+        except ValueError as error:
+            return str(error)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(callback, requests))
+    assert sum(result == {"accepted": True, "receipt": {**requests[index], "sourceId": "overseer", "provenanceId": f"roadex:{requests[index]['decisionId']}", "status": "staged"}} for index, result in enumerate(results)) == 1
+    winner = PsychloBridgeStore(tmp_path / "bridge.sqlite3").external_execution("reconcile-1")
+    assert winner["gateWorkflowId"] in {"workflow-a", "workflow-b"}

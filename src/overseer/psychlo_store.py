@@ -47,6 +47,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS registry_candidates(candidate_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
         """)
         for column in ("delivery_skiller", "delivery_memory"):
             try:
@@ -350,6 +351,35 @@ class PsychloBridgeStore:
 
     def projection_counts(self) -> dict[str, int]:
         return {name: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for name, table in (("telemetry", "telemetry_checkpoints"), ("learning", "learning_observations"), ("registry", "registry_candidates"), ("adoption", "adoption_evidence"), ("external", "external_executions"))}
+
+    def protocol_record(self, kind: str, record_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT idempotency_key,digest,payload_json,state,attempts,last_error,updated_at FROM protocol_records WHERE kind=? AND record_id=?", (kind, record_id)).fetchone()
+        if row is None: return None
+        return {"kind": kind, "id": record_id, "idempotencyKey": row[0], "digest": row[1], "payload": json.loads(row[2]), "state": row[3], "attempts": row[4], "lastError": row[5], "updatedAt": row[6]}
+
+    def record_protocol(self, kind: str, record_id: str, idempotency_key: str, digest: str, payload: Mapping[str, Any], *, state: str = "queued") -> tuple[dict[str, Any], bool]:
+        existing = self.protocol_record(kind, record_id)
+        if existing is not None:
+            if existing["digest"] != digest or existing["payload"] != dict(payload): raise ValueError(f"{kind} conflict")
+            return existing, False
+        by_key = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? AND idempotency_key=?", (kind, idempotency_key)).fetchone()
+        if by_key is not None and by_key[0] != record_id: raise ValueError(f"{kind} idempotency conflict")
+        try:
+            self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at) VALUES (?,?,?,?,?,?,?)", (kind, record_id, idempotency_key, digest, _dump(payload), state, self._now()))
+        except sqlite3.IntegrityError as error:
+            raise ValueError(f"{kind} conflict") from error
+        return self.protocol_record(kind, record_id), True
+
+    def transition_protocol(self, kind: str, record_id: str, state: str, error: str | None = None) -> dict[str, Any]:
+        with self.connection:
+            self.connection.execute("UPDATE protocol_records SET state=?,attempts=attempts+1,last_error=?,updated_at=? WHERE kind=? AND record_id=?", (state, error, self._now(), kind, record_id))
+        result = self.protocol_record(kind, record_id)
+        if result is None: raise ValueError("protocol record is missing")
+        return result
+
+    def pending_protocol(self, kind: str, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? AND state NOT IN ('delivered','settled','rejected') ORDER BY updated_at,record_id LIMIT ?", (kind, max(1, min(100, int(limit))))).fetchall()
+        return [self.protocol_record(kind, row[0]) for row in rows]
 
 
 def _token_hash(token: str) -> str:

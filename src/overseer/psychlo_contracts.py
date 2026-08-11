@@ -29,6 +29,7 @@ LEARNING_SCHEMA = "psychlo.learning.v1"
 REGISTRY_SCHEMA = "psychlo.registry-candidate.v1"
 ADOPTION_SCHEMA = "psychlo.adoption-evidence.v1"
 EXTERNAL_SCHEMA = "psychlo.external-round.v1"
+EXTERNAL_BINDING_SCHEMA = "psychlo.external-round-binding.v1"
 TELEMETRY_KINDS = {"baseline", "completed-turn", "durable-checkpoint", "bounded-long-turn", "terminal"}
 ATTRIBUTIONS = {"isolated", "shared", "censored", "unknown"}
 LEARNING_DESTINATIONS = {"skiller", "private-memory"}
@@ -277,4 +278,81 @@ def parse_external_round(payload: Mapping[str, Any]) -> dict[str, Any]:
     _timestamp(value.get("occurredAt"))
     if value.get("schemaVersion") != EXTERNAL_SCHEMA or canonical_digest(value) != value.get("digest"):
         raise ContractError("external round digest or schema is invalid")
+    return value
+
+
+def _strict_protocol(value: Any, *, required: set[str], name: str, schema: str | None = None) -> dict[str, Any]:
+    result = _object(value, name=name)
+    _keys(result, required, name=name)
+    if schema is not None and result.get("schemaVersion") != schema:
+        raise ContractError(f"{name} schema version is invalid")
+    for field in ("correlationId", "idempotencyKey", "occurredAt"):
+        if field in required:
+            _id(result.get(field), name=field) if field != "occurredAt" else _timestamp(result.get(field))
+    return result
+
+
+def parse_external_round_binding(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"authorizationId", "externalExecutionId", "reconciliationId", "projectId", "aTeamId", "planId", "planVersion", "projectLeadId", "threadId", "repository", "startingCheckpoint", "terminalCheckpoint", "correlationId", "idempotencyKey", "occurredAt", "schemaVersion", "digest"}
+    value = _strict_protocol(payload, required=required, name="external round binding", schema=EXTERNAL_BINDING_SCHEMA)
+    for field in required - {"repository", "occurredAt", "schemaVersion", "digest"}:
+        _id(value[field], name=field)
+    _digest(value["digest"], name="digest")
+    repository = _object(value["repository"], name="repository")
+    _keys(repository, {"pathIdentity", "beforeHead", "afterHead", "dirtyDigest"}, name="repository")
+    _text(repository["pathIdentity"], name="pathIdentity", maximum=2048)
+    for field in ("beforeHead", "afterHead"):
+        if not isinstance(repository[field], str) or not GIT_RE.fullmatch(repository[field]): raise ContractError(f"{field} is invalid")
+    _digest(repository["dirtyDigest"], name="dirtyDigest")
+    if canonical_digest({key: value[key] for key in value if key != "digest"}) != value["digest"]:
+        raise ContractError("external round binding digest mismatch")
+    return value
+
+
+def parse_ingress_conflict_reconciliation(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"sourceId", "scope", "ingressSourceId", "ingressIdempotencyKey", "correlationId", "idempotencyKey", "occurredAt", "provenanceId", "status", "ingressType"}
+    value = _strict_protocol(payload, required=required, name="ingress conflict reconciliation")
+    _keys(value, required | {"projectId"}, name="ingress conflict reconciliation")
+    if value["sourceId"] != "overseer" or value["scope"] not in {"project", "global"} or value["status"] != "resolved": raise ContractError("ingress reconciliation identity is invalid")
+    if value["scope"] == "project": _id(value.get("projectId"), name="projectId")
+    elif "projectId" in value: raise ContractError("global reconciliation must not bind a project")
+    for field in ("ingressSourceId", "ingressIdempotencyKey", "provenanceId", "ingressType"): _id(value[field], name=field)
+    if value["ingressType"] not in {"plan.admitted", "plan.changed", "project.decommissioned", "project.takeover-imported", "project.scheduling-input-recorded", "overseer.usage-snapshot", "handoff.receipt-recorded", "external-round-binding-authorized", "external-round-reconciled", "cross-project.team-binding-authorized", "coordinator.concurrency-canary-authorized", "coordinator.concurrency-ceiling-authorized"}: raise ContractError("ingress type is invalid")
+    return value
+
+
+def parse_cross_project_team_binding(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"bindingId", "coordinationTeamId", "supervisorMemberId", "supervisorLeadId", "approvalId", "approvalProvenanceId", "approvedAt", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    value = _strict_protocol(payload, required=required, name="cross-project team binding")
+    for field in required - {"approvedAt", "occurredAt", "digest"}: _id(value[field], name=field)
+    _timestamp(value["approvedAt"], name="approvedAt"); _digest(value["digest"], name="digest")
+    if datetime.fromisoformat(value["approvedAt"].replace("Z", "+00:00")) > datetime.fromisoformat(value["occurredAt"].replace("Z", "+00:00")): raise ContractError("team binding approval is postdated")
+    ordered = {key: value[key] for key in ("bindingId", "coordinationTeamId", "supervisorMemberId", "supervisorLeadId", "approvalId", "approvalProvenanceId", "approvedAt", "correlationId", "idempotencyKey", "occurredAt")}
+    if hashlib.sha256(json.dumps(ordered, separators=(",", ":")).encode()).hexdigest() != value["digest"]: raise ContractError("team binding digest mismatch")
+    return value
+
+
+def parse_cross_project_work(payload: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+    required = {"operation", "input", "bindingId", "coordinationTeamId", "supervisorMemberId", "supervisorLeadId", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    value = _strict_protocol(payload, required=required, name=f"cross-project {kind}")
+    if value["operation"] not in {"work-request", "propose", "approve", "validate", "retire", "reuse", "participant-result", "supervisor-review"}: raise ContractError("cross-project operation is invalid")
+    for field in ("bindingId", "coordinationTeamId", "supervisorMemberId", "supervisorLeadId"): _id(value[field], name=field)
+    if not isinstance(value["input"], Mapping) or isinstance(value["input"], list): raise ContractError("cross-project input is invalid")
+    _digest(value["digest"], name="digest")
+    return value
+
+
+def parse_canary_authorization(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"authorizationId", "targetTemporaryCeiling", "expectedGlobalCeiling", "expectedRevision", "projects", "workflowId", "decisionVersion", "decisionId", "question", "deadline", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    value = _strict_protocol(payload, required=required, name="concurrency canary authorization")
+    if value["targetTemporaryCeiling"] != 2 or value["expectedGlobalCeiling"] != 1 or not isinstance(value["expectedRevision"], int) or isinstance(value["expectedRevision"], bool) or value["expectedRevision"] < 0: raise ContractError("canary authorization ceiling is invalid")
+    if not isinstance(value["projects"], list) or len(value["projects"]) != 2: raise ContractError("canary requires two projects")
+    for project in value["projects"]:
+        item = _object(project, name="canary project"); _keys(item, {"projectId", "planId", "planVersion", "leadId"}, name="canary project")
+        for field in item: _id(item[field], name=field)
+    if value["projects"][0]["projectId"] == value["projects"][1]["projectId"]: raise ContractError("canary projects must differ")
+    _id(value["authorizationId"], name="authorizationId"); _id(value["workflowId"], name="workflowId"); _id(value["decisionVersion"], name="decisionVersion"); _id(value["decisionId"], name="decisionId"); _text(value["question"], name="question"); _timestamp(value["deadline"], name="deadline"); _digest(value["digest"], name="digest")
+    if value["decisionId"] != f"roadex:concurrency-canary:{value['authorizationId']}" or value["question"] != f"Approve the exact live concurrency canary {value['digest']}" or datetime.fromisoformat(value["deadline"].replace("Z", "+00:00")) <= datetime.fromisoformat(value["occurredAt"].replace("Z", "+00:00")): raise ContractError("canary authorization binding is invalid")
+    base = {key: value[key] for key in ("authorizationId", "targetTemporaryCeiling", "expectedGlobalCeiling", "expectedRevision", "projects", "workflowId", "decisionVersion", "deadline", "correlationId", "idempotencyKey", "occurredAt")}
+    if hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest() != value["digest"]: raise ContractError("canary authorization digest mismatch")
     return value

@@ -21,6 +21,11 @@ from .psychlo_contracts import (
     learning_observation_digest,
     parse_adoption_evidence,
     parse_external_round,
+    parse_external_round_binding,
+    parse_ingress_conflict_reconciliation,
+    parse_cross_project_team_binding,
+    parse_cross_project_work,
+    parse_canary_authorization,
     parse_learning_observation,
     parse_learning_advisory,
     parse_registry_candidate,
@@ -191,10 +196,11 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
 
 
 class PsychloBridge:
-    def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[[str, str], str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None):
+    def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[[str, str], str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False):
         self.store, self.dispatcher, self.sender = store, dispatcher, sender
         self.peer_secret = getattr(sender, "secret", None)
         self.callback_origin = callback_origin.rstrip("/")
+        self.require_external_binding = require_external_binding
         self.clock = clock or (lambda: datetime.now(UTC).isoformat())
         self.token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._recover_decision_intents()
@@ -572,6 +578,13 @@ class PsychloBridge:
         except ContractError as error:
             raise ValueError(str(error)) from error
         digest = envelope["digest"]
+        binding = self.store.protocol_record("external-round-binding", envelope["reconciliationId"])
+        if binding is None and self.require_external_binding:
+            raise ValueError("external round binding authorization is required")
+        if binding is not None:
+            bound = binding["payload"]
+            if bound.get("externalExecutionId") != envelope["externalExecutionId"] or bound.get("projectId") != envelope["projectId"] or bound.get("planId") != envelope["planId"] or bound.get("planVersion") != envelope["planVersion"] or bound.get("projectLeadId") != envelope["projectLeadId"] or bound.get("threadId") != envelope["threadId"] or bound.get("repository") != envelope["repository"] or bound.get("startingCheckpoint") != envelope["startingCheckpoint"] or bound.get("terminalCheckpoint") != envelope["terminalCheckpoint"]:
+                raise ValueError("external round binding conflict")
         existing = self.store.external_execution(envelope["reconciliationId"])
         if existing is not None:
             if existing["digest"] != digest or existing["payload"] != envelope:
@@ -590,6 +603,114 @@ class PsychloBridge:
         return self.store.external_execution(envelope["reconciliationId"])["receipt"]
 
     reconcile_external_round = receive_external_round
+
+    # ---- Psychlo final peer projections -------------------------------
+    def _persist_protocol(self, kind: str, record_id: str, payload: Mapping[str, Any], *, forward: bool = True) -> dict[str, Any]:
+        digest = str(payload.get("digest") or canonical_digest(payload))
+        record, inserted = self.store.record_protocol(kind, record_id, str(payload.get("idempotencyKey", record_id)), digest, payload)
+        if inserted and forward:
+            try:
+                response = self.sender(kind, record_id, payload)
+                if response.get("accepted") is not True: raise ValueError("Psychlo rejected protocol record")
+                record = self.store.transition_protocol(kind, record_id, "delivered")
+            except Exception as error:
+                self.store.transition_protocol(kind, record_id, "failed", "forward-failed")
+                raise error
+        elif not inserted and record["state"] not in {"delivered", "settled"} and forward:
+            try:
+                response = self.sender(kind, record_id, payload)
+                if response.get("accepted") is not True: raise ValueError("Psychlo rejected protocol record")
+                record = self.store.transition_protocol(kind, record_id, "delivered")
+            except Exception:
+                self.store.transition_protocol(kind, record_id, "failed", "forward-failed")
+        return {"inserted": inserted, "replay": not inserted, "record": record}
+
+    def authorize_external_round_binding(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try: authorization = parse_external_round_binding(payload)
+        except ContractError as error: raise ValueError(str(error)) from error
+        external = self.store.external_execution(authorization["reconciliationId"])
+        if external is None: raise ValueError("external execution must be persisted before binding")
+        envelope = external["payload"]
+        for field in ("externalExecutionId", "projectId", "planId", "planVersion", "projectLeadId", "threadId", "startingCheckpoint", "terminalCheckpoint"):
+            if authorization[field] != envelope[field]: raise ValueError("external round binding conflict")
+        if authorization["repository"] != envelope["repository"]: raise ValueError("external round binding conflict")
+        return self._persist_protocol("external-round-binding", authorization["reconciliationId"], authorization)
+
+    receive_external_round_binding = authorize_external_round_binding
+
+    def reconcile_ingress_conflict(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try: value = parse_ingress_conflict_reconciliation(payload)
+        except ContractError as error: raise ValueError(str(error)) from error
+        return self._persist_protocol("ingress-conflict-reconciliation", value["idempotencyKey"], value)
+
+    receive_ingress_conflict_reconciliation = reconcile_ingress_conflict
+
+    def authorize_cross_project_team_binding(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try: value = parse_cross_project_team_binding(payload)
+        except ContractError as error: raise ValueError(str(error)) from error
+        return self._persist_protocol("cross-project-team-binding", value["bindingId"], value)
+
+    receive_cross_project_team_binding = authorize_cross_project_team_binding
+
+    def coordinate_cross_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        if set(value) != {"operation", "input"} or value["operation"] not in {"work-request", "propose", "approve", "validate", "retire", "reuse"} or not isinstance(value["input"], Mapping): raise ValueError("cross-project command is invalid")
+        inner = dict(value["input"])
+        key = inner.get("idempotencyKey")
+        if not isinstance(key, str) or not key.strip(): raise ValueError("cross-project command idempotency is required")
+        return self._persist_protocol("cross-project-command", key, value)
+
+    receive_cross_project_command = coordinate_cross_project
+
+    def receive_cross_project_participant_result(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        key, record_id = value.get("idempotencyKey"), value.get("resultId")
+        if not isinstance(key, str) or not key.strip() or not isinstance(record_id, str) or not record_id.strip() or value.get("status") not in {"completed", "blocked"}: raise ValueError("participant result is invalid")
+        return self._persist_protocol("cross-project-participant-result", record_id, value)
+
+    def receive_cross_project_supervisor_review(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        key, record_id = value.get("idempotencyKey"), value.get("reviewId")
+        if not isinstance(key, str) or not key.strip() or not isinstance(record_id, str) or not record_id.strip() or value.get("decision") not in {"accepted", "rejected"}: raise ValueError("supervisor review is invalid")
+        return self._persist_protocol("cross-project-supervisor-review", record_id, value)
+
+    def authorize_concurrency_canary(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try: value = parse_canary_authorization(payload)
+        except ContractError as error: raise ValueError(str(error)) from error
+        return self._persist_protocol("concurrency-canary-authorization", value["authorizationId"], value)
+
+    receive_concurrency_canary_authorization = authorize_concurrency_canary
+
+    def authorize_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        required = {"authorizationId", "ceiling", "expectedRevision", "revision", "canaryResultId", "projectId", "planId", "workflowId", "decisionVersion", "decisionId", "question", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+        if set(value) != required or any(not isinstance(value.get(field), str) or not value[field].strip() for field in required - {"ceiling", "expectedRevision", "revision"}): raise ValueError("concurrency ceiling authorization is invalid")
+        if not all(isinstance(value[field], int) and not isinstance(value[field], bool) and value[field] >= 0 for field in ("expectedRevision", "revision")) or not isinstance(value["ceiling"], int) or value["ceiling"] < 1: raise ValueError("concurrency ceiling authorization is invalid")
+        if value["decisionId"] != f"roadex:concurrency:{value['authorizationId']}" or value["question"] != f"Approve the exact global concurrency operation {value['digest']}": raise ValueError("concurrency ceiling authorization binding is invalid")
+        return self._persist_protocol("concurrency-ceiling-authorization", value["authorizationId"], value)
+
+    receive_concurrency_ceiling_authorization = authorize_concurrency_ceiling
+
+    def change_concurrency_ceiling(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        if set(value) != {"authorizationId", "correlationId", "idempotencyKey", "occurredAt", "digest"}: raise ValueError("concurrency ceiling change is invalid")
+        return self._persist_protocol("concurrency-ceiling-change", value["authorizationId"], value)
+
+    receive_concurrency_ceiling_change = change_concurrency_ceiling
+
+    def recover_protocol_records(self) -> dict[str, int]:
+        recovered = failed = 0
+        for kind in ("external-round-binding", "ingress-conflict-reconciliation", "cross-project-team-binding", "cross-project-command", "cross-project-participant-result", "cross-project-supervisor-review", "concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"):
+            for record in self.store.pending_protocol(kind):
+                try:
+                    response = self.sender(kind, record["id"], record["payload"])
+                    if response.get("accepted") is not True: raise ValueError("rejected")
+                    self.store.transition_protocol(kind, record["id"], "delivered")
+                    recovered += 1
+                except Exception:
+                    self.store.transition_protocol(kind, record["id"], "failed", "forward-failed")
+                    failed += 1
+        return {"recovered": recovered, "failed": failed}
 
     def _external_decision_request(self, envelope: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
         return {"decisionId": f"roadex:external:{envelope['reconciliationId']}", "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": workflow_id, "decisionVersion": envelope["planVersion"], "correlationId": envelope["correlationId"], "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}", "question": envelope["explicitGate"], "resultProvenanceId": envelope["digest"]}
@@ -724,7 +845,7 @@ def create_bridge_from_environment(environment: Mapping[str, str] | None = None)
     store = PsychloBridgeStore(selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"])
     dispatcher = CodexProjectDispatcher(selected["OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE"])
     sender = PsychloPeerSender(selected.get("OVERSEER_PSYCHLO_ENDPOINT", "http://127.0.0.1:8798"), secret)
-    return PsychloBridge(store=store, dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766")
+    return PsychloBridge(store=store, dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766", require_external_binding=True)
 
 
 def _weekly_window(snapshot: Mapping[str, Any] | None) -> Mapping[str, Any]:

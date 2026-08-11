@@ -39,6 +39,7 @@ from .psychlo_contracts import (
     parse_registry_candidate,
     parse_telemetry_checkpoint,
 )
+from .psychlo_contracts import SHA256_RE
 from .audit import ApprovalRequest, ApprovalStatus
 from .core import ApprovalLevel
 from .admin import AdminChangePlan
@@ -651,9 +652,14 @@ class PsychloBridge:
         except ContractError as error:
             raise ValueError(str(error)) from error
         inserted = self.store.record_registry(candidate, canonical_digest(candidate))
-        return {"inserted": inserted, "replay": not inserted, "candidate": self.store.registry_candidate(candidate["candidateId"])}
+        stored = self.store.registry_candidate(candidate["candidateId"])
+        if stored is None:
+            raise ValueError("registry candidate was not persisted")
+        protocol = self._persist_adoption_peer("registry-candidate", candidate["candidateId"], _registry_wire_payload(stored))
+        return {"inserted": inserted, "replay": not inserted, "candidate": stored, "receipt": protocol["record"].get("receipt")}
 
     receive_registry_candidate = register_candidate
+    produce_registry_candidate = register_candidate
 
     def record_adoption_evidence(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         payload = {**payload, "sourceId": payload.get("sourceId", "overseer"), "messageId": payload.get("messageId", payload.get("assessmentId", "")), "correlationId": payload.get("correlationId", f"adoption:{payload.get('assessmentId', '')}"), "idempotencyKey": payload.get("idempotencyKey", f"adoption:{payload.get('assessmentId', '')}"), "occurredAt": payload.get("occurredAt", self.clock()), "schemaVersion": payload.get("schemaVersion", "psychlo.adoption-evidence.v1")}
@@ -668,11 +674,40 @@ class PsychloBridge:
         for reference in evidence["evidence"]:
             if registered.get(reference["evidenceId"]) != (reference["digest"], reference["kind"]):
                 raise ValueError("adoption evidence registry reference conflict")
-        assessment_id = evidence["messageId"]
+        # A registry candidate is always delivered before its assessment.  If
+        # this bridge was restarted after the registry row was recorded but
+        # before its outbox record was created, recover that producer seam
+        # here rather than letting Psychlo see an unbound assessment.
+        registry_record = self.store.protocol_record("registry-candidate", evidence["candidateId"])
+        if registry_record is None or registry_record.get("state") not in {"delivered", "settled"}:
+            registry_wire = _registry_wire_payload(candidate)
+            self._persist_adoption_peer("registry-candidate", evidence["candidateId"], registry_wire)
+        assessment_id = evidence["assessmentId"]
         inserted = self.store.record_adoption(assessment_id, evidence["candidateId"], evidence, canonical_digest(evidence))
-        return {"inserted": inserted, "replay": not inserted, "evidence": self.store.adoption_evidence(assessment_id)}
+        protocol = self._persist_adoption_peer("adoption-evidence", assessment_id, _adoption_wire_payload(evidence))
+        return {"inserted": inserted, "replay": not inserted, "evidence": self.store.adoption_evidence(assessment_id), "receipt": protocol["record"].get("receipt")}
 
     receive_adoption_evidence = record_adoption_evidence
+    produce_adoption_evidence = record_adoption_evidence
+
+    def produce_adoption(self, candidate: Mapping[str, Any], evidence: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist and deliver the registry binding before its assessment."""
+        self.register_candidate(candidate)
+        return self.record_adoption_evidence(evidence)
+
+    def _persist_adoption_peer(self, kind: str, record_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        digest = canonical_digest(payload)
+        record, inserted = self.store.record_protocol(kind, record_id, str(payload.get("idempotencyKey", record_id)), digest, payload)
+        if record["state"] in {"delivered", "settled"}:
+            return {"inserted": inserted, "replay": not inserted, "record": record}
+        try:
+            response = self.sender(kind, record_id, payload)
+            _validate_adoption_peer_response(kind, payload, response)
+            record = self.store.transition_protocol(kind, record_id, "delivered", receipt=dict(response))
+        except Exception as error:
+            self.store.transition_protocol(kind, record_id, "forward-pending", "forward-failed")
+            raise ValueError("forward-pending") from error
+        return {"inserted": inserted, "replay": not inserted, "record": record}
 
     def discover_adoption_evidence(self, candidate_id: str, reader: Callable[[str], Mapping[str, Any]], *, limit: int = 64) -> dict[str, Any]:
         """Perform bounded registry-only discovery; the reader receives no write API."""
@@ -1312,7 +1347,7 @@ class PsychloBridge:
 
     def recover_protocol_records(self) -> dict[str, int]:
         recovered = failed = 0
-        for kind in ("external-round-binding", "ingress-conflict-reconciliation", "cross-project-team-binding", "cross-project-command", "coordination-work-request", "cross-project-participant-result", "cross-project-supervisor-review", "concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"):
+        for kind in ("registry-candidate", "adoption-evidence", "external-round-binding", "ingress-conflict-reconciliation", "cross-project-team-binding", "cross-project-command", "coordination-work-request", "cross-project-participant-result", "cross-project-supervisor-review", "concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"):
             for record in self.store.pending_protocol(kind):
                 try:
                     if record["attempts"] >= 3:
@@ -1330,6 +1365,10 @@ class PsychloBridge:
                             self.store.transition_protocol("coordination-work-request", str(request_id), "settled")
                         recovered += 1
                         continue
+                    if kind in {"registry-candidate", "adoption-evidence"}:
+                        self._forward_adoption_record(record)
+                        recovered += 1
+                        continue
                     if kind in {"concurrency-canary-authorization", "concurrency-ceiling-authorization", "concurrency-ceiling-change"}:
                         self._revalidate_concurrency_protocol_record(record)
                     response = self.sender(kind, record["id"], record["payload"])
@@ -1340,6 +1379,25 @@ class PsychloBridge:
                     self.store.transition_protocol(kind, record["id"], "forward-pending", "forward-failed")
                     failed += 1
         return {"recovered": recovered, "failed": failed}
+
+    def _forward_adoption_record(self, record: Mapping[str, Any]) -> None:
+        kind = str(record["kind"])
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ValueError("adoption payload is invalid")
+        if kind == "registry-candidate":
+            candidate = parse_registry_candidate({**dict(payload), "sourceId": "overseer", "messageId": str(payload.get("candidateId", record["id"])), "schemaVersion": "psychlo.registry-candidate.v1"})
+            wire = _registry_wire_payload(candidate)
+        elif kind == "adoption-evidence":
+            evidence = parse_adoption_evidence({**dict(payload), "sourceId": "overseer", "messageId": str(payload.get("assessmentId", record["id"])), "schemaVersion": "psychlo.adoption-evidence.v1"})
+            wire = _adoption_wire_payload(evidence)
+        else:
+            raise ValueError("unsupported adoption record")
+        if canonical_digest(wire) != record.get("digest"):
+            raise ValueError("adoption protocol digest conflict")
+        response = self.sender(kind, str(record["id"]), wire)
+        _validate_adoption_peer_response(kind, wire, response)
+        self.store.transition_protocol(kind, str(record["id"]), "delivered", receipt=dict(response))
 
     def _external_decision_request(self, envelope: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
         return {"decisionId": f"roadex:external:{envelope['reconciliationId']}", "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": workflow_id, "decisionVersion": envelope["planVersion"], "correlationId": envelope["correlationId"], "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}", "question": envelope["explicitGate"], "resultProvenanceId": envelope["digest"]}
@@ -1533,6 +1591,60 @@ def _weekly_window(snapshot: Mapping[str, Any] | None) -> Mapping[str, Any]:
     windows = [window for limit in snapshot.get("rate_limits", []) for window in limit.get("windows", []) if isinstance(window, dict)]
     if not windows: raise ValueError("weekly usage window is required")
     return max(windows, key=lambda item: float(item.get("window_minutes", item.get("duration_minutes", 0)) or 0))
+
+
+def _registry_wire_payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = ("candidateId", "projectId", "targetProjectId", "registryId", "registryDigest", "evidenceIds", "evidenceDigests", "evidenceKinds", "canonical", "correlationId", "idempotencyKey", "occurredAt")
+    return {key: candidate[key] for key in allowed if key in candidate}
+
+
+def _adoption_wire_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    inner_allowed = ("candidateId", "registry", "repository", "artifact", "application", "team", "ownership", "plan", "lead", "checkpoint", "security", "contradictions", "evidence")
+    inner = {key: evidence[key] for key in inner_allowed if key in evidence}
+    allowed = ("candidateId", "assessmentId", "correlationId", "idempotencyKey", "occurredAt")
+    return {**{key: evidence[key] for key in allowed if key in evidence}, "evidence": inner}
+
+
+def _validate_adoption_peer_response(kind: str, payload: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+    if not isinstance(response, Mapping) or response.get("accepted") is not True:
+        raise ValueError("Psychlo rejected adoption evidence")
+    if kind == "registry-candidate":
+        registration = response.get("registration")
+        if registration is not None:
+            if not isinstance(registration, Mapping):
+                raise ValueError("registry receipt is invalid")
+            allowed = {"candidateId", "projectId", "targetProjectId", "registryId", "registryDigest", "evidenceIds", "evidenceDigests", "evidenceKinds", "canonical", "sourceId", "messageId", "correlationId", "idempotencyKey", "occurredAt", "sourceEventSequence"}
+            if set(registration) - allowed or registration.get("candidateId") != payload.get("candidateId") or registration.get("sourceId") != "overseer":
+                raise ValueError("registry receipt identity conflict")
+            if any(key.endswith("Path") or "secret" in key.lower() or "token" in key.lower() for key in registration):
+                raise ValueError("registry receipt contains sensitive fields")
+            if "sourceEventSequence" in registration and (not isinstance(registration["sourceEventSequence"], int) or isinstance(registration["sourceEventSequence"], bool) or registration["sourceEventSequence"] < 1):
+                raise ValueError("registry receipt sequence is invalid")
+            registration_for_parse = {key: value for key, value in registration.items() if key != "sourceEventSequence"}
+            registration_for_parse["schemaVersion"] = "psychlo.registry-candidate.v1"
+            try:
+                parse_registry_candidate(registration_for_parse)
+            except ContractError as error:
+                raise ValueError("registry receipt is invalid") from error
+        return
+    required = {"accepted", "assessmentId", "candidateId", "classification", "confidence", "evidence", "missingArtifacts", "contradictions", "recommendedWorkflow", "evidenceDigest"}
+    optional = {"repositoryDigest"}
+    if set(response) - required - optional or not required.issubset(response):
+        raise ValueError("adoption receipt is invalid")
+    if response.get("assessmentId") != payload.get("assessmentId") or response.get("candidateId") != payload.get("candidateId"):
+        raise ValueError("adoption receipt identity conflict")
+    submitted_evidence = payload.get("evidence", {}).get("evidence") if isinstance(payload.get("evidence"), Mapping) else None
+    if response.get("evidence") != submitted_evidence:
+        raise ValueError("adoption receipt evidence conflict")
+    if response.get("classification") not in {"recover-active", "adopt-baseline", "cleanup-required", "insufficient-evidence"} or response.get("confidence") not in {"low", "medium", "high"} or response.get("recommendedWorkflow") not in {"reconstruction", "onboarding", "cleanup", "reject"}:
+        raise ValueError("adoption receipt classification is invalid")
+    allowed_reasons = {"repository-missing", "artifact-missing", "application-purpose-missing", "plan-missing", "lead-missing", "checkpoint-missing", "dirty-repository", "contradictory-history", "ownership-missing", "license-missing", "unsafe-files", "unsafe-modes", "symlinks", "secrets", "personal-exports", "oversized-data"}
+    if not isinstance(response.get("missingArtifacts"), list) or not isinstance(response.get("contradictions"), list) or len(response["missingArtifacts"]) > 64 or len(response["contradictions"]) > 64 or any(item not in allowed_reasons for item in response["missingArtifacts"] + response["contradictions"]):
+        raise ValueError("adoption receipt classification is invalid")
+    if "repositoryDigest" in response and (not isinstance(response["repositoryDigest"], str) or not SHA256_RE.fullmatch(response["repositoryDigest"])):
+        raise ValueError("adoption receipt repository digest is invalid")
+    if not isinstance(response.get("evidenceDigest"), str) or not SHA256_RE.fullmatch(response["evidenceDigest"]):
+        raise ValueError("adoption receipt digest is invalid")
 
 
 def _require_round(request: Mapping[str, Any]) -> None:

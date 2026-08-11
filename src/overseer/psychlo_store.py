@@ -60,7 +60,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS registry_candidates(candidate_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS adoption_evidence(assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS external_executions(reconciliation_id TEXT PRIMARY KEY, external_execution_id TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL, status TEXT NOT NULL, forwarded INTEGER NOT NULL DEFAULT 0, gate_decision_id TEXT, gate_workflow_id TEXT, inserted_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
+            CREATE TABLE IF NOT EXISTS protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind, record_id), UNIQUE(kind, idempotency_key), UNIQUE(kind, digest));
             CREATE TABLE IF NOT EXISTS approval_authority_snapshots(approval_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_dispatches(request_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
@@ -73,6 +73,10 @@ class PsychloBridgeStore:
                 pass
         try:
             self.connection.execute("ALTER TABLE external_executions ADD COLUMN gate_workflow_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.connection.execute("ALTER TABLE protocol_records ADD COLUMN receipt_json TEXT")
         except sqlite3.OperationalError:
             pass
         for table in ("coordination_dispatches", "coordination_reviews"):
@@ -779,9 +783,9 @@ class PsychloBridgeStore:
         return {name: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for name, table in (("telemetry", "telemetry_checkpoints"), ("learning", "learning_observations"), ("registry", "registry_candidates"), ("adoption", "adoption_evidence"), ("external", "external_executions"))}
 
     def protocol_record(self, kind: str, record_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT idempotency_key,digest,payload_json,state,attempts,last_error,updated_at FROM protocol_records WHERE kind=? AND record_id=?", (kind, record_id)).fetchone()
+        row = self.connection.execute("SELECT idempotency_key,digest,payload_json,state,attempts,last_error,updated_at,receipt_json FROM protocol_records WHERE kind=? AND record_id=?", (kind, record_id)).fetchone()
         if row is None: return None
-        return {"kind": kind, "id": record_id, "idempotencyKey": row[0], "digest": row[1], "payload": json.loads(row[2]), "state": row[3], "attempts": row[4], "lastError": row[5], "updatedAt": row[6]}
+        return {"kind": kind, "id": record_id, "idempotencyKey": row[0], "digest": row[1], "payload": json.loads(row[2]), "state": row[3], "attempts": row[4], "lastError": row[5], "updatedAt": row[6], "receipt": json.loads(row[7]) if row[7] else None}
 
     def list_protocol(self, kind: str, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? ORDER BY updated_at,record_id LIMIT ?", (kind, max(1, min(1000, int(limit))))).fetchall()
@@ -795,7 +799,7 @@ class PsychloBridgeStore:
         by_key = self.connection.execute("SELECT record_id FROM protocol_records WHERE kind=? AND idempotency_key=?", (kind, idempotency_key)).fetchone()
         if by_key is not None and by_key[0] != record_id: raise ValueError(f"{kind} idempotency conflict")
         try:
-            self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at) VALUES (?,?,?,?,?,?,?)", (kind, record_id, idempotency_key, digest, _dump_wire(payload), state, self._now()))
+            self.connection.execute("INSERT INTO protocol_records(kind,record_id,idempotency_key,digest,payload_json,state,updated_at,receipt_json) VALUES (?,?,?,?,?,?,?,NULL)", (kind, record_id, idempotency_key, digest, _dump_wire(payload), state, self._now()))
         except sqlite3.IntegrityError as error:
             winner = self.protocol_record(kind, record_id)
             if winner is not None and winner["digest"] == digest and winner["payload"] == dict(payload):
@@ -803,9 +807,12 @@ class PsychloBridgeStore:
             raise ValueError(f"{kind} conflict") from error
         return self.protocol_record(kind, record_id), True
 
-    def transition_protocol(self, kind: str, record_id: str, state: str, error: str | None = None) -> dict[str, Any]:
+    def transition_protocol(self, kind: str, record_id: str, state: str, error: str | None = None, receipt: Mapping[str, Any] | None = None) -> dict[str, Any]:
         with self.connection:
-            self.connection.execute("UPDATE protocol_records SET state=?,attempts=attempts+1,last_error=?,updated_at=? WHERE kind=? AND record_id=?", (state, error, self._now(), kind, record_id))
+            if receipt is None:
+                self.connection.execute("UPDATE protocol_records SET state=?,attempts=attempts+1,last_error=?,updated_at=? WHERE kind=? AND record_id=?", (state, error, self._now(), kind, record_id))
+            else:
+                self.connection.execute("UPDATE protocol_records SET state=?,attempts=attempts+1,last_error=?,updated_at=?,receipt_json=? WHERE kind=? AND record_id=?", (state, error, self._now(), _dump_wire(receipt), kind, record_id))
         result = self.protocol_record(kind, record_id)
         if result is None: raise ValueError("protocol record is missing")
         return result

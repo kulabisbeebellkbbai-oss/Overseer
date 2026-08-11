@@ -77,10 +77,38 @@ def test_external_round_requires_digest_and_blocker_for_blocked_result():
 
 def test_adoption_evidence_is_registry_bound_and_strict():
     reference = {"reason": "registry", "kind": "registry", "evidenceId": "evidence-1", "digest": "a" * 64}
-    evidence = {"candidateId": "candidate-1", "registry": {"registryId": "registry-1", "registryDigest": "b" * 64, "evidenceIds": ["evidence-1"], "canonical": True}, "evidence": [reference], "sourceId": "overseer", "messageId": "assessment-1", "correlationId": "corr", "idempotencyKey": "assessment-1", "occurredAt": NOW, "schemaVersion": "psychlo.adoption-evidence.v1"}
+    evidence = {"candidateId": "candidate-1", "assessmentId": "assessment-1", "registry": {"registryId": "registry-1", "registryDigest": "b" * 64, "evidenceIds": ["evidence-1"], "canonical": True}, "evidence": [reference], "sourceId": "overseer", "messageId": "assessment-1", "correlationId": "corr", "idempotencyKey": "assessment-1", "occurredAt": NOW, "schemaVersion": "psychlo.adoption-evidence.v1"}
     assert parse_adoption_evidence(evidence)["registry"]["canonical"] is True
     with pytest.raises(ContractError):
         parse_adoption_evidence({**evidence, "repository": {"path": "/private"}})
+
+
+def test_adoption_evidence_accepts_psychlo_classification_facts_without_paths_or_secrets():
+    digest = "a" * 64
+    ref = lambda reason, kind, evidence_id: {"reason": reason, "kind": kind, "evidenceId": evidence_id, "digest": digest}
+    evidence = {
+        "candidateId": "candidate-1", "assessmentId": "assessment-1",
+        "registry": {"registryId": "registry-1", "registryDigest": digest, "evidenceIds": ["registry-1", "repo-1", "artifact-1", "application-1", "team-1", "ownership-1", "plan-1", "lead-1", "checkpoint-1", "security-1"], "canonical": True},
+        "repository": {"present": True, "canonical": True, "digest": digest, "clean": True, "status": "known", "evidenceRef": ref("canonical-repository", "repository", "repo-1")},
+        "artifact": {"present": True, "deployable": True, "digest": digest, "evidenceRef": ref("deployable-artifact", "artifact", "artifact-1")},
+        "application": {"present": True, "purpose": "service", "provenanceTrusted": True, "evidenceRef": ref("application-purpose", "application", "application-1")},
+        "team": {"present": True, "authoritative": True, "provenanceTrusted": True, "teamId": "team-1", "leadId": "lead-1", "evidenceRef": ref("team-baseline", "team", "team-1")},
+        "ownership": {"trusted": True, "provenanceTrusted": True, "license": "MIT", "evidenceRef": ref("ownership", "ownership", "ownership-1"), "licenseEvidenceRef": ref("license", "ownership", "ownership-1")},
+        "plan": {"present": True, "status": "approved", "planId": "plan-1", "planVersion": "v1", "evidenceRef": ref("active-plan", "plan", "plan-1")},
+        "lead": {"resolved": True, "authoritative": True, "leadId": "lead-1", "teamId": "team-1", "evidenceRef": ref("lead", "lead", "lead-1")},
+        "checkpoint": {"present": True, "state": "pending", "checkpointId": "checkpoint-1", "threadId": "thread-1", "evidenceRef": ref("checkpoint", "checkpoint", "checkpoint-1")},
+        "security": {"reasons": ["unsafe-files"], "evidence": [ref("unsafe-files", "security", "security-1")]},
+        "contradictions": ["dirty-repository"],
+        "evidence": [ref("registry", "registry", "registry-1"), ref("canonical-repository", "repository", "repo-1"), ref("deployable-artifact", "artifact", "artifact-1"), ref("application-purpose", "application", "application-1"), ref("team-baseline", "team", "team-1"), ref("ownership", "ownership", "ownership-1"), ref("active-plan", "plan", "plan-1"), ref("lead", "lead", "lead-1"), ref("checkpoint", "checkpoint", "checkpoint-1"), ref("unsafe-files", "security", "security-1")],
+        "sourceId": "overseer", "messageId": "assessment-1", "correlationId": "corr", "idempotencyKey": "assessment-1", "occurredAt": NOW, "schemaVersion": "psychlo.adoption-evidence.v1",
+    }
+    assert parse_adoption_evidence(evidence)["repository"]["status"] == "known"
+    wire = {"candidateId": evidence["candidateId"], "assessmentId": evidence["assessmentId"], "evidence": {key: value for key, value in evidence.items() if key in {"candidateId", "registry", "repository", "artifact", "application", "team", "ownership", "plan", "lead", "checkpoint", "security", "contradictions", "evidence"}}, "sourceId": "overseer", "messageId": evidence["assessmentId"], "correlationId": evidence["correlationId"], "idempotencyKey": evidence["idempotencyKey"], "occurredAt": evidence["occurredAt"], "schemaVersion": evidence["schemaVersion"]}
+    assert parse_adoption_evidence(wire)["assessmentId"] == "assessment-1"
+    with pytest.raises(ContractError):
+        parse_adoption_evidence({**evidence, "repository": {**evidence["repository"], "path": "/private"}})
+    with pytest.raises(ContractError):
+        parse_adoption_evidence({**evidence, "secret": "do-not-store"})
 
 
 def test_ingress_project_id_is_the_only_exact_optional_key():

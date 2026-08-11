@@ -37,6 +37,9 @@ ATTRIBUTIONS = {"isolated", "shared", "censored", "unknown"}
 LEARNING_DESTINATIONS = {"skiller", "private-memory"}
 EVIDENCE_KINDS = {"registry", "repository", "artifact", "application", "team", "ownership", "plan", "lead", "checkpoint", "security"}
 REASONS = {"registry", "canonical-repository", "repository-missing", "deployable-artifact", "artifact-missing", "application-purpose", "application-purpose-missing", "team-baseline", "active-plan", "plan-missing", "lead", "lead-missing", "checkpoint", "checkpoint-missing", "ownership", "license", "ownership-missing", "license-missing", "unsafe-files", "unsafe-modes", "symlinks", "secrets", "personal-exports", "oversized-data", "dirty-repository", "contradictory-history"}
+APPLICATION_PURPOSES = {"service", "application", "library", "cli", "web"}
+LICENSE_KINDS = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "GPL-3.0", "proprietary"}
+SECURITY_REASONS = {"unsafe-files", "unsafe-modes", "symlinks", "secrets", "personal-exports", "oversized-data"}
 
 
 def _canonical(value: Any) -> str:
@@ -282,26 +285,127 @@ def parse_registry_candidate(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def parse_adoption_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     value = _object(payload, name="adoption evidence")
-    required = {"candidateId", "registry", "evidence", "sourceId", "messageId", "correlationId", "idempotencyKey", "occurredAt", "schemaVersion"}
-    _common(value, schema=ADOPTION_SCHEMA, required=required, name="adoption evidence")
+    required = {"candidateId", "assessmentId", "registry", "evidence", "sourceId", "messageId", "correlationId", "idempotencyKey", "occurredAt", "schemaVersion"}
+    fact_names = {"repository", "artifact", "application", "team", "ownership", "plan", "lead", "checkpoint", "security", "contradictions"}
+    nested = value.get("evidence")
+    if isinstance(nested, Mapping):
+        outer_required = {"candidateId", "assessmentId", "evidence", "sourceId", "messageId", "correlationId", "idempotencyKey", "occurredAt", "schemaVersion"}
+        _common(value, schema=ADOPTION_SCHEMA, required=outer_required, allowed=outer_required, name="adoption evidence")
+        inner = _object(nested, name="adoption classification evidence")
+        _keys(inner, {"candidateId", "registry", "repository", "artifact", "application", "team", "ownership", "plan", "lead", "checkpoint", "security", "contradictions", "evidence"}, name="adoption classification evidence")
+        if inner.get("candidateId") != value.get("candidateId"):
+            raise ContractError("adoption candidate identity conflict")
+        value = {**value, **inner}
+    _common(value, schema=ADOPTION_SCHEMA, required=required, allowed=required | fact_names, name="adoption evidence")
     _id(value["candidateId"], name="candidateId")
+    _id(value["assessmentId"], name="assessmentId")
     registry = _object(value["registry"], name="registry")
     _keys(registry, {"registryId", "registryDigest", "evidenceIds", "canonical"}, name="registry")
     _id(registry.get("registryId"), name="registryId")
     _digest(registry.get("registryDigest"), name="registryDigest")
     if registry.get("canonical") is not True:
         raise ContractError("registry is not canonical")
+    registry_ids = _array(registry.get("evidenceIds"), name="registry evidenceIds")
+    if not registry_ids:
+        raise ContractError("registry evidenceIds are invalid")
     refs = value["evidence"]
     if not isinstance(refs, list) or not refs or len(refs) > MAX_ARRAY:
         raise ContractError("adoption evidence references are invalid")
     for ref in refs:
-        item = _object(ref, name="evidence reference")
-        _keys(item, {"reason", "kind", "evidenceId", "digest"}, name="evidence reference")
-        if item.get("reason") not in REASONS or item.get("kind") not in EVIDENCE_KINDS:
-            raise ContractError("evidence reference is invalid")
-        _id(item.get("evidenceId"), name="evidenceId")
-        _digest(item.get("digest"), name="evidence digest")
+        _adoption_reference(ref)
+    for field, required_fields, optional_fields, kind, expected_reason in (
+        ("repository", {"present", "canonical", "clean", "status"}, {"digest", "evidenceRef"}, "repository", "canonical-repository"),
+        ("artifact", {"present", "deployable"}, {"digest", "evidenceRef"}, "artifact", "deployable-artifact"),
+        ("application", {"present", "provenanceTrusted"}, {"purpose", "evidenceRef"}, "application", "application-purpose"),
+        ("team", {"present", "authoritative", "provenanceTrusted"}, {"teamId", "leadId", "evidenceRef"}, "team", "team-baseline"),
+        ("ownership", {"trusted", "provenanceTrusted"}, {"license", "evidenceRef", "licenseEvidenceRef"}, "ownership", "ownership"),
+        ("plan", {"present", "status"}, {"planId", "planVersion", "evidenceRef"}, "plan", "active-plan"),
+        ("lead", {"resolved", "authoritative"}, {"leadId", "teamId", "evidenceRef"}, "lead", "lead"),
+        ("checkpoint", {"present", "state"}, {"checkpointId", "threadId", "evidenceRef"}, "checkpoint", "checkpoint"),
+    ):
+        fact = value.get(field)
+        if fact is None:
+            continue
+        _adoption_fact(fact, required_fields, optional_fields, kind, expected_reason)
+    repository = value.get("repository")
+    if repository is not None and repository.get("status") not in {"known", "unknown"}:
+        raise ContractError("repository status is invalid")
+    plan = value.get("plan")
+    if plan is not None and plan.get("status") not in {"approved", "in-progress", "none"}:
+        raise ContractError("plan status is invalid")
+    checkpoint = value.get("checkpoint")
+    if checkpoint is not None and checkpoint.get("state") not in {"pending", "uncertain", "none"}:
+        raise ContractError("checkpoint state is invalid")
+    application = value.get("application")
+    if application is not None and "purpose" in application and application["purpose"] not in APPLICATION_PURPOSES:
+        raise ContractError("application purpose is invalid")
+    ownership = value.get("ownership")
+    if ownership is not None and "license" in ownership and ownership["license"] not in LICENSE_KINDS:
+        raise ContractError("ownership license is invalid")
+    security = value.get("security")
+    if security is not None:
+        security_value = _object(security, name="security")
+        _keys(security_value, {"reasons", "evidence"}, name="security")
+        reasons = security_value.get("reasons")
+        security_refs = security_value.get("evidence")
+        if not isinstance(reasons, list) or len(reasons) > MAX_ARRAY or not isinstance(security_refs, list) or len(security_refs) != len(reasons) or any(reason not in SECURITY_REASONS for reason in reasons):
+            raise ContractError("security evidence is invalid")
+        for reason, ref in zip(reasons, security_refs):
+            _adoption_reference(ref, expected_kind="security", expected_reason=reason)
+    contradictions = value.get("contradictions")
+    if contradictions is not None and (not isinstance(contradictions, list) or len(contradictions) > MAX_ARRAY or any(reason not in {"dirty-repository", "contradictory-history"} for reason in contradictions)):
+        raise ContractError("adoption contradictions are invalid")
     return value
+
+
+def _adoption_reference(value: Any, *, expected_kind: str | None = None, expected_reason: str | None = None) -> dict[str, Any]:
+    item = _object(value, name="evidence reference")
+    _keys(item, {"reason", "kind", "evidenceId", "digest"}, name="evidence reference")
+    if item.get("reason") not in REASONS or item.get("kind") not in EVIDENCE_KINDS or _adoption_expected_kind(str(item.get("reason"))) != item.get("kind"):
+        raise ContractError("evidence reference is invalid")
+    if expected_kind is not None and item["kind"] != expected_kind:
+        raise ContractError("evidence reference kind is invalid")
+    if expected_reason is not None and item["reason"] != expected_reason:
+        raise ContractError("evidence reference reason is invalid")
+    _id(item.get("evidenceId"), name="evidenceId")
+    _digest(item.get("digest"), name="evidence digest")
+    return item
+
+
+def _adoption_expected_kind(reason: str) -> str:
+    if reason == "registry": return "registry"
+    if reason in {"canonical-repository", "repository-missing", "dirty-repository", "contradictory-history"}: return "repository"
+    if reason in {"deployable-artifact", "artifact-missing"}: return "artifact"
+    if reason in {"application-purpose", "application-purpose-missing"}: return "application"
+    if reason == "team-baseline": return "team"
+    if reason in {"active-plan", "plan-missing"}: return "plan"
+    if reason in {"lead", "lead-missing"}: return "lead"
+    if reason in {"checkpoint", "checkpoint-missing"}: return "checkpoint"
+    if reason in SECURITY_REASONS: return "security"
+    return "ownership"
+
+
+def _adoption_fact(value: Any, required: set[str], optional: set[str], kind: str, expected_reason: str) -> None:
+    fact = _object(value, name=f"{kind} evidence")
+    _keys(fact, required | optional, name=f"{kind} evidence")
+    for field in required:
+        if field in {"present", "canonical", "clean", "deployable", "provenanceTrusted", "authoritative", "trusted", "resolved"}:
+            if not isinstance(fact.get(field), bool):
+                raise ContractError(f"{kind} evidence is invalid")
+        elif not isinstance(fact.get(field), str) or not fact[field]:
+            raise ContractError(f"{kind} evidence is invalid")
+    for field in optional - {"evidenceRef", "licenseEvidenceRef"}:
+        if field in fact:
+            if field == "digest":
+                _digest(fact[field], name=f"{kind} digest")
+            else:
+                _id(fact[field], name=f"{kind} {field}")
+    if "evidenceRef" in fact:
+        _adoption_reference(fact["evidenceRef"], expected_kind=kind, expected_reason=expected_reason)
+    if "licenseEvidenceRef" in fact:
+        _adoption_reference(fact["licenseEvidenceRef"], expected_kind="ownership", expected_reason="license")
+    if kind == "ownership" and "license" in fact and "licenseEvidenceRef" not in fact:
+        raise ContractError("ownership license evidence is missing")
 
 
 def parse_external_round(payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -25,6 +25,19 @@ SECRET = b"0123456789abcdef0123456789abcdef"
 NOW = "2026-08-10T02:00:00+00:00"
 
 
+def test_admin_canary_and_later_ceiling_initiators_require_separate_approvals(tmp_path: Path):
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda kind, mid, payload: sent.append((kind, mid, payload)) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    approval = {"status": "approved", "kind": "concurrency-canary", "provenanceId": "admin-canary-approval"}
+    canary = {"authorizationId": "canary-1", "targetTemporaryCeiling": 2, "expectedGlobalCeiling": 1, "expectedRevision": 0, "projects": [{"projectId": "p1", "planId": "plan-1", "planVersion": "v1", "leadId": "lead-1"}, {"projectId": "p2", "planId": "plan-2", "planVersion": "v1", "leadId": "lead-2"}], "workflowId": "roadex-test", "decisionVersion": "v1", "deadline": "2026-08-10T03:00:00+00:00", "correlationId": "canary-corr", "idempotencyKey": "canary-key", "occurredAt": NOW}
+    assert bridge.initiate_concurrency_canary_authorization(approval, canary)["inserted"] is True
+    assert sent[-1][0] == "concurrency-canary-authorization"
+    store.record_protocol("concurrency-canary-result", "canary-result-1", "canary-result-key", "a" * 64, {"resultId": "canary-result-1"})
+    ceiling = {"authorizationId": "ceiling-1", "ceiling": 2, "expectedRevision": 0, "revision": 1, "canaryResultId": "canary-result-1", "projectId": "p1", "planId": "plan-1", "workflowId": "roadex-test", "decisionVersion": "v1", "correlationId": "ceiling-corr", "idempotencyKey": "ceiling-key", "occurredAt": NOW}
+    assert bridge.initiate_concurrency_ceiling_authorization({"status": "approved", "kind": "concurrency-ceiling", "provenanceId": "admin-ceiling"}, ceiling)["inserted"] is True
+
+
 def test_verifies_exact_signed_psychlo_request_once(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     body = json.dumps({"kind": "round-request", "messageId": "round-1", "occurredAt": NOW, "payload": {"roundId": "round-1"}}, separators=(",", ":")).encode()

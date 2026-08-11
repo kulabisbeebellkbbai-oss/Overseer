@@ -665,6 +665,28 @@ class PsychloBridge:
         ordered = {key: value[key] for key in ("bindingId", "coordinationTeamId", "supervisorMemberId", "supervisorLeadId", "approvalId", "approvalProvenanceId", "approvedAt", "correlationId", "idempotencyKey", "occurredAt")}; value["digest"] = hashlib.sha256(json.dumps(ordered, separators=(",", ":")).encode()).hexdigest()
         return self.authorize_cross_project_team_binding(value)
 
+    def initiate_concurrency_canary_authorization(self, approval: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._approved_admin_record(approval, "concurrency-canary")
+        value = dict(payload)
+        if value.get("targetTemporaryCeiling") != 2 or value.get("expectedGlobalCeiling") != 1 or not isinstance(value.get("projects"), list) or len(value["projects"]) != 2 or value["projects"][0].get("projectId") == value["projects"][1].get("projectId"): raise ValueError("exact two-project canary is required")
+        for field in ("authorizationId", "expectedRevision", "projects", "workflowId", "decisionVersion", "deadline", "correlationId", "idempotencyKey", "occurredAt"):
+            if field not in value: raise ValueError("canary authorization input is incomplete")
+        base = {key: value[key] for key in ("authorizationId", "targetTemporaryCeiling", "expectedGlobalCeiling", "expectedRevision", "projects", "workflowId", "decisionVersion", "deadline", "correlationId", "idempotencyKey", "occurredAt")}
+        value["digest"] = hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest()
+        value["decisionId"] = f"roadex:concurrency-canary:{value['authorizationId']}"
+        value["question"] = f"Approve the exact live concurrency canary {value['digest']}"
+        return self.authorize_concurrency_canary(value)
+
+    def initiate_concurrency_ceiling_authorization(self, approval: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._approved_admin_record(approval, "concurrency-ceiling")
+        value = dict(payload)
+        canary_id = value.get("canaryResultId")
+        if not isinstance(canary_id, str) or self.store.protocol_record("concurrency-canary-result", canary_id) is None: raise ValueError("successful canary evidence is required")
+        required = ("authorizationId", "ceiling", "expectedRevision", "revision", "canaryResultId", "projectId", "planId", "workflowId", "decisionVersion", "correlationId", "idempotencyKey", "occurredAt")
+        if any(field not in value for field in required): raise ValueError("ceiling authorization input is incomplete")
+        base = {key: value[key] for key in required}; value["digest"] = hashlib.sha256(json.dumps(base, separators=(",", ":")).encode()).hexdigest(); value["decisionId"] = f"roadex:concurrency:{value['authorizationId']}"; value["question"] = f"Approve the exact global concurrency operation {value['digest']}"
+        return self.authorize_concurrency_ceiling(value)
+
     def reconcile_ingress_conflict(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try: value = parse_ingress_conflict_reconciliation(payload)
         except ContractError as error: raise ValueError(str(error)) from error

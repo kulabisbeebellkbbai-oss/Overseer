@@ -118,7 +118,8 @@ class PsychloBridgeStore:
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS protocol_kind_digest_unique ON protocol_records(kind,digest) WHERE kind != 'cross-project-participant-result'")
         row = self.connection.execute("SELECT tbl_name,sql FROM sqlite_master WHERE type='index' AND name='protocol_kind_digest_unique'").fetchone()
         normalized = "" if row is None else "".join(str(row[1]).lower().split())
-        if row is None or row[0] != "protocol_records" or "onprotocol_records(kind,digest)" not in normalized or "wherekind!='cross-project-participant-result'" not in normalized:
+        expected = "createuniqueindexprotocol_kind_digest_uniqueonprotocol_records(kind,digest)wherekind!='cross-project-participant-result'"
+        if row is None or row[0] != "protocol_records" or normalized != expected:
             raise ValueError("protocol digest index binding is invalid")
 
     def _backfill_coordination_terminals(self) -> None:

@@ -1088,6 +1088,23 @@ def test_legacy_protocol_migration_rolls_back_if_replacement_index_cannot_bind(t
     connection.close()
 
 
+@pytest.mark.parametrize("suffix", ["AND 0", "OR kind = 'cross-project-participant-result'"])
+def test_protocol_migration_rejects_same_named_index_with_malformed_predicate(tmp_path: Path, suffix: str):
+    store_path = tmp_path / "bridge.sqlite3"
+    connection = sqlite3.connect(store_path)
+    connection.execute("CREATE TABLE protocol_records(kind TEXT NOT NULL, record_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, digest TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, receipt_json TEXT, PRIMARY KEY(kind,record_id), UNIQUE(kind,idempotency_key))")
+    index_sql = f"CREATE UNIQUE INDEX protocol_kind_digest_unique ON protocol_records(kind,digest) WHERE kind != 'cross-project-participant-result' {suffix}"
+    connection.execute(index_sql)
+    connection.execute("INSERT INTO protocol_records VALUES ('cross-project-command','command-1','command-1',?,'{}','delivered',0,NULL,?,NULL)", ("c" * 64, NOW))
+    connection.commit(); connection.close(); store_path.chmod(0o600)
+    with pytest.raises(ValueError, match="protocol digest index binding is invalid"):
+        PsychloBridgeStore(store_path)
+    connection = sqlite3.connect(store_path)
+    assert connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='protocol_kind_digest_unique'").fetchone() == (index_sql,)
+    assert connection.execute("SELECT record_id,digest FROM protocol_records").fetchall() == [("command-1", "c" * 64)]
+    connection.close()
+
+
 def test_rejected_progressive_review_blocks_only_its_trigger_and_is_not_resent_after_restart(tmp_path: Path):
     results = {}
     reviews = {}

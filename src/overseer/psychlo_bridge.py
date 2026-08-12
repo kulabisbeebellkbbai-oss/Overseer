@@ -343,10 +343,6 @@ class PsychloBridge:
         identity = self._project_registration_identity(registration)
         envelope = registration["envelope"]; receipt = registration["receipt"]; plan = envelope["plan"]
         project_id = identity["projectId"]; project_lead_id = identity["projectLeadId"]; receipt_id = identity["receiptId"]
-        existing = self.store.project(project_id)
-        if existing:
-            if existing[0] != dict(registration): raise ValueError("project registration conflict")
-            return {"accepted": True}
         tasks = plan.get("tasks")
         constraints = plan.get("constraints", [])
         if not isinstance(tasks, list) or not tasks or len(tasks) > 128 or not isinstance(constraints, list): raise ValueError("project registration is invalid")
@@ -358,6 +354,26 @@ class PsychloBridge:
             "gateDistance": len(tasks), "expectedUsageCost": max(1, min(10, (len(tasks) + 1) // 2)),
             "correlationId": f"psychlo-scheduling:{receipt_id}", "idempotencyKey": f"psychlo-scheduling:{receipt_id}", "occurredAt": self.clock(),
         }
+        existing = self.store.project(project_id)
+        if existing:
+            if existing[0] == dict(registration): return {"accepted": True}
+            existing_identity = self._project_registration_identity(existing[0], existing[1])
+            lifecycle = envelope.get("lifecycle")
+            previous_project = existing[0]["envelope"]["project"]
+            if (
+                not isinstance(lifecycle, dict) or lifecycle.get("kind") != "change"
+                or lifecycle.get("supersedesPlanId") != previous_project.get("planId")
+                or lifecycle.get("supersedesVersion") != previous_project.get("planVersion")
+                or identity["aTeamId"] != existing_identity["aTeamId"]
+                or identity["projectLeadId"] != existing_identity["projectLeadId"]
+                or (identity["planId"], identity["planVersion"]) == (existing_identity["planId"], existing_identity["planVersion"])
+            ):
+                raise ValueError("project registration conflict")
+            def deliver_change() -> None:
+                response = self.sender("scheduling-input", scheduling["idempotencyKey"], scheduling)
+                if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
+            self.store.replace_project(project_id, existing[0], registration, scheduling, deliver_change)
+            return {"accepted": True}
         response = self.sender("scheduling-input", scheduling["idempotencyKey"], scheduling)
         if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
         self.store.record_project(project_id, registration, scheduling)

@@ -13,7 +13,7 @@ import os
 import sqlite3
 import stat
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, ContractError
 
@@ -661,6 +661,36 @@ class PsychloBridgeStore:
 
     def record_project(self, project_id: str, registration: Mapping[str, Any], scheduling: Mapping[str, Any]) -> None:
         self.connection.execute("INSERT INTO projects VALUES (?,?,?)", (project_id, _dump(registration), _dump(scheduling)))
+
+    def replace_project(
+        self,
+        project_id: str,
+        expected_registration: Mapping[str, Any],
+        registration: Mapping[str, Any],
+        scheduling: Mapping[str, Any],
+        deliver: Callable[[], None],
+    ) -> bool:
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self.connection.execute(
+                "SELECT registration_json FROM projects WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("project registration conflict")
+            current = json.loads(row[0])
+            if current == dict(registration):
+                return False
+            if current != dict(expected_registration):
+                raise ValueError("project registration conflict")
+            deliver()
+            updated = self.connection.execute(
+                "UPDATE projects SET registration_json=?,scheduling_json=? WHERE project_id=? AND registration_json=?",
+                (_dump(registration), _dump(scheduling), project_id, _dump(expected_registration)),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("project registration conflict")
+            return True
 
     def telemetry_checkpoint(self, checkpoint_id: str):
         row = self.connection.execute("SELECT payload_json FROM telemetry_checkpoints WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()

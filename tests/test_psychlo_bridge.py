@@ -75,6 +75,30 @@ def _scheduling_payload(registration: dict) -> dict:
     return {"projectId": envelope["project"]["id"], "projectLeadId": envelope["projectLead"]["id"], "state": "managed", "remainingEffort": "trivial" if len(tasks) == 1 else "standard", "hasSecurityImpact": any("security" in str(item).lower() for item in constraints), "hasDependencyImpact": any(bool(item["dependencyIds"]) for item in tasks), "gateDistance": len(tasks), "expectedUsageCost": max(1, min(10, (len(tasks) + 1) // 2)), "correlationId": f"psychlo-scheduling:{receipt_id}", "idempotencyKey": f"psychlo-scheduling:{receipt_id}", "occurredAt": NOW}
 
 
+def _project_change_registration(registration: dict, *, version: str = "v2", supersedes_version: str = "v1") -> dict:
+    changed = json.loads(json.dumps(registration))
+    envelope = changed["envelope"]
+    envelope["contractVersion"] = "a-team.psychlo.handoff.v2"
+    envelope["project"]["planVersion"] = version
+    envelope["correlationId"] = f"registration-{envelope['project']['id']}-{version}"
+    envelope["idempotencyKey"] = f"registration-{envelope['project']['id']}-{version}"
+    envelope["lifecycle"] = {
+        "kind": "change",
+        "supersedesPlanId": envelope["project"]["planId"],
+        "supersedesVersion": supersedes_version,
+    }
+    envelope.pop("digest", None)
+    envelope["digest"] = canonical_digest(envelope)
+    receipt = changed["receipt"]
+    receipt["handoffContractVersion"] = envelope["contractVersion"]
+    receipt["receiptId"] = f"receipt-{envelope['project']['id']}-{version}"
+    receipt["project"]["planVersion"] = version
+    receipt["correlationId"] = envelope["correlationId"]
+    receipt["idempotencyKey"] = envelope["idempotencyKey"]
+    receipt["envelopeDigest"] = envelope["digest"]
+    return changed
+
+
 def _coordination_process(store_path: str, calls_path: str, request: dict, barrier) -> None:
     store = PsychloBridgeStore(store_path)
     if store.project(request["projectId"]) is None:
@@ -1370,6 +1394,54 @@ def test_registers_an_admitted_plan_and_publishes_initial_scheduling(tmp_path: P
     assert sent[0][2] == {"projectId": "arcade", "projectLeadId": "member-hermione", "state": "managed", "remainingEffort": "standard", "hasSecurityImpact": True, "hasDependencyImpact": True, "gateDistance": 2, "expectedUsageCost": 1, "correlationId": "psychlo-scheduling:receipt-arcade", "idempotencyKey": "psychlo-scheduling:receipt-arcade", "occurredAt": NOW}
     bridge.register_project(registration)
     assert len(sent) == 1
+
+
+def test_register_project_accepts_exact_successor_plan_change_and_replays_silently(tmp_path: Path):
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(
+        store=store, dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    initial = _registration_payload("arcade", "member-hermione", plan_id="arcade-plan")
+    assert bridge.register_project(initial) == {"accepted": True}
+    changed = _project_change_registration(initial)
+
+    assert bridge.register_project(changed) == {"accepted": True}
+    assert bridge.register_project(changed) == {"accepted": True}
+    assert len(sent) == 2
+    assert sent[-1][2]["idempotencyKey"] == "psychlo-scheduling:receipt-arcade-v2"
+    stored = store.project("arcade")
+    assert stored is not None
+    assert stored[0] == changed
+    assert stored[1] == sent[-1][2]
+
+
+@pytest.mark.parametrize("defect", ["wrong_previous", "wrong_team", "wrong_lead"])
+def test_register_project_rejects_unbound_successor_plan_change(tmp_path: Path, defect: str):
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(
+        store=store, dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    initial = _registration_payload("arcade", "member-hermione", plan_id="arcade-plan")
+    bridge.register_project(initial)
+    changed = _project_change_registration(initial)
+    if defect == "wrong_previous": changed["envelope"]["lifecycle"]["supersedesVersion"] = "v0"
+    elif defect == "wrong_team": changed["envelope"]["aTeamId"] = "team-other"
+    else: changed["envelope"]["projectLead"]["id"] = "member-other"
+    changed["envelope"]["digest"] = canonical_digest({key: value for key, value in changed["envelope"].items() if key != "digest"})
+    changed["receipt"]["aTeamId"] = changed["envelope"]["aTeamId"]
+    changed["receipt"]["project"]["planVersion"] = changed["envelope"]["project"]["planVersion"]
+    changed["receipt"]["envelopeDigest"] = changed["envelope"]["digest"]
+
+    with pytest.raises(ValueError, match="project registration conflict"):
+        bridge.register_project(changed)
+    assert len(sent) == 1
+    assert store.project("arcade")[0] == initial
 
 
 def test_coordination_dispatch_accepts_exact_real_registration_shape_after_restart(tmp_path: Path):

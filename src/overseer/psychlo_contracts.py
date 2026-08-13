@@ -50,6 +50,8 @@ POLICY_EXCEPTION_RULES = {
     "enforce-safety-reserve", "respect-blackouts", "carry-unused-daily-allowance",
     "pause-after-failures", "require-manual-resume", "enforce-project-share",
 }
+USAGE_SNAPSHOT_V11_SCHEMA = "psychlo.usage-snapshot.v1.1"
+USAGE_ENVELOPE_V11_SCHEMA = "psychlo.usage-envelope.v1.1"
 
 
 def _canonical(value: Any) -> str:
@@ -576,7 +578,7 @@ def _finite_nonnegative(value: Any, *, name: str) -> float | int:
 
 
 def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str, rule_key: str) -> dict[str, Any]:
-    required = {"schemaVersion", "id", rule_key, "policyRevision", "actorId", "reason", "activatedAt", "expiresAt", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    required = {"schemaVersion", "id", rule_key, "policyRevision", "actorId", "reason", "activatedAt", "expiresAt", "correlationId", "idempotencyKey", "occurredAt", "scopeDigest", "decisionVersion", "digest"}
     optional = {"requestedValue", "basePolicyDigest", "proposedPolicy"}
     result = _strict_protocol(value, required=required, allowed=required | optional, name=name, schema=schema)
     _id(result["id"], name="exception id")
@@ -586,6 +588,7 @@ def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str
     if not isinstance(result["policyRevision"], int) or isinstance(result["policyRevision"], bool) or result["policyRevision"] < 0:
         raise ContractError("policy exception revision is invalid")
     _id(result["actorId"], name="actorId"); _text(result["reason"], name="reason", maximum=512)
+    _digest(result["scopeDigest"], name="scopeDigest"); _id(result["decisionVersion"], name="decisionVersion")
     _timestamp(result["activatedAt"], name="activatedAt"); _timestamp(result["expiresAt"], name="expiresAt")
     if datetime.fromisoformat(result["expiresAt"].replace("Z", "+00:00")) <= datetime.fromisoformat(result["activatedAt"].replace("Z", "+00:00")):
         raise ContractError("policy exception expiry is invalid")
@@ -613,7 +616,7 @@ def policy_exception_request_digest(payload: Mapping[str, Any]) -> str:
 
 
 def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:
-    fields = {"status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest"}
+    fields = {"status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "scopeDigest", "decisionVersion"}
     result = {key: payload[key] for key in fields if key in payload}
     for key in ("requestedValue", "basePolicyDigest", "proposedPolicy", "reason"):
         if key in payload and payload[key] is not None: result[key] = payload[key]
@@ -622,17 +625,37 @@ def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:
 
 def parse_policy_exception_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
     value = _object(payload, name="policy exception outcome")
-    required = {"schemaVersion", "sourceId", "status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "actorId", "correlationId", "idempotencyKey", "occurredAt", "outcomeDigest"}
+    required = {"schemaVersion", "sourceId", "status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "actorId", "correlationId", "idempotencyKey", "occurredAt", "scopeDigest", "decisionVersion", "outcomeDigest"}
     _keys(value, required | {"requestedValue", "reason", "basePolicyDigest", "proposedPolicy"}, name="policy exception outcome")
     if value.get("schemaVersion") != POLICY_EXCEPTION_OUTCOME_SCHEMA or value.get("sourceId") != "overseer" or value.get("status") not in {"approved", "rejected"}: raise ContractError("policy exception outcome authority is invalid")
     _id(value.get("exceptionId"), name="exceptionId"); _id(value.get("ruleId"), name="ruleId")
     if value["ruleId"] not in POLICY_EXCEPTION_RULES or not isinstance(value["policyRevision"], int) or isinstance(value["policyRevision"], bool) or value["policyRevision"] < 0: raise ContractError("policy exception outcome binding is invalid")
     for field in ("requestDigest", "decisionDigest", "outcomeDigest"): _digest(value.get(field), name=field)
+    _digest(value["scopeDigest"], name="scopeDigest"); _id(value["decisionVersion"], name="decisionVersion")
     for field in ("decisionId", "actorId", "correlationId", "idempotencyKey"): _id(value.get(field), name=field)
     _timestamp(value.get("occurredAt"))
     if value["status"] == "rejected" and (not isinstance(value.get("reason"), str) or not value["reason"].strip()): raise ContractError("rejected policy exception reason is required")
     if policy_exception_outcome_digest(value) != value["outcomeDigest"]: raise ContractError("policy exception outcome digest mismatch")
     return value
+
+
+def parse_usage_snapshot_v11(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the frozen, signed/enveloped v1.1 provider snapshot shape."""
+    envelope = _object(payload, name="usage snapshot envelope")
+    required = {"schemaVersion", "correlationId", "idempotencyKey", "occurredAt", "snapshot", "digest"}
+    _keys(envelope, required, name="usage snapshot envelope")
+    if envelope["schemaVersion"] != USAGE_ENVELOPE_V11_SCHEMA: raise ContractError("usage snapshot envelope schema is invalid")
+    _id(envelope["correlationId"], name="correlationId"); _id(envelope["idempotencyKey"], name="idempotencyKey"); _timestamp(envelope["occurredAt"]); _digest(envelope["digest"], name="digest")
+    snapshot = _object(envelope["snapshot"], name="usage snapshot")
+    fields = {"schemaVersion", "id", "sourceId", "capturedAt", "policyVersion", "providerResetAt", "scopeDigest", "decisionVersion", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed", "digest"}
+    _keys(snapshot, fields, name="usage snapshot")
+    if snapshot["schemaVersion"] != USAGE_SNAPSHOT_V11_SCHEMA or snapshot["sourceId"] != "overseer": raise ContractError("usage snapshot authority is invalid")
+    for field in ("id", "policyVersion", "decisionVersion"): _id(snapshot[field], name=field)
+    _timestamp(snapshot["capturedAt"]); _timestamp(snapshot["providerResetAt"]); _digest(snapshot["scopeDigest"], name="scopeDigest"); _digest(snapshot["digest"], name="snapshot digest")
+    for field in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed"): _finite_nonnegative(snapshot[field], name=field)
+    if canonical_digest({key: value for key, value in snapshot.items() if key != "digest"}) != snapshot["digest"]: raise ContractError("usage snapshot digest mismatch")
+    if canonical_digest({key: value for key, value in envelope.items() if key != "digest"}) != envelope["digest"]: raise ContractError("usage snapshot envelope digest mismatch")
+    return envelope
 
 
 def parse_external_round_binding(payload: Mapping[str, Any]) -> dict[str, Any]:

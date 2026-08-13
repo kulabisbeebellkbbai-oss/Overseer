@@ -83,6 +83,13 @@ class PsychloBridgeStore:
             self.connection.execute("ALTER TABLE protocol_records ADD COLUMN receipt_json TEXT")
         except sqlite3.OperationalError:
             pass
+        for column, definition in (("idempotency_key", "TEXT"), ("approval_id", "TEXT")):
+            try:
+                self.connection.execute(f"ALTER TABLE policy_exception_requests ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS policy_exception_idempotency_unique ON policy_exception_requests(idempotency_key) WHERE idempotency_key IS NOT NULL")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS policy_exception_reset_index ON psychlo_usage_accounting(reset_at, inserted_at)")
         self._migrate_protocol_digest_uniqueness()
         self._backfill_coordination_terminals()
         for table in ("coordination_dispatches", "coordination_reviews"):
@@ -164,25 +171,33 @@ class PsychloBridgeStore:
         value = dict(request); request_id = value.get("id")
         if not isinstance(request_id, str) or not request_id.strip(): raise ValueError("policy exception request identity is required")
         selected_digest = str(digest or value.get("digest") or canonical_digest(value))
+        if selected_digest != canonical_digest({key: item for key, item in value.items() if key != "digest"}): raise ValueError("policy exception request digest mismatch")
+        idempotency_key = value.get("idempotencyKey")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip(): raise ValueError("policy exception idempotency key is required")
         encoded = _dump_wire(value)
-        existing = self.policy_exception_request(request_id)
-        if existing is not None:
-            if existing["digest"] != selected_digest or existing["payload"] != value: raise ValueError("policy exception request conflict")
-            return existing, False
+        self.connection.execute("BEGIN IMMEDIATE")
         try:
-            self.connection.execute("INSERT INTO policy_exception_requests(request_id,digest,payload_json,state,outcome_json,consumed_at,updated_at) VALUES (?,?,?,'pending',NULL,NULL,?)", (request_id, selected_digest, encoded, self._now()))
+            existing = self.connection.execute("SELECT request_id,digest,payload_json FROM policy_exception_requests WHERE idempotency_key=? OR request_id=?", (idempotency_key, request_id)).fetchone()
+            if existing is not None:
+                if existing[1] != selected_digest or json.loads(existing[2]) != value: raise ValueError("policy exception idempotency conflict")
+                self.connection.execute("COMMIT")
+                return self.policy_exception_request(str(existing[0])), False
+            self.connection.execute("INSERT INTO policy_exception_requests(request_id,digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id) VALUES (?,?,?,'pending',NULL,NULL,?,?,NULL)", (request_id, selected_digest, encoded, self._now(), idempotency_key))
+            self.connection.execute("COMMIT")
         except sqlite3.IntegrityError as error:
-            winner = self.policy_exception_request(request_id)
-            if winner is not None and winner["digest"] == selected_digest and winner["payload"] == value: return winner, False
+            self.connection.execute("ROLLBACK")
             raise ValueError("policy exception request conflict") from error
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
         return self.policy_exception_request(request_id), True
 
     def policy_exception_request(self, request_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT digest,payload_json,state,outcome_json,consumed_at,updated_at FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
+        row = self.connection.execute("SELECT digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
         if row is None: return None
-        return {"requestId": request_id, "digest": row[0], "payload": json.loads(row[1]), "state": row[2], "outcome": json.loads(row[3]) if row[3] else None, "consumedAt": row[4], "updatedAt": row[5]}
+        return {"requestId": request_id, "digest": row[0], "payload": json.loads(row[1]), "state": row[2], "outcome": json.loads(row[3]) if row[3] else None, "consumedAt": row[4], "updatedAt": row[5], "idempotencyKey": row[6], "approvalId": row[7]}
 
-    def consume_policy_exception_request(self, request_id: str, outcome: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+    def consume_policy_exception_request(self, request_id: str, outcome: Mapping[str, Any], *, now: str, approval_id: str | None = None) -> dict[str, Any]:
         encoded = _dump_wire(outcome)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -191,7 +206,7 @@ class PsychloBridgeStore:
             if row[0] in {"approved", "rejected", "expired", "delivered", "forward-pending"}:
                 if row[1] == encoded: return self.policy_exception_request(request_id)
                 raise ValueError("policy exception authority is one-use and already consumed")
-            self.connection.execute("UPDATE policy_exception_requests SET state='forward-pending',outcome_json=?,consumed_at=?,updated_at=? WHERE request_id=? AND state='pending'", (encoded, now, now, request_id))
+            self.connection.execute("UPDATE policy_exception_requests SET state='forward-pending',outcome_json=?,consumed_at=?,updated_at=?,approval_id=COALESCE(?,approval_id) WHERE request_id=? AND state='pending'", (encoded, now, now, approval_id, request_id))
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
@@ -201,7 +216,7 @@ class PsychloBridgeStore:
         return result
 
     def transition_policy_exception_request(self, request_id: str, state: str, *, now: str | None = None) -> dict[str, Any]:
-        if state not in {"pending", "forward-pending", "delivered", "approved", "rejected", "expired"}: raise ValueError("policy exception state is invalid")
+        if state not in {"pending", "forward-pending", "delivered", "approved", "rejected", "expired", "recovery-invalid"}: raise ValueError("policy exception state is invalid")
         self.connection.execute("UPDATE policy_exception_requests SET state=?,updated_at=? WHERE request_id=?", (state, now or self._now(), request_id))
         result = self.policy_exception_request(request_id)
         if result is None: raise ValueError("policy exception request is missing")

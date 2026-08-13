@@ -12,7 +12,9 @@
     "correlationId": "corr-exception-enforce-safety-reserve",
     "idempotencyKey": "exception-enforce-safety-reserve",
     "occurredAt": "2026-08-12T12:00:00.000Z",
-    "digest": "dada7a8ffe5c22e8974afe9cdcc41af3ac4275f773b8ba5a00280e3e9f3e0338"
+    "scopeDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "decisionVersion": "decision-v1",
+    "digest": "c01fdef45590e31a57d9974e7a20a58924f691ebd9b2ac9a2d3277d04f49587a"
   },
   "outcome": {
     "schemaVersion": "psychlo.policy-exception-outcome.v1",
@@ -22,14 +24,16 @@
     "policyRevision": 4,
     "ruleId": "enforce-safety-reserve",
     "requestedValue": false,
-    "requestDigest": "dada7a8ffe5c22e8974afe9cdcc41af3ac4275f773b8ba5a00280e3e9f3e0338",
+    "requestDigest": "c01fdef45590e31a57d9974e7a20a58924f691ebd9b2ac9a2d3277d04f49587a",
     "decisionId": "roadex:psychlo-policy-exception:exception-enforce-safety-reserve",
     "decisionDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "actorId": "operator-1",
     "correlationId": "corr-exception-enforce-safety-reserve",
     "idempotencyKey": "exception-enforce-safety-reserve",
     "occurredAt": "2026-08-12T12:00:00.000Z",
-    "outcomeDigest": "6ae17e30f0fa063f84129a0239d3d2ddf6c1a604b209f1704972d00315801453"
+    "scopeDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "decisionVersion": "decision-v1",
+    "outcomeDigest": "ac4b353946c5b7329bb51b243d68ff7e3f64bdcc81ad6a2cb9b72930c6f6a27d"
   },
   "usageSnapshot": {
     "id": "codex-usage-v11-fixture",

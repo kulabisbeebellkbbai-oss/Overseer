@@ -39,6 +39,7 @@ from .psychlo_contracts import (
     parse_project_registration,
     parse_policy_exception_request,
     parse_policy_exception_outcome,
+    parse_usage_snapshot_v11,
     policy_exception_outcome_digest,
     parse_registry_candidate,
     parse_telemetry_checkpoint,
@@ -208,6 +209,7 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
     snapshot_id = "codex-usage-" + hashlib.sha256((captured + str(newest_window.get("resets_at"))).encode()).hexdigest()[:24]
     accounting = usage_store.latest_usage_accounting(str(newest_window.get("resets_at"))) if usage_store is not None else None
     if accounting is None and usage_store is not None:
+        # v1.0 compatibility: retain the historical projection fallback.
         accounting = usage_store.latest_usage_accounting()
     values = accounting["payload"] if accounting is not None else {}
     weekly_quota = values.get("weeklyQuota", newest_window.get("weekly_quota", newest_window.get("quota", 100.0)))
@@ -220,6 +222,34 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
         "correlationId": f"psychlo:{snapshot_id}", "idempotencyKey": snapshot_id, "occurredAt": captured,
         "snapshot": {"id": snapshot_id, "sourceId": "overseer", "capturedAt": captured, "policyVersion": policy_version, "unusedPriorDayWeeklyCapacity": unused, "weeklyRemainingCapacity": float(weekly_remaining), "weeklyQuota": float(weekly_quota), "dailyConsumed": float(daily_consumed), "otherDevelopmentConsumed": float(other_development)},
     }
+
+
+def derive_v11_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, usage_store: PsychloBridgeStore, now: str | None = None) -> dict[str, Any]:
+    """Produce the strict v1.1 provider snapshot from one persisted reset window."""
+    if not history:
+        raise ValueError("Codex usage history is required")
+    newest = history[0]
+    window = _weekly_window(newest)
+    reset_at = str(window.get("resets_at"))
+    accounting = usage_store.latest_usage_accounting(reset_at)
+    if accounting is None or accounting.get("resetAt") != reset_at:
+        raise ValueError("same-reset persisted usage accounting is required")
+    values = accounting["payload"]
+    fields = ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")
+    for field in fields:
+        value = values.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+            raise ValueError(f"{field} must be finite and nonnegative")
+    captured = str(newest["observed_at"])
+    snapshot_id = "codex-usage-v11-" + hashlib.sha256((captured + reset_at).encode()).hexdigest()[:24]
+    scope_digest = values.get("scopeDigest") or canonical_digest({key: values[key] for key in fields})
+    snapshot = {"schemaVersion": "psychlo.usage-snapshot.v1.1", "id": snapshot_id, "sourceId": "overseer", "capturedAt": captured, "policyVersion": policy_version, "providerResetAt": reset_at, "scopeDigest": scope_digest, "decisionVersion": values.get("decisionVersion", "provider-v1"), **{field: float(values[field]) for field in fields}}
+    snapshot["digest"] = canonical_digest(snapshot)
+    envelope = {"schemaVersion": "psychlo.usage-envelope.v1.1", "correlationId": f"psychlo:{snapshot_id}", "idempotencyKey": snapshot_id, "occurredAt": captured, "snapshot": snapshot}
+    envelope["digest"] = canonical_digest(envelope)
+    try: parse_usage_snapshot_v11(envelope)
+    except ContractError as error: raise ValueError(str(error)) from error
+    return envelope
 
 
 class PsychloBridge:
@@ -537,6 +567,10 @@ class PsychloBridge:
         payload = derive_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
 
+    def emit_usage_v11(self, history: list[dict[str, Any]], policy_version: str) -> Mapping[str, Any]:
+        payload = derive_v11_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
+        return self.sender("usage-snapshot-v1.1", str(payload["idempotencyKey"]), payload)
+
     def receive_policy_exception_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try:
             request = parse_policy_exception_request(payload)
@@ -583,7 +617,7 @@ class PsychloBridge:
             raise ValueError("policy exception approval is pending")
         if status != "approved":
             outcome = self._policy_exception_outcome(request, record, "rejected", "Roadex rejected the exact policy exception")
-            self.store.consume_policy_exception_request(request["id"], outcome, now=self.clock())
+            self.store.consume_policy_exception_request(request["id"], outcome, now=self.clock(), approval_id=approval_id)
             try:
                 response = self.sender("policy-exception-outcome", request["id"], outcome)
                 if response.get("accepted") is not True: raise ValueError("Psychlo rejected policy exception outcome")
@@ -592,7 +626,7 @@ class PsychloBridge:
             self.store.transition_policy_exception_request(request["id"], "rejected", now=self.clock())
             return outcome
         outcome = self._policy_exception_outcome(request, record, "approved", None)
-        self.store.consume_policy_exception_request(request["id"], outcome, now=self.clock())
+        self.store.consume_policy_exception_request(request["id"], outcome, now=self.clock(), approval_id=approval_id)
         try:
             response = self.sender("policy-exception-outcome", request["id"], outcome)
             if response.get("accepted") is not True: raise ValueError("Psychlo rejected policy exception outcome")
@@ -612,6 +646,7 @@ class PsychloBridge:
             raise ValueError("approved policy exception authority is missing")
         approval, subject = loaded if isinstance(loaded, tuple) and len(loaded) == 2 else (loaded, None)
         if not isinstance(approval, ApprovalRequest) or approval.id != approval_id: raise ValueError("policy exception approval identity conflict")
+        if approval.approval_level is not ApprovalLevel.HUMAN: raise ValueError("human policy exception approval is required")
         if subject is None and self.approval_store is not None: subject = self._load_primary_subject(self.approval_store, approval.subject_id)
         if not isinstance(subject, AdminChangePlan): raise ValueError("policy exception administrative subject is required")
         if subject.id != approval.subject_id or subject.owner_domain.value != self.approval_owner_domain or subject.canceled or subject.archived:
@@ -623,6 +658,8 @@ class PsychloBridge:
         expected_digest = metadata.get("payloadDigest", metadata.get("payload_digest"))
         if expected_payload is not None and expected_payload != dict(request): raise ValueError("policy exception approval payload does not bind to the request")
         if expected_digest != request["digest"]: raise ValueError("policy exception approval digest does not bind to the request")
+        if metadata.get("scopeDigest") != request["scopeDigest"] or metadata.get("decisionVersion") != request["decisionVersion"]:
+            raise ValueError("policy exception approval decision binding is invalid")
         if approval.owner_domain.value != self.approval_owner_domain or approval.subject_id != subject.id: raise ValueError("policy exception approval owner is invalid")
         if tuple(approval.evidence_required) and request["digest"] not in set(approval.evidence_required): raise ValueError("policy exception approval evidence does not bind to the request")
         if approval.status.value == "approved" and (not isinstance(approval.decided_by, str) or not approval.decided_by.strip() or approval.decided_by.lower() in {"sisko", "overseer", "system"}): raise ValueError("independent human policy exception approval is required")
@@ -633,7 +670,7 @@ class PsychloBridge:
         approval = record["approval"]; metadata = record["metadata"]
         decision_id = metadata.get("decisionId", f"roadex:psychlo-policy-exception:{request['id']}")
         decision_digest = metadata.get("decisionDigest", canonical_digest({"approvalId": approval.id, "subjectId": approval.subject_id, "requestDigest": request["digest"]}))
-        outcome = {"schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": status, "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"], **({"requestedValue": request["requestedValue"]} if "requestedValue" in request else {}), "requestDigest": request["digest"], "decisionId": decision_id, "decisionDigest": decision_digest, "actorId": request["actorId"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"], "occurredAt": self.clock()}
+        outcome = {"schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": status, "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"], **({"requestedValue": request["requestedValue"]} if "requestedValue" in request else {}), "requestDigest": request["digest"], "decisionId": decision_id, "decisionDigest": decision_digest, "scopeDigest": request["scopeDigest"], "decisionVersion": request["decisionVersion"], "actorId": request["actorId"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"], "occurredAt": self.clock()}
         if reason is not None: outcome["reason"] = reason
         outcome["outcomeDigest"] = policy_exception_outcome_digest(outcome)
         try: parse_policy_exception_outcome(outcome)
@@ -648,10 +685,26 @@ class PsychloBridge:
         for record in self.store.pending_policy_exception_requests():
             if record is None or record.get("state") != "forward-pending" or not isinstance(record.get("outcome"), dict): continue
             try:
+                request = parse_policy_exception_request(record["payload"])
+                if record.get("requestId") != request["id"] or record.get("digest") != request["digest"] or canonical_digest({key: value for key, value in request.items() if key != "digest"}) != record.get("digest"):
+                    raise ValueError("stored policy exception request is corrupt")
+                if self._policy_exception_expired(request):
+                    self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
+                    continue
                 outcome = parse_policy_exception_outcome(record["outcome"])
+                if any(outcome.get(key) != request.get(key) for key in ("exceptionId", "requestDigest", "scopeDigest", "decisionVersion", "actorId", "correlationId", "idempotencyKey")):
+                    raise ValueError("stored policy exception outcome binding is corrupt")
+                approval_id = record.get("approvalId")
+                if not approval_id: raise ValueError("stored policy exception approval binding is missing")
+                authority = self._load_policy_exception_approval(approval_id, request)
+                status = getattr(authority["approval"].status, "value", authority["approval"].status)
+                if status != outcome["status"]:
+                    raise ValueError("stored policy exception decision is stale")
                 response = self.sender("policy-exception-outcome", str(outcome["exceptionId"]), outcome)
                 if response.get("accepted") is True: self.store.transition_policy_exception_request(str(outcome["exceptionId"]), str(outcome["status"]), now=self.clock())
             except Exception:
+                try: self.store.transition_policy_exception_request(str(record.get("requestId")), "recovery-invalid", now=self.clock())
+                except Exception: pass
                 continue
 
     def status(self) -> dict[str, Any]:

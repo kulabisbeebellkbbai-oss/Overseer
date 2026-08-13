@@ -21,6 +21,7 @@ from overseer.psychlo_bridge import (
     PsychloBridgeStore,
     CodexProjectDispatcher,
     derive_usage_snapshot,
+    derive_v11_usage_snapshot,
     sign_peer_message,
     verify_peer_request,
     _read_secret,
@@ -1282,6 +1283,8 @@ def _policy_exception_request(**changes: object) -> dict:
         "id": "exception-enforce-safety-reserve",
         "requestedRuleId": "enforce-safety-reserve",
         "policyRevision": 4,
+        "scopeDigest": "e" * 64,
+        "decisionVersion": "decision-v1",
         "actorId": "operator-1",
         "requestedValue": False,
         "reason": "bounded safety drill",
@@ -1313,6 +1316,8 @@ def _save_policy_exception_approval(path: Path, request: dict, *, status: Approv
                 "payloadDigest": digest,
                 "decisionId": "roadex:psychlo-policy-exception:" + request["id"],
                 "decisionDigest": "d" * 64,
+                "scopeDigest": request["scopeDigest"],
+                "decisionVersion": request["decisionVersion"],
                 "evidence": [digest],
             }
         }, separators=(",", ":")),
@@ -1430,6 +1435,38 @@ def test_v11_policy_exception_fixture_recomputes_exact_digests():
     assert policy_exception_outcome_digest(outcome) == outcome["outcomeDigest"]
     assert parse_policy_exception_outcome(outcome) == outcome
     assert {fixture["usageSnapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700, 612, 42, 17}
+
+
+def test_policy_exception_idempotency_is_globally_unique_and_exact_replay_only(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    first = _policy_exception_request(id="exception-idempotency-a", idempotencyKey="shared-policy-key")
+    second = _policy_exception_request(id="exception-idempotency-b", idempotencyKey="shared-policy-key")
+    assert store.record_policy_exception_request(first)[1] is True
+    with pytest.raises(ValueError, match="idempotency"):
+        store.record_policy_exception_request(second)
+    assert store.record_policy_exception_request(first)[1] is False
+
+
+def test_recovery_rejects_corrupt_request_row_and_expired_outcome_without_send(tmp_path: Path):
+    request = _policy_exception_request(id="exception-recovery-corrupt")
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    store.record_policy_exception_request(request)
+    outcome = {"schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": "approved", "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"], "requestedValue": request["requestedValue"], "requestDigest": request["digest"], "decisionId": "decision-recovery", "decisionDigest": "d" * 64, "actorId": request["actorId"], "scopeDigest": request["scopeDigest"], "decisionVersion": request["decisionVersion"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"], "occurredAt": NOW}
+    from overseer.psychlo_contracts import policy_exception_outcome_digest
+    outcome["outcomeDigest"] = policy_exception_outcome_digest(outcome)
+    store.consume_policy_exception_request(request["id"], outcome, now=NOW)
+    store.connection.execute("UPDATE policy_exception_requests SET digest=? WHERE request_id=?", ("f" * 64, request["id"]))
+    sent = []
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: "2026-08-13T00:00:00+00:00")
+    assert sent == []
+
+
+def test_v11_usage_requires_same_reset_persisted_accounting_and_never_defaults(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    store.record_usage_accounting("wrong-reset", {"snapshotId": "wrong-reset", "resetAt": "2026-08-15T00:00:00+00:00", "weeklyQuota": 700, "weeklyRemainingCapacity": 600, "dailyConsumed": 10, "otherDevelopmentConsumed": 2})
+    history = [{"observed_at": "2026-08-12T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}, {"observed_at": "2026-08-11T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}]
+    with pytest.raises(ValueError, match="persisted|reset|accounting"):
+        derive_v11_usage_snapshot(history, policy_version="2026-08-09", usage_store=store)
 
 
 def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: Path):

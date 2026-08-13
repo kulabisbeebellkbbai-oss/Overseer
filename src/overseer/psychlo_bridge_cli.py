@@ -23,7 +23,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "emit-usage":
         bridge = create_bridge_from_environment()
         history = CodexUsageTracker(args.usage_db).history(1000)
-        result = bridge.emit_usage(history, args.policy_version)
+        # Scheduled runtime emission is the strict v1.1 producer.  The
+        # bridge's v1.0 method remains available for legacy wire callers.
+        result = bridge.emit_usage_v11(history, args.policy_version)
         print(json.dumps({"accepted": result.get("accepted") is True}, sort_keys=True))
         return 0
     if args.command == "sync-projects":

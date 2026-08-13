@@ -8,6 +8,7 @@ become a normal ``rounds`` row by projection or recovery.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import os
 import sqlite3
@@ -66,6 +67,8 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
             CREATE TABLE IF NOT EXISTS coordination_terminals(request_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_operation_claims(kind TEXT NOT NULL, operation_id TEXT NOT NULL, owner_id TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, operation_id), UNIQUE(kind, idempotency_key));
+            CREATE TABLE IF NOT EXISTS policy_exception_requests(request_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, consumed_at TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS psychlo_usage_accounting(snapshot_id TEXT PRIMARY KEY, reset_at TEXT NOT NULL, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
         """)
         for column in ("delivery_skiller", "delivery_memory"):
             try:
@@ -156,6 +159,89 @@ class PsychloBridgeStore:
         row = self.connection.execute("SELECT digest,payload_json,created_at FROM approval_authority_snapshots WHERE approval_id=?", (approval_id,)).fetchone()
         if row is None: return None
         return {"approvalId": approval_id, "digest": row[0], "payload": json.loads(row[1]), "createdAt": row[2]}
+
+    def record_policy_exception_request(self, request: Mapping[str, Any], digest: str | None = None) -> tuple[dict[str, Any], bool]:
+        value = dict(request); request_id = value.get("id")
+        if not isinstance(request_id, str) or not request_id.strip(): raise ValueError("policy exception request identity is required")
+        selected_digest = str(digest or value.get("digest") or canonical_digest(value))
+        encoded = _dump_wire(value)
+        existing = self.policy_exception_request(request_id)
+        if existing is not None:
+            if existing["digest"] != selected_digest or existing["payload"] != value: raise ValueError("policy exception request conflict")
+            return existing, False
+        try:
+            self.connection.execute("INSERT INTO policy_exception_requests(request_id,digest,payload_json,state,outcome_json,consumed_at,updated_at) VALUES (?,?,?,'pending',NULL,NULL,?)", (request_id, selected_digest, encoded, self._now()))
+        except sqlite3.IntegrityError as error:
+            winner = self.policy_exception_request(request_id)
+            if winner is not None and winner["digest"] == selected_digest and winner["payload"] == value: return winner, False
+            raise ValueError("policy exception request conflict") from error
+        return self.policy_exception_request(request_id), True
+
+    def policy_exception_request(self, request_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT digest,payload_json,state,outcome_json,consumed_at,updated_at FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
+        if row is None: return None
+        return {"requestId": request_id, "digest": row[0], "payload": json.loads(row[1]), "state": row[2], "outcome": json.loads(row[3]) if row[3] else None, "consumedAt": row[4], "updatedAt": row[5]}
+
+    def consume_policy_exception_request(self, request_id: str, outcome: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+        encoded = _dump_wire(outcome)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT state,outcome_json FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
+            if row is None: raise ValueError("policy exception request is missing")
+            if row[0] in {"approved", "rejected", "expired", "delivered", "forward-pending"}:
+                if row[1] == encoded: return self.policy_exception_request(request_id)
+                raise ValueError("policy exception authority is one-use and already consumed")
+            self.connection.execute("UPDATE policy_exception_requests SET state='forward-pending',outcome_json=?,consumed_at=?,updated_at=? WHERE request_id=? AND state='pending'", (encoded, now, now, request_id))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.policy_exception_request(request_id)
+        if result is None: raise ValueError("policy exception request is missing")
+        return result
+
+    def transition_policy_exception_request(self, request_id: str, state: str, *, now: str | None = None) -> dict[str, Any]:
+        if state not in {"pending", "forward-pending", "delivered", "approved", "rejected", "expired"}: raise ValueError("policy exception state is invalid")
+        self.connection.execute("UPDATE policy_exception_requests SET state=?,updated_at=? WHERE request_id=?", (state, now or self._now(), request_id))
+        result = self.policy_exception_request(request_id)
+        if result is None: raise ValueError("policy exception request is missing")
+        return result
+
+    def pending_policy_exception_requests(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT request_id FROM policy_exception_requests WHERE state IN ('pending','forward-pending') ORDER BY updated_at,request_id").fetchall()
+        return [self.policy_exception_request(str(row[0])) for row in rows]
+
+    def record_usage_accounting(self, snapshot_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(payload)
+        if value.get("snapshotId") != snapshot_id or value.get("resetAt") is None: raise ValueError("usage accounting identity is required")
+        for field in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed"):
+            item = value.get(field)
+            if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or item < 0: raise ValueError("usage accounting values must be finite and nonnegative")
+        encoded = _dump_wire(value)
+        existing = self.usage_accounting(snapshot_id)
+        if existing is not None:
+            if existing["payload"] != value: raise ValueError("usage accounting record is immutable")
+            return existing
+        self.connection.execute("INSERT INTO psychlo_usage_accounting(snapshot_id,reset_at,payload_json,inserted_at) VALUES (?,?,?,?)", (snapshot_id, str(value["resetAt"]), encoded, self._now()))
+        return self.usage_accounting(snapshot_id)
+
+    def usage_accounting(self, snapshot_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT reset_at,payload_json,inserted_at FROM psychlo_usage_accounting WHERE snapshot_id=?", (snapshot_id,)).fetchone()
+        if row is None: return None
+        return {"snapshotId": snapshot_id, "resetAt": row[0], "payload": json.loads(row[1]), "insertedAt": row[2]}
+
+    def latest_usage_accounting(self, reset_at: str | None = None) -> dict[str, Any] | None:
+        rows = self.connection.execute("SELECT snapshot_id,reset_at FROM psychlo_usage_accounting ORDER BY inserted_at DESC,snapshot_id DESC").fetchall()
+        if reset_at is not None:
+            try: expected = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+            except ValueError: expected = None
+            rows = [row for row in rows if (datetime.fromisoformat(str(row[1]).replace("Z", "+00:00")) == expected if expected is not None else row[1] == reset_at)]
+        return None if not rows else self.usage_accounting(str(rows[0][0]))
+
+    # Public names used by the provider snapshot producer and test fixtures.
+    record_usage_snapshot = record_usage_accounting
+    save_usage_record = record_usage_accounting
+    latest_usage_snapshot = latest_usage_accounting
 
     def claim_coordination_operation(self, kind: str, operation_id: str, owner_id: str, lease_expires_at: str, idempotency_key: str, *, now: str) -> bool:
         if kind not in {"lead-dispatch", "supervisor-dispatch"} or not all(isinstance(item, str) and item.strip() for item in (operation_id, owner_id, lease_expires_at, idempotency_key, now)):

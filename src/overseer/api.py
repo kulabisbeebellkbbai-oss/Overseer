@@ -718,6 +718,8 @@ def make_api_handler(
                 "/psychlo/coordination/work": "coordination-work-request",
                 "/psychlo/concurrency/canary-result": "concurrency-canary-result",
                 "/psychlo/concurrency/canary-results": "concurrency-canary-result",
+                "/psychlo/policy-exceptions": "policy-exception-request",
+                "/psychlo/policy-exception-requests": "policy-exception-request",
             }
             if raw_path in peer_kinds:
                 self._handle_psychlo_peer(peer_kinds[raw_path])
@@ -777,6 +779,7 @@ def make_api_handler(
                 "/psychlo/admin/cross-project-team-binding": "cross-project-team-binding",
                 "/psychlo/admin/concurrency-canary-authorization": "concurrency-canary-authorization",
                 "/psychlo/admin/concurrency-ceiling-authorization": "concurrency-ceiling-authorization",
+                "/psychlo/admin/policy-exception-authorization": "policy-exception",
                 "/admin/psychlo/external-round-binding": "external-round-binding",
                 "/admin/psychlo/ingress-conflict-reconciliation": "ingress-conflict-reconciliation",
                 "/admin/psychlo/cross-project-team-binding": "cross-project-team-binding",
@@ -787,6 +790,7 @@ def make_api_handler(
                 "/roadex/psychlo/cross-project-team-binding": "cross-project-team-binding",
                 "/roadex/psychlo/concurrency-canary-authorization": "concurrency-canary-authorization",
                 "/roadex/psychlo/concurrency-ceiling-authorization": "concurrency-ceiling-authorization",
+                "/roadex/psychlo/policy-exception-authorization": "policy-exception",
             }
             if path in initiator_routes:
                 if psychlo_bridge is None:
@@ -1387,6 +1391,8 @@ def make_api_handler(
                     result = psychlo_bridge.receive_coordination_work_request(message["payload"])
                 elif kind == "concurrency-canary-result":
                     result = psychlo_bridge.receive_concurrency_canary_result(message["payload"])
+                elif kind == "policy-exception-request":
+                    result = psychlo_bridge.receive_policy_exception_request(message["payload"])
                 elif kind == "decision-outcome":
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:

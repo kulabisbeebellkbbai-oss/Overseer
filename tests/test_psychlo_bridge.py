@@ -1276,6 +1276,162 @@ def test_emit_usage_ignores_malformed_lead_result_and_uses_provider_snapshot(tmp
     assert round(sent[0][2]["snapshot"]["unusedPriorDayWeeklyCapacity"], 6) == round(100 / 7 - 5, 6)
 
 
+def _policy_exception_request(**changes: object) -> dict:
+    base = {
+        "schemaVersion": "psychlo.policy-exception-request.v1",
+        "id": "exception-enforce-safety-reserve",
+        "requestedRuleId": "enforce-safety-reserve",
+        "policyRevision": 4,
+        "actorId": "operator-1",
+        "requestedValue": False,
+        "reason": "bounded safety drill",
+        "activatedAt": "2026-08-12T12:00:00.000Z",
+        "expiresAt": "2026-08-13T00:00:00.000Z",
+        "correlationId": "corr-exception-enforce-safety-reserve",
+        "idempotencyKey": "exception-enforce-safety-reserve",
+        "occurredAt": "2026-08-12T12:00:00.000Z",
+    }
+    base.update(changes)
+    base["digest"] = canonical_digest(base)
+    return base
+
+
+def _save_policy_exception_approval(path: Path, request: dict, *, status: ApprovalStatus = ApprovalStatus.APPROVED) -> SQLiteStore:
+    primary = SQLiteStore(path)
+    digest = canonical_digest(request)
+    plan_base = plan_user_service_restart("plan-" + request["id"], request["id"], "approve Psychlo policy exception")
+    plan = replace(
+        plan_base,
+        owner_domain=OwnerDomain.SISKO,
+        approval_level=ApprovalLevel.HUMAN,
+        target=request["id"],
+        proposed_state=json.dumps({
+            "psychloAuthorization": {
+                "action": "psychlo-policy-exception",
+                "target": request["id"],
+                "payload": request,
+                "payloadDigest": digest,
+                "decisionId": "roadex:psychlo-policy-exception:" + request["id"],
+                "decisionDigest": "d" * 64,
+                "evidence": [digest],
+            }
+        }, separators=(",", ":")),
+        approved=status == ApprovalStatus.APPROVED,
+        approved_by="human-user" if status == ApprovalStatus.APPROVED else None,
+        approved_at=NOW if status == ApprovalStatus.APPROVED else None,
+    )
+    primary.save_admin_change_plan(plan)
+    primary.save_approval(ApprovalRequest(
+        "approval-" + request["id"], plan.id, ApprovalLevel.HUMAN, "thread-approval", OwnerDomain.SISKO,
+        "approve Psychlo policy exception", status, (digest,), "human-user" if status == ApprovalStatus.APPROVED else None,
+        NOW if status == ApprovalStatus.APPROVED else None,
+    ))
+    return primary
+
+
+def test_policy_exception_requires_real_persisted_approval_and_consumes_authority_once(tmp_path: Path):
+    request = _policy_exception_request()
+    sent = []
+    primary = _save_policy_exception_approval(tmp_path / "primary.sqlite3", request)
+    bridge_store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(
+        store=bridge_store, dispatcher=lambda *_: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, approval_store=primary,
+    )
+    # A request is durably pending before any approval lookup is allowed to clear it.
+    pending = bridge.receive_policy_exception_request(request)
+    assert pending["status"] == "pending"
+    assert sent == []
+    approved = bridge.authorize_policy_exception("approval-" + request["id"], request)
+    assert approved["status"] == "approved"
+    assert sent[0][0] == "policy-exception-outcome"
+    assert sent[0][2]["requestDigest"] == request["digest"]
+    assert sent[0][2]["decisionId"] == "roadex:psychlo-policy-exception:" + request["id"]
+    with pytest.raises(ValueError, match="one-use|consumed|replay"):
+        bridge.authorize_policy_exception("approval-" + request["id"], request)
+
+
+@pytest.mark.parametrize("defect", ["scope", "revision", "rule", "value", "digest"])
+def test_policy_exception_rejects_altered_request_after_real_approval(tmp_path: Path, defect: str):
+    request = _policy_exception_request()
+    primary = _save_policy_exception_approval(tmp_path / "primary.sqlite3", request)
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+        approval_store=primary,
+    )
+    bridge.receive_policy_exception_request(request)
+    altered = dict(request)
+    if defect == "scope": altered["id"] = "exception-other"
+    elif defect == "revision": altered["policyRevision"] = 5
+    elif defect == "rule": altered["requestedRuleId"] = "enforce-provider-quota"
+    elif defect == "value": altered["requestedValue"] = True
+    else: altered["digest"] = "f" * 64
+    if defect != "digest": altered["digest"] = canonical_digest({key: value for key, value in altered.items() if key != "digest"})
+    with pytest.raises(ValueError):
+        bridge.authorize_policy_exception("approval-" + request["id"], altered)
+
+
+def test_usage_snapshot_contains_only_persisted_overseer_v11_accounting(tmp_path: Path):
+    sent = []
+    bridge_store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge_store.record_usage_accounting("usage-v11", {
+        "snapshotId": "usage-v11", "resetAt": "2026-08-16T00:00:00.000Z", "weeklyQuota": 700,
+        "weeklyRemainingCapacity": 612, "dailyConsumed": 42, "otherDevelopmentConsumed": 17,
+    })
+    bridge = PsychloBridge(
+        store=bridge_store, dispatcher=lambda *_: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    history = [
+        {"observed_at": "2026-08-12T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
+        {"observed_at": "2026-08-11T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]},
+    ]
+    bridge.emit_usage(history, "2026-08-09")
+    snapshot = sent[0][2]["snapshot"]
+    assert {snapshot[key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700, 612, 42, 17}
+
+
+def test_policy_exception_rejection_is_signed_and_forwarded(tmp_path: Path):
+    request = _policy_exception_request(id="exception-rejected")
+    primary = _save_policy_exception_approval(tmp_path / "primary.sqlite3", request, status=ApprovalStatus.REJECTED)
+    sent = []
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, approval_store=primary,
+    )
+    bridge.receive_policy_exception_request(request)
+    outcome = bridge.authorize_policy_exception("approval-" + request["id"], request)
+    assert outcome["status"] == "rejected"
+    assert sent[0][0] == "policy-exception-outcome"
+    assert bridge.store.policy_exception_request(request["id"])["state"] == "rejected"
+
+
+def test_policy_exception_expiry_is_terminal_before_approval_lookup(tmp_path: Path):
+    request = _policy_exception_request(id="exception-expired", activatedAt="2026-08-08T00:00:00.000Z", expiresAt="2026-08-09T00:00:00.000Z")
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    result = bridge.receive_policy_exception_request(request)
+    assert result["status"] == "expired"
+    assert bridge.store.policy_exception_request(request["id"])["state"] == "expired"
+
+
+def test_v11_policy_exception_fixture_recomputes_exact_digests():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "psychlo-v1-1-policy-exception.json").read_text(encoding="utf-8"))
+    request = fixture["request"]
+    outcome = fixture["outcome"]
+    assert canonical_digest({key: value for key, value in request.items() if key != "digest"}) == request["digest"]
+    from overseer.psychlo_contracts import parse_policy_exception_outcome, policy_exception_outcome_digest
+    assert policy_exception_outcome_digest(outcome) == outcome["outcomeDigest"]
+    assert parse_policy_exception_outcome(outcome) == outcome
+    assert {fixture["usageSnapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700, 612, 42, 17}
+
+
 def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: Path):
     secret = tmp_path / "secret"
     secret.write_bytes(SECRET); secret.chmod(0o640)

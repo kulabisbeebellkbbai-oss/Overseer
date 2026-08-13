@@ -42,6 +42,14 @@ REASONS = {"registry", "canonical-repository", "repository-missing", "deployable
 APPLICATION_PURPOSES = {"service", "application", "library", "cli", "web"}
 LICENSE_KINDS = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "GPL-3.0", "proprietary"}
 SECURITY_REASONS = {"unsafe-files", "unsafe-modes", "symlinks", "secrets", "personal-exports", "oversized-data"}
+POLICY_EXCEPTION_REQUEST_SCHEMA = "psychlo.policy-exception-request.v1"
+POLICY_EXCEPTION_OUTCOME_SCHEMA = "psychlo.policy-exception-outcome.v1"
+POLICY_EXCEPTION_AUTHORIZATION_SCHEMA = "psychlo.policy-exception-authorization.v1"
+POLICY_EXCEPTION_RULES = {
+    "reset-daily-at-provider-reset", "count-other-development", "enforce-provider-quota",
+    "enforce-safety-reserve", "respect-blackouts", "carry-unused-daily-allowance",
+    "pause-after-failures", "require-manual-resume", "enforce-project-share",
+}
 
 
 def _canonical(value: Any) -> str:
@@ -559,6 +567,72 @@ def _strict_protocol(value: Any, *, required: set[str], name: str, schema: str |
         if field in required:
             _id(result.get(field), name=field) if field != "occurredAt" else _timestamp(result.get(field))
     return result
+
+
+def _finite_nonnegative(value: Any, *, name: str) -> float | int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        raise ContractError(f"{name} is invalid")
+    return value
+
+
+def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str, rule_key: str) -> dict[str, Any]:
+    required = {"schemaVersion", "id", rule_key, "policyRevision", "actorId", "reason", "activatedAt", "expiresAt", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    optional = {"requestedValue", "basePolicyDigest", "proposedPolicy"}
+    result = _strict_protocol(value, required=required, allowed=required | optional, name=name, schema=schema)
+    _id(result["id"], name="exception id")
+    _id(result[rule_key], name=rule_key)
+    if result[rule_key] not in POLICY_EXCEPTION_RULES:
+        raise ContractError("policy exception rule is invalid")
+    if not isinstance(result["policyRevision"], int) or isinstance(result["policyRevision"], bool) or result["policyRevision"] < 0:
+        raise ContractError("policy exception revision is invalid")
+    _id(result["actorId"], name="actorId"); _text(result["reason"], name="reason", maximum=512)
+    _timestamp(result["activatedAt"], name="activatedAt"); _timestamp(result["expiresAt"], name="expiresAt")
+    if datetime.fromisoformat(result["expiresAt"].replace("Z", "+00:00")) <= datetime.fromisoformat(result["activatedAt"].replace("Z", "+00:00")):
+        raise ContractError("policy exception expiry is invalid")
+    if "requestedValue" in result:
+        requested = result["requestedValue"]
+        if not isinstance(requested, bool) and (not isinstance(requested, (int, float)) or isinstance(requested, bool) or not math.isfinite(float(requested))):
+            raise ContractError("policy exception requested value is invalid")
+    if "basePolicyDigest" in result: _digest(result["basePolicyDigest"], name="basePolicyDigest")
+    if "proposedPolicy" in result:
+        proposed = _object(result["proposedPolicy"], name="proposedPolicy")
+        if proposed.get("revision") != result["policyRevision"] + 1:
+            raise ContractError("proposed policy revision is invalid")
+    _digest(result["digest"], name="digest")
+    if canonical_digest({key: item for key, item in result.items() if key != "digest"}) != result["digest"]:
+        raise ContractError(f"{name} digest mismatch")
+    return result
+
+
+def parse_policy_exception_request(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return _policy_exception_common(payload, name="policy exception request", schema=POLICY_EXCEPTION_REQUEST_SCHEMA, rule_key="requestedRuleId")
+
+
+def policy_exception_request_digest(payload: Mapping[str, Any]) -> str:
+    return canonical_digest({key: item for key, item in payload.items() if key != "digest"})
+
+
+def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:
+    fields = {"status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest"}
+    result = {key: payload[key] for key in fields if key in payload}
+    for key in ("requestedValue", "basePolicyDigest", "proposedPolicy", "reason"):
+        if key in payload and payload[key] is not None: result[key] = payload[key]
+    return canonical_digest(result)
+
+
+def parse_policy_exception_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
+    value = _object(payload, name="policy exception outcome")
+    required = {"schemaVersion", "sourceId", "status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "actorId", "correlationId", "idempotencyKey", "occurredAt", "outcomeDigest"}
+    _keys(value, required | {"requestedValue", "reason", "basePolicyDigest", "proposedPolicy"}, name="policy exception outcome")
+    if value.get("schemaVersion") != POLICY_EXCEPTION_OUTCOME_SCHEMA or value.get("sourceId") != "overseer" or value.get("status") not in {"approved", "rejected"}: raise ContractError("policy exception outcome authority is invalid")
+    _id(value.get("exceptionId"), name="exceptionId"); _id(value.get("ruleId"), name="ruleId")
+    if value["ruleId"] not in POLICY_EXCEPTION_RULES or not isinstance(value["policyRevision"], int) or isinstance(value["policyRevision"], bool) or value["policyRevision"] < 0: raise ContractError("policy exception outcome binding is invalid")
+    for field in ("requestDigest", "decisionDigest", "outcomeDigest"): _digest(value.get(field), name=field)
+    for field in ("decisionId", "actorId", "correlationId", "idempotencyKey"): _id(value.get(field), name=field)
+    _timestamp(value.get("occurredAt"))
+    if value["status"] == "rejected" and (not isinstance(value.get("reason"), str) or not value["reason"].strip()): raise ContractError("rejected policy exception reason is required")
+    if policy_exception_outcome_digest(value) != value["outcomeDigest"]: raise ContractError("policy exception outcome digest mismatch")
+    return value
 
 
 def parse_external_round_binding(payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -37,6 +37,9 @@ from .psychlo_contracts import (
     parse_learning_observation,
     parse_learning_advisory,
     parse_project_registration,
+    parse_policy_exception_request,
+    parse_policy_exception_outcome,
+    policy_exception_outcome_digest,
     parse_registry_candidate,
     parse_telemetry_checkpoint,
 )
@@ -185,7 +188,7 @@ def verify_peer_request(secret: bytes, store: PsychloBridgeStore, expected_kind:
     return message
 
 
-def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, now: str | None = None) -> dict[str, Any]:
+def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, now: str | None = None, usage_store: PsychloBridgeStore | None = None) -> dict[str, Any]:
     if not history:
         raise ValueError("Codex usage history is required")
     newest = history[0]
@@ -203,9 +206,19 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
     unused = max(0.0, 100.0 / 7.0 - prior_day_used)
     captured = str(newest["observed_at"])
     snapshot_id = "codex-usage-" + hashlib.sha256((captured + str(newest_window.get("resets_at"))).encode()).hexdigest()[:24]
+    accounting = usage_store.latest_usage_accounting(str(newest_window.get("resets_at"))) if usage_store is not None else None
+    if accounting is None and usage_store is not None:
+        accounting = usage_store.latest_usage_accounting()
+    values = accounting["payload"] if accounting is not None else {}
+    weekly_quota = values.get("weeklyQuota", newest_window.get("weekly_quota", newest_window.get("quota", 100.0)))
+    weekly_remaining = values.get("weeklyRemainingCapacity", float(newest_window.get("remaining_percent") or 0))
+    daily_consumed = values.get("dailyConsumed", 0.0)
+    other_development = values.get("otherDevelopmentConsumed", 0.0)
+    for name, value in (("weeklyQuota", weekly_quota), ("weeklyRemainingCapacity", weekly_remaining), ("dailyConsumed", daily_consumed), ("otherDevelopmentConsumed", other_development)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0: raise ValueError(f"{name} must be finite and nonnegative")
     return {
         "correlationId": f"psychlo:{snapshot_id}", "idempotencyKey": snapshot_id, "occurredAt": captured,
-        "snapshot": {"id": snapshot_id, "sourceId": "overseer", "capturedAt": captured, "policyVersion": policy_version, "unusedPriorDayWeeklyCapacity": unused, "weeklyRemainingCapacity": float(newest_window.get("remaining_percent") or 0)},
+        "snapshot": {"id": snapshot_id, "sourceId": "overseer", "capturedAt": captured, "policyVersion": policy_version, "unusedPriorDayWeeklyCapacity": unused, "weeklyRemainingCapacity": float(weekly_remaining), "weeklyQuota": float(weekly_quota), "dailyConsumed": float(daily_consumed), "otherDevelopmentConsumed": float(other_development)},
     }
 
 
@@ -230,6 +243,7 @@ class PsychloBridge:
         self._coordination_tick_lock = threading.Lock()
         self._recover_decision_intents()
         self.recover_protocol_records()
+        self._recover_policy_exception_records()
 
     def tick(self, *, limit: int = 32) -> dict[str, int | bool]:
         """Run one bounded, non-overlapping coordination polling pass."""
@@ -520,8 +534,125 @@ class PsychloBridge:
 
     def emit_usage(self, history: list[dict[str, Any]], policy_version: str) -> Mapping[str, Any]:
         if not history: raise ValueError("Codex usage history is required")
-        payload = derive_usage_snapshot(history, policy_version=policy_version)
+        payload = derive_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
+
+    def receive_policy_exception_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            request = parse_policy_exception_request(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        stored, inserted = self.store.record_policy_exception_request(request, request["digest"])
+        if stored["outcome"] is not None:
+            return {"accepted": True, "replay": not inserted, "status": stored["state"], "outcome": stored["outcome"]}
+        if self._policy_exception_expired(request):
+            self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
+            return {"accepted": True, "replay": not inserted, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"]}
+        # Roadex/Overseer approval is intentionally not inferred from a
+        # request.  A pending request is durable before any authority lookup.
+        approval_id = request["id"]
+        if self.approval_store is None and self.approval_loader is None:
+            return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"]}
+        try:
+            return self.authorize_policy_exception(approval_id, request)
+        except ValueError as error:
+            if str(error) in {"approved policy exception authority is missing", "policy exception approval is pending"}:
+                return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"]}
+            raise
+
+    receive_policy_exception = receive_policy_exception_request
+
+    def authorize_policy_exception(self, approval_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            request = parse_policy_exception_request(payload)
+        except ContractError as error:
+            raise ValueError(str(error)) from error
+        stored = self.store.policy_exception_request(request["id"])
+        if stored is None or stored["digest"] != request["digest"] or stored["payload"] != request:
+            raise ValueError("policy exception approval scope does not bind to the stored request")
+        if stored["outcome"] is not None:
+            raise ValueError("policy exception authority is one-use and already consumed")
+        record = self._load_policy_exception_approval(approval_id, request)
+        approval_record = record["approval"]
+        status = getattr(approval_record, "status", approval_record.get("status") if isinstance(approval_record, Mapping) else None)
+        status = getattr(status, "value", status)
+        if status in {"expired", "superseded"} or self._policy_exception_expired(request):
+            self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
+            return {"accepted": True, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"]}
+        if status == "pending":
+            raise ValueError("policy exception approval is pending")
+        if status != "approved":
+            outcome = self._policy_exception_outcome(request, record, "rejected", "Roadex rejected the exact policy exception")
+            self.store.consume_policy_exception_request(request["id"], outcome, now=self.clock())
+            try:
+                response = self.sender("policy-exception-outcome", request["id"], outcome)
+                if response.get("accepted") is not True: raise ValueError("Psychlo rejected policy exception outcome")
+            except Exception as error:
+                raise ValueError("forward-pending") from error
+            self.store.transition_policy_exception_request(request["id"], "rejected", now=self.clock())
+            return outcome
+        outcome = self._policy_exception_outcome(request, record, "approved", None)
+        self.store.consume_policy_exception_request(request["id"], outcome, now=self.clock())
+        try:
+            response = self.sender("policy-exception-outcome", request["id"], outcome)
+            if response.get("accepted") is not True: raise ValueError("Psychlo rejected policy exception outcome")
+        except Exception as error:
+            raise ValueError("forward-pending") from error
+        self.store.transition_policy_exception_request(request["id"], "approved", now=self.clock())
+        return outcome
+
+    initiate_policy_exception_authorization = authorize_policy_exception
+
+    def _load_policy_exception_approval(self, approval_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(approval_id, str) or not approval_id.strip() or isinstance(approval_id, Mapping): raise ValueError("persisted approval record ID is required")
+        if self.approval_loader is None and self.approval_store is None: raise ValueError("authoritative approval store is unavailable")
+        try:
+            loaded = self.approval_loader(approval_id) if self.approval_loader is not None else self._load_primary_approval(approval_id)
+        except (KeyError, LookupError, OSError):
+            raise ValueError("approved policy exception authority is missing")
+        approval, subject = loaded if isinstance(loaded, tuple) and len(loaded) == 2 else (loaded, None)
+        if not isinstance(approval, ApprovalRequest) or approval.id != approval_id: raise ValueError("policy exception approval identity conflict")
+        if subject is None and self.approval_store is not None: subject = self._load_primary_subject(self.approval_store, approval.subject_id)
+        if not isinstance(subject, AdminChangePlan): raise ValueError("policy exception administrative subject is required")
+        if subject.id != approval.subject_id or subject.owner_domain.value != self.approval_owner_domain or subject.canceled or subject.archived:
+            raise ValueError("policy exception administrative subject is invalid")
+        metadata = self._subject_metadata(subject)
+        if metadata.get("action", metadata.get("kind")) not in {"psychlo-policy-exception", "policy-exception"} or metadata.get("target", subject.target) != request["id"]:
+            raise ValueError("policy exception approval scope does not bind to the request")
+        expected_payload = metadata.get("payload")
+        expected_digest = metadata.get("payloadDigest", metadata.get("payload_digest"))
+        if expected_payload is not None and expected_payload != dict(request): raise ValueError("policy exception approval payload does not bind to the request")
+        if expected_digest != request["digest"]: raise ValueError("policy exception approval digest does not bind to the request")
+        if approval.owner_domain.value != self.approval_owner_domain or approval.subject_id != subject.id: raise ValueError("policy exception approval owner is invalid")
+        if tuple(approval.evidence_required) and request["digest"] not in set(approval.evidence_required): raise ValueError("policy exception approval evidence does not bind to the request")
+        if approval.status.value == "approved" and (not isinstance(approval.decided_by, str) or not approval.decided_by.strip() or approval.decided_by.lower() in {"sisko", "overseer", "system"}): raise ValueError("independent human policy exception approval is required")
+        if approval.status.value == "approved" and (not subject.approved or subject.approved_by != approval.decided_by): raise ValueError("policy exception approval is not an immutable approved subject")
+        return {"approval": approval, "subject": subject, "metadata": metadata}
+
+    def _policy_exception_outcome(self, request: Mapping[str, Any], record: Mapping[str, Any], status: str, reason: str | None) -> dict[str, Any]:
+        approval = record["approval"]; metadata = record["metadata"]
+        decision_id = metadata.get("decisionId", f"roadex:psychlo-policy-exception:{request['id']}")
+        decision_digest = metadata.get("decisionDigest", canonical_digest({"approvalId": approval.id, "subjectId": approval.subject_id, "requestDigest": request["digest"]}))
+        outcome = {"schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": status, "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"], **({"requestedValue": request["requestedValue"]} if "requestedValue" in request else {}), "requestDigest": request["digest"], "decisionId": decision_id, "decisionDigest": decision_digest, "actorId": request["actorId"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"], "occurredAt": self.clock()}
+        if reason is not None: outcome["reason"] = reason
+        outcome["outcomeDigest"] = policy_exception_outcome_digest(outcome)
+        try: parse_policy_exception_outcome(outcome)
+        except ContractError as error: raise ValueError(str(error)) from error
+        return outcome
+
+    def _policy_exception_expired(self, request: Mapping[str, Any]) -> bool:
+        try: return datetime.fromisoformat(str(request["expiresAt"]).replace("Z", "+00:00")) <= datetime.fromisoformat(self.clock().replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError): return True
+
+    def _recover_policy_exception_records(self) -> None:
+        for record in self.store.pending_policy_exception_requests():
+            if record is None or record.get("state") != "forward-pending" or not isinstance(record.get("outcome"), dict): continue
+            try:
+                outcome = parse_policy_exception_outcome(record["outcome"])
+                response = self.sender("policy-exception-outcome", str(outcome["exceptionId"]), outcome)
+                if response.get("accepted") is True: self.store.transition_policy_exception_request(str(outcome["exceptionId"]), str(outcome["status"]), now=self.clock())
+            except Exception:
+                continue
 
     def status(self) -> dict[str, Any]:
         return {"configured": True, "projections": self.store.projection_counts(), "activeRound": self.store.active_round(), "pendingDecisions": len(self.store.list_staged_decisions())}
@@ -1055,11 +1186,19 @@ class PsychloBridge:
             "cross-project-team-binding": self.initiate_cross_project_team_binding,
             "concurrency-canary-authorization": self.initiate_concurrency_canary_authorization,
             "concurrency-ceiling-authorization": self.initiate_concurrency_ceiling_authorization,
+            "policy-exception": self._initiate_policy_exception_authorization,
         }
         method = methods.get(kind)
         if method is None:
             raise ValueError("unsupported authorized operation")
         return method(value["approval_id"], dict(value["input"]))
+
+    def _initiate_policy_exception_authorization(self, approval_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = payload.get("id", payload.get("requestId"))
+        if not isinstance(request_id, str): raise ValueError("policy exception request ID is required")
+        stored = self.store.policy_exception_request(request_id)
+        if stored is None: raise ValueError("policy exception request is missing")
+        return self.authorize_policy_exception(approval_id, stored["payload"])
 
     def reconcile_ingress_conflict(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try: value = parse_ingress_conflict_reconciliation(payload)

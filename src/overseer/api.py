@@ -325,6 +325,7 @@ def make_api_handler(
     human_approval_token: str | None = None,
     human_approval_identity: str | None = None,
     psychlo_bridge: PsychloBridge | None = None,
+    psychlo_peer_authority: str = "127.0.0.1:8766",
 ):
     if psychlo_bridge is not None:
         def load_bridge_approval(approval_id: str):
@@ -1364,7 +1365,7 @@ def make_api_handler(
                 body = self._read_bounded_body()
                 headers = self._singleton_headers()
                 if not isinstance(psychlo_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
-                message = verify_peer_request(psychlo_bridge.peer_secret, psychlo_bridge.store, kind, body, headers, expected_authority="127.0.0.1:8766")
+                message = verify_peer_request(psychlo_bridge.peer_secret, psychlo_bridge.store, kind, body, headers, expected_authority=psychlo_peer_authority)
                 if kind == "project-register":
                     result = psychlo_bridge.register_project(message["payload"])
                 elif kind == "round-request":

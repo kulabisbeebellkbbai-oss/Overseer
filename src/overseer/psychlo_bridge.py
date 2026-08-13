@@ -1917,7 +1917,14 @@ class PsychloPeerSender:
             response_status = response.status
             data = response.read(MAX_BODY_BYTES + 1)
         if len(data) > MAX_BODY_BYTES: raise ValueError("Psychlo peer response is too large")
-        response_headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+        response_headers = {}
+        for header_name in (PEER_RESPONSE_KIND_HEADER, PEER_RESPONSE_TIMESTAMP_HEADER, PEER_RESPONSE_NONCE_HEADER, PEER_RESPONSE_SIGNATURE_HEADER):
+            get_all = getattr(response.headers, "get_all", None)
+            values = list(get_all(header_name) or []) if callable(get_all) else [value for key, value in response.headers.items() if str(key).lower() == header_name]
+            if len(values) > 1:
+                raise ValueError("invalid_response_signature")
+            if values:
+                response_headers[header_name] = str(values[0])
         verify_peer_response(
             self.secret,
             kind,

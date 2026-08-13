@@ -1381,6 +1381,37 @@ def test_peer_sender_rejects_wrong_kind_and_replayed_response(monkeypatch):
         sender("round-request", "replay-second", {"value": 1})
 
 
+def test_peer_sender_rejects_duplicate_response_proof_headers(monkeypatch):
+    body = b'{"accepted":true}'
+    timestamp = NOW
+    nonce = "response-duplicate-123456"
+    signature = sign_peer_response(SECRET, "round-request", timestamp, nonce, body)
+
+    class Headers:
+        def get_content_type(self): return "application/json"
+        def items(self):
+            return [
+                ("content-type", "application/json"),
+                ("x-psychlo-peer-response-kind", "round-request"),
+                ("x-psychlo-peer-response-timestamp", timestamp),
+                ("x-psychlo-peer-response-nonce", nonce),
+                ("x-psychlo-peer-response-signature", signature),
+                ("x-psychlo-peer-response-signature", signature),
+            ]
+
+    class Response:
+        status = 202
+        headers = Headers()
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self, _limit): return body
+
+    sender = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
+    monkeypatch.setattr(sender.opener, "open", lambda *_args, **_kwargs: Response())
+    with pytest.raises(ValueError, match="response_signature"):
+        sender("round-request", "duplicate-proof", {"value": 1})
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [

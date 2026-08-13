@@ -9,6 +9,7 @@ description = "Local resource manager for service health, asset checkout, mainte
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=45,<47",
   "mcp>=1.28.1,<2",
   "pydantic>=2.11",
   "starlette>=0.27",

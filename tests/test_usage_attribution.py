@@ -22,8 +22,8 @@ AUTHORITY = "meter-psychlo-dedicated"
 ACCOUNT = "account-psychlo"
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes.fromhex("11" * 32))
 PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-RESET = "2026-08-16T00:00:00+00:00"
-INTERVAL_START = "2026-08-12T00:00:00+00:00"
+RESET = "2026-08-12T00:00:00+00:00"
+INTERVAL_START = RESET
 INTERVAL_END = "2026-08-13T00:00:00+00:00"
 
 
@@ -63,6 +63,7 @@ def _observation(**changes: object) -> dict:
 def _receipt(**changes: object) -> dict:
     value = {
         "receiptId": "receipt-round-1",
+        "observationId": "observation-20260812",
         "authorityId": AUTHORITY,
         "authorityBindingId": "binding-psychlo-codex",
         "authorityBindingDigest": "a" * 64,
@@ -179,7 +180,7 @@ def test_receipts_reject_mismatched_scope_or_negative_residual(tmp_path: Path, f
         ledger.record_execution_receipt(_receipt(**{field: value}))
 
 
-def test_overlapping_receipts_and_measurement_gaps_are_rejected(tmp_path: Path):
+def test_overlapping_receipts_are_rejected_within_one_observation(tmp_path: Path):
     ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
     ledger.record_provider_observation(_observation())
     ledger.record_execution_receipt(_receipt())
@@ -197,13 +198,16 @@ def test_overlapping_receipts_and_measurement_gaps_are_rejected(tmp_path: Path):
                 idempotencyKey="receipt-idempotency-overlap",
             )
         )
-    with pytest.raises(UsageAttributionError, match="gap"):
-        ledger.reconcile_measurement_intervals(
-            [
-                _observation(observationId="observation-a", intervalStart="2026-08-12T00:00:00+00:00", intervalEnd="2026-08-12T10:00:00+00:00", idempotencyKey="observation-a"),
-                _observation(observationId="observation-b", intervalStart="2026-08-12T11:00:00+00:00", intervalEnd="2026-08-13T00:00:00+00:00", idempotencyKey="observation-b"),
-            ]
-        )
+
+
+def test_next_reset_receipts_are_scoped_to_their_exact_observation(tmp_path: Path):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt(consumed=42))
+    next_reset = "2026-08-13T00:00:00+00:00"
+    ledger.record_provider_observation(_observation(observationId="observation-20260813", providerResetAt=next_reset, intervalStart=next_reset, intervalEnd="2026-08-14T00:00:00+00:00", occurredAt="2026-08-14T00:00:00+00:00", totalConsumed=5, weeklyRemainingCapacity=695, correlationId="meter-correlation-20260813", idempotencyKey="meter-observation-20260813"))
+    ledger.record_execution_receipt(_receipt(receiptId="receipt-next", observationId="observation-20260813", providerResetAt=next_reset, roundId="round-2", dispatchId="dispatch-2", resultId="result-2", startedAt="2026-08-13T01:00:00+00:00", settledAt="2026-08-13T02:00:00+00:00", consumed=5, correlationId="receipt-next", idempotencyKey="receipt-next", occurredAt="2026-08-13T02:00:00+00:00"))
+    assert len(ledger.receipts_for_observation(ledger.observation("observation-20260813"))) == 1
 
 
 def test_snapshot_and_delivery_intent_are_immutable_and_replay_after_restart(tmp_path: Path):

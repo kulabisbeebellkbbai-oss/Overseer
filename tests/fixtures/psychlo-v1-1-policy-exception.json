@@ -46,7 +46,7 @@
       "sourceId": "overseer",
       "capturedAt": "2026-08-12T12:00:00.000Z",
       "policyVersion": "2026-08-09",
-      "providerResetAt": "2026-08-16T00:00:00+00:00",
+      "providerResetAt": "2026-08-12T00:00:00+00:00",
       "scopeDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "decisionVersion": "decision-v1",
       "weeklyQuota": 700,
@@ -54,8 +54,8 @@
       "unusedPriorDayWeeklyCapacity": 58,
       "dailyConsumed": 42,
       "otherDevelopmentConsumed": 46,
-      "digest": "95e2927505c41cb3d3166bfe2fb17814841177b7f309ab4a5a73c3af2d7f2574"
+      "digest": "bd555ac8ba0a0f625d2b4c2bda85a8ca66df606550afbfb1c9ed97e8ab937737"
     },
-    "digest": "6259eb164690e25ee378795f5450b258f77319749b9a6615b8256100c4e2a8ed"
+    "digest": "a94bac55301aa343a338afdbee6f750dfbd20c9c4d81a2647d02040c9502844d"
   }
 }

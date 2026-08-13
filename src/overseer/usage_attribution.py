@@ -152,7 +152,7 @@ class UsageAttributionLedger:
         for field in ("observationId","authorityBindingId","providerId","limitId","decisionVersion","correlationId","idempotencyKey"): _id(value[field], field)
         if not isinstance(value["authorityBindingDigest"], str) or len(value["authorityBindingDigest"]) != 64: raise UsageAttributionError("observation authority binding digest is invalid")
         start, end, occurred, reset = (_time(value[k], k) for k in ("intervalStart","intervalEnd","occurredAt","providerResetAt"))
-        if start >= end or occurred != end or end > reset: raise UsageAttributionError("observation measurement interval is invalid")
+        if reset != start or start >= end or occurred != end: raise UsageAttributionError("observation measurement interval is invalid")
         total = _ticks(value["totalConsumed"], "total consumed")
         quota = _ticks(value["weeklyQuota"], "weekly quota")
         remaining = _ticks(value["weeklyRemainingCapacity"], "weekly remaining")
@@ -162,7 +162,7 @@ class UsageAttributionLedger:
 
     def record_execution_receipt(self, supplied: Mapping[str, Any]) -> dict[str, Any]:
         value = _verify_seal(supplied, "receipt", self.approved_authority_public_key)
-        required = {"receiptId","authorityId","authorityBindingId","authorityBindingDigest","measurementScope","accountId","providerId","limitId","usageUnit","providerResetAt","projectId","planId","planVersion","aTeamId","projectLeadId","roundId","dispatchId","resultId","startedAt","settledAt","consumed","correlationId","idempotencyKey","occurredAt","signature","digest"}
+        required = {"receiptId","observationId","authorityId","authorityBindingId","authorityBindingDigest","measurementScope","accountId","providerId","limitId","usageUnit","providerResetAt","projectId","planId","planVersion","aTeamId","projectLeadId","roundId","dispatchId","resultId","startedAt","settledAt","consumed","correlationId","idempotencyKey","occurredAt","signature","digest"}
         if set(value) != required: raise UsageAttributionError("receipt identity shape is invalid")
         for field in required - {"consumed","digest","signature","startedAt","settledAt","occurredAt","providerResetAt","authorityBindingDigest"}: _id(value[field], field)
         if value["accountId"] != self.approved_account_id: raise UsageAttributionError("receipt account binding is invalid")
@@ -174,7 +174,7 @@ class UsageAttributionLedger:
         start, end, occurred = (_time(value[k], k) for k in ("startedAt","settledAt","occurredAt"))
         if start >= end or occurred != end or start < _time(observation["intervalStart"], "interval start") or end > _time(observation["intervalEnd"], "interval end"): raise UsageAttributionError("receipt measurement interval is invalid")
         consumed = _ticks(value["consumed"], "receipt consumed")
-        prior = self.connection.execute("SELECT payload_json FROM usage_execution_receipts ORDER BY inserted_at,receipt_id").fetchall()
+        prior = self.connection.execute("SELECT payload_json FROM usage_execution_receipts WHERE json_extract(payload_json,'$.observationId')=? ORDER BY inserted_at,receipt_id", (value["observationId"],)).fetchall()
         total = consumed
         for row in prior:
             item = json.loads(row[0]); total += int(item["consumed"])
@@ -183,8 +183,8 @@ class UsageAttributionLedger:
         return self._insert_immutable("usage_execution_receipts", "receipt_id", value["receiptId"], value, extra=("result_id", value["resultId"]))
 
     def _observation_for_scope(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        rows = self.connection.execute("SELECT payload_json FROM usage_observations").fetchall()
-        for row in rows:
+        row = self.connection.execute("SELECT payload_json FROM usage_observations WHERE observation_id=?", (value["observationId"],)).fetchone()
+        if row is not None:
             item = json.loads(row[0])
             if all(item[k] == value[k] for k in ("authorityId","authorityBindingId","accountId","providerId","limitId","usageUnit","providerResetAt","measurementScope")): return item
         raise UsageAttributionError("receipt account or reset scope is invalid")
@@ -207,11 +207,6 @@ class UsageAttributionLedger:
             if self.connection.in_transaction: self.connection.execute("ROLLBACK")
             raise
 
-    def reconcile_measurement_intervals(self, observations: list[Mapping[str, Any]]) -> None:
-        ordered = sorted((_verify_seal(item, "observation", self.approved_authority_public_key) for item in observations), key=lambda item: str(item["intervalStart"]))
-        for left, right in zip(ordered, ordered[1:]):
-            if left["intervalEnd"] != right["intervalStart"]: raise UsageAttributionError("measurement interval gap or overlap")
-
     def observation(self, observation_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT payload_json FROM usage_observations WHERE observation_id=?", (observation_id,)).fetchone()
         if row is None: raise UsageAttributionError("observation is missing")
@@ -219,7 +214,7 @@ class UsageAttributionLedger:
 
     def receipts_for_observation(self, observation: Mapping[str, Any]) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT payload_json FROM usage_execution_receipts ORDER BY inserted_at,receipt_id").fetchall()
-        return [json.loads(row[0]) for row in rows if all(json.loads(row[0])[k] == observation[k] for k in ("authorityId","authorityBindingId","accountId","providerId","limitId","usageUnit","providerResetAt","measurementScope"))]
+        return [json.loads(row[0]) for row in rows if json.loads(row[0])["observationId"] == observation["observationId"]]
 
     def delivery_intent(self, key: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT observation_id,payload_json,digest,state FROM usage_snapshot_intents WHERE idempotency_key=?", (key,)).fetchone()

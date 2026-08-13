@@ -1439,8 +1439,8 @@ def test_v11_policy_exception_fixture_recomputes_exact_digests():
     assert canonical_digest({key: value for key, value in usage.items() if key != "digest"}) == usage["digest"]
     assert {fixture["usageSnapshot"]["snapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700.0, 612.0, 42.0, 46.0}
     assert fixture["usageSnapshot"]["snapshot"]["unusedPriorDayWeeklyCapacity"] == 58.0
-    assert fixture["usageSnapshot"]["snapshot"]["digest"] == "95e2927505c41cb3d3166bfe2fb17814841177b7f309ab4a5a73c3af2d7f2574"
-    assert fixture["usageSnapshot"]["digest"] == "6259eb164690e25ee378795f5450b258f77319749b9a6615b8256100c4e2a8ed"
+    assert fixture["usageSnapshot"]["snapshot"]["digest"] == "bd555ac8ba0a0f625d2b4c2bda85a8ca66df606550afbfb1c9ed97e8ab937737"
+    assert fixture["usageSnapshot"]["digest"] == "a94bac55301aa343a338afdbee6f750dfbd20c9c4d81a2647d02040c9502844d"
 
 
 @pytest.mark.parametrize("left,right", [(1.0, 1), (-0.0, 0), (1.25, 1.25), (1e-3, 0.001), (1e-7, 0.0000001), (1e21, 1000000000000000000000)])

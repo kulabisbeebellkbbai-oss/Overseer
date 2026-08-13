@@ -6,8 +6,9 @@ import json
 import sqlite3
 import base64
 import os
+import secrets
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from cryptography.exceptions import InvalidSignature
@@ -125,14 +126,19 @@ def _validate_usage_snapshot_receipt(receipt: object, envelope: Mapping[str, Any
 class UsageAttributionLedger:
     """Append-only authority observations, execution receipts, and intents."""
 
-    _SCHEMA = 3
+    _SCHEMA = 4
     _MAX_SNAPSHOT_DELIVERY_ATTEMPTS = 2
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def __init__(self, path: Path | str, *, approved_authority_id: str, approved_authority_binding_id: str, approved_authority_binding_digest: str, approved_account_id: str, approved_authority_public_key: bytes, receipt_identity_validator: Callable[[Mapping[str, Any]], None]):
+    def __init__(self, path: Path | str, *, approved_authority_id: str, approved_authority_binding_id: str, approved_authority_binding_digest: str, approved_account_id: str, approved_authority_public_key: bytes, receipt_identity_validator: Callable[[Mapping[str, Any]], None], clock: Callable[[], str] | None = None, lease_seconds: int = 300, token_factory: Callable[[], str] | None = None):
+        self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
+        if not callable(self.clock):
+            raise UsageAttributionError("usage attribution clock is required")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0 or lease_seconds > 86400:
+            raise UsageAttributionError("usage attribution lease duration is invalid")
+        self.lease_seconds = lease_seconds
+        self.token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
+        if not callable(self.token_factory):
+            raise UsageAttributionError("usage attribution attempt token factory is required")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         parent = self.path.parent.stat(follow_symlinks=False)
@@ -171,6 +177,16 @@ class UsageAttributionLedger:
                     self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
                     self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN last_error TEXT")
                     self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN receipt_json TEXT")
+                    version = "3"
+                if version == "3":
+                    self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN attempt_token TEXT")
+                    self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN sending_at TEXT")
+                    self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN lease_expires_at TEXT")
+                    # A v3 sending row has no durable owner identity and may
+                    # not be silently reassigned during migration.
+                    active = self.connection.execute("SELECT 1 FROM usage_snapshot_intents WHERE state='sending' LIMIT 1").fetchone()
+                    if active is not None:
+                        raise UsageAttributionError("usage attribution migration rejects active sending without a lease")
                     self.connection.execute("UPDATE usage_attribution_meta SET value=? WHERE key='schema_version'", (str(self._SCHEMA),))
                 elif version != str(self._SCHEMA):
                     raise UsageAttributionError("usage attribution migration rejects unknown or corrupt legacy schema")
@@ -179,12 +195,8 @@ class UsageAttributionLedger:
                 self.connection.execute("INSERT INTO usage_attribution_meta VALUES ('schema_version',?)", (str(self._SCHEMA),))
             self.connection.execute("CREATE TABLE IF NOT EXISTS usage_observations(observation_id TEXT PRIMARY KEY,digest TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,inserted_at TEXT NOT NULL)")
             self.connection.execute("CREATE TABLE IF NOT EXISTS usage_execution_receipts(receipt_id TEXT PRIMARY KEY,result_id TEXT NOT NULL UNIQUE,digest TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,inserted_at TEXT NOT NULL)")
-            self.connection.execute("CREATE TABLE IF NOT EXISTS usage_snapshot_intents(idempotency_key TEXT PRIMARY KEY,observation_id TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,inserted_at TEXT NOT NULL,updated_at TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,receipt_json TEXT)")
+            self.connection.execute("CREATE TABLE IF NOT EXISTS usage_snapshot_intents(idempotency_key TEXT PRIMARY KEY,observation_id TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,inserted_at TEXT NOT NULL,updated_at TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,receipt_json TEXT,attempt_token TEXT,sending_at TEXT,lease_expires_at TEXT)")
             self._validate_all_locked()
-            # A process can die after the external request starts and before
-            # its receipt is committed.  Sending is intentionally converted
-            # to uncertain on the next process opening the ledger.
-            self.connection.execute("UPDATE usage_snapshot_intents SET state='uncertain',updated_at=? WHERE state='sending'", (self._now(),))
             self.connection.execute("COMMIT")
         except Exception:
             if self.connection.in_transaction:
@@ -206,7 +218,7 @@ class UsageAttributionLedger:
             except UsageAttributionError as error: raise UsageAttributionError("corrupt receipt ledger") from error
             if value.get("digest") != row[1]:
                 raise UsageAttributionError("corrupt receipt ledger")
-        for row in self.connection.execute("SELECT payload_json,digest,state,receipt_json,attempts FROM usage_snapshot_intents"):
+        for row in self.connection.execute("SELECT payload_json,digest,state,receipt_json,attempts,attempt_token,sending_at,lease_expires_at FROM usage_snapshot_intents"):
             try: value = json.loads(row[0])
             except json.JSONDecodeError as error: raise UsageAttributionError("corrupt snapshot intent") from error
             if canonical_digest(value) != row[1] or row[2] not in {"pending", "sending", "uncertain", "delivered", "rejected"}:
@@ -215,6 +227,18 @@ class UsageAttributionLedger:
             except Exception as error: raise UsageAttributionError("corrupt snapshot intent") from error
             if not isinstance(row[4], int) or row[4] < 0 or row[4] > self._MAX_SNAPSHOT_DELIVERY_ATTEMPTS:
                 raise UsageAttributionError("corrupt snapshot intent")
+            if row[2] == "sending":
+                if not isinstance(row[5], str) or not row[5].strip() or len(row[5]) > 256:
+                    raise UsageAttributionError("corrupt snapshot intent lease")
+                try:
+                    sending_at = _time(row[6], "sending")
+                    lease_expires_at = _time(row[7], "lease")
+                except UsageAttributionError as error:
+                    raise UsageAttributionError("corrupt snapshot intent lease") from error
+                if lease_expires_at <= sending_at:
+                    raise UsageAttributionError("corrupt snapshot intent lease")
+            elif any(value is not None for value in row[5:8]):
+                raise UsageAttributionError("corrupt snapshot intent lease")
             if row[2] == "delivered":
                 try: receipt = json.loads(row[3]) if row[3] else None
                 except json.JSONDecodeError as error: raise UsageAttributionError("corrupt snapshot intent receipt") from error
@@ -304,10 +328,10 @@ class UsageAttributionLedger:
         return [json.loads(row[0]) for row in rows if json.loads(row[0])["observationId"] == observation["observationId"]]
 
     def delivery_intent(self, key: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT observation_id,payload_json,digest,state,attempts,last_error,receipt_json FROM usage_snapshot_intents WHERE idempotency_key=?", (key,)).fetchone()
+        row = self.connection.execute("SELECT observation_id,payload_json,digest,state,attempts,last_error,receipt_json,attempt_token,sending_at,lease_expires_at FROM usage_snapshot_intents WHERE idempotency_key=?", (key,)).fetchone()
         if row is None:
             return None
-        return {"observationId":row[0],"payload":json.loads(row[1]),"digest":row[2],"state":row[3],"attempts":row[4],"lastError":row[5],"receipt":json.loads(row[6]) if row[6] else None}
+        return {"observationId":row[0],"payload":json.loads(row[1]),"digest":row[2],"state":row[3],"attempts":row[4],"lastError":row[5],"receipt":json.loads(row[6]) if row[6] else None,"attemptToken":row[7],"sendingAt":row[8],"leaseExpiresAt":row[9]}
 
     def delivery_intent_for_observation(self, observation_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT idempotency_key FROM usage_snapshot_intents WHERE observation_id=?", (observation_id,)).fetchone()
@@ -322,31 +346,52 @@ class UsageAttributionLedger:
                 existing=json.loads(row[0])
                 if existing != dict(payload): raise UsageAttributionError("snapshot intent immutable conflict")
                 self.connection.execute("COMMIT"); return existing, False
-            self.connection.execute("INSERT INTO usage_snapshot_intents(idempotency_key,observation_id,payload_json,digest,state,inserted_at,updated_at,attempts,last_error,receipt_json) VALUES (?,?,?,?,?,?,?,0,NULL,NULL)",(key,observation_id,encoded,digest,"pending",now,now))
+            self.connection.execute("INSERT INTO usage_snapshot_intents(idempotency_key,observation_id,payload_json,digest,state,inserted_at,updated_at,attempts,last_error,receipt_json,attempt_token,sending_at,lease_expires_at) VALUES (?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL,NULL)",(key,observation_id,encoded,digest,"pending",now,now))
             self.connection.execute("COMMIT"); return dict(payload), True
         except Exception:
             if self.connection.in_transaction:self.connection.execute("ROLLBACK")
             raise
 
-    def mark_delivered(self, key: str, receipt: Mapping[str, Any]) -> None:
+    def _cas_update(self, key: str, attempt_token: str, state: str, *, error: str | None = None, receipt: str | None = None) -> bool:
+        if not isinstance(attempt_token, str) or not attempt_token.strip():
+            raise UsageAttributionError("snapshot delivery attempt token is required")
+        now = self._now()
+        cursor = self.connection.execute("UPDATE usage_snapshot_intents SET state=?,updated_at=?,last_error=?,receipt_json=?,attempt_token=NULL,sending_at=NULL,lease_expires_at=NULL WHERE idempotency_key=? AND state='sending' AND attempt_token=? AND lease_expires_at>?", (state, now, error, receipt, key, attempt_token, now))
+        return cursor.rowcount == 1
+
+    def mark_delivered(self, key: str, attempt_token: str, receipt: Mapping[str, Any]) -> bool:
         intent = self.delivery_intent(key)
         if intent is None:
             raise UsageAttributionError("snapshot intent is missing")
         validated = _validate_usage_snapshot_receipt(receipt, intent["payload"])
-        self.connection.execute("UPDATE usage_snapshot_intents SET state='delivered',updated_at=?,last_error=NULL,receipt_json=? WHERE idempotency_key=? AND state='sending'",(self._now(), self._encoded(validated), key))
+        return self._cas_update(key, attempt_token, "delivered", receipt=self._encoded(validated))
 
-    def mark_pending(self, key: str) -> None:
-        self.connection.execute("UPDATE usage_snapshot_intents SET state='pending',updated_at=?,last_error=NULL WHERE idempotency_key=? AND state='sending'",(self._now(),key))
+    def mark_pending(self, key: str, attempt_token: str) -> bool:
+        return self._cas_update(key, attempt_token, "pending")
 
-    def mark_uncertain(self, key: str, error: str | None = None) -> None:
-        self.connection.execute("UPDATE usage_snapshot_intents SET state='uncertain',updated_at=?,last_error=? WHERE idempotency_key=? AND state='sending'",(self._now(),error,key))
+    def mark_uncertain(self, key: str, attempt_token: str, error: str | None = None) -> bool:
+        return self._cas_update(key, attempt_token, "uncertain", error=error)
 
-    def claim_pending(self, key: str) -> bool:
+    def mark_rejected(self, key: str, attempt_token: str, error: str | None = None) -> bool:
+        return self._cas_update(key, attempt_token, "rejected", error=error)
+
+    def _now(self) -> str:
+        value = self.clock()
+        if not isinstance(value, str):
+            raise UsageAttributionError("usage attribution clock returned an invalid timestamp")
+        return _time(value, "clock").astimezone(timezone.utc).isoformat()
+
+    def claim_pending(self, key: str) -> str | None:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            changed = self.connection.execute("UPDATE usage_snapshot_intents SET state='sending',attempts=attempts+1,updated_at=? WHERE idempotency_key=? AND state IN ('pending','uncertain') AND attempts<?", (self._now(),key,self._MAX_SNAPSHOT_DELIVERY_ATTEMPTS)).rowcount == 1
+            now = self._now()
+            expires = (_time(now, "clock") + timedelta(seconds=self.lease_seconds)).isoformat()
+            token = self.token_factory()
+            if not isinstance(token, str) or not token.strip() or len(token) > 256:
+                raise UsageAttributionError("usage attribution attempt token is invalid")
+            changed = self.connection.execute("UPDATE usage_snapshot_intents SET state='sending',attempts=attempts+1,updated_at=?,attempt_token=?,sending_at=?,lease_expires_at=?,last_error=NULL,receipt_json=NULL WHERE idempotency_key=? AND attempts<? AND (state IN ('pending','uncertain') OR (state='sending' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))", (now,token,now,expires,key,self._MAX_SNAPSHOT_DELIVERY_ATTEMPTS,now)).rowcount == 1
             self.connection.execute("COMMIT")
-            return changed
+            return token if changed else None
         except Exception:
             if self.connection.in_transaction: self.connection.execute("ROLLBACK")
             raise
@@ -375,31 +420,37 @@ class UsageSnapshotProducer:
         if intent and intent["state"]=="delivered": return {"payload":payload,"replay":True,"receipt":intent["receipt"]}
         if intent and intent["state"]=="rejected":
             raise UsageAttributionError("snapshot delivery is permanently rejected")
-        claimed=self.ledger.claim_pending(key)
-        if not claimed:
+        attempt_token=self.ledger.claim_pending(key)
+        if not attempt_token:
             current = self.ledger.delivery_intent(key)
             if current and current["state"] in {"pending", "uncertain"} and int(current["attempts"]) >= self.ledger._MAX_SNAPSHOT_DELIVERY_ATTEMPTS:
+                raise UsageAttributionError("usage snapshot delivery retry limit exhausted")
+            if current and current["state"] == "sending" and int(current["attempts"]) >= self.ledger._MAX_SNAPSHOT_DELIVERY_ATTEMPTS and current.get("leaseExpiresAt") is not None and _time(str(current["leaseExpiresAt"]), "lease") <= _time(self.ledger._now(), "clock"):
                 raise UsageAttributionError("usage snapshot delivery retry limit exhausted")
             return {"payload":payload,"replay":True,"receipt":current["receipt"] if current else None}
         try:
             if self.before_send is not None:
                 self.before_send()
         except BaseException:
-            self.ledger.mark_pending(key)
+            if not self.ledger.mark_pending(key, attempt_token):
+                raise UsageAttributionError("usage snapshot delivery lease lost")
             raise
         try:
             response=self.sender("usage-snapshot",key,payload)
         except UsageSnapshotPreSendError:
-            self.ledger.mark_pending(key)
+            if not self.ledger.mark_pending(key, attempt_token):
+                raise UsageAttributionError("usage snapshot delivery lease lost")
             raise
         except BaseException as error:
-            self.ledger.mark_uncertain(key, str(error)[:500])
+            if not self.ledger.mark_uncertain(key, attempt_token, str(error)[:500]):
+                raise UsageAttributionError("usage snapshot delivery lease lost") from error
             raise
         if self.after_send is not None:
             try:
                 self.after_send()
             except Exception as error:
-                self.ledger.mark_uncertain(key, str(error)[:500])
+                if not self.ledger.mark_uncertain(key, attempt_token, str(error)[:500]):
+                    raise UsageAttributionError("usage snapshot delivery lease lost") from error
                 raise
         try:
             if not isinstance(response, Mapping):
@@ -410,9 +461,11 @@ class UsageSnapshotProducer:
             receipt = response.get("receipt") if isinstance(response.get("receipt"), Mapping) else response
             receipt = _validate_usage_snapshot_receipt(receipt, payload)
         except BaseException as error:
-            self.ledger.mark_uncertain(key, str(error)[:500])
+            if not self.ledger.mark_uncertain(key, attempt_token, str(error)[:500]):
+                raise UsageAttributionError("usage snapshot delivery lease lost") from error
             raise
-        self.ledger.mark_delivered(key, receipt)
+        if not self.ledger.mark_delivered(key, attempt_token, receipt):
+            raise UsageAttributionError("usage snapshot delivery lease lost")
         return {"payload":payload,"replay":False,"receipt":receipt}
 
 

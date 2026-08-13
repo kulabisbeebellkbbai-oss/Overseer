@@ -92,11 +92,11 @@ def _receipt(**changes: object) -> dict:
     return _sealed({**value, **changes})
 
 
-def _ledger(path: Path) -> UsageAttributionLedger:
+def _ledger(path: Path, **options: object) -> UsageAttributionLedger:
     def validate(value: dict) -> None:
         expected = {"projectId": "psychlo", "planId": "psychlo-v1-1", "planVersion": "v1.1", "aTeamId": "a-team-psychlo", "projectLeadId": "lead-psychlo"}
         if any(value.get(key) != item for key, item in expected.items()): raise UsageAttributionError("receipt does not bind to a managed project identity")
-    return UsageAttributionLedger(path, approved_authority_id=AUTHORITY, approved_authority_binding_id="binding-psychlo-codex", approved_authority_binding_digest="a" * 64, approved_account_id=ACCOUNT, approved_authority_public_key=PUBLIC_KEY, receipt_identity_validator=validate)
+    return UsageAttributionLedger(path, approved_authority_id=AUTHORITY, approved_authority_binding_id="binding-psychlo-codex", approved_authority_binding_digest="a" * 64, approved_account_id=ACCOUNT, approved_authority_public_key=PUBLIC_KEY, receipt_identity_validator=validate, **options)
 
 
 def _delivery_response(payload: dict, **changes: object) -> dict:
@@ -113,6 +113,27 @@ def _delivery_response(payload: dict, **changes: object) -> dict:
         "outcome": "inserted",
     }
     return {"receipt": {**receipt, **changes}}
+
+
+def _lease_owner_process(path: str, ready, release, result_queue) -> None:
+    ledger = _ledger(Path(path), clock=lambda: "2026-08-13T00:00:00+00:00", lease_seconds=60, token_factory=lambda: "attempt-a")
+    def before_send() -> None:
+        ready.set()
+        release.wait(10)
+    try:
+        result_queue.put(UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload), before_send=before_send).emit("observation-20260812", policy_version="2026-08-13")["replay"])
+    except Exception as error:  # pragma: no cover - assertion reports child failure
+        result_queue.put(f"error:{error}")
+
+
+def _lease_competitor_process(path: str, result_queue) -> None:
+    ledger = _ledger(Path(path), clock=lambda: "2026-08-13T00:00:00+00:00", lease_seconds=60, token_factory=lambda: "attempt-b")
+    calls: list[str] = []
+    try:
+        result = UsageSnapshotProducer(ledger, sender=lambda *_: calls.append("sent") or pytest.fail("second owner must not send")).emit("observation-20260812", policy_version="2026-08-13")
+        result_queue.put((result["replay"], calls))
+    except Exception as error:  # pragma: no cover - assertion reports child failure
+        result_queue.put(f"error:{error}")
 
 
 def test_authoritative_observation_and_bound_receipts_produce_exact_psychlo_payload(tmp_path: Path):
@@ -341,7 +362,8 @@ def test_uncertain_delivery_has_one_bounded_exact_payload_retry(tmp_path: Path):
 
 def test_post_send_crash_recovers_exact_payload_and_corrupt_intent_fails_closed(tmp_path: Path):
     path = tmp_path / "usage-attribution.sqlite3"
-    ledger = _ledger(path)
+    clock = ["2026-08-13T00:00:00+00:00"]
+    ledger = _ledger(path, clock=lambda: clock[0], lease_seconds=60)
     ledger.record_provider_observation(_observation())
     ledger.record_execution_receipt(_receipt())
     first: list[dict] = []
@@ -349,7 +371,8 @@ def test_post_send_crash_recovers_exact_payload_and_corrupt_intent_fails_closed(
         UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: first.append(payload) or _delivery_response(payload), after_send=lambda: (_ for _ in ()).throw(SystemExit(9))).emit("observation-20260812", policy_version="2026-08-13")
     assert ledger.delivery_intent_for_observation("observation-20260812")["state"] == "sending"
     ledger.connection.close()
-    restarted = _ledger(path)
+    clock[0] = "2026-08-13T00:01:01+00:00"
+    restarted = _ledger(path, clock=lambda: clock[0], lease_seconds=60)
     second: list[dict] = []
     recovered = UsageSnapshotProducer(restarted, sender=lambda kind, message_id, payload: second.append(payload) or _delivery_response(payload)).emit("observation-20260812", policy_version="2026-08-13")
     assert recovered["replay"] is False and first == second
@@ -396,6 +419,118 @@ def test_cross_process_delivery_intent_has_one_winner(tmp_path: Path):
     for process in processes:
         process.join(timeout=10)
     assert sorted(results) == [False, True]
+
+
+def test_unexpired_delivery_lease_excludes_second_sender(tmp_path: Path):
+    path = tmp_path / "usage-attribution.sqlite3"
+    import multiprocessing
+    first = _ledger(path)
+    first.record_provider_observation(_observation())
+    first.record_execution_receipt(_receipt())
+    ready = multiprocessing.Event()
+    release = multiprocessing.Event()
+    queue = multiprocessing.Queue()
+    owner = multiprocessing.Process(target=_lease_owner_process, args=(str(path), ready, release, queue))
+    owner.start()
+    assert ready.wait(10)
+    competitor_queue = multiprocessing.Queue()
+    competitor = multiprocessing.Process(target=_lease_competitor_process, args=(str(path), competitor_queue))
+    competitor.start()
+    assert competitor_queue.get(timeout=10) == (True, [])
+    release.set()
+    assert queue.get(timeout=10) is False
+    owner.join(timeout=10)
+    competitor.join(timeout=10)
+    assert owner.exitcode == 0 and competitor.exitcode == 0
+
+
+def test_stale_owner_cannot_finalize_after_exact_retry_claim(tmp_path: Path):
+    path = tmp_path / "usage-attribution.sqlite3"
+    clock = ["2026-08-13T00:00:00+00:00"]
+    first = _ledger(path, clock=lambda: clock[0], lease_seconds=60, token_factory=lambda: "attempt-a")
+    first.record_provider_observation(_observation())
+    first.record_execution_receipt(_receipt())
+    # Prepare the same envelope without crossing the external boundary.
+    snapshot = {"schemaVersion":"psychlo.usage-snapshot.v1.1","id":"stale-snapshot","sourceId":"overseer","capturedAt":INTERVAL_END,"policyVersion":"2026-08-13","providerResetAt":RESET,"scopeDigest":"b" * 64,"decisionVersion":"meter-v1","unusedPriorDayWeeklyCapacity":58,"weeklyQuota":700,"weeklyRemainingCapacity":658,"dailyConsumed":12,"otherDevelopmentConsumed":30}
+    snapshot["digest"] = canonical_digest(snapshot)
+    envelope = {"schemaVersion":"psychlo.usage-envelope.v1.1","messageId":"stale-snapshot","correlationId":"psychlo:stale-snapshot","idempotencyKey":"stale-snapshot","occurredAt":INTERVAL_END,"snapshot":snapshot}
+    envelope["digest"] = canonical_digest(envelope)
+    first.prepare_intent("observation-20260812", envelope)
+    old_token = first.claim_pending("stale-snapshot")
+    assert old_token == "attempt-a"
+    first.connection.close()
+    clock[0] = "2026-08-13T00:01:01+00:00"
+    second = _ledger(path, clock=lambda: clock[0], lease_seconds=60, token_factory=lambda: "attempt-b")
+    new_token = second.claim_pending("stale-snapshot")
+    assert new_token == "attempt-b"
+    assert second.mark_delivered("stale-snapshot", old_token, _delivery_response(envelope)["receipt"]) is False
+    current = second.delivery_intent("stale-snapshot")
+    assert current is not None and current["state"] == "sending" and current["attemptToken"] == "attempt-b"
+    assert second.mark_delivered("stale-snapshot", new_token, _delivery_response(envelope)["receipt"]) is True
+
+
+def test_active_sending_survives_restart_and_only_stale_lease_is_reclaimed(tmp_path: Path):
+    path = tmp_path / "usage-attribution.sqlite3"
+    clock = ["2026-08-13T00:00:00+00:00"]
+    ledger = _ledger(path, clock=lambda: clock[0], lease_seconds=60, token_factory=lambda: "attempt-a")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    snapshot = {"schemaVersion":"psychlo.usage-snapshot.v1.1","id":"restart-snapshot","sourceId":"overseer","capturedAt":INTERVAL_END,"policyVersion":"2026-08-13","providerResetAt":RESET,"scopeDigest":"c" * 64,"decisionVersion":"meter-v1","unusedPriorDayWeeklyCapacity":58,"weeklyQuota":700,"weeklyRemainingCapacity":658,"dailyConsumed":12,"otherDevelopmentConsumed":30}
+    snapshot["digest"] = canonical_digest(snapshot)
+    envelope = {"schemaVersion":"psychlo.usage-envelope.v1.1","messageId":"restart-snapshot","correlationId":"psychlo:restart-snapshot","idempotencyKey":"restart-snapshot","occurredAt":INTERVAL_END,"snapshot":snapshot}
+    envelope["digest"] = canonical_digest(envelope)
+    ledger.prepare_intent("observation-20260812", envelope)
+    assert ledger.claim_pending("restart-snapshot") == "attempt-a"
+    ledger.connection.close()
+    restarted = _ledger(path, clock=lambda: clock[0], lease_seconds=60, token_factory=lambda: "attempt-b")
+    assert restarted.delivery_intent("restart-snapshot")["state"] == "sending"
+    assert restarted.claim_pending("restart-snapshot") is None
+    clock[0] = "2026-08-13T00:01:01+00:00"
+    assert restarted.claim_pending("restart-snapshot") == "attempt-b"
+
+
+def test_v3_migration_adds_lease_columns_but_rejects_unowned_sending(tmp_path: Path):
+    snapshot = {"schemaVersion":"psychlo.usage-snapshot.v1.1","id":"migration-snapshot","sourceId":"overseer","capturedAt":INTERVAL_END,"policyVersion":"2026-08-13","providerResetAt":RESET,"scopeDigest":"d" * 64,"decisionVersion":"meter-v1","unusedPriorDayWeeklyCapacity":58,"weeklyQuota":700,"weeklyRemainingCapacity":658,"dailyConsumed":12,"otherDevelopmentConsumed":30}
+    snapshot["digest"] = canonical_digest(snapshot)
+    envelope = {"schemaVersion":"psychlo.usage-envelope.v1.1","messageId":"migration-snapshot","correlationId":"psychlo:migration-snapshot","idempotencyKey":"migration-snapshot","occurredAt":INTERVAL_END,"snapshot":snapshot}
+    envelope["digest"] = canonical_digest(envelope)
+    path = tmp_path / "v3-pending.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE usage_attribution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO usage_attribution_meta VALUES ('schema_version', '3');
+        CREATE TABLE usage_observations (observation_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
+        CREATE TABLE usage_execution_receipts (receipt_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
+        CREATE TABLE usage_snapshot_intents (idempotency_key TEXT PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL, inserted_at TEXT NOT NULL, updated_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, receipt_json TEXT);
+    """)
+    encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    connection.execute("INSERT INTO usage_snapshot_intents VALUES (?,?,?,?,?,?,?,?,?,?)", ("migration-snapshot", "observation-20260812", encoded, canonical_digest(envelope), "pending", INTERVAL_END, INTERVAL_END, 0, None, None))
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+    migrated = _ledger(path)
+    columns = {row[1] for row in migrated.connection.execute("PRAGMA table_info(usage_snapshot_intents)")}
+    assert {"attempt_token", "sending_at", "lease_expires_at"}.issubset(columns)
+    migrated.connection.close()
+
+    active_path = tmp_path / "v3-sending.sqlite3"
+    connection = sqlite3.connect(active_path)
+    connection.executescript("""
+        CREATE TABLE usage_attribution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO usage_attribution_meta VALUES ('schema_version', '3');
+        CREATE TABLE usage_observations (observation_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
+        CREATE TABLE usage_execution_receipts (receipt_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
+        CREATE TABLE usage_snapshot_intents (idempotency_key TEXT PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL, inserted_at TEXT NOT NULL, updated_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, receipt_json TEXT);
+    """)
+    connection.execute("INSERT INTO usage_snapshot_intents VALUES (?,?,?,?,?,?,?,?,?,?)", ("migration-snapshot", "observation-20260812", encoded, canonical_digest(envelope), "sending", INTERVAL_END, INTERVAL_END, 1, None, None))
+    connection.commit()
+    connection.close()
+    active_path.chmod(0o600)
+    with pytest.raises(UsageAttributionError, match="active sending|migration"):
+        _ledger(active_path)
+    connection = sqlite3.connect(active_path)
+    assert connection.execute("SELECT value FROM usage_attribution_meta WHERE key='schema_version'").fetchone()[0] == "3"
+    connection.close()
 
 
 def test_migration_rolls_back_and_corrupt_ledger_is_rejected(tmp_path: Path):

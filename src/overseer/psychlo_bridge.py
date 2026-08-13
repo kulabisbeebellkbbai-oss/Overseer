@@ -391,6 +391,9 @@ class PsychloBridge:
         identity = self._project_registration_identity(registration)
         envelope = registration["envelope"]; receipt = registration["receipt"]; plan = envelope["plan"]
         project_id = identity["projectId"]; project_lead_id = identity["projectLeadId"]; receipt_id = identity["receiptId"]
+        request_binding = envelope.get("requestBinding") if envelope.get("contractVersion") == "a-team.psychlo.handoff.v3" else None
+        if isinstance(request_binding, dict) and request_binding.get("requestedCommand") == "decommission":
+            raise ValueError("v3 decommission registration is unsupported")
         tasks = plan.get("tasks")
         constraints = plan.get("constraints", [])
         if not isinstance(tasks, list) or not tasks or len(tasks) > 128 or not isinstance(constraints, list): raise ValueError("project registration is invalid")
@@ -415,6 +418,7 @@ class PsychloBridge:
                 or identity["aTeamId"] != existing_identity["aTeamId"]
                 or identity["projectLeadId"] != existing_identity["projectLeadId"]
                 or (identity["planId"], identity["planVersion"]) == (existing_identity["planId"], existing_identity["planVersion"])
+                or (isinstance(request_binding, dict) and request_binding.get("requestedCommand") not in {"continue", "plan-change"})
             ):
                 raise ValueError("project registration conflict")
             def deliver_change() -> None:
@@ -422,6 +426,8 @@ class PsychloBridge:
                 if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
             self.store.replace_project(project_id, existing[0], registration, scheduling, deliver_change)
             return {"accepted": True}
+        if isinstance(request_binding, dict) and request_binding.get("requestedCommand") != "start":
+            raise ValueError("v3 lifecycle change requires an existing project registration")
         response = self.sender("scheduling-input", scheduling["idempotencyKey"], scheduling)
         if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
         self.store.record_project(project_id, registration, scheduling)

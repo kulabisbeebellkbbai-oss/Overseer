@@ -101,6 +101,34 @@ def _project_change_registration(registration: dict, *, version: str = "v2", sup
     return changed
 
 
+def _project_v3_change_registration(registration: dict, *, plan_id: str | None = None, version: str = "v2", command: str = "continue") -> dict:
+    changed = json.loads(json.dumps(registration))
+    envelope = changed["envelope"]
+    previous = dict(envelope["project"])
+    envelope["contractVersion"] = "a-team.psychlo.handoff.v3"
+    envelope["project"]["planId"] = plan_id or f"{previous['planId']}-v2"
+    envelope["project"]["planVersion"] = version
+    envelope["correlationId"] = f"registration-{envelope['project']['id']}-{version}-v3"
+    envelope["idempotencyKey"] = f"registration-{envelope['project']['id']}-{version}-v3"
+    envelope["requestBinding"] = {"psychloRequestId": f"request-{envelope['project']['id']}-{version}", "requestedCommand": command}
+    envelope["lifecycle"] = {
+        "kind": "change",
+        "supersedesPlanId": previous["planId"],
+        "supersedesVersion": previous["planVersion"],
+    }
+    envelope.pop("digest", None)
+    envelope["digest"] = canonical_digest(envelope)
+    receipt = changed["receipt"]
+    receipt["handoffContractVersion"] = envelope["contractVersion"]
+    receipt["receiptId"] = f"receipt-{envelope['project']['id']}-{version}-v3"
+    receipt["project"]["planId"] = envelope["project"]["planId"]
+    receipt["project"]["planVersion"] = version
+    receipt["correlationId"] = envelope["correlationId"]
+    receipt["idempotencyKey"] = envelope["idempotencyKey"]
+    receipt["envelopeDigest"] = envelope["digest"]
+    return changed
+
+
 def _coordination_process(store_path: str, calls_path: str, request: dict, barrier) -> None:
     store = PsychloBridgeStore(store_path)
     if store.project(request["projectId"]) is None:
@@ -1894,6 +1922,63 @@ def test_register_project_accepts_exact_successor_plan_change_and_replays_silent
     assert stored is not None
     assert stored[0] == changed
     assert stored[1] == sent[-1][2]
+
+
+def test_register_project_advances_exact_v3_change_registration_across_restart(tmp_path: Path):
+    sent = []
+    store_path = tmp_path / "bridge.sqlite3"
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(store_path), dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    initial = _registration_payload("arcade", "member-hermione", plan_id="arcade-plan", team_id="team-arcade")
+    changed = _project_v3_change_registration(initial)
+
+    assert bridge.register_project(initial) == {"accepted": True}
+    assert bridge.register_project(changed) == {"accepted": True}
+    stored = bridge.store.project("arcade")
+    assert stored is not None
+    assert stored[0] == changed
+    assert stored[0]["envelope"]["contractVersion"] == "a-team.psychlo.handoff.v3"
+    assert stored[0]["envelope"]["requestBinding"] == {"psychloRequestId": "request-arcade-v2", "requestedCommand": "continue"}
+    assert stored[0]["envelope"]["aTeamId"] == "team-arcade"
+    assert stored[0]["envelope"]["projectLead"]["id"] == "member-hermione"
+    assert stored[0]["envelope"]["project"]["planId"] == "arcade-plan-v2"
+    assert stored[0]["envelope"]["project"]["planVersion"] == "v2"
+    assert stored[1] == sent[-1][2]
+
+    restarted = PsychloBridge(
+        store=PsychloBridgeStore(store_path), dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    assert restarted.register_project(changed) == {"accepted": True}
+    assert len(sent) == 2
+    assert restarted.store.project("arcade") == stored
+
+
+def test_register_project_rejects_v3_decommission_without_persistence(tmp_path: Path):
+    registration = _registration_payload("arcade", "member-hermione")
+    changed = json.loads(json.dumps(registration))
+    envelope = changed["envelope"]
+    envelope["contractVersion"] = "a-team.psychlo.handoff.v3"
+    envelope["requestBinding"] = {"psychloRequestId": "request-arcade-decommission", "requestedCommand": "decommission"}
+    envelope["lifecycle"] = {"kind": "decommission", "deploymentAvailability": "unavailable"}
+    envelope.pop("digest", None)
+    envelope["digest"] = canonical_digest(envelope)
+    changed["receipt"]["handoffContractVersion"] = envelope["contractVersion"]
+    changed["receipt"]["envelopeDigest"] = envelope["digest"]
+    sent = []
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="decommission"):
+        bridge.register_project(changed)
+    assert bridge.store.project("arcade") is None
+    assert sent == []
 
 
 @pytest.mark.parametrize("defect", ["wrong_previous", "wrong_team", "wrong_lead"])

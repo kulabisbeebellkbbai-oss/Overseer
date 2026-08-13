@@ -32,7 +32,7 @@ REGISTRY_SCHEMA = "psychlo.registry-candidate.v1"
 ADOPTION_SCHEMA = "psychlo.adoption-evidence.v1"
 EXTERNAL_SCHEMA = "psychlo.external-round.v1"
 EXTERNAL_BINDING_SCHEMA = "psychlo.external-round-binding.v1"
-HANDOFF_VERSIONS = {"a-team.psychlo.handoff.v1", "a-team.psychlo.handoff.v2"}
+HANDOFF_VERSIONS = {"a-team.psychlo.handoff.v1", "a-team.psychlo.handoff.v2", "a-team.psychlo.handoff.v3"}
 HANDOFF_RECEIPT_VERSION = "a-team.psychlo.receipt.v1"
 TELEMETRY_KINDS = {"baseline", "completed-turn", "durable-checkpoint", "bounded-long-turn", "terminal"}
 ATTRIBUTIONS = {"isolated", "shared", "censored", "unknown"}
@@ -209,7 +209,15 @@ def parse_project_registration(payload: Mapping[str, Any]) -> dict[str, Any]:
     envelope = _object(registration["envelope"], name="handoff envelope")
     version = envelope.get("contractVersion")
     base = {"contractVersion", "source", "aTeamId", "approval", "project", "projectLead", "plan", "correlationId", "idempotencyKey", "occurredAt", "digest"}
-    if version not in HANDOFF_VERSIONS or set(envelope) != (base | ({"lifecycle"} if version.endswith(".v2") else set())) or envelope.get("source") != "a-team":
+    if version == "a-team.psychlo.handoff.v1":
+        expected_envelope_keys = base
+    elif version == "a-team.psychlo.handoff.v2":
+        expected_envelope_keys = base | {"lifecycle"}
+    elif version == "a-team.psychlo.handoff.v3":
+        expected_envelope_keys = base | {"requestBinding"} | ({"lifecycle"} if "lifecycle" in envelope else set())
+    else:
+        expected_envelope_keys = set()
+    if version not in HANDOFF_VERSIONS or set(envelope) != expected_envelope_keys or envelope.get("source") != "a-team":
         raise ContractError("handoff envelope contract is invalid")
     _id(envelope.get("aTeamId"), name="aTeamId"); _id(envelope.get("correlationId"), name="correlationId"); _id(envelope.get("idempotencyKey"), name="idempotencyKey")
     _offset_timestamp(envelope.get("occurredAt"), name="occurredAt")
@@ -245,7 +253,17 @@ def parse_project_registration(payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(criteria, list) or len(criteria) > 32: raise ContractError("task acceptance criteria are invalid")
         for item in criteria: _text(item, name="task acceptance criterion")
     _validate_task_graph(task_ids, dependencies)
-    if version.endswith(".v2"): _parse_handoff_lifecycle(envelope.get("lifecycle"), project, lead["id"])
+    if version == "a-team.psychlo.handoff.v2" or (version == "a-team.psychlo.handoff.v3" and "lifecycle" in envelope):
+        _parse_handoff_lifecycle(envelope.get("lifecycle"), project, lead["id"])
+    if version == "a-team.psychlo.handoff.v3":
+        binding = _object(envelope.get("requestBinding"), name="handoff request binding")
+        if set(binding) != {"psychloRequestId", "requestedCommand"} or binding.get("requestedCommand") not in {"start", "continue", "plan-change", "decommission"}:
+            raise ContractError("handoff request binding is invalid")
+        _id(binding.get("psychloRequestId"), name="psychloRequestId")
+        command = binding["requestedCommand"]
+        lifecycle_kind = envelope.get("lifecycle", {}).get("kind") if isinstance(envelope.get("lifecycle"), Mapping) else None
+        if (command == "start" and lifecycle_kind is not None) or (command in {"continue", "plan-change"} and lifecycle_kind != "change") or (command == "decommission" and lifecycle_kind != "decommission"):
+            raise ContractError("handoff request binding does not match lifecycle")
     _digest(envelope.get("digest"), name="handoff digest")
     if canonical_digest(envelope) != envelope["digest"]: raise ContractError("handoff envelope digest does not match canonical content")
     receipt = _object(registration["receipt"], name="handoff receipt")

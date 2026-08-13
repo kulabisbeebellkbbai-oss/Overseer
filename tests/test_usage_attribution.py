@@ -121,7 +121,8 @@ def _lease_owner_process(path: str, ready, release, result_queue) -> None:
         ready.set()
         release.wait(10)
     try:
-        result_queue.put(UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload), before_send=before_send).emit("observation-20260812", policy_version="2026-08-13")["replay"])
+        result = UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload), before_send=before_send).emit("observation-20260812", policy_version="2026-08-13")
+        result_queue.put((result["replay"], result["state"], result["delivered"]))
     except Exception as error:  # pragma: no cover - assertion reports child failure
         result_queue.put(f"error:{error}")
 
@@ -131,7 +132,7 @@ def _lease_competitor_process(path: str, result_queue) -> None:
     calls: list[str] = []
     try:
         result = UsageSnapshotProducer(ledger, sender=lambda *_: calls.append("sent") or pytest.fail("second owner must not send")).emit("observation-20260812", policy_version="2026-08-13")
-        result_queue.put((result["replay"], calls))
+        result_queue.put((result["replay"], result["state"], result["delivered"], calls))
     except Exception as error:  # pragma: no cover - assertion reports child failure
         result_queue.put(f"error:{error}")
 
@@ -175,6 +176,7 @@ def test_authoritative_observation_and_bound_receipts_produce_exact_psychlo_payl
     assert snapshot["dailyConsumed"] == 20
     assert snapshot["otherDevelopmentConsumed"] == 22
     assert snapshot["dailyConsumed"] + snapshot["otherDevelopmentConsumed"] == snapshot["weeklyQuota"] - snapshot["weeklyRemainingCapacity"]
+    assert result["state"] == "delivered" and result["delivered"] is True
     assert snapshot["unusedPriorDayWeeklyCapacity"] == 58.0
     assert result["replay"] is False
     assert sent[0][0:2] == ("usage-snapshot", envelope["idempotencyKey"])
@@ -261,6 +263,7 @@ def test_snapshot_and_delivery_intent_are_immutable_and_replay_after_restart(tmp
     restarted = _ledger(path)
     replay = UsageSnapshotProducer(restarted, sender=lambda *_: pytest.fail("delivered replay must not resend" )).emit("observation-20260812", policy_version="2026-08-13")
     assert replay["replay"] is True
+    assert replay["state"] == "delivered" and replay["delivered"] is True
     assert replay["payload"] == first["payload"]
     with pytest.raises(UsageAttributionError, match="immutable|conflict"):
         restarted.record_provider_observation(_observation(weeklyQuota=701, totalConsumed=43))
@@ -343,7 +346,8 @@ def test_duplicate_receipt_survives_restart_without_resend(tmp_path: Path):
     ledger.connection.close()
     restarted = _ledger(path)
     replay = UsageSnapshotProducer(restarted, sender=lambda *_: pytest.fail("duplicate delivery receipt must prevent resend")).emit("observation-20260812", policy_version="2026-08-13")
-    assert replay["replay"] is True and replay["receipt"] == first["receipt"] == stored["receipt"]
+    assert replay["replay"] is True and replay["state"] == "delivered" and replay["delivered"] is True
+    assert replay["receipt"] == first["receipt"] == stored["receipt"]
 
 
 def test_uncertain_delivery_has_one_bounded_exact_payload_retry(tmp_path: Path):
@@ -436,9 +440,9 @@ def test_unexpired_delivery_lease_excludes_second_sender(tmp_path: Path):
     competitor_queue = multiprocessing.Queue()
     competitor = multiprocessing.Process(target=_lease_competitor_process, args=(str(path), competitor_queue))
     competitor.start()
-    assert competitor_queue.get(timeout=10) == (True, [])
+    assert competitor_queue.get(timeout=10) == (False, "sending", False, [])
     release.set()
-    assert queue.get(timeout=10) is False
+    assert queue.get(timeout=10) == (False, "delivered", True)
     owner.join(timeout=10)
     competitor.join(timeout=10)
     assert owner.exitcode == 0 and competitor.exitcode == 0

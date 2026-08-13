@@ -9,7 +9,7 @@ import base64
 from pathlib import Path
 
 from .psychlo_bridge import MAX_BODY_BYTES, _read_private_file, create_bridge_from_environment
-from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, managed_receipt_validator
+from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, _validate_usage_snapshot_receipt, managed_receipt_validator
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,8 +39,9 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(receipt, dict): raise ValueError("usage receipt input is invalid")
             ledger.record_execution_receipt(receipt)
         result = UsageSnapshotProducer(ledger, sender=bridge.sender).emit(str(observation["observationId"]), policy_version=args.policy_version)
-        print(json.dumps({"delivered": True, "replay": result["replay"], "receipt": result.get("receipt")}, sort_keys=True))
-        return 0
+        output, exit_code = _usage_delivery_output(result, ledger)
+        print(json.dumps(output, sort_keys=True))
+        return exit_code
     if args.command == "sync-projects":
         bridge = create_bridge_from_environment()
         with open(args.handoff_file, encoding="utf-8") as handle:
@@ -66,6 +67,46 @@ def _closed_json(path: Path, keys: set[str] | None) -> object:
     if keys is not None and (not isinstance(value, dict) or set(value) != keys or any(not isinstance(value[key], str) for key in keys)):
         raise ValueError("usage authority configuration is invalid")
     return value
+
+
+def _usage_delivery_output(result: object, ledger: UsageAttributionLedger) -> tuple[dict[str, object], int]:
+    """Render only a durably persisted delivery as CLI success."""
+    if isinstance(result, dict):
+        payload = result.get("payload")
+        receipt = result.get("receipt")
+        state = result.get("state")
+    else:
+        payload = receipt = state = None
+    persisted = None
+    if isinstance(payload, dict) and isinstance(payload.get("idempotencyKey"), str):
+        persisted = ledger.delivery_intent(payload["idempotencyKey"])
+    if state == "delivered" and isinstance(payload, dict) and isinstance(receipt, dict) and persisted is not None:
+        try:
+            validated = _validate_usage_snapshot_receipt(receipt, payload)
+        except Exception:
+            validated = None
+        persisted_receipt = persisted.get("receipt") if isinstance(persisted, dict) else None
+        if (
+            persisted.get("state") == "delivered"
+            and isinstance(validated, dict)
+            and isinstance(persisted_receipt, dict)
+            and persisted_receipt == validated
+            and validated.get("outcome") in {"inserted", "duplicate"}
+        ):
+            return {
+                "delivered": True,
+                "state": "delivered",
+                "replay": bool(result.get("replay")),
+                "receipt": persisted_receipt,
+            }, 0
+    safe_state = state if state in {"pending", "sending", "uncertain", "rejected"} else "not-delivered"
+    safe: dict[str, object] = {"delivered": False, "state": safe_state, "replay": False}
+    if isinstance(payload, dict):
+        for field in ("idempotencyKey", "messageId"):
+            value = payload.get(field)
+            if isinstance(value, str) and 0 < len(value) <= 200:
+                safe[field] = value
+    return safe, 1
 
 
 if __name__ == "__main__":

@@ -401,6 +401,20 @@ class UsageSnapshotProducer:
     def __init__(self, ledger: UsageAttributionLedger, *, sender: Callable[[str,str,dict[str,Any]], Mapping[str,Any]], before_send: Callable[[], None] | None = None, after_send: Callable[[], None] | None = None):
         self.ledger=ledger; self.sender=sender; self.before_send=before_send; self.after_send=after_send
 
+    @staticmethod
+    def _result(payload: Mapping[str, Any], *, state: str, replay: bool, receipt: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return the durable intent state, never an optimistic send result."""
+        delivered = state == "delivered" and isinstance(receipt, Mapping)
+        return {
+            "payload": dict(payload),
+            "state": state,
+            "delivered": delivered,
+            # ``replay`` is a successful replay only when the persisted state
+            # is delivered.  An active lease is not a replay success.
+            "replay": bool(replay and delivered),
+            "receipt": dict(receipt) if isinstance(receipt, Mapping) else None,
+        }
+
     def emit(self, observation_id: str, *, policy_version: str) -> dict[str, Any]:
         observation=self.ledger.observation(observation_id)
         receipts=self.ledger.receipts_for_observation(observation)
@@ -417,7 +431,10 @@ class UsageSnapshotProducer:
         payload, _ = self.ledger.prepare_intent(observation_id,envelope)
         intent=self.ledger.delivery_intent(str(payload["idempotencyKey"]))
         key=str(payload["idempotencyKey"])
-        if intent and intent["state"]=="delivered": return {"payload":payload,"replay":True,"receipt":intent["receipt"]}
+        if intent and intent["state"]=="delivered":
+            if not isinstance(intent.get("receipt"), Mapping):
+                raise UsageAttributionError("delivered snapshot intent has no durable receipt")
+            return self._result(payload, state="delivered", replay=True, receipt=intent["receipt"])
         if intent and intent["state"]=="rejected":
             raise UsageAttributionError("snapshot delivery is permanently rejected")
         attempt_token=self.ledger.claim_pending(key)
@@ -427,7 +444,9 @@ class UsageSnapshotProducer:
                 raise UsageAttributionError("usage snapshot delivery retry limit exhausted")
             if current and current["state"] == "sending" and int(current["attempts"]) >= self.ledger._MAX_SNAPSHOT_DELIVERY_ATTEMPTS and current.get("leaseExpiresAt") is not None and _time(str(current["leaseExpiresAt"]), "lease") <= _time(self.ledger._now(), "clock"):
                 raise UsageAttributionError("usage snapshot delivery retry limit exhausted")
-            return {"payload":payload,"replay":True,"receipt":current["receipt"] if current else None}
+            state = str(current["state"]) if current else "not-delivered"
+            receipt = current.get("receipt") if current else None
+            return self._result(payload, state=state, replay=state == "delivered", receipt=receipt)
         try:
             if self.before_send is not None:
                 self.before_send()
@@ -466,7 +485,10 @@ class UsageSnapshotProducer:
             raise
         if not self.ledger.mark_delivered(key, attempt_token, receipt):
             raise UsageAttributionError("usage snapshot delivery lease lost")
-        return {"payload":payload,"replay":False,"receipt":receipt}
+        persisted = self.ledger.delivery_intent(key)
+        if persisted is None or persisted["state"] != "delivered" or not isinstance(persisted.get("receipt"), Mapping):
+            raise UsageAttributionError("usage snapshot delivery receipt was not persisted")
+        return self._result(payload, state="delivered", replay=False, receipt=persisted["receipt"])
 
 
 def managed_receipt_validator(store: Any) -> Callable[[Mapping[str, Any]], None]:

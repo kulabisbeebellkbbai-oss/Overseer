@@ -597,7 +597,9 @@ class PsychloBridge:
             request = parse_policy_exception_request(payload)
         except ContractError as error:
             raise ValueError(str(error)) from error
-        stored, inserted = self.store.record_policy_exception_request(request, request["digest"], receiver_message_id=message_id or request["id"])
+        receiver_message_id = message_id or request["id"]
+        initial_receipt = _policy_exception_receiver_receipt(request, receiver_message_id, outcome="inserted")
+        stored, inserted = self.store.record_policy_exception_request(request, request["digest"], receiver_message_id=receiver_message_id, receiver_receipt=initial_receipt)
         receiver_message_id = stored.get("receiverMessageId") or message_id or request["id"]
         receipt = _durable_policy_exception_receiver_receipt(self.store, request, inserted=inserted, message_id=receiver_message_id)
         if stored["outcome"] is not None and stored["state"] not in {"expired", "recovery-invalid"}:

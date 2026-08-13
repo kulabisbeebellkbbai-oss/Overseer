@@ -34,6 +34,18 @@ def _dump_wire(value: Mapping[str, Any]) -> str:
     return json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"))
 
 
+def _requested_values_equal(left: Any, right: Any) -> bool:
+    """Compare the optional scalar without collapsing booleans into numbers."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        # Request validation has already rejected non-finite values.  Python's
+        # numeric comparison intentionally preserves the contract's existing
+        # f64 canonicalization, where -0 and +0 share the zero bit pattern.
+        return float(left) == float(right)
+    return left == right
+
+
 class PsychloBridgeStore:
     def __init__(self, filename: str | Path):
         self.filename = Path(filename)
@@ -175,7 +187,7 @@ class PsychloBridgeStore:
         if row is None: return None
         return {"approvalId": approval_id, "digest": row[0], "payload": json.loads(row[1]), "createdAt": row[2]}
 
-    def record_policy_exception_request(self, request: Mapping[str, Any], digest: str | None = None, *, receiver_message_id: str | None = None) -> tuple[dict[str, Any], bool]:
+    def record_policy_exception_request(self, request: Mapping[str, Any], digest: str | None = None, *, receiver_message_id: str | None = None, receiver_receipt: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
         value = dict(request); request_id = value.get("id")
         if not isinstance(request_id, str) or not request_id.strip(): raise ValueError("policy exception request identity is required")
         selected_digest = str(digest or value.get("digest") or policy_exception_request_digest(value))
@@ -183,6 +195,11 @@ class PsychloBridgeStore:
         idempotency_key = value.get("idempotencyKey")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip(): raise ValueError("policy exception idempotency key is required")
         encoded = _dump_wire(value)
+        parsed_receipt = parse_policy_exception_receiver_receipt(receiver_receipt) if receiver_receipt is not None else None
+        if parsed_receipt is not None:
+            self._validate_policy_exception_receiver_receipt_binding(request_id, value, parsed_receipt)
+            if parsed_receipt["outcome"] != "inserted":
+                raise ValueError("initial policy exception receiver receipt must be inserted")
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.connection.execute("SELECT request_id,digest,payload_json FROM policy_exception_requests WHERE idempotency_key=? OR request_id=?", (idempotency_key, request_id)).fetchone()
@@ -190,7 +207,7 @@ class PsychloBridgeStore:
                 if existing[1] != selected_digest or json.loads(existing[2]) != value: raise ValueError("policy exception idempotency conflict")
                 self.connection.execute("COMMIT")
                 return self.policy_exception_request(str(existing[0])), False
-            self.connection.execute("INSERT INTO policy_exception_requests(request_id,digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id,receiver_message_id) VALUES (?,?,?,'pending',NULL,NULL,?,?,NULL,?)", (request_id, selected_digest, encoded, self._now(), idempotency_key, receiver_message_id))
+            self.connection.execute("INSERT INTO policy_exception_requests(request_id,digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id,receiver_message_id,receiver_receipt_json) VALUES (?,?,?,'pending',NULL,NULL,?,?,NULL,?,?)", (request_id, selected_digest, encoded, self._now(), idempotency_key, receiver_message_id, _dump_wire(parsed_receipt) if parsed_receipt is not None else None))
             self.connection.execute("COMMIT")
         except sqlite3.IntegrityError as error:
             self.connection.execute("ROLLBACK")
@@ -199,6 +216,11 @@ class PsychloBridgeStore:
             self.connection.execute("ROLLBACK")
             raise
         return self.policy_exception_request(request_id), True
+
+    @staticmethod
+    def _validate_policy_exception_receiver_receipt_binding(request_id: str, payload: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
+        if receipt["exceptionId"] != request_id or receipt["requestDigest"] != payload.get("digest") or receipt["policyRevision"] != payload.get("policyRevision") or receipt["ruleId"] != payload.get("requestedRuleId") or receipt["scopeDigest"] != payload.get("scopeDigest") or receipt["decisionVersion"] != payload.get("decisionVersion") or receipt["correlationId"] != payload.get("correlationId") or receipt["idempotencyKey"] != payload.get("idempotencyKey") or ("requestedValue" in receipt) != ("requestedValue" in payload) or not _requested_values_equal(receipt.get("requestedValue"), payload.get("requestedValue")):
+            raise ValueError("policy exception receiver receipt does not bind to the exact request")
 
     def policy_exception_request(self, request_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id,receiver_message_id,receiver_receipt_json FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
@@ -215,8 +237,7 @@ class PsychloBridgeStore:
             if row is None:
                 raise ValueError("policy exception request is missing")
             payload = json.loads(row[0])
-            if parsed["exceptionId"] != request_id or parsed["requestDigest"] != payload.get("digest") or parsed["policyRevision"] != payload.get("policyRevision") or parsed["ruleId"] != payload.get("requestedRuleId") or parsed["scopeDigest"] != payload.get("scopeDigest") or parsed["decisionVersion"] != payload.get("decisionVersion") or parsed["correlationId"] != payload.get("correlationId") or parsed["idempotencyKey"] != payload.get("idempotencyKey") or ("requestedValue" in parsed) != ("requestedValue" in payload) or parsed.get("requestedValue") != payload.get("requestedValue"):
-                raise ValueError("policy exception receiver receipt does not bind to the exact request")
+            self._validate_policy_exception_receiver_receipt_binding(request_id, payload, parsed)
             if row[1] is not None:
                 existing = json.loads(row[1])
                 if existing != parsed:

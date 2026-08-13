@@ -1668,6 +1668,73 @@ def test_policy_exception_receiver_receipt_preserves_absence_and_rejects_value_c
         bridge.receive_policy_exception_request(altered, message_id="altered-retry")
 
 
+@pytest.mark.parametrize("request_value,receipt_value", [(False, 0), (True, 1)])
+def test_policy_exception_receiver_receipt_does_not_collapse_boolean_and_numeric_values(tmp_path: Path, request_value: object, receipt_value: object):
+    request = _policy_exception_request(id=f"exception-receiver-type-{str(request_value).lower()}", requestedValue=request_value)
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    bridge.receive_policy_exception_request(request, message_id=request["id"])
+    forged = dict(bridge.store.policy_exception_request(request["id"])["receiverReceipt"])
+    forged["requestedValue"] = receipt_value
+    with pytest.raises(ValueError, match="bind|immutable"):
+        bridge.store.record_policy_exception_receiver_receipt(request["id"], forged)
+
+
+def test_policy_exception_request_and_inserted_receipt_commit_atomically_after_interruption(tmp_path: Path):
+    class FailCommitConnection:
+        def __init__(self, connection):
+            self.connection = connection
+            self.fail = True
+
+        def execute(self, sql, *args):
+            if self.fail and sql == "COMMIT":
+                self.fail = False
+                raise RuntimeError("injected receiver receipt commit interruption")
+            return self.connection.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(path)
+    raw_connection = store.connection
+    failing_connection = FailCommitConnection(raw_connection)
+    store.connection = failing_connection
+    request = _policy_exception_request(id="exception-receiver-atomic", requestedValue=1.25)
+    bridge = PsychloBridge(
+        store=store,
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    with pytest.raises(RuntimeError, match="interruption"):
+        bridge.receive_policy_exception_request(request, message_id=request["id"])
+    store.connection = raw_connection
+    assert store.policy_exception_request(request["id"]) is None
+
+    inserted = bridge.receive_policy_exception_request(request, message_id=request["id"])
+    assert inserted["receipt"]["outcome"] == "inserted"
+    assert inserted["receipt"]["requestedValue"] == 1.25
+    store.connection.close()
+    restarted = PsychloBridge(
+        store=PsychloBridgeStore(path),
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    duplicate = restarted.receive_policy_exception_request(request, message_id="fresh-atomic-retry")
+    assert duplicate["receipt"]["outcome"] == "duplicate"
+    assert duplicate["receipt"]["messageId"] == request["id"]
+    assert duplicate["receipt"]["requestedValue"] == 1.25
+
+
 def test_policy_exception_receiver_receipt_rejects_same_key_conflict(tmp_path: Path):
     request = _policy_exception_request(id="exception-receiver-conflict")
     bridge = PsychloBridge(

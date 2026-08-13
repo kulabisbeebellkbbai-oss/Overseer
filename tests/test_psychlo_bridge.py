@@ -26,7 +26,7 @@ from overseer.psychlo_bridge import (
     verify_peer_request,
     _read_secret,
 )
-from overseer.psychlo_contracts import canonical_digest, ContractError, parse_policy_exception_outcome, policy_exception_outcome_digest
+from overseer.psychlo_contracts import canonical_digest, ContractError, parse_policy_exception_outcome, policy_exception_outcome_digest, policy_exception_request_digest
 from overseer.psychlo_store import _round_result_digest
 from overseer.psychlo_contracts import parse_policy_exception_request
 from overseer.audit import ApprovalRequest, ApprovalStatus
@@ -1296,13 +1296,13 @@ def _policy_exception_request(**changes: object) -> dict:
         "occurredAt": "2026-08-12T12:00:00.000Z",
     }
     base.update(changes)
-    base["digest"] = canonical_digest(base)
+    base["digest"] = policy_exception_request_digest(base)
     return base
 
 
 def _save_policy_exception_approval(path: Path, request: dict, *, status: ApprovalStatus = ApprovalStatus.APPROVED) -> SQLiteStore:
     primary = SQLiteStore(path)
-    digest = canonical_digest(request)
+    digest = policy_exception_request_digest(request)
     plan_base = plan_user_service_restart("plan-" + request["id"], request["id"], "approve Psychlo policy exception")
     plan = replace(
         plan_base,
@@ -1439,6 +1439,8 @@ def test_v11_policy_exception_fixture_recomputes_exact_digests():
     assert canonical_digest({key: value for key, value in usage["snapshot"].items() if key != "digest"}) == usage["snapshot"]["digest"]
     assert canonical_digest({key: value for key, value in usage.items() if key != "digest"}) == usage["digest"]
     assert {fixture["usageSnapshot"]["snapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700.0, 612.0, 42.0, 17.0}
+    assert fixture["usageSnapshot"]["snapshot"]["digest"] == "fbf1f2fbe8a8ae2b11d41cc571a06863de0b554681d6fb94734dcfed9f91da1f"
+    assert fixture["usageSnapshot"]["digest"] == "c37736f7d6722374e8c5bb06cdb51d233af3ccea0b3b2432dc5899de3327b46c"
 
 
 @pytest.mark.parametrize("left,right", [(1.0, 1), (-0.0, 0), (1.25, 1.25), (1e-3, 0.001), (1e-7, 0.0000001), (1e21, 1000000000000000000000)])
@@ -1458,6 +1460,7 @@ def test_rejected_policy_exception_reason_is_bounded():
     outcome = {
         "schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": "rejected",
         "exceptionId": "exception-reason", "policyRevision": 1, "ruleId": "enforce-provider-quota",
+        "requestedValue": False,
         "requestDigest": "a" * 64, "decisionId": "decision-reason", "decisionDigest": "b" * 64,
         "actorId": "operator-1", "correlationId": "correlation-reason", "idempotencyKey": "idempotency-reason",
         "occurredAt": NOW, "scopeDigest": "c" * 64, "decisionVersion": "decision-v1", "reason": "x" * 513,
@@ -1471,8 +1474,93 @@ def test_policy_exception_rejects_unused_proposed_policy_fields():
     request = _policy_exception_request()
     request["basePolicyDigest"] = "b" * 64
     request["digest"] = canonical_digest({key: value for key, value in request.items() if key != "digest"})
-    with pytest.raises(ContractError, match="unknown fields"):
+    with pytest.raises(ContractError, match="form"):
         parse_policy_exception_request(request)
+
+
+def _policy_revision(*, revision: int = 5) -> dict:
+    return {
+        "schemaVersion": "psychlo.policy.v1", "id": "policy-proposed", "revision": revision,
+        "dailyQuotaPercent": 70, "safetyReservePercent": 10, "projectShares": {"project-1": 50},
+        "failurePauseThreshold": 3,
+        "rules": {
+            "reset-daily-at-provider-reset": True, "count-other-development": True,
+            "enforce-provider-quota": True, "enforce-safety-reserve": True,
+            "respect-blackouts": True, "carry-unused-daily-allowance": True,
+            "pause-after-failures": True, "require-manual-resume": True,
+            "enforce-project-share": True,
+        },
+        "operatingEnvelope": {"maxDailyQuotaPercent": 90, "minSafetyReservePercent": 5},
+        "actorId": "operator-1", "correlationId": "policy-correlation", "idempotencyKey": "policy-idempotency",
+        "occurredAt": NOW,
+    }
+
+
+def test_policy_exception_proposed_policy_form_is_strict_and_discriminated():
+    proposed = _policy_revision()
+    proposed["digest"] = canonical_digest(proposed)
+    request = _policy_exception_request(basePolicyDigest="b" * 64, proposedPolicy=proposed)
+    request.pop("requestedValue")
+    request["digest"] = policy_exception_request_digest(request)
+    assert parse_policy_exception_request(request) == request
+    outcome = {
+        "schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": "approved",
+        "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"],
+        "basePolicyDigest": request["basePolicyDigest"], "proposedPolicy": proposed,
+        "requestDigest": request["digest"], "decisionId": "decision-proposed", "decisionDigest": "d" * 64,
+        "actorId": request["actorId"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"],
+        "occurredAt": NOW, "scopeDigest": request["scopeDigest"], "decisionVersion": request["decisionVersion"],
+    }
+    outcome["outcomeDigest"] = policy_exception_outcome_digest(outcome)
+    assert parse_policy_exception_outcome(outcome) == outcome
+
+    scalar = _policy_exception_request()
+    scalar.pop("requestedValue")
+    scalar["digest"] = policy_exception_request_digest(scalar)
+    with pytest.raises(ContractError, match="requestedValue|form"):
+        parse_policy_exception_request(scalar)
+
+    mixed = _policy_exception_request(basePolicyDigest="b" * 64, proposedPolicy=proposed)
+    mixed["digest"] = policy_exception_request_digest(mixed)
+    with pytest.raises(ContractError, match="requestedValue|form"):
+        parse_policy_exception_request(mixed)
+
+
+def test_policy_exception_outcome_mirrors_form_and_status_reason_rules():
+    approved = {
+        "schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": "approved",
+        "exceptionId": "exception-form", "policyRevision": 4, "ruleId": "enforce-safety-reserve",
+        "requestedValue": False, "requestDigest": "a" * 64, "decisionId": "decision-form", "decisionDigest": "b" * 64,
+        "actorId": "operator-1", "correlationId": "correlation-form", "idempotencyKey": "idempotency-form",
+        "occurredAt": NOW, "scopeDigest": "c" * 64, "decisionVersion": "decision-v1",
+    }
+    approved["outcomeDigest"] = policy_exception_outcome_digest(approved)
+    assert parse_policy_exception_outcome(approved) == approved
+    with_reason = {**approved, "reason": "must be rejected for approved outcome"}
+    with_reason["outcomeDigest"] = policy_exception_outcome_digest(with_reason)
+    with pytest.raises(ContractError, match="reason"):
+        parse_policy_exception_outcome(with_reason)
+
+    rejected = {**approved, "status": "rejected", "reason": "bounded rejection"}
+    rejected["outcomeDigest"] = policy_exception_outcome_digest(rejected)
+    assert parse_policy_exception_outcome(rejected) == rejected
+
+
+@pytest.mark.parametrize("value,tag", [(1, "3ff0000000000000"), (1.0, "3ff0000000000000"), (-0.0, "0000000000000000"), (0.125, "3fc0000000000000"), (1e-7, "3e7ad7f29abcaf48")])
+def test_policy_exception_requested_value_vectors_use_field_specific_f64_tags(value: object, tag: str):
+    left = _policy_exception_request(requestedValue=value)
+    expected = {key: item for key, item in left.items() if key != "digest"}
+    expected["requestedValue"] = {"$f64": tag}
+    expected_digest = hashlib.sha256(json.dumps(expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert policy_exception_request_digest(left) == expected_digest
+    assert left["digest"] == policy_exception_request_digest(left)
+    assert canonical_digest({key: item for key, item in left.items() if key != "digest"}) != left["digest"]
+
+
+def test_policy_exception_requested_value_boolean_remains_wire_boolean_and_unmodified():
+    request = _policy_exception_request(requestedValue=False)
+    assert isinstance(request["requestedValue"], bool)
+    assert policy_exception_request_digest(request) == canonical_digest({key: item for key, item in request.items() if key != "digest"})
 
 
 def test_policy_exception_idempotency_is_globally_unique_and_exact_replay_only(tmp_path: Path):

@@ -39,6 +39,7 @@ from .psychlo_contracts import (
     parse_project_registration,
     parse_policy_exception_request,
     parse_policy_exception_outcome,
+    policy_exception_request_digest,
     parse_usage_snapshot_v11,
     policy_exception_outcome_digest,
     parse_registry_candidate,
@@ -670,7 +671,7 @@ class PsychloBridge:
         approval = record["approval"]; metadata = record["metadata"]
         decision_id = metadata.get("decisionId", f"roadex:psychlo-policy-exception:{request['id']}")
         decision_digest = metadata.get("decisionDigest", canonical_digest({"approvalId": approval.id, "subjectId": approval.subject_id, "requestDigest": request["digest"]}))
-        outcome = {"schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": status, "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"], **({"requestedValue": request["requestedValue"]} if "requestedValue" in request else {}), "requestDigest": request["digest"], "decisionId": decision_id, "decisionDigest": decision_digest, "scopeDigest": request["scopeDigest"], "decisionVersion": request["decisionVersion"], "actorId": request["actorId"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"], "occurredAt": self.clock()}
+        outcome = {"schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": status, "exceptionId": request["id"], "policyRevision": request["policyRevision"], "ruleId": request["requestedRuleId"], **({"requestedValue": request["requestedValue"]} if "requestedValue" in request else {}), **({"basePolicyDigest": request["basePolicyDigest"], "proposedPolicy": request["proposedPolicy"]} if "proposedPolicy" in request else {}), "requestDigest": request["digest"], "decisionId": decision_id, "decisionDigest": decision_digest, "scopeDigest": request["scopeDigest"], "decisionVersion": request["decisionVersion"], "actorId": request["actorId"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"], "occurredAt": self.clock()}
         if reason is not None: outcome["reason"] = reason
         outcome["outcomeDigest"] = policy_exception_outcome_digest(outcome)
         try: parse_policy_exception_outcome(outcome)
@@ -686,7 +687,7 @@ class PsychloBridge:
             if record is None or record.get("state") != "forward-pending" or not isinstance(record.get("outcome"), dict): continue
             try:
                 request = parse_policy_exception_request(record["payload"])
-                if record.get("requestId") != request["id"] or record.get("digest") != request["digest"] or canonical_digest({key: value for key, value in request.items() if key != "digest"}) != record.get("digest"):
+                if record.get("requestId") != request["id"] or record.get("digest") != request["digest"] or policy_exception_request_digest(request) != record.get("digest"):
                     raise ValueError("stored policy exception request is corrupt")
                 if self._policy_exception_expired(request):
                     self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())

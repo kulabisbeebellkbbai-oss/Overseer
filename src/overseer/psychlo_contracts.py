@@ -59,53 +59,35 @@ def _canonical(value: Any) -> str:
         return "{" + ",".join(json.dumps(str(k), separators=(",", ":")) + ":" + _canonical(value[k]) for k in sorted(value)) + "}"
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(_canonical(item) for item in value) + "]"
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if isinstance(value, (int, float)):
-        return _canonical_number(value)
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _canonical_number(value: int | float) -> str:
-    """Encode numbers using the ECMAScript/JSON shortest-number rules.
-
-    Python's JSON parser preserves arbitrary-size integers while JavaScript
-    parses them as IEEE-754 doubles.  Converting both input types to a double
-    before formatting prevents a Python/JS digest split for integral values,
-    exponent notation, and negative zero.
-    """
-    try:
-        number = float(value)
-    except (OverflowError, ValueError) as error:
-        raise ContractError("numeric value is outside canonical JSON range") from error
-    if not math.isfinite(number):
-        raise ContractError("numeric value is not finite")
-    if number == 0:
-        return "0"
-    text = repr(number).lower()
-    if "e" not in text:
-        if text.endswith(".0"):
-            text = text[:-2]
-        return text
-    mantissa, exponent_text = text.split("e", 1)
-    exponent = int(exponent_text)
-    if -6 <= exponent < 21:
-        negative = mantissa.startswith("-")
-        digits = mantissa.lstrip("-").replace(".", "")
-        decimal_index = (mantissa.lstrip("-").find(".") if "." in mantissa else len(mantissa.lstrip("-"))) + exponent
-        if decimal_index <= 0:
-            plain = "0." + ("0" * -decimal_index) + digits
-        elif decimal_index >= len(digits):
-            plain = digits + ("0" * (decimal_index - len(digits)))
-        else:
-            plain = digits[:decimal_index] + "." + digits[decimal_index:]
-        return ("-" if negative else "") + plain
-    return f"{mantissa}e{'+' if exponent >= 0 else ''}{exponent}"
 
 
 def canonical_digest(value: Mapping[str, Any]) -> str:
     """Return SHA-256 over canonical content, ignoring a top-level digest."""
     content = {key: item for key, item in value.items() if key != "digest"}
+    return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
+
+
+def _policy_exception_f64_tag(value: Any, *, name: str) -> dict[str, str]:
+    """Return the exact cross-language digest representation for one number."""
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ContractError(f"{name} must be a finite binary64 number") from error
+    if not math.isfinite(number):
+        raise ContractError(f"{name} must be a finite binary64 number")
+    bits = 0 if number == 0 else struct.unpack(">Q", struct.pack(">d", number))[0]
+    return {"$f64": f"{bits:016x}"}
+
+
+def _policy_exception_digest(value: Mapping[str, Any]) -> str:
+    """Digest an exception while tagging only its requestedValue number."""
+    content = {key: item for key, item in value.items() if key != "digest"}
+    requested = content.get("requestedValue")
+    if "requestedValue" in content and not isinstance(requested, bool):
+        if not isinstance(requested, (int, float)):
+            raise ContractError("policy exception requested value must be boolean or finite number")
+        content["requestedValue"] = _policy_exception_f64_tag(requested, name="policy exception requested value")
     return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
 
 
@@ -621,13 +603,86 @@ def _finite_nonnegative(value: Any, *, name: str) -> float | int:
 def _policy_exception_requested_value(value: Any, *, name: str) -> None:
     if isinstance(value, bool):
         return
-    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ContractError(f"{name} must be boolean or finite number")
+    try:
+        finite = math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        finite = False
+    if not finite:
+        raise ContractError(f"{name} must be boolean or finite number")
+
+
+def _policy_revision(value: Any, *, expected_revision: int) -> dict[str, Any]:
+    proposed = _object(value, name="proposedPolicy")
+    fields = {"schemaVersion", "id", "revision", "dailyQuotaPercent", "safetyReservePercent", "projectShares", "failurePauseThreshold", "rules", "operatingEnvelope", "actorId", "correlationId", "idempotencyKey", "occurredAt", "digest"}
+    _keys(proposed, fields, name="proposedPolicy")
+    if proposed.get("schemaVersion") != "psychlo.policy.v1": raise ContractError("proposed policy schema is invalid")
+    _id(proposed.get("id"), name="proposed policy id")
+    revision = proposed.get("revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision != expected_revision + 1: raise ContractError("proposed policy revision is invalid")
+    for field in ("dailyQuotaPercent", "safetyReservePercent"):
+        value_number = proposed.get(field)
+        if isinstance(value_number, bool) or not isinstance(value_number, (int, float)):
+            raise ContractError(f"proposed policy {field} is invalid")
+        try: valid = math.isfinite(float(value_number)) and 0 <= value_number <= 100
+        except (OverflowError, TypeError, ValueError): valid = False
+        if not valid: raise ContractError(f"proposed policy {field} is invalid")
+    shares = _object(proposed.get("projectShares"), name="projectShares")
+    total = 0.0
+    for project_id, share in shares.items():
+        _id(project_id, name="project share project id")
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            raise ContractError("proposed policy project share is invalid")
+        try: valid = math.isfinite(float(share)) and 0 <= share <= 100
+        except (OverflowError, TypeError, ValueError): valid = False
+        if not valid: raise ContractError("proposed policy project share is invalid")
+        total += float(share)
+    if total > 100: raise ContractError("proposed policy project shares exceed 100 percent")
+    threshold = proposed.get("failurePauseThreshold")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 0 < threshold <= 100: raise ContractError("proposed policy failure threshold is invalid")
+    rules = _object(proposed.get("rules"), name="policy rules")
+    _keys(rules, POLICY_EXCEPTION_RULES, name="policy rules")
+    if any(not isinstance(enabled, bool) for enabled in rules.values()): raise ContractError("proposed policy rules are invalid")
+    envelope = _object(proposed.get("operatingEnvelope"), name="operatingEnvelope")
+    _keys(envelope, {"maxDailyQuotaPercent", "minSafetyReservePercent"}, name="operatingEnvelope")
+    for field in ("maxDailyQuotaPercent", "minSafetyReservePercent"):
+        value_number = envelope.get(field)
+        if isinstance(value_number, bool) or not isinstance(value_number, (int, float)):
+            raise ContractError(f"operating envelope {field} is invalid")
+        try: valid = math.isfinite(float(value_number)) and 0 <= value_number <= 100
+        except (OverflowError, TypeError, ValueError): valid = False
+        if not valid: raise ContractError(f"operating envelope {field} is invalid")
+    if proposed["dailyQuotaPercent"] > envelope["maxDailyQuotaPercent"] or proposed["safetyReservePercent"] < envelope["minSafetyReservePercent"]:
+        raise ContractError("proposed policy violates operating envelope")
+    _id(proposed.get("actorId"), name="proposed policy actorId")
+    _id(proposed.get("correlationId"), name="proposed policy correlationId")
+    _id(proposed.get("idempotencyKey"), name="proposed policy idempotencyKey")
+    _timestamp(proposed.get("occurredAt"))
+    _digest(proposed.get("digest"), name="proposed policy digest")
+    if canonical_digest(proposed) != proposed["digest"]: raise ContractError("proposed policy digest mismatch")
+    return proposed
+
+
+def _policy_exception_form(value: Mapping[str, Any], *, policy_revision: int, name: str) -> None:
+    has_requested = "requestedValue" in value
+    has_base = "basePolicyDigest" in value
+    has_proposed = "proposedPolicy" in value
+    if has_requested:
+        if has_base or has_proposed: raise ContractError(f"{name} scalar form cannot include proposed policy fields")
+        _policy_exception_requested_value(value["requestedValue"], name="policy exception requested value")
+        return
+    if has_base or has_proposed:
+        if not has_base or not has_proposed: raise ContractError(f"{name} proposed-policy form requires basePolicyDigest and proposedPolicy")
+        _digest(value["basePolicyDigest"], name="basePolicyDigest")
+        _policy_revision(value["proposedPolicy"], expected_revision=policy_revision)
+        return
+    raise ContractError(f"{name} requires exactly one exception form")
 
 
 def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str, rule_key: str) -> dict[str, Any]:
     required = {"schemaVersion", "id", rule_key, "policyRevision", "actorId", "reason", "activatedAt", "expiresAt", "correlationId", "idempotencyKey", "occurredAt", "scopeDigest", "decisionVersion", "digest"}
-    optional = {"requestedValue"}
+    optional = {"requestedValue", "basePolicyDigest", "proposedPolicy"}
     result = _strict_protocol(value, required=required, allowed=required | optional, name=name, schema=schema)
     _id(result["id"], name="exception id")
     _id(result[rule_key], name=rule_key)
@@ -640,10 +695,9 @@ def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str
     _timestamp(result["activatedAt"], name="activatedAt"); _timestamp(result["expiresAt"], name="expiresAt")
     if datetime.fromisoformat(result["expiresAt"].replace("Z", "+00:00")) <= datetime.fromisoformat(result["activatedAt"].replace("Z", "+00:00")):
         raise ContractError("policy exception expiry is invalid")
-    if "requestedValue" in result:
-        _policy_exception_requested_value(result["requestedValue"], name="policy exception requested value")
+    _policy_exception_form(result, policy_revision=result["policyRevision"], name=name)
     _digest(result["digest"], name="digest")
-    if canonical_digest({key: item for key, item in result.items() if key != "digest"}) != result["digest"]:
+    if _policy_exception_digest(result) != result["digest"]:
         raise ContractError(f"{name} digest mismatch")
     return result
 
@@ -653,30 +707,30 @@ def parse_policy_exception_request(payload: Mapping[str, Any]) -> dict[str, Any]
 
 
 def policy_exception_request_digest(payload: Mapping[str, Any]) -> str:
-    return canonical_digest({key: item for key, item in payload.items() if key != "digest"})
+    return _policy_exception_digest(payload)
 
 
 def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:
     fields = {"status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "scopeDigest", "decisionVersion"}
     result = {key: payload[key] for key in fields if key in payload}
-    for key in ("requestedValue", "reason"):
+    for key in ("requestedValue", "basePolicyDigest", "proposedPolicy", "reason"):
         if key in payload and payload[key] is not None: result[key] = payload[key]
-    return canonical_digest(result)
+    return _policy_exception_digest(result)
 
 
 def parse_policy_exception_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
     value = _object(payload, name="policy exception outcome")
     required = {"schemaVersion", "sourceId", "status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "actorId", "correlationId", "idempotencyKey", "occurredAt", "scopeDigest", "decisionVersion", "outcomeDigest"}
-    _keys(value, required | {"requestedValue", "reason"}, name="policy exception outcome")
+    _keys(value, required | {"requestedValue", "basePolicyDigest", "proposedPolicy", "reason"}, name="policy exception outcome")
     if value.get("schemaVersion") != POLICY_EXCEPTION_OUTCOME_SCHEMA or value.get("sourceId") != "overseer" or value.get("status") not in {"approved", "rejected"}: raise ContractError("policy exception outcome authority is invalid")
     _id(value.get("exceptionId"), name="exceptionId"); _id(value.get("ruleId"), name="ruleId")
     if value["ruleId"] not in POLICY_EXCEPTION_RULES or not isinstance(value["policyRevision"], int) or isinstance(value["policyRevision"], bool) or value["policyRevision"] < 0: raise ContractError("policy exception outcome binding is invalid")
     for field in ("requestDigest", "decisionDigest", "outcomeDigest"): _digest(value.get(field), name=field)
     _digest(value["scopeDigest"], name="scopeDigest"); _id(value["decisionVersion"], name="decisionVersion")
-    if "requestedValue" in value:
-        _policy_exception_requested_value(value["requestedValue"], name="policy exception outcome requested value")
+    _policy_exception_form(value, policy_revision=value["policyRevision"], name="policy exception outcome")
     for field in ("decisionId", "actorId", "correlationId", "idempotencyKey"): _id(value.get(field), name=field)
     _timestamp(value.get("occurredAt"))
+    if value["status"] == "approved" and "reason" in value: raise ContractError("approved policy exception outcome forbids reason")
     if value["status"] == "rejected": _text(value.get("reason"), name="rejected policy exception reason", maximum=512)
     if policy_exception_outcome_digest(value) != value["outcomeDigest"]: raise ContractError("policy exception outcome digest mismatch")
     return value

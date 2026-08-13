@@ -144,3 +144,38 @@ live Claude disabled: OVERSEER_LIVE_AGENT_PROVIDER is not claude
 
 No live prompt, settings mutation, credential change, service action, package
 installation, or checkout-as-provider-workspace action occurred.
+
+## Psychlo Policy-Exception Contract Parity Follow-up
+
+The review correction at `318a44c` was repaired test-first. Global canonical
+JSON number handling remains unchanged; only the policy-exception
+`requestedValue` field tags finite numeric values as normalized IEEE-754
+binary64 hex for digesting (`-0` becomes zero), while the wire value remains a
+JSON number or boolean. Scalar and proposed-policy forms are now strict and
+discriminated, all nine Psychlo rule IDs are accepted, and outcomes mirror the
+originating form. Approved outcomes forbid `reason`; rejected outcomes require
+bounded `reason`. Actor, correlation, idempotency, scope, decision, and request
+digest bindings remain required.
+
+The frozen usage snapshot digests were restored to the established values:
+`fbf1f2fbe8a8ae2b11d41cc571a06863de0b554681d6fb94734dcfed9f91da1f` and
+`c37736f7d6722374e8c5bb06cdb51d233af3ccea0b3b2432dc5899de3327b46c`.
+
+Verification:
+
+```text
+pytest -q tests/test_psychlo_bridge.py
+131 passed
+
+pytest -q tests/test_psychlo_contracts.py tests/test_psychlo_usage_systemd.py \
+  tests/test_psychlo_external_round.py tests/test_psychlo_learning_protocol.py
+33 passed
+```
+
+TDD red evidence was observed before implementation: the frozen-digest
+assertion failed against the changed `7aa048...`/`d17e50...` values, and the
+new proposed-policy/outcome form tests failed because the counterpart accepted
+the wrong optional shape and lacked the field-specific digest representation.
+
+No live services, gateways, credentials, packages, or external systems were
+changed.

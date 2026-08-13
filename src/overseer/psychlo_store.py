@@ -16,7 +16,7 @@ import stat
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping
 
-from .psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, ContractError
+from .psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, policy_exception_request_digest, ContractError
 
 
 def _round_result_digest(result: Mapping[str, Any]) -> str:
@@ -170,8 +170,8 @@ class PsychloBridgeStore:
     def record_policy_exception_request(self, request: Mapping[str, Any], digest: str | None = None) -> tuple[dict[str, Any], bool]:
         value = dict(request); request_id = value.get("id")
         if not isinstance(request_id, str) or not request_id.strip(): raise ValueError("policy exception request identity is required")
-        selected_digest = str(digest or value.get("digest") or canonical_digest(value))
-        if selected_digest != canonical_digest({key: item for key, item in value.items() if key != "digest"}): raise ValueError("policy exception request digest mismatch")
+        selected_digest = str(digest or value.get("digest") or policy_exception_request_digest(value))
+        if selected_digest != policy_exception_request_digest(value): raise ValueError("policy exception request digest mismatch")
         idempotency_key = value.get("idempotencyKey")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip(): raise ValueError("policy exception idempotency key is required")
         encoded = _dump_wire(value)

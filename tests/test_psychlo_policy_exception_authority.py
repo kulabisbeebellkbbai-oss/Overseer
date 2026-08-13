@@ -35,7 +35,7 @@ def request(request_id: str = "exception-authority") -> dict:
     return value
 
 
-def bridge(tmp_path: Path, *, sent: list | None = None):
+def bridge(tmp_path: Path, *, sent: list | None = None, now: str = NOW):
     primary = SQLiteStore(tmp_path / "primary.sqlite3")
     projected = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     outbound = sent if sent is not None else []
@@ -45,7 +45,7 @@ def bridge(tmp_path: Path, *, sent: list | None = None):
             dispatcher=lambda *_: "unused",
             sender=lambda kind, message_id, payload: outbound.append((kind, message_id, payload)) or {"accepted": True},
             callback_origin="http://127.0.0.1:8766",
-            clock=lambda: NOW,
+            clock=lambda: now,
             approval_store=primary,
         ),
         primary,
@@ -68,6 +68,30 @@ def test_signed_request_stages_exact_non_executable_authority_atomically(tmp_pat
     assert approval.approval_level.value == "human"
     assert binding.source_id == plan.id
     assert binding.scope_digest
+
+
+def test_staging_binding_failure_rolls_back_plan_and_approval_then_retry_succeeds(tmp_path: Path, monkeypatch):
+    value = request("exception-atomic-stage")
+    primary = SQLiteStore(tmp_path / "primary.sqlite3")
+    original = primary.save_roadex_approval_binding
+
+    def fail_binding(_binding):
+        raise RuntimeError("injected binding failure")
+
+    monkeypatch.setattr(primary, "save_roadex_approval_binding", fail_binding)
+    with pytest.raises(RuntimeError, match="injected binding failure"):
+        primary.stage_psychlo_policy_exception_authority(value, created_at=NOW)
+    assert primary.list_admin_change_plans() == ()
+    assert primary.list_approvals() == ()
+    with pytest.raises(KeyError):
+        primary.load_roadex_approval_binding("admin.psychlo.policy-exception.exception-atomic-stage")
+
+    monkeypatch.setattr(primary, "save_roadex_approval_binding", original)
+    staged = primary.stage_psychlo_policy_exception_authority(value, created_at=NOW)
+    assert staged["inserted"] is True
+    assert primary.load_admin_change_plan(staged["planId"])
+    assert primary.load_approval(staged["approvalId"])
+    assert primary.load_roadex_approval_binding(staged["planId"])
 
 
 def test_generic_admin_approval_cannot_authorize_policy_exception(tmp_path: Path):
@@ -124,6 +148,43 @@ def test_dedicated_rejection_cancels_pair_and_forwards_rejection(tmp_path: Path)
     assert primary.load_approval("approval.psychlo.policy-exception.exception-reject").status.value == "rejected"
 
 
+def test_decision_write_failure_rolls_back_both_authority_records(tmp_path: Path, monkeypatch):
+    value = request("exception-atomic-decision")
+    bridge_instance, primary = bridge(tmp_path)
+    bridge_instance.receive_policy_exception_request(value)
+    original = primary.save_approval
+
+    def fail_approval(_approval):
+        raise RuntimeError("injected approval decision failure")
+
+    monkeypatch.setattr(primary, "save_approval", fail_approval)
+    with pytest.raises(RuntimeError, match="injected approval decision failure"):
+        bridge_instance.decide_policy_exception_authority(
+            {
+                "request_id": value["id"],
+                "decision": "approve",
+                "decided_by": "human-user",
+                "reason": "approved for the bounded drill",
+            }
+        )
+    plan = primary.load_admin_change_plan("admin.psychlo.policy-exception.exception-atomic-decision")
+    approval = primary.load_approval("approval.psychlo.policy-exception.exception-atomic-decision")
+    assert plan.approved is False and plan.canceled is False
+    assert approval.status.value == "pending"
+    assert primary.psychlo_policy_exception_decision(value["id"]) is None
+
+    monkeypatch.setattr(primary, "save_approval", original)
+    result = bridge_instance.decide_policy_exception_authority(
+        {
+            "request_id": value["id"],
+            "decision": "approve",
+            "decided_by": "human-user",
+            "reason": "approved for the bounded drill",
+        }
+    )
+    assert result["status"] == "approved"
+
+
 def test_restart_replay_does_not_duplicate_authority(tmp_path: Path):
     value = request("exception-replay")
     first, primary = bridge(tmp_path)
@@ -149,3 +210,55 @@ def test_dedicated_decision_replay_returns_stable_outcome(tmp_path: Path):
     second = bridge_instance.decide_policy_exception_authority(payload)
     assert first["status"] == second["status"] == "approved"
     assert second["replay"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("decision", "deny"),
+        ("decided_by", "other-human"),
+        ("reason", "changed reason"),
+        ("decided_at", "2026-08-12T12:02:00+00:00"),
+    ],
+)
+def test_dedicated_decision_replay_rejects_changed_identity(tmp_path: Path, field: str, changed: str):
+    value = request(f"exception-decision-conflict-{field}")
+    bridge_instance, _ = bridge(tmp_path)
+    payload = {
+        "request_id": value["id"],
+        "decision": "approve",
+        "decided_by": "human-user",
+        "reason": "approved for the bounded drill",
+        "decided_at": NOW,
+    }
+    bridge_instance.receive_policy_exception_request(value)
+    bridge_instance.decide_policy_exception_authority(payload)
+    altered = {**payload, field: changed}
+    with pytest.raises(ValueError, match="decision conflict"):
+        bridge_instance.decide_policy_exception_authority(altered)
+
+
+def test_late_approval_expires_primary_pair_and_bridge_request_atomically(tmp_path: Path):
+    value = request(
+        "exception-late-approval",
+    )
+    value["expiresAt"] = "2026-08-12T12:02:00.000Z"
+    value["digest"] = policy_exception_request_digest(value)
+    bridge_instance, primary = bridge(tmp_path, now="2026-08-12T12:01:00+00:00")
+    bridge_instance.receive_policy_exception_request(value)
+    bridge_instance.clock = lambda: "2026-08-12T12:03:00+00:00"
+
+    result = bridge_instance.decide_policy_exception_authority(
+        {
+            "request_id": value["id"],
+            "decision": "approve",
+            "decided_by": "human-user",
+            "reason": "approval arrived too late",
+        }
+    )
+    plan = primary.load_admin_change_plan("admin.psychlo.policy-exception.exception-late-approval")
+    approval = primary.load_approval("approval.psychlo.policy-exception.exception-late-approval")
+    assert result["status"] == "expired"
+    assert plan.canceled is True and plan.approved is False
+    assert approval.status.value == "expired"
+    assert bridge_instance.store.policy_exception_request(value["id"])["state"] == "expired"

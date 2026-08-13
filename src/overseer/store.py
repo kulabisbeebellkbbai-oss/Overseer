@@ -2003,7 +2003,7 @@ class SQLiteStore:
             "INSERT OR REPLACE INTO approvals (id, subject_id, payload) VALUES (?, ?, ?)",
             (approval.id, approval.subject_id, _dump(approval)),
         )
-        self._commit()
+        self._commit_agent_mutation()
 
     def load_approval(self, approval_id: str) -> ApprovalRequest:
         return _load_dataclass(ApprovalRequest, self._get_payload("approvals", approval_id))
@@ -2189,10 +2189,17 @@ class SQLiteStore:
         """Atomically decide the dedicated plan and its HUMAN approval."""
         if decision not in {"approved", "rejected", "expired"}:
             raise ValueError("policy exception decision is invalid")
-        if not isinstance(decided_by, str) or not decided_by.strip() or decided_by.lower() in {"sisko", "overseer", "system"}:
+        automated_expiry = decision == "expired" and decided_by == "overseer-expiry"
+        if not isinstance(decided_by, str) or not decided_by.strip() or (not automated_expiry and decided_by.lower() in {"sisko", "overseer", "system"}):
             raise ValueError("independent human policy exception decision is required")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("policy exception decision reason is required")
+        try:
+            decision_time = datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise ValueError("policy exception decided_at is invalid") from error
+        if decision_time.tzinfo is None:
+            raise ValueError("policy exception decided_at is invalid")
         plan_id = f"admin.psychlo.policy-exception.{request_id}"
         approval_id = f"approval.psychlo.policy-exception.{request_id}"
         with self.agent_transaction():
@@ -2200,24 +2207,77 @@ class SQLiteStore:
             approval = self.load_approval(approval_id)
             if plan.kind.value != "psychlo_policy_exception" or plan.target != request_id or approval.subject_id != plan_id or approval.approval_level is not ApprovalLevel.HUMAN:
                 raise ValueError("policy exception authority identity is invalid")
-            if decision == "approved":
+            metadata = json.loads(plan.proposed_state).get("psychloAuthorization", {})
+            signed_request = metadata.get("payload") if isinstance(metadata, dict) else None
+            if not isinstance(signed_request, dict) or signed_request.get("id") != request_id or signed_request.get("digest") != metadata.get("payloadDigest"):
+                raise ValueError("policy exception authority request binding is invalid")
+            try:
+                expires_at = datetime.fromisoformat(str(signed_request["expiresAt"]).replace("Z", "+00:00"))
+            except (KeyError, ValueError) as error:
+                raise ValueError("policy exception authority expiry is invalid") from error
+            if expires_at.tzinfo is None:
+                raise ValueError("policy exception authority expiry is invalid")
+
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS psychlo_policy_exception_decisions (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            existing_row = self._connection.execute(
+                "SELECT payload FROM psychlo_policy_exception_decisions WHERE request_id=?", (request_id,)
+            ).fetchone()
+            submitted = {
+                "requestId": request_id,
+                "decision": decision,
+                "decidedBy": decided_by,
+                "reason": reason,
+                "decidedAt": decided_at,
+            }
+            if existing_row is not None:
+                existing = json.loads(str(existing_row["payload"]))
+                if any(existing.get(key) != value for key, value in submitted.items()):
+                    raise ValueError("policy exception authority decision conflict")
+                status = existing.get("status")
+                state_valid = (
+                    status == "approved" and plan.approved and not plan.canceled and approval.status is ApprovalStatus.APPROVED
+                ) or (
+                    status in {"rejected", "expired"} and plan.canceled and not plan.approved
+                    and approval.status is (ApprovalStatus.REJECTED if status == "rejected" else ApprovalStatus.EXPIRED)
+                )
+                if not state_valid:
+                    raise ValueError("policy exception authority decision state mismatch")
+                return {"status": status, "planId": plan_id, "approvalId": approval_id, "replay": True}
+
+            status = "expired" if decision_time >= expires_at else decision
+            record = {**submitted, "status": status}
+            self._connection.execute(
+                "INSERT INTO psychlo_policy_exception_decisions(request_id,payload) VALUES (?,?)",
+                (request_id, _dump(record)),
+            )
+            if status == "approved":
                 if plan.canceled or plan.approved or approval.status is not ApprovalStatus.PENDING:
-                    if plan.approved and approval.status is ApprovalStatus.APPROVED and plan.approved_by == decided_by and approval.decided_by == decided_by:
-                        return {"status": "approved", "planId": plan_id, "approvalId": approval_id, "replay": True}
                     raise ValueError("policy exception authority decision conflict")
                 updated_plan = replace(plan, approved=True, approved_by=decided_by, approved_at=decided_at)
                 updated_approval = replace(approval, status=ApprovalStatus.APPROVED, decided_by=decided_by, decided_at=decided_at)
             else:
-                terminal_status = ApprovalStatus.REJECTED if decision == "rejected" else ApprovalStatus.EXPIRED
-                if plan.canceled and approval.status is terminal_status:
-                    return {"status": decision, "planId": plan_id, "approvalId": approval_id, "replay": True}
+                terminal_status = ApprovalStatus.REJECTED if status == "rejected" else ApprovalStatus.EXPIRED
                 if plan.approved or approval.status is not ApprovalStatus.PENDING:
                     raise ValueError("policy exception authority decision conflict")
-                updated_plan = replace(plan, canceled=True, canceled_by=decided_by, canceled_at=decided_at, cancellation_reason=reason)
-                updated_approval = replace(approval, status=ApprovalStatus.REJECTED if decision == "rejected" else ApprovalStatus.EXPIRED, decided_by=decided_by, decided_at=decided_at)
+                cancellation_reason = reason if status == decision else "signed policy exception request expired before decision"
+                updated_plan = replace(plan, canceled=True, canceled_by=decided_by, canceled_at=decided_at, cancellation_reason=cancellation_reason)
+                updated_approval = replace(approval, status=terminal_status, decided_by=decided_by, decided_at=decided_at)
             self.save_admin_change_plan(updated_plan)
             self.save_approval(updated_approval)
-            return {"status": decision, "planId": plan_id, "approvalId": approval_id, "replay": False}
+            return {"status": status, "planId": plan_id, "approvalId": approval_id, "replay": False}
+
+    def psychlo_policy_exception_decision(self, request_id: str) -> dict[str, Any] | None:
+        table = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='psychlo_policy_exception_decisions'"
+        ).fetchone()
+        if table is None:
+            return None
+        row = self._connection.execute(
+            "SELECT payload FROM psychlo_policy_exception_decisions WHERE request_id=?", (request_id,)
+        ).fetchone()
+        return None if row is None else json.loads(str(row["payload"]))
 
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))

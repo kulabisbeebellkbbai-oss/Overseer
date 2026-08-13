@@ -637,7 +637,8 @@ class PsychloBridge:
         reason = value.get("reason")
         if not isinstance(decided_by, str) or not isinstance(reason, str):
             raise ValueError("policy exception decision actor and reason are required")
-        decided_at = value.get("decided_at") or self.clock()
+        existing_decision = self.approval_store.psychlo_policy_exception_decision(request_id) if self.approval_store is not None else None
+        decided_at = value.get("decided_at") or (existing_decision.get("decidedAt") if existing_decision is not None else self.clock())
         result = self.approval_store.decide_psychlo_policy_exception_authority(
             request_id, decision, decided_by, reason, decided_at=str(decided_at)
         ) if self.approval_store is not None else None
@@ -647,6 +648,9 @@ class PsychloBridge:
             stored = self.store.policy_exception_request(request_id)
             if stored is not None and stored.get("outcome") is not None:
                 return {"accepted": True, "replay": True, "status": stored["state"], "outcome": stored["outcome"]}
+            if result.get("status") == "expired":
+                self.store.transition_policy_exception_request(request_id, "expired", now=str(decided_at))
+                return {"accepted": True, **result}
         if result.get("status") in {"approved", "rejected"}:
             request = self.store.policy_exception_request(request_id)
             if request is None:
@@ -655,6 +659,8 @@ class PsychloBridge:
             return self.authorize_policy_exception(
                 f"approval.psychlo.policy-exception.{request_id}", request["payload"]
             )
+        if result.get("status") == "expired":
+            self.store.transition_policy_exception_request(request_id, "expired", now=str(decided_at))
         return {"accepted": True, **result}
 
     receive_policy_exception = receive_policy_exception_request

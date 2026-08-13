@@ -1564,6 +1564,35 @@ def test_policy_exception_expiry_is_terminal_before_approval_lookup(tmp_path: Pa
     assert bridge.store.policy_exception_request(request["id"])["state"] == "expired"
 
 
+def test_policy_exception_receiver_receipt_is_durable_and_duplicate_stable(tmp_path: Path):
+    request = _policy_exception_request(id="exception-receiver-receipt")
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    first = bridge.receive_policy_exception_request(request, message_id="message-first")
+    duplicate = bridge.receive_policy_exception_request(request, message_id="message-second")
+    assert first["receipt"]["schemaVersion"] == "psychlo.policy-exception-receiver-receipt.v1"
+    assert first["receipt"]["outcome"] == "inserted"
+    assert duplicate["receipt"] == {**first["receipt"], "outcome": "duplicate"}
+    assert duplicate["receipt"]["messageId"] == "message-first"
+    assert duplicate["receipt"]["persistenceId"] == "policy-exception:exception-receiver-receipt"
+
+
+def test_policy_exception_receiver_receipt_rejects_same_key_conflict(tmp_path: Path):
+    request = _policy_exception_request(id="exception-receiver-conflict")
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    bridge.receive_policy_exception_request(request, message_id="message-conflict")
+    altered = dict(request)
+    altered["reason"] = "altered"
+    altered["digest"] = policy_exception_request_digest(altered)
+    with pytest.raises(ValueError, match="conflict|idempotency"):
+        bridge.receive_policy_exception_request(altered, message_id="message-conflict-new")
+
+
 def test_v11_policy_exception_fixture_recomputes_exact_digests():
     fixture = json.loads((Path(__file__).parent / "fixtures" / "psychlo-v1-1-policy-exception.json").read_text(encoding="utf-8"))
     request = fixture["request"]

@@ -56,6 +56,7 @@ from .store import SQLiteStore
 
 MAX_BODY_BYTES = 256 * 1024
 PEER_VERSION = b"psychlo-overseer-v1\0"
+POLICY_EXCEPTION_RECEIPT_SCHEMA = "psychlo.policy-exception-receiver-receipt.v1"
 
 
 def _canonical(direction: str, timestamp: str, nonce: str, body: bytes) -> bytes:
@@ -74,6 +75,34 @@ def sign_peer_message(secret: bytes, direction: str, kind: str, message_id: str,
         "x-psychlo-peer-nonce": nonce,
         "x-psychlo-peer-signature": signature,
     }
+
+
+def sign_peer_response(secret: bytes, timestamp: str, nonce: str, body: bytes) -> str:
+    """Sign one response body with a response-only domain separator."""
+    return hmac.new(secret, _canonical("overseer-to-psychlo-response", timestamp, nonce, body), hashlib.sha256).hexdigest()
+
+
+def _policy_exception_receiver_receipt(request: Mapping[str, Any], message_id: str, *, outcome: str) -> dict[str, Any]:
+    """Build the deterministic receipt for the durable receiver row."""
+    receipt = {
+        "schemaVersion": POLICY_EXCEPTION_RECEIPT_SCHEMA,
+        "kind": "policy-exception-request",
+        "status": "accepted",
+        "receiptId": f"overseer-policy-exception:{request['id']}",
+        "persistenceId": f"policy-exception:{request['id']}",
+        "messageId": message_id,
+        "exceptionId": request["id"],
+        "policyRevision": request["policyRevision"],
+        "ruleId": request["requestedRuleId"],
+        "requestDigest": request["digest"],
+        "scopeDigest": request["scopeDigest"],
+        "decisionVersion": request["decisionVersion"],
+        "correlationId": request["correlationId"],
+        "idempotencyKey": request["idempotencyKey"],
+        "outcome": outcome,
+    }
+    if "requestedValue" in request: receipt["requestedValue"] = request["requestedValue"]
+    return receipt
 
 
 class _LegacyPsychloBridgeStore:
@@ -542,27 +571,30 @@ class PsychloBridge:
         payload = derive_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
 
-    def receive_policy_exception_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def receive_policy_exception_request(self, payload: Mapping[str, Any], *, message_id: str | None = None) -> dict[str, Any]:
         try:
             request = parse_policy_exception_request(payload)
         except ContractError as error:
             raise ValueError(str(error)) from error
-        stored, inserted = self.store.record_policy_exception_request(request, request["digest"])
+        stored, inserted = self.store.record_policy_exception_request(request, request["digest"], receiver_message_id=message_id or request["id"])
+        receiver_message_id = stored.get("receiverMessageId") or message_id or request["id"]
+        receipt = _policy_exception_receiver_receipt(request, receiver_message_id, outcome="inserted" if inserted else "duplicate")
         if stored["outcome"] is not None:
-            return {"accepted": True, "replay": not inserted, "status": stored["state"], "outcome": stored["outcome"]}
+            return {"accepted": True, "replay": not inserted, "status": stored["state"], "outcome": stored["outcome"], "receipt": receipt}
         if self._policy_exception_expired(request):
             self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
-            return {"accepted": True, "replay": not inserted, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"]}
+            return {"accepted": True, "replay": not inserted, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
         # Roadex/Overseer approval is intentionally not inferred from a
         # request.  A pending request is durable before any authority lookup.
         approval_id = request["id"]
         if self.approval_store is None and self.approval_loader is None:
-            return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"]}
+            return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
         try:
-            return self.authorize_policy_exception(approval_id, request)
+            result = self.authorize_policy_exception(approval_id, request)
+            return {**result, "receipt": receipt}
         except ValueError as error:
             if str(error) in {"approved policy exception authority is missing", "policy exception approval is pending"}:
-                return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"]}
+                return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
             raise
 
     receive_policy_exception = receive_policy_exception_request

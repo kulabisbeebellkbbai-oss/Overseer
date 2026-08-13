@@ -23,7 +23,7 @@ from .roadex_approval_fixture import (
 )
 
 from .codex_usage import CodexUsageTracker
-from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, verify_peer_request, MAX_BODY_BYTES
+from .psychlo_bridge import PsychloBridge, create_bridge_from_environment, sign_peer_response, verify_peer_request, MAX_BODY_BYTES
 from .store import SQLiteStore
 from .cli import (
     DEFAULT_AGENT_REGISTRY,
@@ -1392,12 +1392,17 @@ def make_api_handler(
                 elif kind == "concurrency-canary-result":
                     result = psychlo_bridge.receive_concurrency_canary_result(message["payload"])
                 elif kind == "policy-exception-request":
-                    result = psychlo_bridge.receive_policy_exception_request(message["payload"])
+                    result = psychlo_bridge.receive_policy_exception_request(message["payload"], message_id=message["messageId"])
                 elif kind == "decision-outcome":
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:
                     raise ValueError("unsupported Psychlo peer kind")
-                self._write_json(dict(result), HTTPStatus.ACCEPTED)
+                if kind == "policy-exception-request":
+                    response_body = json.dumps(dict(result), sort_keys=True).encode("utf-8")
+                    response_signature = sign_peer_response(psychlo_bridge.peer_secret, headers["x-psychlo-peer-timestamp"], headers["x-psychlo-peer-nonce"], response_body)
+                    self._write_json(dict(result), HTTPStatus.ACCEPTED, {"x-psychlo-peer-response-signature": response_signature})
+                else:
+                    self._write_json(dict(result), HTTPStatus.ACCEPTED)
             except ValueError as error:
                 code = str(error)
                 status = HTTPStatus.CONFLICT if code in {"replay", "single_stream_busy"} else HTTPStatus.UNAUTHORIZED if code == "invalid_signature" else HTTPStatus.BAD_REQUEST

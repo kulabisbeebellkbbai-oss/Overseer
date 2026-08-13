@@ -45,6 +45,7 @@ SECURITY_REASONS = {"unsafe-files", "unsafe-modes", "symlinks", "secrets", "pers
 POLICY_EXCEPTION_REQUEST_SCHEMA = "psychlo.policy-exception-request.v1"
 POLICY_EXCEPTION_OUTCOME_SCHEMA = "psychlo.policy-exception-outcome.v1"
 POLICY_EXCEPTION_AUTHORIZATION_SCHEMA = "psychlo.policy-exception-authorization.v1"
+POLICY_EXCEPTION_RECEIPT_SCHEMA = "psychlo.policy-exception-receiver-receipt.v1"
 POLICY_EXCEPTION_RULES = {
     "reset-daily-at-provider-reset", "count-other-development", "enforce-provider-quota",
     "enforce-safety-reserve", "respect-blackouts", "carry-unused-daily-allowance",
@@ -708,6 +709,23 @@ def parse_policy_exception_request(payload: Mapping[str, Any]) -> dict[str, Any]
 
 def policy_exception_request_digest(payload: Mapping[str, Any]) -> str:
     return _policy_exception_digest(payload)
+
+
+def parse_policy_exception_receiver_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
+    value = _object(payload, name="policy exception receiver receipt")
+    required = {"schemaVersion", "kind", "status", "receiptId", "persistenceId", "messageId", "exceptionId", "policyRevision", "ruleId", "requestDigest", "scopeDigest", "decisionVersion", "correlationId", "idempotencyKey", "outcome"}
+    _keys(value, required | {"requestedValue"}, name="policy exception receiver receipt")
+    if value.get("schemaVersion") != POLICY_EXCEPTION_RECEIPT_SCHEMA or value.get("kind") != "policy-exception-request" or value.get("status") != "accepted" or value.get("outcome") not in {"inserted", "duplicate"}:
+        raise ContractError("policy exception receiver receipt is invalid")
+    for field in ("receiptId", "persistenceId", "messageId", "exceptionId", "ruleId", "decisionVersion", "correlationId", "idempotencyKey"):
+        _id(value.get(field), name=f"receipt {field}")
+    if not isinstance(value.get("policyRevision"), int) or isinstance(value.get("policyRevision"), bool) or value["policyRevision"] < 0:
+        raise ContractError("receipt policy revision is invalid")
+    for field in ("requestDigest", "scopeDigest"):
+        _digest(value.get(field), name=f"receipt {field}")
+    if "requestedValue" in value:
+        _policy_exception_requested_value(value["requestedValue"], name="receipt requested value")
+    return value
 
 
 def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:

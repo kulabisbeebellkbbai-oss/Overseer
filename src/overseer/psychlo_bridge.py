@@ -40,6 +40,7 @@ from .psychlo_contracts import (
     parse_learning_advisory,
     parse_project_registration,
     parse_policy_exception_request,
+    parse_policy_exception_receiver_receipt,
     parse_policy_exception_outcome,
     policy_exception_request_digest,
     parse_usage_snapshot_v11,
@@ -102,6 +103,20 @@ def _policy_exception_receiver_receipt(request: Mapping[str, Any], message_id: s
         "outcome": outcome,
     }
     if "requestedValue" in request: receipt["requestedValue"] = request["requestedValue"]
+    return receipt
+
+
+def _durable_policy_exception_receiver_receipt(store: Any, request: Mapping[str, Any], *, inserted: bool, message_id: str) -> dict[str, Any]:
+    """Return the immutable inserted receipt, marking only replay outcome."""
+    stored_receipt = store.policy_exception_request(str(request["id"])).get("receiverReceipt")
+    if stored_receipt is None:
+        stored_receipt = store.record_policy_exception_receiver_receipt(
+            str(request["id"]),
+            _policy_exception_receiver_receipt(request, message_id, outcome="inserted"),
+        )
+    receipt = parse_policy_exception_receiver_receipt(stored_receipt)
+    if not inserted:
+        receipt = {**receipt, "outcome": "duplicate"}
     return receipt
 
 
@@ -584,7 +599,7 @@ class PsychloBridge:
             raise ValueError(str(error)) from error
         stored, inserted = self.store.record_policy_exception_request(request, request["digest"], receiver_message_id=message_id or request["id"])
         receiver_message_id = stored.get("receiverMessageId") or message_id or request["id"]
-        receipt = _policy_exception_receiver_receipt(request, receiver_message_id, outcome="inserted" if inserted else "duplicate")
+        receipt = _durable_policy_exception_receiver_receipt(self.store, request, inserted=inserted, message_id=receiver_message_id)
         if stored["outcome"] is not None and stored["state"] not in {"expired", "recovery-invalid"}:
             return {"accepted": True, "replay": not inserted, "status": stored["state"], "outcome": stored["outcome"], "receipt": receipt}
         if stored["state"] in {"expired", "recovery-invalid"}:

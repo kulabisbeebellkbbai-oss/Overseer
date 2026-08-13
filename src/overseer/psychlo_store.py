@@ -16,7 +16,7 @@ import stat
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping
 
-from .psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, policy_exception_request_digest, ContractError
+from .psychlo_contracts import canonical_digest, learning_observation_digest, learning_observation_legacy_selected_digest, parse_canary_authorization, parse_concurrency_canary_result, parse_concurrency_ceiling_authorization, parse_learning_observation, parse_policy_exception_receiver_receipt, policy_exception_request_digest, ContractError
 
 
 def _round_result_digest(result: Mapping[str, Any]) -> str:
@@ -67,7 +67,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS coordination_reviews(request_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT, idempotency_key TEXT);
             CREATE TABLE IF NOT EXISTS coordination_terminals(request_id TEXT PRIMARY KEY, result_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coordination_operation_claims(kind TEXT NOT NULL, operation_id TEXT NOT NULL, owner_id TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, operation_id), UNIQUE(kind, idempotency_key));
-            CREATE TABLE IF NOT EXISTS policy_exception_requests(request_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, consumed_at TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS policy_exception_requests(request_id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, consumed_at TEXT, updated_at TEXT NOT NULL, receiver_receipt_json TEXT);
             CREATE TABLE IF NOT EXISTS psychlo_usage_accounting(snapshot_id TEXT PRIMARY KEY, reset_at TEXT NOT NULL, payload_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
         """)
         for column in ("delivery_skiller", "delivery_memory"):
@@ -90,6 +90,10 @@ class PsychloBridgeStore:
                 pass
         try:
             self.connection.execute("ALTER TABLE policy_exception_requests ADD COLUMN receiver_message_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.connection.execute("ALTER TABLE policy_exception_requests ADD COLUMN receiver_receipt_json TEXT")
         except sqlite3.OperationalError:
             pass
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS policy_exception_idempotency_unique ON policy_exception_requests(idempotency_key) WHERE idempotency_key IS NOT NULL")
@@ -197,9 +201,34 @@ class PsychloBridgeStore:
         return self.policy_exception_request(request_id), True
 
     def policy_exception_request(self, request_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id,receiver_message_id FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
+        row = self.connection.execute("SELECT digest,payload_json,state,outcome_json,consumed_at,updated_at,idempotency_key,approval_id,receiver_message_id,receiver_receipt_json FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
         if row is None: return None
-        return {"requestId": request_id, "digest": row[0], "payload": json.loads(row[1]), "state": row[2], "outcome": json.loads(row[3]) if row[3] else None, "consumedAt": row[4], "updatedAt": row[5], "idempotencyKey": row[6], "approvalId": row[7], "receiverMessageId": row[8]}
+        return {"requestId": request_id, "digest": row[0], "payload": json.loads(row[1]), "state": row[2], "outcome": json.loads(row[3]) if row[3] else None, "consumedAt": row[4], "updatedAt": row[5], "idempotencyKey": row[6], "approvalId": row[7], "receiverMessageId": row[8], "receiverReceipt": json.loads(row[9]) if row[9] else None}
+
+    def record_policy_exception_receiver_receipt(self, request_id: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist the first accepted receiver receipt without changing it on replay."""
+        parsed = parse_policy_exception_receiver_receipt(receipt)
+        encoded = _dump_wire(parsed)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT payload_json,receiver_receipt_json FROM policy_exception_requests WHERE request_id=?", (request_id,)).fetchone()
+            if row is None:
+                raise ValueError("policy exception request is missing")
+            payload = json.loads(row[0])
+            if parsed["exceptionId"] != request_id or parsed["requestDigest"] != payload.get("digest") or parsed["policyRevision"] != payload.get("policyRevision") or parsed["ruleId"] != payload.get("requestedRuleId") or parsed["scopeDigest"] != payload.get("scopeDigest") or parsed["decisionVersion"] != payload.get("decisionVersion") or parsed["correlationId"] != payload.get("correlationId") or parsed["idempotencyKey"] != payload.get("idempotencyKey") or ("requestedValue" in parsed) != ("requestedValue" in payload) or parsed.get("requestedValue") != payload.get("requestedValue"):
+                raise ValueError("policy exception receiver receipt does not bind to the exact request")
+            if row[1] is not None:
+                existing = json.loads(row[1])
+                if existing != parsed:
+                    raise ValueError("policy exception receiver receipt is immutable")
+                self.connection.execute("COMMIT")
+                return existing
+            self.connection.execute("UPDATE policy_exception_requests SET receiver_receipt_json=? WHERE request_id=?", (encoded, request_id))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return parsed
 
     def consume_policy_exception_request(self, request_id: str, outcome: Mapping[str, Any], *, now: str, approval_id: str | None = None) -> dict[str, Any]:
         encoded = _dump_wire(outcome)

@@ -1605,6 +1605,67 @@ def test_policy_exception_receiver_receipt_is_durable_and_duplicate_stable(tmp_p
     assert duplicate["receipt"] == {**first["receipt"], "outcome": "duplicate"}
     assert duplicate["receipt"]["messageId"] == "message-first"
     assert duplicate["receipt"]["persistenceId"] == "policy-exception:exception-receiver-receipt"
+    persisted = bridge.store.policy_exception_request(request["id"])
+    assert persisted is not None
+    assert persisted["receiverReceipt"]["requestedValue"] is False
+
+
+@pytest.mark.parametrize("requested_value", [False, 1.25, -0.0, 1e-7])
+def test_policy_exception_receiver_receipt_preserves_typed_requested_value_across_restart(tmp_path: Path, requested_value: object):
+    request = _policy_exception_request(id=f"exception-receiver-value-{str(requested_value).replace('-', 'n').replace('.', 'p')}", requestedValue=requested_value)
+    path = tmp_path / "bridge.sqlite3"
+    first_bridge = PsychloBridge(
+        store=PsychloBridgeStore(path),
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    first = first_bridge.receive_policy_exception_request(request, message_id=request["id"])
+    persisted = first_bridge.store.policy_exception_request(request["id"])
+    assert persisted is not None
+    assert "requestedValue" in persisted["receiverReceipt"]
+    assert persisted["receiverReceipt"]["requestedValue"] == requested_value
+    first_bridge.store.connection.close()
+
+    restarted = PsychloBridge(
+        store=PsychloBridgeStore(path),
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    duplicate = restarted.receive_policy_exception_request(request, message_id="fresh-retry-message")
+    assert duplicate["receipt"]["outcome"] == "duplicate"
+    assert duplicate["receipt"]["messageId"] == request["id"]
+    assert duplicate["receipt"]["requestedValue"] == requested_value
+    assert first["receipt"]["requestedValue"] == requested_value
+
+
+def test_policy_exception_receiver_receipt_preserves_absence_and_rejects_value_conflict(tmp_path: Path):
+    request = _policy_exception_request(id="exception-receiver-value-absent")
+    request.pop("requestedValue")
+    proposed = _policy_revision()
+    proposed["digest"] = canonical_digest(proposed)
+    request["basePolicyDigest"] = "b" * 64
+    request["proposedPolicy"] = proposed
+    request["digest"] = policy_exception_request_digest(request)
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+    result = bridge.receive_policy_exception_request(request, message_id=request["id"])
+    assert "requestedValue" not in result["receipt"]
+    persisted = bridge.store.policy_exception_request(request["id"])
+    assert persisted is not None and "requestedValue" not in persisted["receiverReceipt"]
+
+    altered = {**request, "requestedValue": False}
+    altered["digest"] = policy_exception_request_digest(altered)
+    with pytest.raises(ValueError, match="form"):
+        bridge.receive_policy_exception_request(altered, message_id="altered-retry")
 
 
 def test_policy_exception_receiver_receipt_rejects_same_key_conflict(tmp_path: Path):

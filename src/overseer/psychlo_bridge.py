@@ -58,6 +58,10 @@ from .store import SQLiteStore
 MAX_BODY_BYTES = 256 * 1024
 PEER_VERSION = b"psychlo-overseer-v1\0"
 POLICY_EXCEPTION_RECEIPT_SCHEMA = "psychlo.policy-exception-receiver-receipt.v1"
+PEER_RESPONSE_KIND_HEADER = "x-psychlo-peer-response-kind"
+PEER_RESPONSE_TIMESTAMP_HEADER = "x-psychlo-peer-response-timestamp"
+PEER_RESPONSE_NONCE_HEADER = "x-psychlo-peer-response-nonce"
+PEER_RESPONSE_SIGNATURE_HEADER = "x-psychlo-peer-response-signature"
 
 
 def _canonical(direction: str, timestamp: str, nonce: str, body: bytes) -> bytes:
@@ -78,9 +82,49 @@ def sign_peer_message(secret: bytes, direction: str, kind: str, message_id: str,
     }
 
 
-def sign_peer_response(secret: bytes, timestamp: str, nonce: str, body: bytes) -> str:
-    """Sign one response body with a response-only domain separator."""
-    return hmac.new(secret, _canonical("overseer-to-psychlo-response", timestamp, nonce, body), hashlib.sha256).hexdigest()
+def _canonical_peer_response(kind: str, timestamp: str, nonce: str, body: bytes) -> bytes:
+    return PEER_VERSION + b"overseer-to-psychlo-response\0" + kind.encode() + b"\0" + timestamp.encode() + b"\0" + nonce.encode() + b"\0" + body
+
+
+def sign_peer_response(secret: bytes, kind: str, timestamp: str, nonce: str, body: bytes) -> str:
+    """Sign one exact response body with kind/timestamp/nonce binding."""
+    return hmac.new(secret, _canonical_peer_response(kind, timestamp, nonce, body), hashlib.sha256).hexdigest()
+
+
+def verify_peer_response(
+    secret: bytes,
+    kind: str,
+    body: bytes,
+    headers: Mapping[str, str],
+    *,
+    now: str | None = None,
+    maximum_clock_skew_ms: int = 5 * 60 * 1_000,
+    claim_nonce: Callable[[str], bool] | None = None,
+) -> None:
+    """Verify response integrity before parsing or trusting the JSON body."""
+    response_kind = headers.get(PEER_RESPONSE_KIND_HEADER)
+    timestamp = headers.get(PEER_RESPONSE_TIMESTAMP_HEADER)
+    nonce = headers.get(PEER_RESPONSE_NONCE_HEADER)
+    signature = headers.get(PEER_RESPONSE_SIGNATURE_HEADER)
+    if response_kind != kind or not timestamp or not nonce or not signature:
+        raise ValueError("invalid_response_signature")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,160}", nonce) or not re.fullmatch(r"[a-f0-9]{64}", signature):
+        raise ValueError("invalid_response_signature")
+    try:
+        timestamp_value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if timestamp_value.tzinfo is None:
+            raise ValueError
+        if now is not None:
+            now_value = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            if now_value.tzinfo is None or abs((now_value - timestamp_value).total_seconds() * 1_000) > maximum_clock_skew_ms:
+                raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid_response_signature") from None
+    expected = sign_peer_response(secret, kind, timestamp, nonce, body)
+    if not hmac.compare_digest(expected, signature):
+        raise ValueError("invalid_response_signature")
+    if claim_nonce is not None and not claim_nonce(nonce):
+        raise ValueError("response_replay")
 
 
 def _policy_exception_receiver_receipt(request: Mapping[str, Any], message_id: str, *, outcome: str) -> dict[str, Any]:
@@ -1858,6 +1902,7 @@ class PsychloPeerSender:
     def __init__(self, endpoint: str, secret: bytes, *, clock: Callable[[], str] | None = None, timeout: float = 5.0):
         self.endpoint, self.authority = _validate_psychlo_endpoint(endpoint)
         self.secret, self.clock, self.timeout = secret, clock or (lambda: datetime.now(UTC).isoformat()), timeout
+        self._response_nonces: set[str] = set()
         self.opener = build_opener(ProxyHandler({}), _RejectRedirects())
 
     def __call__(self, kind: str, message_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1872,12 +1917,29 @@ class PsychloPeerSender:
             response_status = response.status
             data = response.read(MAX_BODY_BYTES + 1)
         if len(data) > MAX_BODY_BYTES: raise ValueError("Psychlo peer response is too large")
+        response_headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+        verify_peer_response(
+            self.secret,
+            kind,
+            data,
+            response_headers,
+            now=self.clock(),
+            claim_nonce=self._claim_response_nonce,
+        )
         parsed = json.loads(data)
         if not isinstance(parsed, dict): raise ValueError("Psychlo peer response is invalid")
         # Preserve the transport status for strict delivery consumers.  A
         # 202 or 409 is an HTTP acknowledgement/conflict, not proof that the
         # usage snapshot was durably inserted or deduplicated.
         return {**parsed, "status_code": response_status}
+
+    def _claim_response_nonce(self, nonce: str) -> bool:
+        if nonce in self._response_nonces:
+            return False
+        if len(self._response_nonces) >= 4_096:
+            self._response_nonces.pop()
+        self._response_nonces.add(nonce)
+        return True
 
 
 class _RejectRedirects(HTTPRedirectHandler):

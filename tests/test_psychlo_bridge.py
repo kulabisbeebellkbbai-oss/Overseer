@@ -23,6 +23,7 @@ from overseer.psychlo_bridge import (
     derive_usage_snapshot,
     PsychloPeerSender,
     sign_peer_message,
+    sign_peer_response,
     verify_peer_request,
     _read_secret,
 )
@@ -1274,10 +1275,21 @@ def test_peer_verification_rejects_wrong_or_missing_injected_authority(tmp_path:
 )
 def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoint: str, authority: str):
     requests = []
+    response_body = b'{"accepted":true}'
+    response_timestamp = datetime.now(UTC).isoformat()
+    response_headers = {
+        "content-type": "application/json",
+        "x-psychlo-peer-response-kind": "usage-snapshot",
+        "x-psychlo-peer-response-timestamp": response_timestamp,
+        "x-psychlo-peer-response-nonce": "response-authority-123456",
+        "x-psychlo-peer-response-signature": sign_peer_response(SECRET, "usage-snapshot", response_timestamp, "response-authority-123456", response_body),
+    }
 
     class Headers:
         def get_content_type(self):
             return "application/json"
+        def items(self):
+            return response_headers.items()
 
     class Response:
         status = 201
@@ -1290,7 +1302,7 @@ def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoi
             return False
 
         def read(self, _limit):
-            return b'{"accepted":true}'
+            return response_body
 
     def fake_open(request, timeout):
         requests.append((request, timeout))
@@ -1304,6 +1316,69 @@ def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoi
     assert timeout == 2
     assert request.get_header("Host") == authority
     assert request.full_url == f"{endpoint}/internal/overseer/usage-snapshot"
+
+
+def test_peer_sender_rejects_missing_response_proof(monkeypatch):
+    class Headers:
+        def get_content_type(self):
+            return "application/json"
+        def items(self):
+            return [("content-type", "application/json")]
+
+    class Response:
+        status = 202
+        headers = Headers()
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def read(self, _limit):
+            return b'{"accepted":true}'
+
+    sender = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
+    monkeypatch.setattr(sender.opener, "open", lambda *_args, **_kwargs: Response())
+    with pytest.raises(ValueError, match="response_signature"):
+        sender("round-request", "missing-response-proof", {"value": 1})
+
+
+def test_peer_sender_rejects_wrong_kind_and_replayed_response(monkeypatch):
+    body = b'{"accepted":true}'
+    timestamp = NOW
+    wrong_kind_headers = {
+        "content-type": "application/json",
+        "x-psychlo-peer-response-kind": "round-reconcile",
+        "x-psychlo-peer-response-timestamp": timestamp,
+        "x-psychlo-peer-response-nonce": "response-kind-123456",
+        "x-psychlo-peer-response-signature": sign_peer_response(SECRET, "round-reconcile", timestamp, "response-kind-123456", body),
+    }
+    replay_headers = {
+        "content-type": "application/json",
+        "x-psychlo-peer-response-kind": "round-request",
+        "x-psychlo-peer-response-timestamp": timestamp,
+        "x-psychlo-peer-response-nonce": "response-replay-123456",
+        "x-psychlo-peer-response-signature": sign_peer_response(SECRET, "round-request", timestamp, "response-replay-123456", body),
+    }
+
+    class Headers:
+        def __init__(self, values): self.values = values
+        def get_content_type(self): return "application/json"
+        def items(self): return self.values.items()
+
+    class Response:
+        status = 202
+        def __init__(self, values): self.headers = Headers(values)
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self, _limit): return body
+
+    responses = iter([Response(wrong_kind_headers), Response(replay_headers), Response(replay_headers)])
+    sender = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
+    monkeypatch.setattr(sender.opener, "open", lambda *_args, **_kwargs: next(responses))
+    with pytest.raises(ValueError, match="response_signature"):
+        sender("round-request", "wrong-kind", {"value": 1})
+    assert sender("round-request", "replay-first", {"value": 1})["accepted"] is True
+    with pytest.raises(ValueError, match="response_replay"):
+        sender("round-request", "replay-second", {"value": 1})
 
 
 @pytest.mark.parametrize(
@@ -1342,10 +1417,16 @@ def test_peer_sender_ignores_proxy_environment(monkeypatch):
     class Target(BaseHTTPRequestHandler):
         def do_POST(self):
             requests.append(self.path)
+            body = b'{"accepted":true}'
+            timestamp = datetime.now(UTC).isoformat()
             self.send_response(201)
             self.send_header("Content-Type", "application/json")
+            self.send_header("x-psychlo-peer-response-kind", "usage-snapshot")
+            self.send_header("x-psychlo-peer-response-timestamp", timestamp)
+            self.send_header("x-psychlo-peer-response-nonce", "response-proxy-123456")
+            self.send_header("x-psychlo-peer-response-signature", sign_peer_response(SECRET, "usage-snapshot", timestamp, "response-proxy-123456", body))
             self.end_headers()
-            self.wfile.write(b'{"accepted":true}')
+            self.wfile.write(body)
 
         def log_message(self, *_):
             pass

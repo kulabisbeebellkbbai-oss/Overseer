@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1404,16 +1405,14 @@ def make_api_handler(
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:
                     raise ValueError("unsupported Psychlo peer kind")
-                if kind == "policy-exception-request":
-                    response_body = json.dumps(dict(result), sort_keys=True).encode("utf-8")
-                    response_signature = sign_peer_response(psychlo_bridge.peer_secret, headers["x-psychlo-peer-timestamp"], headers["x-psychlo-peer-nonce"], response_body)
-                    self._write_json(dict(result), HTTPStatus.ACCEPTED, {"x-psychlo-peer-response-signature": response_signature})
-                else:
-                    self._write_json(dict(result), HTTPStatus.ACCEPTED)
+                self._write_json(dict(result), HTTPStatus.ACCEPTED, peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret)
             except ValueError as error:
                 code = str(error)
                 status = HTTPStatus.CONFLICT if code in {"replay", "single_stream_busy"} else HTTPStatus.UNAUTHORIZED if code == "invalid_signature" else HTTPStatus.BAD_REQUEST
-                self._write_json({"accepted": False, "error": code}, status)
+                if psychlo_bridge is not None and isinstance(psychlo_bridge.peer_secret, bytes):
+                    self._write_json({"accepted": False, "error": code}, status, peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret)
+                else:
+                    self._write_json({"accepted": False, "error": code}, status)
 
         def _handle_psychlo_round_result(self, capability: str) -> None:
             forbidden = ("authorization", "cookie", "origin", "transfer-encoding", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")
@@ -1474,12 +1473,25 @@ def make_api_handler(
             payload: dict[str, Any],
             status: HTTPStatus = HTTPStatus.OK,
             headers: dict[str, str] | None = None,
+            *,
+            peer_response_kind: str | None = None,
+            peer_response_secret: bytes | None = None,
         ) -> None:
             body = json.dumps(payload, sort_keys=True).encode("utf-8")
+            response_headers = dict(headers or {})
+            if peer_response_kind is not None and peer_response_secret is not None:
+                timestamp = datetime.now(UTC).isoformat()
+                nonce = secrets.token_urlsafe(24)
+                response_headers.update({
+                    "x-psychlo-peer-response-kind": peer_response_kind,
+                    "x-psychlo-peer-response-timestamp": timestamp,
+                    "x-psychlo-peer-response-nonce": nonce,
+                    "x-psychlo-peer-response-signature": sign_peer_response(peer_response_secret, peer_response_kind, timestamp, nonce, body),
+                })
             self.send_response(int(status))
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
-            for name, value in (headers or {}).items():
+            for name, value in response_headers.items():
                 self.send_header(name, value)
             self.end_headers()
             try:

@@ -59,7 +59,48 @@ def _canonical(value: Any) -> str:
         return "{" + ",".join(json.dumps(str(k), separators=(",", ":")) + ":" + _canonical(value[k]) for k in sorted(value)) + "}"
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(_canonical(item) for item in value) + "]"
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, (int, float)):
+        return _canonical_number(value)
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _canonical_number(value: int | float) -> str:
+    """Encode numbers using the ECMAScript/JSON shortest-number rules.
+
+    Python's JSON parser preserves arbitrary-size integers while JavaScript
+    parses them as IEEE-754 doubles.  Converting both input types to a double
+    before formatting prevents a Python/JS digest split for integral values,
+    exponent notation, and negative zero.
+    """
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ContractError("numeric value is outside canonical JSON range") from error
+    if not math.isfinite(number):
+        raise ContractError("numeric value is not finite")
+    if number == 0:
+        return "0"
+    text = repr(number).lower()
+    if "e" not in text:
+        if text.endswith(".0"):
+            text = text[:-2]
+        return text
+    mantissa, exponent_text = text.split("e", 1)
+    exponent = int(exponent_text)
+    if -6 <= exponent < 21:
+        negative = mantissa.startswith("-")
+        digits = mantissa.lstrip("-").replace(".", "")
+        decimal_index = (mantissa.lstrip("-").find(".") if "." in mantissa else len(mantissa.lstrip("-"))) + exponent
+        if decimal_index <= 0:
+            plain = "0." + ("0" * -decimal_index) + digits
+        elif decimal_index >= len(digits):
+            plain = digits + ("0" * (decimal_index - len(digits)))
+        else:
+            plain = digits[:decimal_index] + "." + digits[decimal_index:]
+        return ("-" if negative else "") + plain
+    return f"{mantissa}e{'+' if exponent >= 0 else ''}{exponent}"
 
 
 def canonical_digest(value: Mapping[str, Any]) -> str:
@@ -577,9 +618,16 @@ def _finite_nonnegative(value: Any, *, name: str) -> float | int:
     return value
 
 
+def _policy_exception_requested_value(value: Any, *, name: str) -> None:
+    if isinstance(value, bool):
+        return
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ContractError(f"{name} must be boolean or finite number")
+
+
 def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str, rule_key: str) -> dict[str, Any]:
     required = {"schemaVersion", "id", rule_key, "policyRevision", "actorId", "reason", "activatedAt", "expiresAt", "correlationId", "idempotencyKey", "occurredAt", "scopeDigest", "decisionVersion", "digest"}
-    optional = {"requestedValue", "basePolicyDigest", "proposedPolicy"}
+    optional = {"requestedValue"}
     result = _strict_protocol(value, required=required, allowed=required | optional, name=name, schema=schema)
     _id(result["id"], name="exception id")
     _id(result[rule_key], name=rule_key)
@@ -593,14 +641,7 @@ def _policy_exception_common(value: Mapping[str, Any], *, name: str, schema: str
     if datetime.fromisoformat(result["expiresAt"].replace("Z", "+00:00")) <= datetime.fromisoformat(result["activatedAt"].replace("Z", "+00:00")):
         raise ContractError("policy exception expiry is invalid")
     if "requestedValue" in result:
-        requested = result["requestedValue"]
-        if not isinstance(requested, bool) and (not isinstance(requested, (int, float)) or isinstance(requested, bool) or not math.isfinite(float(requested))):
-            raise ContractError("policy exception requested value is invalid")
-    if "basePolicyDigest" in result: _digest(result["basePolicyDigest"], name="basePolicyDigest")
-    if "proposedPolicy" in result:
-        proposed = _object(result["proposedPolicy"], name="proposedPolicy")
-        if proposed.get("revision") != result["policyRevision"] + 1:
-            raise ContractError("proposed policy revision is invalid")
+        _policy_exception_requested_value(result["requestedValue"], name="policy exception requested value")
     _digest(result["digest"], name="digest")
     if canonical_digest({key: item for key, item in result.items() if key != "digest"}) != result["digest"]:
         raise ContractError(f"{name} digest mismatch")
@@ -618,7 +659,7 @@ def policy_exception_request_digest(payload: Mapping[str, Any]) -> str:
 def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:
     fields = {"status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "scopeDigest", "decisionVersion"}
     result = {key: payload[key] for key in fields if key in payload}
-    for key in ("requestedValue", "basePolicyDigest", "proposedPolicy", "reason"):
+    for key in ("requestedValue", "reason"):
         if key in payload and payload[key] is not None: result[key] = payload[key]
     return canonical_digest(result)
 
@@ -626,15 +667,17 @@ def policy_exception_outcome_digest(payload: Mapping[str, Any]) -> str:
 def parse_policy_exception_outcome(payload: Mapping[str, Any]) -> dict[str, Any]:
     value = _object(payload, name="policy exception outcome")
     required = {"schemaVersion", "sourceId", "status", "exceptionId", "policyRevision", "ruleId", "requestDigest", "decisionId", "decisionDigest", "actorId", "correlationId", "idempotencyKey", "occurredAt", "scopeDigest", "decisionVersion", "outcomeDigest"}
-    _keys(value, required | {"requestedValue", "reason", "basePolicyDigest", "proposedPolicy"}, name="policy exception outcome")
+    _keys(value, required | {"requestedValue", "reason"}, name="policy exception outcome")
     if value.get("schemaVersion") != POLICY_EXCEPTION_OUTCOME_SCHEMA or value.get("sourceId") != "overseer" or value.get("status") not in {"approved", "rejected"}: raise ContractError("policy exception outcome authority is invalid")
     _id(value.get("exceptionId"), name="exceptionId"); _id(value.get("ruleId"), name="ruleId")
     if value["ruleId"] not in POLICY_EXCEPTION_RULES or not isinstance(value["policyRevision"], int) or isinstance(value["policyRevision"], bool) or value["policyRevision"] < 0: raise ContractError("policy exception outcome binding is invalid")
     for field in ("requestDigest", "decisionDigest", "outcomeDigest"): _digest(value.get(field), name=field)
     _digest(value["scopeDigest"], name="scopeDigest"); _id(value["decisionVersion"], name="decisionVersion")
+    if "requestedValue" in value:
+        _policy_exception_requested_value(value["requestedValue"], name="policy exception outcome requested value")
     for field in ("decisionId", "actorId", "correlationId", "idempotencyKey"): _id(value.get(field), name=field)
     _timestamp(value.get("occurredAt"))
-    if value["status"] == "rejected" and (not isinstance(value.get("reason"), str) or not value["reason"].strip()): raise ContractError("rejected policy exception reason is required")
+    if value["status"] == "rejected": _text(value.get("reason"), name="rejected policy exception reason", maximum=512)
     if policy_exception_outcome_digest(value) != value["outcomeDigest"]: raise ContractError("policy exception outcome digest mismatch")
     return value
 

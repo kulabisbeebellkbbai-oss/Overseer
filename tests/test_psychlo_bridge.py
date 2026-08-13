@@ -26,8 +26,9 @@ from overseer.psychlo_bridge import (
     verify_peer_request,
     _read_secret,
 )
-from overseer.psychlo_contracts import canonical_digest
+from overseer.psychlo_contracts import canonical_digest, ContractError, parse_policy_exception_outcome, policy_exception_outcome_digest
 from overseer.psychlo_store import _round_result_digest
+from overseer.psychlo_contracts import parse_policy_exception_request
 from overseer.audit import ApprovalRequest, ApprovalStatus
 from overseer.core import ApprovalLevel, OwnerDomain
 from overseer.admin import plan_user_service_restart
@@ -1438,6 +1439,40 @@ def test_v11_policy_exception_fixture_recomputes_exact_digests():
     assert canonical_digest({key: value for key, value in usage["snapshot"].items() if key != "digest"}) == usage["snapshot"]["digest"]
     assert canonical_digest({key: value for key, value in usage.items() if key != "digest"}) == usage["digest"]
     assert {fixture["usageSnapshot"]["snapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700.0, 612.0, 42.0, 17.0}
+
+
+@pytest.mark.parametrize("left,right", [(1.0, 1), (-0.0, 0), (1.25, 1.25), (1e-3, 0.001), (1e-7, 0.0000001), (1e21, 1000000000000000000000)])
+def test_policy_exception_numeric_requested_value_has_language_independent_digest(left: object, right: object):
+    first = _policy_exception_request(requestedRuleId="enforce-provider-quota", requestedValue=left)
+    second = _policy_exception_request(requestedRuleId="enforce-provider-quota", requestedValue=right)
+    assert first["digest"] == second["digest"]
+
+
+@pytest.mark.parametrize("value", ["1", None, float("nan"), float("inf"), 10**400])
+def test_policy_exception_requested_value_rejects_noncanonical_numeric_values(value: object):
+    with pytest.raises(ContractError):
+        parse_policy_exception_request(_policy_exception_request(requestedRuleId="enforce-provider-quota", requestedValue=value))
+
+
+def test_rejected_policy_exception_reason_is_bounded():
+    outcome = {
+        "schemaVersion": "psychlo.policy-exception-outcome.v1", "sourceId": "overseer", "status": "rejected",
+        "exceptionId": "exception-reason", "policyRevision": 1, "ruleId": "enforce-provider-quota",
+        "requestDigest": "a" * 64, "decisionId": "decision-reason", "decisionDigest": "b" * 64,
+        "actorId": "operator-1", "correlationId": "correlation-reason", "idempotencyKey": "idempotency-reason",
+        "occurredAt": NOW, "scopeDigest": "c" * 64, "decisionVersion": "decision-v1", "reason": "x" * 513,
+    }
+    outcome["outcomeDigest"] = policy_exception_outcome_digest(outcome)
+    with pytest.raises(ContractError, match="reason"):
+        parse_policy_exception_outcome(outcome)
+
+
+def test_policy_exception_rejects_unused_proposed_policy_fields():
+    request = _policy_exception_request()
+    request["basePolicyDigest"] = "b" * 64
+    request["digest"] = canonical_digest({key: value for key, value in request.items() if key != "digest"})
+    with pytest.raises(ContractError, match="unknown fields"):
+        parse_policy_exception_request(request)
 
 
 def test_policy_exception_idempotency_is_globally_unique_and_exact_replay_only(tmp_path: Path):

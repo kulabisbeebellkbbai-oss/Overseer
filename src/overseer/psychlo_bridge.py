@@ -17,7 +17,7 @@ import sqlite3
 import stat
 import threading
 from typing import Any, Callable, Mapping
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 from .psychlo_contracts import (
@@ -1719,6 +1719,7 @@ class PsychloPeerSender:
     def __init__(self, endpoint: str, secret: bytes, *, clock: Callable[[], str] | None = None, timeout: float = 5.0):
         self.endpoint, self.authority = _validate_psychlo_endpoint(endpoint)
         self.secret, self.clock, self.timeout = secret, clock or (lambda: datetime.now(UTC).isoformat()), timeout
+        self.opener = build_opener(ProxyHandler({}), _RejectRedirects())
 
     def __call__(self, kind: str, message_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         timestamp = self.clock()
@@ -1726,7 +1727,7 @@ class PsychloPeerSender:
         body = json.dumps({"kind": kind, "messageId": message_id, "occurredAt": timestamp, "payload": dict(payload)}, separators=(",", ":")).encode()
         headers = sign_peer_message(self.secret, "overseer-to-psychlo", kind, message_id, timestamp, nonce, body, authority=self.authority)
         request = Request(f"{self.endpoint}/internal/overseer/{kind}", data=body, headers=headers, method="POST")
-        with urlopen(request, timeout=self.timeout) as response:
+        with self.opener.open(request, timeout=self.timeout) as response:
             if response.status not in {200, 201, 202, 409} or response.headers.get_content_type() != "application/json":
                 raise ValueError("Psychlo peer rejected the request")
             response_status = response.status
@@ -1738,6 +1739,11 @@ class PsychloPeerSender:
         # 202 or 409 is an HTTP acknowledgement/conflict, not proof that the
         # usage snapshot was durably inserted or deduplicated.
         return {**parsed, "status_code": response_status}
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        raise ValueError("Psychlo peer redirects are forbidden")
 
 
 def _validate_psychlo_endpoint(endpoint: str) -> tuple[str, str]:
@@ -1774,6 +1780,9 @@ def _validate_psychlo_endpoint(endpoint: str) -> tuple[str, str]:
     except ValueError as error:
         raise ValueError("Psychlo endpoint must be the exact approved loopback origin") from error
     if not address.is_loopback:
+        raise ValueError("Psychlo endpoint must be the exact approved loopback origin")
+    port_text = parsed.netloc.rsplit(":", 1)[-1]
+    if port_text != str(port):
         raise ValueError("Psychlo endpoint must be the exact approved loopback origin")
     authority = f"[{hostname}]:{port}" if address.version == 6 else f"{hostname}:{port}"
     return endpoint.rstrip("/"), authority

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 import threading
 from types import SimpleNamespace
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.client import HTTPConnection
 import pytest
 from dataclasses import replace
@@ -1264,12 +1264,13 @@ def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoi
         def read(self, _limit):
             return b'{"accepted":true}'
 
-    def fake_urlopen(request, timeout):
+    def fake_open(request, timeout):
         requests.append((request, timeout))
         return Response()
 
-    monkeypatch.setattr("overseer.psychlo_bridge.urlopen", fake_urlopen)
-    result = PsychloPeerSender(endpoint, SECRET, timeout=2)("usage-snapshot", "message-1", {"value": 1})
+    sender = PsychloPeerSender(endpoint, SECRET, timeout=2)
+    monkeypatch.setattr(sender.opener, "open", fake_open)
+    result = sender("usage-snapshot", "message-1", {"value": 1})
     assert result["accepted"] is True
     request, timeout = requests[0]
     assert timeout == 2
@@ -1290,11 +1291,87 @@ def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoi
         "http://[::]:43127",
         "http://127.0.0.1",
         "http://127.0.0.1:0",
+        "http://127.0.0.1:080",
+        "http://127.0.0.1:00080",
+        "http://[::1]:080",
+        "http://[::1]:00080",
     ],
 )
 def test_peer_sender_rejects_unsafe_or_ambiguous_endpoint(endpoint: str):
     with pytest.raises(ValueError, match="loopback origin"):
         PsychloPeerSender(endpoint, SECRET)
+
+
+def test_peer_sender_keeps_explicit_default_port_in_authority(monkeypatch):
+    sender = PsychloPeerSender("http://127.0.0.1:80", SECRET)
+    assert sender.endpoint == "http://127.0.0.1:80"
+    assert sender.authority == "127.0.0.1:80"
+
+
+def test_peer_sender_ignores_proxy_environment(monkeypatch):
+    requests = []
+
+    class Target(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"accepted":true}')
+
+        def log_message(self, *_):
+            pass
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    thread = threading.Thread(target=target.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    try:
+        result = PsychloPeerSender(f"http://127.0.0.1:{target.server_port}", SECRET)("usage-snapshot", "message-proxy", {"value": 1})
+        assert result["accepted"] is True
+        assert requests == ["/internal/overseer/usage-snapshot"]
+    finally:
+        target.shutdown(); target.server_close(); thread.join(timeout=2)
+
+
+def test_peer_sender_rejects_redirect_without_following_second_request():
+    redirected_requests = []
+
+    class RedirectTarget(BaseHTTPRequestHandler):
+        def do_POST(self):
+            redirected_requests.append(self.path)
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"accepted":true}')
+
+        def log_message(self, *_):
+            pass
+
+    redirected = ThreadingHTTPServer(("127.0.0.1", 0), RedirectTarget)
+
+    class RedirectSource(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(307)
+            self.send_header("Location", f"http://127.0.0.1:{redirected.server_port}/escaped")
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), RedirectSource)
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (source, redirected)]
+    for thread in threads: thread.start()
+    try:
+        with pytest.raises(ValueError, match="redirects are forbidden"):
+            PsychloPeerSender(f"http://127.0.0.1:{source.server_port}", SECRET)("usage-snapshot", "message-redirect", {"value": 1})
+        assert redirected_requests == []
+    finally:
+        for server in (source, redirected): server.shutdown(); server.server_close()
+        for thread in threads: thread.join(timeout=2)
 
 
 def test_derives_prior_day_unused_weekly_capacity_from_provider_delta_only():

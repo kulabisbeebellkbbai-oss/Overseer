@@ -1726,13 +1726,17 @@ class PsychloPeerSender:
         headers = sign_peer_message(self.secret, "overseer-to-psychlo", kind, message_id, timestamp, nonce, body, authority="127.0.0.1:8798")
         request = Request(f"{self.endpoint}/internal/overseer/{kind}", data=body, headers=headers, method="POST")
         with urlopen(request, timeout=self.timeout) as response:
-            if response.status not in {202, 409} or response.headers.get_content_type() != "application/json":
+            if response.status not in {200, 201, 202, 409} or response.headers.get_content_type() != "application/json":
                 raise ValueError("Psychlo peer rejected the request")
+            response_status = response.status
             data = response.read(MAX_BODY_BYTES + 1)
         if len(data) > MAX_BODY_BYTES: raise ValueError("Psychlo peer response is too large")
         parsed = json.loads(data)
         if not isinstance(parsed, dict): raise ValueError("Psychlo peer response is invalid")
-        return parsed
+        # Preserve the transport status for strict delivery consumers.  A
+        # 202 or 409 is an HTTP acknowledgement/conflict, not proof that the
+        # usage snapshot was durably inserted or deduplicated.
+        return {**parsed, "status_code": response_status}
 
 
 class CodexProjectDispatcher:

@@ -7,7 +7,7 @@ import sqlite3
 import base64
 import os
 import stat
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from cryptography.exceptions import InvalidSignature
@@ -18,6 +18,17 @@ from .psychlo_contracts import canonical_digest, parse_usage_snapshot_v11
 
 class UsageAttributionError(ValueError):
     """Raised when usage ownership cannot be established exactly."""
+
+
+class UsageSnapshotPreSendError(UsageAttributionError):
+    """A sender failed before it started an external delivery attempt.
+
+    This explicit exception is useful for adapters which perform local
+    validation or connection setup before handing control to the remote
+    request.  It is the only sender failure which is safe to retry as
+    ``pending``; an ordinary sender exception is ambiguous and therefore
+    durable as ``uncertain``.
+    """
 
 
 def _time(value: object, name: str) -> datetime:
@@ -60,10 +71,66 @@ def _verify_seal(value: Mapping[str, Any], name: str, public_key: Ed25519PublicK
     return {**payload, "signature": signature, "digest": digest}
 
 
+_DELIVERY_RECEIPT_REQUIRED = {
+    "kind", "messageId", "correlationId", "idempotencyKey", "snapshotId",
+    "snapshotDigest", "envelopeDigest", "outcome",
+}
+
+
+def _validate_usage_snapshot_receipt(receipt: object, envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the receipt that is authoritative for external delivery.
+
+    HTTP acknowledgement, ``accepted: true``, a rejection, or a receipt
+    which merely has a matching idempotency key is deliberately insufficient.
+    The peer must bind every immutable envelope identity and report the
+    durable persistence outcome.  A peer may choose either a persistence ID
+    or a monotonic sequence as its storage reference.
+    """
+    if not isinstance(receipt, Mapping):
+        raise UsageAttributionError("usage snapshot delivery receipt is required")
+    value = dict(receipt)
+    if not _DELIVERY_RECEIPT_REQUIRED.issubset(value):
+        raise UsageAttributionError("usage snapshot delivery receipt is incomplete")
+    references = [field for field in ("persistenceId", "sequence") if field in value]
+    if len(references) != 1:
+        raise UsageAttributionError("usage snapshot delivery receipt persistence reference is invalid")
+    for field in ("kind", "messageId", "correlationId", "idempotencyKey", "snapshotId", "snapshotDigest", "envelopeDigest", "outcome"):
+        if not isinstance(value[field], str) or not value[field].strip():
+            raise UsageAttributionError("usage snapshot delivery receipt identity is invalid")
+    reference = value[references[0]]
+    if references[0] == "persistenceId":
+        if not isinstance(reference, str) or not reference.strip():
+            raise UsageAttributionError("usage snapshot delivery receipt persistence reference is invalid")
+    elif isinstance(reference, bool) or not isinstance(reference, int) or reference < 0:
+        raise UsageAttributionError("usage snapshot delivery receipt sequence is invalid")
+    expected_snapshot = envelope.get("snapshot")
+    if not isinstance(expected_snapshot, Mapping):
+        raise UsageAttributionError("usage snapshot envelope is invalid")
+    expected = {
+        "kind": "usage-snapshot",
+        "messageId": envelope.get("messageId"),
+        "correlationId": envelope.get("correlationId"),
+        "idempotencyKey": envelope.get("idempotencyKey"),
+        "snapshotId": expected_snapshot.get("id"),
+        "snapshotDigest": expected_snapshot.get("digest"),
+        "envelopeDigest": envelope.get("digest"),
+    }
+    if any(value[field] != expected[field] for field in expected):
+        raise UsageAttributionError("usage snapshot delivery receipt identity mismatch")
+    if value["outcome"] not in {"inserted", "duplicate"}:
+        raise UsageAttributionError("usage snapshot delivery receipt outcome is invalid")
+    return value
+
+
 class UsageAttributionLedger:
     """Append-only authority observations, execution receipts, and intents."""
 
-    _SCHEMA = 2
+    _SCHEMA = 3
+    _MAX_SNAPSHOT_DELIVERY_ATTEMPTS = 2
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
     def __init__(self, path: Path | str, *, approved_authority_id: str, approved_authority_binding_id: str, approved_authority_binding_digest: str, approved_account_id: str, approved_authority_public_key: bytes, receipt_identity_validator: Callable[[Mapping[str, Any]], None]):
         self.path = Path(path)
@@ -97,16 +164,27 @@ class UsageAttributionLedger:
             existing = self.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_attribution_meta'").fetchone()
             if existing:
                 row = self.connection.execute("SELECT value FROM usage_attribution_meta WHERE key='schema_version'").fetchone()
-                if row is None or str(row[0]) != str(self._SCHEMA):
+                if row is None:
+                    raise UsageAttributionError("usage attribution migration rejects unknown or corrupt legacy schema")
+                version = str(row[0])
+                if version == "2":
+                    self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+                    self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN last_error TEXT")
+                    self.connection.execute("ALTER TABLE usage_snapshot_intents ADD COLUMN receipt_json TEXT")
+                    self.connection.execute("UPDATE usage_attribution_meta SET value=? WHERE key='schema_version'", (str(self._SCHEMA),))
+                elif version != str(self._SCHEMA):
                     raise UsageAttributionError("usage attribution migration rejects unknown or corrupt legacy schema")
             else:
                 self.connection.execute("CREATE TABLE usage_attribution_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
                 self.connection.execute("INSERT INTO usage_attribution_meta VALUES ('schema_version',?)", (str(self._SCHEMA),))
             self.connection.execute("CREATE TABLE IF NOT EXISTS usage_observations(observation_id TEXT PRIMARY KEY,digest TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,inserted_at TEXT NOT NULL)")
             self.connection.execute("CREATE TABLE IF NOT EXISTS usage_execution_receipts(receipt_id TEXT PRIMARY KEY,result_id TEXT NOT NULL UNIQUE,digest TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,inserted_at TEXT NOT NULL)")
-            self.connection.execute("CREATE TABLE IF NOT EXISTS usage_snapshot_intents(idempotency_key TEXT PRIMARY KEY,observation_id TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,inserted_at TEXT NOT NULL,updated_at TEXT NOT NULL)")
+            self.connection.execute("CREATE TABLE IF NOT EXISTS usage_snapshot_intents(idempotency_key TEXT PRIMARY KEY,observation_id TEXT NOT NULL UNIQUE,payload_json TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,inserted_at TEXT NOT NULL,updated_at TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,receipt_json TEXT)")
             self._validate_all_locked()
-            self.connection.execute("UPDATE usage_snapshot_intents SET state='pending' WHERE state='sending'")
+            # A process can die after the external request starts and before
+            # its receipt is committed.  Sending is intentionally converted
+            # to uncertain on the next process opening the ledger.
+            self.connection.execute("UPDATE usage_snapshot_intents SET state='uncertain',updated_at=? WHERE state='sending'", (self._now(),))
             self.connection.execute("COMMIT")
         except Exception:
             if self.connection.in_transaction:
@@ -128,13 +206,22 @@ class UsageAttributionLedger:
             except UsageAttributionError as error: raise UsageAttributionError("corrupt receipt ledger") from error
             if value.get("digest") != row[1]:
                 raise UsageAttributionError("corrupt receipt ledger")
-        for row in self.connection.execute("SELECT payload_json,digest,state FROM usage_snapshot_intents"):
+        for row in self.connection.execute("SELECT payload_json,digest,state,receipt_json,attempts FROM usage_snapshot_intents"):
             try: value = json.loads(row[0])
             except json.JSONDecodeError as error: raise UsageAttributionError("corrupt snapshot intent") from error
-            if canonical_digest(value) != row[1] or row[2] not in {"pending", "sending", "delivered", "rejected"}:
+            if canonical_digest(value) != row[1] or row[2] not in {"pending", "sending", "uncertain", "delivered", "rejected"}:
                 raise UsageAttributionError("corrupt snapshot intent")
             try: parse_usage_snapshot_v11(value)
             except Exception as error: raise UsageAttributionError("corrupt snapshot intent") from error
+            if not isinstance(row[4], int) or row[4] < 0 or row[4] > self._MAX_SNAPSHOT_DELIVERY_ATTEMPTS:
+                raise UsageAttributionError("corrupt snapshot intent")
+            if row[2] == "delivered":
+                try: receipt = json.loads(row[3]) if row[3] else None
+                except json.JSONDecodeError as error: raise UsageAttributionError("corrupt snapshot intent receipt") from error
+                try: _validate_usage_snapshot_receipt(receipt, value)
+                except UsageAttributionError as error: raise UsageAttributionError("corrupt snapshot intent receipt") from error
+            elif row[3] is not None:
+                raise UsageAttributionError("corrupt snapshot intent receipt")
 
     @staticmethod
     def _encoded(value: Mapping[str, Any]) -> str:
@@ -217,8 +304,10 @@ class UsageAttributionLedger:
         return [json.loads(row[0]) for row in rows if json.loads(row[0])["observationId"] == observation["observationId"]]
 
     def delivery_intent(self, key: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT observation_id,payload_json,digest,state FROM usage_snapshot_intents WHERE idempotency_key=?", (key,)).fetchone()
-        return None if row is None else {"observationId":row[0],"payload":json.loads(row[1]),"digest":row[2],"state":row[3]}
+        row = self.connection.execute("SELECT observation_id,payload_json,digest,state,attempts,last_error,receipt_json FROM usage_snapshot_intents WHERE idempotency_key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        return {"observationId":row[0],"payload":json.loads(row[1]),"digest":row[2],"state":row[3],"attempts":row[4],"lastError":row[5],"receipt":json.loads(row[6]) if row[6] else None}
 
     def delivery_intent_for_observation(self, observation_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT idempotency_key FROM usage_snapshot_intents WHERE observation_id=?", (observation_id,)).fetchone()
@@ -233,25 +322,29 @@ class UsageAttributionLedger:
                 existing=json.loads(row[0])
                 if existing != dict(payload): raise UsageAttributionError("snapshot intent immutable conflict")
                 self.connection.execute("COMMIT"); return existing, False
-            self.connection.execute("INSERT INTO usage_snapshot_intents VALUES (?,?,?,?,?,?,?)",(key,observation_id,encoded,digest,"pending",now,now))
+            self.connection.execute("INSERT INTO usage_snapshot_intents(idempotency_key,observation_id,payload_json,digest,state,inserted_at,updated_at,attempts,last_error,receipt_json) VALUES (?,?,?,?,?,?,?,0,NULL,NULL)",(key,observation_id,encoded,digest,"pending",now,now))
             self.connection.execute("COMMIT"); return dict(payload), True
         except Exception:
             if self.connection.in_transaction:self.connection.execute("ROLLBACK")
             raise
 
-    def mark_delivered(self, key: str) -> None:
-        self.connection.execute("UPDATE usage_snapshot_intents SET state='delivered',updated_at=inserted_at WHERE idempotency_key=?",(key,))
+    def mark_delivered(self, key: str, receipt: Mapping[str, Any]) -> None:
+        intent = self.delivery_intent(key)
+        if intent is None:
+            raise UsageAttributionError("snapshot intent is missing")
+        validated = _validate_usage_snapshot_receipt(receipt, intent["payload"])
+        self.connection.execute("UPDATE usage_snapshot_intents SET state='delivered',updated_at=?,last_error=NULL,receipt_json=? WHERE idempotency_key=? AND state='sending'",(self._now(), self._encoded(validated), key))
 
     def mark_pending(self, key: str) -> None:
-        self.connection.execute("UPDATE usage_snapshot_intents SET state='pending',updated_at=inserted_at WHERE idempotency_key=? AND state='sending'",(key,))
+        self.connection.execute("UPDATE usage_snapshot_intents SET state='pending',updated_at=?,last_error=NULL WHERE idempotency_key=? AND state='sending'",(self._now(),key))
 
-    def mark_rejected(self, key: str) -> None:
-        self.connection.execute("UPDATE usage_snapshot_intents SET state='rejected',updated_at=inserted_at WHERE idempotency_key=? AND state='sending'",(key,))
+    def mark_uncertain(self, key: str, error: str | None = None) -> None:
+        self.connection.execute("UPDATE usage_snapshot_intents SET state='uncertain',updated_at=?,last_error=? WHERE idempotency_key=? AND state='sending'",(self._now(),error,key))
 
     def claim_pending(self, key: str) -> bool:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            changed = self.connection.execute("UPDATE usage_snapshot_intents SET state='sending' WHERE idempotency_key=? AND state='pending'", (key,)).rowcount == 1
+            changed = self.connection.execute("UPDATE usage_snapshot_intents SET state='sending',attempts=attempts+1,updated_at=? WHERE idempotency_key=? AND state IN ('pending','uncertain') AND attempts<?", (self._now(),key,self._MAX_SNAPSHOT_DELIVERY_ATTEMPTS)).rowcount == 1
             self.connection.execute("COMMIT")
             return changed
         except Exception:
@@ -260,8 +353,8 @@ class UsageAttributionLedger:
 
 
 class UsageSnapshotProducer:
-    def __init__(self, ledger: UsageAttributionLedger, *, sender: Callable[[str,str,dict[str,Any]], Mapping[str,Any]], after_send: Callable[[], None] | None = None):
-        self.ledger=ledger; self.sender=sender; self.after_send=after_send
+    def __init__(self, ledger: UsageAttributionLedger, *, sender: Callable[[str,str,dict[str,Any]], Mapping[str,Any]], before_send: Callable[[], None] | None = None, after_send: Callable[[], None] | None = None):
+        self.ledger=ledger; self.sender=sender; self.before_send=before_send; self.after_send=after_send
 
     def emit(self, observation_id: str, *, policy_version: str) -> dict[str, Any]:
         observation=self.ledger.observation(observation_id)
@@ -273,29 +366,54 @@ class UsageSnapshotProducer:
         scope=canonical_digest({"observation":observation["digest"],"receipts":[item["digest"] for item in receipts]})
         snapshot={"schemaVersion":"psychlo.usage-snapshot.v1.1","id":snapshot_id,"sourceId":"overseer","capturedAt":observation["occurredAt"],"policyVersion":policy_version,"providerResetAt":observation["providerResetAt"],"scopeDigest":scope,"decisionVersion":observation["decisionVersion"],"unusedPriorDayWeeklyCapacity":int(observation["unusedPriorDayWeeklyCapacity"]),"weeklyQuota":int(observation["weeklyQuota"]),"weeklyRemainingCapacity":int(observation["weeklyRemainingCapacity"]),"dailyConsumed":managed,"otherDevelopmentConsumed":max(0,residual)}
         snapshot["digest"]=canonical_digest(snapshot)
-        envelope={"schemaVersion":"psychlo.usage-envelope.v1.1","correlationId":f"psychlo:{snapshot_id}","idempotencyKey":snapshot_id,"occurredAt":observation["occurredAt"],"snapshot":snapshot}
+        envelope={"schemaVersion":"psychlo.usage-envelope.v1.1","messageId":snapshot_id,"correlationId":f"psychlo:{snapshot_id}","idempotencyKey":snapshot_id,"occurredAt":observation["occurredAt"],"snapshot":snapshot}
         envelope["digest"]=canonical_digest(envelope)
         parse_usage_snapshot_v11(envelope)
-        payload,winner=self.ledger.prepare_intent(observation_id,envelope)
+        payload, _ = self.ledger.prepare_intent(observation_id,envelope)
         intent=self.ledger.delivery_intent(str(payload["idempotencyKey"]))
         key=str(payload["idempotencyKey"])
-        if intent and intent["state"]=="delivered": return {"payload":payload,"replay":True}
-        if winner:
-            claimed=self.ledger.claim_pending(key)
-        else:
-            claimed=self.ledger.claim_pending(key)
-        if not claimed: return {"payload":payload,"replay":True}
+        if intent and intent["state"]=="delivered": return {"payload":payload,"replay":True,"receipt":intent["receipt"]}
+        if intent and intent["state"]=="rejected":
+            raise UsageAttributionError("snapshot delivery is permanently rejected")
+        claimed=self.ledger.claim_pending(key)
+        if not claimed:
+            current = self.ledger.delivery_intent(key)
+            if current and current["state"] in {"pending", "uncertain"} and int(current["attempts"]) >= self.ledger._MAX_SNAPSHOT_DELIVERY_ATTEMPTS:
+                raise UsageAttributionError("usage snapshot delivery retry limit exhausted")
+            return {"payload":payload,"replay":True,"receipt":current["receipt"] if current else None}
         try:
-            response=self.sender("usage-snapshot",key,payload)
+            if self.before_send is not None:
+                self.before_send()
         except BaseException:
             self.ledger.mark_pending(key)
             raise
-        if self.after_send is not None: self.after_send()
-        if response.get("accepted") is not True:
-            self.ledger.mark_rejected(key)
-            raise UsageAttributionError("peer rejected usage snapshot")
-        self.ledger.mark_delivered(key)
-        return {"payload":payload,"replay":False}
+        try:
+            response=self.sender("usage-snapshot",key,payload)
+        except UsageSnapshotPreSendError:
+            self.ledger.mark_pending(key)
+            raise
+        except BaseException as error:
+            self.ledger.mark_uncertain(key, str(error)[:500])
+            raise
+        if self.after_send is not None:
+            try:
+                self.after_send()
+            except Exception as error:
+                self.ledger.mark_uncertain(key, str(error)[:500])
+                raise
+        try:
+            if not isinstance(response, Mapping):
+                raise UsageAttributionError("usage snapshot delivery response is invalid")
+            status = response.get("status_code", response.get("statusCode"))
+            if status is not None and str(status) in {"202", "409"}:
+                raise UsageAttributionError("usage snapshot delivery response is not a durable receipt")
+            receipt = response.get("receipt") if isinstance(response.get("receipt"), Mapping) else response
+            receipt = _validate_usage_snapshot_receipt(receipt, payload)
+        except BaseException as error:
+            self.ledger.mark_uncertain(key, str(error)[:500])
+            raise
+        self.ledger.mark_delivered(key, receipt)
+        return {"payload":payload,"replay":False,"receipt":receipt}
 
 
 def managed_receipt_validator(store: Any) -> Callable[[Mapping[str, Any]], None]:

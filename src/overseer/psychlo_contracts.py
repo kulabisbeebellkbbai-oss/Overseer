@@ -740,9 +740,10 @@ def parse_usage_snapshot_v11(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the frozen, signed/enveloped v1.1 provider snapshot shape."""
     envelope = _object(payload, name="usage snapshot envelope")
     required = {"schemaVersion", "correlationId", "idempotencyKey", "occurredAt", "snapshot", "digest"}
-    _keys(envelope, required, name="usage snapshot envelope")
+    _keys(envelope, required | {"messageId"}, name="usage snapshot envelope")
     if envelope["schemaVersion"] != USAGE_ENVELOPE_V11_SCHEMA: raise ContractError("usage snapshot envelope schema is invalid")
     _id(envelope["correlationId"], name="correlationId"); _id(envelope["idempotencyKey"], name="idempotencyKey"); _timestamp(envelope["occurredAt"]); _digest(envelope["digest"], name="digest")
+    if "messageId" in envelope: _id(envelope["messageId"], name="messageId")
     snapshot = _object(envelope["snapshot"], name="usage snapshot")
     fields = {"schemaVersion", "id", "sourceId", "capturedAt", "policyVersion", "providerResetAt", "scopeDigest", "decisionVersion", "unusedPriorDayWeeklyCapacity", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed", "digest"}
     _keys(snapshot, fields, name="usage snapshot")

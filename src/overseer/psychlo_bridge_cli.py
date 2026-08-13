@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(receipt, dict): raise ValueError("usage receipt input is invalid")
             ledger.record_execution_receipt(receipt)
         result = UsageSnapshotProducer(ledger, sender=bridge.sender).emit(str(observation["observationId"]), policy_version=args.policy_version)
-        print(json.dumps({"accepted": True, "replay": result["replay"]}, sort_keys=True))
+        print(json.dumps({"delivered": True, "replay": result["replay"], "receipt": result.get("receipt")}, sort_keys=True))
         return 0
     if args.command == "sync-projects":
         bridge = create_bridge_from_environment()

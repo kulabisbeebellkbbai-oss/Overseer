@@ -14,6 +14,7 @@ from overseer.psychlo_contracts import canonical_digest, parse_usage_snapshot_v1
 from overseer.usage_attribution import (
     UsageAttributionError,
     UsageAttributionLedger,
+    UsageSnapshotPreSendError,
     UsageSnapshotProducer,
 )
 
@@ -98,6 +99,22 @@ def _ledger(path: Path) -> UsageAttributionLedger:
     return UsageAttributionLedger(path, approved_authority_id=AUTHORITY, approved_authority_binding_id="binding-psychlo-codex", approved_authority_binding_digest="a" * 64, approved_account_id=ACCOUNT, approved_authority_public_key=PUBLIC_KEY, receipt_identity_validator=validate)
 
 
+def _delivery_response(payload: dict, **changes: object) -> dict:
+    snapshot = payload["snapshot"]
+    receipt = {
+        "kind": "usage-snapshot",
+        "messageId": payload["messageId"],
+        "correlationId": payload["correlationId"],
+        "idempotencyKey": payload["idempotencyKey"],
+        "snapshotId": snapshot["id"],
+        "snapshotDigest": snapshot["digest"],
+        "envelopeDigest": payload["digest"],
+        "persistenceId": "psychlo-persistence-1",
+        "outcome": "inserted",
+    }
+    return {"receipt": {**receipt, **changes}}
+
+
 def test_authoritative_observation_and_bound_receipts_produce_exact_psychlo_payload(tmp_path: Path):
     ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
     ledger.record_provider_observation(_observation())
@@ -122,7 +139,7 @@ def test_authoritative_observation_and_bound_receipts_produce_exact_psychlo_payl
         assert kind == "usage-snapshot"
         assert ledger.delivery_intent(payload["idempotencyKey"]) is not None
         sent.append((kind, message_id, payload))
-        return {"accepted": True}
+        return _delivery_response(payload)
 
     producer = UsageSnapshotProducer(ledger, sender=sender)
     result = producer.emit("observation-20260812", policy_version="2026-08-13")
@@ -216,7 +233,7 @@ def test_snapshot_and_delivery_intent_are_immutable_and_replay_after_restart(tmp
     ledger.record_provider_observation(_observation())
     ledger.record_execution_receipt(_receipt())
     calls: list[tuple[str, str]] = []
-    producer = UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: calls.append((kind, message_id)) or {"accepted": True})
+    producer = UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: calls.append((kind, message_id)) or _delivery_response(payload))
     first = producer.emit("observation-20260812", policy_version="2026-08-13")
     assert first["replay"] is False
     ledger.connection.close()
@@ -237,11 +254,89 @@ def test_delivery_failure_is_durable_and_retry_wins_exactly_once(tmp_path: Path)
     with pytest.raises(RuntimeError, match="send failed"):
         UsageSnapshotProducer(ledger, sender=lambda *_: (_ for _ in ()).throw(RuntimeError("send failed"))).emit("observation-20260812", policy_version="2026-08-13")
     pending = ledger.delivery_intent_for_observation("observation-20260812")
-    assert pending is not None and pending["state"] == "pending"
+    assert pending is not None and pending["state"] == "uncertain"
     sent: list[tuple[str, str]] = []
-    retry = UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: sent.append((kind, message_id)) or {"accepted": True}).emit("observation-20260812", policy_version="2026-08-13")
+    retry = UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: sent.append((kind, message_id)) or _delivery_response(payload)).emit("observation-20260812", policy_version="2026-08-13")
     assert retry["replay"] is False
     assert sent == [("usage-snapshot", retry["payload"]["idempotencyKey"])]
+
+
+def test_pre_send_failure_remains_pending_and_later_valid_receipt_delivers(tmp_path: Path):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    with pytest.raises(RuntimeError, match="local setup"):
+        UsageSnapshotProducer(
+            ledger,
+            sender=lambda *_: pytest.fail("external sender must not run"),
+            before_send=lambda: (_ for _ in ()).throw(RuntimeError("local setup")),
+        ).emit("observation-20260812", policy_version="2026-08-13")
+    assert ledger.delivery_intent_for_observation("observation-20260812")["state"] == "pending"
+    result = UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload)).emit("observation-20260812", policy_version="2026-08-13")
+    assert result["receipt"]["outcome"] == "inserted"
+
+
+def test_sender_pre_send_marker_is_retryable_but_ordinary_failure_is_uncertain(tmp_path: Path):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    with pytest.raises(UsageSnapshotPreSendError):
+        UsageSnapshotProducer(ledger, sender=lambda *_: (_ for _ in ()).throw(UsageSnapshotPreSendError("connect"))).emit("observation-20260812", policy_version="2026-08-13")
+    assert ledger.delivery_intent_for_observation("observation-20260812")["state"] == "pending"
+
+
+@pytest.mark.parametrize("response", [{"status_code": 202}, {"status_code": 409}, {"accepted": True}])
+def test_non_receipts_are_uncertain_and_never_mark_delivered(tmp_path: Path, response: dict):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    with pytest.raises(UsageAttributionError):
+        UsageSnapshotProducer(ledger, sender=lambda *_: response).emit("observation-20260812", policy_version="2026-08-13")
+    intent = ledger.delivery_intent_for_observation("observation-20260812")
+    assert intent["state"] == "uncertain" and intent["receipt"] is None
+
+
+def test_mismatched_receipt_is_uncertain_and_exact_payload_is_retried(tmp_path: Path):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    sent: list[dict] = []
+    def mismatched(_kind: str, _message_id: str, payload: dict) -> dict:
+        sent.append(payload)
+        return _delivery_response(payload, envelopeDigest="f" * 64)
+    with pytest.raises(UsageAttributionError, match="mismatch"):
+        UsageSnapshotProducer(ledger, sender=mismatched).emit("observation-20260812", policy_version="2026-08-13")
+    original = ledger.delivery_intent_for_observation("observation-20260812")["payload"]
+    result = UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload, outcome="duplicate")).emit("observation-20260812", policy_version="2026-08-13")
+    assert result["receipt"]["outcome"] == "duplicate"
+    assert sent[0] == original
+
+
+def test_duplicate_receipt_survives_restart_without_resend(tmp_path: Path):
+    path = tmp_path / "usage-attribution.sqlite3"
+    ledger = _ledger(path)
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    first = UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload, outcome="duplicate")).emit("observation-20260812", policy_version="2026-08-13")
+    stored = ledger.delivery_intent_for_observation("observation-20260812")
+    ledger.connection.close()
+    restarted = _ledger(path)
+    replay = UsageSnapshotProducer(restarted, sender=lambda *_: pytest.fail("duplicate delivery receipt must prevent resend")).emit("observation-20260812", policy_version="2026-08-13")
+    assert replay["replay"] is True and replay["receipt"] == first["receipt"] == stored["receipt"]
+
+
+def test_uncertain_delivery_has_one_bounded_exact_payload_retry(tmp_path: Path):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    with pytest.raises(RuntimeError):
+        UsageSnapshotProducer(ledger, sender=lambda *_: (_ for _ in ()).throw(RuntimeError("ambiguous"))).emit("observation-20260812", policy_version="2026-08-13")
+    with pytest.raises(RuntimeError):
+        UsageSnapshotProducer(ledger, sender=lambda *_: (_ for _ in ()).throw(RuntimeError("ambiguous again"))).emit("observation-20260812", policy_version="2026-08-13")
+    with pytest.raises(UsageAttributionError, match="retry limit"):
+        UsageSnapshotProducer(ledger, sender=lambda *_: pytest.fail("retry budget must be exhausted")).emit("observation-20260812", policy_version="2026-08-13")
+    with pytest.raises(UsageAttributionError, match="immutable"):
+        UsageSnapshotProducer(ledger, sender=lambda *_: pytest.fail("replacement envelope must not be sent")).emit("observation-20260812", policy_version="different-policy")
 
 
 def test_post_send_crash_recovers_exact_payload_and_corrupt_intent_fails_closed(tmp_path: Path):
@@ -251,12 +346,12 @@ def test_post_send_crash_recovers_exact_payload_and_corrupt_intent_fails_closed(
     ledger.record_execution_receipt(_receipt())
     first: list[dict] = []
     with pytest.raises(SystemExit):
-        UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: first.append(payload) or {"accepted": True}, after_send=lambda: (_ for _ in ()).throw(SystemExit(9))).emit("observation-20260812", policy_version="2026-08-13")
+        UsageSnapshotProducer(ledger, sender=lambda kind, message_id, payload: first.append(payload) or _delivery_response(payload), after_send=lambda: (_ for _ in ()).throw(SystemExit(9))).emit("observation-20260812", policy_version="2026-08-13")
     assert ledger.delivery_intent_for_observation("observation-20260812")["state"] == "sending"
     ledger.connection.close()
     restarted = _ledger(path)
     second: list[dict] = []
-    recovered = UsageSnapshotProducer(restarted, sender=lambda kind, message_id, payload: second.append(payload) or {"accepted": True}).emit("observation-20260812", policy_version="2026-08-13")
+    recovered = UsageSnapshotProducer(restarted, sender=lambda kind, message_id, payload: second.append(payload) or _delivery_response(payload)).emit("observation-20260812", policy_version="2026-08-13")
     assert recovered["replay"] is False and first == second
     restarted.connection.execute("UPDATE usage_snapshot_intents SET digest=?", ("0" * 64,))
     restarted.connection.close()
@@ -264,9 +359,21 @@ def test_post_send_crash_recovers_exact_payload_and_corrupt_intent_fails_closed(
         _ledger(path)
 
 
+def test_corrupt_persisted_receipt_fails_closed_on_restart(tmp_path: Path):
+    path = tmp_path / "usage-attribution.sqlite3"
+    ledger = _ledger(path)
+    ledger.record_provider_observation(_observation())
+    ledger.record_execution_receipt(_receipt())
+    UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload)).emit("observation-20260812", policy_version="2026-08-13")
+    ledger.connection.execute("UPDATE usage_snapshot_intents SET receipt_json=?", ('{"kind":"usage-snapshot"}',))
+    ledger.connection.close()
+    with pytest.raises(UsageAttributionError, match="corrupt snapshot intent receipt"):
+        _ledger(path)
+
+
 def _cross_process_emit(path: str, ready, result_queue) -> None:
     ledger = _ledger(Path(path))
-    producer = UsageSnapshotProducer(ledger, sender=lambda *_: {"accepted": True})
+    producer = UsageSnapshotProducer(ledger, sender=lambda _kind, _message_id, payload: _delivery_response(payload))
     ready.wait(10)
     try:
         result_queue.put(producer.emit("observation-20260812", policy_version="2026-08-13")["replay"])

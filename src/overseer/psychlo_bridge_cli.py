@@ -12,11 +12,27 @@ from .psychlo_bridge import MAX_BODY_BYTES, _read_private_file, create_bridge_fr
 from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, _validate_usage_snapshot_receipt, managed_receipt_validator
 
 
-def main(argv: list[str] | None = None) -> int:
+def _delivery_lease_seconds(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("delivery lease seconds must be an integer from 1 to 86400") from error
+    if not 1 <= parsed <= 86400:
+        raise argparse.ArgumentTypeError("delivery lease seconds must be an integer from 1 to 86400")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one bounded Psychlo bridge operation")
     subparsers = parser.add_subparsers(dest="command", required=True)
     emit = subparsers.add_parser("emit-usage")
     emit.add_argument("--policy-version", default=os.environ.get("OVERSEER_PSYCHLO_POLICY_VERSION", "2026-08-09"))
+    emit.add_argument(
+        "--delivery-lease-seconds",
+        type=_delivery_lease_seconds,
+        default=os.environ.get("OVERSEER_PSYCHLO_DELIVERY_LEASE_SECONDS", 300),
+        help="bounded lease for one usage snapshot delivery claim (default: 300)",
+    )
     emit.add_argument("--attribution-ledger", default=os.environ.get("OVERSEER_PSYCHLO_USAGE_ATTRIBUTION_LEDGER"))
     emit.add_argument("--authority-config", default=os.environ.get("OVERSEER_PSYCHLO_USAGE_AUTHORITY_FILE"))
     emit.add_argument("--observation-file", default=os.environ.get("OVERSEER_PSYCHLO_USAGE_OBSERVATION_FILE"))
@@ -24,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
     sync = subparsers.add_parser("sync-projects")
     sync.add_argument("--handoff-file", default=os.environ.get("OVERSEER_A_TEAM_HANDOFF_FILE", "/home/god/Documents/Codex Workspace/The A-Team/data/handoffs.json"))
     subparsers.add_parser("tick")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "emit-usage":
         bridge = create_bridge_from_environment()
@@ -33,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         observation = _closed_json(Path(args.observation_file), None)
         receipts = _closed_json(Path(args.receipt_file), None)
         if not isinstance(receipts, list): raise ValueError("usage receipt input must be an array")
-        ledger = UsageAttributionLedger(args.attribution_ledger, approved_authority_id=authority["authorityId"], approved_authority_binding_id=authority["authorityBindingId"], approved_authority_binding_digest=authority["authorityBindingDigest"], approved_account_id=authority["accountId"], approved_authority_public_key=base64.b64decode(authority["publicKey"], validate=True), receipt_identity_validator=managed_receipt_validator(bridge.store))
+        ledger = UsageAttributionLedger(args.attribution_ledger, approved_authority_id=authority["authorityId"], approved_authority_binding_id=authority["authorityBindingId"], approved_authority_binding_digest=authority["authorityBindingDigest"], approved_account_id=authority["accountId"], approved_authority_public_key=base64.b64decode(authority["publicKey"], validate=True), receipt_identity_validator=managed_receipt_validator(bridge.store), lease_seconds=args.delivery_lease_seconds)
         ledger.record_provider_observation(observation)
         for receipt in receipts:
             if not isinstance(receipt, dict): raise ValueError("usage receipt input is invalid")

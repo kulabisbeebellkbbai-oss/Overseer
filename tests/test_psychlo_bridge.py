@@ -21,6 +21,7 @@ from overseer.psychlo_bridge import (
     PsychloBridgeStore,
     CodexProjectDispatcher,
     derive_usage_snapshot,
+    PsychloPeerSender,
     sign_peer_message,
     verify_peer_request,
     _read_secret,
@@ -1234,6 +1235,66 @@ def test_peer_verification_rejects_wrong_or_missing_injected_authority(tmp_path:
             assert str(error) == "invalid_headers"
         else:
             raise AssertionError("wrong or missing authority was accepted")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "authority"),
+    [
+        ("http://127.0.0.1:43127", "127.0.0.1:43127"),
+        ("http://[::1]:43128", "[::1]:43128"),
+    ],
+)
+def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoint: str, authority: str):
+    requests = []
+
+    class Headers:
+        def get_content_type(self):
+            return "application/json"
+
+    class Response:
+        status = 201
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, _limit):
+            return b'{"accepted":true}'
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr("overseer.psychlo_bridge.urlopen", fake_urlopen)
+    result = PsychloPeerSender(endpoint, SECRET, timeout=2)("usage-snapshot", "message-1", {"value": 1})
+    assert result["accepted"] is True
+    request, timeout = requests[0]
+    assert timeout == 2
+    assert request.get_header("Host") == authority
+    assert request.full_url == f"{endpoint}/internal/overseer/usage-snapshot"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://example.com:43127",
+        "http://127.0.0.1:43127/path",
+        "http://user:password@127.0.0.1:43127",
+        "http://127.0.0.1:43127?unsafe=1",
+        "http://127.0.0.1:43127#unsafe",
+        "https://127.0.0.1:43127",
+        "http://0.0.0.0:43127",
+        "http://[::]:43127",
+        "http://127.0.0.1",
+        "http://127.0.0.1:0",
+    ],
+)
+def test_peer_sender_rejects_unsafe_or_ambiguous_endpoint(endpoint: str):
+    with pytest.raises(ValueError, match="loopback origin"):
+        PsychloPeerSender(endpoint, SECRET)
 
 
 def test_derives_prior_day_unused_weekly_capacity_from_provider_delta_only():

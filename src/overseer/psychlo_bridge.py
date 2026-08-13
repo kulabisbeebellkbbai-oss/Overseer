@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
+import ipaddress
 import inspect
 import json
 import math
@@ -17,6 +18,7 @@ import stat
 import threading
 from typing import Any, Callable, Mapping
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from .psychlo_contracts import (
     ContractError,
@@ -1715,15 +1717,14 @@ class PsychloBridge:
 
 class PsychloPeerSender:
     def __init__(self, endpoint: str, secret: bytes, *, clock: Callable[[], str] | None = None, timeout: float = 5.0):
-        if endpoint != "http://127.0.0.1:8798":
-            raise ValueError("Psychlo endpoint must be the exact approved loopback origin")
-        self.endpoint, self.secret, self.clock, self.timeout = endpoint, secret, clock or (lambda: datetime.now(UTC).isoformat()), timeout
+        self.endpoint, self.authority = _validate_psychlo_endpoint(endpoint)
+        self.secret, self.clock, self.timeout = secret, clock or (lambda: datetime.now(UTC).isoformat()), timeout
 
     def __call__(self, kind: str, message_id: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         timestamp = self.clock()
         nonce = secrets.token_urlsafe(24)
         body = json.dumps({"kind": kind, "messageId": message_id, "occurredAt": timestamp, "payload": dict(payload)}, separators=(",", ":")).encode()
-        headers = sign_peer_message(self.secret, "overseer-to-psychlo", kind, message_id, timestamp, nonce, body, authority="127.0.0.1:8798")
+        headers = sign_peer_message(self.secret, "overseer-to-psychlo", kind, message_id, timestamp, nonce, body, authority=self.authority)
         request = Request(f"{self.endpoint}/internal/overseer/{kind}", data=body, headers=headers, method="POST")
         with urlopen(request, timeout=self.timeout) as response:
             if response.status not in {200, 201, 202, 409} or response.headers.get_content_type() != "application/json":
@@ -1737,6 +1738,45 @@ class PsychloPeerSender:
         # 202 or 409 is an HTTP acknowledgement/conflict, not proof that the
         # usage snapshot was durably inserted or deduplicated.
         return {**parsed, "status_code": response_status}
+
+
+def _validate_psychlo_endpoint(endpoint: str) -> tuple[str, str]:
+    """Return a canonical local origin and its exact HTTP Host authority.
+
+    The endpoint is configuration, so it must not be allowed to redirect peer
+    traffic or change the signed authority.  Numeric loopback addresses are
+    required; hostnames, credentials, paths, queries, fragments, and missing
+    or invalid ports fail closed.
+    """
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("Psychlo endpoint must be the exact approved loopback origin")
+    try:
+        parsed = urlsplit(endpoint)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Psychlo endpoint must be the exact approved loopback origin") from error
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or hostname is None
+        or port is None
+        or port < 1
+        or not parsed.netloc
+    ):
+        raise ValueError("Psychlo endpoint must be the exact approved loopback origin")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError as error:
+        raise ValueError("Psychlo endpoint must be the exact approved loopback origin") from error
+    if not address.is_loopback:
+        raise ValueError("Psychlo endpoint must be the exact approved loopback origin")
+    authority = f"[{hostname}]:{port}" if address.version == 6 else f"{hostname}:{port}"
+    return endpoint.rstrip("/"), authority
 
 
 class CodexProjectDispatcher:

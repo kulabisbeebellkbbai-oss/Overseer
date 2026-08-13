@@ -1,8 +1,11 @@
 from pathlib import Path
+import base64
+from types import SimpleNamespace
 
 import pytest
 
-from overseer.psychlo_bridge_cli import _closed_json, _usage_delivery_output
+import overseer.psychlo_bridge_cli as cli
+from overseer.psychlo_bridge_cli import _closed_json, _usage_delivery_output, build_parser
 
 
 def test_usage_authority_input_is_private_bounded_and_no_follow(tmp_path: Path):
@@ -90,3 +93,72 @@ def test_cli_active_lease_is_in_progress_and_not_replay_success():
         "idempotencyKey": payload["idempotencyKey"],
         "messageId": payload["messageId"],
     }
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "86401", "not-an-integer"])
+def test_cli_rejects_out_of_bounds_delivery_lease_seconds(value: str):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["emit-usage", "--delivery-lease-seconds", value])
+
+
+def test_cli_accepts_bounded_delivery_lease_seconds_and_preserves_default():
+    parser = build_parser()
+    assert parser.parse_args(["emit-usage"]).delivery_lease_seconds == 300
+    assert parser.parse_args(["emit-usage", "--delivery-lease-seconds", "86400"]).delivery_lease_seconds == 86400
+
+
+def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Path, capsys):
+    captured = {}
+
+    class Ledger:
+        def __init__(self, _path, **kwargs):
+            captured.update(kwargs)
+
+        def record_provider_observation(self, _observation):
+            pass
+
+        def record_execution_receipt(self, _receipt):
+            pass
+
+        def delivery_intent(self, _key):
+            return None
+
+    class Producer:
+        def __init__(self, _ledger, *, sender):
+            assert callable(sender)
+
+        def emit(self, _observation_id, *, policy_version):
+            assert policy_version == "policy-test"
+            return {"payload": {"idempotencyKey": "snapshot-test"}, "state": "pending", "replay": False}
+
+    authority = {
+        "authorityId": "meter",
+        "authorityBindingId": "binding",
+        "authorityBindingDigest": "a" * 64,
+        "accountId": "account",
+        "publicKey": base64.b64encode(b"k" * 32).decode(),
+    }
+    observation = {"observationId": "observation-test"}
+    monkeypatch.setattr(cli, "create_bridge_from_environment", lambda: SimpleNamespace(sender=lambda *_: {}, store=object()))
+    monkeypatch.setattr(cli, "_closed_json", lambda path, keys: authority if keys is not None else ([] if Path(path).name == "receipts.json" else observation))
+    monkeypatch.setattr(cli, "UsageAttributionLedger", Ledger)
+    monkeypatch.setattr(cli, "UsageSnapshotProducer", Producer)
+
+    exit_code = cli.main([
+        "emit-usage",
+        "--policy-version",
+        "policy-test",
+        "--delivery-lease-seconds",
+        "17",
+        "--attribution-ledger",
+        str(tmp_path / "ledger.sqlite3"),
+        "--authority-config",
+        str(tmp_path / "authority.json"),
+        "--observation-file",
+        str(tmp_path / "observation.json"),
+        "--receipt-file",
+        str(tmp_path / "receipts.json"),
+    ])
+    assert exit_code == 1
+    assert captured["lease_seconds"] == 17
+    assert '"delivered": false' in capsys.readouterr().out

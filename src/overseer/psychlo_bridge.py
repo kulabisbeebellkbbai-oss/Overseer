@@ -579,8 +579,10 @@ class PsychloBridge:
         stored, inserted = self.store.record_policy_exception_request(request, request["digest"], receiver_message_id=message_id or request["id"])
         receiver_message_id = stored.get("receiverMessageId") or message_id or request["id"]
         receipt = _policy_exception_receiver_receipt(request, receiver_message_id, outcome="inserted" if inserted else "duplicate")
-        if stored["outcome"] is not None:
+        if stored["outcome"] is not None and stored["state"] not in {"expired", "recovery-invalid"}:
             return {"accepted": True, "replay": not inserted, "status": stored["state"], "outcome": stored["outcome"], "receipt": receipt}
+        if stored["state"] in {"expired", "recovery-invalid"}:
+            return {"accepted": True, "replay": not inserted, "status": stored["state"], "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
         authority = None
         if self.approval_store is not None:
             authority = self.approval_store.stage_psychlo_policy_exception_authority(request, created_at=self.clock())
@@ -645,12 +647,12 @@ class PsychloBridge:
         if result is None:
             raise ValueError("authoritative approval store is unavailable")
         if result.get("replay"):
-            stored = self.store.policy_exception_request(request_id)
-            if stored is not None and stored.get("outcome") is not None:
-                return {"accepted": True, "replay": True, "status": stored["state"], "outcome": stored["outcome"]}
             if result.get("status") == "expired":
                 self.store.transition_policy_exception_request(request_id, "expired", now=str(decided_at))
                 return {"accepted": True, **result}
+            stored = self.store.policy_exception_request(request_id)
+            if stored is not None and stored.get("outcome") is not None:
+                return {"accepted": True, "replay": True, "status": stored["state"], "outcome": stored["outcome"]}
         if result.get("status") in {"approved", "rejected"}:
             request = self.store.policy_exception_request(request_id)
             if request is None:
@@ -680,6 +682,8 @@ class PsychloBridge:
         status = getattr(approval_record, "status", approval_record.get("status") if isinstance(approval_record, Mapping) else None)
         status = getattr(status, "value", status)
         if status in {"expired", "superseded"} or self._policy_exception_expired(request):
+            if status == "approved":
+                self._expire_undelivered_policy_exception_authority(approval_id, request)
             self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
             return {"accepted": True, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"]}
         if status == "pending":
@@ -752,6 +756,14 @@ class PsychloBridge:
         try: return datetime.fromisoformat(str(request["expiresAt"]).replace("Z", "+00:00")) <= datetime.fromisoformat(self.clock().replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError): return True
 
+    def _expire_undelivered_policy_exception_authority(self, approval_id: str, request: Mapping[str, Any]) -> None:
+        expected = f"approval.psychlo.policy-exception.{request['id']}"
+        if self.approval_store is None or approval_id != expected:
+            raise ValueError("dedicated policy exception expiration authority is required")
+        self.approval_store.expire_undelivered_psychlo_policy_exception_authority(
+            str(request["id"]), expired_at=self.clock()
+        )
+
     def _recover_policy_exception_records(self) -> None:
         for record in self.store.pending_policy_exception_requests():
             if record is None or record.get("state") != "forward-pending" or not isinstance(record.get("outcome"), dict): continue
@@ -760,6 +772,10 @@ class PsychloBridge:
                 if record.get("requestId") != request["id"] or record.get("digest") != request["digest"] or policy_exception_request_digest(request) != record.get("digest"):
                     raise ValueError("stored policy exception request is corrupt")
                 if self._policy_exception_expired(request):
+                    approval_id = record.get("approvalId")
+                    if not approval_id:
+                        raise ValueError("stored policy exception approval binding is missing")
+                    self._expire_undelivered_policy_exception_authority(str(approval_id), request)
                     self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
                     continue
                 outcome = parse_policy_exception_outcome(record["outcome"])

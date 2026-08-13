@@ -262,3 +262,110 @@ def test_late_approval_expires_primary_pair_and_bridge_request_atomically(tmp_pa
     assert plan.canceled is True and plan.approved is False
     assert approval.status.value == "expired"
     assert bridge_instance.store.policy_exception_request(value["id"])["state"] == "expired"
+
+
+def test_restart_after_approved_outcome_delivery_failure_expires_primary_authority(tmp_path: Path):
+    value = request("exception-approved-undelivered")
+    value["expiresAt"] = "2026-08-12T12:02:00.000Z"
+    value["digest"] = policy_exception_request_digest(value)
+    primary = SQLiteStore(tmp_path / "primary.sqlite3")
+    projected_path = tmp_path / "bridge.sqlite3"
+    projected = PsychloBridgeStore(projected_path)
+    first = PsychloBridge(
+        store=projected,
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": False},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: "2026-08-12T12:01:00+00:00",
+        approval_store=primary,
+    )
+    first.receive_policy_exception_request(value)
+    with pytest.raises(ValueError, match="forward-pending"):
+        first.decide_policy_exception_authority(
+            {
+                "request_id": value["id"],
+                "decision": "approve",
+                "decided_by": "human-user",
+                "reason": "approved before expiry",
+            }
+        )
+    assert primary.load_admin_change_plan("admin.psychlo.policy-exception.exception-approved-undelivered").approved
+    assert primary.load_approval("approval.psychlo.policy-exception.exception-approved-undelivered").status.value == "approved"
+    projected.connection.close()
+
+    restarted_store = PsychloBridgeStore(projected_path)
+    sent: list = []
+    PsychloBridge(
+        store=restarted_store,
+        dispatcher=lambda *_: "unused",
+        sender=lambda *args: sent.append(args) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: "2026-08-12T12:03:00+00:00",
+        approval_store=primary,
+    )
+    plan = primary.load_admin_change_plan("admin.psychlo.policy-exception.exception-approved-undelivered")
+    approval = primary.load_approval("approval.psychlo.policy-exception.exception-approved-undelivered")
+    assert restarted_store.policy_exception_request(value["id"])["state"] == "expired"
+    assert plan.canceled is True and plan.approved is False
+    assert approval.status.value == "expired"
+    assert primary.psychlo_policy_exception_authority_expiration(value["id"])["originalDecision"] == "approved"
+    assert sent == []
+    replay = restarted_store.policy_exception_request(value["id"])
+    assert replay["state"] == "expired" and replay["outcome"]["status"] == "approved"
+
+    restarted = PsychloBridge(
+        store=restarted_store,
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: "2026-08-12T12:04:00+00:00",
+        approval_store=primary,
+    )
+    terminal = restarted.receive_policy_exception_request(value)
+    assert terminal["status"] == "expired"
+    assert "outcome" not in terminal
+
+
+def test_authorize_after_expiry_expires_preapproved_undelivered_authority(tmp_path: Path):
+    value = request("exception-authorize-after-expiry")
+    value["expiresAt"] = "2026-08-12T12:02:00.000Z"
+    value["digest"] = policy_exception_request_digest(value)
+    bridge_instance, primary = bridge(tmp_path, now="2026-08-12T12:01:00+00:00")
+    bridge_instance.receive_policy_exception_request(value)
+    primary.decide_psychlo_policy_exception_authority(
+        value["id"], "approved", "human-user", "approved before expiry", decided_at="2026-08-12T12:01:30+00:00"
+    )
+    bridge_instance.clock = lambda: "2026-08-12T12:03:00+00:00"
+
+    result = bridge_instance.authorize_policy_exception(
+        f"approval.psychlo.policy-exception.{value['id']}", value
+    )
+    plan = primary.load_admin_change_plan(f"admin.psychlo.policy-exception.{value['id']}")
+    approval = primary.load_approval(f"approval.psychlo.policy-exception.{value['id']}")
+    assert result["status"] == "expired"
+    assert plan.canceled and not plan.approved
+    assert approval.status.value == "expired"
+    assert bridge_instance.store.policy_exception_request(value["id"])["state"] == "expired"
+
+
+def test_restart_after_delivered_approval_does_not_expire_primary_authority(tmp_path: Path):
+    value = request("exception-approved-delivered")
+    value["expiresAt"] = "2026-08-12T12:02:00.000Z"
+    value["digest"] = policy_exception_request_digest(value)
+    bridge_instance, primary = bridge(tmp_path, now="2026-08-12T12:01:00+00:00")
+    bridge_instance.receive_policy_exception_request(value)
+    result = bridge_instance.decide_policy_exception_authority(
+        {
+            "request_id": value["id"],
+            "decision": "approve",
+            "decided_by": "human-user",
+            "reason": "approved and delivered before expiry",
+        }
+    )
+    assert result["status"] == "approved"
+    bridge_instance.clock = lambda: "2026-08-12T12:03:00+00:00"
+    bridge_instance._recover_policy_exception_records()
+    assert bridge_instance.store.policy_exception_request(value["id"])["state"] == "approved"
+    assert primary.load_admin_change_plan("admin.psychlo.policy-exception.exception-approved-delivered").approved
+    assert primary.load_approval("approval.psychlo.policy-exception.exception-approved-delivered").status.value == "approved"
+    assert primary.psychlo_policy_exception_authority_expiration(value["id"]) is None

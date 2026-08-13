@@ -2235,6 +2235,15 @@ class SQLiteStore:
                 existing = json.loads(str(existing_row["payload"]))
                 if any(existing.get(key) != value for key, value in submitted.items()):
                     raise ValueError("policy exception authority decision conflict")
+                expiration = self.psychlo_policy_exception_authority_expiration(request_id)
+                if expiration is not None:
+                    if not (
+                        expiration.get("originalDecision") == existing.get("status")
+                        and plan.canceled and not plan.approved
+                        and approval.status is ApprovalStatus.EXPIRED
+                    ):
+                        raise ValueError("policy exception authority expiration state mismatch")
+                    return {"status": "expired", "planId": plan_id, "approvalId": approval_id, "replay": True}
                 status = existing.get("status")
                 state_valid = (
                     status == "approved" and plan.approved and not plan.canceled and approval.status is ApprovalStatus.APPROVED
@@ -2276,6 +2285,102 @@ class SQLiteStore:
             return None
         row = self._connection.execute(
             "SELECT payload FROM psychlo_policy_exception_decisions WHERE request_id=?", (request_id,)
+        ).fetchone()
+        return None if row is None else json.loads(str(row["payload"]))
+
+    def expire_undelivered_psychlo_policy_exception_authority(
+        self,
+        request_id: str,
+        *,
+        expired_at: str,
+    ) -> dict[str, Any]:
+        """Supersede an approved authority whose signed outcome was not delivered.
+
+        The original canonical human decision remains immutable in
+        ``psychlo_policy_exception_decisions``.  A separate expiration record
+        binds the lifecycle supersession while this transaction cancels the
+        plan and expires its paired ApprovalRequest together.
+        """
+        try:
+            current_time = datetime.fromisoformat(expired_at.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise ValueError("policy exception expiration time is invalid") from error
+        if current_time.tzinfo is None:
+            raise ValueError("policy exception expiration time is invalid")
+        plan_id = f"admin.psychlo.policy-exception.{request_id}"
+        approval_id = f"approval.psychlo.policy-exception.{request_id}"
+        with self.agent_transaction():
+            plan = self.load_admin_change_plan(plan_id)
+            approval = self.load_approval(approval_id)
+            decision = self.psychlo_policy_exception_decision(request_id)
+            if (
+                plan.kind.value != "psychlo_policy_exception"
+                or plan.target != request_id
+                or approval.subject_id != plan_id
+                or approval.approval_level is not ApprovalLevel.HUMAN
+                or decision is None
+                or decision.get("status") != "approved"
+            ):
+                raise ValueError("undelivered policy exception authority identity is invalid")
+            metadata = json.loads(plan.proposed_state).get("psychloAuthorization", {})
+            signed_request = metadata.get("payload") if isinstance(metadata, dict) else None
+            if not isinstance(signed_request, dict) or signed_request.get("id") != request_id or signed_request.get("digest") != metadata.get("payloadDigest"):
+                raise ValueError("undelivered policy exception authority request binding is invalid")
+            try:
+                expires_at = datetime.fromisoformat(str(signed_request["expiresAt"]).replace("Z", "+00:00"))
+            except (KeyError, ValueError) as error:
+                raise ValueError("policy exception authority expiry is invalid") from error
+            if expires_at.tzinfo is None or current_time < expires_at:
+                raise ValueError("policy exception authority has not expired")
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS psychlo_policy_exception_authority_expirations (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            existing = self.psychlo_policy_exception_authority_expiration(request_id)
+            if existing is not None:
+                if not (plan.canceled and not plan.approved and approval.status is ApprovalStatus.EXPIRED):
+                    raise ValueError("policy exception authority expiration state mismatch")
+                return {**existing, "replay": True}
+            if not (plan.approved and not plan.canceled and approval.status is ApprovalStatus.APPROVED):
+                raise ValueError("only an approved undelivered policy exception authority can expire")
+            expiration = {
+                "requestId": request_id,
+                "approvalId": approval_id,
+                "planId": plan_id,
+                "originalDecision": "approved",
+                "originalDecisionAt": decision.get("decidedAt"),
+                "expiredAt": expired_at,
+                "reason": "signed policy exception request expired before approved outcome delivery",
+            }
+            self._connection.execute(
+                "INSERT INTO psychlo_policy_exception_authority_expirations(request_id,payload) VALUES (?,?)",
+                (request_id, _dump(expiration)),
+            )
+            self.save_admin_change_plan(replace(
+                plan,
+                approved=False,
+                approved_by=None,
+                approved_at=None,
+                canceled=True,
+                canceled_by="overseer-expiry",
+                canceled_at=expired_at,
+                cancellation_reason=expiration["reason"],
+            ))
+            self.save_approval(replace(
+                approval,
+                status=ApprovalStatus.EXPIRED,
+                decided_by="overseer-expiry",
+                decided_at=expired_at,
+            ))
+            return {**expiration, "replay": False}
+
+    def psychlo_policy_exception_authority_expiration(self, request_id: str) -> dict[str, Any] | None:
+        table = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='psychlo_policy_exception_authority_expirations'"
+        ).fetchone()
+        if table is None:
+            return None
+        row = self._connection.execute(
+            "SELECT payload FROM psychlo_policy_exception_authority_expirations WHERE request_id=?", (request_id,)
         ).fetchone()
         return None if row is None else json.loads(str(row["payload"]))
 

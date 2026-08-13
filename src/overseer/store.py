@@ -43,8 +43,8 @@ from .agent_contracts import (
     FailoverPolicy,
     ProviderHealthObservation,
 )
-from .audit import ApprovalRequest, AuditEvent, AuditEventType
-from .core import Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
+from .audit import ApprovalRequest, ApprovalStatus, AuditEvent, AuditEventType
+from .core import ApprovalLevel, Claim, ConflictDecision, OwnerDomain, Resource, RiskLevel
 from .crew import CrewMessage
 from .health import HealthEvidence, HealthTarget
 from .host import HostInspectionSnapshot
@@ -2047,6 +2047,177 @@ class SQLiteStore:
 
     def save_admin_change_plan(self, plan: AdminChangePlan) -> None:
         self._upsert("admin_change_plans", plan.id, _dump(plan))
+
+    def stage_psychlo_policy_exception_authority(
+        self,
+        request: dict[str, Any],
+        *,
+        created_at: str,
+    ) -> dict[str, Any]:
+        """Atomically stage the non-executable policy-exception authority.
+
+        The Psychlo bridge projection is intentionally not an approval store.
+        This method is the single primary-store write boundary for the three
+        records Roadex displays: the frozen admin plan, its HUMAN
+        ``ApprovalRequest``, and the immutable source binding.  A partially
+        written set is rejected rather than repaired, so restart recovery can
+        only observe a complete authority or a durable failure.
+        """
+        from .admin import AdminChangeKind, AdminCommandStep
+        from .core import ApprovalLevel, OwnerDomain, RiskLevel
+        from .roadex_approval_status import (
+            RoadexApprovalBindingDraft,
+            binding_from_draft,
+            exact_source_evidence_digest,
+        )
+        from .psychlo_contracts import canonical_digest
+
+        request_id = request.get("id")
+        request_digest = request.get("digest")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("policy exception request identity is required")
+        if not isinstance(request_digest, str) or not request_digest.strip():
+            raise ValueError("policy exception request digest is required")
+        plan_id = f"admin.psychlo.policy-exception.{request_id}"
+        approval_id = f"approval.psychlo.policy-exception.{request_id}"
+        encoded_metadata = {
+            "psychloAuthorization": {
+                "action": "psychlo-policy-exception",
+                "authorityWorkflow": "dedicated-human-policy-exception",
+                "target": request_id,
+                "approvalId": approval_id,
+                "payload": dict(request),
+                "payloadDigest": request_digest,
+                "decisionId": f"roadex:psychlo-policy-exception:{request_id}",
+                "decisionDigest": canonical_digest({
+                    "approvalId": approval_id,
+                    "subjectId": plan_id,
+                    "requestDigest": request_digest,
+                }),
+                "scopeDigest": request.get("scopeDigest"),
+                "decisionVersion": request.get("decisionVersion"),
+                "evidence": [request_digest],
+            }
+        }
+        proposed_state = json.dumps(encoded_metadata, sort_keys=True, separators=(",", ":"))
+        # No command is ever emitted for this record.  The descriptive step
+        # makes the plan legible while ``AdminChangePlan.can_execute`` has an
+        # explicit kind guard as a second fail-closed boundary.
+        plan = AdminChangePlan(
+            id=plan_id,
+            kind=AdminChangeKind.PSYCHLO_POLICY_EXCEPTION,
+            owner_domain=OwnerDomain.SISKO,
+            risk_level=RiskLevel.MEDIUM,
+            approval_level=ApprovalLevel.HUMAN,
+            target=request_id,
+            reason=str(request.get("reason") or "Psychlo policy exception requires independent human decision"),
+            current_state="pending signed Psychlo request",
+            proposed_state=proposed_state,
+            steps=(AdminCommandStep("Record human decision only", ("__overseer_policy_exception_decision__",), "This marker is not an executable host command"),),
+            rollback_steps=(),
+            risks=("policy safety rules may be relaxed if independently approved", "the request expires at its signed deadline"),
+            verification_steps=(),
+        )
+        approval = ApprovalRequest(
+            id=approval_id,
+            subject_id=plan_id,
+            approval_level=ApprovalLevel.HUMAN,
+            requester_thread=f"psychlo:{request.get('actorId', 'unknown')}",
+            owner_domain=OwnerDomain.SISKO,
+            reason=plan.reason,
+            status=ApprovalStatus.PENDING,
+            evidence_required=(request_digest,),
+        )
+        draft = RoadexApprovalBindingDraft(
+            approval_ref=plan_id,
+            source_kind="admin-plan",
+            source_id=plan_id,
+            project_id=f"psychlo:{request_id}",
+            workspace_id="psychlo",
+            resource_ref=f"policy-exception:{request_id}",
+            authority_class="privileged-operation",
+            subject=f"Psychlo policy exception {request_id}",
+        )
+
+        with self.agent_transaction():
+            existing_plan = None
+            existing_approval = None
+            existing_binding = None
+            try:
+                existing_plan = self.load_admin_change_plan(plan_id)
+            except KeyError:
+                pass
+            try:
+                existing_approval = self.load_approval(approval_id)
+            except KeyError:
+                pass
+            try:
+                existing_binding = self.load_roadex_approval_binding(plan_id)
+            except KeyError:
+                pass
+            if any(item is not None for item in (existing_plan, existing_approval, existing_binding)):
+                if not (existing_plan == plan and existing_approval == approval):
+                    raise ValueError("policy exception authority staging conflict")
+                expected_binding = binding_from_draft(
+                    draft,
+                    exact_source_evidence_digest(existing_plan),
+                    created_at=existing_binding.created_at if existing_binding is not None else created_at,
+                )
+                if existing_binding != expected_binding:
+                    raise ValueError("policy exception Roadex binding conflict")
+                return {
+                    "inserted": False,
+                    "planId": plan_id,
+                    "approvalId": approval_id,
+                    "binding": existing_binding,
+                }
+            self.save_admin_change_plan(plan)
+            self.save_approval(approval)
+            binding = binding_from_draft(draft, exact_source_evidence_digest(plan), created_at=created_at)
+            self.save_roadex_approval_binding(binding)
+            return {"inserted": True, "planId": plan_id, "approvalId": approval_id, "binding": binding}
+
+    def decide_psychlo_policy_exception_authority(
+        self,
+        request_id: str,
+        decision: str,
+        decided_by: str,
+        reason: str,
+        *,
+        decided_at: str,
+    ) -> dict[str, Any]:
+        """Atomically decide the dedicated plan and its HUMAN approval."""
+        if decision not in {"approved", "rejected", "expired"}:
+            raise ValueError("policy exception decision is invalid")
+        if not isinstance(decided_by, str) or not decided_by.strip() or decided_by.lower() in {"sisko", "overseer", "system"}:
+            raise ValueError("independent human policy exception decision is required")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("policy exception decision reason is required")
+        plan_id = f"admin.psychlo.policy-exception.{request_id}"
+        approval_id = f"approval.psychlo.policy-exception.{request_id}"
+        with self.agent_transaction():
+            plan = self.load_admin_change_plan(plan_id)
+            approval = self.load_approval(approval_id)
+            if plan.kind.value != "psychlo_policy_exception" or plan.target != request_id or approval.subject_id != plan_id or approval.approval_level is not ApprovalLevel.HUMAN:
+                raise ValueError("policy exception authority identity is invalid")
+            if decision == "approved":
+                if plan.canceled or plan.approved or approval.status is not ApprovalStatus.PENDING:
+                    if plan.approved and approval.status is ApprovalStatus.APPROVED and plan.approved_by == decided_by and approval.decided_by == decided_by:
+                        return {"status": "approved", "planId": plan_id, "approvalId": approval_id, "replay": True}
+                    raise ValueError("policy exception authority decision conflict")
+                updated_plan = replace(plan, approved=True, approved_by=decided_by, approved_at=decided_at)
+                updated_approval = replace(approval, status=ApprovalStatus.APPROVED, decided_by=decided_by, decided_at=decided_at)
+            else:
+                terminal_status = ApprovalStatus.REJECTED if decision == "rejected" else ApprovalStatus.EXPIRED
+                if plan.canceled and approval.status is terminal_status:
+                    return {"status": decision, "planId": plan_id, "approvalId": approval_id, "replay": True}
+                if plan.approved or approval.status is not ApprovalStatus.PENDING:
+                    raise ValueError("policy exception authority decision conflict")
+                updated_plan = replace(plan, canceled=True, canceled_by=decided_by, canceled_at=decided_at, cancellation_reason=reason)
+                updated_approval = replace(approval, status=ApprovalStatus.REJECTED if decision == "rejected" else ApprovalStatus.EXPIRED, decided_by=decided_by, decided_at=decided_at)
+            self.save_admin_change_plan(updated_plan)
+            self.save_approval(updated_approval)
+            return {"status": decision, "planId": plan_id, "approvalId": approval_id, "replay": False}
 
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))

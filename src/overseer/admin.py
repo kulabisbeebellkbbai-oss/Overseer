@@ -15,6 +15,10 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
 class AdminChangeKind(StrEnum):
+    # This is a durable human-authority record only.  It deliberately has no
+    # execution adapter or command steps; the policy-exception bridge owns its
+    # paired ApprovalRequest decision path.
+    PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
     USER_SERVICE_RESTART = "user_service_restart"
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
@@ -141,6 +145,7 @@ class AdminChangePlan:
         return (
             not self.archived
             and not self.canceled
+            and self.kind is not AdminChangeKind.PSYCHLO_POLICY_EXCEPTION
             and (self.approved or not self.requires_explicit_approval())
             and not missing_admin_change_fields(self)
         )

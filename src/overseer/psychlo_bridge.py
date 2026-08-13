@@ -581,14 +581,27 @@ class PsychloBridge:
         receipt = _policy_exception_receiver_receipt(request, receiver_message_id, outcome="inserted" if inserted else "duplicate")
         if stored["outcome"] is not None:
             return {"accepted": True, "replay": not inserted, "status": stored["state"], "outcome": stored["outcome"], "receipt": receipt}
+        authority = None
+        if self.approval_store is not None:
+            authority = self.approval_store.stage_psychlo_policy_exception_authority(request, created_at=self.clock())
         if self._policy_exception_expired(request):
             self.store.transition_policy_exception_request(request["id"], "expired", now=self.clock())
-            return {"accepted": True, "replay": not inserted, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
+            if self.approval_store is not None:
+                try:
+                    self.approval_store.decide_psychlo_policy_exception_authority(
+                        request["id"], "expired", "overseer-expiry", "signed policy exception request expired", decided_at=self.clock()
+                    )
+                except (KeyError, ValueError):
+                    # Legacy callers may have supplied an already-terminal
+                    # authority; the bridge request remains terminal either
+                    # way and the authority path fails closed on mismatch.
+                    pass
+            return {"accepted": True, "replay": not inserted, "status": "expired", "exceptionId": request["id"], "requestDigest": request["digest"], **self._policy_exception_authority_refs(authority, request), "receipt": receipt}
         # Roadex/Overseer approval is intentionally not inferred from a
         # request.  A pending request is durable before any authority lookup.
         approval_id = request["id"]
         if self.approval_store is None and self.approval_loader is None:
-            return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
+            return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"], **self._policy_exception_authority_refs(authority, request), "receipt": receipt}
         try:
             result = self.authorize_policy_exception(approval_id, request)
             return {**result, "receipt": receipt}
@@ -596,6 +609,53 @@ class PsychloBridge:
             if str(error) in {"approved policy exception authority is missing", "policy exception approval is pending"}:
                 return {"accepted": True, "replay": not inserted, "status": "pending", "exceptionId": request["id"], "requestDigest": request["digest"], "receipt": receipt}
             raise
+
+    @staticmethod
+    def _policy_exception_authority_refs(authority: Mapping[str, Any] | None, request: Mapping[str, Any]) -> dict[str, str]:
+        if authority is not None:
+            return {"planId": str(authority["planId"]), "approvalId": str(authority["approvalId"]), "roadexApprovalRef": str(authority["planId"])}
+        request_id = str(request["id"])
+        return {"planId": f"admin.psychlo.policy-exception.{request_id}", "approvalId": f"approval.psychlo.policy-exception.{request_id}", "roadexApprovalRef": f"admin.psychlo.policy-exception.{request_id}"}
+
+    def decide_policy_exception_authority(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Dedicated Roadex human action for the paired exception authority."""
+        value = dict(payload)
+        allowed = {"request_id", "exception_id", "decision", "decided_by", "reason", "decided_at"}
+        if set(value) - allowed or ("request_id" in value and "exception_id" in value):
+            raise ValueError("exact policy exception decision fields are required")
+        request_id = value.get("request_id", value.get("exception_id"))
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("policy exception request ID is required")
+        decision = value.get("decision")
+        if decision == "approve":
+            decision = "approved"
+        if decision == "deny":
+            decision = "rejected"
+        if not isinstance(decision, str):
+            raise ValueError("policy exception decision is required")
+        decided_by = value.get("decided_by")
+        reason = value.get("reason")
+        if not isinstance(decided_by, str) or not isinstance(reason, str):
+            raise ValueError("policy exception decision actor and reason are required")
+        decided_at = value.get("decided_at") or self.clock()
+        result = self.approval_store.decide_psychlo_policy_exception_authority(
+            request_id, decision, decided_by, reason, decided_at=str(decided_at)
+        ) if self.approval_store is not None else None
+        if result is None:
+            raise ValueError("authoritative approval store is unavailable")
+        if result.get("replay"):
+            stored = self.store.policy_exception_request(request_id)
+            if stored is not None and stored.get("outcome") is not None:
+                return {"accepted": True, "replay": True, "status": stored["state"], "outcome": stored["outcome"]}
+        if result.get("status") in {"approved", "rejected"}:
+            request = self.store.policy_exception_request(request_id)
+            if request is None:
+                raise ValueError("policy exception request is missing")
+            # Consume and forward only after both authoritative records commit.
+            return self.authorize_policy_exception(
+                f"approval.psychlo.policy-exception.{request_id}", request["payload"]
+            )
+        return {"accepted": True, **result}
 
     receive_policy_exception = receive_policy_exception_request
 
@@ -652,7 +712,9 @@ class PsychloBridge:
         if approval.approval_level is not ApprovalLevel.HUMAN: raise ValueError("human policy exception approval is required")
         if subject is None and self.approval_store is not None: subject = self._load_primary_subject(self.approval_store, approval.subject_id)
         if not isinstance(subject, AdminChangePlan): raise ValueError("policy exception administrative subject is required")
-        if subject.id != approval.subject_id or subject.owner_domain.value != self.approval_owner_domain or subject.canceled or subject.archived:
+        if subject.id != approval.subject_id or subject.owner_domain.value != self.approval_owner_domain or subject.archived:
+            raise ValueError("policy exception administrative subject is invalid")
+        if subject.canceled and approval.status.value not in {"rejected", "expired"}:
             raise ValueError("policy exception administrative subject is invalid")
         metadata = self._subject_metadata(subject)
         if metadata.get("action", metadata.get("kind")) not in {"psychlo-policy-exception", "policy-exception"} or metadata.get("target", subject.target) != request["id"]:

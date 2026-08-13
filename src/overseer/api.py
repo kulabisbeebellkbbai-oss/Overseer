@@ -771,8 +771,14 @@ def make_api_handler(
             if not auth_context.get("authorized"):
                 self._write_auth_error(auth_context)
                 return
-            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path in {"/roadex/human-decisions/decide", "/roadex/approval-fixtures/stage"}) and auth_context.get("auth_type") != "admin_token":
+            if (path.startswith("/storage/control/") or path.startswith("/backup-provisioning/") or path in {"/roadex/human-decisions/decide", "/roadex/approval-fixtures/stage", "/roadex/psychlo/policy-exception-decision"}) and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
+                return
+            if path == "/roadex/psychlo/policy-exception-decision":
+                if psychlo_bridge is None:
+                    self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                    return
+                self._handle_json(lambda payload: psychlo_bridge.decide_policy_exception_authority(payload))
                 return
             initiator_routes = {
                 "/psychlo/admin/external-round-binding": "external-round-binding",

@@ -225,34 +225,6 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
     }
 
 
-def derive_v11_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str, usage_store: PsychloBridgeStore, now: str | None = None) -> dict[str, Any]:
-    """Produce the strict v1.1 provider snapshot from one persisted reset window."""
-    if not history:
-        raise ValueError("Codex usage history is required")
-    newest = history[0]
-    window = _weekly_window(newest)
-    reset_at = str(window.get("resets_at"))
-    accounting = usage_store.latest_usage_accounting(reset_at)
-    if accounting is None or accounting.get("resetAt") != reset_at:
-        raise ValueError("same-reset persisted usage accounting is required")
-    values = accounting["payload"]
-    fields = ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")
-    for field in fields:
-        value = values.get(field)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
-            raise ValueError(f"{field} must be finite and nonnegative")
-    captured = str(newest["observed_at"])
-    snapshot_id = "codex-usage-v11-" + hashlib.sha256((captured + reset_at).encode()).hexdigest()[:24]
-    scope_digest = values.get("scopeDigest") or canonical_digest({key: values[key] for key in fields})
-    snapshot = {"schemaVersion": "psychlo.usage-snapshot.v1.1", "id": snapshot_id, "sourceId": "overseer", "capturedAt": captured, "policyVersion": policy_version, "providerResetAt": reset_at, "scopeDigest": scope_digest, "decisionVersion": values.get("decisionVersion", "provider-v1"), **{field: float(values[field]) for field in fields}}
-    snapshot["digest"] = canonical_digest(snapshot)
-    envelope = {"schemaVersion": "psychlo.usage-envelope.v1.1", "correlationId": f"psychlo:{snapshot_id}", "idempotencyKey": snapshot_id, "occurredAt": captured, "snapshot": snapshot}
-    envelope["digest"] = canonical_digest(envelope)
-    try: parse_usage_snapshot_v11(envelope)
-    except ContractError as error: raise ValueError(str(error)) from error
-    return envelope
-
-
 class PsychloBridge:
     def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[..., str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False, approval_loader: Callable[[str], Any] | None = None, approval_store: SQLiteStore | None = None, approval_owner_domain: str = "sisko", supervisor_dispatcher: Callable[..., str] | None = None, project_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, supervisor_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, coordination_owner_id: str | None = None, coordination_lease_seconds: int = 30):
         self.store, self.dispatcher, self.sender = store, dispatcher, sender
@@ -567,10 +539,6 @@ class PsychloBridge:
         if not history: raise ValueError("Codex usage history is required")
         payload = derive_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
-
-    def emit_usage_v11(self, history: list[dict[str, Any]], policy_version: str) -> Mapping[str, Any]:
-        payload = derive_v11_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
-        return self.sender("usage-snapshot-v1.1", str(payload["idempotencyKey"]), payload)
 
     def receive_policy_exception_request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try:

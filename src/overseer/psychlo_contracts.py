@@ -744,12 +744,14 @@ def parse_usage_snapshot_v11(payload: Mapping[str, Any]) -> dict[str, Any]:
     if envelope["schemaVersion"] != USAGE_ENVELOPE_V11_SCHEMA: raise ContractError("usage snapshot envelope schema is invalid")
     _id(envelope["correlationId"], name="correlationId"); _id(envelope["idempotencyKey"], name="idempotencyKey"); _timestamp(envelope["occurredAt"]); _digest(envelope["digest"], name="digest")
     snapshot = _object(envelope["snapshot"], name="usage snapshot")
-    fields = {"schemaVersion", "id", "sourceId", "capturedAt", "policyVersion", "providerResetAt", "scopeDigest", "decisionVersion", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed", "digest"}
+    fields = {"schemaVersion", "id", "sourceId", "capturedAt", "policyVersion", "providerResetAt", "scopeDigest", "decisionVersion", "unusedPriorDayWeeklyCapacity", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed", "digest"}
     _keys(snapshot, fields, name="usage snapshot")
     if snapshot["schemaVersion"] != USAGE_SNAPSHOT_V11_SCHEMA or snapshot["sourceId"] != "overseer": raise ContractError("usage snapshot authority is invalid")
     for field in ("id", "policyVersion", "decisionVersion"): _id(snapshot[field], name=field)
     _timestamp(snapshot["capturedAt"]); _timestamp(snapshot["providerResetAt"]); _digest(snapshot["scopeDigest"], name="scopeDigest"); _digest(snapshot["digest"], name="snapshot digest")
-    for field in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed"): _finite_nonnegative(snapshot[field], name=field)
+    for field in ("unusedPriorDayWeeklyCapacity", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed"):
+        if isinstance(snapshot[field], bool) or not isinstance(snapshot[field], int) or snapshot[field] < 0: raise ContractError(f"{field} must be nonnegative integer quota ticks")
+    if snapshot["weeklyRemainingCapacity"] > snapshot["weeklyQuota"] or snapshot["dailyConsumed"] + snapshot["otherDevelopmentConsumed"] != snapshot["weeklyQuota"] - snapshot["weeklyRemainingCapacity"]: raise ContractError("usage snapshot conservation is invalid")
     if canonical_digest({key: value for key, value in snapshot.items() if key != "digest"}) != snapshot["digest"]: raise ContractError("usage snapshot digest mismatch")
     if canonical_digest({key: value for key, value in envelope.items() if key != "digest"}) != envelope["digest"]: raise ContractError("usage snapshot envelope digest mismatch")
     return envelope

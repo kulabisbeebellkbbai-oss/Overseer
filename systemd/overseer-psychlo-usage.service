@@ -1,7 +1,6 @@
 [Unit]
 Description=Send one authenticated Codex usage snapshot to Psychlo
-Requires=overseer-codex-usage-snapshot.service
-After=overseer-api.service psychlo.service overseer-codex-usage-snapshot.service
+After=overseer-api.service psychlo.service
 
 [Service]
 Type=oneshot
@@ -11,6 +10,10 @@ Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=%h/.local/share/overseer/psychlo/br
 Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=%h/.config/overseer/psychlo-project-bindings.json
 Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-overseer-peer-secret
 Environment=OVERSEER_PSYCHLO_POLICY_VERSION=2026-08-08
+Environment=OVERSEER_PSYCHLO_USAGE_ATTRIBUTION_LEDGER=%h/.local/share/overseer/psychlo/usage-attribution.sqlite3
+Environment=OVERSEER_PSYCHLO_USAGE_AUTHORITY_FILE=%h/.config/overseer/psychlo-usage-authority.json
+Environment=OVERSEER_PSYCHLO_USAGE_OBSERVATION_FILE=%h/.local/share/overseer/psychlo-meter/latest-observation.json
+Environment=OVERSEER_PSYCHLO_USAGE_RECEIPTS_FILE=%h/.local/share/overseer/psychlo-meter/latest-receipts.json
 LoadCredential=psychlo-overseer-peer-secret:%h/.config/psychlo/overseer-peer-secret
 ExecStartPre=/usr/bin/python3 -m overseer.psychlo_bridge_cli sync-projects
 ExecStart=/usr/bin/python3 -m overseer.psychlo_bridge_cli emit-usage
@@ -19,8 +22,9 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=tmpfs
 BindReadOnlyPaths=%h/.config/overseer/psychlo-project-bindings.json
+BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json
 BindReadOnlyPaths="%h/Documents/Codex Workspace/Overseer/src"
-BindReadOnlyPaths=%h/.local/share/overseer/codex-usage-mcp/state.sqlite3
+BindReadOnlyPaths=%h/.local/share/overseer/psychlo-meter
 BindReadOnlyPaths="%h/Documents/Codex Workspace/The A-Team/data/handoffs.json"
 BindPaths=%h/.local/share/overseer/psychlo
 UMask=0077

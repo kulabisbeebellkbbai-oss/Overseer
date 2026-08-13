@@ -21,7 +21,6 @@ from overseer.psychlo_bridge import (
     PsychloBridgeStore,
     CodexProjectDispatcher,
     derive_usage_snapshot,
-    derive_v11_usage_snapshot,
     sign_peer_message,
     verify_peer_request,
     _read_secret,
@@ -1438,9 +1437,10 @@ def test_v11_policy_exception_fixture_recomputes_exact_digests():
     usage = parse_usage_snapshot_v11(fixture["usageSnapshot"])
     assert canonical_digest({key: value for key, value in usage["snapshot"].items() if key != "digest"}) == usage["snapshot"]["digest"]
     assert canonical_digest({key: value for key, value in usage.items() if key != "digest"}) == usage["digest"]
-    assert {fixture["usageSnapshot"]["snapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700.0, 612.0, 42.0, 17.0}
-    assert fixture["usageSnapshot"]["snapshot"]["digest"] == "fbf1f2fbe8a8ae2b11d41cc571a06863de0b554681d6fb94734dcfed9f91da1f"
-    assert fixture["usageSnapshot"]["digest"] == "c37736f7d6722374e8c5bb06cdb51d233af3ccea0b3b2432dc5899de3327b46c"
+    assert {fixture["usageSnapshot"]["snapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700.0, 612.0, 42.0, 46.0}
+    assert fixture["usageSnapshot"]["snapshot"]["unusedPriorDayWeeklyCapacity"] == 58.0
+    assert fixture["usageSnapshot"]["snapshot"]["digest"] == "95e2927505c41cb3d3166bfe2fb17814841177b7f309ab4a5a73c3af2d7f2574"
+    assert fixture["usageSnapshot"]["digest"] == "6259eb164690e25ee378795f5450b258f77319749b9a6615b8256100c4e2a8ed"
 
 
 @pytest.mark.parametrize("left,right", [(1.0, 1), (-0.0, 0), (1.25, 1.25), (1e-3, 0.001), (1e-7, 0.0000001), (1e21, 1000000000000000000000)])
@@ -1585,14 +1585,6 @@ def test_recovery_rejects_corrupt_request_row_and_expired_outcome_without_send(t
     sent = []
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: "2026-08-13T00:00:00+00:00")
     assert sent == []
-
-
-def test_v11_usage_requires_same_reset_persisted_accounting_and_never_defaults(tmp_path: Path):
-    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
-    store.record_usage_accounting("wrong-reset", {"snapshotId": "wrong-reset", "resetAt": "2026-08-15T00:00:00+00:00", "weeklyQuota": 700, "weeklyRemainingCapacity": 600, "dailyConsumed": 10, "otherDevelopmentConsumed": 2})
-    history = [{"observed_at": "2026-08-12T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}, {"observed_at": "2026-08-11T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}]
-    with pytest.raises(ValueError, match="persisted|reset|accounting"):
-        derive_v11_usage_snapshot(history, policy_version="2026-08-09", usage_store=store)
 
 
 def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: Path):

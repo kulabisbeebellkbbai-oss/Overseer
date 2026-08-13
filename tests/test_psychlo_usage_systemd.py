@@ -2,18 +2,21 @@ from pathlib import Path
 import subprocess
 
 
-def test_psychlo_usage_waits_for_a_fresh_codex_usage_capture():
+def test_psychlo_usage_requires_the_private_attribution_authority_feed():
     unit = (
         Path(__file__).resolve().parents[1]
         / "systemd"
         / "overseer-psychlo-usage.service"
     ).read_text(encoding="utf-8")
 
-    assert "Requires=overseer-codex-usage-snapshot.service" in unit
-    assert (
-        "After=overseer-api.service psychlo.service "
-        "overseer-codex-usage-snapshot.service"
-    ) in unit
+    assert "overseer-codex-usage-snapshot.service" not in unit
+    assert "OVERSEER_PSYCHLO_USAGE_ATTRIBUTION_LEDGER" in unit
+    assert "OVERSEER_PSYCHLO_USAGE_AUTHORITY_FILE" in unit
+    assert "OVERSEER_PSYCHLO_USAGE_OBSERVATION_FILE" in unit
+    assert "OVERSEER_PSYCHLO_USAGE_RECEIPTS_FILE" in unit
+    assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json" in unit
+    assert "BindReadOnlyPaths=%h/.local/share/overseer/psychlo-meter" in unit
+    assert "codex-usage-mcp/state.sqlite3" not in unit
 
 
 def test_coordination_tick_timer_is_checked_in_inactive_bounded_and_valid():

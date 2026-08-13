@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import multiprocessing
+import secrets
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,11 @@ from overseer.store import SQLiteStore
 
 SECRET = b"0123456789abcdef0123456789abcdef"
 NOW = "2026-08-10T02:00:00+00:00"
+
+
+def _bound_response_signature(kind: str, message_id: str, request_nonce: str, payload: dict, response_timestamp: str, response_nonce: str, response_body: bytes) -> str:
+    request_body = json.dumps({"kind": kind, "messageId": message_id, "occurredAt": NOW, "payload": payload}, separators=(",", ":")).encode()
+    return sign_peer_response(SECRET, kind, message_id, request_nonce, hashlib.sha256(request_body).hexdigest(), response_timestamp, response_nonce, response_body)
 
 
 def _save_real_approval(path: Path, approval_id: str, operation: dict, action: str, target: str) -> SQLiteStore:
@@ -1276,13 +1282,13 @@ def test_peer_verification_rejects_wrong_or_missing_injected_authority(tmp_path:
 def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoint: str, authority: str):
     requests = []
     response_body = b'{"accepted":true}'
-    response_timestamp = datetime.now(UTC).isoformat()
+    response_timestamp = NOW
     response_headers = {
         "content-type": "application/json",
         "x-psychlo-peer-response-kind": "usage-snapshot",
         "x-psychlo-peer-response-timestamp": response_timestamp,
         "x-psychlo-peer-response-nonce": "response-authority-123456",
-        "x-psychlo-peer-response-signature": sign_peer_response(SECRET, "usage-snapshot", response_timestamp, "response-authority-123456", response_body),
+        "x-psychlo-peer-response-signature": _bound_response_signature("usage-snapshot", "message-1", "request-authority-123456", {"value": 1}, response_timestamp, "response-authority-123456", response_body),
     }
 
     class Headers:
@@ -1308,7 +1314,8 @@ def test_peer_sender_signs_the_configured_loopback_authority(monkeypatch, endpoi
         requests.append((request, timeout))
         return Response()
 
-    sender = PsychloPeerSender(endpoint, SECRET, timeout=2)
+    sender = PsychloPeerSender(endpoint, SECRET, clock=lambda: NOW, timeout=2)
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda _size: "request-authority-123456")
     monkeypatch.setattr(sender.opener, "open", fake_open)
     result = sender("usage-snapshot", "message-1", {"value": 1})
     assert result["accepted"] is True
@@ -1349,14 +1356,14 @@ def test_peer_sender_rejects_wrong_kind_and_replayed_response(monkeypatch):
         "x-psychlo-peer-response-kind": "round-reconcile",
         "x-psychlo-peer-response-timestamp": timestamp,
         "x-psychlo-peer-response-nonce": "response-kind-123456",
-        "x-psychlo-peer-response-signature": sign_peer_response(SECRET, "round-reconcile", timestamp, "response-kind-123456", body),
+        "x-psychlo-peer-response-signature": _bound_response_signature("round-reconcile", "wrong-kind", "request-wrong-kind-123456", {"value": 1}, timestamp, "response-kind-123456", body),
     }
     replay_headers = {
         "content-type": "application/json",
         "x-psychlo-peer-response-kind": "round-request",
         "x-psychlo-peer-response-timestamp": timestamp,
         "x-psychlo-peer-response-nonce": "response-replay-123456",
-        "x-psychlo-peer-response-signature": sign_peer_response(SECRET, "round-request", timestamp, "response-replay-123456", body),
+        "x-psychlo-peer-response-signature": _bound_response_signature("round-request", "replay-first", "request-replay-first-123456", {"value": 1}, timestamp, "response-replay-123456", body),
     }
 
     class Headers:
@@ -1371,21 +1378,27 @@ def test_peer_sender_rejects_wrong_kind_and_replayed_response(monkeypatch):
         def __exit__(self, *_): return False
         def read(self, _limit): return body
 
-    responses = iter([Response(wrong_kind_headers), Response(replay_headers), Response(replay_headers)])
+    responses = iter([Response(wrong_kind_headers), Response(replay_headers), Response(replay_headers), Response(replay_headers)])
+    request_nonces = iter(["request-wrong-kind-123456", "request-replay-first-123456", "request-replay-second-123456", "request-replay-restart-123456"])
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda _size: next(request_nonces))
     sender = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
     monkeypatch.setattr(sender.opener, "open", lambda *_args, **_kwargs: next(responses))
     with pytest.raises(ValueError, match="response_signature"):
         sender("round-request", "wrong-kind", {"value": 1})
     assert sender("round-request", "replay-first", {"value": 1})["accepted"] is True
-    with pytest.raises(ValueError, match="response_replay"):
+    with pytest.raises(ValueError, match="response_signature"):
         sender("round-request", "replay-second", {"value": 1})
+    restarted = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
+    monkeypatch.setattr(restarted.opener, "open", lambda *_args, **_kwargs: next(responses))
+    with pytest.raises(ValueError, match="response_signature"):
+        restarted("round-request", "replay-after-restart", {"value": 1})
 
 
 def test_peer_sender_rejects_duplicate_response_proof_headers(monkeypatch):
     body = b'{"accepted":true}'
     timestamp = NOW
     nonce = "response-duplicate-123456"
-    signature = sign_peer_response(SECRET, "round-request", timestamp, nonce, body)
+    signature = _bound_response_signature("round-request", "duplicate-proof", "request-duplicate-123456", {"value": 1}, timestamp, nonce, body)
 
     class Headers:
         def get_content_type(self): return "application/json"
@@ -1406,6 +1419,7 @@ def test_peer_sender_rejects_duplicate_response_proof_headers(monkeypatch):
         def __exit__(self, *_): return False
         def read(self, _limit): return body
 
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda _size: "request-duplicate-123456")
     sender = PsychloPeerSender("http://127.0.0.1:43127", SECRET, clock=lambda: NOW)
     monkeypatch.setattr(sender.opener, "open", lambda *_args, **_kwargs: Response())
     with pytest.raises(ValueError, match="response_signature"):
@@ -1448,6 +1462,7 @@ def test_peer_sender_ignores_proxy_environment(monkeypatch):
     class Target(BaseHTTPRequestHandler):
         def do_POST(self):
             requests.append(self.path)
+            request_body = self.rfile.read(int(self.headers["content-length"]))
             body = b'{"accepted":true}'
             timestamp = datetime.now(UTC).isoformat()
             self.send_response(201)
@@ -1455,7 +1470,10 @@ def test_peer_sender_ignores_proxy_environment(monkeypatch):
             self.send_header("x-psychlo-peer-response-kind", "usage-snapshot")
             self.send_header("x-psychlo-peer-response-timestamp", timestamp)
             self.send_header("x-psychlo-peer-response-nonce", "response-proxy-123456")
-            self.send_header("x-psychlo-peer-response-signature", sign_peer_response(SECRET, "usage-snapshot", timestamp, "response-proxy-123456", body))
+            self.send_header("x-psychlo-peer-response-signature", sign_peer_response(
+                SECRET, "usage-snapshot", self.headers["x-psychlo-peer-message-id"], self.headers["x-psychlo-peer-nonce"],
+                hashlib.sha256(request_body).hexdigest(), timestamp, "response-proxy-123456", body,
+            ))
             self.end_headers()
             self.wfile.write(body)
 

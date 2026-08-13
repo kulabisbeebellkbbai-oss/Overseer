@@ -82,13 +82,13 @@ def sign_peer_message(secret: bytes, direction: str, kind: str, message_id: str,
     }
 
 
-def _canonical_peer_response(kind: str, timestamp: str, nonce: str, body: bytes) -> bytes:
-    return PEER_VERSION + b"overseer-to-psychlo-response\0" + kind.encode() + b"\0" + timestamp.encode() + b"\0" + nonce.encode() + b"\0" + body
+def _canonical_peer_response(kind: str, request_message_id: str, request_nonce: str, request_digest: str, timestamp: str, nonce: str, body: bytes) -> bytes:
+    return PEER_VERSION + b"overseer-to-psychlo-response\0" + kind.encode() + b"\0" + request_message_id.encode() + b"\0" + request_nonce.encode() + b"\0" + request_digest.encode() + b"\0" + timestamp.encode() + b"\0" + nonce.encode() + b"\0" + body
 
 
-def sign_peer_response(secret: bytes, kind: str, timestamp: str, nonce: str, body: bytes) -> str:
-    """Sign one exact response body with kind/timestamp/nonce binding."""
-    return hmac.new(secret, _canonical_peer_response(kind, timestamp, nonce, body), hashlib.sha256).hexdigest()
+def sign_peer_response(secret: bytes, kind: str, request_message_id: str, request_nonce: str, request_digest: str, timestamp: str, nonce: str, body: bytes) -> str:
+    """Sign one exact response body bound to its triggering request."""
+    return hmac.new(secret, _canonical_peer_response(kind, request_message_id, request_nonce, request_digest, timestamp, nonce, body), hashlib.sha256).hexdigest()
 
 
 def verify_peer_response(
@@ -97,6 +97,9 @@ def verify_peer_response(
     body: bytes,
     headers: Mapping[str, str],
     *,
+    request_message_id: str,
+    request_nonce: str,
+    request_digest: str,
     now: str | None = None,
     maximum_clock_skew_ms: int = 5 * 60 * 1_000,
     claim_nonce: Callable[[str], bool] | None = None,
@@ -120,7 +123,7 @@ def verify_peer_response(
                 raise ValueError
     except (TypeError, ValueError, OverflowError):
         raise ValueError("invalid_response_signature") from None
-    expected = sign_peer_response(secret, kind, timestamp, nonce, body)
+    expected = sign_peer_response(secret, kind, request_message_id, request_nonce, request_digest, timestamp, nonce, body)
     if not hmac.compare_digest(expected, signature):
         raise ValueError("invalid_response_signature")
     if claim_nonce is not None and not claim_nonce(nonce):
@@ -1930,6 +1933,9 @@ class PsychloPeerSender:
             kind,
             data,
             response_headers,
+            request_message_id=message_id,
+            request_nonce=nonce,
+            request_digest=hashlib.sha256(body).hexdigest(),
             now=self.clock(),
             claim_nonce=self._claim_response_nonce,
         )

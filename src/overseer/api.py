@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -1405,12 +1406,26 @@ def make_api_handler(
                     result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
                 else:
                     raise ValueError("unsupported Psychlo peer kind")
-                self._write_json(dict(result), HTTPStatus.ACCEPTED, peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret)
+                self._write_json(
+                    dict(result), HTTPStatus.ACCEPTED,
+                    peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret,
+                    peer_request_message_id=message["messageId"],
+                    peer_request_nonce=headers["x-psychlo-peer-nonce"],
+                    peer_request_digest=hashlib.sha256(body).hexdigest(),
+                )
             except ValueError as error:
                 code = str(error)
                 status = HTTPStatus.CONFLICT if code in {"replay", "single_stream_busy"} else HTTPStatus.UNAUTHORIZED if code == "invalid_signature" else HTTPStatus.BAD_REQUEST
                 if psychlo_bridge is not None and isinstance(psychlo_bridge.peer_secret, bytes):
-                    self._write_json({"accepted": False, "error": code}, status, peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret)
+                    failure_headers = locals().get("headers") or {}
+                    failure_body = locals().get("body", b"")
+                    self._write_json(
+                        {"accepted": False, "error": code}, status,
+                        peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret,
+                        peer_request_message_id=failure_headers.get("x-psychlo-peer-message-id", "invalid"),
+                        peer_request_nonce=failure_headers.get("x-psychlo-peer-nonce", "invalid"),
+                        peer_request_digest=hashlib.sha256(failure_body).hexdigest(),
+                    )
                 else:
                     self._write_json({"accepted": False, "error": code}, status)
 
@@ -1476,6 +1491,9 @@ def make_api_handler(
             *,
             peer_response_kind: str | None = None,
             peer_response_secret: bytes | None = None,
+            peer_request_message_id: str = "invalid",
+            peer_request_nonce: str = "invalid",
+            peer_request_digest: str = "0" * 64,
         ) -> None:
             body = json.dumps(payload, sort_keys=True).encode("utf-8")
             response_headers = dict(headers or {})
@@ -1486,7 +1504,7 @@ def make_api_handler(
                     "x-psychlo-peer-response-kind": peer_response_kind,
                     "x-psychlo-peer-response-timestamp": timestamp,
                     "x-psychlo-peer-response-nonce": nonce,
-                    "x-psychlo-peer-response-signature": sign_peer_response(peer_response_secret, peer_response_kind, timestamp, nonce, body),
+                    "x-psychlo-peer-response-signature": sign_peer_response(peer_response_secret, peer_response_kind, peer_request_message_id, peer_request_nonce, peer_request_digest, timestamp, nonce, body),
                 })
             self.send_response(int(status))
             self.send_header("content-type", "application/json")

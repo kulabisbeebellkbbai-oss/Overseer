@@ -184,6 +184,47 @@ def test_authoritative_observation_and_bound_receipts_produce_exact_psychlo_payl
     assert envelope["snapshot"]["digest"] == canonical_digest({key: value for key, value in snapshot.items() if key != "digest"})
 
 
+def test_scope_digest_is_stable_for_one_reset_but_changes_at_next_reset(tmp_path: Path):
+    ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
+    first = _observation()
+    second = _observation(
+        observationId="observation-20260812-later",
+        intervalEnd="2026-08-14T00:00:00+00:00",
+        occurredAt="2026-08-14T00:00:00+00:00",
+        totalConsumed=50,
+        weeklyRemainingCapacity=650,
+        correlationId="meter-correlation-20260812-later",
+        idempotencyKey="meter-observation-20260812-later",
+    )
+    next_reset = _observation(
+        observationId="observation-20260813",
+        providerResetAt="2026-08-13T00:00:00+00:00",
+        intervalStart="2026-08-13T00:00:00+00:00",
+        intervalEnd="2026-08-14T00:00:00+00:00",
+        occurredAt="2026-08-14T00:00:00+00:00",
+        totalConsumed=10,
+        weeklyRemainingCapacity=690,
+        correlationId="meter-correlation-20260813",
+        idempotencyKey="meter-observation-20260813",
+    )
+    for observation in (first, second, next_reset):
+        ledger.record_provider_observation(observation)
+
+    def emit(observation_id: str) -> dict:
+        return UsageSnapshotProducer(
+            ledger,
+            sender=lambda _kind, _message_id, payload: _delivery_response(payload),
+        ).emit(observation_id, policy_version="2026-08-13")["payload"]["snapshot"]
+
+    first_snapshot = emit(first["observationId"])
+    second_snapshot = emit(second["observationId"])
+    next_reset_snapshot = emit(next_reset["observationId"])
+
+    assert first_snapshot["scopeDigest"] == second_snapshot["scopeDigest"]
+    assert first_snapshot["digest"] != second_snapshot["digest"]
+    assert next_reset_snapshot["scopeDigest"] != first_snapshot["scopeDigest"]
+
+
 def test_global_percentages_tokens_defaults_and_unbound_receipts_fail_closed(tmp_path: Path):
     ledger = _ledger(tmp_path / "usage-attribution.sqlite3")
     with pytest.raises(UsageAttributionError, match="authority|measurement|absolute"):

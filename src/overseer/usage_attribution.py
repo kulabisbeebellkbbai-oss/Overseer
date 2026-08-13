@@ -60,6 +60,32 @@ def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
+# This is the signed authority's accounting/reset identity.  Observation IDs,
+# interval measurements, receipt attribution, and capture timestamps are
+# deliberately excluded: they belong to the exact observation snapshot and
+# must not invalidate an exception authorized for the same reset scope.
+_ACCOUNTING_SCOPE_FIELDS = (
+    "authorityId",
+    "authorityBindingId",
+    "authorityBindingDigest",
+    "accountId",
+    "providerId",
+    "limitId",
+    "usageUnit",
+    "providerResetAt",
+    "measurementScope",
+    "decisionVersion",
+)
+
+
+def _accounting_scope_digest(observation: Mapping[str, Any]) -> str:
+    try:
+        identity = {field: observation[field] for field in _ACCOUNTING_SCOPE_FIELDS}
+    except KeyError as error:
+        raise UsageAttributionError("observation accounting scope is incomplete") from error
+    return canonical_digest(identity)
+
+
 def _verify_seal(value: Mapping[str, Any], name: str, public_key: Ed25519PublicKey) -> dict[str, Any]:
     payload = dict(value)
     digest = payload.pop("digest", None)
@@ -422,7 +448,7 @@ class UsageSnapshotProducer:
         total=int(observation["totalConsumed"]); residual=total-managed
         if residual < 0: raise UsageAttributionError("negative residual usage")
         snapshot_id="usage-attribution-"+canonical_digest({"observationId":observation_id,"policyVersion":policy_version})[:24]
-        scope=canonical_digest({"observation":observation["digest"],"receipts":[item["digest"] for item in receipts]})
+        scope = _accounting_scope_digest(observation)
         snapshot={"schemaVersion":"psychlo.usage-snapshot.v1.1","id":snapshot_id,"sourceId":"overseer","capturedAt":observation["occurredAt"],"policyVersion":policy_version,"providerResetAt":observation["providerResetAt"],"scopeDigest":scope,"decisionVersion":observation["decisionVersion"],"unusedPriorDayWeeklyCapacity":int(observation["unusedPriorDayWeeklyCapacity"]),"weeklyQuota":int(observation["weeklyQuota"]),"weeklyRemainingCapacity":int(observation["weeklyRemainingCapacity"]),"dailyConsumed":managed,"otherDevelopmentConsumed":max(0,residual)}
         snapshot["digest"]=canonical_digest(snapshot)
         envelope={"schemaVersion":"psychlo.usage-envelope.v1.1","messageId":snapshot_id,"correlationId":f"psychlo:{snapshot_id}","idempotencyKey":snapshot_id,"occurredAt":observation["occurredAt"],"snapshot":snapshot}

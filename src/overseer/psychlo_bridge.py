@@ -252,6 +252,32 @@ def derive_v11_usage_snapshot(history: list[dict[str, Any]], *, policy_version: 
     return envelope
 
 
+def persist_v11_provider_usage(history: list[dict[str, Any]], *, usage_store: PsychloBridgeStore) -> dict[str, Any]:
+    """Persist one provider/reset accounting record atomically before v1.1 emit."""
+    if not history: raise ValueError("Codex usage history is required")
+    newest = history[0]; window = _weekly_window(newest); reset_at = window.get("resets_at")
+    if not isinstance(reset_at, str) or not reset_at.strip(): raise ValueError("provider reset is required")
+    quota = window.get("weekly_quota", window.get("quota"))
+    remaining = window.get("remaining_capacity")
+    if remaining is None and isinstance(quota, (int, float)) and not isinstance(quota, bool):
+        percent = window.get("remaining_percent")
+        if isinstance(percent, (int, float)) and math.isfinite(float(percent)): remaining = float(quota) * float(percent) / 100.0
+    same_reset = [item for item in history[1:] if _weekly_window(item).get("resets_at") == reset_at]
+    prior = min(same_reset, key=lambda item: abs((_time(str(item["observed_at"])) - (_time(str(newest["observed_at"])) - timedelta(days=1))).total_seconds()), default=None)
+    prior_window = _weekly_window(prior) if prior is not None else {}
+    daily = window.get("daily_consumed")
+    if daily is None and isinstance(quota, (int, float)) and not isinstance(quota, bool) and prior is not None:
+        used, prior_used = window.get("used_percent"), prior_window.get("used_percent")
+        if isinstance(used, (int, float)) and isinstance(prior_used, (int, float)): daily = float(quota) * max(0.0, float(used) - float(prior_used)) / 100.0
+    other = window.get("other_development_consumed")
+    if other is None: other = newest.get("otherDevelopmentConsumed")
+    values = {"weeklyQuota": quota, "weeklyRemainingCapacity": remaining, "dailyConsumed": daily, "otherDevelopmentConsumed": other}
+    for field, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0: raise ValueError(f"provider {field} is missing or invalid")
+    snapshot_id = "provider-usage-v11-" + hashlib.sha256((str(reset_at) + str(newest["observed_at"])).encode()).hexdigest()[:24]
+    return usage_store.record_usage_accounting(snapshot_id, {"snapshotId": snapshot_id, "resetAt": reset_at, **{field: float(value) for field, value in values.items()}})
+
+
 class PsychloBridge:
     def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[..., str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False, approval_loader: Callable[[str], Any] | None = None, approval_store: SQLiteStore | None = None, approval_owner_domain: str = "sisko", supervisor_dispatcher: Callable[..., str] | None = None, project_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, supervisor_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, coordination_owner_id: str | None = None, coordination_lease_seconds: int = 30):
         self.store, self.dispatcher, self.sender = store, dispatcher, sender
@@ -568,6 +594,7 @@ class PsychloBridge:
         return self.sender("usage-snapshot", str(payload["idempotencyKey"]), payload)
 
     def emit_usage_v11(self, history: list[dict[str, Any]], policy_version: str) -> Mapping[str, Any]:
+        persist_v11_provider_usage(history, usage_store=self.store)
         payload = derive_v11_usage_snapshot(history, policy_version=policy_version, usage_store=self.store)
         return self.sender("usage-snapshot-v1.1", str(payload["idempotencyKey"]), payload)
 

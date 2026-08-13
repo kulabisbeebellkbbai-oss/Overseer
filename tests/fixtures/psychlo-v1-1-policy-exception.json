@@ -36,14 +36,25 @@
     "outcomeDigest": "ac4b353946c5b7329bb51b243d68ff7e3f64bdcc81ad6a2cb9b72930c6f6a27d"
   },
   "usageSnapshot": {
-    "id": "codex-usage-v11-fixture",
-    "sourceId": "overseer",
-    "capturedAt": "2026-08-12T12:00:00.000Z",
-    "policyVersion": "2026-08-09",
-    "unusedPriorDayWeeklyCapacity": 9,
-    "weeklyRemainingCapacity": 612,
-    "weeklyQuota": 700,
-    "dailyConsumed": 42,
-    "otherDevelopmentConsumed": 17
+    "schemaVersion": "psychlo.usage-envelope.v1.1",
+    "correlationId": "psychlo:codex-usage-v11-fixture",
+    "idempotencyKey": "codex-usage-v11-fixture",
+    "occurredAt": "2026-08-12T12:00:00.000Z",
+    "snapshot": {
+      "schemaVersion": "psychlo.usage-snapshot.v1.1",
+      "id": "codex-usage-v11-fixture",
+      "sourceId": "overseer",
+      "capturedAt": "2026-08-12T12:00:00.000Z",
+      "policyVersion": "2026-08-09",
+      "providerResetAt": "2026-08-16T00:00:00+00:00",
+      "scopeDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "decisionVersion": "decision-v1",
+      "weeklyQuota": 700.0,
+      "weeklyRemainingCapacity": 612.0,
+      "dailyConsumed": 42.0,
+      "otherDevelopmentConsumed": 17.0,
+      "digest": "fbf1f2fbe8a8ae2b11d41cc571a06863de0b554681d6fb94734dcfed9f91da1f"
+    },
+    "digest": "c37736f7d6722374e8c5bb06cdb51d233af3ccea0b3b2432dc5899de3327b46c"
   }
 }

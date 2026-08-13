@@ -1431,10 +1431,13 @@ def test_v11_policy_exception_fixture_recomputes_exact_digests():
     request = fixture["request"]
     outcome = fixture["outcome"]
     assert canonical_digest({key: value for key, value in request.items() if key != "digest"}) == request["digest"]
-    from overseer.psychlo_contracts import parse_policy_exception_outcome, policy_exception_outcome_digest
+    from overseer.psychlo_contracts import parse_policy_exception_outcome, parse_usage_snapshot_v11, policy_exception_outcome_digest
     assert policy_exception_outcome_digest(outcome) == outcome["outcomeDigest"]
     assert parse_policy_exception_outcome(outcome) == outcome
-    assert {fixture["usageSnapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700, 612, 42, 17}
+    usage = parse_usage_snapshot_v11(fixture["usageSnapshot"])
+    assert canonical_digest({key: value for key, value in usage["snapshot"].items() if key != "digest"}) == usage["snapshot"]["digest"]
+    assert canonical_digest({key: value for key, value in usage.items() if key != "digest"}) == usage["digest"]
+    assert {fixture["usageSnapshot"]["snapshot"][key] for key in ("weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed")} == {700.0, 612.0, 42.0, 17.0}
 
 
 def test_policy_exception_idempotency_is_globally_unique_and_exact_replay_only(tmp_path: Path):
@@ -1467,6 +1470,19 @@ def test_v11_usage_requires_same_reset_persisted_accounting_and_never_defaults(t
     history = [{"observed_at": "2026-08-12T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "remaining_percent": 70, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}, {"observed_at": "2026-08-11T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 25, "remaining_percent": 75, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}]
     with pytest.raises(ValueError, match="persisted|reset|accounting"):
         derive_v11_usage_snapshot(history, policy_version="2026-08-09", usage_store=store)
+
+
+def test_v11_runtime_producer_persists_real_provider_record_before_emit_and_replays(tmp_path: Path):
+    sent = []
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: "unused", sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    history = [{"observed_at": "2026-08-12T12:00:00+00:00", "rate_limits": [{"limit_id": "codex", "windows": [{"duration_minutes": 10080, "used_percent": 30, "weekly_quota": 700, "remaining_capacity": 612, "daily_consumed": 42, "other_development_consumed": 17, "resets_at": "2026-08-16T00:00:00+00:00"}]}]}]
+    first = bridge.emit_usage_v11(history, "2026-08-09")
+    second = bridge.emit_usage_v11(history, "2026-08-09")
+    assert first == second and len(sent) == 2
+    assert store.latest_usage_accounting("2026-08-16T00:00:00+00:00")["payload"]["weeklyQuota"] == 700.0
+    restarted = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    assert restarted.latest_usage_accounting("2026-08-16T00:00:00+00:00") is not None
 
 
 def test_private_peer_secret_rejects_symlink_and_group_readable_file(tmp_path: Path):

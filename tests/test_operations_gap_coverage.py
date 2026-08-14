@@ -1812,6 +1812,43 @@ exit 0
                     mutates=True,
                 )
 
+    def test_remote_testing_supports_psychlo_authenticated_browser_verify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease = request_remote_testing_lease_status(
+                root,
+                "lease.psychlo.browser",
+                "Psychlo",
+                "run the approved authenticated browser verification",
+                job_types=("psychlo.authenticated_browser_verify",),
+            )
+            status = remote_testing_status(root)
+
+        self.assertEqual(lease["lease"]["job_types"], ["psychlo.authenticated_browser_verify"])
+        self.assertIn("psychlo.authenticated_browser_verify", status["supported_job_types"])
+
+    def test_remote_testing_rejects_psychlo_authenticated_browser_verify_without_scoped_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_remote_testing_lease_status(
+                root,
+                "lease.psychlo.browser",
+                "Psychlo",
+                "run the approved authenticated browser verification",
+                job_types=("psychlo.authenticated_browser_verify",),
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires a Quark-issued auth_token_id"):
+                enqueue_remote_test_job_status(
+                    root,
+                    "lease.psychlo.browser",
+                    "psychlo.authenticated_browser_verify",
+                    project="Psychlo",
+                    base_url="https://psychlo.home.arpa:9443",
+                    ui_path="/Psychlo",
+                    gateway_path="/Psychlo",
+                )
+
     def test_remote_testing_rejects_unapproved_roadex_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

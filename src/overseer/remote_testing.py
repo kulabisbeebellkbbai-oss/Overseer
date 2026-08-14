@@ -31,9 +31,11 @@ SUPPORTED_JOB_TYPES = (
     "tank.local_facility_request",
     "roadex.authenticated_session_prompt",
     "roadex.project_creation_flow",
+    "psychlo.authenticated_browser_verify",
 )
 SCOPED_TOKEN_REQUIRED_JOB_TYPES = (
     "roadex.authenticated_session_prompt",
+    "psychlo.authenticated_browser_verify",
 )
 SENSITIVE_KEY_PARTS = (
     "token",

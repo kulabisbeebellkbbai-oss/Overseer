@@ -17,6 +17,7 @@ import stat
 import subprocess
 import ctypes
 import errno
+import fcntl
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -100,6 +101,74 @@ class PythonVenvProvisionSpec:
         payload = asdict(self)
         payload["artifacts"] = [asdict(artifact) for artifact in self.artifacts]
         return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+class PythonVenvExecutionBusy(RuntimeError):
+    """Another process owns the exact target lifecycle lock."""
+
+
+class PythonVenvExecutionLock:
+    def __init__(self, fd: int, path: Path):
+        self.fd = fd
+        self.path = path
+
+    def release(self) -> None:
+        if self.fd < 0:
+            return
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+
+def python_venv_execution_lock_path(spec: PythonVenvProvisionSpec) -> Path:
+    target = Path(spec.venv_path)
+    target_key = hashlib.sha256(str(target).encode("utf-8")).hexdigest()
+    return target.parent / f".overseer-python-venv-lock-{target_key}"
+
+
+def acquire_python_venv_execution_lock(plan) -> PythonVenvExecutionLock:
+    """Acquire the target lifecycle lock before validation or any command."""
+    metadata = getattr(plan, "adapter_metadata", {}).get(PYTHON_VENV_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        raise ValueError("python venv lock cannot be derived without its typed manifest")
+    spec = python_venv_spec_from_metadata(metadata)
+    target = _path_without_following_symlinks(spec.venv_path, must_exist=False, label="venv target")
+    repository = _path_without_following_symlinks(spec.repository_root, must_exist=True, label="repository root")
+    parent = _path_without_following_symlinks(target.parent, must_exist=True, label="venv target parent")
+    _owner_only_directory(parent, label="venv target parent", allow_sticky_shared=True)
+    try:
+        target.relative_to(repository)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("venv target must be outside repository root")
+    lock_path = python_venv_execution_lock_path(spec)
+    _path_without_following_symlinks(lock_path, must_exist=False, label="venv lifecycle lock")
+    fd = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("venv lifecycle lock is not owner-controlled")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise PythonVenvExecutionBusy(f"venv lifecycle lock is busy: {lock_path}") from error
+        return PythonVenvExecutionLock(fd, lock_path)
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _canonical_json(value: Any) -> str:
@@ -921,6 +990,8 @@ def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]
         if seal_present and sealed_root is not None:
             shutil.rmtree(sealed_root)
             removed = True
+        if removed:
+            _fsync_directory(target.parent)
         return (0, "marker-owned venv and sealed inputs removed", "") if removed else (0, "nothing to remove", "")
     raise ValueError(f"unknown Python venv marker command: {marker}")
 
@@ -932,10 +1003,14 @@ __all__ = [
     "PYTHON_VENV_REMOVE_MARKER",
     "PYTHON_VENV_INPUTS_MARKER",
     "PythonVenvArtifact",
+    "PythonVenvExecutionBusy",
+    "PythonVenvExecutionLock",
     "PythonVenvProvisionSpec",
+    "acquire_python_venv_execution_lock",
     "execute_python_venv_marker",
     "plan_python_hashed_venv_provision",
     "python_venv_plan_digest",
+    "python_venv_execution_lock_path",
     "python_venv_spec_from_metadata",
     "python_venv_spec_to_metadata",
     "validate_python_venv_plan",

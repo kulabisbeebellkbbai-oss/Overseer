@@ -1289,6 +1289,46 @@ def execute_admin_change_plan(
     runner: AdminCommandRunner | None = None,
     enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
 ) -> AdminExecutionResult:
+    """Execute a plan, serializing the full Python venv lifecycle."""
+    if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
+        enabled_adapter_kinds = tuple(enabled_adapter_kinds)
+        capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
+        if capability.can_execute_live() and plan.can_execute():
+            try:
+                from .python_venv import (
+                    PythonVenvExecutionBusy,
+                    acquire_python_venv_execution_lock,
+                )
+
+                lifecycle_lock = acquire_python_venv_execution_lock(plan)
+            except PythonVenvExecutionBusy as exc:
+                return AdminExecutionResult(
+                    id=f"admin.exec.{plan.id}.blocked",
+                    plan_id=plan.id,
+                    status=AdminExecutionStatus.BLOCKED,
+                    summary=f"python venv lifecycle is busy; no command or rollback ran: {exc}",
+                    command_results=(),
+                )
+            except (OSError, ValueError) as exc:
+                return AdminExecutionResult(
+                    id=f"admin.exec.{plan.id}.blocked",
+                    plan_id=plan.id,
+                    status=AdminExecutionStatus.BLOCKED,
+                    summary=f"python venv lifecycle lock blocked execution: {exc}",
+                    command_results=(),
+                )
+            try:
+                return _execute_admin_change_plan_body(plan, runner, enabled_adapter_kinds)
+            finally:
+                lifecycle_lock.release()
+    return _execute_admin_change_plan_body(plan, runner, enabled_adapter_kinds)
+
+
+def _execute_admin_change_plan_body(
+    plan: AdminChangePlan,
+    runner: AdminCommandRunner | None = None,
+    enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
+) -> AdminExecutionResult:
     capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
     if not capability.can_execute_live():
         return AdminExecutionResult(

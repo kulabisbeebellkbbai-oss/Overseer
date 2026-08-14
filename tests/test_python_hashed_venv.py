@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -392,6 +393,61 @@ def test_hash_pinned_venv_git_verification_clears_hostile_environment(monkeypatc
     assert environment["GIT_CONFIG_NOGLOBAL"] == "1"
     for hostile in ("GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         assert hostile not in environment
+
+
+def test_hash_pinned_venv_lifecycle_lock_blocks_contender_without_rollback():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        winner = approve_admin_change_plan(
+            plan_python_hashed_venv_provision("admin.python.venv.lock-winner", spec, "test", "absent"),
+            "human",
+        )
+        contender = approve_admin_change_plan(
+            plan_python_hashed_venv_provision("admin.python.venv.lock-contender", spec, "test", "absent"),
+            "human",
+        )
+        entered_publication = threading.Event()
+        release_winner = threading.Event()
+        winner_results = []
+
+        def winner_runner(step):
+            if step.command and step.command[0] == "__overseer_python_venv_preflight__":
+                result = run_admin_command_step(step)
+                entered_publication.set()
+                assert release_winner.wait(5)
+                return result
+            return AdminCommandResult(step.title, step.command, 0, "winner")
+
+        def run_winner():
+            winner_results.append(
+                execute_admin_change_plan(
+                    winner,
+                    runner=winner_runner,
+                    enabled_adapter_kinds=(AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,),
+                )
+            )
+
+        thread = threading.Thread(target=run_winner)
+        thread.start()
+        assert entered_publication.wait(5)
+        contender_result = execute_admin_change_plan(
+            contender,
+            runner=lambda step: pytest.fail("contender command or rollback ran"),
+            enabled_adapter_kinds=(AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,),
+        )
+        release_winner.set()
+        thread.join(timeout=5)
+        target = Path(spec.venv_path)
+        seal_root = Path(winner.steps[0].command[7])
+        target_exists = target.exists()
+        seal_exists = seal_root.exists()
+
+    assert winner_results and winner_results[0].status == AdminExecutionStatus.COMPLETED
+    assert contender_result.status == AdminExecutionStatus.BLOCKED
+    assert "busy" in contender_result.summary
+    assert target_exists
+    assert seal_exists
 
 
 def test_legacy_empty_environment_serialization_is_unchanged():

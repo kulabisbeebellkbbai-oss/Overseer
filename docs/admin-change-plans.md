@@ -106,4 +106,6 @@ the exact plan digest marker. Canonical execution also binds
 the plan id, immutable header, commands, rollback, verification, risks, and
 manifest, so approval/risk downgrades or command edits fail closed. Service
 activation is outside this adapter and requires its own separately approved
-plan.
+plan. A target-specific owner-safe nonblocking lifecycle lock is held across
+creation, installation, verification, and rollback; contenders are blocked
+before any command or rollback runs.

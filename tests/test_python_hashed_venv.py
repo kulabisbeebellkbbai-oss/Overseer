@@ -152,6 +152,31 @@ def test_hash_pinned_venv_canonical_lock_rejects_alias_contender():
     assert "lexical" in contender.summary
 
 
+def test_hash_pinned_venv_canonical_lock_rejects_double_leading_slash_contender():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        winner = approve_admin_change_plan(
+            plan_python_hashed_venv_provision("admin.python.venv.double-slash", spec, "test", "absent"),
+            "human",
+        )
+        alias_metadata = dict(winner.adapter_metadata["python_venv"])
+        alias_metadata["venv_path"] = "//" + spec.venv_path.lstrip("/")
+        alias_plan = replace(
+            winner,
+            target=alias_metadata["venv_path"],
+            adapter_metadata={"python_venv": alias_metadata},
+        )
+        with acquire_python_venv_execution_lock(winner):
+            contender = execute_admin_change_plan(
+                alias_plan,
+                runner=lambda step: pytest.fail("double-slash contender command ran"),
+                enabled_adapter_kinds=(AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,),
+            )
+    assert contender.status == AdminExecutionStatus.BLOCKED
+    assert "leading slash" in contender.summary
+
+
 def test_hash_pinned_venv_rejects_symlinked_target_parent():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

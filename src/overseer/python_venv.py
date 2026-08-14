@@ -217,6 +217,8 @@ def python_venv_spec_from_metadata(payload: dict[str, Any]) -> PythonVenvProvisi
 
 def _path_without_following_symlinks(path: str | Path, *, must_exist: bool, label: str) -> Path:
     raw_path = os.fspath(path)
+    if raw_path.startswith("//"):
+        raise ValueError(f"{label} must use exactly one leading slash")
     if any(part in {".", ".."} for part in raw_path.split("/") if part):
         raise ValueError(f"{label} must not contain lexical . or .. path components")
     candidate = Path(path)

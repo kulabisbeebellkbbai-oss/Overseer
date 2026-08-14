@@ -49,6 +49,7 @@ from .admin import (
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
+from .python_venv import plan_python_hashed_venv_provision, python_venv_spec_from_metadata
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
@@ -4221,6 +4222,7 @@ def admin_change_plan_status(plan: AdminChangePlan) -> dict[str, object]:
         "verification_steps": [_admin_command_status(step) for step in plan.verification_steps],
         "risks": list(plan.risks),
         "residual_scan_findings": list(plan.residual_scan_findings),
+        "adapter_metadata": plan.adapter_metadata,
     }
 
 
@@ -4269,6 +4271,7 @@ def plan_admin_change_status(
     mount_path: str | None = None,
     credential_file: str | None = None,
     filesystem_type: str = "cifs",
+    python_venv_spec: dict[str, object] | None = None,
 ) -> dict[str, object]:
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
@@ -4320,6 +4323,15 @@ def plan_admin_change_status(
         )
     elif plan_kind == AdminChangeKind.BLOCK_IP:
         plan = plan_block_ip(plan_id, target, reason, current_state)
+    elif plan_kind == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
+        if not python_venv_spec:
+            raise ValueError("python_venv_spec is required for python_hashed_venv_provision")
+        plan = plan_python_hashed_venv_provision(
+            plan_id,
+            python_venv_spec_from_metadata(python_venv_spec),
+            reason,
+            current_state,
+        )
     else:
         raise ValueError(f"unsupported admin change kind: {kind}")
     status = admin_change_plan_status(plan)
@@ -4929,6 +4941,13 @@ def _admin_adapter_enablement_plan_item_status(capability) -> dict[str, object]:
 
 
 def _admin_adapter_enablement_risks(kind: AdminChangeKind) -> list[str]:
+    if kind == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
+        return [
+            "only the exact human-approved immutable manifest may create the isolated runtime",
+            "lockfile, wheelhouse, resolver, and artifact digests must remain unchanged between staging and execution",
+            "system Python and unrelated environments are intentionally outside the adapter boundary",
+            "rollback can remove only the newly-created plan-marker-owned versioned runtime",
+        ]
     if kind in {
         AdminChangeKind.APT_INSTALL,
         AdminChangeKind.APT_UPDATE,
@@ -6562,6 +6581,7 @@ def _admin_command_status(step) -> dict[str, object]:
         "title": step.title,
         "command": list(step.command),
         "reason": step.reason,
+        "environment": {key: value for key, value in getattr(step, "environment", ())},
     }
 
 
@@ -10663,6 +10683,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     admin_plan_parser.add_argument("--mount-path")
     admin_plan_parser.add_argument("--credential-file")
     admin_plan_parser.add_argument("--filesystem-type", default="cifs")
+    admin_plan_parser.add_argument(
+        "--python-venv-spec",
+        help="JSON object (or path to JSON) for python_hashed_venv_provision immutable manifest",
+    )
     admin_plan_parser.add_argument("--use-firewalld", action="store_true", help="stage firewalld-specific firewall_deny_tcp commands")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -12002,6 +12026,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "plan-admin-change":
+        python_venv_spec = None
+        if args.python_venv_spec:
+            spec_source = Path(args.python_venv_spec)
+            raw_spec = spec_source.read_text(encoding="utf-8") if spec_source.is_file() else args.python_venv_spec
+            python_venv_spec = json.loads(raw_spec)
         print(
             json.dumps(
                 plan_admin_change_status(
@@ -12025,6 +12054,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     mount_path=args.mount_path,
                     credential_file=args.credential_file,
                     filesystem_type=args.filesystem_type,
+                    python_venv_spec=python_venv_spec,
                 ),
                 sort_keys=True,
             )

@@ -72,6 +72,13 @@ from .admin import (
     plan_user_service_restart,
     unarchive_admin_change_plan,
 )
+from .python_venv import (
+    PythonVenvArtifact,
+    PythonVenvProvisionSpec,
+    plan_python_hashed_venv_provision,
+    validate_python_venv_plan,
+    validate_python_venv_spec,
+)
 from .audit import (
     ApprovalRequest,
     ApprovalStatus,
@@ -305,7 +312,12 @@ __all__ = [
     "plan_firewall_allow_tcp",
     "plan_firewall_deny_tcp",
     "plan_npm_global_install",
+    "plan_python_hashed_venv_provision",
     "plan_storage_mount_test",
+    "PythonVenvArtifact",
+    "PythonVenvProvisionSpec",
+    "validate_python_venv_plan",
+    "validate_python_venv_spec",
     "plan_user_service_restart",
     "ApprovalRequest",
     "ApprovalStatus",

@@ -7,6 +7,7 @@ import ipaddress
 import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 from enum import StrEnum
 
@@ -19,6 +20,7 @@ class AdminChangeKind(StrEnum):
     # execution adapter or command steps; the policy-exception bridge owns its
     # paired ApprovalRequest decision path.
     PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
+    PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
     USER_SERVICE_RESTART = "user_service_restart"
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
@@ -50,6 +52,7 @@ class AdminCommandStep:
     title: str
     command: tuple[str, ...]
     reason: str
+    environment: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,7 @@ class AdminChangePlan:
     archived_by: str | None = None
     archived_at: str | None = None
     archive_record_id: str | None = None
+    adapter_metadata: dict[str, object] = field(default_factory=dict)
 
     def requires_explicit_approval(self) -> bool:
         return not self.canceled and (self.approval_level != ApprovalLevel.NONE or self.risk_level != RiskLevel.LOW)
@@ -152,6 +156,20 @@ class AdminChangePlan:
 
 
 DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapability] = {
+    AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(
+        kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,
+        adapter_name="python-hashed-venv-provisioner",
+        status=AdminAdapterStatus.DISABLED,
+        summary="hash-pinned Python venv provisioning requires exact admin adapter enablement and human approval",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(
+            ("uv", "venv", "--python"),
+            ("uv", "pip", "sync", "--require-hashes", "--no-deps", "--only-binary=:all:"),
+            ("python", "-m", "venv"),
+            ("python", "-m", "pip", "install", "--require-hashes", "--no-deps", "--only-binary=:all:"),
+        ),
+    ),
     AdminChangeKind.USER_SERVICE_RESTART: AdminExecutionCapability(
         kind=AdminChangeKind.USER_SERVICE_RESTART,
         adapter_name="user-systemd-service",
@@ -1228,6 +1246,8 @@ def missing_admin_change_fields(plan: AdminChangePlan) -> tuple[str, ...]:
         missing.append("risks")
     if not plan.verification_steps:
         missing.append("verification_steps")
+    if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION and not plan.adapter_metadata.get("python_venv"):
+        missing.append("python_venv_manifest")
     return tuple(missing)
 
 
@@ -1299,6 +1319,19 @@ def execute_admin_change_plan(
         )
 
     command_runner = runner or run_admin_command_step
+    if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
+        try:
+            from .python_venv import validate_python_venv_plan
+
+            validate_python_venv_plan(plan)
+        except (OSError, ValueError) as exc:
+            return AdminExecutionResult(
+                id=f"admin.exec.{plan.id}.blocked",
+                plan_id=plan.id,
+                status=AdminExecutionStatus.BLOCKED,
+                summary=f"python venv manifest validation blocked execution: {exc}",
+                command_results=(),
+            )
     command_results_list: list[AdminCommandResult] = []
     for step in plan.steps:
         result = command_runner(step)
@@ -1369,7 +1402,17 @@ def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecuti
 
 
 def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
+    if step.command and step.command[0].startswith("__overseer_python_venv_"):
+        try:
+            from .python_venv import execute_python_venv_marker
+
+            exit_code, stdout, stderr = execute_python_venv_marker(step.command)
+        except (OSError, ValueError) as exc:
+            exit_code, stdout, stderr = 1, "", str(exc)
+        return AdminCommandResult(step.title, step.command, exit_code, stdout, stderr)
     environment = _admin_command_environment(step.command)
+    if step.environment:
+        environment = (environment or os.environ) | dict(step.environment)
     completed = subprocess.run(
         step.command,
         check=False,

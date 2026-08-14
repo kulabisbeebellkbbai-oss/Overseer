@@ -21,6 +21,7 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 - `apt_upgrade`
 - `flatpak_install`
 - `npm_global_install`
+- `python_hashed_venv_provision`
 - `firewall_allow_tcp`
 - `firewall_deny_tcp`
 - `block_ip`
@@ -74,3 +75,24 @@ Every execution attempt also writes an audit event keyed to the admin plan. Comp
 For firewall-affecting plans, `authorizations-required` and `admin-summary` also report the IDS/firewall review gate. The queue distinguishes missing packages, prepared packages that need prompt export, exported prompts that need submission, submitted packages waiting for advisory results, revision-required packages, and accepted advisory results that are ready for human approval.
 
 IDS/firewall review package lifecycle changes also write audit events keyed to the package id. Preparing and submitting a package use `requested`, prompt export uses `verified`, accepted results use `approved`, and revision-required results use `rejected`.
+# Hash-pinned Python virtual environments
+
+`python_hashed_venv_provision` is a disabled-by-default O'Brien adapter for
+creating a new, final versioned virtual environment outside a repository. A
+plan must carry a typed manifest containing the source commit/tree or
+`pyproject.toml` digest, the immutable requirements-lock digest, resolver
+provenance, and every resolver/runtime artifact URL, version, and SHA256.
+
+The adapter is insert-only: it rejects repository-local targets, symlinked
+path components, existing destinations, unsafe ownership/modes, VCS/editable
+requirements, ranges, duplicate packages, and package-manager configuration
+flags. When a wheelhouse is supplied it uses a fixed local wheelhouse with
+`--require-hashes --no-deps --only-binary=:all: --no-index`; it always keeps
+`PIP_CONFIG_FILE=/dev/null` and does not modify system Python. Verification
+imports the expected package and checks its version.
+
+Execution requires both the exact human approval for the stored plan and a
+separate approval to enable the `python_hashed_venv_provision` adapter. A
+marker is written only to the newly-created target; rollback refuses to touch
+any path without the exact plan digest marker. Service activation is outside
+this adapter and requires its own separately approved plan.

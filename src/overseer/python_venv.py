@@ -27,6 +27,7 @@ PYTHON_VENV_PREFLIGHT_MARKER = "__overseer_python_venv_preflight__"
 PYTHON_VENV_MARKER = "__overseer_python_venv_marker__"
 PYTHON_VENV_REMOVE_MARKER = "__overseer_python_venv_remove_owned__"
 PYTHON_VENV_INPUTS_MARKER = ".overseer-python-venv-inputs-owner"
+PYTHON_VENV_PLAN_DIGEST_PLACEHOLDER = "__overseer_python_venv_plan_digest__"
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _PACKAGE_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([A-Za-z0-9][A-Za-z0-9_.+!-]*)\s+(.+)$")
@@ -288,7 +289,7 @@ def _execution_environment(spec: PythonVenvProvisionSpec) -> tuple[tuple[str, st
     )
 
 
-def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
+def validate_python_venv_spec(spec: PythonVenvProvisionSpec, *, allow_existing_target: bool = False) -> None:
     """Validate all immutable and path-safety invariants before execution."""
 
     if spec.resolver not in {"uv", "python"} and not spec.resolver.startswith("/"):
@@ -367,7 +368,26 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
             if not git_ref:
                 continue
             verify_args = (str(git_executable), "-C", git_target, "rev-parse", "--verify", "HEAD" if label == "source commit" else "HEAD^{tree}")
-            completed = subprocess.run(verify_args, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            git_environment = {
+                "PATH": f"{git_executable.parent}:/usr/bin:/bin",
+                "HOME": "/nonexistent",
+                "XDG_CONFIG_HOME": "/nonexistent",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_NOGLOBAL": "1",
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+            completed = subprocess.run(
+                verify_args,
+                check=False,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                env=git_environment,
+            )
             if completed.returncode != 0 or completed.stdout.strip().lower() != git_ref.lower():
                 raise ValueError(f"{label} does not match the current source checkout")
     if spec.pyproject_digest:
@@ -377,8 +397,12 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
         if actual_pyproject_digest.lower() != spec.pyproject_digest.lower():
             raise ValueError("pyproject digest does not match the immutable manifest")
     target = _path_without_following_symlinks(spec.venv_path, must_exist=False, label="venv target")
-    if target.exists():
+    if target.exists() and not allow_existing_target:
         raise ValueError("venv target already exists; insert-only provisioning refuses overwrite")
+    if target.exists():
+        info = target.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("existing venv target is not an owner-controlled 0700 directory")
     try:
         target.relative_to(repository_root)
     except ValueError:
@@ -403,10 +427,12 @@ def plan_python_hashed_venv_provision(
     spec: PythonVenvProvisionSpec,
     reason: str,
     current_state: str = "unknown",
+    *,
+    allow_existing_target: bool = False,
 ):
     """Build a high-risk, human-approved plan without changing host state."""
 
-    validate_python_venv_spec(spec)
+    validate_python_venv_spec(spec, allow_existing_target=allow_existing_target)
     from .admin import AdminChangeKind, AdminChangePlan, AdminCommandStep
 
     metadata = python_venv_spec_to_metadata(spec)
@@ -456,6 +482,7 @@ def plan_python_hashed_venv_provision(
     preflight_command = (
         PYTHON_VENV_PREFLIGHT_MARKER,
         spec.venv_path,
+        PYTHON_VENV_PLAN_DIGEST_PLACEHOLDER,
         spec.manifest_digest,
         spec.requirements_lock_path,
         spec.requirements_lock_digest,
@@ -476,11 +503,11 @@ def plan_python_hashed_venv_provision(
         steps=(
             AdminCommandStep(PYTHON_VENV_PREFLIGHT_MARKER, preflight_command, "seal the exact hash-verified lock and wheel inputs and recheck the insert-only destination immediately before creation"),
             AdminCommandStep("Create final versioned Python venv", venv_command, "create the new runtime directly at its final path; overwrite and --clear are forbidden", environment=environment, clear_environment=True),
-            AdminCommandStep(PYTHON_VENV_MARKER, (PYTHON_VENV_MARKER, spec.venv_path, spec.manifest_digest), "mark the exact newly-created runtime before package mutation so failed installs can roll back safely"),
+            AdminCommandStep(PYTHON_VENV_MARKER, (PYTHON_VENV_MARKER, spec.venv_path, PYTHON_VENV_PLAN_DIGEST_PLACEHOLDER), "verify the exact plan-owned runtime marker before package mutation so failed installs can roll back safely"),
             AdminCommandStep("Install hash-pinned wheels", install_command, "install only lockfile-pinned hashed wheels into the isolated venv" , environment=environment, clear_environment=True),
         ),
         rollback_steps=(
-            AdminCommandStep("Remove marker-owned Python venv", (PYTHON_VENV_REMOVE_MARKER, spec.venv_path, spec.manifest_digest, str(sealed_root)), "remove only the exact newly-created runtime and sealed inputs bearing this plan marker"),
+            AdminCommandStep("Remove marker-owned Python venv", (PYTHON_VENV_REMOVE_MARKER, spec.venv_path, PYTHON_VENV_PLAN_DIGEST_PLACEHOLDER, str(sealed_root)), "remove only the exact newly-created runtime and sealed inputs bearing this plan marker"),
         ),
         risks=(
             "isolated runtime files are created outside the repository",
@@ -495,14 +522,34 @@ def plan_python_hashed_venv_provision(
         adapter_metadata={PYTHON_VENV_METADATA_KEY: metadata},
     )
     plan_digest = python_venv_plan_digest(plan)
+    def bind_plan_digest(step):
+        if step.command and step.command[0] in {
+            PYTHON_VENV_PREFLIGHT_MARKER,
+            PYTHON_VENV_MARKER,
+            PYTHON_VENV_REMOVE_MARKER,
+        }:
+            return replace(step, command=(*step.command[:2], plan_digest, *step.command[3:]))
+        return step
     plan_metadata = dict(plan.adapter_metadata)
     plan_metadata[PYTHON_VENV_METADATA_KEY] = {**metadata, "plan_digest": plan_digest}
-    return replace(plan, adapter_metadata=plan_metadata)
+    return replace(
+        plan,
+        steps=tuple(bind_plan_digest(step) for step in plan.steps),
+        rollback_steps=tuple(bind_plan_digest(step) for step in plan.rollback_steps),
+        adapter_metadata=plan_metadata,
+    )
 
 
 def _plan_shape(plan) -> dict[str, Any]:
     def step_shape(step) -> dict[str, Any]:
-        payload: dict[str, Any] = {"title": step.title, "command": list(step.command), "reason": step.reason}
+        command = list(step.command)
+        if command and command[0] in {
+            PYTHON_VENV_PREFLIGHT_MARKER,
+            PYTHON_VENV_MARKER,
+            PYTHON_VENV_REMOVE_MARKER,
+        } and len(command) > 2:
+            command[2] = PYTHON_VENV_PLAN_DIGEST_PLACEHOLDER
+        payload: dict[str, Any] = {"title": step.title, "command": command, "reason": step.reason}
         if getattr(step, "environment", ()):
             payload["environment"] = {key: value for key, value in step.environment}
         if getattr(step, "clear_environment", False):
@@ -551,12 +598,24 @@ def validate_python_venv_plan(plan) -> PythonVenvProvisionSpec:
     expected_digest = metadata.get("manifest_digest")
     if expected_digest != spec.manifest_digest:
         raise ValueError("python venv manifest digest is not stable")
-    validate_python_venv_spec(spec)
+    validate_python_venv_spec(spec, allow_existing_target=True)
     if plan.target != spec.venv_path:
         raise ValueError("python venv plan target does not match its manifest")
+    if Path(spec.venv_path).exists():
+        _verify_owner_marker(
+            Path(spec.venv_path) / ".overseer-python-venv-owner",
+            metadata.get("plan_digest", ""),
+            label="venv ownership marker",
+        )
     if metadata.get("plan_digest") != python_venv_plan_digest(plan):
         raise ValueError("python venv canonical immutable plan header or command digest does not match approval")
-    canonical = plan_python_hashed_venv_provision(plan.id, spec, plan.reason, plan.current_state)
+    canonical = plan_python_hashed_venv_provision(
+        plan.id,
+        spec,
+        plan.reason,
+        plan.current_state,
+        allow_existing_target=Path(spec.venv_path).exists(),
+    )
     if metadata.get("plan_digest") != python_venv_plan_digest(canonical):
         raise ValueError("python venv plan digest is not stable")
     if plan.steps != canonical.steps or plan.rollback_steps != canonical.rollback_steps or plan.verification_steps != canonical.verification_steps:
@@ -599,22 +658,69 @@ def _write_sealed_file(path: Path, content: bytes, *, label: str) -> None:
         os.close(fd)
 
 
+def _verify_owner_marker(path: Path, digest: str, *, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise ValueError(f"{label} is absent or mismatched") from None
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+        or path.read_text(encoding="utf-8").strip() != digest
+    ):
+        raise ValueError(f"{label} is absent or mismatched")
+
+
+def _ensure_plan_owned_target(target_text: str, plan_digest: str) -> Path:
+    """Atomically claim the final target before an external venv tool runs."""
+    target = _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
+    _owner_only_directory(target.parent, label="venv target parent", allow_sticky_shared=True)
+    created = False
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        try:
+            os.mkdir(target, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        info = target.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError("venv target is not an owner-controlled directory")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError("venv target is not an owner-controlled 0700 directory")
+    marker_path = target / ".overseer-python-venv-owner"
+    try:
+        marker_info = marker_path.lstat()
+    except FileNotFoundError:
+        if not created:
+            raise ValueError("preexisting venv target lacks the exact plan ownership marker") from None
+        _write_sealed_file(marker_path, plan_digest.encode("ascii") + b"\n", label="venv ownership marker")
+    else:
+        if stat.S_ISLNK(marker_info.st_mode) or not stat.S_ISREG(marker_info.st_mode):
+            raise ValueError("venv ownership marker is not a regular file")
+        _verify_owner_marker(marker_path, plan_digest, label="venv ownership marker")
+    os.chmod(target, 0o700, follow_symlinks=False)
+    return target
+
+
 def _seal_python_venv_inputs(command: tuple[str, ...]) -> tuple[int, str, str]:
     (
         _marker,
         target_text,
-        digest,
+        plan_digest,
+        manifest_digest,
         lock_text,
         lock_digest,
         wheelhouse_text,
         sealed_text,
         wheel_manifest_text,
     ) = command
-    _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
-    target = Path(target_text)
-    if target.exists():
-        return 1, "", "refusing creation: exact insert-only target already exists"
-    _validate_digest(digest, "manifest digest")
+    _validate_digest(plan_digest, "plan digest")
+    _validate_digest(manifest_digest, "manifest digest")
+    target = _ensure_plan_owned_target(target_text, plan_digest)
     _validate_digest(lock_digest, "requirements lock SHA256")
     lock_path = _path_without_following_symlinks(lock_text, must_exist=True, label="requirements lock")
     _owner_safe_regular_file(lock_path, label="requirements lock")
@@ -651,12 +757,13 @@ def _seal_python_venv_inputs(command: tuple[str, ...]) -> tuple[int, str, str]:
         return 1, "", "refusing seal: wheelhouse contents changed after validation"
     seal_root = _path_without_following_symlinks(sealed_text, must_exist=False, label="sealed input area")
     if seal_root.exists():
-        return 1, "", "refusing seal: manifest-bound sealed input area already exists"
-    _owner_only_directory(target.parent, label="venv target parent", allow_sticky_shared=True)
+        _owner_only_directory(seal_root, label="sealed input area")
+        _verify_owner_marker(seal_root / PYTHON_VENV_INPUTS_MARKER, plan_digest, label="sealed input ownership marker")
+        shutil.rmtree(seal_root)
     try:
         os.mkdir(seal_root, 0o700)
         _owner_only_directory(seal_root, label="sealed input area")
-        _write_sealed_file(seal_root / PYTHON_VENV_INPUTS_MARKER, digest.encode("ascii") + b"\n", label="sealed input marker")
+        _write_sealed_file(seal_root / PYTHON_VENV_INPUTS_MARKER, plan_digest.encode("ascii") + b"\n", label="sealed input marker")
         sealed_wheelhouse = seal_root / "wheelhouse"
         os.mkdir(sealed_wheelhouse, 0o700)
         _write_sealed_file(seal_root / "requirements.lock", lock_bytes, label="sealed requirements lock")
@@ -681,19 +788,11 @@ def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]
     if marker == PYTHON_VENV_MARKER:
         _, target_text, digest = command
         target = _path_without_following_symlinks(target_text, must_exist=True, label="venv target")
-        if target.lstat().st_uid != os.getuid() or stat.S_IMODE(target.lstat().st_mode) & 0o022:
-            raise ValueError("venv target is not owner-controlled")
-        os.chmod(target, 0o700, follow_symlinks=False)
-        marker_path = target / ".overseer-python-venv-owner"
-        try:
-            marker_info = marker_path.lstat()
-        except FileNotFoundError:
-            marker_info = None
-        if marker_info is not None:
-            raise ValueError("venv ownership marker already exists")
-        marker_path.write_text(digest + "\n", encoding="utf-8")
-        os.chmod(marker_path, 0o600, follow_symlinks=False)
-        return 0, "marker recorded", ""
+        info = target.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("venv target is not an owner-controlled 0700 directory")
+        _verify_owner_marker(target / ".overseer-python-venv-owner", digest, label="venv ownership marker")
+        return 0, "marker verified", ""
     if marker == PYTHON_VENV_REMOVE_MARKER:
         _, target_text, digest, *sealed_parts = command
         target = _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
@@ -704,19 +803,11 @@ def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]
         if target.exists():
             if target.lstat().st_uid != os.getuid() or stat.S_IMODE(target.lstat().st_mode) & 0o022:
                 raise ValueError("venv target is not owner-controlled")
-            marker_path = target / ".overseer-python-venv-owner"
-            try:
-                marker_info = marker_path.lstat()
-            except FileNotFoundError:
-                return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
-            if (
-                stat.S_ISLNK(marker_info.st_mode)
-                or not stat.S_ISREG(marker_info.st_mode)
-                or marker_info.st_uid != os.getuid()
-                or stat.S_IMODE(marker_info.st_mode) & 0o077
-                or marker_path.read_text(encoding="utf-8").strip() != digest
-            ):
-                return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
+            _verify_owner_marker(
+                target / ".overseer-python-venv-owner",
+                digest,
+                label="exact plan ownership marker",
+            )
             shutil.rmtree(target)
             removed = True
         if sealed_root is not None and sealed_root.exists():

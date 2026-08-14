@@ -99,8 +99,10 @@ sealed paths.
 
 Execution requires both the exact human approval for the stored plan and a
 separate approval to enable the `python_hashed_venv_provision` adapter. A
-marker is written only to the newly-created target; rollback refuses to touch
-any path without the exact plan digest marker. Canonical execution also binds
+preflight step atomically claims the final 0700 target with the full plan
+digest before the external venv tool runs; replay accepts only that marker and
+the matching sealed-input marker. Rollback refuses to touch any path without
+the exact plan digest marker. Canonical execution also binds
 the plan id, immutable header, commands, rollback, verification, risks, and
 manifest, so approval/risk downgrades or command edits fail closed. Service
 activation is outside this adapter and requires its own separately approved

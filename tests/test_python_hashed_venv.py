@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
+import overseer.python_venv as python_venv
 
 from overseer import (
     AdminAdapterStatus,
@@ -180,8 +181,11 @@ def test_hash_pinned_venv_marker_rollback_removes_only_owned_target():
     with tempfile.TemporaryDirectory() as directory:
         target = Path(directory) / "runtime-1.2.3"
         target.mkdir()
-        target.chmod(0o755)
+        target.chmod(0o700)
         digest = "d" * 64
+        marker = target / ".overseer-python-venv-owner"
+        marker.write_text(digest + "\n", encoding="utf-8")
+        marker.chmod(0o600)
         marked = run_admin_command_step(
             AdminCommandStep("mark", ("__overseer_python_venv_marker__", str(target), digest), "mark")
         )
@@ -261,7 +265,7 @@ def test_hash_pinned_venv_preflight_seals_inputs_and_rollback_removes_only_seal(
         spec = _fixture_spec(root)
         plan = plan_python_hashed_venv_provision("admin.python.venv.seal", spec, "test", "absent")
         preflight = run_admin_command_step(plan.steps[0])
-        seal_root = Path(plan.steps[0].command[6])
+        seal_root = Path(plan.steps[0].command[7])
         assert preflight.exit_code == 0
         assert (seal_root / "requirements.lock").read_bytes() == Path(spec.requirements_lock_path).read_bytes()
         assert (seal_root / "wheelhouse" / "example-1.2.3-py3-none-any.whl").read_bytes()
@@ -269,6 +273,75 @@ def test_hash_pinned_venv_preflight_seals_inputs_and_rollback_removes_only_seal(
         rollback = run_admin_command_step(plan.rollback_steps[0])
         assert rollback.exit_code == 0
         assert not seal_root.exists()
+
+
+def test_hash_pinned_venv_preflight_claims_final_target_and_replays_partial_state():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = plan_python_hashed_venv_provision("admin.python.venv.replay", spec, "test", "absent")
+        first = run_admin_command_step(plan.steps[0])
+        target = Path(spec.venv_path)
+        marker = target / ".overseer-python-venv-owner"
+        seal_root = Path(plan.steps[0].command[7])
+        assert first.exit_code == 0
+        assert target.stat().st_mode & 0o777 == 0o700
+        assert marker.read_text(encoding="utf-8").strip() == plan.adapter_metadata["python_venv"]["plan_digest"]
+        assert marker.read_text(encoding="utf-8").strip() != spec.manifest_digest
+        (target / "partial.txt").write_text("crash residue", encoding="utf-8")
+        replay = run_admin_command_step(plan.steps[0])
+        assert replay.exit_code == 0
+        assert target.exists() and seal_root.exists()
+        rollback = run_admin_command_step(plan.rollback_steps[0])
+        assert rollback.exit_code == 0
+        assert not target.exists() and not seal_root.exists()
+
+
+def test_hash_pinned_venv_preflight_rejects_unmarked_preexisting_target():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = plan_python_hashed_venv_provision("admin.python.venv.unmarked", spec, "test", "absent")
+        target = Path(spec.venv_path)
+        target.mkdir(mode=0o700)
+        result = run_admin_command_step(plan.steps[0])
+    assert result.exit_code != 0
+    assert "marker" in result.stderr or "ownership" in result.stderr
+
+
+def test_hash_pinned_venv_git_verification_clears_hostile_environment(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        git_path = Path("/usr/bin/git")
+        spec = _fixture_spec(
+            root,
+            source_commit="a" * 40,
+            git_executable=str(git_path),
+            git_executable_sha256=hashlib.sha256(git_path.read_bytes()).hexdigest(),
+        )
+        captured = {}
+
+        class Completed:
+            returncode = 0
+            stdout = "a" * 40 + "\n"
+
+        def fake_run(args, **kwargs):
+            captured.update(kwargs)
+            return Completed()
+
+        monkeypatch.setattr(python_venv.subprocess, "run", fake_run)
+        monkeypatch.setenv("GIT_DIR", "/hostile/git")
+        monkeypatch.setenv("GIT_WORK_TREE", "/hostile/tree")
+        monkeypatch.setenv("GIT_OBJECT_DIRECTORY", "/hostile/objects")
+        monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/hostile/alternates")
+        validate_python_venv_spec(spec)
+
+    environment = captured["env"]
+    assert environment["HOME"] == "/nonexistent"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_NOGLOBAL"] == "1"
+    for hostile in ("GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        assert hostile not in environment
 
 
 def test_legacy_empty_environment_serialization_is_unchanged():

@@ -13,12 +13,14 @@ from overseer import (
     AdminChangeKind,
     AdminCommandResult,
     AdminExecutionStatus,
+    ApprovalLevel,
     approve_admin_change_plan,
     admin_execution_capability_for,
     execute_admin_change_plan,
     plan_python_hashed_venv_provision,
 )
 from overseer.admin import AdminCommandStep, run_admin_command_step
+from overseer.core import RiskLevel
 from overseer.python_venv import PythonVenvArtifact, PythonVenvProvisionSpec, validate_python_venv_spec
 from overseer.serialization import to_jsonable
 
@@ -26,7 +28,10 @@ from overseer.serialization import to_jsonable
 def _fixture_spec(root: Path, *, target: Path | None = None, **overrides) -> PythonVenvProvisionSpec:
     repo = root / "repo"
     repo.mkdir(exist_ok=True)
-    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1.0.0'\n", encoding="utf-8")
+    repo.chmod(0o700)
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text("[project]\nname='fixture'\nversion='1.0.0'\n", encoding="utf-8")
+    pyproject.chmod(0o600)
     wheel = root / "wheelhouse" / "example-1.2.3-py3-none-any.whl"
     wheel.parent.mkdir(exist_ok=True)
     wheel.write_bytes(b"fixture wheel bytes")
@@ -34,6 +39,7 @@ def _fixture_spec(root: Path, *, target: Path | None = None, **overrides) -> Pyt
     wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     lock = repo / "requirements.lock"
     lock.write_text("example==1.2.3 --hash=sha256:" + wheel_digest + "\n", encoding="utf-8")
+    lock.chmod(0o600)
     (root / "wheelhouse").mkdir(exist_ok=True)
     (root / "wheelhouse").chmod(0o700)
     managed = root / "managed-venvs"
@@ -226,6 +232,43 @@ def test_hash_pinned_venv_reconstructs_canonical_commands_before_execution():
         )
     assert result.status == AdminExecutionStatus.BLOCKED
     assert "canonical" in result.summary
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    (("risk_level", RiskLevel.LOW, "risk level"), ("approval_level", ApprovalLevel.NONE, "approval level")),
+)
+def test_hash_pinned_venv_cannot_execute_after_approval_header_downgrade(field, value, expected):
+    with tempfile.TemporaryDirectory() as directory:
+        spec = _fixture_spec(Path(directory))
+        plan = approve_admin_change_plan(
+            plan_python_hashed_venv_provision("admin.python.venv.header", spec, "test", "absent"),
+            "human",
+        )
+        tampered = replace(plan, **{field: value})
+        result = execute_admin_change_plan(
+            tampered,
+            enabled_adapter_kinds=(AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,),
+            runner=lambda step: pytest.fail("tampered plan executed a command"),
+        )
+    assert result.status == AdminExecutionStatus.BLOCKED
+    assert expected in result.summary
+
+
+def test_hash_pinned_venv_preflight_seals_inputs_and_rollback_removes_only_seal():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = plan_python_hashed_venv_provision("admin.python.venv.seal", spec, "test", "absent")
+        preflight = run_admin_command_step(plan.steps[0])
+        seal_root = Path(plan.steps[0].command[6])
+        assert preflight.exit_code == 0
+        assert (seal_root / "requirements.lock").read_bytes() == Path(spec.requirements_lock_path).read_bytes()
+        assert (seal_root / "wheelhouse" / "example-1.2.3-py3-none-any.whl").read_bytes()
+        Path(spec.requirements_lock_path).write_text("example==9.9.9\n", encoding="utf-8")
+        rollback = run_admin_command_step(plan.rollback_steps[0])
+        assert rollback.exit_code == 0
+        assert not seal_root.exists()
 
 
 def test_legacy_empty_environment_serialization_is_unchanged():

@@ -26,6 +26,7 @@ PYTHON_VENV_METADATA_KEY = "python_venv"
 PYTHON_VENV_PREFLIGHT_MARKER = "__overseer_python_venv_preflight__"
 PYTHON_VENV_MARKER = "__overseer_python_venv_marker__"
 PYTHON_VENV_REMOVE_MARKER = "__overseer_python_venv_remove_owned__"
+PYTHON_VENV_INPUTS_MARKER = ".overseer-python-venv-inputs-owner"
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _PACKAGE_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([A-Za-z0-9][A-Za-z0-9_.+!-]*)\s+(.+)$")
@@ -80,6 +81,8 @@ class PythonVenvProvisionSpec:
     expected_version: str
     resolver_executable: str | None = None
     resolver_executable_sha256: str | None = None
+    git_executable: str | None = None
+    git_executable_sha256: str | None = None
     source_commit: str | None = None
     source_tree_digest: str | None = None
     pyproject_digest: str | None = None
@@ -143,16 +146,44 @@ def _owner_only_directory(path: Path, *, label: str, allow_sticky_shared: bool =
         raise ValueError(f"{label} must be owner-only")
 
 
+def _owner_controlled_directory(path: Path, *, label: str) -> None:
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"{label} must be a regular directory without symlinks")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"{label} must be owned by the current user and not group/world writable")
+
+
+def _owner_safe_regular_file(path: Path, *, label: str, allow_root: bool = False) -> os.stat_result:
+    """Return an owner-controlled regular-file stat without following links."""
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label} must be a regular file without symlinks")
+    allowed_owners = {os.getuid(), 0} if allow_root else {os.getuid()}
+    if info.st_uid not in allowed_owners or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"{label} must be owned by the current user and not group/world writable")
+    return info
+
+
+def _owner_safe_executable(path_text: str, digest: str, *, label: str) -> Path:
+    path = _path_without_following_symlinks(path_text, must_exist=True, label=label)
+    info = _owner_safe_regular_file(path, label=label, allow_root=True)
+    if not info.st_mode & stat.S_IXUSR:
+        raise ValueError(f"{label} must be owner-executable")
+    _validate_digest(digest, f"{label} SHA256")
+    if hashlib.sha256(path.read_bytes()).hexdigest().lower() != digest.lower():
+        raise ValueError(f"{label} digest does not match the immutable manifest")
+    return path
+
+
 def _validate_digest(value: str, label: str) -> None:
-    if not _SHA256_RE.fullmatch(value or ""):
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
         raise ValueError(f"{label} must be a 64-character SHA256 digest")
 
 
 def _validate_lock_file(spec: PythonVenvProvisionSpec) -> dict[str, tuple[str, frozenset[str]]]:
     lock = _path_without_following_symlinks(spec.requirements_lock_path, must_exist=True, label="requirements lock")
-    info = lock.lstat()
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("requirements lock must be a regular file")
+    _owner_safe_regular_file(lock, label="requirements lock")
     actual = hashlib.sha256(lock.read_bytes()).hexdigest()
     if actual.lower() != spec.requirements_lock_digest.lower():
         raise ValueError("requirements lock digest does not match the immutable manifest")
@@ -229,6 +260,34 @@ def _validate_wheelhouse(spec: PythonVenvProvisionSpec, lock_entries: dict[str, 
         raise ValueError("wheelhouse artifacts do not exactly match the immutable wheel manifest")
 
 
+def _sealed_inputs_root(spec: PythonVenvProvisionSpec) -> Path:
+    return Path(spec.venv_path).parent / f".overseer-python-inputs-{spec.manifest_digest}"
+
+
+def _wheel_manifest(spec: PythonVenvProvisionSpec) -> tuple[dict[str, str], ...]:
+    entries = []
+    for artifact in spec.artifacts:
+        name = artifact.name if artifact.name.lower().endswith(".whl") else Path(artifact.url).name
+        if name.lower().endswith(".whl"):
+            entries.append({"name": name, "sha256": artifact.sha256.lower(), "version": artifact.version})
+    return tuple(sorted(entries, key=lambda item: item["name"]))
+
+
+def _execution_environment(spec: PythonVenvProvisionSpec) -> tuple[tuple[str, str], ...]:
+    return (
+        ("PATH", f"{Path(spec.resolver_executable).parent}:/usr/bin:/bin"),
+        ("PIP_CONFIG_FILE", os.devnull),
+        ("PIP_NO_INDEX", "1"),
+        ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+        ("PIP_ROOT_USER_ACTION", "ignore"),
+        ("PYTHONHOME", ""),
+        ("PYTHONNOUSERSITE", "1"),
+        ("PYTHONPATH", ""),
+        ("UV_OFFLINE", "1"),
+        ("UV_PYTHON_DOWNLOADS", "never"),
+    )
+
+
 def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
     """Validate all immutable and path-safety invariants before execution."""
 
@@ -244,17 +303,11 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
         raise ValueError("strict import name and expected version are required")
     if not spec.resolver_executable or not spec.resolver_executable_sha256:
         raise ValueError("exact approved resolver executable path and digest are required")
-    resolver_executable = _path_without_following_symlinks(spec.resolver_executable, must_exist=True, label="resolver executable")
-    resolver_info = resolver_executable.lstat()
-    if not stat.S_ISREG(resolver_info.st_mode) or stat.S_IMODE(resolver_info.st_mode) & 0o022:
-        raise ValueError("resolver executable must be a non-writable regular file")
-    if not resolver_info.st_mode & stat.S_IXUSR:
-        raise ValueError("resolver executable must be owner-executable")
-    if resolver_info.st_uid not in {0, os.getuid()}:
-        raise ValueError("resolver executable must be owned by root or the current user")
-    _validate_digest(spec.resolver_executable_sha256, "resolver executable SHA256")
-    if hashlib.sha256(resolver_executable.read_bytes()).hexdigest().lower() != spec.resolver_executable_sha256.lower():
-        raise ValueError("resolver executable digest does not match the immutable manifest")
+    resolver_executable = _owner_safe_executable(
+        spec.resolver_executable,
+        spec.resolver_executable_sha256,
+        label="resolver executable",
+    )
     if spec.resolver == "python" and not resolver_executable.name.startswith("python3"):
         raise ValueError("python resolver executable must be a Python 3 interpreter")
     if not spec.import_name.strip() or not spec.expected_version.strip():
@@ -293,23 +346,33 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
         raise ValueError("repository root must be a directory")
     if repository_root.stat().st_uid != os.getuid():
         raise ValueError("repository root is not owned by the current user")
+    _owner_controlled_directory(repository_root, label="repository root")
     if not source_root.is_dir():
         raise ValueError("source root must be a directory")
+    _owner_controlled_directory(source_root, label="source root")
     try:
         source_root.relative_to(repository_root)
     except ValueError:
         raise ValueError("source root must be inside repository root") from None
     if spec.source_commit or spec.source_tree_digest:
+        if not spec.git_executable or not spec.git_executable_sha256:
+            raise ValueError("exact approved git executable path and digest are required for git source verification")
+        git_executable = _owner_safe_executable(
+            spec.git_executable,
+            spec.git_executable_sha256,
+            label="git executable",
+        )
         git_target = str(source_root)
         for git_ref, label in ((spec.source_commit, "source commit"), (spec.source_tree_digest, "source tree digest")):
             if not git_ref:
                 continue
-            verify_args = ("git", "-C", git_target, "rev-parse", "--verify", "HEAD" if label == "source commit" else "HEAD^{tree}")
+            verify_args = (str(git_executable), "-C", git_target, "rev-parse", "--verify", "HEAD" if label == "source commit" else "HEAD^{tree}")
             completed = subprocess.run(verify_args, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL)
             if completed.returncode != 0 or completed.stdout.strip().lower() != git_ref.lower():
                 raise ValueError(f"{label} does not match the current source checkout")
     if spec.pyproject_digest:
         pyproject = _path_without_following_symlinks(source_root / "pyproject.toml", must_exist=True, label="pyproject")
+        _owner_safe_regular_file(pyproject, label="pyproject")
         actual_pyproject_digest = hashlib.sha256(pyproject.read_bytes()).hexdigest()
         if actual_pyproject_digest.lower() != spec.pyproject_digest.lower():
             raise ValueError("pyproject digest does not match the immutable manifest")
@@ -327,6 +390,10 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
     _owner_only_directory(target_parent, label="venv target parent", allow_sticky_shared=True)
     if spec.expected_version not in target.name:
         raise ValueError("venv target must be a final versioned path containing expected_version")
+    _owner_safe_regular_file(
+        _path_without_following_symlinks(spec.requirements_lock_path, must_exist=True, label="requirements lock"),
+        label="requirements lock",
+    )
     lock_entries = _validate_lock_file(spec)
     _validate_wheelhouse(spec, lock_entries)
 
@@ -344,6 +411,10 @@ def plan_python_hashed_venv_provision(
 
     metadata = python_venv_spec_to_metadata(spec)
     python_executable = str(Path(spec.venv_path) / "bin" / "python")
+    sealed_root = _sealed_inputs_root(spec)
+    sealed_lock = str(sealed_root / "requirements.lock")
+    sealed_wheelhouse = str(sealed_root / "wheelhouse")
+    wheel_manifest_json = _canonical_json(list(_wheel_manifest(spec)))
     resolver = (spec.resolver_executable,)
     venv_command = (
         (*resolver, "venv", "--offline", "--no-python-downloads", "--python", spec.python_version, spec.venv_path)
@@ -361,8 +432,10 @@ def plan_python_hashed_venv_provision(
             "--require-hashes",
             "--no-deps",
             "--only-binary=:all:",
-            *( ("--no-index", "--find-links", spec.wheelhouse_path) if spec.wheelhouse_path else () ),
-            spec.requirements_lock_path,
+            "--no-index",
+            "--find-links",
+            sealed_wheelhouse,
+            sealed_lock,
         )
     else:
         install_command = (
@@ -373,18 +446,22 @@ def plan_python_hashed_venv_provision(
             "--require-hashes",
             "--no-deps",
             "--only-binary=:all:",
-            *( ("--no-index", "--find-links", spec.wheelhouse_path) if spec.wheelhouse_path else () ),
+            "--no-index",
+            "--find-links",
+            sealed_wheelhouse,
             "-r",
-            spec.requirements_lock_path,
+            sealed_lock,
         )
-    environment = (
-        ("PATH", f"{Path(spec.resolver_executable).parent}:/usr/bin:/bin"),
-        ("PIP_CONFIG_FILE", os.devnull),
-        ("PIP_NO_INDEX", "1"),
-        ("PYTHONNOUSERSITE", "1"),
-        ("PYTHONPATH", ""),
-        ("UV_OFFLINE", "1"),
-        ("UV_PYTHON_DOWNLOADS", "never"),
+    environment = _execution_environment(spec)
+    preflight_command = (
+        PYTHON_VENV_PREFLIGHT_MARKER,
+        spec.venv_path,
+        spec.manifest_digest,
+        spec.requirements_lock_path,
+        spec.requirements_lock_digest,
+        spec.wheelhouse_path,
+        str(sealed_root),
+        wheel_manifest_json,
     )
     plan = AdminChangePlan(
         id=plan_id,
@@ -397,13 +474,13 @@ def plan_python_hashed_venv_provision(
         current_state=current_state,
         proposed_state=f"create immutable isolated Python {spec.python_version} runtime at {spec.venv_path}",
         steps=(
-            AdminCommandStep(PYTHON_VENV_PREFLIGHT_MARKER, (PYTHON_VENV_PREFLIGHT_MARKER, spec.venv_path, spec.manifest_digest), "recheck the immutable manifest and insert-only destination immediately before creation"),
-            AdminCommandStep("Create final versioned Python venv", venv_command, "create the new runtime directly at its final path; overwrite and --clear are forbidden"),
+            AdminCommandStep(PYTHON_VENV_PREFLIGHT_MARKER, preflight_command, "seal the exact hash-verified lock and wheel inputs and recheck the insert-only destination immediately before creation"),
+            AdminCommandStep("Create final versioned Python venv", venv_command, "create the new runtime directly at its final path; overwrite and --clear are forbidden", environment=environment, clear_environment=True),
             AdminCommandStep(PYTHON_VENV_MARKER, (PYTHON_VENV_MARKER, spec.venv_path, spec.manifest_digest), "mark the exact newly-created runtime before package mutation so failed installs can roll back safely"),
             AdminCommandStep("Install hash-pinned wheels", install_command, "install only lockfile-pinned hashed wheels into the isolated venv" , environment=environment, clear_environment=True),
         ),
         rollback_steps=(
-            AdminCommandStep("Remove marker-owned Python venv", (PYTHON_VENV_REMOVE_MARKER, spec.venv_path, spec.manifest_digest), "remove only the exact newly-created runtime bearing this plan marker"),
+            AdminCommandStep("Remove marker-owned Python venv", (PYTHON_VENV_REMOVE_MARKER, spec.venv_path, spec.manifest_digest, str(sealed_root)), "remove only the exact newly-created runtime and sealed inputs bearing this plan marker"),
         ),
         risks=(
             "isolated runtime files are created outside the repository",
@@ -412,8 +489,8 @@ def plan_python_hashed_venv_provision(
             "rollback is only permitted for this plan's marker-owned runtime",
         ),
         verification_steps=(
-            AdminCommandStep("Verify isolated interpreter", (python_executable, "-c", f"import platform; assert platform.python_version() == {spec.python_version!r}"), "confirm the new venv interpreter exactly matches the requested runtime"),
-            AdminCommandStep("Verify managed import and version", (python_executable, "-c", f"import {spec.import_name}; assert getattr({spec.import_name}, '__version__', None) == {spec.expected_version!r}"), "confirm the expected import and version are present inside the new venv"),
+            AdminCommandStep("Verify isolated interpreter", (python_executable, "-c", f"import platform; assert platform.python_version() == {spec.python_version!r}"), "confirm the new venv interpreter exactly matches the requested runtime", environment=environment, clear_environment=True),
+            AdminCommandStep("Verify managed import and version", (python_executable, "-c", f"import {spec.import_name}; assert getattr({spec.import_name}, '__version__', None) == {spec.expected_version!r}"), "confirm the expected import and version are present inside the new venv", environment=environment, clear_environment=True),
         ),
         adapter_metadata={PYTHON_VENV_METADATA_KEY: metadata},
     )
@@ -435,7 +512,11 @@ def _plan_shape(plan) -> dict[str, Any]:
     metadata = dict(getattr(plan, "adapter_metadata", {}).get(PYTHON_VENV_METADATA_KEY, {}))
     metadata.pop("plan_digest", None)
     return {
+        "id": plan.id,
         "kind": str(plan.kind),
+        "owner_domain": str(plan.owner_domain),
+        "risk_level": str(plan.risk_level),
+        "approval_level": str(plan.approval_level),
         "target": plan.target,
         "reason": plan.reason,
         "current_state": plan.current_state,
@@ -453,6 +534,16 @@ def python_venv_plan_digest(plan) -> str:
 
 
 def validate_python_venv_plan(plan) -> PythonVenvProvisionSpec:
+    from .admin import AdminChangeKind
+
+    if plan.kind != AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
+        raise ValueError("python venv plan kind is not python_hashed_venv_provision")
+    if plan.owner_domain != OwnerDomain.OBRIEN:
+        raise ValueError("python venv plan owner domain must be OBRIEN")
+    if plan.risk_level != RiskLevel.HIGH:
+        raise ValueError("python venv plan risk level must be HIGH")
+    if plan.approval_level != ApprovalLevel.HUMAN:
+        raise ValueError("python venv plan approval level must be HUMAN")
     metadata = getattr(plan, "adapter_metadata", {}).get(PYTHON_VENV_METADATA_KEY)
     if not isinstance(metadata, dict):
         raise ValueError("python_hashed_venv_provision plan is missing its typed manifest")
@@ -463,6 +554,8 @@ def validate_python_venv_plan(plan) -> PythonVenvProvisionSpec:
     validate_python_venv_spec(spec)
     if plan.target != spec.venv_path:
         raise ValueError("python venv plan target does not match its manifest")
+    if metadata.get("plan_digest") != python_venv_plan_digest(plan):
+        raise ValueError("python venv canonical immutable plan header or command digest does not match approval")
     canonical = plan_python_hashed_venv_provision(plan.id, spec, plan.reason, plan.current_state)
     if metadata.get("plan_digest") != python_venv_plan_digest(canonical):
         raise ValueError("python venv plan digest is not stable")
@@ -473,16 +566,118 @@ def validate_python_venv_plan(plan) -> PythonVenvProvisionSpec:
     return spec
 
 
+def _read_owner_file_bytes(path: Path, *, label: str) -> bytes:
+    """Read one immutable input through an O_NOFOLLOW descriptor."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{label} must be a regular file without symlinks")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError(f"{label} must be owned by the current user and not group/world writable")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _write_sealed_file(path: Path, content: bytes, *, label: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        offset = 0
+        while offset < len(content):
+            offset += os.write(fd, content[offset:])
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
+def _seal_python_venv_inputs(command: tuple[str, ...]) -> tuple[int, str, str]:
+    (
+        _marker,
+        target_text,
+        digest,
+        lock_text,
+        lock_digest,
+        wheelhouse_text,
+        sealed_text,
+        wheel_manifest_text,
+    ) = command
+    _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
+    target = Path(target_text)
+    if target.exists():
+        return 1, "", "refusing creation: exact insert-only target already exists"
+    _validate_digest(digest, "manifest digest")
+    _validate_digest(lock_digest, "requirements lock SHA256")
+    lock_path = _path_without_following_symlinks(lock_text, must_exist=True, label="requirements lock")
+    _owner_safe_regular_file(lock_path, label="requirements lock")
+    lock_bytes = _read_owner_file_bytes(lock_path, label="requirements lock")
+    if hashlib.sha256(lock_bytes).hexdigest().lower() != lock_digest.lower():
+        return 1, "", "refusing seal: requirements lock changed after validation"
+    wheelhouse = _path_without_following_symlinks(wheelhouse_text, must_exist=True, label="wheelhouse")
+    _owner_only_directory(wheelhouse, label="wheelhouse")
+    try:
+        wheel_manifest = json.loads(wheel_manifest_text)
+    except json.JSONDecodeError as error:
+        raise ValueError("wheel manifest is not canonical JSON") from error
+    if not isinstance(wheel_manifest, list) or _canonical_json(wheel_manifest) != wheel_manifest_text:
+        raise ValueError("wheel manifest is not canonical JSON")
+    expected_names: set[str] = set()
+    wheel_bytes: list[tuple[str, bytes]] = []
+    for entry in wheel_manifest:
+        if not isinstance(entry, dict) or set(entry) != {"name", "sha256", "version"}:
+            raise ValueError("wheel manifest entry is malformed")
+        name = entry["name"]
+        if not isinstance(name, str) or not name or Path(name).name != name or not name.lower().endswith(".whl"):
+            raise ValueError("wheel manifest contains an unsafe wheel name")
+        if name in expected_names:
+            raise ValueError("wheel manifest contains duplicate wheel names")
+        expected_names.add(name)
+        _validate_digest(entry["sha256"], f"wheel {name} SHA256")
+        wheel_path = _path_without_following_symlinks(wheelhouse / name, must_exist=True, label=f"wheel {name}")
+        content = _read_owner_file_bytes(wheel_path, label=f"wheel {name}")
+        if hashlib.sha256(content).hexdigest().lower() != entry["sha256"].lower():
+            return 1, "", f"refusing seal: wheel changed after validation: {name}"
+        wheel_bytes.append((name, content))
+    actual_names = {item.name for item in wheelhouse.iterdir() if item.is_file() and item.suffix == ".whl"}
+    if actual_names != expected_names:
+        return 1, "", "refusing seal: wheelhouse contents changed after validation"
+    seal_root = _path_without_following_symlinks(sealed_text, must_exist=False, label="sealed input area")
+    if seal_root.exists():
+        return 1, "", "refusing seal: manifest-bound sealed input area already exists"
+    _owner_only_directory(target.parent, label="venv target parent", allow_sticky_shared=True)
+    try:
+        os.mkdir(seal_root, 0o700)
+        _owner_only_directory(seal_root, label="sealed input area")
+        _write_sealed_file(seal_root / PYTHON_VENV_INPUTS_MARKER, digest.encode("ascii") + b"\n", label="sealed input marker")
+        sealed_wheelhouse = seal_root / "wheelhouse"
+        os.mkdir(sealed_wheelhouse, 0o700)
+        _write_sealed_file(seal_root / "requirements.lock", lock_bytes, label="sealed requirements lock")
+        for name, content in wheel_bytes:
+            _write_sealed_file(sealed_wheelhouse / name, content, label=f"sealed wheel {name}")
+        return 0, "immutable lock and wheel inputs sealed", ""
+    except Exception:
+        try:
+            if seal_root.is_dir() and not seal_root.is_symlink() and seal_root.lstat().st_uid == os.getuid():
+                shutil.rmtree(seal_root)
+        except OSError:
+            pass
+        raise
+
+
 def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]:
     """Execute an internal marker operation; never follows a path symlink."""
 
     marker = command[0]
     if marker == PYTHON_VENV_PREFLIGHT_MARKER:
-        _, target_text, _digest = command
-        _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
-        if Path(target_text).exists():
-            return 1, "", "refusing creation: exact insert-only target already exists"
-        return 0, "immutable Python venv manifest and empty target revalidated", ""
+        return _seal_python_venv_inputs(command)
     if marker == PYTHON_VENV_MARKER:
         _, target_text, digest = command
         target = _path_without_following_symlinks(target_text, must_exist=True, label="venv target")
@@ -500,25 +695,49 @@ def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]
         os.chmod(marker_path, 0o600, follow_symlinks=False)
         return 0, "marker recorded", ""
     if marker == PYTHON_VENV_REMOVE_MARKER:
-        _, target_text, digest = command
-        target = _path_without_following_symlinks(target_text, must_exist=True, label="venv target")
-        if target.lstat().st_uid != os.getuid() or stat.S_IMODE(target.lstat().st_mode) & 0o022:
-            raise ValueError("venv target is not owner-controlled")
-        marker_path = target / ".overseer-python-venv-owner"
-        try:
-            marker_info = marker_path.lstat()
-        except FileNotFoundError:
-            return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
-        if (
-            stat.S_ISLNK(marker_info.st_mode)
-            or not stat.S_ISREG(marker_info.st_mode)
-            or marker_info.st_uid != os.getuid()
-            or stat.S_IMODE(marker_info.st_mode) & 0o077
-            or marker_path.read_text(encoding="utf-8").strip() != digest
-        ):
-            return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
-        shutil.rmtree(target)
-        return 0, "marker-owned venv removed", ""
+        _, target_text, digest, *sealed_parts = command
+        target = _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
+        sealed_root = None
+        if sealed_parts:
+            sealed_root = _path_without_following_symlinks(sealed_parts[0], must_exist=False, label="sealed input area")
+        removed = False
+        if target.exists():
+            if target.lstat().st_uid != os.getuid() or stat.S_IMODE(target.lstat().st_mode) & 0o022:
+                raise ValueError("venv target is not owner-controlled")
+            marker_path = target / ".overseer-python-venv-owner"
+            try:
+                marker_info = marker_path.lstat()
+            except FileNotFoundError:
+                return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
+            if (
+                stat.S_ISLNK(marker_info.st_mode)
+                or not stat.S_ISREG(marker_info.st_mode)
+                or marker_info.st_uid != os.getuid()
+                or stat.S_IMODE(marker_info.st_mode) & 0o077
+                or marker_path.read_text(encoding="utf-8").strip() != digest
+            ):
+                return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
+            shutil.rmtree(target)
+            removed = True
+        if sealed_root is not None and sealed_root.exists():
+            if not sealed_root.is_dir() or sealed_root.is_symlink() or sealed_root.lstat().st_uid != os.getuid():
+                raise ValueError("sealed input area is not owner-controlled")
+            marker_path = sealed_root / PYTHON_VENV_INPUTS_MARKER
+            try:
+                marker_info = marker_path.lstat()
+            except FileNotFoundError:
+                return 1, "", "refusing rollback: sealed input ownership marker is absent"
+            if (
+                stat.S_ISLNK(marker_info.st_mode)
+                or not stat.S_ISREG(marker_info.st_mode)
+                or marker_info.st_uid != os.getuid()
+                or stat.S_IMODE(marker_info.st_mode) & 0o077
+                or marker_path.read_text(encoding="utf-8").strip() != digest
+            ):
+                return 1, "", "refusing rollback: sealed input ownership marker is absent or mismatched"
+            shutil.rmtree(sealed_root)
+            removed = True
+        return (0, "marker-owned venv and sealed inputs removed", "") if removed else (0, "nothing to remove", "")
     raise ValueError(f"unknown Python venv marker command: {marker}")
 
 
@@ -527,6 +746,7 @@ __all__ = [
     "PYTHON_VENV_MARKER",
     "PYTHON_VENV_PREFLIGHT_MARKER",
     "PYTHON_VENV_REMOVE_MARKER",
+    "PYTHON_VENV_INPUTS_MARKER",
     "PythonVenvArtifact",
     "PythonVenvProvisionSpec",
     "execute_python_venv_marker",

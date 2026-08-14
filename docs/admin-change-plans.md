@@ -89,10 +89,19 @@ requirements, ranges, duplicate packages, and package-manager configuration
 flags. When a wheelhouse is supplied it uses a fixed local wheelhouse with
 `--require-hashes --no-deps --only-binary=:all: --no-index`; it always keeps
 `PIP_CONFIG_FILE=/dev/null` and does not modify system Python. Verification
-imports the expected package and checks its version.
+imports the expected package and checks its version. Creation, installation,
+and verification run with a cleared fixed environment (`PATH`, `PYTHONPATH`,
+`PYTHONHOME`, `PIP_*`, and `UV_*` protections); Git verification, when used,
+also requires an absolute hash-pinned Git executable. Immediately before
+creation, the adapter seals the exact lock and wheel bytes into an owner-only
+manifest-bound staging area, and the install commands consume only those
+sealed paths.
 
 Execution requires both the exact human approval for the stored plan and a
 separate approval to enable the `python_hashed_venv_provision` adapter. A
 marker is written only to the newly-created target; rollback refuses to touch
-any path without the exact plan digest marker. Service activation is outside
-this adapter and requires its own separately approved plan.
+any path without the exact plan digest marker. Canonical execution also binds
+the plan id, immutable header, commands, rollback, verification, risks, and
+manifest, so approval/risk downgrades or command edits fail closed. Service
+activation is outside this adapter and requires its own separately approved
+plan.

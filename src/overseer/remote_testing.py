@@ -29,10 +29,12 @@ SUPPORTED_JOB_TYPES = (
     "overseer.performance_regression",
     "protected_gateway.request_sequence",
     "tank.local_facility_request",
+    "psychlo.authenticated_browser_verify",
     "roadex.authenticated_session_prompt",
     "roadex.project_creation_flow",
 )
 SCOPED_TOKEN_REQUIRED_JOB_TYPES = (
+    "psychlo.authenticated_browser_verify",
     "roadex.authenticated_session_prompt",
 )
 SENSITIVE_KEY_PARTS = (

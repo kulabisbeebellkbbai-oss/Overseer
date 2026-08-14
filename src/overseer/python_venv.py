@@ -15,6 +15,9 @@ import re
 import shutil
 import stat
 import subprocess
+import ctypes
+import errno
+import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,8 @@ PYTHON_VENV_MARKER = "__overseer_python_venv_marker__"
 PYTHON_VENV_REMOVE_MARKER = "__overseer_python_venv_remove_owned__"
 PYTHON_VENV_INPUTS_MARKER = ".overseer-python-venv-inputs-owner"
 PYTHON_VENV_PLAN_DIGEST_PLACEHOLDER = "__overseer_python_venv_plan_digest__"
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _PACKAGE_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([A-Za-z0-9][A-Za-z0-9_.+!-]*)\s+(.+)$")
@@ -654,6 +659,7 @@ def _write_sealed_file(path: Path, content: bytes, *, label: str) -> None:
         while offset < len(content):
             offset += os.write(fd, content[offset:])
         os.fchmod(fd, 0o600)
+        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -673,19 +679,74 @@ def _verify_owner_marker(path: Path, digest: str, *, label: str) -> None:
         raise ValueError(f"{label} is absent or mismatched")
 
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _rename_noreplace(source: Path, destination: Path, *, label: str) -> None:
+    """Atomically publish a directory without replacing a concurrent target."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, f"{label} requires renameat2(RENAME_NOREPLACE)")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, f"{label}: {os.strerror(error_number)}")
+    _fsync_directory(destination.parent)
+
+
+def _remove_owned_orphan_temps(parent: Path, prefix: str, marker_name: str, digest: str) -> None:
+    for candidate in sorted(parent.glob(f"{prefix}*")):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            continue
+        try:
+            _verify_owner_marker(candidate / marker_name, digest, label="owned temporary marker")
+        except ValueError:
+            continue
+        shutil.rmtree(candidate)
+
+
 def _ensure_plan_owned_target(target_text: str, plan_digest: str) -> Path:
-    """Atomically claim the final target before an external venv tool runs."""
+    """Atomically publish a marker-owned final target before venv creation."""
     target = _path_without_following_symlinks(target_text, must_exist=False, label="venv target")
     _owner_only_directory(target.parent, label="venv target parent", allow_sticky_shared=True)
-    created = False
     try:
         info = target.lstat()
     except FileNotFoundError:
-        try:
-            os.mkdir(target, 0o700)
-            created = True
-        except FileExistsError:
-            pass
+        _remove_owned_orphan_temps(
+            target.parent,
+            f".overseer-python-venv-{plan_digest}.tmp-",
+            ".overseer-python-venv-owner",
+            plan_digest,
+        )
+        temporary = Path(tempfile.mkdtemp(prefix=f".overseer-python-venv-{plan_digest}.tmp-", dir=target.parent))
+        os.chmod(temporary, 0o700, follow_symlinks=False)
+        _write_sealed_file(
+            temporary / ".overseer-python-venv-owner",
+            plan_digest.encode("ascii") + b"\n",
+            label="venv ownership marker",
+        )
+        _fsync_directory(temporary)
+        _rename_noreplace(temporary, target, label="venv target publication")
+        info = target.lstat()
+    else:
         info = target.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise ValueError("venv target is not an owner-controlled directory")
@@ -695,9 +756,7 @@ def _ensure_plan_owned_target(target_text: str, plan_digest: str) -> Path:
     try:
         marker_info = marker_path.lstat()
     except FileNotFoundError:
-        if not created:
-            raise ValueError("preexisting venv target lacks the exact plan ownership marker") from None
-        _write_sealed_file(marker_path, plan_digest.encode("ascii") + b"\n", label="venv ownership marker")
+        raise ValueError("preexisting venv target lacks the exact plan ownership marker") from None
     else:
         if stat.S_ISLNK(marker_info.st_mode) or not stat.S_ISREG(marker_info.st_mode):
             raise ValueError("venv ownership marker is not a regular file")
@@ -759,24 +818,45 @@ def _seal_python_venv_inputs(command: tuple[str, ...]) -> tuple[int, str, str]:
     if seal_root.exists():
         _owner_only_directory(seal_root, label="sealed input area")
         _verify_owner_marker(seal_root / PYTHON_VENV_INPUTS_MARKER, plan_digest, label="sealed input ownership marker")
-        shutil.rmtree(seal_root)
-    try:
-        os.mkdir(seal_root, 0o700)
-        _owner_only_directory(seal_root, label="sealed input area")
-        _write_sealed_file(seal_root / PYTHON_VENV_INPUTS_MARKER, plan_digest.encode("ascii") + b"\n", label="sealed input marker")
+        sealed_lock = seal_root / "requirements.lock"
         sealed_wheelhouse = seal_root / "wheelhouse"
-        os.mkdir(sealed_wheelhouse, 0o700)
-        _write_sealed_file(seal_root / "requirements.lock", lock_bytes, label="sealed requirements lock")
-        for name, content in wheel_bytes:
-            _write_sealed_file(sealed_wheelhouse / name, content, label=f"sealed wheel {name}")
-        return 0, "immutable lock and wheel inputs sealed", ""
-    except Exception:
         try:
-            if seal_root.is_dir() and not seal_root.is_symlink() and seal_root.lstat().st_uid == os.getuid():
-                shutil.rmtree(seal_root)
-        except OSError:
-            pass
-        raise
+            complete = (
+                _read_owner_file_bytes(sealed_lock, label="sealed requirements lock") == lock_bytes
+                and sealed_wheelhouse.is_dir()
+                and {item.name for item in sealed_wheelhouse.iterdir()} == expected_names
+                and all(
+                    _read_owner_file_bytes(sealed_wheelhouse / name, label=f"sealed wheel {name}") == content
+                    for name, content in wheel_bytes
+                )
+            )
+        except (OSError, ValueError):
+            complete = False
+        if complete:
+            return 0, "immutable lock and wheel inputs already sealed", ""
+        shutil.rmtree(seal_root)
+    _remove_owned_orphan_temps(
+        seal_root.parent,
+        f"{seal_root.name}.tmp-",
+        PYTHON_VENV_INPUTS_MARKER,
+        plan_digest,
+    )
+    temporary = Path(tempfile.mkdtemp(prefix=f"{seal_root.name}.tmp-", dir=seal_root.parent))
+    os.chmod(temporary, 0o700, follow_symlinks=False)
+    _write_sealed_file(
+        temporary / PYTHON_VENV_INPUTS_MARKER,
+        plan_digest.encode("ascii") + b"\n",
+        label="sealed input marker",
+    )
+    sealed_wheelhouse = temporary / "wheelhouse"
+    os.mkdir(sealed_wheelhouse, 0o700)
+    _write_sealed_file(temporary / "requirements.lock", lock_bytes, label="sealed requirements lock")
+    for name, content in wheel_bytes:
+        _write_sealed_file(sealed_wheelhouse / name, content, label=f"sealed wheel {name}")
+    _fsync_directory(sealed_wheelhouse)
+    _fsync_directory(temporary)
+    _rename_noreplace(temporary, seal_root, label="sealed input publication")
+    return 0, "immutable lock and wheel inputs sealed", ""
 
 
 def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]:
@@ -799,33 +879,46 @@ def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]
         sealed_root = None
         if sealed_parts:
             sealed_root = _path_without_following_symlinks(sealed_parts[0], must_exist=False, label="sealed input area")
-        removed = False
-        if target.exists():
-            if target.lstat().st_uid != os.getuid() or stat.S_IMODE(target.lstat().st_mode) & 0o022:
+        target_present = False
+        try:
+            target_info = target.lstat()
+            target_present = True
+        except FileNotFoundError:
+            target_info = None
+        seal_present = False
+        if sealed_root is not None:
+            try:
+                seal_info = sealed_root.lstat()
+                seal_present = True
+            except FileNotFoundError:
+                seal_info = None
+        # Validate every existing ownership marker before deleting either
+        # object.  A mismatched seal must never leave a half-rolled-back target.
+        if target_present:
+            if target_info is None or stat.S_ISLNK(target_info.st_mode) or not stat.S_ISDIR(target_info.st_mode):
+                raise ValueError("venv target is not owner-controlled")
+            if target_info.st_uid != os.getuid() or stat.S_IMODE(target_info.st_mode) & 0o077:
                 raise ValueError("venv target is not owner-controlled")
             _verify_owner_marker(
                 target / ".overseer-python-venv-owner",
                 digest,
                 label="exact plan ownership marker",
             )
+        if seal_present:
+            if seal_info is None or stat.S_ISLNK(seal_info.st_mode) or not stat.S_ISDIR(seal_info.st_mode):
+                raise ValueError("sealed input area is not owner-controlled")
+            if seal_info.st_uid != os.getuid() or stat.S_IMODE(seal_info.st_mode) & 0o077:
+                raise ValueError("sealed input area is not owner-controlled")
+            _verify_owner_marker(
+                sealed_root / PYTHON_VENV_INPUTS_MARKER,
+                digest,
+                label="sealed input ownership marker",
+            )
+        removed = False
+        if target_present:
             shutil.rmtree(target)
             removed = True
-        if sealed_root is not None and sealed_root.exists():
-            if not sealed_root.is_dir() or sealed_root.is_symlink() or sealed_root.lstat().st_uid != os.getuid():
-                raise ValueError("sealed input area is not owner-controlled")
-            marker_path = sealed_root / PYTHON_VENV_INPUTS_MARKER
-            try:
-                marker_info = marker_path.lstat()
-            except FileNotFoundError:
-                return 1, "", "refusing rollback: sealed input ownership marker is absent"
-            if (
-                stat.S_ISLNK(marker_info.st_mode)
-                or not stat.S_ISREG(marker_info.st_mode)
-                or marker_info.st_uid != os.getuid()
-                or stat.S_IMODE(marker_info.st_mode) & 0o077
-                or marker_path.read_text(encoding="utf-8").strip() != digest
-            ):
-                return 1, "", "refusing rollback: sealed input ownership marker is absent or mismatched"
+        if seal_present and sealed_root is not None:
             shutil.rmtree(sealed_root)
             removed = True
         return (0, "marker-owned venv and sealed inputs removed", "") if removed else (0, "nothing to remove", "")

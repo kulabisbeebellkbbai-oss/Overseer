@@ -309,6 +309,56 @@ def test_hash_pinned_venv_preflight_rejects_unmarked_preexisting_target():
     assert "marker" in result.stderr or "ownership" in result.stderr
 
 
+def test_hash_pinned_venv_orphan_temp_cleanup_requires_exact_marker():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = plan_python_hashed_venv_provision("admin.python.venv.orphans", spec, "test", "absent")
+        parent = Path(spec.venv_path).parent
+        prefix = f".overseer-python-venv-{plan.adapter_metadata['python_venv']['plan_digest']}.tmp-"
+        unmarked = parent / f"{prefix}unmarked"
+        unmarked.mkdir(mode=0o700)
+        exact = parent / f"{prefix}exact"
+        exact.mkdir(mode=0o700)
+        marker = exact / ".overseer-python-venv-owner"
+        marker.write_text(plan.adapter_metadata["python_venv"]["plan_digest"] + "\n", encoding="utf-8")
+        marker.chmod(0o600)
+        result = run_admin_command_step(plan.steps[0])
+        assert result.exit_code == 0
+        assert unmarked.exists()
+        assert not exact.exists()
+
+
+def test_hash_pinned_venv_seal_pre_marker_blocks_without_deleting_target():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = plan_python_hashed_venv_provision("admin.python.venv.seal-pre-marker", spec, "test", "absent")
+        seal_root = Path(plan.steps[0].command[7])
+        seal_root.mkdir(mode=0o700)
+        result = run_admin_command_step(plan.steps[0])
+        target = Path(spec.venv_path)
+        assert result.exit_code != 0
+        assert target.exists()
+        assert "sealed input ownership marker" in result.stderr
+
+
+def test_hash_pinned_venv_rollback_validates_seal_before_deleting_target():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = plan_python_hashed_venv_provision("admin.python.venv.rollback-seal", spec, "test", "absent")
+        assert run_admin_command_step(plan.steps[0]).exit_code == 0
+        seal_root = Path(plan.steps[0].command[7])
+        seal_marker = seal_root / ".overseer-python-venv-inputs-owner"
+        seal_marker.write_text("e" * 64 + "\n", encoding="utf-8")
+        result = run_admin_command_step(plan.rollback_steps[0])
+        target = Path(spec.venv_path)
+        assert result.exit_code != 0
+        assert target.exists()
+        assert seal_root.exists()
+
+
 def test_hash_pinned_venv_git_verification_clears_hostile_environment(monkeypatch):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

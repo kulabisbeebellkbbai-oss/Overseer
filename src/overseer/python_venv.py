@@ -14,7 +14,8 @@ import os
 import re
 import shutil
 import stat
-from dataclasses import asdict, dataclass
+import subprocess
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,8 @@ class PythonVenvProvisionSpec:
     python_version: str
     import_name: str
     expected_version: str
+    resolver_executable: str | None = None
+    resolver_executable_sha256: str | None = None
     source_commit: str | None = None
     source_tree_digest: str | None = None
     pyproject_digest: str | None = None
@@ -103,6 +106,7 @@ def python_venv_spec_to_metadata(spec: PythonVenvProvisionSpec) -> dict[str, Any
 def python_venv_spec_from_metadata(payload: dict[str, Any]) -> PythonVenvProvisionSpec:
     values = dict(payload)
     values.pop("manifest_digest", None)
+    values.pop("plan_digest", None)
     values["artifacts"] = tuple(PythonVenvArtifact(**artifact) for artifact in values.get("artifacts", ()))
     return PythonVenvProvisionSpec(**values)
 
@@ -144,7 +148,7 @@ def _validate_digest(value: str, label: str) -> None:
         raise ValueError(f"{label} must be a 64-character SHA256 digest")
 
 
-def _validate_lock_file(spec: PythonVenvProvisionSpec) -> None:
+def _validate_lock_file(spec: PythonVenvProvisionSpec) -> dict[str, tuple[str, frozenset[str]]]:
     lock = _path_without_following_symlinks(spec.requirements_lock_path, must_exist=True, label="requirements lock")
     info = lock.lstat()
     if not stat.S_ISREG(info.st_mode):
@@ -152,7 +156,7 @@ def _validate_lock_file(spec: PythonVenvProvisionSpec) -> None:
     actual = hashlib.sha256(lock.read_bytes()).hexdigest()
     if actual.lower() != spec.requirements_lock_digest.lower():
         raise ValueError("requirements lock digest does not match the immutable manifest")
-    names: set[str] = set()
+    names: dict[str, tuple[str, frozenset[str]]] = {}
     for line_number, raw_line in enumerate(lock.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -168,18 +172,38 @@ def _validate_lock_file(spec: PythonVenvProvisionSpec) -> None:
         normalized_name = match.group(1).lower().replace("_", "-")
         if normalized_name in names:
             raise ValueError(f"requirements lock contains duplicate package: {match.group(1)}")
-        names.add(normalized_name)
         hashes = re.findall(r"--hash=sha256:([0-9a-fA-F]{64})(?:\s|$)", match.group(3))
         if not hashes or any(len(item) != 64 for item in hashes):
             raise ValueError(f"requirements lock line {line_number} must contain SHA256 hashes")
+        names[normalized_name] = (match.group(2), frozenset(item.lower() for item in hashes))
+    if not names:
+        raise ValueError("requirements lock must contain at least one pinned package")
+    return names
 
 
-def _validate_wheelhouse(spec: PythonVenvProvisionSpec) -> None:
+def _wheel_identity(filename: str) -> tuple[str, str]:
+    parts = Path(filename).stem.split("-")
+    if len(parts) < 5:
+        raise ValueError(f"wheel filename is not a valid versioned wheel: {filename}")
+    distribution = "-".join(parts[:-4]).lower().replace("_", "-")
+    version = parts[-4]
+    if not distribution or not version:
+        raise ValueError(f"wheel filename is missing distribution or version: {filename}")
+    return distribution, version
+
+
+def _validate_wheelhouse(spec: PythonVenvProvisionSpec, lock_entries: dict[str, tuple[str, frozenset[str]]]) -> None:
     if not spec.wheelhouse_path:
-        return
+        raise ValueError("offline owner-safe wheelhouse is required")
     wheelhouse = _path_without_following_symlinks(spec.wheelhouse_path, must_exist=True, label="wheelhouse")
     _owner_only_directory(wheelhouse, label="wheelhouse")
-    for item in wheelhouse.iterdir():
+    wheel_artifacts = [
+        artifact
+        for artifact in spec.artifacts
+        if artifact.name.lower().endswith(".whl") or Path(artifact.url).name.lower().endswith(".whl")
+    ]
+    seen_wheel_names: set[str] = set()
+    for item in sorted(wheelhouse.iterdir()):
         info = item.lstat()
         if stat.S_ISLNK(info.st_mode):
             raise ValueError(f"wheelhouse contains a symlink: {item}")
@@ -187,6 +211,22 @@ def _validate_wheelhouse(spec: PythonVenvProvisionSpec) -> None:
             raise ValueError(f"wheelhouse may contain only regular wheel files: {item}")
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
             raise ValueError(f"wheelhouse artifact is not owner-controlled: {item}")
+        digest = hashlib.sha256(item.read_bytes()).hexdigest()
+        distribution, version = _wheel_identity(item.name)
+        matching = [
+            artifact
+            for artifact in wheel_artifacts
+            if artifact.name == item.name or Path(artifact.url).name == item.name
+        ]
+        if len(matching) != 1 or matching[0].version != version or matching[0].sha256.lower() != digest:
+            raise ValueError(f"wheelhouse artifact parity mismatch: {item.name}")
+        locked = lock_entries.get(distribution)
+        if locked is None or locked[0] != version or digest not in locked[1]:
+            raise ValueError(f"wheelhouse artifact does not match requirements lock: {item.name}")
+        seen_wheel_names.add(item.name)
+    expected_wheels = {artifact.name if artifact.name.lower().endswith(".whl") else Path(artifact.url).name for artifact in wheel_artifacts}
+    if seen_wheel_names != expected_wheels:
+        raise ValueError("wheelhouse artifacts do not exactly match the immutable wheel manifest")
 
 
 def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
@@ -200,6 +240,23 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
             raise ValueError("absolute resolver must be a vetted Python interpreter under /usr/bin or /usr/local/bin")
     if not spec.resolver_version.strip() or not spec.resolver_provenance.strip():
         raise ValueError("resolver version and provenance are required")
+    if not spec.import_name.strip() or not spec.import_name.isidentifier() or not spec.expected_version.strip():
+        raise ValueError("strict import name and expected version are required")
+    if not spec.resolver_executable or not spec.resolver_executable_sha256:
+        raise ValueError("exact approved resolver executable path and digest are required")
+    resolver_executable = _path_without_following_symlinks(spec.resolver_executable, must_exist=True, label="resolver executable")
+    resolver_info = resolver_executable.lstat()
+    if not stat.S_ISREG(resolver_info.st_mode) or stat.S_IMODE(resolver_info.st_mode) & 0o022:
+        raise ValueError("resolver executable must be a non-writable regular file")
+    if not resolver_info.st_mode & stat.S_IXUSR:
+        raise ValueError("resolver executable must be owner-executable")
+    if resolver_info.st_uid not in {0, os.getuid()}:
+        raise ValueError("resolver executable must be owned by root or the current user")
+    _validate_digest(spec.resolver_executable_sha256, "resolver executable SHA256")
+    if hashlib.sha256(resolver_executable.read_bytes()).hexdigest().lower() != spec.resolver_executable_sha256.lower():
+        raise ValueError("resolver executable digest does not match the immutable manifest")
+    if spec.resolver == "python" and not resolver_executable.name.startswith("python3"):
+        raise ValueError("python resolver executable must be a Python 3 interpreter")
     if not spec.import_name.strip() or not spec.expected_version.strip():
         raise ValueError("import name and expected version are required")
     if not spec.source_commit and not spec.source_tree_digest and not spec.pyproject_digest:
@@ -212,7 +269,11 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
         (spec.requirements_lock_digest, "requirements lock digest"),
     ):
         if value:
-            _validate_digest(value, label)
+            if label == "source tree digest":
+                if not _COMMIT_RE.fullmatch(value):
+                    raise ValueError("source tree digest must be a full 40- or 64-character hexadecimal id")
+            else:
+                _validate_digest(value, label)
     if not spec.artifacts:
         raise ValueError("at least one immutable resolver/runtime artifact is required")
     artifact_names: set[str] = set()
@@ -234,6 +295,19 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
         raise ValueError("repository root is not owned by the current user")
     if not source_root.is_dir():
         raise ValueError("source root must be a directory")
+    try:
+        source_root.relative_to(repository_root)
+    except ValueError:
+        raise ValueError("source root must be inside repository root") from None
+    if spec.source_commit or spec.source_tree_digest:
+        git_target = str(source_root)
+        for git_ref, label in ((spec.source_commit, "source commit"), (spec.source_tree_digest, "source tree digest")):
+            if not git_ref:
+                continue
+            verify_args = ("git", "-C", git_target, "rev-parse", "--verify", "HEAD" if label == "source commit" else "HEAD^{tree}")
+            completed = subprocess.run(verify_args, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            if completed.returncode != 0 or completed.stdout.strip().lower() != git_ref.lower():
+                raise ValueError(f"{label} does not match the current source checkout")
     if spec.pyproject_digest:
         pyproject = _path_without_following_symlinks(source_root / "pyproject.toml", must_exist=True, label="pyproject")
         actual_pyproject_digest = hashlib.sha256(pyproject.read_bytes()).hexdigest()
@@ -253,8 +327,8 @@ def validate_python_venv_spec(spec: PythonVenvProvisionSpec) -> None:
     _owner_only_directory(target_parent, label="venv target parent", allow_sticky_shared=True)
     if spec.expected_version not in target.name:
         raise ValueError("venv target must be a final versioned path containing expected_version")
-    _validate_lock_file(spec)
-    _validate_wheelhouse(spec)
+    lock_entries = _validate_lock_file(spec)
+    _validate_wheelhouse(spec, lock_entries)
 
 
 def plan_python_hashed_venv_provision(
@@ -270,13 +344,18 @@ def plan_python_hashed_venv_provision(
 
     metadata = python_venv_spec_to_metadata(spec)
     python_executable = str(Path(spec.venv_path) / "bin" / "python")
-    resolver = ("uv",) if spec.resolver == "uv" else (spec.resolver if spec.resolver != "python" else "python3",)
-    venv_command = (*resolver, "venv", "--python", spec.python_version, spec.venv_path) if spec.resolver == "uv" else (*resolver, "-m", "venv", spec.venv_path)
+    resolver = (spec.resolver_executable,)
+    venv_command = (
+        (*resolver, "venv", "--offline", "--no-python-downloads", "--python", spec.python_version, spec.venv_path)
+        if spec.resolver == "uv"
+        else (*resolver, "-m", "venv", spec.venv_path)
+    )
     if spec.resolver == "uv":
         install_command = (
             *resolver,
             "pip",
             "sync",
+            "--offline",
             "--python",
             python_executable,
             "--require-hashes",
@@ -287,7 +366,7 @@ def plan_python_hashed_venv_provision(
         )
     else:
         install_command = (
-            *resolver,
+            python_executable,
             "-m",
             "pip",
             "install",
@@ -298,8 +377,16 @@ def plan_python_hashed_venv_provision(
             "-r",
             spec.requirements_lock_path,
         )
-    environment = (("PIP_CONFIG_FILE", os.devnull),)
-    return AdminChangePlan(
+    environment = (
+        ("PATH", f"{Path(spec.resolver_executable).parent}:/usr/bin:/bin"),
+        ("PIP_CONFIG_FILE", os.devnull),
+        ("PIP_NO_INDEX", "1"),
+        ("PYTHONNOUSERSITE", "1"),
+        ("PYTHONPATH", ""),
+        ("UV_OFFLINE", "1"),
+        ("UV_PYTHON_DOWNLOADS", "never"),
+    )
+    plan = AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,
         owner_domain=OwnerDomain.OBRIEN,
@@ -313,7 +400,7 @@ def plan_python_hashed_venv_provision(
             AdminCommandStep(PYTHON_VENV_PREFLIGHT_MARKER, (PYTHON_VENV_PREFLIGHT_MARKER, spec.venv_path, spec.manifest_digest), "recheck the immutable manifest and insert-only destination immediately before creation"),
             AdminCommandStep("Create final versioned Python venv", venv_command, "create the new runtime directly at its final path; overwrite and --clear are forbidden"),
             AdminCommandStep(PYTHON_VENV_MARKER, (PYTHON_VENV_MARKER, spec.venv_path, spec.manifest_digest), "mark the exact newly-created runtime before package mutation so failed installs can roll back safely"),
-            AdminCommandStep("Install hash-pinned wheels", install_command, "install only lockfile-pinned hashed wheels into the isolated venv" , environment=environment),
+            AdminCommandStep("Install hash-pinned wheels", install_command, "install only lockfile-pinned hashed wheels into the isolated venv" , environment=environment, clear_environment=True),
         ),
         rollback_steps=(
             AdminCommandStep("Remove marker-owned Python venv", (PYTHON_VENV_REMOVE_MARKER, spec.venv_path, spec.manifest_digest), "remove only the exact newly-created runtime bearing this plan marker"),
@@ -325,11 +412,44 @@ def plan_python_hashed_venv_provision(
             "rollback is only permitted for this plan's marker-owned runtime",
         ),
         verification_steps=(
-            AdminCommandStep("Verify isolated interpreter", (python_executable, "--version"), "confirm the new venv interpreter exists and reports the requested runtime"),
+            AdminCommandStep("Verify isolated interpreter", (python_executable, "-c", f"import platform; assert platform.python_version() == {spec.python_version!r}"), "confirm the new venv interpreter exactly matches the requested runtime"),
             AdminCommandStep("Verify managed import and version", (python_executable, "-c", f"import {spec.import_name}; assert getattr({spec.import_name}, '__version__', None) == {spec.expected_version!r}"), "confirm the expected import and version are present inside the new venv"),
         ),
         adapter_metadata={PYTHON_VENV_METADATA_KEY: metadata},
     )
+    plan_digest = python_venv_plan_digest(plan)
+    plan_metadata = dict(plan.adapter_metadata)
+    plan_metadata[PYTHON_VENV_METADATA_KEY] = {**metadata, "plan_digest": plan_digest}
+    return replace(plan, adapter_metadata=plan_metadata)
+
+
+def _plan_shape(plan) -> dict[str, Any]:
+    def step_shape(step) -> dict[str, Any]:
+        payload: dict[str, Any] = {"title": step.title, "command": list(step.command), "reason": step.reason}
+        if getattr(step, "environment", ()):
+            payload["environment"] = {key: value for key, value in step.environment}
+        if getattr(step, "clear_environment", False):
+            payload["clear_environment"] = True
+        return payload
+
+    metadata = dict(getattr(plan, "adapter_metadata", {}).get(PYTHON_VENV_METADATA_KEY, {}))
+    metadata.pop("plan_digest", None)
+    return {
+        "kind": str(plan.kind),
+        "target": plan.target,
+        "reason": plan.reason,
+        "current_state": plan.current_state,
+        "proposed_state": plan.proposed_state,
+        "steps": [step_shape(step) for step in plan.steps],
+        "rollback_steps": [step_shape(step) for step in plan.rollback_steps],
+        "verification_steps": [step_shape(step) for step in plan.verification_steps],
+        "risks": list(plan.risks),
+        "manifest": metadata,
+    }
+
+
+def python_venv_plan_digest(plan) -> str:
+    return hashlib.sha256(_canonical_json(_plan_shape(plan)).encode("utf-8")).hexdigest()
 
 
 def validate_python_venv_plan(plan) -> PythonVenvProvisionSpec:
@@ -343,6 +463,13 @@ def validate_python_venv_plan(plan) -> PythonVenvProvisionSpec:
     validate_python_venv_spec(spec)
     if plan.target != spec.venv_path:
         raise ValueError("python venv plan target does not match its manifest")
+    canonical = plan_python_hashed_venv_provision(plan.id, spec, plan.reason, plan.current_state)
+    if metadata.get("plan_digest") != python_venv_plan_digest(canonical):
+        raise ValueError("python venv plan digest is not stable")
+    if plan.steps != canonical.steps or plan.rollback_steps != canonical.rollback_steps or plan.verification_steps != canonical.verification_steps:
+        raise ValueError("python venv canonical plan command boundary does not match its immutable manifest")
+    if plan.adapter_metadata != canonical.adapter_metadata:
+        raise ValueError("python venv plan metadata does not match its immutable manifest")
     return spec
 
 
@@ -378,7 +505,17 @@ def execute_python_venv_marker(command: tuple[str, ...]) -> tuple[int, str, str]
         if target.lstat().st_uid != os.getuid() or stat.S_IMODE(target.lstat().st_mode) & 0o022:
             raise ValueError("venv target is not owner-controlled")
         marker_path = target / ".overseer-python-venv-owner"
-        if not marker_path.is_file() or marker_path.is_symlink() or marker_path.read_text(encoding="utf-8").strip() != digest:
+        try:
+            marker_info = marker_path.lstat()
+        except FileNotFoundError:
+            return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
+        if (
+            stat.S_ISLNK(marker_info.st_mode)
+            or not stat.S_ISREG(marker_info.st_mode)
+            or marker_info.st_uid != os.getuid()
+            or stat.S_IMODE(marker_info.st_mode) & 0o077
+            or marker_path.read_text(encoding="utf-8").strip() != digest
+        ):
             return 1, "", "refusing rollback: exact plan ownership marker is absent or mismatched"
         shutil.rmtree(target)
         return 0, "marker-owned venv removed", ""
@@ -394,6 +531,7 @@ __all__ = [
     "PythonVenvProvisionSpec",
     "execute_python_venv_marker",
     "plan_python_hashed_venv_provision",
+    "python_venv_plan_digest",
     "python_venv_spec_from_metadata",
     "python_venv_spec_to_metadata",
     "validate_python_venv_plan",

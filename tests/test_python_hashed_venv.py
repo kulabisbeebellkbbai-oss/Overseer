@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -20,13 +20,20 @@ from overseer import (
 )
 from overseer.admin import AdminCommandStep, run_admin_command_step
 from overseer.python_venv import PythonVenvArtifact, PythonVenvProvisionSpec, validate_python_venv_spec
+from overseer.serialization import to_jsonable
 
 
 def _fixture_spec(root: Path, *, target: Path | None = None, **overrides) -> PythonVenvProvisionSpec:
     repo = root / "repo"
     repo.mkdir(exist_ok=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1.0.0'\n", encoding="utf-8")
+    wheel = root / "wheelhouse" / "example-1.2.3-py3-none-any.whl"
+    wheel.parent.mkdir(exist_ok=True)
+    wheel.write_bytes(b"fixture wheel bytes")
+    wheel.chmod(0o600)
+    wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     lock = repo / "requirements.lock"
-    lock.write_text("example==1.2.3 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8")
+    lock.write_text("example==1.2.3 --hash=sha256:" + wheel_digest + "\n", encoding="utf-8")
     (root / "wheelhouse").mkdir(exist_ok=True)
     (root / "wheelhouse").chmod(0o700)
     managed = root / "managed-venvs"
@@ -38,7 +45,7 @@ def _fixture_spec(root: Path, *, target: Path | None = None, **overrides) -> Pyt
         venv_path=str(target or (root / "managed-venvs" / "psychlo-1.2.3")),
         source_root=str(repo),
         repository_root=str(repo),
-        source_commit="1" * 40,
+        pyproject_digest=hashlib.sha256((repo / "pyproject.toml").read_bytes()).hexdigest(),
         requirements_lock_path=str(lock),
         requirements_lock_digest=digest,
         wheelhouse_path=str(root / "wheelhouse"),
@@ -49,8 +56,16 @@ def _fixture_spec(root: Path, *, target: Path | None = None, **overrides) -> Pyt
                 version="0.8.0",
                 sha256="b" * 64,
             ),
+            PythonVenvArtifact(
+                name=wheel.name,
+                url="https://example.test/example-1.2.3-py3-none-any.whl",
+                version="1.2.3",
+                sha256=wheel_digest,
+            ),
         ),
-        resolver="uv",
+        resolver="python",
+        resolver_executable="/usr/bin/python3.13",
+        resolver_executable_sha256=hashlib.sha256(Path("/usr/bin/python3.13").read_bytes()).hexdigest(),
         resolver_version="0.8.0",
         resolver_provenance="approved internal artifact mirror manifest uv-0.8.0",
         python_version="3.13",
@@ -77,7 +92,7 @@ def test_hash_pinned_venv_plan_records_immutable_inputs_and_commands():
     assert plan.risk_level.value == "high"
     assert plan.adapter_metadata["python_venv"]["requirements_lock_digest"] == spec.requirements_lock_digest
     commands = [step.command for step in plan.steps]
-    assert ("uv", "venv", "--python", "3.13", spec.venv_path) in commands
+    assert (spec.resolver_executable, "-m", "venv", spec.venv_path) in commands
     assert any("--require-hashes" in command for command in commands)
     assert any("--no-deps" in command for command in commands)
     assert plan.verification_steps[-1].command[-1].find("import example") >= 0
@@ -181,3 +196,52 @@ def test_hash_pinned_venv_lock_rejects_vcs_ranges_and_duplicate_packages():
         spec = replace(spec, requirements_lock_digest=hashlib.sha256(lock.read_bytes()).hexdigest())
         with pytest.raises(ValueError, match="must pin"):
             validate_python_venv_spec(spec)
+
+
+def test_hash_pinned_venv_requires_strict_import_name_and_actual_wheel_parity():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root, import_name="example.bad")
+        with pytest.raises(ValueError, match="strict import"):
+            validate_python_venv_spec(spec)
+        wheel = Path(spec.wheelhouse_path) / "example-1.2.3-py3-none-any.whl"
+        wheel.write_bytes(b"drift")
+        with pytest.raises(ValueError, match="wheelhouse artifact|requirements lock"):
+            validate_python_venv_spec(replace(spec, import_name="example"))
+
+
+def test_hash_pinned_venv_reconstructs_canonical_commands_before_execution():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        plan = approve_admin_change_plan(
+            plan_python_hashed_venv_provision("admin.python.venv.tampered", spec, "test", "absent"),
+            "human",
+        )
+        tampered = replace(plan, steps=plan.steps + (AdminCommandStep("unexpected", ("touch", "/tmp/bad"), "bad"),))
+        result = execute_admin_change_plan(
+            tampered,
+            enabled_adapter_kinds=(AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,),
+            runner=lambda step: pytest.fail("tampered plan executed a command"),
+        )
+    assert result.status == AdminExecutionStatus.BLOCKED
+    assert "canonical" in result.summary
+
+
+def test_legacy_empty_environment_serialization_is_unchanged():
+    step = AdminCommandStep("legacy", ("echo", "ok"), "legacy step")
+    assert to_jsonable(step) == {"title": "legacy", "command": ["echo", "ok"], "reason": "legacy step"}
+
+
+def test_legacy_omissions_do_not_apply_to_unrelated_dataclasses():
+    @dataclass(frozen=True)
+    class UnrelatedRecord:
+        environment: tuple[tuple[str, str], ...] = ()
+        clear_environment: bool = False
+        adapter_metadata: dict[str, object] | None = None
+
+    assert to_jsonable(UnrelatedRecord()) == {
+        "environment": [],
+        "clear_environment": False,
+        "adapter_metadata": None,
+    }

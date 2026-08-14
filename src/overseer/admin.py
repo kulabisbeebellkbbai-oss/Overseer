@@ -53,6 +53,7 @@ class AdminCommandStep:
     command: tuple[str, ...]
     reason: str
     environment: tuple[tuple[str, str], ...] = ()
+    clear_environment: bool = False
 
 
 @dataclass(frozen=True)
@@ -1411,7 +1412,9 @@ def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
             exit_code, stdout, stderr = 1, "", str(exc)
         return AdminCommandResult(step.title, step.command, exit_code, stdout, stderr)
     environment = _admin_command_environment(step.command)
-    if step.environment:
+    if step.clear_environment:
+        environment = dict(step.environment)
+    elif step.environment:
         environment = (environment or os.environ) | dict(step.environment)
     completed = subprocess.run(
         step.command,

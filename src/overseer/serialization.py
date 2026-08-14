@@ -11,6 +11,16 @@ from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
 T = TypeVar("T")
 
 
+# These omissions are a wire-compatibility rule for the two admin dataclasses
+# only.  Keeping the type key explicit prevents an unrelated dataclass that
+# happens to use an ``environment`` or ``adapter_metadata`` field from being
+# silently rewritten.
+_LEGACY_DEFAULT_OMISSIONS: dict[str, frozenset[str]] = {
+    "overseer.admin.AdminCommandStep": frozenset({"environment", "clear_environment"}),
+    "overseer.admin.AdminChangePlan": frozenset({"adapter_metadata"}),
+}
+
+
 def to_jsonable(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -23,7 +33,25 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): to_jsonable(item) for key, item in value.items()}
     if is_dataclass(value):
-        return {field.name: to_jsonable(getattr(value, field.name)) for field in fields(value)}
+        omission_fields = _LEGACY_DEFAULT_OMISSIONS.get(
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            frozenset(),
+        )
+        payload = {}
+        for field in fields(value):
+            field_value = getattr(value, field.name)
+            # These fields were added to AdminCommandStep after legacy plan
+            # payloads were already persisted.  Omit their defaults so an
+            # empty environment does not change strict source digests or
+            # migration comparisons; non-empty values remain explicit.
+            if field.name in omission_fields and field.name == "environment" and field_value == ():
+                continue
+            if field.name in omission_fields and field.name == "clear_environment" and field_value is False:
+                continue
+            if field.name in omission_fields and field.name == "adapter_metadata" and field_value == {}:
+                continue
+            payload[field.name] = to_jsonable(field_value)
+        return payload
     return value
 
 

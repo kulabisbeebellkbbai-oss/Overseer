@@ -76,6 +76,7 @@ from .python_venv import (
     PythonVenvArtifact,
     PythonVenvProvisionSpec,
     plan_python_hashed_venv_provision,
+    python_venv_plan_digest,
     validate_python_venv_plan,
     validate_python_venv_spec,
 )
@@ -316,6 +317,7 @@ __all__ = [
     "plan_storage_mount_test",
     "PythonVenvArtifact",
     "PythonVenvProvisionSpec",
+    "python_venv_plan_digest",
     "validate_python_venv_plan",
     "validate_python_venv_spec",
     "plan_user_service_restart",

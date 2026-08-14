@@ -6577,12 +6577,16 @@ def _ids_review_authorization_next_step(ids_review_packages: Sequence[HostSecuri
 
 
 def _admin_command_status(step) -> dict[str, object]:
-    return {
+    payload = {
         "title": step.title,
         "command": list(step.command),
         "reason": step.reason,
-        "environment": {key: value for key, value in getattr(step, "environment", ())},
     }
+    if getattr(step, "environment", ()):
+        payload["environment"] = {key: value for key, value in step.environment}
+    if getattr(step, "clear_environment", False):
+        payload["clear_environment"] = True
+    return payload
 
 
 def _admin_command_result_status(result: AdminCommandResult) -> dict[str, object]:

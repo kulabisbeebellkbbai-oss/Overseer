@@ -22,7 +22,7 @@ from typing import (
     get_type_hints,
 )
 
-from .admin import AdminChangePlan
+from .admin import AdminChangePlan, AdminCommandStep
 from .backup_provisioning import (
     DonutHoleBackupProvisioningPlan,
     PLAN_KIND,
@@ -146,6 +146,31 @@ def _check_exact_fields(data: Mapping[str, object], expected: Iterable[str], lab
         raise ValueError(f"{label} payload has extra fields")
 
 
+def _check_legacy_optional_fields(
+    data: Mapping[str, object],
+    expected: Iterable[str],
+    label: str,
+    allowed_missing: set[str],
+) -> None:
+    """Check an old persisted payload without widening its accepted shape.
+
+    Only fields that have an explicit dataclass default and were added after
+    the original payload format may be absent.  Unknown fields remain
+    rejected, and callers still type-check every field that is present.
+    """
+    expected_fields = tuple(expected)
+    expected_set = set(expected_fields)
+    missing = {field for field in expected_fields if field not in data}
+    extra = {field for field in data if field not in expected_set}
+    required_missing = missing - allowed_missing
+    if required_missing and extra:
+        raise ValueError(f"{label} payload has missing and extra fields")
+    if required_missing:
+        raise ValueError(f"{label} payload is missing fields")
+    if extra:
+        raise ValueError(f"{label} payload has extra fields")
+
+
 def _check_strict_types(value: object, annotation: Any, field: str) -> None:
     if annotation is str or annotation is bytes:
         if type(value) is not str:
@@ -235,8 +260,16 @@ def _check_strict_types(value: object, annotation: Any, field: str) -> None:
     if isinstance(annotation, type) and getattr(annotation, "__dataclass_fields__", None) is not None:
         if not isinstance(value, Mapping):
             raise ValueError(f"{field} must be an object")
-        _check_exact_fields(value, tuple(field.name for field in fields(annotation)), field)
+        allowed_missing = {"environment", "clear_environment"} if annotation is AdminCommandStep else set()
+        _check_legacy_optional_fields(
+            value,
+            tuple(nested.name for nested in fields(annotation)),
+            field,
+            allowed_missing,
+        )
         for nested in fields(annotation):
+            if nested.name not in value:
+                continue
             _check_strict_types(
                 value[nested.name],
                 get_type_hints(annotation).get(nested.name, nested.type),
@@ -251,9 +284,17 @@ def _check_strict_types(value: object, annotation: Any, field: str) -> None:
 
 def _decode_dataclass_payload(payload: str, dataclass_type: type[Any], label: str):
     data = _require_canonical_json(payload, label)
-    _check_exact_fields(data, tuple(field.name for field in fields(dataclass_type)), label)
+    allowed_missing = {"adapter_metadata"} if dataclass_type is AdminChangePlan else set()
+    _check_legacy_optional_fields(
+        data,
+        tuple(field.name for field in fields(dataclass_type)),
+        label,
+        allowed_missing,
+    )
     resolved_types = get_type_hints(dataclass_type)
     for field in fields(dataclass_type):
+        if field.name not in data:
+            continue
         _check_strict_types(
             data[field.name],
             resolved_types.get(field.name, field.type),

@@ -23,7 +23,12 @@ from overseer import (
 )
 from overseer.admin import AdminCommandStep, run_admin_command_step
 from overseer.core import RiskLevel
-from overseer.python_venv import PythonVenvArtifact, PythonVenvProvisionSpec, validate_python_venv_spec
+from overseer.python_venv import (
+    PythonVenvArtifact,
+    PythonVenvProvisionSpec,
+    acquire_python_venv_execution_lock,
+    validate_python_venv_spec,
+)
 from overseer.serialization import to_jsonable
 
 
@@ -112,6 +117,39 @@ def test_hash_pinned_venv_requires_owner_safe_path_outside_repository():
         spec = _fixture_spec(root, target=root / "repo" / ".venv")
         with pytest.raises(ValueError, match="outside repository"):
             validate_python_venv_spec(spec)
+
+
+def test_hash_pinned_venv_rejects_lexical_alias_components_before_lock_identity():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root, target=f"{root}/managed-venvs/./psychlo-1.2.3")
+        with pytest.raises(ValueError, match="lexical"):
+            validate_python_venv_spec(spec)
+
+
+def test_hash_pinned_venv_canonical_lock_rejects_alias_contender():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        spec = _fixture_spec(root)
+        winner = approve_admin_change_plan(
+            plan_python_hashed_venv_provision("admin.python.venv.canonical-lock", spec, "test", "absent"),
+            "human",
+        )
+        alias_metadata = dict(winner.adapter_metadata["python_venv"])
+        alias_metadata["venv_path"] = f"{root}/managed-venvs/./psychlo-1.2.3"
+        alias_plan = replace(
+            winner,
+            target=alias_metadata["venv_path"],
+            adapter_metadata={"python_venv": alias_metadata},
+        )
+        with acquire_python_venv_execution_lock(winner):
+            contender = execute_admin_change_plan(
+                alias_plan,
+                runner=lambda step: pytest.fail("alias contender command ran"),
+                enabled_adapter_kinds=(AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,),
+            )
+    assert contender.status == AdminExecutionStatus.BLOCKED
+    assert "lexical" in contender.summary
 
 
 def test_hash_pinned_venv_rejects_symlinked_target_parent():

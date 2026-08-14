@@ -108,9 +108,10 @@ class PythonVenvExecutionBusy(RuntimeError):
 
 
 class PythonVenvExecutionLock:
-    def __init__(self, fd: int, path: Path):
+    def __init__(self, fd: int, path: Path, parent_fd: int):
         self.fd = fd
         self.path = path
+        self.parent_fd = parent_fd
 
     def release(self) -> None:
         if self.fd < 0:
@@ -120,6 +121,8 @@ class PythonVenvExecutionLock:
         finally:
             os.close(self.fd)
             self.fd = -1
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
     def __enter__(self):
         return self
@@ -129,7 +132,7 @@ class PythonVenvExecutionLock:
 
 
 def python_venv_execution_lock_path(spec: PythonVenvProvisionSpec) -> Path:
-    target = Path(spec.venv_path)
+    target = _path_without_following_symlinks(spec.venv_path, must_exist=False, label="venv target")
     target_key = hashlib.sha256(str(target).encode("utf-8")).hexdigest()
     return target.parent / f".overseer-python-venv-lock-{target_key}"
 
@@ -150,24 +153,47 @@ def acquire_python_venv_execution_lock(plan) -> PythonVenvExecutionLock:
         pass
     else:
         raise ValueError("venv target must be outside repository root")
-    lock_path = python_venv_execution_lock_path(spec)
-    _path_without_following_symlinks(lock_path, must_exist=False, label="venv lifecycle lock")
-    fd = os.open(
-        lock_path,
-        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
+    lock_name = python_venv_execution_lock_path(spec).name
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
+        parent_info = os.fstat(parent_fd)
+        current_parent_info = parent.lstat()
+        if (
+            parent_info.st_dev != current_parent_info.st_dev
+            or parent_info.st_ino != current_parent_info.st_ino
+            or parent_info.st_uid != os.getuid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o077
+        ):
+            raise ValueError("venv target parent identity changed while opening lifecycle lock")
+        fd = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        lock_path = parent / lock_name
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-            raise ValueError("venv lifecycle lock is not owner-controlled")
         try:
+            lock_path_info = lock_path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o077
+                or lock_path_info.st_dev != info.st_dev
+                or lock_path_info.st_ino != info.st_ino
+            ):
+                raise ValueError("venv lifecycle lock is not owner-controlled")
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise PythonVenvExecutionBusy(f"venv lifecycle lock is busy: {lock_path}") from error
-        return PythonVenvExecutionLock(fd, lock_path)
+        return PythonVenvExecutionLock(fd, lock_path, parent_fd)
     except Exception:
-        os.close(fd)
+        if "fd" in locals():
+            os.close(fd)
+        os.close(parent_fd)
         raise
 
 
@@ -190,9 +216,14 @@ def python_venv_spec_from_metadata(payload: dict[str, Any]) -> PythonVenvProvisi
 
 
 def _path_without_following_symlinks(path: str | Path, *, must_exist: bool, label: str) -> Path:
+    raw_path = os.fspath(path)
+    if any(part in {".", ".."} for part in raw_path.split("/") if part):
+        raise ValueError(f"{label} must not contain lexical . or .. path components")
     candidate = Path(path)
     if not candidate.is_absolute():
         raise ValueError(f"{label} must be absolute")
+    if any(part in {".", ".."} for part in candidate.parts):
+        raise ValueError(f"{label} must not contain lexical . or .. path components")
     current = Path(candidate.anchor)
     parts = candidate.parts[1:]
     for index, part in enumerate(parts):

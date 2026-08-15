@@ -1217,6 +1217,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       if (action === "plan-admin-change") return await planAdminChange();
       if (action === "approve-admin-change") return await approveAdminChange();
       if (action === "approve-and-execute-admin-change") return await approveAndExecuteAdminChange();
+      if (action === "decide-psychlo-policy-exception") return await decidePsychloPolicyException(source);
       if (action === "cancel-admin-change") return await cancelAdminChange();
       if (action === "execute-admin-change") return await executeAdminChange();
       if (action === "request-admin-adapter-enablement") return await requestAdminAdapterEnablement();
@@ -1744,6 +1745,32 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           execution_error: error.message
         };
       }
+    }
+    async function decidePsychloPolicyException(source) {
+      const requestId = source.dataset.requestId;
+      const decision = source.dataset.decision;
+      const card = source.closest(".decision-card");
+      const readCardField = (id) => Array.from(card?.querySelectorAll("[id]") || [])
+        .find((field) => field.id === id)?.value || "";
+      const decidedBy = readCardField(source.dataset.decidedById).trim();
+      const reason = readCardField(source.dataset.reasonId).trim();
+      if (!requestId || !["approved", "rejected"].includes(decision)) {
+        throw new Error("exact Psychlo policy exception decision target is required");
+      }
+      if (!decidedBy || /^(sisko|overseer|system)$/i.test(decidedBy)) {
+        throw new Error("an independent human identity is required");
+      }
+      if (!reason) throw new Error("a policy exception decision reason is required");
+      const verb = decision === "approved" ? "approve" : "reject";
+      if (!window.confirm(`Confirm ${verb} Psychlo policy exception ${requestId}\n\nDecision by: ${decidedBy}`)) {
+        throw new Error("Psychlo policy exception decision cancelled");
+      }
+      return await postJson("/roadex/psychlo/policy-exception-decision", {
+        request_id: requestId,
+        decision: source.dataset.decision,
+        decided_by: decidedBy,
+        reason: reason
+      });
     }
     async function cancelAdminChange() {
       return await postJson("/admin/cancel", {
@@ -3652,12 +3679,37 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
       ];
       const readinessById = Object.fromEntries((readiness.items || []).map((item) => [item.id, item]));
       const cards = [
-        ...pendingPlans.map((plan) => adminPlanDecisionCard(plan, readinessById[plan.id] || {})),
+        ...pendingPlans.map((plan) => plan.kind === "psychlo_policy_exception"
+          ? psychloPolicyExceptionDecisionCard(plan)
+          : adminPlanDecisionCard(plan, readinessById[plan.id] || {})),
         ...approvalGroups.map((approval) => approvalDecisionCard(approval))
       ].join("");
       return `<div class="panel span-12 decision-card">
         <div class="toolbar"><h3>Approval Decisions</h3><span class="pill ${auth.pending_count ? "warn" : "good"}">${safe(auth.pending_count || 0)} pending</span></div>
         <div class="grid">${cards || "<p class='muted'>No pending approval decisions.</p>"}</div>
+      </div>`;
+    }
+    function psychloPolicyExceptionDecisionCard(plan) {
+      const planId = plan.id || "";
+      const requestId = plan.target || "";
+      const key = slug(planId || requestId || "policy-exception");
+      const decidedById = `psychlo-policy-exception-decided-by-${key}`;
+      const reasonId = `psychlo-policy-exception-reason-${key}`;
+      const reviewId = `review-${key}`;
+      const action = (decision, label, className = "") => `<button type="button" class="action-btn ${className}" data-action="decide-psychlo-policy-exception" data-decision="${decision}" data-request-id="${safe(requestId)}" data-decided-by-id="${decidedById}" data-reason-id="${reasonId}">${label}</button>`;
+      return `<div class="panel span-6 decision-card warn">
+        <div class="toolbar"><h3>Psychlo Policy Exception</h3><span class="pill warn">human approval</span></div>
+        ${decisionContext("Decision Context", {
+          plan_id: planId,
+          request_id: requestId,
+          owner: plan.owner_domain,
+          reason: plan.reason,
+          next_step: plan.next_step
+        }, reviewId)}
+        <p class="muted">This is a dedicated human decision. It records the decision and forwards the signed outcome; it is not an executable admin plan.</p>
+        <div class="field"><label for="${decidedById}">Independent human identity</label><input id="${decidedById}" placeholder="Enter the approving human identity" autocomplete="off"></div>
+        <div class="field"><label for="${reasonId}">Decision reason</label><textarea id="${reasonId}" placeholder="Required for approval or rejection"></textarea></div>
+        <div class="actions">${action("approved", "Approve exception")} ${action("rejected", "Reject exception", "deny")}</div>
       </div>`;
     }
     function adminPlanDecisionCard(plan, readiness) {

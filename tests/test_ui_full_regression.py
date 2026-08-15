@@ -199,6 +199,7 @@ ACTION_ROUTES = {
     "dispatch-crew-messages": ("POST", "/crew/dispatch"),
     "decide-crew-message": ("POST", "/crew/messages/decide"),
     "decide-roadex-human": ("POST", "/roadex/human-decisions/decide"),
+    "decide-psychlo-policy-exception": ("POST", "/roadex/psychlo/policy-exception-decision"),
     "resubmit-crew-message": ("POST", "/crew/messages/resubmit"),
     "reconcile-crew-reviews": ("POST", "/crew/reconcile"),
     "dispatch-ids-review-package": ("POST", "/host/security/ids-review-packages/dispatch"),

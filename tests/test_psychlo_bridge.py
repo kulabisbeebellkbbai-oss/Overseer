@@ -2529,6 +2529,65 @@ def test_threaded_http_policy_exception_stages_authority_and_roadex_binding(tmp_
         assert binding.project_id == "psychlo:exception-threaded-http"
 
 
+def test_http_policy_exception_decision_uses_dedicated_route_and_exact_human_payload(tmp_path: Path):
+    class Sender:
+        secret = SECRET
+
+        def __call__(self, _kind, _message_id, _payload):
+            return {"accepted": True}
+
+    request = _policy_exception_request(id="exception-dedicated-http")
+    primary_path = tmp_path / "overseer.sqlite3"
+    primary = SQLiteStore(primary_path)
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=Sender(),
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        approval_store=primary,
+    )
+    bridge.receive_policy_exception_request(request)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_api_handler(str(primary_path), "admin-secret", psychlo_bridge=bridge),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        body = json.dumps(
+            {
+                "request_id": request["id"],
+                "decision": "approved",
+                "decided_by": "independent-human-reviewer",
+                "reason": "approved after reviewing the signed quota exception",
+            }
+        ).encode()
+        connection.request(
+            "POST",
+            "/roadex/psychlo/policy-exception-decision",
+            body=body,
+            headers={
+                "Authorization": "Bearer admin-secret",
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        assert response.status == 200
+        assert result["status"] == "approved"
+        assert primary.load_admin_change_plan(
+            f"admin.psychlo.policy-exception.{request['id']}"
+        ).approved
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        primary.close()
+
+
 def test_request_scoped_bridge_closes_partial_resources_when_clone_fails(tmp_path: Path, monkeypatch):
     approval = SQLiteStore(tmp_path / "primary.sqlite3")
     template = PsychloBridge(

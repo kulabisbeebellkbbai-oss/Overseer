@@ -93,6 +93,8 @@ class ProviderPercentageMeterConfig:
 
     def __post_init__(self) -> None:
         _identity(self.provider_id, "provider identity")
+        if self.provider_id != "codex":
+            raise ValueError("meter provider must match the fixed Codex app-server source")
         _identity(self.limit_id, "limit identity")
         _identity(self.decision_version, "decision version")
         if self.window_name not in {"primary", "secondary"}:

@@ -103,6 +103,11 @@ def test_meter_rejects_inconsistent_limit_identity_and_outside_window_time():
         meter.observe(RAW, observed_at="2026-08-06T05:30:00+00:00")
 
 
+def test_meter_configuration_cannot_relabel_the_fixed_codex_source():
+    with pytest.raises(ValueError, match="fixed Codex"):
+        ProviderPercentageMeterConfig(provider_id="other", limit_id="codex", window_name="primary", decision_version="provider-percentage-v1")
+
+
 def test_private_key_must_match_authority_public_key():
     with pytest.raises(ValueError, match="public key"):
         ProviderPercentageMeter(AUTHORITY.__class__(**{**AUTHORITY.__dict__, "public_key": os.urandom(32)}), CONFIG, PRIVATE)

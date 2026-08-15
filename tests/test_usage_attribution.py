@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
 import sqlite3
+import base64
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from overseer.psychlo_contracts import canonical_digest, parse_usage_snapshot_v11
+from overseer.psychlo_contracts import canonical_digest, parse_usage_snapshot_v11, parse_usage_snapshot_v12
+from overseer.psychlo_usage_meter import MeterAuthority, ProviderPercentageMeter, ProviderPercentageMeterConfig
 from overseer.usage_attribution import (
     UsageAttributionError,
     UsageAttributionLedger,
@@ -26,6 +30,63 @@ PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Ra
 RESET = "2026-08-12T00:00:00+00:00"
 INTERVAL_START = RESET
 INTERVAL_END = "2026-08-13T00:00:00+00:00"
+
+
+def test_frozen_provider_percentage_fixture_recomputes_seal_digests_and_bytes(tmp_path: Path):
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "psychlo-v1-2-provider-percentage-meter.json"
+    fixture_bytes = fixture_path.read_bytes()
+    fixture = json.loads(fixture_bytes)
+    assert fixture["schemaVersion"] == "psychlo.provider-percentage-meter.fixture.v1"
+    observation = fixture["observation"]
+    envelope = fixture["usageEnvelope"]
+
+    fixture_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    body = {key: value for key, value in observation.items() if key not in {"digest", "signature"}}
+    encoded_body = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    assert observation["digest"] == canonical_digest(body)
+    try:
+        fixture_key.public_key().verify(base64.b64decode(observation["signature"], validate=True), encoded_body)
+    except (InvalidSignature, ValueError) as error:
+        raise AssertionError("frozen provider observation seal is invalid") from error
+    assert observation["digest"] == envelope["snapshot"]["accounting"]["observationDigest"]
+    assert parse_usage_snapshot_v12(envelope) == envelope
+
+    authority = MeterAuthority(
+        authority_id="fixture-meter-authority",
+        authority_binding_id="fixture-binding",
+        authority_binding_digest="b" * 64,
+        account_id="fixture-account",
+        public_key=fixture_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+    )
+    config = ProviderPercentageMeterConfig("codex", "codex", "primary", "provider-percentage-fixture-v1")
+    raw = {"rateLimitsByLimitId": {"codex": {"limitId": "codex", "primary": {"usedPercent": 37, "windowDurationMins": 60, "resetsAt": "2026-08-15T12:00:00+00:00"}}}}
+    regenerated_observation = ProviderPercentageMeter(authority, config, fixture_key).observe(raw, observed_at="2026-08-15T11:30:00+00:00")
+    ledger = UsageAttributionLedger(
+        tmp_path / "fixture.sqlite3",
+        approved_authority_id=authority.authority_id,
+        approved_authority_binding_id=authority.authority_binding_id,
+        approved_authority_binding_digest=authority.authority_binding_digest,
+        approved_account_id=authority.account_id,
+        approved_authority_public_key=authority.public_key,
+        receipt_identity_validator=lambda _: None,
+        clock=lambda: "2026-08-15T11:30:00+00:00",
+    )
+    ledger.record_provider_observation(regenerated_observation)
+    regenerated_envelope = UsageSnapshotProducer(
+        ledger,
+        sender=lambda _kind, _message_id, payload: {"receipt": {
+            "kind": "usage-snapshot", "messageId": payload["messageId"], "correlationId": payload["correlationId"],
+            "idempotencyKey": payload["idempotencyKey"], "snapshotId": payload["snapshot"]["id"],
+            "snapshotDigest": payload["snapshot"]["digest"], "envelopeDigest": payload["digest"],
+            "persistenceId": "fixture-persist", "outcome": "inserted",
+        }},
+    ).emit(regenerated_observation["observationId"], policy_version="provider-percentage-fixture-v1")["payload"]
+    regenerated = {"schemaVersion": fixture["schemaVersion"], "observation": regenerated_observation, "usageEnvelope": regenerated_envelope}
+    expected_bytes = (json.dumps(regenerated, sort_keys=True, indent=2) + "\n").encode()
+    assert fixture_bytes == expected_bytes
+    counterpart = os.environ.get("PSYCHLO_V12_FIXTURE")
+    if counterpart:
+        assert fixture_bytes == Path(counterpart).read_bytes()
 
 
 def _sealed(value: dict) -> dict:

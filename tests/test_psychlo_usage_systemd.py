@@ -17,6 +17,24 @@ def test_psychlo_usage_requires_the_private_attribution_authority_feed():
     assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json" in unit
     assert "BindReadOnlyPaths=%h/.local/share/overseer/psychlo-meter" in unit
     assert "codex-usage-mcp/state.sqlite3" not in unit
+    assert "ExecStartPre=" not in unit
+    assert "%h/.local/share/overseer/codex-usage-mcp-venv/bin/python -m overseer.psychlo_bridge_cli emit-usage" in unit
+
+
+def test_percentage_meter_is_a_separate_fail_closed_one_shot():
+    root = Path(__file__).resolve().parents[1]
+    meter_path = root / "systemd" / "overseer-psychlo-meter.service"
+    meter = meter_path.read_text(encoding="utf-8")
+    assert "ConditionPathExists=%h/.config/overseer/psychlo-meter/producer-enabled" in meter
+    assert "LoadCredential=psychlo-usage-authority-private-key:%h/.config/overseer/psychlo-usage-authority-private-key.pem" in meter
+    assert "%d/psychlo-usage-authority-private-key" in meter
+    assert "%h/.local/share/overseer/codex-usage-mcp-venv/bin/python -m overseer.psychlo_usage_meter_cli" in meter
+    assert "ExecStartPre=" not in meter
+    assert "ProtectHome=tmpfs" in meter
+    assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/config.json" in meter
+    assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority-private-key.pem" not in meter
+    assert "psychlo-usage.timer" not in meter
+    subprocess.run(["systemd-analyze", "verify", str(meter_path)], check=True, capture_output=True, text=True)
 
 
 def test_coordination_tick_timer_is_checked_in_inactive_bounded_and_valid():

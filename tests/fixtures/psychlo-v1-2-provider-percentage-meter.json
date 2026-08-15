@@ -1,0 +1,60 @@
+{
+  "observation": {
+    "accountId": "fixture-account",
+    "authorityBindingDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "authorityBindingId": "fixture-binding",
+    "authorityId": "fixture-meter-authority",
+    "correlationId": "provider-percentage-correlation-codex",
+    "decisionVersion": "provider-percentage-fixture-v1",
+    "digest": "95dd01aa617bf2e5016ec7174dcc77cf67987f7ca55e8d9e0bc9f089e4c76e54",
+    "idempotencyKey": "provider-percentage-idempotency-177b9191b5d3c94ca2e0b15e",
+    "intervalEnd": "2026-08-15T11:30:00+00:00",
+    "intervalStart": "2026-08-15T11:00:00+00:00",
+    "limitId": "codex",
+    "measurementScope": "provider-global-percentage-window",
+    "observationId": "provider-percentage-177b9191b5d3c94ca2e0b15e",
+    "occurredAt": "2026-08-15T11:30:00+00:00",
+    "providerId": "codex",
+    "providerNextResetAt": "2026-08-15T12:00:00+00:00",
+    "providerResetAt": "2026-08-15T11:00:00+00:00",
+    "signature": "aqPOCIGKBR3QId0w0Ok++6aCylDLwjYZoYbnKXPjkm3I7kE+tNMS/CNj+G0gTquzbawL4ILEOJ6owK6s+sNmAg==",
+    "totalConsumed": 37,
+    "unusedPriorDayWeeklyCapacity": 0,
+    "usageUnit": "provider-percentage-points",
+    "weeklyQuota": 100,
+    "weeklyRemainingCapacity": 63,
+    "windowDurationMins": 60,
+    "windowName": "primary"
+  },
+  "schemaVersion": "psychlo.provider-percentage-meter.fixture.v1",
+  "usageEnvelope": {
+    "correlationId": "psychlo:usage-attribution-de05b8005918826c1e9a0f6d",
+    "digest": "8dbc8ca1a78e9bcbb960749c254068728f7543a8394ee96e713e7c3a77bec5df",
+    "idempotencyKey": "usage-attribution-de05b8005918826c1e9a0f6d",
+    "messageId": "usage-attribution-de05b8005918826c1e9a0f6d",
+    "occurredAt": "2026-08-15T11:30:00+00:00",
+    "schemaVersion": "psychlo.usage-envelope.v1.2",
+    "snapshot": {
+      "accounting": {
+        "authorityBindingDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "carryForwardMode": "disabled-not-provider-disclosed",
+        "observationDigest": "95dd01aa617bf2e5016ec7174dcc77cf67987f7ca55e8d9e0bc9f089e4c76e54",
+        "unit": "provider-percentage-points"
+      },
+      "capturedAt": "2026-08-15T11:30:00+00:00",
+      "dailyConsumed": 0,
+      "decisionVersion": "provider-percentage-fixture-v1",
+      "digest": "4df21841e9d8ce84e2e44ff27ed6c377ef6619c6616c192ad5155d8ea8cfc24a",
+      "id": "usage-attribution-de05b8005918826c1e9a0f6d",
+      "otherDevelopmentConsumed": 37,
+      "policyVersion": "provider-percentage-fixture-v1",
+      "providerResetAt": "2026-08-15T11:00:00+00:00",
+      "schemaVersion": "psychlo.usage-snapshot.v1.2",
+      "scopeDigest": "122eb8841724b0819e42f99db13e8a9ac6b22564cee0bb9de4c0993dc5d07b03",
+      "sourceId": "overseer",
+      "unusedPriorDayWeeklyCapacity": 0,
+      "weeklyQuota": 100,
+      "weeklyRemainingCapacity": 63
+    }
+  }
+}

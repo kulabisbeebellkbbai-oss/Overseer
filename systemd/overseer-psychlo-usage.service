@@ -15,8 +15,7 @@ Environment=OVERSEER_PSYCHLO_USAGE_AUTHORITY_FILE=%h/.config/overseer/psychlo-us
 Environment=OVERSEER_PSYCHLO_USAGE_OBSERVATION_FILE=%h/.local/share/overseer/psychlo-meter/latest-observation.json
 Environment=OVERSEER_PSYCHLO_USAGE_RECEIPTS_FILE=%h/.local/share/overseer/psychlo-meter/latest-receipts.json
 LoadCredential=psychlo-overseer-peer-secret:%h/.config/psychlo/overseer-peer-secret
-ExecStartPre=/usr/bin/python3 -m overseer.psychlo_bridge_cli sync-projects
-ExecStart=/usr/bin/python3 -m overseer.psychlo_bridge_cli emit-usage
+ExecStart=%h/.local/share/overseer/codex-usage-mcp-venv/bin/python -m overseer.psychlo_bridge_cli emit-usage
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

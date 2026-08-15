@@ -16,6 +16,15 @@ from typing import Any
 DEFAULT_DB_PATH = Path("state/codex-usage.sqlite3")
 
 
+class CodexAppServerMethodNotFound(RuntimeError):
+    """The app server explicitly rejected one JSON-RPC method."""
+
+    def __init__(self, code: object, message: object):
+        self.code = str(code)
+        self.message = str(message)
+        super().__init__(self.code, self.message)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -54,10 +63,14 @@ class CodexAppServerClient:
                 {"clientInfo": {"name": "overseer-codex-usage", "version": "0.1.0"}, "capabilities": {}},
             )
             self._receive(process, 1)
-            self._send(process, 2, "account/rateLimits/read", {})
-            rate_limits = self._receive(process, 2)
+            rate_limits = self._read_rate_limits(process)
             self._send(process, 3, "account/usage/read", {})
-            usage = self._receive(process, 3)
+            try:
+                usage = self._receive(process, 3)
+            except CodexAppServerMethodNotFound as error:
+                if not self.is_removed_account_usage_error(error):
+                    raise
+                usage = {}
             return {"rate_limits": rate_limits, "usage": usage}
         finally:
             if process.poll() is None:
@@ -66,6 +79,40 @@ class CodexAppServerClient:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
+
+    def read_rate_limits(self) -> dict[str, Any]:
+        """Read only provider windows, without requesting account usage."""
+        process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            self._send(process, 1, "initialize", {"clientInfo": {"name": "overseer-codex-meter", "version": "0.1.0"}, "capabilities": {}})
+            self._receive(process, 1)
+            return self._read_rate_limits(process)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+    def _read_rate_limits(self, process: subprocess.Popen[str]) -> dict[str, Any]:
+        self._send(process, 2, "account/rateLimits/read", {})
+        return self._receive(process, 2)
+
+    @staticmethod
+    def is_removed_account_usage_error(error: BaseException) -> bool:
+        return isinstance(error, CodexAppServerMethodNotFound) and error.code == "-32601" and error.message in {
+            "Method not found: account/usage/read",
+            "Method not found: account/usage/read.",
+            "Method not found",
+        }
 
     @staticmethod
     def _send(process: subprocess.Popen[str], request_id: int, method: str, params: dict[str, Any]) -> None:
@@ -90,6 +137,8 @@ class CodexAppServerClient:
                 continue
             if "error" in message:
                 error = message["error"]
+                if error.get("code") == -32601:
+                    raise CodexAppServerMethodNotFound(error.get("code"), error.get("message"))
                 raise RuntimeError(f"codex_app_server_error:{error.get('code')}:{error.get('message')}")
             result = message.get("result")
             if not isinstance(result, dict):
@@ -132,6 +181,18 @@ class CodexUsageTracker:
             connection.execute(
                 "INSERT INTO codex_usage_snapshots (observed_at, source, payload) VALUES (?, ?, ?)",
                 (observed_at, "codex_app_server", json.dumps(snapshot, sort_keys=True)),
+            )
+        return snapshot
+
+    def refresh_rate_limits(self) -> dict[str, Any]:
+        """Capture only provider-disclosed percentage windows."""
+        observed_at = _now()
+        raw = {"rate_limits": self.client.read_rate_limits(), "usage": {}}
+        snapshot = self._normalize(raw, observed_at)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO codex_usage_snapshots (observed_at, source, payload) VALUES (?, ?, ?)",
+                (observed_at, "codex_app_server_rate_limits", json.dumps(snapshot, sort_keys=True)),
             )
         return snapshot
 

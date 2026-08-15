@@ -53,6 +53,8 @@ POLICY_EXCEPTION_RULES = {
 }
 USAGE_SNAPSHOT_V11_SCHEMA = "psychlo.usage-snapshot.v1.1"
 USAGE_ENVELOPE_V11_SCHEMA = "psychlo.usage-envelope.v1.1"
+USAGE_SNAPSHOT_V12_SCHEMA = "psychlo.usage-snapshot.v1.2"
+USAGE_ENVELOPE_V12_SCHEMA = "psychlo.usage-envelope.v1.2"
 
 
 def _canonical(value: Any) -> str:
@@ -792,6 +794,42 @@ def parse_usage_snapshot_v11(payload: Mapping[str, Any]) -> dict[str, Any]:
     if canonical_digest({key: value for key, value in snapshot.items() if key != "digest"}) != snapshot["digest"]: raise ContractError("usage snapshot digest mismatch")
     if canonical_digest({key: value for key, value in envelope.items() if key != "digest"}) != envelope["digest"]: raise ContractError("usage snapshot envelope digest mismatch")
     return envelope
+
+
+def parse_usage_snapshot_v12(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the closed provider-percentage-point snapshot envelope."""
+    envelope = _object(payload, name="usage snapshot envelope")
+    required = {"schemaVersion", "correlationId", "idempotencyKey", "occurredAt", "snapshot", "digest"}
+    _keys(envelope, required | {"messageId"}, name="usage snapshot envelope")
+    if envelope["schemaVersion"] != USAGE_ENVELOPE_V12_SCHEMA: raise ContractError("usage snapshot envelope schema is invalid")
+    _id(envelope["correlationId"], name="correlationId"); _id(envelope["idempotencyKey"], name="idempotencyKey"); _timestamp(envelope["occurredAt"]); _digest(envelope["digest"], name="digest")
+    if "messageId" in envelope: _id(envelope["messageId"], name="messageId")
+    snapshot = _object(envelope["snapshot"], name="usage snapshot")
+    fields = {"schemaVersion", "id", "sourceId", "capturedAt", "policyVersion", "providerResetAt", "scopeDigest", "decisionVersion", "unusedPriorDayWeeklyCapacity", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed", "accounting", "digest"}
+    _keys(snapshot, fields, name="usage snapshot")
+    if snapshot["schemaVersion"] != USAGE_SNAPSHOT_V12_SCHEMA or snapshot["sourceId"] != "overseer": raise ContractError("usage snapshot authority is invalid")
+    for field in ("id", "policyVersion", "decisionVersion"): _id(snapshot[field], name=field)
+    _timestamp(snapshot["capturedAt"]); _timestamp(snapshot["providerResetAt"]); _digest(snapshot["scopeDigest"], name="scopeDigest"); _digest(snapshot["digest"], name="snapshot digest")
+    accounting = _object(snapshot["accounting"], name="usage snapshot accounting")
+    accounting_fields = {"unit", "authorityBindingDigest", "observationDigest", "carryForwardMode"}
+    _keys(accounting, accounting_fields, name="usage snapshot accounting")
+    if accounting["unit"] != "provider-percentage-points" or accounting["carryForwardMode"] != "disabled-not-provider-disclosed": raise ContractError("usage snapshot accounting is invalid")
+    _digest(accounting["authorityBindingDigest"], name="authorityBindingDigest"); _digest(accounting["observationDigest"], name="observationDigest")
+    for field in ("unusedPriorDayWeeklyCapacity", "weeklyQuota", "weeklyRemainingCapacity", "dailyConsumed", "otherDevelopmentConsumed"):
+        if isinstance(snapshot[field], bool) or not isinstance(snapshot[field], int) or not 0 <= snapshot[field] <= 100: raise ContractError(f"{field} must be an integer percentage point")
+    if snapshot["unusedPriorDayWeeklyCapacity"] != 0 or snapshot["weeklyQuota"] != 100: raise ContractError("provider percentage accounting scale is invalid")
+    if snapshot["weeklyRemainingCapacity"] > snapshot["weeklyQuota"] or snapshot["dailyConsumed"] + snapshot["otherDevelopmentConsumed"] != snapshot["weeklyQuota"] - snapshot["weeklyRemainingCapacity"]: raise ContractError("usage snapshot conservation is invalid")
+    if canonical_digest({key: value for key, value in snapshot.items() if key != "digest"}) != snapshot["digest"]: raise ContractError("usage snapshot digest mismatch")
+    if canonical_digest({key: value for key, value in envelope.items() if key != "digest"}) != envelope["digest"]: raise ContractError("usage snapshot envelope digest mismatch")
+    return envelope
+
+
+def parse_usage_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Dispatch without weakening the frozen v1.1 parser."""
+    envelope = _object(payload, name="usage snapshot envelope")
+    if envelope.get("schemaVersion") == USAGE_ENVELOPE_V12_SCHEMA:
+        return parse_usage_snapshot_v12(envelope)
+    return parse_usage_snapshot_v11(envelope)
 
 
 def parse_external_round_binding(payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -6,7 +6,30 @@ import pytest
 
 from overseer.api import codex_usage_health_status
 from overseer.codex_usage import CodexUsageTracker
+from overseer.codex_usage import CodexAppServerClient, CodexAppServerMethodNotFound
 from overseer.ui import OPERATOR_CONSOLE_HTML
+
+
+class _FinishedProcess:
+    def poll(self):
+        return 0
+
+
+class _ScriptedAppServerClient(CodexAppServerClient):
+    def __init__(self, terminal_error: BaseException):
+        super().__init__()
+        self.terminal_error = terminal_error
+
+    @staticmethod
+    def _send(process, request_id, method, params):
+        return None
+
+    def _receive(self, process, request_id):
+        if request_id == 1:
+            return {}
+        if request_id == 2:
+            return {"rateLimitsByLimitId": {"codex": {"limitId": "codex", "primary": {"usedPercent": 12, "windowDurationMins": 60, "resetsAt": 1786000000}}}}
+        raise self.terminal_error
 
 
 class FakeClient:
@@ -65,6 +88,39 @@ def test_history_limit_is_validated(tmp_path: Path):
     tracker = CodexUsageTracker(tmp_path / "usage.sqlite3", client=FakeClient())
     with pytest.raises(ValueError, match="between 1 and 1000"):
         tracker.history(0)
+
+
+class RemovedUsageClient:
+    def read_usage(self):
+        raise AssertionError("tracker should use the rate-limit-only compatibility path")
+
+    def read_rate_limits(self):
+        return {"rateLimitsByLimitId": {"codex": {"limitId": "codex", "primary": {"usedPercent": 12, "windowDurationMins": 60, "resetsAt": 1786000000}}}}
+
+
+def test_rate_limit_only_read_is_available_when_account_usage_method_was_removed(tmp_path: Path):
+    tracker = CodexUsageTracker(tmp_path / "usage.sqlite3", client=RemovedUsageClient())
+    result = tracker.refresh_rate_limits()
+    assert result["rate_limits"][0]["windows"][0]["used_percent"] == 12
+
+
+def test_method_not_found_compatibility_is_narrow():
+    assert CodexAppServerClient.is_removed_account_usage_error(CodexAppServerMethodNotFound("-32601", "Method not found: account/usage/read")) is True
+    assert CodexAppServerClient.is_removed_account_usage_error(RuntimeError("codex_app_server_error:-32601:Method not found: other")) is False
+    assert CodexAppServerClient.is_removed_account_usage_error(TimeoutError("timed out")) is False
+
+
+def test_read_usage_preserves_limits_only_for_removed_usage_rpc(monkeypatch):
+    monkeypatch.setattr("overseer.codex_usage.subprocess.Popen", lambda *args, **kwargs: _FinishedProcess())
+    result = _ScriptedAppServerClient(CodexAppServerMethodNotFound(-32601, "Method not found: account/usage/read")).read_usage()
+    assert result["rate_limits"]["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"] == 12
+    assert result["usage"] == {}
+
+
+def test_read_usage_does_not_hide_other_provider_failures(monkeypatch):
+    monkeypatch.setattr("overseer.codex_usage.subprocess.Popen", lambda *args, **kwargs: _FinishedProcess())
+    with pytest.raises(TimeoutError, match="provider timeout"):
+        _ScriptedAppServerClient(TimeoutError("provider timeout")).read_usage()
 
 
 def test_normalization_handles_legacy_single_limit():

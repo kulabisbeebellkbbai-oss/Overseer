@@ -25,6 +25,7 @@ overseer = "overseer.cli:main"
 overseer-codex-usage-mcp = "overseer.codex_usage_mcp:main"
 overseer-quark-scheduler = "overseer.quark_scheduler_cli:main"
 overseer-psychlo-bridge = "overseer.psychlo_bridge_cli:main"
+overseer-psychlo-usage-meter = "overseer.psychlo_usage_meter_cli:main"
 overseer-backup-provisioning = "overseer.backup_provisioning_cli:main"
 
 [tool.setuptools.packages.find]

@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .psychlo_contracts import canonical_digest, parse_usage_snapshot_v11
+from .psychlo_contracts import canonical_digest, parse_usage_snapshot
 
 
 class UsageAttributionError(ValueError):
@@ -83,6 +83,15 @@ def _accounting_scope_digest(observation: Mapping[str, Any]) -> str:
         identity = {field: observation[field] for field in _ACCOUNTING_SCOPE_FIELDS}
     except KeyError as error:
         raise UsageAttributionError("observation accounting scope is incomplete") from error
+    if observation.get("usageUnit") == "provider-percentage-points":
+        try:
+            identity.update({
+                "windowName": observation["windowName"],
+                "providerNextResetAt": observation["providerNextResetAt"],
+                "windowDurationMins": observation["windowDurationMins"],
+            })
+        except KeyError as error:
+            raise UsageAttributionError("percentage observation accounting scope is incomplete") from error
     return canonical_digest(identity)
 
 
@@ -249,7 +258,7 @@ class UsageAttributionLedger:
             except json.JSONDecodeError as error: raise UsageAttributionError("corrupt snapshot intent") from error
             if canonical_digest(value) != row[1] or row[2] not in {"pending", "sending", "uncertain", "delivered", "rejected"}:
                 raise UsageAttributionError("corrupt snapshot intent")
-            try: parse_usage_snapshot_v11(value)
+            try: parse_usage_snapshot(value)
             except Exception as error: raise UsageAttributionError("corrupt snapshot intent") from error
             if not isinstance(row[4], int) or row[4] < 0 or row[4] > self._MAX_SNAPSHOT_DELIVERY_ATTEMPTS:
                 raise UsageAttributionError("corrupt snapshot intent")
@@ -279,21 +288,30 @@ class UsageAttributionLedger:
 
     def record_provider_observation(self, supplied: Mapping[str, Any]) -> dict[str, Any]:
         value = _verify_seal(supplied, "observation", self.approved_authority_public_key)
-        required = {"observationId","authorityId","authorityBindingId","authorityBindingDigest","measurementScope","accountId","providerId","limitId","usageUnit","providerResetAt","intervalStart","intervalEnd","totalConsumed","weeklyQuota","weeklyRemainingCapacity","unusedPriorDayWeeklyCapacity","decisionVersion","correlationId","idempotencyKey","occurredAt","signature","digest"}
+        common = {"observationId","authorityId","authorityBindingId","authorityBindingDigest","measurementScope","accountId","providerId","limitId","usageUnit","providerResetAt","intervalStart","intervalEnd","totalConsumed","weeklyQuota","weeklyRemainingCapacity","unusedPriorDayWeeklyCapacity","decisionVersion","correlationId","idempotencyKey","occurredAt","signature","digest"}
+        v12 = value.get("usageUnit") == "provider-percentage-points"
+        required = common | ({"windowName", "providerNextResetAt", "windowDurationMins"} if v12 else set())
         if set(value) != required: raise UsageAttributionError("observation authority shape is invalid")
         if value["authorityId"] != self.approved_authority_id or value["accountId"] != self.approved_account_id or value["authorityBindingId"] != self.approved_authority_binding_id or value["authorityBindingDigest"] != self.approved_authority_binding_digest:
             raise UsageAttributionError("observation authority binding is invalid")
-        if value["measurementScope"] != "exclusive-metered-intervals":
+        if v12:
+            if value["measurementScope"] != "provider-global-percentage-window": raise UsageAttributionError("observation measurement authority is invalid")
+            if isinstance(value["windowDurationMins"], bool) or not isinstance(value["windowDurationMins"], int) or value["windowDurationMins"] <= 0: raise UsageAttributionError("observation window duration is invalid")
+        elif value["measurementScope"] != "exclusive-metered-intervals":
             raise UsageAttributionError("observation measurement authority is not exclusive")
-        if value["usageUnit"] != "quota_points": raise UsageAttributionError("observation unit is invalid")
+        elif value["usageUnit"] != "quota_points": raise UsageAttributionError("observation unit is invalid")
         for field in ("observationId","authorityBindingId","providerId","limitId","decisionVersion","correlationId","idempotencyKey"): _id(value[field], field)
         if not isinstance(value["authorityBindingDigest"], str) or len(value["authorityBindingDigest"]) != 64: raise UsageAttributionError("observation authority binding digest is invalid")
         start, end, occurred, reset = (_time(value[k], k) for k in ("intervalStart","intervalEnd","occurredAt","providerResetAt"))
         if reset != start or start >= end or occurred != end: raise UsageAttributionError("observation measurement interval is invalid")
+        if v12:
+            next_reset = _time(value["providerNextResetAt"], "provider next reset")
+            if next_reset <= end or next_reset - reset != timedelta(minutes=value["windowDurationMins"]): raise UsageAttributionError("observation provider window is invalid")
         total = _ticks(value["totalConsumed"], "total consumed")
         quota = _ticks(value["weeklyQuota"], "weekly quota")
         remaining = _ticks(value["weeklyRemainingCapacity"], "weekly remaining")
         _ticks(value["unusedPriorDayWeeklyCapacity"], "unused prior day")
+        if v12 and (total > 100 or quota != 100 or value["unusedPriorDayWeeklyCapacity"] != 0): raise UsageAttributionError("provider percentage accounting is invalid")
         if remaining > quota or quota - remaining != total: raise UsageAttributionError("observation conservation is invalid")
         return self._insert_immutable("usage_observations", "observation_id", value["observationId"], value)
 
@@ -304,7 +322,7 @@ class UsageAttributionLedger:
         for field in required - {"consumed","digest","signature","startedAt","settledAt","occurredAt","providerResetAt","authorityBindingDigest"}: _id(value[field], field)
         if value["accountId"] != self.approved_account_id: raise UsageAttributionError("receipt account binding is invalid")
         if value["authorityId"] != self.approved_authority_id or value["authorityBindingId"] != self.approved_authority_binding_id or value["authorityBindingDigest"] != self.approved_authority_binding_digest or value["measurementScope"] != "exclusive-metered-intervals": raise UsageAttributionError("receipt authority binding is invalid")
-        if value["usageUnit"] != "quota_points": raise UsageAttributionError("receipt unit is invalid")
+        if value["usageUnit"] != "quota_points": raise UsageAttributionError("receipt unit is invalid for provider percentage observations")
         observation = self._observation_for_scope(value)
         if value["authorityBindingDigest"] != observation["authorityBindingDigest"]: raise UsageAttributionError("receipt binding identity is invalid")
         self.receipt_identity_validator(value)
@@ -449,11 +467,14 @@ class UsageSnapshotProducer:
         if residual < 0: raise UsageAttributionError("negative residual usage")
         snapshot_id="usage-attribution-"+canonical_digest({"observationId":observation_id,"policyVersion":policy_version})[:24]
         scope = _accounting_scope_digest(observation)
-        snapshot={"schemaVersion":"psychlo.usage-snapshot.v1.1","id":snapshot_id,"sourceId":"overseer","capturedAt":observation["occurredAt"],"policyVersion":policy_version,"providerResetAt":observation["providerResetAt"],"scopeDigest":scope,"decisionVersion":observation["decisionVersion"],"unusedPriorDayWeeklyCapacity":int(observation["unusedPriorDayWeeklyCapacity"]),"weeklyQuota":int(observation["weeklyQuota"]),"weeklyRemainingCapacity":int(observation["weeklyRemainingCapacity"]),"dailyConsumed":managed,"otherDevelopmentConsumed":max(0,residual)}
+        provider_percentage = observation["usageUnit"] == "provider-percentage-points"
+        snapshot={"schemaVersion":"psychlo.usage-snapshot.v1.2" if provider_percentage else "psychlo.usage-snapshot.v1.1","id":snapshot_id,"sourceId":"overseer","capturedAt":observation["occurredAt"],"policyVersion":policy_version,"providerResetAt":observation["providerResetAt"],"scopeDigest":scope,"decisionVersion":observation["decisionVersion"],"unusedPriorDayWeeklyCapacity":int(observation["unusedPriorDayWeeklyCapacity"]),"weeklyQuota":int(observation["weeklyQuota"]),"weeklyRemainingCapacity":int(observation["weeklyRemainingCapacity"]),"dailyConsumed":0 if provider_percentage else managed,"otherDevelopmentConsumed":int(observation["totalConsumed"]) if provider_percentage else max(0,residual)}
+        if provider_percentage:
+            snapshot["accounting"]={"unit":"provider-percentage-points","authorityBindingDigest":observation["authorityBindingDigest"],"observationDigest":observation["digest"],"carryForwardMode":"disabled-not-provider-disclosed"}
         snapshot["digest"]=canonical_digest(snapshot)
-        envelope={"schemaVersion":"psychlo.usage-envelope.v1.1","messageId":snapshot_id,"correlationId":f"psychlo:{snapshot_id}","idempotencyKey":snapshot_id,"occurredAt":observation["occurredAt"],"snapshot":snapshot}
+        envelope={"schemaVersion":"psychlo.usage-envelope.v1.2" if provider_percentage else "psychlo.usage-envelope.v1.1","messageId":snapshot_id,"correlationId":f"psychlo:{snapshot_id}","idempotencyKey":snapshot_id,"occurredAt":observation["occurredAt"],"snapshot":snapshot}
         envelope["digest"]=canonical_digest(envelope)
-        parse_usage_snapshot_v11(envelope)
+        parse_usage_snapshot(envelope)
         payload, _ = self.ledger.prepare_intent(observation_id,envelope)
         intent=self.ledger.delivery_intent(str(payload["idempotencyKey"]))
         key=str(payload["idempotencyKey"])

@@ -319,7 +319,7 @@ def derive_usage_snapshot(history: list[dict[str, Any]], *, policy_version: str,
 
 
 class PsychloBridge:
-    def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[..., str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False, approval_loader: Callable[[str], Any] | None = None, approval_store: SQLiteStore | None = None, approval_owner_domain: str = "sisko", supervisor_dispatcher: Callable[..., str] | None = None, project_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, supervisor_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, coordination_owner_id: str | None = None, coordination_lease_seconds: int = 30):
+    def __init__(self, *, store: PsychloBridgeStore, dispatcher: Callable[..., str], sender: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]], callback_origin: str, clock: Callable[[], str] | None = None, token_factory: Callable[[], str] | None = None, require_external_binding: bool = False, approval_loader: Callable[[str], Any] | None = None, approval_store: SQLiteStore | None = None, approval_owner_domain: str = "sisko", supervisor_dispatcher: Callable[..., str] | None = None, project_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, supervisor_result_collector: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None, coordination_owner_id: str | None = None, coordination_lease_seconds: int = 30, coordination_tick_lock: threading.Lock | None = None, recover: bool = True):
         self.store, self.dispatcher, self.sender = store, dispatcher, sender
         self.peer_secret = getattr(sender, "secret", None)
         self.callback_origin = callback_origin.rstrip("/")
@@ -336,10 +336,67 @@ class PsychloBridge:
         self.supervisor_result_collector = supervisor_result_collector
         self.coordination_owner_id = coordination_owner_id or f"{os.getpid()}:{secrets.token_hex(12)}"
         self.coordination_lease_seconds = max(5, min(300, int(coordination_lease_seconds)))
-        self._coordination_tick_lock = threading.Lock()
-        self._recover_decision_intents()
-        self.recover_protocol_records()
-        self._recover_policy_exception_records()
+        self._coordination_tick_lock = coordination_tick_lock or threading.Lock()
+        if recover:
+            self._recover_decision_intents()
+            self.recover_protocol_records()
+            self._recover_policy_exception_records()
+
+    def request_scoped(self) -> "PsychloBridge":
+        """Create a bridge whose SQLite handles belong to the request worker.
+
+        The server keeps one bridge for startup recovery and immutable
+        configuration, but a ``ThreadingHTTPServer`` must never use those
+        handles from a worker thread.  Recovery is intentionally skipped for
+        request clones; it runs once during startup on the template bridge.
+        """
+        request_store = None
+        approval_store = None
+        try:
+            if self.approval_store is not None:
+                approval_store = SQLiteStore(self.approval_store.path)
+            request_store = PsychloBridgeStore(self.store.filename)
+            return PsychloBridge(
+                store=request_store,
+                dispatcher=self.dispatcher,
+                sender=self.sender,
+                callback_origin=self.callback_origin,
+                clock=self.clock,
+                token_factory=self.token_factory,
+                require_external_binding=self.require_external_binding,
+                approval_loader=self.approval_loader,
+                approval_store=approval_store,
+                approval_owner_domain=self.approval_owner_domain,
+                supervisor_dispatcher=self.supervisor_dispatcher,
+                project_result_collector=self.project_result_collector,
+                supervisor_result_collector=self.supervisor_result_collector,
+                coordination_owner_id=self.coordination_owner_id,
+                coordination_lease_seconds=self.coordination_lease_seconds,
+                coordination_tick_lock=self._coordination_tick_lock,
+                recover=False,
+            )
+        except Exception:
+            for resource in (request_store, approval_store):
+                if resource is None:
+                    continue
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+            raise
+
+    def close(self) -> None:
+        """Close this bridge's owned SQLite handles."""
+        errors: list[Exception] = []
+        for resource in (self.store, self.approval_store):
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
     def tick(self, *, limit: int = 32) -> dict[str, int | bool]:
         """Run one bounded, non-overlapping coordination polling pass."""

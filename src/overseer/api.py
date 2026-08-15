@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from http import HTTPStatus
@@ -340,6 +341,17 @@ def make_api_handler(
     class OverseerApiHandler(BaseHTTPRequestHandler):
         server_version = "OverseerApi/0.1"
 
+        @contextmanager
+        def _psychlo_request(self):
+            if psychlo_bridge is None:
+                yield None
+                return
+            request_bridge = psychlo_bridge.request_scoped()
+            try:
+                yield request_bridge
+            finally:
+                request_bridge.close()
+
         def do_GET(self) -> None:
             route = urlsplit(self.path)
             raw_path = route.path
@@ -359,12 +371,13 @@ def make_api_handler(
                 self._write_auth_error(auth_context)
                 return
             if path == "/psychlo/tick":
-                if psychlo_bridge is None:
-                    self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
-                elif auth_context.get("auth_type") != "admin_token":
-                    self._write_json({"error": "admin_token_required"}, HTTPStatus.FORBIDDEN)
-                else:
-                    self._handle(lambda: psychlo_bridge.tick())
+                with self._psychlo_request() as request_bridge:
+                    if request_bridge is None:
+                        self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                    elif auth_context.get("auth_type") != "admin_token":
+                        self._write_json({"error": "admin_token_required"}, HTTPStatus.FORBIDDEN)
+                    else:
+                        self._handle(lambda: request_bridge.tick())
                 return
             if path.startswith("/storage/control/") and auth_context.get("auth_type") != "admin_token":
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
@@ -681,7 +694,8 @@ def make_api_handler(
                 self._handle(lambda: list_backup_provisioning_plans(store_path))
                 return
             if path == "/roadex/human-decisions":
-                self._handle(lambda: _combined_roadex_decisions(store_path, psychlo_bridge))
+                with self._psychlo_request() as request_bridge:
+                    self._handle(lambda: _combined_roadex_decisions(store_path, request_bridge))
                 return
             if path == "/roadex/approval-status":
                 refs = query.get("approval_ref", [])
@@ -694,7 +708,8 @@ def make_api_handler(
                 )
                 return
             if path == "/psychlo/status":
-                self._handle(lambda: psychlo_bridge.status() if psychlo_bridge is not None else {"configured": False})
+                with self._psychlo_request() as request_bridge:
+                    self._handle(lambda: request_bridge.status() if request_bridge is not None else {"configured": False})
                 return
             self._write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -777,10 +792,11 @@ def make_api_handler(
                 self._write_json({"error":"unauthorized","reason":"admin_token_required"},HTTPStatus.FORBIDDEN)
                 return
             if path == "/roadex/psychlo/policy-exception-decision":
-                if psychlo_bridge is None:
-                    self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
-                    return
-                self._handle_json(lambda payload: psychlo_bridge.decide_policy_exception_authority(payload))
+                with self._psychlo_request() as request_bridge:
+                    if request_bridge is None:
+                        self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                        return
+                    self._handle_json(lambda payload: request_bridge.decide_policy_exception_authority(payload))
                 return
             initiator_routes = {
                 "/psychlo/admin/external-round-binding": "external-round-binding",
@@ -802,13 +818,14 @@ def make_api_handler(
                 "/roadex/psychlo/policy-exception-authorization": "policy-exception",
             }
             if path in initiator_routes:
-                if psychlo_bridge is None:
-                    self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
-                    return
-                if auth_context.get("auth_type") != "admin_token":
-                    self._write_json({"error": "admin_token_required"}, HTTPStatus.FORBIDDEN)
-                    return
-                self._handle_json(lambda payload: psychlo_bridge.initiate_authorized(initiator_routes[path], payload))
+                with self._psychlo_request() as request_bridge:
+                    if request_bridge is None:
+                        self._write_json({"error": "not_configured"}, HTTPStatus.NOT_FOUND)
+                        return
+                    if auth_context.get("auth_type") != "admin_token":
+                        self._write_json({"error": "admin_token_required"}, HTTPStatus.FORBIDDEN)
+                        return
+                    self._handle_json(lambda payload: request_bridge.initiate_authorized(initiator_routes[path], payload))
                 return
             if path == "/backup-provisioning/stage":
                 self._handle_json(lambda payload: stage_backup_provisioning_plan_api(store_path, payload))
@@ -820,7 +837,8 @@ def make_api_handler(
                 self._handle_json(lambda payload: execute_backup_provisioning_plan_api(store_path, payload, backup_provisioning_adapter_factory))
                 return
             if path == "/roadex/human-decisions/decide":
-                self._handle_json(lambda payload: _decide_roadex_human(store_path, payload, roadex_decision_adapter_factory, psychlo_bridge))
+                with self._psychlo_request() as request_bridge:
+                    self._handle_json(lambda payload: _decide_roadex_human(store_path, payload, roadex_decision_adapter_factory, request_bridge))
                 return
             if path == "/roadex/approval-fixtures/stage":
                 self._handle_json(lambda payload: stage_roadex_approval_fixture_api(store_path, payload))
@@ -1366,49 +1384,53 @@ def make_api_handler(
                 )
 
         def _handle_psychlo_peer(self, kind: str) -> None:
-            if psychlo_bridge is None:
+            with self._psychlo_request() as request_bridge:
+                self._handle_psychlo_peer_with_bridge(kind, request_bridge)
+
+        def _handle_psychlo_peer_with_bridge(self, kind: str, request_bridge: PsychloBridge | None) -> None:
+            if request_bridge is None:
                 self._write_json({"accepted": False, "error": "not_configured"}, HTTPStatus.NOT_FOUND)
                 return
             try:
                 body = self._read_bounded_body()
                 headers = self._singleton_headers()
-                if not isinstance(psychlo_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
-                message = verify_peer_request(psychlo_bridge.peer_secret, psychlo_bridge.store, kind, body, headers, expected_authority=psychlo_peer_authority)
+                if not isinstance(request_bridge.peer_secret, bytes): raise ValueError("peer_secret_unavailable")
+                message = verify_peer_request(request_bridge.peer_secret, request_bridge.store, kind, body, headers, expected_authority=psychlo_peer_authority)
                 if kind == "project-register":
-                    result = psychlo_bridge.register_project(message["payload"])
+                    result = request_bridge.register_project(message["payload"])
                 elif kind == "round-request":
-                    result = psychlo_bridge.request_round(message["payload"])
+                    result = request_bridge.request_round(message["payload"])
                 elif kind == "round-reconcile":
-                    result = psychlo_bridge.reconcile_round(message["payload"])
+                    result = request_bridge.reconcile_round(message["payload"])
                 elif kind == "decision-stage":
-                    result = psychlo_bridge.stage_decision(message["payload"])
+                    result = request_bridge.stage_decision(message["payload"])
                 elif kind == "telemetry-checkpoint":
-                    result = psychlo_bridge.receive_telemetry_checkpoint(message["payload"])
+                    result = request_bridge.receive_telemetry_checkpoint(message["payload"])
                 elif kind == "learning-pull":
-                    result = psychlo_bridge.receive_learning_pull(message["payload"])
+                    result = request_bridge.receive_learning_pull(message["payload"])
                 elif kind == "learning-ack":
-                    result = psychlo_bridge.receive_learning_ack(message["payload"])
+                    result = request_bridge.receive_learning_ack(message["payload"])
                 elif kind == "learning-advisory":
-                    result = psychlo_bridge.receive_learning_advisory(message["payload"])
+                    result = request_bridge.receive_learning_advisory(message["payload"])
                 elif kind == "registry-candidate":
-                    result = psychlo_bridge.receive_registry_candidate(message["payload"])
+                    result = request_bridge.receive_registry_candidate(message["payload"])
                 elif kind == "adoption-evidence":
-                    result = psychlo_bridge.receive_adoption_evidence(message["payload"])
+                    result = request_bridge.receive_adoption_evidence(message["payload"])
                 elif kind == "external-round":
-                    result = psychlo_bridge.receive_external_round(message["payload"])
+                    result = request_bridge.receive_external_round(message["payload"])
                 elif kind == "coordination-work-request":
-                    result = psychlo_bridge.receive_coordination_work_request(message["payload"])
+                    result = request_bridge.receive_coordination_work_request(message["payload"])
                 elif kind == "concurrency-canary-result":
-                    result = psychlo_bridge.receive_concurrency_canary_result(message["payload"])
+                    result = request_bridge.receive_concurrency_canary_result(message["payload"])
                 elif kind == "policy-exception-request":
-                    result = psychlo_bridge.receive_policy_exception_request(message["payload"], message_id=message["messageId"])
+                    result = request_bridge.receive_policy_exception_request(message["payload"], message_id=message["messageId"])
                 elif kind == "decision-outcome":
-                    result = psychlo_bridge.receive_external_decision_outcome(message["payload"])
+                    result = request_bridge.receive_external_decision_outcome(message["payload"])
                 else:
                     raise ValueError("unsupported Psychlo peer kind")
                 self._write_json(
                     dict(result), HTTPStatus.ACCEPTED,
-                    peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret,
+                    peer_response_kind=kind, peer_response_secret=request_bridge.peer_secret,
                     peer_request_message_id=message["messageId"],
                     peer_request_nonce=headers["x-psychlo-peer-nonce"],
                     peer_request_digest=hashlib.sha256(body).hexdigest(),
@@ -1416,12 +1438,12 @@ def make_api_handler(
             except ValueError as error:
                 code = str(error)
                 status = HTTPStatus.CONFLICT if code in {"replay", "single_stream_busy"} else HTTPStatus.UNAUTHORIZED if code == "invalid_signature" else HTTPStatus.BAD_REQUEST
-                if psychlo_bridge is not None and isinstance(psychlo_bridge.peer_secret, bytes):
+                if request_bridge is not None and isinstance(request_bridge.peer_secret, bytes):
                     failure_headers = locals().get("headers") or {}
                     failure_body = locals().get("body", b"")
                     self._write_json(
                         {"accepted": False, "error": code}, status,
-                        peer_response_kind=kind, peer_response_secret=psychlo_bridge.peer_secret,
+                        peer_response_kind=kind, peer_response_secret=request_bridge.peer_secret,
                         peer_request_message_id=failure_headers.get("x-psychlo-peer-message-id", "invalid"),
                         peer_request_nonce=failure_headers.get("x-psychlo-peer-nonce", "invalid"),
                         peer_request_digest=hashlib.sha256(failure_body).hexdigest(),
@@ -1433,16 +1455,17 @@ def make_api_handler(
             forbidden = ("authorization", "cookie", "origin", "transfer-encoding", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto")
             hosts = self.headers.get_all("host") or []
             content_types = self.headers.get_all("content-type") or []
-            if psychlo_bridge is None or hosts != ["127.0.0.1:8766"] or content_types != ["application/json"] or any(self.headers.get(name) for name in forbidden):
-                self._write_json({"accepted": False, "error": "loopback_required"}, HTTPStatus.FORBIDDEN)
-                return
-            try:
-                body = self._read_bounded_body()
-                payload = json.loads(body)
-                if not isinstance(payload, dict): raise ValueError("round result must be an object")
-                self._write_json(dict(psychlo_bridge.receive_round_result(capability, payload)), HTTPStatus.ACCEPTED)
-            except (JSONDecodeError, UnicodeDecodeError, ValueError) as error:
-                self._write_json({"accepted": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+            with self._psychlo_request() as request_bridge:
+                if request_bridge is None or hosts != ["127.0.0.1:8766"] or content_types != ["application/json"] or any(self.headers.get(name) for name in forbidden):
+                    self._write_json({"accepted": False, "error": "loopback_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    body = self._read_bounded_body()
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict): raise ValueError("round result must be an object")
+                    self._write_json(dict(request_bridge.receive_round_result(capability, payload)), HTTPStatus.ACCEPTED)
+                except (JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+                    self._write_json({"accepted": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
 
         def _read_bounded_body(self) -> bytes:
             text = self.headers.get("content-length", "")
@@ -1585,6 +1608,8 @@ def run_api_server(
         server.serve_forever()
     finally:
         server.server_close()
+        if psychlo_bridge is not None:
+            psychlo_bridge.close()
 
 
 def load_auth_token(token_file: str | None) -> str | None:

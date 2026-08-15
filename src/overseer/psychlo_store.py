@@ -125,6 +125,15 @@ class PsychloBridgeStore:
             except sqlite3.OperationalError:
                 pass
 
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> "PsychloBridgeStore":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
 

@@ -15,6 +15,7 @@ from http.client import HTTPConnection
 import pytest
 from dataclasses import replace
 
+import overseer.psychlo_bridge as psychlo_bridge_module
 from overseer.api import make_api_handler
 
 from overseer.psychlo_bridge import (
@@ -2435,6 +2436,215 @@ def test_private_http_round_route_uses_hmac_not_admin_bearer(tmp_path: Path):
         connection.close()
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_threaded_http_policy_exception_stages_authority_and_roadex_binding(tmp_path: Path):
+    """A real request worker must use its own primary SQLite connection."""
+    class Sender:
+        secret = SECRET
+
+        def __call__(self, _kind, _message_id, _payload):
+            return {"accepted": True}
+
+    request = _policy_exception_request(id="exception-threaded-http")
+    primary_path = tmp_path / "overseer.sqlite3"
+    primary = SQLiteStore(primary_path)
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=Sender(),
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        approval_store=primary,
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_api_handler(str(primary_path), "admin-secret", psychlo_bridge=bridge),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    timestamp = datetime.now(UTC).isoformat()
+    body = json.dumps(
+        {
+            "kind": "policy-exception-request",
+            "messageId": request["id"],
+            "occurredAt": timestamp,
+            "payload": request,
+        },
+        separators=(",", ":"),
+    ).encode()
+    headers = sign_peer_message(
+        SECRET,
+        "psychlo-to-overseer",
+        "policy-exception-request",
+        request["id"],
+        timestamp,
+        "nonce_threaded_policy_exception_123456",
+        body,
+    )
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("POST", "/psychlo/policy-exceptions", body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        assert response.status == 202, response_body
+        result = json.loads(response_body)
+        assert result["accepted"] is True
+        assert result["status"] == "pending"
+        replay_headers = sign_peer_message(
+            SECRET,
+            "psychlo-to-overseer",
+            "policy-exception-request",
+            request["id"],
+            timestamp,
+            "nonce_threaded_policy_exception_replay_123456",
+            body,
+        )
+        connection.request("POST", "/psychlo/policy-exceptions", body=body, headers=replay_headers)
+        replay = connection.getresponse()
+        replay_body = replay.read()
+        assert replay.status == 202, replay_body
+        assert json.loads(replay_body)["replay"] is True
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        primary.close()
+
+    with SQLiteStore(primary_path) as persisted:
+        plan = persisted.load_admin_change_plan(
+            "admin.psychlo.policy-exception.exception-threaded-http"
+        )
+        approval = persisted.load_approval(
+            "approval.psychlo.policy-exception.exception-threaded-http"
+        )
+        binding = persisted.load_roadex_approval_binding(plan.id)
+        assert plan.kind.value == "psychlo_policy_exception"
+        assert plan.approval_level is ApprovalLevel.HUMAN
+        assert approval.approval_level is ApprovalLevel.HUMAN
+        assert approval.subject_id == plan.id
+        assert approval.status is ApprovalStatus.PENDING
+        assert binding.approval_ref == plan.id
+        assert binding.project_id == "psychlo:exception-threaded-http"
+
+
+def test_request_scoped_bridge_closes_partial_resources_when_clone_fails(tmp_path: Path, monkeypatch):
+    approval = SQLiteStore(tmp_path / "primary.sqlite3")
+    template = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        approval_store=approval,
+    )
+    created: list[SQLiteStore] = []
+    closed: list[SQLiteStore] = []
+    real_sqlite_store = psychlo_bridge_module.SQLiteStore
+
+    class TrackingSQLiteStore(real_sqlite_store):
+        def __init__(self, path):
+            super().__init__(path)
+            created.append(self)
+
+        def close(self):
+            closed.append(self)
+            return super().close()
+
+    def fail_bridge_store(_filename):
+        raise RuntimeError("injected request bridge construction failure")
+
+    monkeypatch.setattr(psychlo_bridge_module, "SQLiteStore", TrackingSQLiteStore)
+    monkeypatch.setattr(psychlo_bridge_module, "PsychloBridgeStore", fail_bridge_store)
+    try:
+        with pytest.raises(RuntimeError, match="injected"):
+            template.request_scoped()
+        assert created and closed == created
+    finally:
+        template.close()
+
+
+def test_threaded_http_tick_shares_process_lock_across_request_bridges(tmp_path: Path, monkeypatch):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    template = PsychloBridge(
+        store=store,
+        dispatcher=lambda *_: "unused",
+        sender=lambda *_: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+    )
+    store.record_protocol(
+        "coordination-work-request",
+        "request-tick-lock",
+        "request-tick-lock",
+        "a" * 64,
+        {"id": "request-tick-lock"},
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    drive_calls = 0
+    drive_lock = threading.Lock()
+
+    def blocking_drive(_bridge, _request_id):
+        nonlocal drive_calls
+        with drive_lock:
+            drive_calls += 1
+            first = drive_calls == 1
+        if first:
+            entered.set()
+            assert release.wait(3)
+        return {"accepted": True}
+
+    monkeypatch.setattr(PsychloBridge, "_drive_coordination_request", blocking_drive)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_api_handler(str(tmp_path / "primary.sqlite3"), "admin-secret", psychlo_bridge=template),
+    )
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    first_result: dict[str, object] = {}
+    second_result: dict[str, object] = {}
+    second_done = threading.Event()
+
+    def request_tick(result: dict[str, object], done: threading.Event | None = None):
+        try:
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("GET", "/psychlo/tick", headers={"Authorization": "Bearer admin-secret"})
+            response = connection.getresponse()
+            result["status"] = response.status
+            result["body"] = json.loads(response.read())
+            connection.close()
+        except Exception as error:
+            result["error"] = error
+        finally:
+            if done is not None:
+                done.set()
+
+    first_thread = threading.Thread(target=request_tick, args=(first_result,), daemon=True)
+    second_thread = threading.Thread(target=request_tick, args=(second_result, second_done), daemon=True)
+    try:
+        first_thread.start()
+        assert entered.wait(3), first_result
+        second_thread.start()
+        assert second_done.wait(2), "second tick did not observe the process-wide lock"
+        assert "error" not in second_result
+        assert second_result["status"] == 200
+        assert second_result["body"] == {"busy": True, "processed": 0, "failed": 0}
+        release.set()
+        first_thread.join(timeout=3)
+        if second_thread.ident is not None:
+            second_thread.join(timeout=3)
+        assert "error" not in first_result
+        assert first_result["body"] == {"busy": False, "processed": 1, "failed": 0}
+        assert drive_calls == 1
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=3)
+        first_thread.join(timeout=3)
+        if second_thread.ident is not None:
+            second_thread.join(timeout=3)
+        template.close()
 
 
 def test_task11_telemetry_sampling_keeps_cumulative_counters_and_provider_binding(tmp_path: Path):

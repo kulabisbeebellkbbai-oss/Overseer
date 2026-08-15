@@ -130,6 +130,21 @@ independent human decision.
 
 ## Admin: Sisko And O'Brien
 
+### Approve A Pending Psychlo Policy Exception
+
+Use this only for a signed Psychlo policy-exception request that appears in
+the Approval Decisions board with approval level `human`.
+
+1. Open Admin and locate the Psychlo Policy Exception card.
+2. Confirm the exact plan id, request id, signed request reason, and expiry
+   shown in the decision context.
+3. Enter the actual independent human identity making the decision. Do not use
+   `sisko`, `overseer`, or `system`.
+4. Enter a concise reason that records the evidence reviewed.
+5. Click Approve exception or Reject exception.
+6. Confirm the signed Psychlo outcome and final approval state in Audit. This
+   control records a human decision only; it does not execute a host command.
+
 ### Approve A Pending Admin Request
 
 Use this when an admin plan is staged and waiting for approval.

@@ -2560,7 +2560,7 @@ def test_http_policy_exception_decision_uses_dedicated_route_and_exact_human_pay
             {
                 "request_id": request["id"],
                 "decision": "approved",
-                "decided_by": "independent-human-reviewer",
+                "decided_by": "  independent-human-reviewer  ",
                 "reason": "approved after reviewing the signed quota exception",
             }
         ).encode()
@@ -2577,9 +2577,68 @@ def test_http_policy_exception_decision_uses_dedicated_route_and_exact_human_pay
         result = json.loads(response.read())
         assert response.status == 200
         assert result["status"] == "approved"
-        assert primary.load_admin_change_plan(
-            f"admin.psychlo.policy-exception.{request['id']}"
-        ).approved
+        plan = primary.load_admin_change_plan(f"admin.psychlo.policy-exception.{request['id']}")
+        approval = primary.load_approval(f"approval.psychlo.policy-exception.{request['id']}")
+        assert plan.approved
+        assert plan.approved_by == "independent-human-reviewer"
+        assert approval.decided_by == "independent-human-reviewer"
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        primary.close()
+
+
+@pytest.mark.parametrize("decided_by", [" sisko ", "SISKO", " overseer ", "SYSTEM"])
+def test_http_policy_exception_decision_rejects_padded_or_case_variant_reserved_identity(tmp_path: Path, decided_by: str):
+    class Sender:
+        secret = SECRET
+
+        def __call__(self, _kind, _message_id, _payload):
+            return {"accepted": True}
+
+    request = _policy_exception_request(id=f"exception-http-reserved-{decided_by.strip().lower()}")
+    primary_path = tmp_path / "overseer.sqlite3"
+    primary = SQLiteStore(primary_path)
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=Sender(),
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        approval_store=primary,
+    )
+    bridge.receive_policy_exception_request(request)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_api_handler(str(primary_path), "admin-secret", psychlo_bridge=bridge),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        body = json.dumps(
+            {
+                "request_id": request["id"],
+                "decision": "approved",
+                "decided_by": decided_by,
+                "reason": "reserved identity must not approve policy exceptions",
+            }
+        ).encode()
+        connection.request(
+            "POST",
+            "/roadex/psychlo/policy-exception-decision",
+            body=body,
+            headers={
+                "Authorization": "Bearer admin-secret",
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        response_body = response.read()
+        assert response.status == 400, response_body
+        assert b"independent human" in response_body
         connection.close()
     finally:
         server.shutdown()

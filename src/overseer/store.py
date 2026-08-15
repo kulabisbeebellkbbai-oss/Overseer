@@ -2189,8 +2189,9 @@ class SQLiteStore:
         """Atomically decide the dedicated plan and its HUMAN approval."""
         if decision not in {"approved", "rejected", "expired"}:
             raise ValueError("policy exception decision is invalid")
-        automated_expiry = decision == "expired" and decided_by == "overseer-expiry"
-        if not isinstance(decided_by, str) or not decided_by.strip() or (not automated_expiry and decided_by.lower() in {"sisko", "overseer", "system"}):
+        normalized_decided_by = decided_by.strip() if isinstance(decided_by, str) else ""
+        automated_expiry = decision == "expired" and normalized_decided_by == "overseer-expiry"
+        if not normalized_decided_by or (not automated_expiry and normalized_decided_by.lower() in {"sisko", "overseer", "system"}):
             raise ValueError("independent human policy exception decision is required")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("policy exception decision reason is required")
@@ -2227,7 +2228,7 @@ class SQLiteStore:
             submitted = {
                 "requestId": request_id,
                 "decision": decision,
-                "decidedBy": decided_by,
+                "decidedBy": normalized_decided_by,
                 "reason": reason,
                 "decidedAt": decided_at,
             }
@@ -2264,15 +2265,15 @@ class SQLiteStore:
             if status == "approved":
                 if plan.canceled or plan.approved or approval.status is not ApprovalStatus.PENDING:
                     raise ValueError("policy exception authority decision conflict")
-                updated_plan = replace(plan, approved=True, approved_by=decided_by, approved_at=decided_at)
-                updated_approval = replace(approval, status=ApprovalStatus.APPROVED, decided_by=decided_by, decided_at=decided_at)
+                updated_plan = replace(plan, approved=True, approved_by=normalized_decided_by, approved_at=decided_at)
+                updated_approval = replace(approval, status=ApprovalStatus.APPROVED, decided_by=normalized_decided_by, decided_at=decided_at)
             else:
                 terminal_status = ApprovalStatus.REJECTED if status == "rejected" else ApprovalStatus.EXPIRED
                 if plan.approved or approval.status is not ApprovalStatus.PENDING:
                     raise ValueError("policy exception authority decision conflict")
                 cancellation_reason = reason if status == decision else "signed policy exception request expired before decision"
-                updated_plan = replace(plan, canceled=True, canceled_by=decided_by, canceled_at=decided_at, cancellation_reason=cancellation_reason)
-                updated_approval = replace(approval, status=terminal_status, decided_by=decided_by, decided_at=decided_at)
+                updated_plan = replace(plan, canceled=True, canceled_by=normalized_decided_by, canceled_at=decided_at, cancellation_reason=cancellation_reason)
+                updated_approval = replace(approval, status=terminal_status, decided_by=normalized_decided_by, decided_at=decided_at)
             self.save_admin_change_plan(updated_plan)
             self.save_approval(updated_approval)
             return {"status": status, "planId": plan_id, "approvalId": approval_id, "replay": False}

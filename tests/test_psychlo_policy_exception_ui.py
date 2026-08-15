@@ -29,3 +29,10 @@ def test_policy_exception_card_does_not_route_through_generic_admin_approval_or_
     assert "approve-admin-change" not in card
     assert "/admin/approve" not in card
     assert "/admin/execute" not in card
+
+
+def test_policy_exception_decision_is_listed_in_operator_workflow_contract():
+    assert (
+        '{workflow: "Approve a pending Psychlo policy exception", page: "Admin", '
+        'owner: "independent human", action: "decide-psychlo-policy-exception"'
+    ) in OPERATOR_CONSOLE_HTML

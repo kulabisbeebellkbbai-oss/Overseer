@@ -128,6 +128,108 @@ def test_dedicated_decision_commits_pair_and_forwards_signed_outcome(tmp_path: P
     assert primary.load_approval("approval.psychlo.policy-exception.exception-approve").status.value == "approved"
 
 
+@pytest.mark.parametrize("decided_by", [" sisko ", "SISKO", " overseer ", "SYSTEM"])
+def test_store_rejects_padded_or_case_variant_reserved_decision_identities(tmp_path: Path, decided_by: str):
+    value = request(f"exception-reserved-store-{decided_by.strip().lower()}")
+    primary = SQLiteStore(tmp_path / "primary.sqlite3")
+    primary.stage_psychlo_policy_exception_authority(value, created_at=NOW)
+
+    with pytest.raises(ValueError, match="independent human"):
+        primary.decide_psychlo_policy_exception_authority(
+            value["id"],
+            "approved",
+            decided_by,
+            "reserved identity must not approve policy exceptions",
+            decided_at=NOW,
+        )
+
+
+def test_store_trims_and_persists_legitimate_decision_identity(tmp_path: Path):
+    value = request("exception-trimmed-store")
+    primary = SQLiteStore(tmp_path / "primary.sqlite3")
+    primary.stage_psychlo_policy_exception_authority(value, created_at=NOW)
+
+    result = primary.decide_psychlo_policy_exception_authority(
+        value["id"],
+        "approved",
+        "  Casey Human  ",
+        "approved after reviewing the signed request",
+        decided_at=NOW,
+    )
+
+    assert result["status"] == "approved"
+    assert primary.load_admin_change_plan(
+        f"admin.psychlo.policy-exception.{value['id']}"
+    ).approved_by == "Casey Human"
+    assert primary.load_approval(
+        f"approval.psychlo.policy-exception.{value['id']}"
+    ).decided_by == "Casey Human"
+    assert primary.psychlo_policy_exception_decision(value["id"])["decidedBy"] == "Casey Human"
+
+
+@pytest.mark.parametrize("decided_by", [" sisko ", "SISKO", " overseer ", "SYSTEM"])
+def test_bridge_rejects_padded_or_case_variant_reserved_decision_identities(tmp_path: Path, decided_by: str):
+    value = request(f"exception-reserved-bridge-{decided_by.strip().lower()}")
+    bridge_instance, _primary = bridge(tmp_path)
+    bridge_instance.receive_policy_exception_request(value)
+
+    with pytest.raises(ValueError, match="independent human"):
+        bridge_instance.decide_policy_exception_authority(
+            {
+                "request_id": value["id"],
+                "decision": "approved",
+                "decided_by": decided_by,
+                "reason": "reserved identity must not approve policy exceptions",
+            }
+        )
+
+
+def test_bridge_trims_and_persists_legitimate_decision_identity(tmp_path: Path):
+    value = request("exception-trimmed-bridge")
+    bridge_instance, primary = bridge(tmp_path)
+    bridge_instance.receive_policy_exception_request(value)
+
+    result = bridge_instance.decide_policy_exception_authority(
+        {
+            "request_id": value["id"],
+            "decision": "approved",
+            "decided_by": "  Casey Human  ",
+            "reason": "approved after reviewing the signed request",
+        }
+    )
+
+    assert result["status"] == "approved"
+    assert primary.load_admin_change_plan(
+        f"admin.psychlo.policy-exception.{value['id']}"
+    ).approved_by == "Casey Human"
+
+
+def test_bridge_treats_padded_identity_replay_as_the_same_decision(tmp_path: Path):
+    value = request("exception-trimmed-replay")
+    bridge_instance, primary = bridge(tmp_path)
+    bridge_instance.receive_policy_exception_request(value)
+    first = bridge_instance.decide_policy_exception_authority(
+        {
+            "request_id": value["id"],
+            "decision": "approved",
+            "decided_by": "  Casey Human  ",
+            "reason": "approved after reviewing the signed request",
+        }
+    )
+    replay = bridge_instance.decide_policy_exception_authority(
+        {
+            "request_id": value["id"],
+            "decision": "approved",
+            "decided_by": "Casey Human",
+            "reason": "approved after reviewing the signed request",
+        }
+    )
+
+    assert first["status"] == "approved"
+    assert replay["replay"] is True
+    assert primary.psychlo_policy_exception_decision(value["id"])["decidedBy"] == "Casey Human"
+
+
 def test_dedicated_rejection_cancels_pair_and_forwards_rejection(tmp_path: Path):
     value = request("exception-reject")
     sent: list = []

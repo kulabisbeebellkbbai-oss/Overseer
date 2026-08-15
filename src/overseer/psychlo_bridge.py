@@ -764,7 +764,11 @@ class PsychloBridge:
             raise ValueError("policy exception decision is required")
         decided_by = value.get("decided_by")
         reason = value.get("reason")
-        if not isinstance(decided_by, str) or not isinstance(reason, str):
+        decided_by = decided_by.strip() if isinstance(decided_by, str) else ""
+        automated_expiry = decision == "expired" and decided_by == "overseer-expiry"
+        if not decided_by or (not automated_expiry and decided_by.lower() in {"sisko", "overseer", "system"}):
+            raise ValueError("independent human policy exception decision is required")
+        if not isinstance(reason, str):
             raise ValueError("policy exception decision actor and reason are required")
         existing_decision = self.approval_store.psychlo_policy_exception_decision(request_id) if self.approval_store is not None else None
         decided_at = value.get("decided_at") or (existing_decision.get("decidedAt") if existing_decision is not None else self.clock())

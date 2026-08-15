@@ -3536,6 +3536,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
         {workflow: "Review and reconcile crew decisions", page: "Any", owner: "Sisko", action: "resubmit-crew-message", source, query: "Review and reconcile crew decisions"},
         {workflow: "Review and reconcile crew decisions", page: "Any", owner: "Sisko", action: "reconcile-crew-reviews", source, query: "Review and reconcile crew decisions"},
         {workflow: "Complete a Roadex final human decision", page: "Overview", owner: "Sisko", action: "decide-roadex-human", source, query: "Complete a Roadex final human decision"},
+        {workflow: "Approve a pending Psychlo policy exception", page: "Admin", owner: "independent human", action: "decide-psychlo-policy-exception", source, query: "Approve a pending Psychlo policy exception"},
         {workflow: "Approve a pending admin request", page: "Admin", owner: "Sisko", action: "approve-admin-change", source, query: "Approve a pending admin request"},
         {workflow: "Approve and implement an admin request", page: "Admin", owner: "Sisko / O'Brien", action: "approve-and-execute-admin-change", source, query: "Approve and implement an admin request"},
         {workflow: "Request changes for a plan", page: "Admin", owner: "Sisko", action: "cancel-admin-change", source, query: "Request changes for a plan"},

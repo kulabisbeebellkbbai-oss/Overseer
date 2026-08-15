@@ -22,6 +22,7 @@ ProtectSystem=strict
 ProtectHome=tmpfs
 BindReadOnlyPaths=%h/.config/overseer/psychlo-project-bindings.json
 BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json
+BindReadOnlyPaths=%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47
 BindReadOnlyPaths=%h/.local/share/overseer/project/src
 BindReadOnlyPaths=%h/.local/share/overseer/psychlo-meter
 BindReadOnlyPaths="%h/Documents/Codex Workspace/The A-Team/data/handoffs.json"

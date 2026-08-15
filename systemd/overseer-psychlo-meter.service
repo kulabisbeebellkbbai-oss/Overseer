@@ -17,6 +17,7 @@ ProtectHome=tmpfs
 BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/producer-enabled
 BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json
 BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/config.json
+BindReadOnlyPaths=%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47
 BindReadOnlyPaths=%h/.local/share/overseer/project/src
 BindPaths=%h/.local/share/overseer/psychlo-meter
 UMask=0077

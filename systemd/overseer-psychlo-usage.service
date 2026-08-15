@@ -4,7 +4,7 @@ After=overseer-api.service psychlo.service
 
 [Service]
 Type=oneshot
-Environment="PYTHONPATH=%h/Documents/Codex Workspace/Overseer/src"
+Environment=PYTHONPATH=%h/.local/share/overseer/project/src
 Environment=OVERSEER_PSYCHLO_ENDPOINT=http://127.0.0.1:8798
 Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=%h/.local/share/overseer/psychlo/bridge.sqlite3
 Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=%h/.config/overseer/psychlo-project-bindings.json
@@ -15,14 +15,14 @@ Environment=OVERSEER_PSYCHLO_USAGE_AUTHORITY_FILE=%h/.config/overseer/psychlo-us
 Environment=OVERSEER_PSYCHLO_USAGE_OBSERVATION_FILE=%h/.local/share/overseer/psychlo-meter/latest-observation.json
 Environment=OVERSEER_PSYCHLO_USAGE_RECEIPTS_FILE=%h/.local/share/overseer/psychlo-meter/latest-receipts.json
 LoadCredential=psychlo-overseer-peer-secret:%h/.config/psychlo/overseer-peer-secret
-ExecStart=%h/.local/share/overseer/codex-usage-mcp-venv/bin/python -m overseer.psychlo_bridge_cli emit-usage
+ExecStart=%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python -m overseer.psychlo_bridge_cli emit-usage
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=tmpfs
 BindReadOnlyPaths=%h/.config/overseer/psychlo-project-bindings.json
 BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json
-BindReadOnlyPaths="%h/Documents/Codex Workspace/Overseer/src"
+BindReadOnlyPaths=%h/.local/share/overseer/project/src
 BindReadOnlyPaths=%h/.local/share/overseer/psychlo-meter
 BindReadOnlyPaths="%h/Documents/Codex Workspace/The A-Team/data/handoffs.json"
 BindPaths=%h/.local/share/overseer/psychlo

@@ -18,7 +18,8 @@ def test_psychlo_usage_requires_the_private_attribution_authority_feed():
     assert "BindReadOnlyPaths=%h/.local/share/overseer/psychlo-meter" in unit
     assert "codex-usage-mcp/state.sqlite3" not in unit
     assert "ExecStartPre=" not in unit
-    assert "%h/.local/share/overseer/codex-usage-mcp-venv/bin/python -m overseer.psychlo_bridge_cli emit-usage" in unit
+    assert "%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python -m overseer.psychlo_bridge_cli emit-usage" in unit
+    assert "PYTHONPATH=%h/.local/share/overseer/project/src" in unit
 
 
 def test_percentage_meter_is_a_separate_fail_closed_one_shot():
@@ -28,7 +29,8 @@ def test_percentage_meter_is_a_separate_fail_closed_one_shot():
     assert "ConditionPathExists=%h/.config/overseer/psychlo-meter/producer-enabled" in meter
     assert "LoadCredential=psychlo-usage-authority-private-key:%h/.config/overseer/psychlo-usage-authority-private-key.pem" in meter
     assert "%d/psychlo-usage-authority-private-key" in meter
-    assert "%h/.local/share/overseer/codex-usage-mcp-venv/bin/python -m overseer.psychlo_usage_meter_cli" in meter
+    assert "%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python -m overseer.psychlo_usage_meter_cli" in meter
+    assert "PYTHONPATH=%h/.local/share/overseer/project/src" in meter
     assert "ExecStartPre=" not in meter
     assert "ProtectHome=tmpfs" in meter
     assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/config.json" in meter

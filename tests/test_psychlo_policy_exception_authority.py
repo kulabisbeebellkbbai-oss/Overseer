@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from overseer.admin import approve_admin_change_plan
-from overseer.psychlo_bridge import PsychloBridge
+from overseer.psychlo_bridge import PsychloBridge, create_bridge_from_environment
 from overseer.psychlo_contracts import policy_exception_request_digest
 from overseer.psychlo_store import PsychloBridgeStore
 from overseer.store import SQLiteStore
@@ -194,6 +194,41 @@ def test_restart_replay_does_not_duplicate_authority(tmp_path: Path):
     assert replay["replay"] is True
     assert len(primary.list_approvals()) == 1
     assert len(primary.list_admin_change_plans()) == 1
+
+
+def test_environment_bound_bridge_replay_stages_authority_in_primary_store(tmp_path: Path):
+    value = request("exception-environment-replay")
+    value["expiresAt"] = "2099-08-13T00:00:00.000Z"
+    value["digest"] = policy_exception_request_digest(value)
+    secret = tmp_path / "peer-secret"
+    secret.write_text("s" * 32, encoding="utf-8")
+    secret.chmod(0o600)
+    bindings = tmp_path / "project-bindings.json"
+    bindings.write_text("{}", encoding="utf-8")
+    bindings.chmod(0o600)
+    environment = {
+        "OVERSEER_PSYCHLO_PEER_SECRET_FILE": str(secret),
+        "OVERSEER_PSYCHLO_BRIDGE_DATABASE": str(tmp_path / "bridge.sqlite3"),
+        "OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE": str(bindings),
+        "OVERSEER_PSYCHLO_ENDPOINT": "http://127.0.0.1:9",
+        "OVERSEER_STORE_DATABASE": str(tmp_path / "primary.sqlite3"),
+    }
+
+    first = create_bridge_from_environment(environment)
+    try:
+        assert first.receive_policy_exception_request(value)["status"] == "pending"
+    finally:
+        first.close()
+    second = create_bridge_from_environment(environment)
+    try:
+        replay = second.receive_policy_exception_request(value, message_id="replayed")
+    finally:
+        second.close()
+
+    assert replay["replay"] is True
+    with SQLiteStore(environment["OVERSEER_STORE_DATABASE"]) as primary:
+        assert len(primary.list_approvals()) == 1
+        assert len(primary.list_admin_change_plans()) == 1
 
 
 def test_dedicated_decision_replay_returns_stable_outcome(tmp_path: Path):

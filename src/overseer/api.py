@@ -1592,7 +1592,14 @@ def run_api_server(
         raise ValueError("Human approval token must be independent from the agent token")
     from .backup_host_operations import ConcreteHostProvisioningAdapter, PRIVILEGED_CONFIRMATION
     decision_factory = lambda plan: ConcreteHostProvisioningAdapter(plan, privileged_confirmation=PRIVILEGED_CONFIRMATION)
-    psychlo_bridge = create_bridge_from_environment() if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE") else None
+    psychlo_bridge = None
+    if os.environ.get("OVERSEER_PSYCHLO_PEER_SECRET_FILE"):
+        bridge_environment = dict(os.environ)
+        # The explicit CLI --store is authoritative.  An inherited service
+        # environment must not split Psychlo approval authority into another
+        # SQLite database.
+        bridge_environment["OVERSEER_STORE_DATABASE"] = str(Path(store_path))
+        psychlo_bridge = create_bridge_from_environment(bridge_environment)
     server = ThreadingHTTPServer(
         (host, port),
         make_api_handler(

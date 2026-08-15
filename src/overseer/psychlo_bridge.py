@@ -868,8 +868,29 @@ class PsychloBridge:
             raise ValueError("policy exception approval decision binding is invalid")
         if approval.owner_domain.value != self.approval_owner_domain or approval.subject_id != subject.id: raise ValueError("policy exception approval owner is invalid")
         if tuple(approval.evidence_required) and request["digest"] not in set(approval.evidence_required): raise ValueError("policy exception approval evidence does not bind to the request")
-        if approval.status.value == "approved" and (not isinstance(approval.decided_by, str) or not approval.decided_by.strip() or approval.decided_by.lower() in {"sisko", "overseer", "system"}): raise ValueError("independent human policy exception approval is required")
-        if approval.status.value == "approved" and (not subject.approved or subject.approved_by != approval.decided_by): raise ValueError("policy exception approval is not an immutable approved subject")
+        if approval.status.value == "approved":
+            decided_by = approval.decided_by
+            approved_by = subject.approved_by
+            if (
+                not isinstance(decided_by, str)
+                or not decided_by
+                or decided_by != decided_by.strip()
+                or decided_by.lower() in {"sisko", "overseer", "system"}
+                or not isinstance(approved_by, str)
+                or not approved_by
+                or approved_by != approved_by.strip()
+                or approved_by != decided_by
+            ):
+                raise ValueError("independent human policy exception approval must be canonical")
+            durable_decision = self.approval_store.psychlo_policy_exception_decision(request["id"]) if self.approval_store is not None else None
+            if (
+                not isinstance(durable_decision, Mapping)
+                or durable_decision.get("requestId") != request["id"]
+                or durable_decision.get("decision") != "approved"
+                or durable_decision.get("status") != "approved"
+                or durable_decision.get("decidedBy") != decided_by
+            ):
+                raise ValueError("policy exception approval durable decision binding is invalid")
         return {"approval": approval, "subject": subject, "metadata": metadata}
 
     def _policy_exception_outcome(self, request: Mapping[str, Any], record: Mapping[str, Any], status: str, reason: str | None) -> dict[str, Any]:

@@ -1628,6 +1628,27 @@ def _save_policy_exception_approval(path: Path, request: dict, *, status: Approv
         "approve Psychlo policy exception", status, (digest,), "human-user" if status == ApprovalStatus.APPROVED else None,
         NOW if status == ApprovalStatus.APPROVED else None,
     ))
+    primary._connection.execute(
+        "CREATE TABLE IF NOT EXISTS psychlo_policy_exception_decisions (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+    )
+    primary._connection.execute(
+        "INSERT INTO psychlo_policy_exception_decisions(request_id,payload) VALUES (?,?)",
+        (
+            request["id"],
+            json.dumps(
+                {
+                    "requestId": request["id"],
+                    "decision": "approved" if status == ApprovalStatus.APPROVED else "rejected",
+                    "decidedBy": "human-user",
+                    "reason": "approved or rejected Psychlo policy exception fixture",
+                    "decidedAt": NOW,
+                    "status": "approved" if status == ApprovalStatus.APPROVED else "rejected",
+                },
+                separators=(",", ":"),
+            ),
+        ),
+    )
+    primary._connection.commit()
     return primary
 
 
@@ -1673,6 +1694,33 @@ def test_policy_exception_rejects_altered_request_after_real_approval(tmp_path: 
     if defect != "digest": altered["digest"] = canonical_digest({key: value for key, value in altered.items() if key != "digest"})
     with pytest.raises(ValueError):
         bridge.authorize_policy_exception("approval-" + request["id"], altered)
+
+
+@pytest.mark.parametrize("contaminated_identity", [" sisko ", "SISKO", " human-user "])
+def test_policy_exception_loader_rejects_legacy_noncanonical_approved_identity_before_send(
+    tmp_path: Path, contaminated_identity: str
+):
+    request = _policy_exception_request(id="exception-legacy-identity-" + contaminated_identity.strip().lower().replace(" ", "-"))
+    sent = []
+    primary = _save_policy_exception_approval(tmp_path / "primary.sqlite3", request)
+    plan = primary.load_admin_change_plan("plan-" + request["id"])
+    approval = primary.load_approval("approval-" + request["id"])
+    primary.save_admin_change_plan(replace(plan, approved_by=contaminated_identity))
+    primary.save_approval(replace(approval, decided_by=contaminated_identity))
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=lambda *_: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        approval_store=primary,
+    )
+    bridge.receive_policy_exception_request(request)
+
+    with pytest.raises(ValueError, match="canonical|independent human|immutable"):
+        bridge.authorize_policy_exception("approval-" + request["id"], request)
+    assert sent == []
+    assert bridge.store.policy_exception_request(request["id"])["outcome"] is None
 
 
 def test_usage_snapshot_contains_only_persisted_overseer_v11_accounting(tmp_path: Path):

@@ -1,6 +1,6 @@
 # Task 2 Report
 
-Status: DONE, pending independent review
+Status: DONE, independent review C0/I0
 
 Implementation:
 - Added a one-shot Ed25519-signed provider percentage meter and closed owner-only CLI inputs.
@@ -10,8 +10,8 @@ Implementation:
 - Added private no-follow atomic observation publication. The producer never sends to Psychlo.
 
 Verification:
-- Focused collector, meter, attribution, bridge CLI, and systemd tests: 63 passed.
-- Full suite: 1403 passed, 5 skipped, with one existing cross-process timing test failing once; its isolated rerun passed.
+- Focused collector, meter, attribution, bridge CLI, and systemd tests after correction: 64 passed.
+- Independent full-suite rerun: 1405 passed, 5 skipped.
 - `python -m compileall -q src/overseer` passed.
 - `git diff --check` passed.
 

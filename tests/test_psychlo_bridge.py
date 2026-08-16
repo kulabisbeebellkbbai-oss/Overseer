@@ -2293,13 +2293,15 @@ def test_recovery_generation_token_fences_stale_same_owner_attempt(tmp_path: Pat
 
 
 def test_recovery_rejects_corrupt_request_and_receipt_before_rollout_scan(tmp_path: Path):
-    for corruption in ("request", "receipt"):
+    for corruption in ("request", "receipt", "receipt-binding"):
         store = PsychloBridgeStore(tmp_path / f"bridge-{corruption}.sqlite3")
         request = _started_round(store, f"round-corrupt-{corruption}")
         if corruption == "request":
             store.connection.execute("UPDATE rounds SET request_json=? WHERE round_id=?", (json.dumps({**request, "scope": "not-bounded"}), request["roundId"]))
-        else:
+        elif corruption == "receipt":
             store.connection.execute("UPDATE rounds SET receipt_json=? WHERE round_id=?", (json.dumps({**request, "status": "accepted", "sourceId": "member-hermione", "provenanceId": "x", "unexpected": True}), request["roundId"]))
+        else:
+            store.connection.execute("UPDATE rounds SET receipt_json=? WHERE round_id=?", (json.dumps({**request, "snapshotId": "different-snapshot", "status": "accepted", "sourceId": "member-hermione", "provenanceId": "x"}), request["roundId"]))
         dispatcher = _RoundRecoveryDispatcher(existing=True)
         bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
         with pytest.raises(ValueError, match="invalid round|receipt"):

@@ -2431,7 +2431,11 @@ def _require_round(request: Mapping[str, Any]) -> None:
 def _require_round_receipt(request: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
     if not isinstance(receipt, Mapping) or set(receipt) != set(request) | {"sourceId", "provenanceId", "status"}:
         raise ValueError("round receipt is invalid")
-    if receipt.get("sourceId") != request.get("projectLeadId") or receipt.get("status") != "accepted":
+    if (
+        any(receipt.get(key) != value for key, value in request.items())
+        or receipt.get("sourceId") != request.get("projectLeadId")
+        or receipt.get("status") != "accepted"
+    ):
         raise ValueError("round receipt binding is invalid")
     _required_string(receipt, "provenanceId")
 

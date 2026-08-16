@@ -605,8 +605,6 @@ class PsychloBridge:
         request, receipt, _, capability, state, result, _ = record
         _require_round(request)
         _require_round_receipt(request, receipt)
-        if state != "started" or result is not None:
-            raise ValueError("only an uncertain started round can report operational failure")
         if not isinstance(capability, str) or not re.fullmatch(r"capability:[A-Za-z0-9._:-]{1,220}", capability):
             raise ValueError("operational failure callback capability is invalid")
         existing = self.store.operational_failure_intent(round_id)
@@ -614,6 +612,9 @@ class PsychloBridge:
             payload = existing["payload"]
             if payload.get("failureCode") != failure_code:
                 raise ValueError("operational failure intent conflict")
+            _require_operational_failure_report(payload, request, capability)
+            if existing["state"] == "accepted":
+                return {"accepted": True, "status": "already-accepted", "receipt": existing["outcome"]}
         else:
             payload = {
                 "schemaVersion": OPERATIONAL_FAILURE_SCHEMA,
@@ -624,9 +625,9 @@ class PsychloBridge:
                 "provenanceId": f"overseer:operational-failure:{round_id}:{failure_code}", "failureCode": failure_code,
                 "callbackCapability": capability, "occurredAt": self.clock(),
             }
+        if state != "started" or result is not None:
+            raise ValueError("only an uncertain started round can report operational failure")
         _require_operational_failure_report(payload, request, capability)
-        if existing is not None and existing["state"] == "accepted":
-            return {"accepted": True, "status": "already-accepted", "receipt": existing["outcome"]}
         scanner = getattr(self.dispatcher, "scan_rollout", None)
         if not callable(scanner):
             raise ValueError("full rollout scanner is required")
@@ -654,8 +655,7 @@ class PsychloBridge:
         if not isinstance(claim_token, str) or not claim_token:
             raise ValueError("operational failure claim token is missing")
         try:
-            response = dict(self.sender("operational-failure", str(request["idempotencyKey"]), payload))
-            _require_operational_failure_acceptance(response, str(request["projectId"]))
+            response = _require_operational_failure_acceptance(dict(self.sender("operational-failure", str(request["idempotencyKey"]), payload)), str(request["projectId"]))
         except Exception as error:
             self.store.finish_operational_failure(round_id, owner, claim_token, accepted=False, outcome={"accepted": False}, error=str(error), now=self.clock())
             raise
@@ -2557,16 +2557,17 @@ def _require_operational_failure_report(report: Mapping[str, Any], request: Mapp
         raise ValueError("operational failure report schema is invalid")
 
 
-def _require_operational_failure_acceptance(response: Mapping[str, Any], project_id: str) -> None:
+def _require_operational_failure_acceptance(response: Mapping[str, Any], project_id: str) -> dict[str, Any]:
     if not isinstance(response, Mapping):
         raise ValueError("Psychlo rejected operational failure")
     allowed = {"accepted", "inserted", "projectId", "failureCount", "status_code"}
-    if set(response) - allowed or set(response) not in ({"accepted", "inserted", "projectId", "failureCount"}, allowed):
+    if set(response) != allowed:
         raise ValueError("Psychlo rejected operational failure")
     if response.get("accepted") is not True or not isinstance(response.get("inserted"), bool) or response.get("projectId") != project_id or isinstance(response.get("failureCount"), bool) or not isinstance(response.get("failureCount"), int) or response["failureCount"] < 1:
         raise ValueError("Psychlo rejected operational failure")
-    if "status_code" in response and (isinstance(response["status_code"], bool) or not isinstance(response["status_code"], int) or response["status_code"] not in {200, 201, 202}):
+    if isinstance(response["status_code"], bool) or not isinstance(response["status_code"], int) or response["status_code"] != 202:
         raise ValueError("Psychlo rejected operational failure")
+    return {key: response[key] for key in ("accepted", "inserted", "projectId", "failureCount")}
 
 
 def _require_bound_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> None:

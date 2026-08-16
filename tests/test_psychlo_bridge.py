@@ -3051,7 +3051,7 @@ def _uncertain_round_request():
 def test_reports_uncertain_round_failure_only_after_absent_full_rollout_scan_and_peer_acceptance(tmp_path: Path):
     dispatcher = _OperationalFailureDispatcher()
     sent = []
-    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatcher, sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-1234567890")
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatcher, sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1, "status_code": 202}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-1234567890")
     request = _uncertain_round_request()
     with pytest.raises(RuntimeError, match="provider unavailable"):
         bridge.request_round(request)
@@ -3093,7 +3093,7 @@ def test_operational_failure_retry_reuses_exact_payload_and_fences_claim(tmp_pat
         calls.append((kind, message_id, dict(payload)))
         if not accepted["value"]:
             return {"accepted": False}
-        return {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1}
+        return {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1, "status_code": 202}
     path = tmp_path / "bridge.sqlite3"
     bridge = PsychloBridge(store=PsychloBridgeStore(path), dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-retry-1234567890")
     request = _uncertain_round_request()

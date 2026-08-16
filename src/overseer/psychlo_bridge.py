@@ -58,6 +58,8 @@ from .store import SQLiteStore
 MAX_BODY_BYTES = 256 * 1024
 PEER_VERSION = b"psychlo-overseer-v1\0"
 POLICY_EXCEPTION_RECEIPT_SCHEMA = "psychlo.policy-exception-receiver-receipt.v1"
+OPERATIONAL_FAILURE_SCHEMA = "psychlo.operational-failure.v1"
+OPERATIONAL_FAILURE_CODES = {"provider-unavailable", "provider-timeout", "provider-rate-limited", "execution-failed", "transport-failed", "resource-unavailable", "cancelled-by-lead"}
 PEER_RESPONSE_KIND_HEADER = "x-psychlo-peer-response-kind"
 PEER_RESPONSE_TIMESTAMP_HEADER = "x-psychlo-peer-response-timestamp"
 PEER_RESPONSE_NONCE_HEADER = "x-psychlo-peer-response-nonce"
@@ -325,7 +327,10 @@ class PsychloBridge:
         self.callback_origin = callback_origin.rstrip("/")
         self.require_external_binding = require_external_binding
         self.clock = clock or (lambda: datetime.now(UTC).isoformat())
-        self.token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
+        # Callback capabilities are part of Psychlo's strict operational
+        # failure contract, so every newly minted normal-round token uses the
+        # contract namespace.  Persisted legacy tokens remain immutable.
+        self.token_factory = token_factory or (lambda: f"capability:{secrets.token_urlsafe(32)}")
         # Administrative authority is deliberately separate from the Psychlo
         # projection store.  The latter must never be an approval authority.
         self.approval_loader = approval_loader
@@ -584,6 +589,78 @@ class PsychloBridge:
                 return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-operational-failure:{request.get('roundId')}", "status": "rejected"}}
             return {"accepted": True, "receipt": existing[1]}
         return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-unknown:{request.get('roundId')}", "status": "unknown"}}
+
+    def report_operational_failure(self, round_id: str, failure_code: str, *, owner_id: str | None = None) -> dict[str, Any]:
+        """Report one uncertain dispatch failure without replaying its prompt.
+
+        The complete rollout scan is deliberately performed before the durable
+        intent is claimed or any peer traffic is sent.  A positive scan proves
+        that the prompt was delivered and therefore blocks this path.
+        """
+        if not isinstance(round_id, str) or not round_id.strip() or failure_code not in OPERATIONAL_FAILURE_CODES:
+            raise ValueError("operational failure identity is invalid")
+        record = self.store.get_round(round_id)
+        if record is None:
+            raise ValueError("round is missing")
+        request, receipt, _, capability, state, result, _ = record
+        _require_round(request)
+        _require_round_receipt(request, receipt)
+        if state != "started" or result is not None:
+            raise ValueError("only an uncertain started round can report operational failure")
+        if not isinstance(capability, str) or not re.fullmatch(r"capability:[A-Za-z0-9._:-]{1,220}", capability):
+            raise ValueError("operational failure callback capability is invalid")
+        existing = self.store.operational_failure_intent(round_id)
+        if existing is not None:
+            payload = existing["payload"]
+            if payload.get("failureCode") != failure_code:
+                raise ValueError("operational failure intent conflict")
+        else:
+            payload = {
+                "schemaVersion": OPERATIONAL_FAILURE_SCHEMA,
+                "roundId": request["roundId"], "projectId": request["projectId"], "projectLeadId": request["projectLeadId"],
+                "planId": request["planId"], "planVersion": request["planVersion"], "snapshotId": request["snapshotId"],
+                "policyVersion": request["policyVersion"], "correlationId": request["correlationId"], "idempotencyKey": request["idempotencyKey"],
+                "sourceId": request["projectLeadId"], "reporterId": "overseer",
+                "provenanceId": f"overseer:operational-failure:{round_id}:{failure_code}", "failureCode": failure_code,
+                "callbackCapability": capability, "occurredAt": self.clock(),
+            }
+        _require_operational_failure_report(payload, request, capability)
+        if existing is not None and existing["state"] == "accepted":
+            return {"accepted": True, "status": "already-accepted", "receipt": existing["outcome"]}
+        scanner = getattr(self.dispatcher, "scan_rollout", None)
+        if not callable(scanner):
+            raise ValueError("full rollout scanner is required")
+        binding = self.store.round_binding(round_id)
+        if binding is None:
+            raise ValueError("original Codex execution binding is missing")
+        scan = _require_rollout_scan(scanner(request["projectLeadId"], self._round_prompt(request, capability)))
+        if scan["binding"] != binding:
+            raise ValueError("rollout identity changed")
+        if scan["found"]:
+            raise ValueError("prompt delivery proof exists; operational failure is unsafe")
+        now = self.clock()
+        intent, _ = self.store.create_operational_failure_intent(round_id, request, capability, payload, now=now)
+        if intent["state"] == "accepted":
+            return {"accepted": True, "status": "already-accepted", "receipt": intent["outcome"]}
+        owner = owner_id or self.coordination_owner_id
+        lease_until = (_time(now) + timedelta(seconds=self.coordination_lease_seconds)).isoformat()
+        claim = self.store.claim_operational_failure(round_id, request, capability, owner_id=owner, lease_expires_at=lease_until, now=now)
+        if claim is None:
+            current = self.store.operational_failure_intent(round_id)
+            if current is not None and current["state"] == "accepted":
+                return {"accepted": True, "status": "already-accepted", "receipt": current["outcome"]}
+            raise ValueError("operational failure is already claimed")
+        claim_token = claim.get("claimToken")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("operational failure claim token is missing")
+        try:
+            response = dict(self.sender("operational-failure", str(request["idempotencyKey"]), payload))
+            _require_operational_failure_acceptance(response, str(request["projectId"]))
+        except Exception as error:
+            self.store.finish_operational_failure(round_id, owner, claim_token, accepted=False, outcome={"accepted": False}, error=str(error), now=self.clock())
+            raise
+        self.store.finish_operational_failure(round_id, owner, claim_token, accepted=True, outcome=response, now=self.clock())
+        return {"accepted": True, "status": "accepted", "receipt": response}
 
     def recover_round(self, round_id: str, *, owner_id: str | None = None) -> dict[str, Any]:
         """Recover exactly one uncertain started round without synthesizing a result."""
@@ -2457,6 +2534,34 @@ def _require_rollout_binding(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value["rolloutDev"], int) or isinstance(value["rolloutDev"], bool) or value["rolloutDev"] < 0 or not isinstance(value["rolloutIno"], int) or isinstance(value["rolloutIno"], bool) or value["rolloutIno"] < 0 or not SHA256_RE.fullmatch(value["rolloutPathDigest"]):
         raise ValueError("rollout identity evidence is invalid")
     return {field: value[field] for field in fields}
+
+
+def _require_operational_failure_report(report: Mapping[str, Any], request: Mapping[str, Any], capability: str) -> None:
+    required = {"schemaVersion", "roundId", "projectId", "projectLeadId", "planId", "planVersion", "snapshotId", "policyVersion", "correlationId", "idempotencyKey", "sourceId", "reporterId", "provenanceId", "failureCode", "callbackCapability", "occurredAt"}
+    if not isinstance(report, Mapping) or set(report) != required:
+        raise ValueError("operational failure report schema is invalid")
+    for key in ("roundId", "projectId", "projectLeadId", "planId", "planVersion", "snapshotId", "policyVersion", "correlationId", "idempotencyKey", "sourceId", "provenanceId"):
+        if not isinstance(report.get(key), str) or not report[key].strip() or len(report[key]) > 256:
+            raise ValueError("operational failure report schema is invalid")
+    if report["schemaVersion"] != OPERATIONAL_FAILURE_SCHEMA or report["reporterId"] != "overseer" or report["failureCode"] not in OPERATIONAL_FAILURE_CODES:
+        raise ValueError("operational failure report schema is invalid")
+    if report["callbackCapability"] != capability or not re.fullmatch(r"capability:[A-Za-z0-9._:-]{1,220}", report["callbackCapability"]):
+        raise ValueError("operational failure callback capability is invalid")
+    if any(report.get(key) != request.get(key) for key in ("roundId", "projectId", "projectLeadId", "planId", "planVersion", "snapshotId", "policyVersion", "correlationId", "idempotencyKey")) or report["sourceId"] != request["projectLeadId"]:
+        raise ValueError("operational failure report does not bind to the exact round request")
+    try:
+        occurred = datetime.fromisoformat(str(report["occurredAt"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise ValueError("operational failure report schema is invalid") from None
+    if occurred.tzinfo is None:
+        raise ValueError("operational failure report schema is invalid")
+
+
+def _require_operational_failure_acceptance(response: Mapping[str, Any], project_id: str) -> None:
+    if not isinstance(response, Mapping) or response.get("accepted") is not True or response.get("projectId") != project_id or isinstance(response.get("failureCount"), bool) or not isinstance(response.get("failureCount"), int) or response["failureCount"] < 1:
+        raise ValueError("Psychlo rejected operational failure")
+
+
 def _require_bound_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
     for key, value in request.items():
         if result.get(key) != value: raise ValueError("round result does not bind to request")

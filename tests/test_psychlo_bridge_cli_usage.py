@@ -114,6 +114,13 @@ def test_cli_exposes_only_one_exact_round_recovery_command():
     assert args.owner_id == "recoverer-a"
 
 
+def test_cli_exposes_only_one_exact_operational_failure_command():
+    args = build_parser().parse_args(["report-operational-failure", "--round-id", "round-uncertain", "--failure-code", "transport-failed"])
+    assert args.command == "report-operational-failure"
+    assert args.round_id == "round-uncertain"
+    assert args.failure_code == "transport-failed"
+
+
 def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Path, capsys):
     captured = {}
 

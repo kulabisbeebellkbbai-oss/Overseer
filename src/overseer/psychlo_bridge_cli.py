@@ -42,6 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     recover_round = subparsers.add_parser("recover-round", help="recover one exact started Psychlo round")
     recover_round.add_argument("--round-id", required=True)
     recover_round.add_argument("--owner-id", default=None)
+    failure = subparsers.add_parser("report-operational-failure", help="report one exact uncertain Psychlo round failure")
+    failure.add_argument("--round-id", required=True)
+    failure.add_argument("--failure-code", required=True, choices=("provider-unavailable", "provider-timeout", "provider-rate-limited", "execution-failed", "transport-failed", "resource-unavailable", "cancelled-by-lead"))
+    failure.add_argument("--owner-id", default=None)
     subparsers.add_parser("tick")
     return parser
 
@@ -82,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "recover-round":
         bridge = create_bridge_from_environment()
         result = bridge.recover_round(args.round_id, owner_id=args.owner_id)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "report-operational-failure":
+        bridge = create_bridge_from_environment()
+        result = bridge.report_operational_failure(args.round_id, args.failure_code, owner_id=args.owner_id)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "tick":

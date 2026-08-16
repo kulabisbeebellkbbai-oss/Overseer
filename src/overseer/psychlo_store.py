@@ -67,6 +67,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
@@ -461,12 +462,12 @@ class PsychloBridgeStore:
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def active_round(self) -> str | None:
-        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone()
+        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' LIMIT 1").fetchone()
         return None if row is None else str(row[0])
 
     def active_rounds(self) -> list[dict[str, Any]]:
         """Return the immutable request identity for every unfinished round."""
-        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()
+        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' ORDER BY rowid").fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def record_canary_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, authorization_id: str, expected_revision: int, now: str) -> None:
@@ -507,7 +508,7 @@ class PsychloBridgeStore:
             bound = next((item for item in projects if isinstance(item, dict) and item.get("projectId") == request.get("projectId")), None)
             if bound is None or any(request.get(field) != bound.get(source) for field, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
                 raise ValueError("concurrency canary round identity is not authorized")
-            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()
+            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' ORDER BY rowid").fetchall()
             active = [json.loads(row[0]) for row in rows]
             if len(active) >= 2:
                 raise ValueError("single_stream_busy")
@@ -611,7 +612,7 @@ class PsychloBridgeStore:
             expected_decision = {"decisionId": authorization.get("decisionId"), "projectId": authorization.get("projectId"), "planId": authorization.get("planId"), "workflowId": authorization.get("workflowId"), "decisionVersion": authorization.get("decisionVersion"), "question": authorization.get("question"), "resultProvenanceId": authorization.get("digest")}
             if any(decision.get(field) != value for field, value in expected_decision.items()):
                 raise ValueError("concurrency ceiling decision binding is invalid")
-            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL ORDER BY rowid").fetchall()]
+            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
@@ -692,7 +693,7 @@ class PsychloBridgeStore:
         """Atomically preserve the default global ceiling of one."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL LIMIT 1").fetchone() is not None:
+            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
@@ -723,6 +724,97 @@ class PsychloBridgeStore:
 
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
+
+    def operational_failure_intent(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,payload_json,payload_digest,state,owner_id,claim_token,lease_expires_at,attempts,outcome_json,last_error,updated_at FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            return None
+        return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "idempotencyKey": row[2], "payload": json.loads(row[3]), "payloadDigest": row[4], "state": row[5], "ownerId": row[6], "claimToken": row[7], "leaseExpiresAt": row[8], "attempts": row[9], "outcome": json.loads(row[10]) if row[10] else None, "lastError": row[11], "updatedAt": row[12]}
+
+    def create_operational_failure_intent(self, round_id: str, request: Mapping[str, Any], capability: str, payload: Mapping[str, Any], *, now: str) -> tuple[dict[str, Any], bool]:
+        request_digest = self._round_request_digest(request)
+        capability_hash = _token_hash(capability)
+        payload_digest = hashlib.sha256(_dump_wire(payload).encode("utf-8")).hexdigest()
+        encoded = _dump_wire(payload)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or json.loads(row[0]) != dict(request) or row[1] != capability_hash or row[2] != capability or row[3] != "started" or row[4] is not None:
+                raise ValueError("operational failure round binding is invalid")
+            existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,payload_digest,payload_json FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
+            if existing is not None:
+                if existing[:4] != (request_digest, capability_hash, str(request["idempotencyKey"]), payload_digest) or existing[4] != encoded:
+                    raise ValueError("operational failure intent conflict")
+                inserted = False
+            else:
+                conflict = self.connection.execute("SELECT round_id FROM operational_failure_intents WHERE idempotency_key=? OR payload_digest=?", (str(request["idempotencyKey"]), payload_digest)).fetchone()
+                if conflict is not None and conflict[0] != round_id:
+                    raise ValueError("operational failure idempotency conflict")
+                self.connection.execute("INSERT INTO operational_failure_intents(round_id,request_digest,capability_hash,idempotency_key,payload_json,payload_digest,state,updated_at) VALUES (?,?,?,?,?,?, 'queued',?)", (round_id, request_digest, capability_hash, str(request["idempotencyKey"]), encoded, payload_digest, now))
+                inserted = True
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        record = self.operational_failure_intent(round_id)
+        if record is None:
+            raise ValueError("operational failure intent is missing")
+        return record, inserted
+
+    def claim_operational_failure(self, round_id: str, request: Mapping[str, Any], capability: str, *, owner_id: str, lease_expires_at: str, now: str) -> dict[str, Any] | None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            round_row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            intent = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,state,owner_id,claim_token,lease_expires_at FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
+            if round_row is None or intent is None or json.loads(round_row[0]) != dict(request) or round_row[1] != _token_hash(capability) or round_row[2] != capability or round_row[3] != "started" or round_row[4] is not None or intent[0] != self._round_request_digest(request) or intent[1] != _token_hash(capability) or intent[2] != str(request["idempotencyKey"]):
+                raise ValueError("operational failure claim binding is invalid")
+            if intent[3] == "accepted":
+                self.connection.execute("COMMIT")
+                return None
+            if intent[4] and intent[5] and intent[6]:
+                try:
+                    if datetime.fromisoformat(str(intent[6]).replace("Z", "+00:00")) > datetime.fromisoformat(now.replace("Z", "+00:00")):
+                        self.connection.execute("COMMIT")
+                        return None
+                except ValueError:
+                    raise ValueError("operational failure lease is invalid")
+            token = secrets.token_urlsafe(32)
+            self.connection.execute("UPDATE operational_failure_intents SET state='claimed',owner_id=?,claim_token=?,lease_expires_at=?,attempts=attempts+1,updated_at=? WHERE round_id=? AND state != 'accepted'", (owner_id, token, lease_expires_at, now, round_id))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self.operational_failure_intent(round_id)
+
+    def finish_operational_failure(self, round_id: str, owner_id: str, claim_token: str, *, accepted: bool, outcome: Mapping[str, Any] | None = None, error: str | None = None, now: str) -> dict[str, Any]:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT state FROM operational_failure_intents WHERE round_id=? AND owner_id=? AND claim_token=?", (round_id, owner_id, claim_token)).fetchone()
+            if row is None:
+                existing = self.operational_failure_intent(round_id)
+                if accepted and existing is not None and existing["state"] == "accepted":
+                    self.connection.execute("COMMIT")
+                    return existing
+                raise ValueError("operational failure claim is unavailable")
+            if accepted:
+                updated = self.connection.execute("UPDATE operational_failure_intents SET state='accepted',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,outcome_json=?,last_error=NULL,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (_dump_wire(outcome or {}), now, round_id, owner_id, claim_token))
+                if updated.rowcount != 1:
+                    raise ValueError("operational failure claim is unavailable")
+                round_update = self.connection.execute("UPDATE rounds SET dispatch_state='failed' WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL", (round_id,))
+                if round_update.rowcount != 1:
+                    raise ValueError("operational failure round state changed")
+            else:
+                updated = self.connection.execute("UPDATE operational_failure_intents SET state='forward-pending',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,outcome_json=?,last_error=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (_dump_wire(outcome or {}), error, now, round_id, owner_id, claim_token))
+                if updated.rowcount != 1:
+                    raise ValueError("operational failure claim is unavailable")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        record = self.operational_failure_intent(round_id)
+        if record is None:
+            raise ValueError("operational failure intent is missing")
+        return record
 
     @staticmethod
     def _round_request_digest(request: Mapping[str, Any]) -> str:

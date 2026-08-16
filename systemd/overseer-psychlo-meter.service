@@ -8,8 +8,11 @@ ConditionPathExists=%h/.config/overseer/psychlo-meter/producer-enabled
 Type=oneshot
 Environment=PYTHONPATH=%h/.local/share/overseer/project/src
 Environment=OVERSEER_CODEX_USAGE_SOURCE=codex-app-server
+Environment=CODEX_HOME=%d
+Environment=PATH=/home/god/.codex/packages/standalone/releases/0.147.0-x86_64-unknown-linux-musl/bin:/usr/bin
 ExecStart=%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python -m overseer.psychlo_usage_meter_cli --authority %h/.config/overseer/psychlo-usage-authority.json --meter-config %h/.config/overseer/psychlo-meter/config.json --private-key %d/psychlo-usage-authority-private-key --output %h/.local/share/overseer/psychlo-meter/latest-observation.json
 LoadCredential=psychlo-usage-authority-private-key:%h/.config/overseer/psychlo-usage-authority-private-key.pem
+LoadCredential=auth.json:%h/.codex/auth.json
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -17,6 +20,7 @@ ProtectHome=tmpfs
 BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/producer-enabled
 BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority.json
 BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/config.json
+BindReadOnlyPaths=/home/god/.codex/packages/standalone/releases/0.147.0-x86_64-unknown-linux-musl/bin/codex
 BindReadOnlyPaths=%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47
 BindReadOnlyPaths=%h/.local/share/overseer/project/src
 BindPaths=%h/.local/share/overseer/psychlo-meter

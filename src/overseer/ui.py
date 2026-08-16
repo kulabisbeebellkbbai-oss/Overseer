@@ -2497,7 +2497,7 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
           <div class="panel span-6">
             <div class="toolbar"><h3>Adapter Enablement</h3><div class="actions"><button class="action-btn" data-action="request-admin-adapter-enablement">Request</button><button class="action-btn" data-action="approve-admin-adapter-enablement">Approve</button></div></div>
             <div class="form-grid">
-              <div class="field span-4"><label for="admin-adapter-kind">Kind</label><select id="admin-adapter-kind">${adminKindOptions()}</select></div>
+              <div class="field span-4"><label for="admin-adapter-kind">Kind</label><select id="admin-adapter-kind">${adminAdapterKindOptions()}</select></div>
               <div class="field span-4"><label for="admin-adapter-requested-by">Requested By</label><input id="admin-adapter-requested-by" value="sisko"></div>
               <div class="field span-4"><label for="admin-adapter-approval-id">Approval ID</label><input id="admin-adapter-approval-id"></div>
               <div class="field span-4"><label for="admin-adapter-approved-by">Approved By</label><input id="admin-adapter-approved-by" value="sisko"></div>
@@ -3246,6 +3246,9 @@ OPERATOR_CONSOLE_HTML = """<!doctype html>
     }
     function adminKindOptions() {
       return ["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
+    }
+    function adminAdapterKindOptions() {
+      return ["psychlo_recurring_cycle_activation", ...["user_service_restart", "apt_install", "apt_update", "apt_upgrade", "firmware_update", "flatpak_install", "npm_global_install", "docker_compose_update", "storage_mount_test", "firewall_allow_tcp", "firewall_deny_tcp", "block_ip"]].map((value) => `<option value="${value}">${safe(value)}</option>`).join("");
     }
     function firmwareBlockerRows(items) {
       return (items || []).filter((item) => item.blocker_type).map((item) => ({

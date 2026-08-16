@@ -6,7 +6,7 @@ OnBootSec=3min
 OnUnitActiveSec=15min
 Persistent=true
 AccuracySec=1min
-Unit=overseer-psychlo-usage.service
+Unit=overseer-psychlo-cycle.service
 
 [Install]
 WantedBy=timers.target

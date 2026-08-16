@@ -50,6 +50,10 @@ from .admin import (
     unarchive_admin_change_plan,
 )
 from .python_venv import plan_python_hashed_venv_provision, python_venv_spec_from_metadata
+from .psychlo_cycle_activation import (
+    plan_psychlo_recurring_cycle_activation,
+    psychlo_cycle_activation_spec_from_private_file,
+)
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
@@ -4272,6 +4276,7 @@ def plan_admin_change_status(
     credential_file: str | None = None,
     filesystem_type: str = "cifs",
     python_venv_spec: dict[str, object] | None = None,
+    psychlo_cycle_spec=None,
 ) -> dict[str, object]:
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
@@ -4332,6 +4337,10 @@ def plan_admin_change_status(
             reason,
             current_state,
         )
+    elif plan_kind == AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION:
+        if psychlo_cycle_spec is None:
+            raise ValueError("psychlo_cycle_spec is required for psychlo_recurring_cycle_activation")
+        plan = plan_psychlo_recurring_cycle_activation(plan_id, psychlo_cycle_spec, reason, current_state)
     else:
         raise ValueError(f"unsupported admin change kind: {kind}")
     status = admin_change_plan_status(plan)
@@ -10691,6 +10700,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--python-venv-spec",
         help="JSON object (or path to JSON) for python_hashed_venv_provision immutable manifest",
     )
+    admin_plan_parser.add_argument(
+        "--psychlo-cycle-spec",
+        help="owner-only JSON manifest for psychlo_recurring_cycle_activation",
+    )
     admin_plan_parser.add_argument("--use-firewalld", action="store_true", help="stage firewalld-specific firewall_deny_tcp commands")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
@@ -12035,6 +12048,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             spec_source = Path(args.python_venv_spec)
             raw_spec = spec_source.read_text(encoding="utf-8") if spec_source.is_file() else args.python_venv_spec
             python_venv_spec = json.loads(raw_spec)
+        psychlo_cycle_spec = None
+        if args.psychlo_cycle_spec:
+            psychlo_cycle_spec = psychlo_cycle_activation_spec_from_private_file(args.psychlo_cycle_spec)
         print(
             json.dumps(
                 plan_admin_change_status(
@@ -12059,6 +12075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     credential_file=args.credential_file,
                     filesystem_type=args.filesystem_type,
                     python_venv_spec=python_venv_spec,
+                    psychlo_cycle_spec=psychlo_cycle_spec,
                 ),
                 sort_keys=True,
             )

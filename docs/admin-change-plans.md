@@ -22,6 +22,7 @@ Admin change plans are Overseer's bridge from observed host evidence to real IT 
 - `flatpak_install`
 - `npm_global_install`
 - `python_hashed_venv_provision`
+- `psychlo_recurring_cycle_activation`
 - `firewall_allow_tcp`
 - `firewall_deny_tcp`
 - `block_ip`
@@ -35,6 +36,7 @@ PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.apt.upgrade.sqlite --kind apt_upgrade --target sqlite3 --package sqlite3 --reason "apply approved patch"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.flatpak.obsidian --kind flatpak_install --target md.obsidian.Obsidian --reason "install approved local documentation editor"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.npm.obsidian-mcp --kind npm_global_install --target obsidian-mcp-server --reason "install approved Documents MCP bridge"
+PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.psychlo-recurring-cycle-activation.20260816 --kind psychlo_recurring_cycle_activation --target overseer-psychlo-usage.timer --psychlo-cycle-spec /home/god/.local/share/overseer/admin-manifests/psychlo-recurring-cycle-activation.20260816.json --reason "activate fresh signed accounting before every approved Psychlo scheduling cycle"
 PYTHONPATH=src python3 -m overseer.cli plan-admin-change --store state/overseer.sqlite3 --plan-id admin.firewall.8443 --kind firewall_allow_tcp --target tcp/8443 --port 8443 --reason "publish approved local service"
 PYTHONPATH=src python3 -m overseer.cli authorizations-required --store state/overseer.sqlite3
 PYTHONPATH=src python3 -m overseer.cli approve-admin-change --store state/overseer.sqlite3 --plan-id admin.restart.overseer-api --approved-by sisko
@@ -53,6 +55,8 @@ Recording approval does not execute the plan. It only updates the stored approva
 Live admin execution is now described by an explicit adapter capability table. Approved user-service restart plans are enabled by default. Package install, package index refresh, package upgrade, firewall allow/deny, and source-block adapters remain disabled unless the same store contains an approved adapter enablement request for that exact kind. The readiness view reports each plan's `adapter_status` so disabled live actions cannot be confused with ready Overseer execution. Use `admin-adapter-enablement-plan` or `GET /admin/adapter-enablement-plan` to generate the required read-only approval plan before any disabled adapter is enabled.
 
 Adapter enablement requests persist the human approval record for that work. Approval changes only the effective adapter capability for that store and kind; it does not approve any specific host change, modify the host, or run commands. Each admin plan must still pass its own approval, IDS review when applicable, command-boundary validation, execution recording, and verification.
+
+`psychlo_recurring_cycle_activation` is a disabled-by-default typed adapter. Its owner-only manifest binds the reviewed source commit and tree, exact hashes of the meter, delivery, cycle, and timer units, installed-unit and backup paths, the activation marker, credential path identities without credential contents, and the exact Codex executable digest. Execution runs one fresh meter-then-delivery canary before enabling the timer. Rollback disables recurrence first and preserves observations, attribution ledgers, projects, rounds, results, policies, and audit history.
 
 Canceling a plan keeps the record visible but removes it from the pending authorization queue and prevents execution. Use cancellation for placeholders, superseded plans, or plans created from disproven evidence.
 

@@ -1,0 +1,7 @@
+[Unit]
+Description=Produce and deliver one fresh authenticated Psychlo accounting snapshot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user start --wait overseer-psychlo-meter.service
+ExecStart=/usr/bin/systemctl --user start --wait overseer-psychlo-usage.service

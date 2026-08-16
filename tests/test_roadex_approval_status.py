@@ -1442,7 +1442,8 @@ def test_admin_terminal_projection_accepts_producer_permitted_missing_times(tmp_
         store.save_admin_change_plan(approve_admin_change_plan(plan, "operator"))
         approved_projection = roadex_approval_status(str(path), draft.approval_ref)
         assert approved_projection["decision"] == "approved"
-        assert approved_projection["updatedAt"] == binding.created_at
+        assert approved_projection["updatedAt"] != binding.created_at
+        assert approved_projection["updatedAt"].endswith("+00:00")
 
         store.save_admin_change_plan(
             cancel_admin_change_plan(

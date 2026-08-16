@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import ipaddress
 import subprocess
+from datetime import datetime, timezone
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import field
@@ -1303,6 +1304,8 @@ def approve_admin_change_plan(plan: AdminChangePlan, approved_by: str, approved_
         raise ValueError("cannot approve incomplete admin change plan")
     if not approved_by.strip():
         raise ValueError("approved_by is required")
+    if approved_at is None:
+        approved_at = datetime.now(timezone.utc).isoformat()
     return replace(plan, approved=True, approved_by=approved_by, approved_at=approved_at)
 
 

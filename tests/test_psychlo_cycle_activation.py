@@ -391,6 +391,26 @@ def test_verification_rejects_missing_or_infinite_next_trigger_without_completio
     assert not (spec.backup_directory / "completed.json").exists()
 
 
+@pytest.mark.parametrize(
+    "next_trigger",
+    ["15min", "3d 3h 47min 28.898386s", "250ms", "123456789"],
+)
+def test_next_timer_trigger_accepts_systemd_finite_timespans(next_trigger: str):
+    def systemctl(args):
+        return _completed(tuple(args), stdout=next_trigger)
+
+    assert cycle_activation._next_timer_trigger(systemctl, "example.timer") == next_trigger
+
+
+@pytest.mark.parametrize("next_trigger", ["garbage", "0s", "0min 0s", "1 fortnight"])
+def test_next_timer_trigger_rejects_malformed_or_zero_timespans(next_trigger: str):
+    def systemctl(args):
+        return _completed(tuple(args), stdout=next_trigger)
+
+    with pytest.raises(RuntimeError, match="next trigger"):
+        cycle_activation._next_timer_trigger(systemctl, "example.timer")
+
+
 def test_verification_accepts_finite_next_trigger_and_replay_rechecks_it(tmp_path: Path):
     spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
     plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")

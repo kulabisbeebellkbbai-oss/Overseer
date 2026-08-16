@@ -47,6 +47,10 @@ _EXPECTED_KEYS = {
 }
 _HEX_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_SYSTEMD_TIMESPAN_RE = re.compile(
+    r"(?P<value>\d+(?:\.\d+)?)(?:us|ms|s|min|h|d|w)"
+    r"(?:\s+(?P<tail>\d+(?:\.\d+)?)(?:us|ms|s|min|h|d|w))*"
+)
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_MARKER_BYTES = 128 * 1024
 
@@ -599,7 +603,7 @@ def _quiesce(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner
     return "loaded systemd state quiesced"
 
 
-def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> int:
+def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> str:
     """Return the timer's finite next monotonic trigger or fail closed."""
     completed = _run_checked(
         runner,
@@ -617,13 +621,16 @@ def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> int:
         raw = raw.strip()
     if not raw or raw.lower() in {"infinity", "n/a", "unknown"}:
         raise RuntimeError("recurring timer has no finite next trigger")
-    try:
-        value = int(raw, 10)
-    except ValueError as error:
-        raise RuntimeError("recurring timer next trigger is not an integer") from error
-    if value <= 0:
+    if raw.isdecimal():
+        if int(raw, 10) <= 0:
+            raise RuntimeError("recurring timer has no finite next trigger")
+        return raw
+    if _SYSTEMD_TIMESPAN_RE.fullmatch(raw) is None:
+        raise RuntimeError("recurring timer next trigger is not a valid systemd timespan")
+    numeric_parts = re.findall(r"\d+(?:\.\d+)?", raw)
+    if not any(any(character in "123456789" for character in part) for part in numeric_parts):
         raise RuntimeError("recurring timer has no finite next trigger")
-    return value
+    return raw
 
 
 def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:

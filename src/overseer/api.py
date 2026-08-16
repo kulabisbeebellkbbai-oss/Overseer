@@ -1399,7 +1399,10 @@ def make_api_handler(
                 if kind == "project-register":
                     result = request_bridge.register_project(message["payload"])
                 elif kind == "round-request":
-                    result = request_bridge.request_round(message["payload"])
+                    payload = message["payload"]
+                    if not isinstance(payload, dict) or set(payload) != {"request", "callbackCapability"}:
+                        raise ValueError("round request envelope is invalid")
+                    result = request_bridge.request_round(payload["request"], callback_capability=payload["callbackCapability"])
                 elif kind == "round-reconcile":
                     result = request_bridge.reconcile_round(message["payload"])
                 elif kind == "decision-stage":

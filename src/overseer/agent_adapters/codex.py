@@ -6,10 +6,13 @@ import csv
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
+import time
 from typing import Protocol
 
 from ..agent_contracts import (
@@ -32,6 +35,7 @@ from .base_cli import CliCommandRunner, CliOutputLimitExceeded
 
 DEFAULT_CODEX_PROJECTS_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 DEFAULT_CODEX_MEMORY_SESSION = Path("/home/god/.local/bin/codex-memory-session")
+DEFAULT_CODEX_STATE_DATABASE = Path("/home/god/.codex/state_5.sqlite")
 DEFAULT_TMUX = Path("/usr/bin/tmux")
 PROMPT_REJECTION_MARKERS = (
     "message exceeds maximum length",
@@ -89,6 +93,101 @@ class LegacyPromptDetails:
     stderr: str = ""
 
 
+class PromptDeliveryEvidence(Protocol):
+    """Bounded evidence reader for one exact prompt dispatch."""
+
+    def confirm(self, prompt: str) -> bool: ...
+
+
+class RolloutPromptDeliveryEvidence:
+    """Confirm a prompt through the newly appended Codex rollout records."""
+
+    def __init__(self, session: AgentSession, *, state_database: str | Path = DEFAULT_CODEX_STATE_DATABASE) -> None:
+        self._rollout = _rollout_path_for_session(session, Path(state_database))
+        metadata = self._rollout.stat(follow_symlinks=False)
+        self._identity = (metadata.st_dev, metadata.st_ino)
+        self._offset = metadata.st_size
+
+    def confirm(self, prompt: str) -> bool:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                descriptor = os.open(self._rollout, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    metadata = os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) != self._identity:
+                        return False
+                    appended = os.pread(descriptor, 256 * 1024, self._offset).decode("utf-8")
+                finally:
+                    os.close(descriptor)
+            except (OSError, UnicodeError):
+                return False
+            for line in appended.splitlines():
+                try:
+                    record = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if _rollout_user_prompt(record) == prompt:
+                    return True
+            time.sleep(0.25)
+        return False
+
+
+def _rollout_path_for_session(session: AgentSession, state_database: Path) -> Path:
+    conversation_id = session.external_session_id or session.id
+    try:
+        with sqlite3.connect(f"file:{state_database}?mode=ro", uri=True, timeout=1.0) as database:
+            row = database.execute("SELECT rollout_path FROM threads WHERE id = ?", (conversation_id,)).fetchone()
+    except (OSError, sqlite3.Error) as error:
+        raise ValueError("Codex rollout index is unavailable") from error
+    if row is None or not isinstance(row[0], str) or not row[0].strip():
+        raise ValueError("Codex rollout is not bound to the conversation")
+    rollout = Path(row[0])
+    if not rollout.is_absolute():
+        raise ValueError("Codex rollout path is not absolute")
+    try:
+        resolved = rollout.resolve(strict=True)
+        sessions_root = Path("/home/god/.codex/sessions").resolve(strict=True)
+        relative = resolved.relative_to(sessions_root)
+        metadata = resolved.stat()
+    except (OSError, ValueError) as error:
+        raise ValueError("Codex rollout path is not private") from error
+    # Codex currently creates its private state tree as 0775/0664 under the
+    # user's primary, single-member group. Trust that existing boundary while
+    # rejecting a foreign group, any world-writable file, or a non-owner file.
+    if not resolved.is_file() or metadata.st_uid != os.getuid() or metadata.st_gid != os.getegid() or metadata.st_mode & 0o002:
+        raise ValueError("Codex rollout path is not private")
+    current = sessions_root
+    for component in relative.parts[:-1]:
+        current = current / component
+        parent = current.stat(follow_symlinks=False)
+        if not current.is_dir() or parent.st_uid != os.getuid() or parent.st_gid != os.getegid() or parent.st_mode & 0o002:
+            raise ValueError("Codex rollout path is not private")
+    return resolved
+
+
+def _rollout_user_prompt(record: object) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+        message = payload.get("message")
+        return message if isinstance(message, str) else None
+    if record.get("type") != "response_item" or payload.get("role") != "user" or payload.get("type") != "message":
+        return None
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    text = "".join(
+        item.get("text", "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "input_text" and isinstance(item.get("text", ""), str)
+    )
+    return text or None
+
+
 class CodexDriver:
     """Provider-neutral Codex behavior with legacy tmux compatibility."""
 
@@ -101,6 +200,7 @@ class CodexDriver:
         tmux_path: str | Path = DEFAULT_TMUX,
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: BoundedCommandRunner | None = None,
+        delivery_evidence_factory=None,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
             raise ValueError("CodexDriver requires the codex provider and adapter")
@@ -139,6 +239,7 @@ class CodexDriver:
             raise TypeError("Codex runner must implement bounded command capture")
         self._legacy_resume_details: dict[str, LegacyResumeDetails] = {}
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
+        self.delivery_evidence_factory = delivery_evidence_factory or (lambda session: RolloutPromptDeliveryEvidence(session))
 
     @classmethod
     def from_legacy_registry(
@@ -152,6 +253,7 @@ class CodexDriver:
         tmux_path: str | Path = DEFAULT_TMUX,
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: CliCommandRunner | SubprocessRunner | None = None,
+        delivery_evidence_factory=None,
     ) -> CodexDriver:
         selected_provider = provider or AgentProvider(
             id="codex",
@@ -175,6 +277,7 @@ class CodexDriver:
             tmux_path=tmux_path,
             codex_memory_session_path=codex_memory_session_path,
             runner=runner,
+            delivery_evidence_factory=delivery_evidence_factory,
         )
 
     def discover(self, workspace: str | None = None) -> tuple[AgentSession, ...]:
@@ -347,6 +450,7 @@ class CodexDriver:
         prompt: str,
         *,
         idempotency_key: str | None = None,
+        prompt_marker: str | None = None,
     ) -> AgentDispatchResult:
         """Dispatch the exact legacy prompt without weakening the generic DTO."""
 
@@ -362,6 +466,7 @@ class CodexDriver:
             resolved,
             request,
             prompt_text=prompt,
+            prompt_marker=prompt_marker,
         )
 
     def prepare_legacy_dispatch(
@@ -629,7 +734,9 @@ class CodexDriver:
         request: AgentDispatchRequest,
         *,
         prompt_text: str | None = None,
+        prompt_marker: str | None = None,
     ) -> AgentDispatchResult:
+        dispatch_prompt = request.prompt if prompt_text is None else prompt_text
         resume_result, resume_details = self._resume_session(
             session,
             request_id=f"{request.id}.resume",
@@ -657,6 +764,19 @@ class CodexDriver:
             )
             self._legacy_prompt_details[result.id] = details
             return result
+        delivery_evidence: PromptDeliveryEvidence | None = None
+        if prompt_marker is not None:
+            try:
+                delivery_evidence = self.delivery_evidence_factory(session)
+            except (OSError, ValueError):
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="delivery_unconfirmed",
+                    reason="codex rollout is not bound to the exact conversation",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                )
         pane_command = self._capture_pane_command(session)
         baseline_result = self._run(pane_command)
         baseline_output = (
@@ -664,7 +784,7 @@ class CodexDriver:
         )
         prompt_result = self._run(
             [str(self.tmux_path), "load-buffer", "-b", "overseer-dispatch", "-"],
-            input_text=request.prompt if prompt_text is None else prompt_text,
+            input_text=dispatch_prompt,
         )
         if prompt_result.returncode != 0:
             return self._prompt_failure(
@@ -746,6 +866,39 @@ class CodexDriver:
                 stdout=pane_result.stdout,
                 stderr=pane_result.stderr,
             )
+        # A successful tmux paste/send-keys sequence only proves that tmux
+        # accepted the commands.  A resumed legacy session may still be idle
+        # (or attached to a stale Codex process), in which case treating the
+        # sequence as an ACK falsely confirms this bounded round.  Require a
+        # successful pane capture whose content changed after submission as
+        # the minimum observable delivery proof.  The bridge persists the
+        # resulting dispatch only after this boundary.
+        if delivery_evidence is not None and (baseline_result.returncode != 0 or pane_result.returncode != 0):
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex project did not confirm prompt delivery",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                prompt_exit_code=prompt_result.returncode,
+                enter_exit_code=enter_result.returncode,
+                stdout=pane_result.stdout,
+                stderr=pane_result.stderr,
+            )
+        if delivery_evidence is not None and not delivery_evidence.confirm(dispatch_prompt):
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex rollout did not record the exact prompt",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                prompt_exit_code=prompt_result.returncode,
+                enter_exit_code=enter_result.returncode,
+                stdout=pane_result.stdout,
+                stderr=pane_result.stderr,
+            )
         reason = "prompt submitted to codex project; advisory result not yet confirmed"
         details = LegacyPromptDetails(
             status="prompt_dispatched",
@@ -766,6 +919,11 @@ class CodexDriver:
             status=details.status,
             reason=reason,
             exit_code=enter_result.returncode,
+            evidence={
+                "prompt_digest": hashlib.sha256(dispatch_prompt.encode("utf-8")).hexdigest(),
+                "delivery_proof": "rollout-user-message" if delivery_evidence is not None else "legacy-tmux-advisory",
+                **({"prompt_marker": prompt_marker} if prompt_marker is not None else {}),
+            },
         )
         self._legacy_prompt_details[result.id] = details
         return result
@@ -832,6 +990,7 @@ class CodexDriver:
         status: str,
         reason: str,
         exit_code: int | None = None,
+        evidence: dict[str, object] | None = None,
     ) -> AgentDispatchResult:
         return AgentDispatchResult(
             id=f"result.{_identifier_part(request_id)}",
@@ -847,6 +1006,7 @@ class CodexDriver:
                 "status": status,
                 "reason": reason,
                 **({"exit_code": exit_code} if exit_code is not None else {}),
+                **(evidence or {}),
             },
         )
 

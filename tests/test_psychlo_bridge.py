@@ -2131,6 +2131,8 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
     assert accepted == {"accepted": True}
     assert forwarded == [("round-result", "result:1", result)]
     assert bridge.request_round(request) == receipt
+    with pytest.raises(ValueError, match="callback capability"):
+        bridge.request_round(request, callback_capability="capability:different-round-binding")
 
 
 def test_round_completion_timing_uses_trusted_receipt_time_not_lead_occurred_at(tmp_path: Path):

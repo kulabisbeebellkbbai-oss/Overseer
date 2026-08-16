@@ -278,9 +278,10 @@ def _canonical_plan(
         current_state=current_state,
         proposed_state=f"install reviewed Psychlo accounting cycle and enable {spec.timer_unit} after a successful canary",
         steps=(
+            AdminCommandStep("Quiesce loaded systemd drift", ("__overseer_psychlo_cycle_quiesce", *marker_args), "normalize loaded unit state before backup"),
             AdminCommandStep("Back up current unit and timer state", ("__overseer_psychlo_cycle_backup", *marker_args), "preserve exact rollback state"),
             AdminCommandStep("Install reviewed cycle units", ("__overseer_psychlo_cycle_install_units", *marker_args), "install only approved unit bytes"),
-            AdminCommandStep("Publish producer activation marker", ("__overseer_psychlo_cycle_publish_marker", *marker_args), "activate the reviewed credential boundary"),
+            AdminCommandStep("Verify producer activation marker", ("__overseer_psychlo_cycle_publish_marker", *marker_args), "preserve the reviewed credential boundary"),
             AdminCommandStep("Reload user systemd", ("__overseer_psychlo_cycle_daemon_reload", *marker_args), "load approved unit bytes"),
             AdminCommandStep("Run one accounting-cycle canary", ("__overseer_psychlo_cycle_canary", *marker_args), "prove fresh observation and durable receipt"),
             AdminCommandStep("Enable recurring timer", ("__overseer_psychlo_cycle_enable_timer", *marker_args), "enable recurrence only after canary success"),
@@ -465,10 +466,6 @@ def _ownership(plan_id: str, digest: str) -> dict[str, str]:
     return {"planId": plan_id, "specDigest": digest}
 
 
-def _ownership_marker_bytes(plan_id: str, digest: str) -> bytes:
-    return (_canonical_json(_ownership(plan_id, digest)) + "\n").encode()
-
-
 def _backup_record(spec: PsychloCycleActivationSpec) -> Path:
     return spec.backup_directory / "record.json"
 
@@ -558,22 +555,48 @@ def _marker_snapshot_matches(left: dict[str, object], right: dict[str, object]) 
     return left == right
 
 
-def _restore_activation_marker(path: Path, snapshot: dict[str, object]) -> None:
-    snapshot = _validate_marker_snapshot(snapshot)
-    if snapshot["present"] is False:
-        if path.exists() or path.is_symlink():
-            _owner_only_regular(path, "Psychlo cycle activation marker")
-            path.unlink()
-        return
-    content = base64.b64decode(str(snapshot["content"]), validate=True)
-    _atomic_write(path, content, int(snapshot["mode"]))
-
-
 def _run_checked(runner: SystemctlRunner, args: Sequence[str], label: str) -> subprocess.CompletedProcess[str]:
     completed = runner(args)
     if completed.returncode != 0:
         raise RuntimeError(f"{label} failed: {completed.stderr.strip()[:300]}")
     return completed
+
+
+def _need_daemon_reload(runner: SystemctlRunner, timer_unit: str) -> bool:
+    completed = _run_checked(
+        runner,
+        ("show", timer_unit, "--property=NeedDaemonReload", "--value"),
+        "query loaded systemd state",
+    )
+    raw = completed.stdout.strip()
+    if "=" in raw:
+        property_name, raw = raw.split("=", 1)
+        if property_name != "NeedDaemonReload":
+            raise RuntimeError("loaded systemd state property is invalid")
+        raw = raw.strip()
+    if raw not in {"yes", "no"}:
+        raise RuntimeError("loaded systemd state is invalid")
+    return raw == "yes"
+
+
+def _units_need_daemon_reload(runner: SystemctlRunner, spec: PsychloCycleActivationSpec) -> bool:
+    states = tuple(_need_daemon_reload(runner, unit) for unit in spec.unit_names)
+    return any(states)
+
+
+def _quiesce(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
+    del plan_id, digest
+    if not _units_need_daemon_reload(runner, spec):
+        return "loaded systemd state already current"
+    _run_checked(
+        runner,
+        ("disable", "--now", spec.timer_unit),
+        "quiesce recurring timer before systemd reload",
+    )
+    _run_checked(runner, ("daemon-reload",), "quiesce user systemd reload")
+    if _units_need_daemon_reload(runner, spec):
+        raise RuntimeError("loaded systemd state remains stale after quiesce")
+    return "loaded systemd state quiesced"
 
 
 def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> int:
@@ -613,6 +636,8 @@ def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner:
         return "backup replay verified"
     if spec.backup_directory.exists():
         raise ValueError("unowned Psychlo cycle backup directory already exists")
+    if _units_need_daemon_reload(runner, spec):
+        raise RuntimeError("loaded systemd state must be quiesced before backup")
     enabled = runner(("is-enabled", spec.timer_unit)).returncode == 0
     units: dict[str, object] = {}
     for name in spec.unit_names:
@@ -665,24 +690,13 @@ def _publish_marker(plan_id: str, digest: str, spec: PsychloCycleActivationSpec)
         else None
     )
     current = _capture_activation_marker(spec.activation_marker)
-    current_bytes = _ownership_marker_bytes(plan_id, digest)
-    current_is_exact_replay = (
-        current.get("present") is True
-        and current.get("sha256") == hashlib.sha256(current_bytes).hexdigest()
-        and base64.b64decode(str(current["content"]), validate=True) == current_bytes
-        and current.get("mode") == 0o600
-    )
-    if current_is_exact_replay:
-        return "activation marker replay verified"
     if predecessor is None:
         raise ValueError("Psychlo cycle backup lacks predecessor activation marker snapshot")
+    if predecessor["present"] is not True:
+        raise ValueError("Psychlo cycle activation requires a pre-existing reviewed marker")
     if not _marker_snapshot_matches(current, predecessor):
         raise ValueError("Psychlo cycle predecessor activation marker changed")
-    if predecessor["present"] is False:
-        _atomic_create(spec.activation_marker, current_bytes, 0o600)
-    else:
-        _atomic_write(spec.activation_marker, current_bytes, 0o600)
-    return "activation marker published"
+    return "predecessor activation marker preserved"
 
 
 def _observation_identity() -> tuple[str | None, str | None]:
@@ -737,14 +751,7 @@ def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runne
         else {"present": False}
     )
     current = _capture_activation_marker(spec.activation_marker)
-    current_bytes = _ownership_marker_bytes(plan_id, digest)
-    current_is_exact_owner = (
-        current.get("present") is True
-        and current.get("sha256") == hashlib.sha256(current_bytes).hexdigest()
-        and base64.b64decode(str(current["content"]), validate=True) == current_bytes
-        and current.get("mode") == 0o600
-    )
-    if not current_is_exact_owner and not _marker_snapshot_matches(current, predecessor):
+    if not _marker_snapshot_matches(current, predecessor):
         raise ValueError("Psychlo cycle activation marker changed during rollback")
     _run_checked(
         runner,
@@ -769,7 +776,6 @@ def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runne
     after_restore = _capture_activation_marker(spec.activation_marker)
     if not _marker_snapshot_matches(after_restore, current):
         raise ValueError("Psychlo cycle activation marker changed during rollback")
-    _restore_activation_marker(spec.activation_marker, predecessor)
     _run_checked(runner, ("daemon-reload",), "user systemd rollback reload")
     if record.get("timerPreviouslyEnabled") is True:
         _run_checked(runner, ("enable", "--now", spec.timer_unit), "restore prior timer state")
@@ -785,7 +791,9 @@ def execute_psychlo_cycle_activation_marker(
     runner = systemctl_runner or _default_systemctl
     operation = command[0]
     try:
-        if operation == "__overseer_psychlo_cycle_backup":
+        if operation == "__overseer_psychlo_cycle_quiesce":
+            result = _quiesce(plan_id, digest, spec, runner)
+        elif operation == "__overseer_psychlo_cycle_backup":
             result = _backup(plan_id, digest, spec, runner)
         elif operation == "__overseer_psychlo_cycle_install_units":
             result = _install(plan_id, digest, spec)
@@ -801,7 +809,14 @@ def execute_psychlo_cycle_activation_marker(
             result = "recurring timer enabled"
         elif operation == "__overseer_psychlo_cycle_verify":
             _verify_installed(spec)
-            _load_owned_json(spec.activation_marker, _ownership(plan_id, digest), "Psychlo cycle activation marker")
+            expected = _ownership(plan_id, digest)
+            record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
+            predecessor = _validate_marker_snapshot(record.get("activationMarker"))
+            current = _capture_activation_marker(spec.activation_marker)
+            if predecessor["present"] is not True:
+                raise ValueError("Psychlo cycle activation marker is missing")
+            if not _marker_snapshot_matches(current, predecessor):
+                raise ValueError("Psychlo cycle activation marker changed during verification")
             _run_checked(runner, ("is-enabled", spec.timer_unit), "verify recurring timer enabled")
             _run_checked(runner, ("is-active", spec.timer_unit), "verify recurring timer active")
             _next_timer_trigger(runner, spec.timer_unit)
@@ -830,7 +845,11 @@ def psychlo_cycle_activation_replay_verified(
         spec = validate_psychlo_cycle_activation_plan(plan)
         expected = _ownership(plan.id, psychlo_cycle_activation_plan_digest(spec))
         _load_owned_json(_completion_record(spec), expected, "Psychlo cycle completion record")
-        _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+        record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
+        predecessor = _validate_marker_snapshot(record.get("activationMarker"))
+        current = _capture_activation_marker(spec.activation_marker)
+        if predecessor["present"] is not True or not _marker_snapshot_matches(current, predecessor):
+            return False
         _verify_installed(spec)
         runner = systemctl_runner or _default_systemctl
         if runner(("is-enabled", spec.timer_unit)).returncode != 0:

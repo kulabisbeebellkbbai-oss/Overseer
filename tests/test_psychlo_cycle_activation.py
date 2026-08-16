@@ -185,9 +185,20 @@ def _completed(args: tuple[str, ...], returncode: int = 0, *, stdout: str = "ok"
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
 
 
+def _is_reload_query(value: tuple[str, ...]) -> bool:
+    return value[0] == "show" and "--property=NeedDaemonReload" in value
+
+
+def _is_next_trigger_query(value: tuple[str, ...]) -> bool:
+    return value[0] == "show" and "--property=NextElapseUSecMonotonic" in value
+
+
 def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
     plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    predecessor = b'{"planId":"admin.predecessor","specDigest":"prior-digest"}\n'
+    spec.activation_marker.write_bytes(predecessor)
+    spec.activation_marker.chmod(0o600)
     calls: list[tuple[str, ...]] = []
 
     def systemctl(args):
@@ -196,7 +207,13 @@ def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, m
         return _completed(
             value,
             1 if value[0] == "is-enabled" and len(calls) == 1 else 0,
-            stdout="123456789" if value[0] == "show" else "ok",
+            stdout=(
+                "123456789"
+                if _is_next_trigger_query(value)
+                else "no"
+                if _is_reload_query(value)
+                else "ok"
+            ),
         )
 
     observations = iter((("old", "old-digest"), ("new", "new-digest")))
@@ -210,6 +227,8 @@ def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, m
 
     assert (code, error) == (0, "")
     assert calls == [
+        *(("show", unit, "--property=NeedDaemonReload", "--value") for unit in spec.unit_names),
+        *(("show", unit, "--property=NeedDaemonReload", "--value") for unit in spec.unit_names),
         ("is-enabled", "overseer-psychlo-usage.timer"),
         ("daemon-reload",),
         ("start", "--wait", "overseer-psychlo-cycle.service"),
@@ -218,10 +237,123 @@ def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, m
         ("is-active", "overseer-psychlo-usage.timer"),
         ("show", "overseer-psychlo-usage.timer", "--property=NextElapseUSecMonotonic", "--value"),
     ]
-    assert json.loads(spec.activation_marker.read_text())["planId"] == plan.id
+    assert spec.activation_marker.read_bytes() == predecessor
     for name, digest in spec.unit_sha256:
         assert hashlib.sha256((spec.installed_unit_directory / name).read_bytes()).hexdigest() == digest
     assert psychlo_cycle_activation_replay_verified(plan, systemctl_runner=systemctl) is True
+
+
+def test_quiesce_normalizes_loaded_unit_drift_before_backup(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    calls: list[tuple[str, ...]] = []
+    need_reload = True
+    enabled = True
+
+    def systemctl(args):
+        nonlocal need_reload, enabled
+        value = tuple(args)
+        calls.append(value)
+        if _is_reload_query(value):
+            return _completed(value, stdout="yes" if need_reload else "no")
+        if value[:2] == ("disable", "--now"):
+            enabled = False
+            return _completed(value)
+        if value[0] == "daemon-reload":
+            need_reload = False
+            return _completed(value)
+        if value[0] == "is-enabled":
+            return _completed(value, 0 if enabled else 1)
+        return _completed(value)
+
+    assert execute_psychlo_cycle_activation_marker(plan.steps[0].command, systemctl_runner=systemctl)[0] == 0
+    assert execute_psychlo_cycle_activation_marker(plan.steps[1].command, systemctl_runner=systemctl)[0] == 0
+    record = json.loads((spec.backup_directory / "record.json").read_text())
+
+    assert calls == [
+        *(("show", unit, "--property=NeedDaemonReload", "--value") for unit in spec.unit_names),
+        ("disable", "--now", spec.timer_unit),
+        ("daemon-reload",),
+        *(("show", unit, "--property=NeedDaemonReload", "--value") for unit in spec.unit_names),
+        *(("show", unit, "--property=NeedDaemonReload", "--value") for unit in spec.unit_names),
+        ("is-enabled", spec.timer_unit),
+    ]
+    assert record["timerPreviouslyEnabled"] is False
+
+    assert execute_psychlo_cycle_activation_marker(plan.rollback_steps[0].command, systemctl_runner=systemctl)[0] == 0
+    assert ("enable", "--now", spec.timer_unit) not in calls
+
+
+def test_quiesce_without_loaded_drift_preserves_enabled_rollback_baseline(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(args):
+        value = tuple(args)
+        calls.append(value)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
+        if value[0] == "is-enabled":
+            return _completed(value)
+        return _completed(value)
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+    assert execute_psychlo_cycle_activation_marker(plan.rollback_steps[0].command, systemctl_runner=systemctl)[0] == 0
+
+    assert ("enable", "--now", spec.timer_unit) in calls
+
+
+def test_predecessor_marker_is_never_replaced_during_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.successor", spec, "activate", "disabled")
+    predecessor = b'{"planId":"admin.predecessor","specDigest":"prior-digest"}\n'
+    spec.activation_marker.write_bytes(predecessor)
+    spec.activation_marker.chmod(0o600)
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0, stdout="no" if value[0] == "show" else "ok")
+
+    for step in plan.steps[:3]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+
+    original_atomic_write = cycle_activation._atomic_write
+
+    def fail_if_marker_replaced(path, content, mode):
+        if path == spec.activation_marker:
+            raise AssertionError("predecessor marker must not be replaced")
+        return original_atomic_write(path, content, mode)
+
+    monkeypatch.setattr(cycle_activation, "_atomic_write", fail_if_marker_replaced)
+    code, _, error = execute_psychlo_cycle_activation_marker(plan.steps[3].command, systemctl_runner=systemctl)
+
+    assert (code, error) == (0, "")
+    assert spec.activation_marker.read_bytes() == predecessor
+
+
+def test_publish_rejects_missing_predecessor_marker_without_creating_one(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.initial", spec, "activate", "disabled")
+
+    def systemctl(args):
+        value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:3]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.steps[3].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert code == 1
+    assert "pre-existing reviewed marker" in error
+    assert not spec.activation_marker.exists()
 
 
 @pytest.mark.parametrize("next_trigger", ["", "0", "infinity", "Infinity"])
@@ -242,7 +374,12 @@ def test_verification_rejects_missing_or_infinite_next_trigger_without_completio
 
     def systemctl(args):
         value = tuple(args)
-        return _completed(value, stdout=next_trigger if value[0] == "show" else "ok")
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
+        return _completed(value, stdout=next_trigger if _is_next_trigger_query(value) else "ok")
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
 
     code, _, error = execute_psychlo_cycle_activation_marker(
         plan.verification_steps[0].command,
@@ -266,7 +403,12 @@ def test_verification_accepts_finite_next_trigger_and_replay_rechecks_it(tmp_pat
 
     def finite_systemctl(args):
         value = tuple(args)
-        return _completed(value, stdout="123456789" if value[0] == "show" else "ok")
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
+        return _completed(value, stdout="123456789" if _is_next_trigger_query(value) else "ok")
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=finite_systemctl)[0] == 0
 
     code, _, error = execute_psychlo_cycle_activation_marker(
         plan.verification_steps[0].command,
@@ -280,7 +422,7 @@ def test_verification_accepts_finite_next_trigger_and_replay_rechecks_it(tmp_pat
 
     def infinite_systemctl(args):
         value = tuple(args)
-        return _completed(value, stdout="infinity" if value[0] == "show" else "ok")
+        return _completed(value, stdout="infinity" if _is_next_trigger_query(value) else "ok")
 
     assert psychlo_cycle_activation_replay_verified(plan, systemctl_runner=infinite_systemctl) is False
     assert completion.read_bytes() == before
@@ -322,9 +464,11 @@ def test_rollback_restores_partial_install_before_marker_publication(tmp_path: P
 
     def systemctl(args):
         value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
         return _completed(value, 1 if value[0] == "is-enabled" else 0)
 
-    for step in plan.steps[:2]:
+    for step in plan.steps[:3]:
         assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
     assert not spec.activation_marker.exists()
     assert (spec.installed_unit_directory / spec.cycle_unit).exists()
@@ -342,14 +486,18 @@ def test_rollback_fails_closed_when_timer_cannot_be_disabled(tmp_path: Path):
     plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
     old_meter = b"old-meter-unit\n"
     (spec.installed_unit_directory / spec.meter_unit).write_bytes(old_meter)
+    spec.activation_marker.write_bytes(b'{"planId":"admin.predecessor","specDigest":"prior-digest"}\n')
+    spec.activation_marker.chmod(0o600)
 
     def systemctl(args):
         value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
         if value[:2] == ("disable", "--now"):
             return _completed(value, 1)
         return _completed(value, 1 if value[0] == "is-enabled" else 0)
 
-    for step in plan.steps[:3]:
+    for step in plan.steps[:4]:
         assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
     installed_meter = (spec.installed_unit_directory / spec.meter_unit).read_bytes()
     marker = spec.activation_marker.read_bytes()
@@ -403,21 +551,20 @@ def test_successor_plan_hands_off_existing_predecessor_marker(tmp_path: Path):
 
     def systemctl(args):
         value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
         return _completed(value, 1 if value[0] == "is-enabled" else 0)
 
-    for step in plan.steps[:2]:
+    for step in plan.steps[:3]:
         assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
 
     code, _, error = execute_psychlo_cycle_activation_marker(
-        plan.steps[2].command,
+        plan.steps[3].command,
         systemctl_runner=systemctl,
     )
 
     assert (code, error) == (0, "")
-    assert json.loads(spec.activation_marker.read_text()) == {
-        "planId": plan.id,
-        "specDigest": psychlo_cycle_activation_plan_digest(spec),
-    }
+    assert spec.activation_marker.read_bytes() == predecessor
     record = json.loads((spec.backup_directory / "record.json").read_text())
     assert record["activationMarker"]["present"] is True
     assert record["activationMarker"]["content"]
@@ -432,15 +579,17 @@ def test_successor_publish_rejects_tampered_predecessor_marker(tmp_path: Path):
 
     def systemctl(args):
         value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
         return _completed(value, 1 if value[0] == "is-enabled" else 0)
 
-    for step in plan.steps[:2]:
+    for step in plan.steps[:3]:
         assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
     tampered = b'{"planId":"attacker","specDigest":"changed"}\n'
     spec.activation_marker.write_bytes(tampered)
 
     code, _, error = execute_psychlo_cycle_activation_marker(
-        plan.steps[2].command,
+        plan.steps[3].command,
         systemctl_runner=systemctl,
     )
 
@@ -460,9 +609,11 @@ def test_rollback_allows_unchanged_predecessor_before_publish(tmp_path: Path):
 
     def systemctl(args):
         value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
         return _completed(value, 1 if value[0] == "is-enabled" else 0)
 
-    for step in plan.steps[:2]:
+    for step in plan.steps[:3]:
         assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
 
     code, _, error = execute_psychlo_cycle_activation_marker(
@@ -486,11 +637,13 @@ def test_rollback_restores_predecessor_marker_bytes_and_mode_exactly(tmp_path: P
 
     def systemctl(args):
         value = tuple(args)
+        if _is_reload_query(value):
+            return _completed(value, stdout="no")
         return _completed(value, 1 if value[0] == "is-enabled" else 0)
 
-    for step in plan.steps[:3]:
+    for step in plan.steps[:4]:
         assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
-    assert spec.activation_marker.read_bytes() != predecessor
+    assert spec.activation_marker.read_bytes() == predecessor
 
     code, _, error = execute_psychlo_cycle_activation_marker(
         plan.rollback_steps[0].command,

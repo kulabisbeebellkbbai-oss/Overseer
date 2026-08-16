@@ -3051,7 +3051,7 @@ def _uncertain_round_request():
 def test_reports_uncertain_round_failure_only_after_absent_full_rollout_scan_and_peer_acceptance(tmp_path: Path):
     dispatcher = _OperationalFailureDispatcher()
     sent = []
-    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatcher, sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True, "projectId": "arcade", "failureCount": 1}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-1234567890")
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatcher, sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-1234567890")
     request = _uncertain_round_request()
     with pytest.raises(RuntimeError, match="provider unavailable"):
         bridge.request_round(request)
@@ -3093,7 +3093,7 @@ def test_operational_failure_retry_reuses_exact_payload_and_fences_claim(tmp_pat
         calls.append((kind, message_id, dict(payload)))
         if not accepted["value"]:
             return {"accepted": False}
-        return {"accepted": True, "projectId": "arcade", "failureCount": 1}
+        return {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1}
     path = tmp_path / "bridge.sqlite3"
     bridge = PsychloBridge(store=PsychloBridgeStore(path), dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-retry-1234567890")
     request = _uncertain_round_request()
@@ -3107,3 +3107,23 @@ def test_operational_failure_retry_reuses_exact_payload_and_fences_claim(tmp_pat
     assert calls[0][2] == calls[1][2]
     assert calls[0][2]["callbackCapability"] == "capability:operational-failure-retry-1234567890"
     assert restarted.store.get_round(request["roundId"])[4] == "failed"
+
+
+@pytest.mark.parametrize("response", [
+    {"accepted": True, "projectId": "arcade", "failureCount": 1},
+    {"accepted": True, "inserted": "yes", "projectId": "arcade", "failureCount": 1},
+    {"accepted": True, "inserted": True, "projectId": "wrong-project", "failureCount": 1},
+    {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 0},
+    {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1, "status_code": 500},
+])
+def test_operational_failure_requires_exact_durable_peer_acceptance(tmp_path: Path, response: dict):
+    dispatcher = _OperationalFailureDispatcher()
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatcher, sender=lambda *_args: response, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:operational-failure-invalid-receipt-1234567890")
+    request = _uncertain_round_request()
+    with pytest.raises(RuntimeError):
+        bridge.request_round(request)
+    with pytest.raises(ValueError, match="rejected"):
+        bridge.report_operational_failure(request["roundId"], "provider-timeout")
+    assert bridge.store.get_round(request["roundId"])[4] == "started"
+    assert bridge.store.get_round(request["roundId"])[5] is None
+    assert bridge.store.operational_failure_intent(request["roundId"])["state"] == "forward-pending"

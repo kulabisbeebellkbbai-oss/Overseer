@@ -2558,7 +2558,14 @@ def _require_operational_failure_report(report: Mapping[str, Any], request: Mapp
 
 
 def _require_operational_failure_acceptance(response: Mapping[str, Any], project_id: str) -> None:
-    if not isinstance(response, Mapping) or response.get("accepted") is not True or response.get("projectId") != project_id or isinstance(response.get("failureCount"), bool) or not isinstance(response.get("failureCount"), int) or response["failureCount"] < 1:
+    if not isinstance(response, Mapping):
+        raise ValueError("Psychlo rejected operational failure")
+    allowed = {"accepted", "inserted", "projectId", "failureCount", "status_code"}
+    if set(response) - allowed or set(response) not in ({"accepted", "inserted", "projectId", "failureCount"}, allowed):
+        raise ValueError("Psychlo rejected operational failure")
+    if response.get("accepted") is not True or not isinstance(response.get("inserted"), bool) or response.get("projectId") != project_id or isinstance(response.get("failureCount"), bool) or not isinstance(response.get("failureCount"), int) or response["failureCount"] < 1:
+        raise ValueError("Psychlo rejected operational failure")
+    if "status_code" in response and (isinstance(response["status_code"], bool) or not isinstance(response["status_code"], int) or response["status_code"] not in {200, 201, 202}):
         raise ValueError("Psychlo rejected operational failure")
 
 

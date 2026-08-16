@@ -597,6 +597,8 @@ class PsychloBridge:
             return {"accepted": True, "status": "already-dispatched", "receipt": receipt}
         if state != "started" or result is not None:
             raise ValueError("only a started round without a result can be recovered")
+        _require_round(request)
+        _require_round_receipt(request, receipt)
         prompt = self._round_prompt(request, capability)
         scanner = getattr(self.dispatcher, "scan_rollout", None)
         if not callable(scanner):
@@ -610,46 +612,68 @@ class PsychloBridge:
                 return {"accepted": True, "status": "already-recovered", "receipt": self.store.get_round(round_id)[1]}
             raise ValueError("round recovery is already claimed")
         existing = self.store.round_recovery(round_id)
+        claim_token = existing.get("claimToken") if existing else None
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("round recovery claim token is missing")
         prior_evidence = existing.get("evidence") if existing else None
         try:
             # The first read is a complete rollout scan.  It is the only safe
             # way to distinguish a post-send crash from an unsent prompt.
-            if bool(scanner(request["projectLeadId"], prompt)):
-                evidence = {"deliveryProof": "rollout-user-message", "source": "existing-rollout-scan", "promptDigest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "roundId": round_id, "requestDigest": self.store.round_recovery(round_id)["requestDigest"], "observedAt": now}
+            scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+            recovery_binding = self.store.round_binding(round_id) or existing.get("binding")
+            if recovery_binding is None:
+                self.store.bind_round_recovery(round_id, owner, claim_token, scan["binding"])
+                recovery_binding = scan["binding"]
+            if scan["binding"] != recovery_binding:
+                raise ValueError("rollout identity changed")
+            if scan["found"]:
+                evidence = {"deliveryProof": "rollout-user-message", "source": "existing-rollout-scan", "promptDigest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "roundId": round_id, "requestDigest": self.store.round_recovery(round_id)["requestDigest"], "rollout": scan["binding"], "observedAt": now}
                 recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
-                self.store.complete_round_recovery_dispatch(round_id, owner, recovered_receipt, evidence, now=now)
+                self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=now)
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             if isinstance(prior_evidence, dict) and prior_evidence.get("redeliveryAttempted") is True:
                 evidence = {**prior_evidence, "source": "recovery-rescan-no-proof", "observedAt": now}
-                self.store.record_round_recovery_attempt(round_id, owner, evidence, now=now)
+                self.store.record_round_recovery_attempt(round_id, owner, claim_token, evidence, now=now)
                 raise ValueError("rollout delivery proof is missing; redelivery already attempted")
             request_digest = self.store.round_recovery(round_id)["requestDigest"]
             attempted = {"redeliveryAttempted": True, "deliveryProof": "pending", "source": "recovery-redelivery", "promptDigest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "roundId": round_id, "requestDigest": request_digest, "observedAt": now}
-            self.store.mark_round_recovery_attempted(round_id, owner, attempted, now=now)
+            self.store.mark_round_recovery_attempted(round_id, owner, claim_token, attempted, now=now)
+            pre_dispatch_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+            if pre_dispatch_scan["binding"] != recovery_binding:
+                raise ValueError("rollout identity changed")
+            if pre_dispatch_scan["found"]:
+                evidence = {**attempted, "deliveryProof": "rollout-user-message", "source": "pre-dispatch-rollout-scan", "rollout": pre_dispatch_scan["binding"], "observedAt": self.clock()}
+                recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
+                self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
+                return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             dispatch_id = self._dispatch_round(request, prompt)
             # The dispatcher acknowledgement is not sufficient: require a
             # complete rollout scan after the one allowed redelivery.
-            if not bool(scanner(request["projectLeadId"], prompt)):
+            post_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+            if post_scan["binding"] != recovery_binding:
+                raise ValueError("rollout identity changed")
+            if not post_scan["found"]:
                 attempted = {**attempted, "dispatchId": str(dispatch_id), "deliveryProof": "missing", "source": "redelivery-no-rollout-proof", "observedAt": self.clock()}
-                self.store.record_round_recovery_attempt(round_id, owner, attempted, now=self.clock())
+                self.store.record_round_recovery_attempt(round_id, owner, claim_token, attempted, now=self.clock())
                 raise ValueError("rollout delivery proof is missing")
             evidence = {**attempted, "dispatchId": str(dispatch_id), "deliveryProof": "rollout-user-message", "source": "redelivery-rollout-scan", "observedAt": self.clock()}
             recovered_receipt = {**receipt, "provenanceId": str(dispatch_id)}
-            self.store.complete_round_recovery_dispatch(round_id, owner, recovered_receipt, evidence, now=self.clock())
+            self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
             return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
         except Exception as error:
             # A crash after external submission is reconciled by a complete
             # scan immediately; no second paste is attempted from this path.
             current = self.store.round_recovery(round_id)
-            if isinstance(error, ValueError) and str(error).startswith("rollout delivery proof"):
+            if isinstance(error, ValueError) and str(error).startswith(("rollout delivery proof", "rollout identity")):
                 raise
             if current is not None and current["state"] == "claimed":
-                if bool(scanner(request["projectLeadId"], prompt)):
-                    evidence = {"redeliveryAttempted": True, "deliveryProof": "rollout-user-message", "source": "exception-rescan", "roundId": round_id, "requestDigest": current["requestDigest"], "observedAt": self.clock()}
+                post_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+                if post_scan["binding"] == (self.store.round_binding(round_id) or current.get("binding")) and post_scan["found"]:
+                    evidence = {"redeliveryAttempted": True, "deliveryProof": "rollout-user-message", "source": "exception-rescan", "roundId": round_id, "requestDigest": current["requestDigest"], "rollout": post_scan["binding"], "observedAt": self.clock()}
                     recovered_receipt = {**receipt, "provenanceId": f"overseer-round-recovery:{round_id}"}
-                    self.store.complete_round_recovery_dispatch(round_id, owner, recovered_receipt, evidence, now=self.clock())
+                    self.store.complete_round_recovery_dispatch(round_id, owner, claim_token, recovered_receipt, evidence, now=self.clock())
                     return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
-                self.store.record_round_recovery_attempt(round_id, owner, {"redeliveryAttempted": True, "deliveryProof": "unknown", "source": "recovery-exception", "roundId": round_id, "requestDigest": current["requestDigest"], "observedAt": self.clock()}, now=self.clock())
+                self.store.record_round_recovery_attempt(round_id, owner, claim_token, {"redeliveryAttempted": True, "deliveryProof": "unknown", "source": "recovery-exception", "roundId": round_id, "requestDigest": current["requestDigest"], "observedAt": self.clock()}, now=self.clock())
             raise ValueError("rollout delivery proof is missing") from error
 
     def _dispatch_round(self, request: Mapping[str, Any], prompt: str) -> str:
@@ -678,6 +702,9 @@ class PsychloBridge:
         return {"accepted": True}
 
     def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        binding_loader = getattr(self.dispatcher, "binding_provenance", None)
+        if callable(binding_loader):
+            self.store.bind_round_execution(str(request["roundId"]), _require_rollout_binding(binding_loader(str(request["projectLeadId"]))))
         self.store.mark_dispatch_started(str(request["roundId"]), self.clock())
         provider_reference = self._dispatch_round(request, self._round_prompt(request, capability))
         delivered = {**receipt, "provenanceId": str(provider_reference)}
@@ -2203,7 +2230,11 @@ class CodexProjectDispatcher:
     def scan_rollout(self, project_lead_id: str, prompt: str) -> bool:
         """Search the complete bound Codex rollout before any recovery paste."""
         driver, session = self._resolve(project_lead_id)
-        return bool(driver.scan_rollout_prompt(session, prompt))
+        return driver.scan_rollout_prompt(session, prompt)
+
+    def binding_provenance(self, project_lead_id: str) -> dict[str, object]:
+        driver, session = self._resolve(project_lead_id)
+        return driver.rollout_provenance(session)
 
     def prepare(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:
         """Resolve the exact stable result identity without dispatching a prompt."""
@@ -2397,6 +2428,31 @@ def _require_round(request: Mapping[str, Any]) -> None:
             raise ValueError("invalid round request")
 
 
+def _require_round_receipt(request: Mapping[str, Any], receipt: Mapping[str, Any]) -> None:
+    if not isinstance(receipt, Mapping) or set(receipt) != set(request) | {"sourceId", "provenanceId", "status"}:
+        raise ValueError("round receipt is invalid")
+    if receipt.get("sourceId") != request.get("projectLeadId") or receipt.get("status") != "accepted":
+        raise ValueError("round receipt binding is invalid")
+    _required_string(receipt, "provenanceId")
+
+
+def _require_rollout_scan(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"found", "conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno"}:
+        raise ValueError("rollout identity evidence is invalid")
+    if not isinstance(value["found"], bool) or any(not isinstance(value[field], str) or not value[field].strip() for field in ("conversationId", "sessionId", "rolloutPathDigest")):
+        raise ValueError("rollout identity evidence is invalid")
+    if not isinstance(value["rolloutDev"], int) or isinstance(value["rolloutDev"], bool) or value["rolloutDev"] < 0 or not isinstance(value["rolloutIno"], int) or isinstance(value["rolloutIno"], bool) or value["rolloutIno"] < 0 or not SHA256_RE.fullmatch(value["rolloutPathDigest"]):
+        raise ValueError("rollout identity evidence is invalid")
+    return {"found": bool(value["found"]), "binding": _require_rollout_binding({key: value[key] for key in ("conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno")})}
+
+
+def _require_rollout_binding(value: Mapping[str, Any]) -> dict[str, Any]:
+    fields = ("conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno")
+    if not isinstance(value, Mapping) or set(value) != set(fields) or any(not isinstance(value[field], str) or not value[field].strip() for field in fields[:3]):
+        raise ValueError("rollout identity evidence is invalid")
+    if not isinstance(value["rolloutDev"], int) or isinstance(value["rolloutDev"], bool) or value["rolloutDev"] < 0 or not isinstance(value["rolloutIno"], int) or isinstance(value["rolloutIno"], bool) or value["rolloutIno"] < 0 or not SHA256_RE.fullmatch(value["rolloutPathDigest"]):
+        raise ValueError("rollout identity evidence is invalid")
+    return {field: value[field] for field in fields}
 def _require_bound_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
     for key, value in request.items():
         if result.get(key) != value: raise ValueError("round result does not bind to request")

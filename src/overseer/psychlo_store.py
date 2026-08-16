@@ -12,6 +12,7 @@ import hashlib
 import math
 from pathlib import Path
 import os
+import secrets
 import sqlite3
 import stat
 from datetime import UTC, datetime
@@ -65,7 +66,7 @@ class PsychloBridgeStore:
         self.connection.executescript("""
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
@@ -126,6 +127,15 @@ class PsychloBridgeStore:
                 self.connection.execute(f"ALTER TABLE rounds ADD COLUMN {column} {definition}")
             except sqlite3.OperationalError:
                 pass
+        for column, definition in (("claim_token", "TEXT"), ("binding_json", "TEXT")):
+            try:
+                self.connection.execute(f"ALTER TABLE round_recoveries ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self.connection.execute("ALTER TABLE rounds ADD COLUMN codex_binding_json TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         self.connection.close()
@@ -696,6 +706,21 @@ class PsychloBridgeStore:
     def mark_dispatch_started(self, round_id: str, started_at: str) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='started',started_at=COALESCE(started_at,?) WHERE round_id=? AND dispatch_state='pending'", (started_at, round_id))
 
+    def bind_round_execution(self, round_id: str, binding: Mapping[str, Any]) -> dict[str, Any]:
+        encoded = _dump_wire(binding)
+        existing = self.connection.execute("SELECT codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+        if existing is None:
+            raise ValueError("round is missing")
+        if existing[0] is not None and existing[0] != encoded:
+            raise ValueError("round execution binding is immutable")
+        if existing[0] is None:
+            self.connection.execute("UPDATE rounds SET codex_binding_json=? WHERE round_id=? AND dispatch_state='pending'", (encoded, round_id))
+        return dict(binding)
+
+    def round_binding(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+        return None if row is None or row[0] is None else json.loads(row[0])
+
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
 
@@ -704,10 +729,10 @@ class PsychloBridgeStore:
         return hashlib.sha256(_dump_wire(request).encode("utf-8")).hexdigest()
 
     def round_recovery(self, round_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,owner_id,lease_expires_at,state,attempts,evidence_json,updated_at FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
+        row = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,owner_id,claim_token,lease_expires_at,state,attempts,evidence_json,binding_json,updated_at FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
         if row is None:
             return None
-        return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "idempotencyKey": row[2], "ownerId": row[3], "leaseExpiresAt": row[4], "state": row[5], "attempts": row[6], "evidence": json.loads(row[7]) if row[7] else None, "updatedAt": row[8]}
+        return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "idempotencyKey": row[2], "ownerId": row[3], "claimToken": row[4], "leaseExpiresAt": row[5], "state": row[6], "attempts": row[7], "evidence": json.loads(row[8]) if row[8] else None, "binding": json.loads(row[9]) if row[9] else None, "updatedAt": row[10]}
 
     def claim_round_recovery(self, round_id: str, request: Mapping[str, Any], capability: str, *, owner_id: str, lease_expires_at: str, now: str) -> bool:
         if not all(isinstance(value, str) and value.strip() for value in (round_id, capability, owner_id, lease_expires_at, now)):
@@ -721,19 +746,19 @@ class PsychloBridgeStore:
                 raise ValueError("only a started round can be recovered")
             request_digest = self._round_request_digest(request)
             idempotency_key = str(request.get("idempotencyKey", ""))
-            existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,owner_id,lease_expires_at,state FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
+            existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,owner_id,claim_token,lease_expires_at,state FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
             if existing is None:
-                self.connection.execute("INSERT INTO round_recoveries(round_id,request_digest,capability_hash,idempotency_key,owner_id,lease_expires_at,state,attempts,updated_at) VALUES (?,?,?,?,?,?,?,1,?)", (round_id, request_digest, row[1], idempotency_key, owner_id, lease_expires_at, "claimed", now))
+                self.connection.execute("INSERT INTO round_recoveries(round_id,request_digest,capability_hash,idempotency_key,owner_id,claim_token,lease_expires_at,state,attempts,updated_at) VALUES (?,?,?,?,?,?,?, ?,1,?)", (round_id, request_digest, row[1], idempotency_key, owner_id, secrets.token_urlsafe(32), lease_expires_at, "claimed", now))
                 acquired = True
             else:
                 if existing[:3] != (request_digest, row[1], idempotency_key):
                     raise ValueError("round recovery binding conflict")
-                if existing[5] == "completed":
+                if existing[6] == "completed":
                     acquired = False
-                elif existing[3] and existing[4] and datetime.fromisoformat(str(existing[4]).replace("Z", "+00:00")) > datetime.fromisoformat(now.replace("Z", "+00:00")):
+                elif existing[3] and existing[5] and datetime.fromisoformat(str(existing[5]).replace("Z", "+00:00")) > datetime.fromisoformat(now.replace("Z", "+00:00")):
                     acquired = False
                 else:
-                    self.connection.execute("UPDATE round_recoveries SET owner_id=?,lease_expires_at=?,state='claimed',attempts=attempts+1,updated_at=? WHERE round_id=?", (owner_id, lease_expires_at, now, round_id))
+                    self.connection.execute("UPDATE round_recoveries SET owner_id=?,claim_token=?,lease_expires_at=?,state='claimed',attempts=attempts+1,updated_at=? WHERE round_id=?", (owner_id, secrets.token_urlsafe(32), lease_expires_at, now, round_id))
                     acquired = True
             self.connection.execute("COMMIT")
             return acquired
@@ -741,9 +766,9 @@ class PsychloBridgeStore:
             self.connection.execute("ROLLBACK")
             raise
 
-    def record_round_recovery_attempt(self, round_id: str, owner_id: str, evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+    def record_round_recovery_attempt(self, round_id: str, owner_id: str, claim_token: str, evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         encoded = _dump_wire(evidence)
-        cursor = self.connection.execute("UPDATE round_recoveries SET state='uncertain',owner_id=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND state='claimed'", (encoded, now, round_id, owner_id))
+        cursor = self.connection.execute("UPDATE round_recoveries SET state='uncertain',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (encoded, now, round_id, owner_id, claim_token))
         if cursor.rowcount != 1:
             raise ValueError("round recovery claim is unavailable")
         result = self.round_recovery(round_id)
@@ -751,9 +776,9 @@ class PsychloBridgeStore:
             raise ValueError("round recovery record is missing")
         return result
 
-    def mark_round_recovery_attempted(self, round_id: str, owner_id: str, evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+    def mark_round_recovery_attempted(self, round_id: str, owner_id: str, claim_token: str, evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         encoded = _dump_wire(evidence)
-        cursor = self.connection.execute("UPDATE round_recoveries SET evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND state='claimed'", (encoded, now, round_id, owner_id))
+        cursor = self.connection.execute("UPDATE round_recoveries SET evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (encoded, now, round_id, owner_id, claim_token))
         if cursor.rowcount != 1:
             raise ValueError("round recovery claim is unavailable")
         result = self.round_recovery(round_id)
@@ -761,9 +786,29 @@ class PsychloBridgeStore:
             raise ValueError("round recovery record is missing")
         return result
 
-    def complete_round_recovery(self, round_id: str, owner_id: str, evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+    def bind_round_recovery(self, round_id: str, owner_id: str, claim_token: str, binding: Mapping[str, Any]) -> dict[str, Any]:
+        encoded = _dump_wire(binding)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT binding_json FROM round_recoveries WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (round_id, owner_id, claim_token)).fetchone()
+            if row is None:
+                raise ValueError("round recovery claim is unavailable")
+            if row[0] is not None and row[0] != encoded:
+                raise ValueError("round recovery rollout identity changed")
+            if row[0] is None:
+                self.connection.execute("UPDATE round_recoveries SET binding_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (encoded, self._now(), round_id, owner_id, claim_token))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.round_recovery(round_id)
+        if result is None:
+            raise ValueError("round recovery record is missing")
+        return result
+
+    def complete_round_recovery(self, round_id: str, owner_id: str, claim_token: str, evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         encoded = _dump_wire(evidence)
-        cursor = self.connection.execute("UPDATE round_recoveries SET state='completed',owner_id=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND state='claimed'", (encoded, now, round_id, owner_id))
+        cursor = self.connection.execute("UPDATE round_recoveries SET state='completed',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (encoded, now, round_id, owner_id, claim_token))
         if cursor.rowcount != 1:
             existing = self.round_recovery(round_id)
             if existing is None or existing["state"] != "completed":
@@ -773,19 +818,19 @@ class PsychloBridgeStore:
             raise ValueError("round recovery record is missing")
         return result
 
-    def complete_round_recovery_dispatch(self, round_id: str, owner_id: str, receipt: Mapping[str, Any], evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+    def complete_round_recovery_dispatch(self, round_id: str, owner_id: str, claim_token: str, receipt: Mapping[str, Any], evidence: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         """Atomically commit the guarded dispatch and its recovery evidence."""
         encoded_receipt = _dump_wire(receipt)
         encoded_evidence = _dump_wire(evidence)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            recovery = self.connection.execute("SELECT lease_expires_at FROM round_recoveries WHERE round_id=? AND owner_id=? AND state='claimed'", (round_id, owner_id)).fetchone()
+            recovery = self.connection.execute("SELECT lease_expires_at FROM round_recoveries WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (round_id, owner_id, claim_token)).fetchone()
             if recovery is None or not recovery[0] or datetime.fromisoformat(str(recovery[0]).replace("Z", "+00:00")) <= datetime.fromisoformat(now.replace("Z", "+00:00")):
                 raise ValueError("round recovery claim is unavailable")
             round_update = self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL", (encoded_receipt, round_id))
             if round_update.rowcount != 1:
                 raise ValueError("started round state changed")
-            recovery_update = self.connection.execute("UPDATE round_recoveries SET state='completed',owner_id=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND state='claimed'", (encoded_evidence, now, round_id, owner_id))
+            recovery_update = self.connection.execute("UPDATE round_recoveries SET state='completed',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (encoded_evidence, now, round_id, owner_id, claim_token))
             if recovery_update.rowcount != 1:
                 raise ValueError("round recovery claim is unavailable")
             self.connection.execute("COMMIT")

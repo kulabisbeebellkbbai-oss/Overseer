@@ -2182,15 +2182,16 @@ def test_does_not_repeat_an_uncertain_durably_started_dispatch(tmp_path: Path):
 
 
 class _RoundRecoveryDispatcher:
-    def __init__(self, *, existing: bool = False, crash_after_send: bool = False):
+    def __init__(self, *, existing: bool = False, crash_after_send: bool = False, binding: str = "a" * 64):
         self.existing = existing
         self.crash_after_send = crash_after_send
+        self.binding = binding
         self.calls = []
         self.scan_calls = []
 
     def scan_rollout(self, lead_id, prompt):
         self.scan_calls.append((lead_id, prompt))
-        return self.existing
+        return {"found": self.existing, "conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": self.binding, "rolloutDev": 1, "rolloutIno": 2}
 
     def __call__(self, lead_id, prompt, idempotency_key=None):
         self.calls.append((lead_id, prompt, idempotency_key))
@@ -2202,8 +2203,8 @@ class _RoundRecoveryDispatcher:
 
 
 def _started_round(store: PsychloBridgeStore, round_id: str = "round-recovery") -> dict:
-    request = {"roundId": round_id, "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": f"idempotency-{round_id}", "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded work round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
-    store.record_round(request, {**request, "status": "accepted"}, f"capability-{round_id}-1234567890abcdef")
+    request = {"roundId": round_id, "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": f"idempotency-{round_id}", "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    store.record_round(request, {**request, "sourceId": request["projectLeadId"], "provenanceId": f"overseer-dispatch:{round_id}", "status": "accepted"}, f"capability-{round_id}-1234567890abcdef")
     store.mark_dispatch_started(round_id, NOW)
     return request
 
@@ -2219,11 +2220,12 @@ def test_recovers_started_round_from_existing_exact_rollout_without_redelivery(t
     assert recovered["status"] == "recovered"
     assert dispatcher.calls == []
     assert store.get_round(request["roundId"])[4] == "dispatched"
-    assert recovered["receipt"] == {**request, "status": "accepted", "provenanceId": f"overseer-round-recovery:{request['roundId']}"}
+    assert recovered["receipt"] == {**request, "sourceId": request["projectLeadId"], "status": "accepted", "provenanceId": f"overseer-round-recovery:{request['roundId']}"}
     evidence = store.round_recovery(request["roundId"])
     assert evidence["state"] == "completed"
     assert evidence["evidence"]["deliveryProof"] == "rollout-user-message"
     assert evidence["evidence"]["source"] == "existing-rollout-scan"
+    assert evidence["evidence"]["rollout"]["conversationId"] == "conversation-arcade"
 
 
 def test_recovery_redelivers_once_with_exact_round_idempotency_key(tmp_path: Path):
@@ -2274,9 +2276,53 @@ def test_recovery_dispatch_commit_rejects_stale_owner_and_preserves_started_stat
     request = _started_round(store)
     store.claim_round_recovery(request["roundId"], request, "capability-round-recovery-1234567890abcdef", owner_id="recoverer-a", lease_expires_at="2026-08-10T02:05:00+00:00", now=NOW)
 
+    token = store.round_recovery(request["roundId"])["claimToken"]
     with pytest.raises(ValueError, match="claim is unavailable"):
-        store.complete_round_recovery_dispatch(request["roundId"], "recoverer-b", {**request, "status": "accepted"}, {"deliveryProof": "rollout-user-message"}, now=NOW)
+        store.complete_round_recovery_dispatch(request["roundId"], "recoverer-b", token, {**request, "status": "accepted"}, {"deliveryProof": "rollout-user-message"}, now=NOW)
     assert store.get_round(request["roundId"])[4] == "started"
+
+
+def test_recovery_generation_token_fences_stale_same_owner_attempt(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-generation-fence")
+    store.claim_round_recovery(request["roundId"], request, "capability-round-generation-fence-1234567890abcdef", owner_id="recoverer-a", lease_expires_at="2026-08-10T02:01:00+00:00", now=NOW)
+    stale_token = store.round_recovery(request["roundId"])["claimToken"]
+    store.claim_round_recovery(request["roundId"], request, "capability-round-generation-fence-1234567890abcdef", owner_id="recoverer-a", lease_expires_at="2026-08-10T03:00:00+00:00", now="2026-08-10T02:02:00+00:00")
+    with pytest.raises(ValueError, match="claim is unavailable"):
+        store.mark_round_recovery_attempted(request["roundId"], "recoverer-a", stale_token, {"redeliveryAttempted": True}, now="2026-08-10T02:02:00+00:00")
+
+
+def test_recovery_rejects_corrupt_request_and_receipt_before_rollout_scan(tmp_path: Path):
+    for corruption in ("request", "receipt"):
+        store = PsychloBridgeStore(tmp_path / f"bridge-{corruption}.sqlite3")
+        request = _started_round(store, f"round-corrupt-{corruption}")
+        if corruption == "request":
+            store.connection.execute("UPDATE rounds SET request_json=? WHERE round_id=?", (json.dumps({**request, "scope": "not-bounded"}), request["roundId"]))
+        else:
+            store.connection.execute("UPDATE rounds SET receipt_json=? WHERE round_id=?", (json.dumps({**request, "status": "accepted", "sourceId": "member-hermione", "provenanceId": "x", "unexpected": True}), request["roundId"]))
+        dispatcher = _RoundRecoveryDispatcher(existing=True)
+        bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+        with pytest.raises(ValueError, match="invalid round|receipt"):
+            bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+        assert dispatcher.scan_calls == []
+
+
+def test_recovery_rejects_rollout_identity_change_between_scans(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-binding-change")
+    class BindingChanges:
+        def __init__(self): self.calls = 0; self.dispatches = 0
+        def scan_rollout(self, _lead, _prompt):
+            self.calls += 1
+            return {"found": self.calls > 1, "conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64 if self.calls == 1 else "b" * 64, "rolloutDev": 1, "rolloutIno": 2}
+        def __call__(self, *_args, **_kwargs):
+            self.dispatches += 1
+            return "dispatch-binding-change"
+    dispatcher = BindingChanges()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="rollout identity"):
+        bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+    assert dispatcher.dispatches == 0
 
 
 def test_recovery_refuses_a_second_redelivery_when_rollout_proof_is_absent(tmp_path: Path):
@@ -2285,7 +2331,7 @@ def test_recovery_refuses_a_second_redelivery_when_rollout_proof_is_absent(tmp_p
     request = _started_round(store)
     class NoProofDispatcher:
         def __init__(self): self.calls = []
-        def scan_rollout(self, _lead, _prompt): return False
+        def scan_rollout(self, _lead, _prompt): return {"found": False, "conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
         def __call__(self, lead, prompt, idempotency_key=None):
             self.calls.append((lead, prompt, idempotency_key))
             return "provider-dispatch-round-recovery"

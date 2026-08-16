@@ -103,10 +103,15 @@ class RolloutPromptDeliveryEvidence:
     """Confirm a prompt through the newly appended Codex rollout records."""
 
     def __init__(self, session: AgentSession, *, state_database: str | Path = DEFAULT_CODEX_STATE_DATABASE) -> None:
+        self._session_id = session.id
+        self._conversation_id = session.external_session_id or session.id
         self._rollout = _rollout_path_for_session(session, Path(state_database))
         metadata = self._rollout.stat(follow_symlinks=False)
         self._identity = (metadata.st_dev, metadata.st_ino)
         self._offset = metadata.st_size
+
+    def provenance(self, *, found: bool = False) -> dict[str, object]:
+        return {"found": found, "conversationId": self._conversation_id, "sessionId": self._session_id, "rolloutPathDigest": hashlib.sha256(str(self._rollout).encode("utf-8")).hexdigest(), "rolloutDev": self._identity[0], "rolloutIno": self._identity[1]}
 
     def confirm(self, prompt: str) -> bool:
         deadline = time.monotonic() + 5.0
@@ -134,29 +139,35 @@ class RolloutPromptDeliveryEvidence:
 
     def scan_existing(self, prompt: str) -> bool:
         """Scan the complete bound rollout, including records before recovery."""
+        return bool(self.scan_existing_provenance(prompt)["found"])
+
+    def scan_existing_provenance(self, prompt: str) -> dict[str, object]:
+        """Scan the complete rollout and return its immutable identity."""
         descriptor: int | None = None
         try:
             descriptor = os.open(self._rollout, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
             metadata = os.fstat(descriptor)
             if (metadata.st_dev, metadata.st_ino) != self._identity:
-                return False
+                raise ValueError("rollout identity changed")
             with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
                 descriptor = None
                 for line in stream:
                     try:
                         if _rollout_user_prompt(json.loads(line)) == prompt:
-                            return True
+                            return self.provenance(found=True)
                     except (ValueError, TypeError):
                         continue
-        except (OSError, UnicodeError):
-            return False
+        except UnicodeError as error:
+            raise ValueError("rollout scan failed") from error
+        except OSError as error:
+            raise ValueError("rollout scan unavailable") from error
         finally:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-        return False
+        return self.provenance(found=False)
 
 
 def _jsonl_records(content: str):
@@ -529,12 +540,18 @@ class CodexDriver:
             prompt="legacy compatibility dispatch",
         )
 
-    def scan_rollout_prompt(self, session: AgentSession, prompt: str) -> bool:
+    def scan_rollout_prompt(self, session: AgentSession, prompt: str) -> dict[str, object]:
         """Return whether the exact prompt is already recorded in the rollout."""
         resolved = self._validated_session(session)
         if resolved is None:
             raise ValueError("cannot scan an unknown Codex session")
-        return RolloutPromptDeliveryEvidence(resolved).scan_existing(prompt)
+        return RolloutPromptDeliveryEvidence(resolved).scan_existing_provenance(prompt)
+
+    def rollout_provenance(self, session: AgentSession) -> dict[str, object]:
+        resolved = self._validated_session(session)
+        if resolved is None:
+            raise ValueError("cannot inspect an unknown Codex session")
+        return RolloutPromptDeliveryEvidence(resolved).provenance()
 
     def inspect(self, session: AgentSession) -> AgentDispatchResult:
         request_id = f"inspect.{_identifier_part(session.id)}"

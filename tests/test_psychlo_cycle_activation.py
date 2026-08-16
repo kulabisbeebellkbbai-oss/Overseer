@@ -24,6 +24,7 @@ from overseer.psychlo_cycle_activation import (
     plan_psychlo_recurring_cycle_activation,
     psychlo_cycle_activation_plan_digest,
     psychlo_cycle_activation_replay_verified,
+    psychlo_cycle_activation_spec_from_private_file,
     validate_psychlo_cycle_activation_plan,
 )
 
@@ -115,6 +116,33 @@ def test_manifest_rejects_unsafe_credentials(tmp_path: Path):
     Path(str(manifest["meterCredential"])).chmod(0o644)
     with pytest.raises(ValueError, match="owner-only"):
         PsychloCycleActivationSpec.from_json(manifest)
+
+
+def test_private_manifest_stages_typed_plan_without_executing(tmp_path: Path):
+    from overseer.cli import plan_admin_change_status
+
+    manifest_path = tmp_path / "activation.json"
+    manifest_path.write_text(json.dumps(_manifest(tmp_path), sort_keys=True), encoding="utf-8")
+    manifest_path.chmod(0o600)
+    spec = psychlo_cycle_activation_spec_from_private_file(manifest_path)
+    status = plan_admin_change_status(
+        tmp_path / "overseer.sqlite3",
+        "admin.psychlo-cycle.activate.20260816",
+        AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION.value,
+        "overseer-psychlo-usage.timer",
+        "activate approved recurring accounting",
+        "disabled",
+        psychlo_cycle_spec=spec,
+    )
+
+    assert status["kind"] == "psychlo_recurring_cycle_activation"
+    assert status["approval_level"] == "human"
+    assert status["approved"] is False
+    assert not spec.activation_marker.exists()
+
+    manifest_path.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only"):
+        psychlo_cycle_activation_spec_from_private_file(manifest_path)
 
 
 def test_plan_is_high_risk_human_approved_and_disabled_by_default(tmp_path: Path):

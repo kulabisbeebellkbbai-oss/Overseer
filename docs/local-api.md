@@ -64,11 +64,14 @@ and reject gateway/forwarded traffic. The bridge persists replay nonces,
 single-stream round receipts, result state, and Roadex decisions in its own
 owner-only SQLite database.
 
-The inactive `overseer-psychlo-usage.timer` template sends the newest
-reset-aware weekly Codex usage projection every 15 minutes. Activation requires
-an exact service plan, one private shared credential, and an explicit
-project-lead-to-Codex-conversation binding file. Roadex decisions appear in the
-existing Overview card and resume only the exact staged Psychlo decision.
+The inactive `overseer-psychlo-usage.timer` template targets the credential-free
+`overseer-psychlo-cycle.service`. Each tick first starts the authority-signed
+Codex percentage meter and only after that succeeds starts the peer-delivery
+service. The meter receives Codex login and signing credentials; delivery
+receives only its peer credential. Activation requires separate approval of the
+typed adapter and exact immutable deployment plan, plus one successful manual
+canary before the timer can be enabled. Roadex decisions appear in the existing
+Overview card and resume only the exact staged Psychlo decision.
 
 ## Run
 

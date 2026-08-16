@@ -74,6 +74,14 @@ class LocalApiHarness:
 
 
 class ProtectedGatewayUiRegressionTests(unittest.TestCase):
+    def test_psychlo_cycle_adapter_is_reviewable_without_raw_manifest_controls(self):
+        from overseer.ui import OPERATOR_CONSOLE_HTML
+
+        self.assertIn('"psychlo_recurring_cycle_activation"', OPERATOR_CONSOLE_HTML)
+        self.assertIn("adminAdapterKindOptions()", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("psychlo-cycle-spec", OPERATOR_CONSOLE_HTML)
+        self.assertNotIn("codexExecutableSha256", OPERATOR_CONSOLE_HTML)
+
     def test_failover_recovery_ui_uses_status_contract(self):
         from overseer.ui import OPERATOR_CONSOLE_HTML
 

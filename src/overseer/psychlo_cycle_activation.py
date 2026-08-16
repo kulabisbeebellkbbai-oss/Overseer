@@ -45,6 +45,7 @@ _EXPECTED_KEYS = {
 }
 _HEX_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_MAX_MANIFEST_BYTES = 128 * 1024
 
 
 def _canonical_json(value: Any) -> str:
@@ -75,6 +76,32 @@ def _owner_only_regular(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be an owner-only regular file")
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
         raise ValueError(f"{label} must be an owner-only regular file")
+
+
+def psychlo_cycle_activation_spec_from_private_file(path: Path | str) -> "PsychloCycleActivationSpec":
+    selected = Path(path)
+    descriptor = os.open(selected, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("Psychlo cycle activation manifest must be an owner-only regular file")
+        if info.st_size <= 0 or info.st_size > _MAX_MANIFEST_BYTES:
+            raise ValueError("Psychlo cycle activation manifest size is invalid")
+        content = bytearray()
+        while len(content) <= _MAX_MANIFEST_BYTES:
+            chunk = os.read(descriptor, min(8192, _MAX_MANIFEST_BYTES + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Psychlo cycle activation manifest is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("Psychlo cycle activation manifest must be a JSON object")
+    return PsychloCycleActivationSpec.from_json(value)
 
 
 def _owner_controlled_directory(path: Path, label: str) -> None:

@@ -438,6 +438,8 @@ class PsychloBridge:
         existing = self.store.get_round(str(request["roundId"]))
         if existing:
             if existing[0] != dict(request): raise ValueError("round identity conflict")
+            if callback_capability is not None and callback_capability != existing[3]:
+                raise ValueError("round callback capability conflicts with persisted round")
             if existing[4] == "pending": return self._dispatch_reserved(existing[0], existing[3], existing[1])
             if existing[4] == "started": raise ValueError("round dispatch is uncertain and requires operational-failure reconciliation")
             if existing[4] == "failed": raise ValueError("round dispatch ended with an operational failure")

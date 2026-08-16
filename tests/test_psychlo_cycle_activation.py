@@ -181,8 +181,8 @@ def test_approved_plan_rejects_immutable_mutation(tmp_path: Path):
         )
 
 
-def _completed(args: tuple[str, ...], returncode: int = 0):
-    return subprocess.CompletedProcess(args, returncode, stdout="ok", stderr="")
+def _completed(args: tuple[str, ...], returncode: int = 0, *, stdout: str = "ok"):
+    return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
 
 
 def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -193,7 +193,11 @@ def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, m
     def systemctl(args):
         value = tuple(args)
         calls.append(value)
-        return _completed(value, 1 if value[0] == "is-enabled" and len(calls) == 1 else 0)
+        return _completed(
+            value,
+            1 if value[0] == "is-enabled" and len(calls) == 1 else 0,
+            stdout="123456789" if value[0] == "show" else "ok",
+        )
 
     observations = iter((("old", "old-digest"), ("new", "new-digest")))
     monkeypatch.setattr(cycle_activation, "_observation_identity", lambda: next(observations))
@@ -212,11 +216,74 @@ def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, m
         ("enable", "--now", "overseer-psychlo-usage.timer"),
         ("is-enabled", "overseer-psychlo-usage.timer"),
         ("is-active", "overseer-psychlo-usage.timer"),
+        ("show", "overseer-psychlo-usage.timer", "--property=NextElapseUSecMonotonic", "--value"),
     ]
     assert json.loads(spec.activation_marker.read_text())["planId"] == plan.id
     for name, digest in spec.unit_sha256:
         assert hashlib.sha256((spec.installed_unit_directory / name).read_bytes()).hexdigest() == digest
     assert psychlo_cycle_activation_replay_verified(plan, systemctl_runner=systemctl) is True
+
+
+@pytest.mark.parametrize("next_trigger", ["", "0", "infinity", "Infinity"])
+def test_verification_rejects_missing_or_infinite_next_trigger_without_completion(
+    tmp_path: Path,
+    next_trigger: str,
+):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    for name, _ in spec.unit_sha256:
+        source = spec.source_root / "systemd" / name
+        (spec.installed_unit_directory / name).write_bytes(source.read_bytes())
+    spec.activation_marker.write_text(
+        json.dumps({"planId": plan.id, "specDigest": psychlo_cycle_activation_plan_digest(spec)}),
+        encoding="utf-8",
+    )
+    spec.activation_marker.chmod(0o600)
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, stdout=next_trigger if value[0] == "show" else "ok")
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.verification_steps[0].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert code == 1
+    assert "finite next trigger" in error
+    assert not (spec.backup_directory / "completed.json").exists()
+
+
+def test_verification_accepts_finite_next_trigger_and_replay_rechecks_it(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    for name, _ in spec.unit_sha256:
+        source = spec.source_root / "systemd" / name
+        (spec.installed_unit_directory / name).write_bytes(source.read_bytes())
+    ownership = {"planId": plan.id, "specDigest": psychlo_cycle_activation_plan_digest(spec)}
+    spec.activation_marker.write_text(json.dumps(ownership), encoding="utf-8")
+    spec.activation_marker.chmod(0o600)
+
+    def finite_systemctl(args):
+        value = tuple(args)
+        return _completed(value, stdout="123456789" if value[0] == "show" else "ok")
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.verification_steps[0].command,
+        systemctl_runner=finite_systemctl,
+    )
+    assert (code, error) == (0, "")
+    completion = spec.backup_directory / "completed.json"
+    before = completion.read_bytes()
+    assert psychlo_cycle_activation_replay_verified(plan, systemctl_runner=finite_systemctl) is True
+    assert completion.read_bytes() == before
+
+    def infinite_systemctl(args):
+        value = tuple(args)
+        return _completed(value, stdout="infinity" if value[0] == "show" else "ok")
+
+    assert psychlo_cycle_activation_replay_verified(plan, systemctl_runner=infinite_systemctl) is False
+    assert completion.read_bytes() == before
 
 
 def test_meter_canary_failure_prevents_timer_enable_and_triggers_rollback(tmp_path: Path):

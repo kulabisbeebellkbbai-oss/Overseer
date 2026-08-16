@@ -3,6 +3,7 @@ Description=Let Psychlo reassess autonomous project work every 15 minutes
 
 [Timer]
 OnBootSec=3min
+OnActiveSec=15min
 OnUnitActiveSec=15min
 Persistent=true
 AccuracySec=1min

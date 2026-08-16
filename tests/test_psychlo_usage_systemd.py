@@ -79,6 +79,8 @@ def test_cycle_sequences_meter_before_delivery_and_timer_targets_cycle():
     assert "[Install]" not in cycle
     assert "Unit=overseer-psychlo-cycle.service" in timer
     assert "Unit=overseer-psychlo-usage.service" not in timer
+    assert "OnActiveSec=15min" in timer
+    assert "OnUnitActiveSec=15min" in timer
     subprocess.run(
         ["systemd-analyze", "verify", str(cycle_path), str(timer_path)],
         check=True,

@@ -487,6 +487,33 @@ def _run_checked(runner: SystemctlRunner, args: Sequence[str], label: str) -> su
     return completed
 
 
+def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> int:
+    """Return the timer's finite next monotonic trigger or fail closed."""
+    completed = _run_checked(
+        runner,
+        ("show", timer_unit, "--property=NextElapseUSecMonotonic", "--value"),
+        "verify recurring timer next trigger",
+    )
+    raw = completed.stdout.strip()
+    if "=" in raw:
+        # Be tolerant of a runner/systemctl version that includes the property
+        # name even though --value was requested, while still requiring one
+        # scalar value.
+        property_name, raw = raw.split("=", 1)
+        if property_name != "NextElapseUSecMonotonic":
+            raise RuntimeError("recurring timer next trigger property is invalid")
+        raw = raw.strip()
+    if not raw or raw.lower() in {"infinity", "n/a", "unknown"}:
+        raise RuntimeError("recurring timer has no finite next trigger")
+    try:
+        value = int(raw, 10)
+    except ValueError as error:
+        raise RuntimeError("recurring timer next trigger is not an integer") from error
+    if value <= 0:
+        raise RuntimeError("recurring timer has no finite next trigger")
+    return value
+
+
 def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
     expected = _ownership(plan_id, digest)
     record_path = _backup_record(spec)
@@ -642,6 +669,7 @@ def execute_psychlo_cycle_activation_marker(
             _load_owned_json(spec.activation_marker, _ownership(plan_id, digest), "Psychlo cycle activation marker")
             _run_checked(runner, ("is-enabled", spec.timer_unit), "verify recurring timer enabled")
             _run_checked(runner, ("is-active", spec.timer_unit), "verify recurring timer active")
+            _next_timer_trigger(runner, spec.timer_unit)
             _atomic_write(
                 _completion_record(spec),
                 (_canonical_json(_ownership(plan_id, digest)) + "\n").encode(),
@@ -674,6 +702,7 @@ def psychlo_cycle_activation_replay_verified(
             return False
         if runner(("is-active", spec.timer_unit)).returncode != 0:
             return False
+        _next_timer_trigger(runner, spec.timer_unit)
         return True
     except (OSError, RuntimeError, ValueError):
         return False

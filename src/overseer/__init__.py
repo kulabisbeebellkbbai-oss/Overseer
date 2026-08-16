@@ -84,6 +84,12 @@ from .python_venv import (
     validate_python_venv_plan,
     validate_python_venv_spec,
 )
+from .psychlo_cycle_activation import (
+    PsychloCycleActivationSpec,
+    plan_psychlo_recurring_cycle_activation,
+    psychlo_cycle_activation_plan_digest,
+    validate_psychlo_cycle_activation_plan,
+)
 from .audit import (
     ApprovalRequest,
     ApprovalStatus,
@@ -328,6 +334,10 @@ __all__ = [
     "python_venv_plan_digest",
     "validate_python_venv_plan",
     "validate_python_venv_spec",
+    "PsychloCycleActivationSpec",
+    "plan_psychlo_recurring_cycle_activation",
+    "psychlo_cycle_activation_plan_digest",
+    "validate_psychlo_cycle_activation_plan",
     "plan_user_service_restart",
     "ApprovalRequest",
     "ApprovalStatus",

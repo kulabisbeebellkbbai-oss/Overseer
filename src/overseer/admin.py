@@ -21,6 +21,7 @@ class AdminChangeKind(StrEnum):
     # paired ApprovalRequest decision path.
     PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
     PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
+    PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
     USER_SERVICE_RESTART = "user_service_restart"
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
@@ -157,6 +158,15 @@ class AdminChangePlan:
 
 
 DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapability] = {
+    AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION: AdminExecutionCapability(
+        kind=AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION,
+        adapter_name="psychlo-recurring-cycle-activation",
+        status=AdminAdapterStatus.DISABLED,
+        summary="Psychlo recurring accounting activation requires exact adapter enablement and human approval",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("__overseer_psychlo_cycle_",),),
+    ),
     AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(
         kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,
         adapter_name="python-hashed-venv-provisioner",

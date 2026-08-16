@@ -37,7 +37,10 @@ def test_percentage_meter_is_a_separate_fail_closed_one_shot():
     assert "%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python -m overseer.psychlo_usage_meter_cli" in meter
     assert "PYTHONPATH=%h/.local/share/overseer/project/src" in meter
     assert "BindReadOnlyPaths=%h/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47" in meter
-    assert "ExecStartPre=" not in meter
+    assert "RuntimeDirectory=overseer-psychlo-meter" in meter
+    assert "RuntimeDirectoryMode=0700" in meter
+    assert "RuntimeDirectoryPreserve=no" in meter
+    assert "ExecStartPre=/usr/bin/install -m 0600 %d/auth.json %t/overseer-psychlo-meter/auth.json" in meter
     assert "ProtectHome=tmpfs" in meter
     assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-meter/config.json" in meter
     assert "BindReadOnlyPaths=%h/.config/overseer/psychlo-usage-authority-private-key.pem" not in meter
@@ -49,7 +52,12 @@ def test_percentage_meter_receives_only_scoped_codex_login_and_binary():
     meter = (ROOT / "systemd" / "overseer-psychlo-meter.service").read_text(encoding="utf-8")
 
     assert "LoadCredential=auth.json:%h/.codex/auth.json" in meter
-    assert "Environment=CODEX_HOME=%d" in meter
+    assert "RuntimeDirectory=overseer-psychlo-meter" in meter
+    assert "RuntimeDirectoryMode=0700" in meter
+    assert "RuntimeDirectoryPreserve=no" in meter
+    assert "ExecStartPre=/usr/bin/install -m 0600 %d/auth.json %t/overseer-psychlo-meter/auth.json" in meter
+    assert "Environment=CODEX_HOME=%t/overseer-psychlo-meter" in meter
+    assert "Environment=CODEX_HOME=%d" not in meter
     assert f"Environment=PATH={Path(CODEX_EXECUTABLE).parent}:/usr/bin" in meter
     assert f"BindReadOnlyPaths={CODEX_EXECUTABLE}" in meter
     assert "BindReadOnlyPaths=%h/.codex" not in meter

@@ -107,6 +107,13 @@ def test_cli_accepts_bounded_delivery_lease_seconds_and_preserves_default():
     assert parser.parse_args(["emit-usage", "--delivery-lease-seconds", "86400"]).delivery_lease_seconds == 86400
 
 
+def test_cli_exposes_only_one_exact_round_recovery_command():
+    args = build_parser().parse_args(["recover-round", "--round-id", "round-uncertain", "--owner-id", "recoverer-a"])
+    assert args.command == "recover-round"
+    assert args.round_id == "round-uncertain"
+    assert args.owner_id == "recoverer-a"
+
+
 def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Path, capsys):
     captured = {}
 

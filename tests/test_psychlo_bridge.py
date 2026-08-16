@@ -2181,6 +2181,125 @@ def test_does_not_repeat_an_uncertain_durably_started_dispatch(tmp_path: Path):
     assert len(attempts) == 1
 
 
+class _RoundRecoveryDispatcher:
+    def __init__(self, *, existing: bool = False, crash_after_send: bool = False):
+        self.existing = existing
+        self.crash_after_send = crash_after_send
+        self.calls = []
+        self.scan_calls = []
+
+    def scan_rollout(self, lead_id, prompt):
+        self.scan_calls.append((lead_id, prompt))
+        return self.existing
+
+    def __call__(self, lead_id, prompt, idempotency_key=None):
+        self.calls.append((lead_id, prompt, idempotency_key))
+        if self.crash_after_send:
+            self.existing = True
+            raise RuntimeError("crashed after prompt submission")
+        self.existing = True
+        return "provider-dispatch-round-recovery"
+
+
+def _started_round(store: PsychloBridgeStore, round_id: str = "round-recovery") -> dict:
+    request = {"roundId": round_id, "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": f"corr-{round_id}", "idempotencyKey": f"idempotency-{round_id}", "snapshotId": f"snapshot-{round_id}", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded work round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    store.record_round(request, {**request, "status": "accepted"}, f"capability-{round_id}-1234567890abcdef")
+    store.mark_dispatch_started(round_id, NOW)
+    return request
+
+
+def test_recovers_started_round_from_existing_exact_rollout_without_redelivery(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store)
+    dispatcher = _RoundRecoveryDispatcher(existing=True)
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    recovered = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    assert recovered["status"] == "recovered"
+    assert dispatcher.calls == []
+    assert store.get_round(request["roundId"])[4] == "dispatched"
+    assert recovered["receipt"] == {**request, "status": "accepted", "provenanceId": f"overseer-round-recovery:{request['roundId']}"}
+    evidence = store.round_recovery(request["roundId"])
+    assert evidence["state"] == "completed"
+    assert evidence["evidence"]["deliveryProof"] == "rollout-user-message"
+    assert evidence["evidence"]["source"] == "existing-rollout-scan"
+
+
+def test_recovery_redelivers_once_with_exact_round_idempotency_key(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store)
+    dispatcher = _RoundRecoveryDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    recovered = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    assert recovered["status"] == "recovered"
+    assert len(dispatcher.calls) == 1
+    assert dispatcher.calls[0][2] == request["idempotencyKey"]
+    assert store.get_round(request["roundId"])[4] == "dispatched"
+    assert store.round_recovery(request["roundId"])["evidence"]["source"] == "redelivery-rollout-scan"
+
+
+def test_recovery_after_crash_rescans_and_never_redelivers_again(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    request = _started_round(store)
+    dispatcher = _RoundRecoveryDispatcher(crash_after_send=True)
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    recovered_first = bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    recovered = restarted.recover_round(request["roundId"], owner_id="recoverer-b")
+
+    assert recovered_first["status"] == "recovered"
+    assert recovered["status"] == "already-dispatched"
+    assert len(dispatcher.calls) == 1
+    assert restarted.store.get_round(request["roundId"])[4] == "dispatched"
+
+
+def test_recovery_claim_excludes_a_second_recoverer(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    request = _started_round(store)
+    store.claim_round_recovery(request["roundId"], request, "capability-round-recovery-1234567890abcdef", owner_id="recoverer-a", lease_expires_at="2026-08-10T02:05:00+00:00", now=NOW)
+    bridge = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=_RoundRecoveryDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="already claimed"):
+        bridge.recover_round(request["roundId"], owner_id="recoverer-b")
+
+
+def test_recovery_dispatch_commit_rejects_stale_owner_and_preserves_started_state(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store)
+    store.claim_round_recovery(request["roundId"], request, "capability-round-recovery-1234567890abcdef", owner_id="recoverer-a", lease_expires_at="2026-08-10T02:05:00+00:00", now=NOW)
+
+    with pytest.raises(ValueError, match="claim is unavailable"):
+        store.complete_round_recovery_dispatch(request["roundId"], "recoverer-b", {**request, "status": "accepted"}, {"deliveryProof": "rollout-user-message"}, now=NOW)
+    assert store.get_round(request["roundId"])[4] == "started"
+
+
+def test_recovery_refuses_a_second_redelivery_when_rollout_proof_is_absent(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    request = _started_round(store)
+    class NoProofDispatcher:
+        def __init__(self): self.calls = []
+        def scan_rollout(self, _lead, _prompt): return False
+        def __call__(self, lead, prompt, idempotency_key=None):
+            self.calls.append((lead, prompt, idempotency_key))
+            return "provider-dispatch-round-recovery"
+    dispatcher = NoProofDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="delivery proof"):
+        bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="already attempted"):
+        restarted.recover_round(request["roundId"], owner_id="recoverer-b")
+    assert len(dispatcher.calls) == 1
+
+
 def test_stages_and_completes_roadex_decision(tmp_path: Path):
     forwarded = []
     bridge = PsychloBridge(

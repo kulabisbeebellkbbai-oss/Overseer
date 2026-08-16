@@ -132,6 +132,40 @@ class RolloutPromptDeliveryEvidence:
             time.sleep(0.25)
         return False
 
+    def scan_existing(self, prompt: str) -> bool:
+        """Scan the complete bound rollout, including records before recovery."""
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self._rollout, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) != self._identity:
+                return False
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = None
+                for line in stream:
+                    try:
+                        if _rollout_user_prompt(json.loads(line)) == prompt:
+                            return True
+                    except (ValueError, TypeError):
+                        continue
+        except (OSError, UnicodeError):
+            return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        return False
+
+
+def _jsonl_records(content: str):
+    for line in content.splitlines():
+        try:
+            yield json.loads(line)
+        except (ValueError, TypeError):
+            continue
+
 
 def _rollout_path_for_session(session: AgentSession, state_database: Path) -> Path:
     conversation_id = session.external_session_id or session.id
@@ -494,6 +528,13 @@ class CodexDriver:
             idempotency_key=dispatch_key,
             prompt="legacy compatibility dispatch",
         )
+
+    def scan_rollout_prompt(self, session: AgentSession, prompt: str) -> bool:
+        """Return whether the exact prompt is already recorded in the rollout."""
+        resolved = self._validated_session(session)
+        if resolved is None:
+            raise ValueError("cannot scan an unknown Codex session")
+        return RolloutPromptDeliveryEvidence(resolved).scan_existing(prompt)
 
     def inspect(self, session: AgentSession) -> AgentDispatchResult:
         request_id = f"inspect.{_identifier_part(session.id)}"

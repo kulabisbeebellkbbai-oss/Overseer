@@ -39,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--receipt-file", default=os.environ.get("OVERSEER_PSYCHLO_USAGE_RECEIPTS_FILE"))
     sync = subparsers.add_parser("sync-projects")
     sync.add_argument("--handoff-file", default=os.environ.get("OVERSEER_A_TEAM_HANDOFF_FILE", "/home/god/Documents/Codex Workspace/The A-Team/data/handoffs.json"))
+    recover_round = subparsers.add_parser("recover-round", help="recover one exact started Psychlo round")
+    recover_round.add_argument("--round-id", required=True)
+    recover_round.add_argument("--owner-id", default=None)
     subparsers.add_parser("tick")
     return parser
 
@@ -75,6 +78,11 @@ def main(argv: list[str] | None = None) -> int:
             bridge.register_project({"envelope": record.get("envelope"), "receipt": record["receipt"]})
             synchronized += 1
         print(json.dumps({"accepted": True, "synchronized": synchronized}, sort_keys=True))
+        return 0
+    if args.command == "recover-round":
+        bridge = create_bridge_from_environment()
+        result = bridge.recover_round(args.round_id, owner_id=args.owner_id)
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "tick":
         bridge = create_bridge_from_environment()

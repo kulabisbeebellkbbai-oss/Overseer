@@ -169,11 +169,12 @@ def test_unavailable_adapter_handoff_preserves_supplied_bindings(
 
 
 class RecordingRunner:
-    def __init__(self, *, reject_prompt: bool = False) -> None:
+    def __init__(self, *, reject_prompt: bool = False, confirm_prompt: bool = True) -> None:
         self.commands: list[tuple[str, ...]] = []
         self.inputs: list[str | None] = []
         self.capture_count = 0
         self.reject_prompt = reject_prompt
+        self.confirm_prompt = confirm_prompt
 
     def __call__(
         self,
@@ -191,6 +192,8 @@ class RecordingRunner:
             output = "Codex ready"
             if self.reject_prompt and self.capture_count == 2:
                 output = "Message exceeds maximum length allowed"
+            elif self.confirm_prompt and self.capture_count == 2:
+                output = "Codex ready\nPrompt accepted"
             return subprocess.CompletedProcess(command, 0, output, "")
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
@@ -567,6 +570,66 @@ def test_dispatch_reports_codex_rejection_without_losing_request_bindings(
     assert result.session_id == request.session_id
     assert result.driver_epoch_id == request.driver_epoch_id
     assert result.error_message == "codex project rejected prompt: message exceeds maximum length"
+
+
+def test_bound_dispatch_does_not_ack_idle_legacy_session_without_rollout_delivery_evidence(
+    codex_csv: Path,
+) -> None:
+    """A resumed tmux process is not proof that this exact prompt was delivered."""
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=RecordingRunner(confirm_prompt=False),
+        delivery_evidence_factory=lambda _session: type("Evidence", (), {"confirm": lambda self, _prompt: False})(),
+    )
+    session = adapter.discover()[0]
+    request = AgentDispatchRequest(
+        id="dispatch.idle-legacy",
+        instance_id="overseer.default",
+        session_id=session.id,
+        driver_epoch_id="epoch.idle-legacy",
+        idempotency_key="dispatch-key.idle-legacy",
+        prompt="Continue exactly one bounded round.",
+    )
+
+    result = adapter._dispatch_session(session, request, prompt_marker="round:idle-legacy")
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_category is AgentErrorCategory.PROVIDER_PROTOCOL_ERROR
+    assert result.error_message == "codex rollout did not record the exact prompt"
+
+
+def test_dispatch_requires_exact_rollout_prompt_evidence_for_bound_legacy_round(
+    codex_csv: Path,
+) -> None:
+    class Evidence:
+        def confirm(self, prompt: str) -> bool:
+            return prompt == "Continue exactly one bounded round."
+
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=RecordingRunner(confirm_prompt=False),
+        delivery_evidence_factory=lambda _session: Evidence(),
+    )
+    session = adapter.discover()[0]
+
+    result = adapter.dispatch_legacy(
+        session,
+        "Continue exactly one bounded round.",
+        idempotency_key="round:arcade:one",
+        prompt_marker="round:arcade:one",
+    )
+
+    assert result.state is AgentOperationState.ACKNOWLEDGED
+    assert result.evidence["delivery_proof"] == "rollout-user-message"
+    assert result.evidence["prompt_digest"] == hashlib.sha256(b"Continue exactly one bounded round.").hexdigest()
 
 
 def test_codex_capability_claims_are_truthful(adapter_factory: AdapterFactory) -> None:

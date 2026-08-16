@@ -429,16 +429,20 @@ class PsychloBridge:
         except (KeyError, TypeError, ValueError):
             return False
 
-    def request_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def request_round(self, request: Mapping[str, Any], *, callback_capability: str | None = None) -> dict[str, Any]:
         _require_round(request)
+        if callback_capability is not None and (not isinstance(callback_capability, str) or not re.fullmatch(r"capability:[A-Za-z0-9._:-]{1,220}", callback_capability)):
+            raise ValueError("round callback capability is invalid")
         if any(item["request"].get("projectId") == request["projectId"] for item in self.store.list_staged_decisions()) or self.store.external_gate_pending(str(request["projectId"])) or self.store.external_gate_blocked(str(request["projectId"])):
             raise ValueError("decision_pending")
         existing = self.store.get_round(str(request["roundId"]))
         if existing:
             if existing[0] != dict(request): raise ValueError("round identity conflict")
-            if existing[4] != "dispatched": return self._dispatch_reserved(existing[0], existing[3], existing[1])
+            if existing[4] == "pending": return self._dispatch_reserved(existing[0], existing[3], existing[1])
+            if existing[4] == "started": raise ValueError("round dispatch is uncertain and requires operational-failure reconciliation")
+            if existing[4] == "failed": raise ValueError("round dispatch ended with an operational failure")
             return {"accepted": True, "receipt": existing[1]}
-        capability = self.token_factory()
+        capability = callback_capability or self.token_factory()
         receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": f"overseer-dispatch:{request['roundId']}", "status": "accepted"}
         if self._durable_ceiling_available():
             self.store.record_durable_ceiling_round(request, receipt, capability, self.clock())
@@ -571,7 +575,11 @@ class PsychloBridge:
     def reconcile_round(self, request: Mapping[str, Any]) -> dict[str, Any]:
         existing = self.store.get_round(str(request.get("roundId", "")))
         if existing and existing[0] == dict(request):
-            if existing[4] != "dispatched": return self._dispatch_reserved(existing[0], existing[3], existing[1])
+            if existing[4] == "pending": return self._dispatch_reserved(existing[0], existing[3], existing[1])
+            if existing[4] == "started":
+                return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-uncertain:{request.get('roundId')}", "status": "unknown"}}
+            if existing[4] == "failed":
+                return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-operational-failure:{request.get('roundId')}", "status": "rejected"}}
             return {"accepted": True, "receipt": existing[1]}
         return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-unknown:{request.get('roundId')}", "status": "unknown"}}
 
@@ -2094,9 +2102,21 @@ class CodexProjectDispatcher:
 
     def __call__(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:
         driver, session = self._resolve(project_lead_id)
-        result = driver.dispatch_legacy(session, prompt, idempotency_key=idempotency_key)
+        result = driver.dispatch_legacy(
+            session,
+            prompt,
+            idempotency_key=idempotency_key,
+            prompt_marker=idempotency_key,
+        )
         if result.state.value not in {"acknowledged", "running", "succeeded"}:
             raise ValueError("project lead dispatch was not acknowledged")
+        expected_prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if (
+            result.evidence.get("status") != "prompt_dispatched"
+            or result.evidence.get("prompt_digest") != expected_prompt_digest
+            or result.evidence.get("delivery_proof") != "rollout-user-message"
+        ):
+            raise ValueError("project lead dispatch lacks exact prompt delivery proof")
         return result.id
 
     def prepare(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:

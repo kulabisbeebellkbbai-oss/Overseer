@@ -746,7 +746,8 @@ def test_production_dispatch_intent_survives_post_send_crash_without_repaste(tmp
             assert idempotency_key == request["id"]
             return SimpleNamespace(id=request_identity)
 
-        def dispatch_legacy(self, _session, _prompt, *, idempotency_key):
+        def dispatch_legacy(self, _session, _prompt, *, idempotency_key, prompt_marker=None):
+            assert prompt_marker == idempotency_key
             sends.append(idempotency_key)
             raise SystemExit("fault after external prompt submission")
 
@@ -2152,12 +2153,11 @@ def test_round_completion_timing_uses_trusted_receipt_time_not_lead_occurred_at(
     assert timing == {"authorizationId": None, "startedAt": NOW, "completedAt": NOW}
 
 
-def test_retries_a_durably_reserved_round_after_dispatch_failure(tmp_path: Path):
+def test_does_not_repeat_an_uncertain_durably_started_dispatch(tmp_path: Path):
     attempts = []
     def dispatch(_lead, _prompt):
         attempts.append("attempt")
-        if len(attempts) == 1: raise ValueError("provider unavailable")
-        return "dispatch:recovered"
+        raise ValueError("provider unavailable")
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatch, sender=lambda *_args: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability_retry_1234567890abcdef")
     request = {"roundId": "round-retry", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-retry", "idempotencyKey": "round-retry", "snapshotId": "snapshot-retry", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
     try:
@@ -2167,8 +2167,16 @@ def test_retries_a_durably_reserved_round_after_dispatch_failure(tmp_path: Path)
     else:
         raise AssertionError("dispatch failure was hidden")
     recovered = bridge.reconcile_round(request)
-    assert recovered["receipt"]["provenanceId"] == "dispatch:recovered"
-    assert len(attempts) == 2
+    assert recovered["receipt"]["status"] == "unknown"
+    assert recovered["receipt"]["provenanceId"] == "overseer-uncertain:round-retry"
+    assert len(attempts) == 1
+    try:
+        bridge.request_round(request)
+    except ValueError as error:
+        assert "operational-failure reconciliation" in str(error)
+    else:
+        raise AssertionError("uncertain dispatch was repeated")
+    assert len(attempts) == 1
 
 
 def test_stages_and_completes_roadex_decision(tmp_path: Path):
@@ -2467,8 +2475,9 @@ def test_private_http_round_route_uses_hmac_not_admin_bearer(tmp_path: Path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_api_handler(str(tmp_path / "overseer.sqlite3"), "admin-secret", psychlo_bridge=bridge))
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     request_payload = {"roundId": "round-http", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-http", "idempotencyKey": "round-http", "snapshotId": "snapshot-http", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    callback_capability = "capability:psychlo-owned-http-round"
     timestamp = datetime.now(UTC).isoformat()
-    body = json.dumps({"kind": "round-request", "messageId": "round-http", "occurredAt": timestamp, "payload": request_payload}, separators=(",", ":")).encode()
+    body = json.dumps({"kind": "round-request", "messageId": "round-http", "occurredAt": timestamp, "payload": {"request": request_payload, "callbackCapability": callback_capability}}, separators=(",", ":")).encode()
     headers = sign_peer_message(SECRET, "psychlo-to-overseer", "round-request", "round-http", timestamp, "nonce_http_1234567890", body)
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
@@ -2477,6 +2486,7 @@ def test_private_http_round_route_uses_hmac_not_admin_bearer(tmp_path: Path):
         response_body = response.read()
         assert response.status == 202, response_body
         assert json.loads(response_body)["receipt"]["status"] == "accepted"
+        assert bridge.store.round_for_capability(callback_capability)[0] == request_payload
         connection.request("POST", "/psychlo/rounds", body=body, headers=headers)
         replay = connection.getresponse()
         assert replay.status == 409

@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -374,13 +376,22 @@ SystemctlRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
 def _default_systemctl(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    uid = os.getuid()
+    home = pwd.getpwuid(uid).pw_dir
     return subprocess.run(
         ("/usr/bin/systemctl", "--user", *args),
         check=False,
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LANG": "C", "LC_ALL": "C"},
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+            "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
     )
 
 
@@ -394,6 +405,30 @@ def _atomic_write(path: Path, content: bytes, mode: int) -> None:
         os.close(descriptor)
         descriptor = -1
         os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_create(path: Path, content: bytes, mode: int) -> None:
+    """Publish a complete immutable file without replacing an existing path."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, mode)
+        os.write(descriptor, content)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(temporary, path, follow_symlinks=False)
         parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(parent)
@@ -460,7 +495,6 @@ def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner:
         return "backup replay verified"
     if spec.backup_directory.exists():
         raise ValueError("unowned Psychlo cycle backup directory already exists")
-    spec.backup_directory.mkdir(mode=0o700)
     enabled = runner(("is-enabled", spec.timer_unit)).returncode == 0
     units: dict[str, object] = {}
     for name in spec.unit_names:
@@ -473,7 +507,19 @@ def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner:
         else:
             units[name] = {"present": False}
     record = {**expected, "timerPreviouslyEnabled": enabled, "units": units}
-    _atomic_write(record_path, (_canonical_json(record) + "\n").encode(), 0o600)
+    staging = Path(tempfile.mkdtemp(prefix=f".{spec.backup_directory.name}.", dir=spec.backup_directory.parent))
+    try:
+        staging.chmod(0o700)
+        _atomic_create(staging / "record.json", (_canonical_json(record) + "\n").encode(), 0o600)
+        os.rename(staging, spec.backup_directory)
+        parent = os.open(spec.backup_directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
     return "backup recorded"
 
 
@@ -492,12 +538,12 @@ def _publish_marker(plan_id: str, digest: str, spec: PsychloCycleActivationSpec)
     if spec.activation_marker.exists():
         _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
         return "activation marker replay verified"
-    _atomic_write(spec.activation_marker, (_canonical_json(expected) + "\n").encode(), 0o600)
+    _atomic_create(spec.activation_marker, (_canonical_json(expected) + "\n").encode(), 0o600)
     return "activation marker published"
 
 
 def _observation_identity() -> tuple[str | None, str | None]:
-    path = Path.home() / ".local/share/overseer/psychlo-meter/latest-observation.json"
+    path = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/share/overseer/psychlo-meter/latest-observation.json"
     if not path.exists():
         return None, None
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -507,7 +553,7 @@ def _observation_identity() -> tuple[str | None, str | None]:
 def _delivered_observation(observation_id: str) -> bool:
     import sqlite3
 
-    ledger = Path.home() / ".local/share/overseer/psychlo/usage-attribution.sqlite3"
+    ledger = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/share/overseer/psychlo/usage-attribution.sqlite3"
     if not ledger.exists():
         return False
     connection = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
@@ -542,7 +588,8 @@ def _verify_installed(spec: PsychloCycleActivationSpec) -> None:
 def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
     expected = _ownership(plan_id, digest)
     record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
-    _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+    if spec.activation_marker.exists():
+        _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
     runner(("disable", "--now", spec.timer_unit))
     units = record.get("units")
     if not isinstance(units, dict):
@@ -559,7 +606,8 @@ def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runne
             _atomic_write(installed, content, 0o644)
         elif installed.exists():
             installed.unlink()
-    spec.activation_marker.unlink()
+    if spec.activation_marker.exists():
+        spec.activation_marker.unlink()
     _run_checked(runner, ("daemon-reload",), "user systemd rollback reload")
     if record.get("timerPreviouslyEnabled") is True:
         _run_checked(runner, ("enable", "--now", spec.timer_unit), "restore prior timer state")

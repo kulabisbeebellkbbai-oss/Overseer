@@ -247,6 +247,29 @@ def test_meter_canary_failure_prevents_timer_enable_and_triggers_rollback(tmp_pa
     assert seen[-1] == "__overseer_psychlo_cycle_rollback"
 
 
+def test_rollback_restores_partial_install_before_marker_publication(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    old_meter = b"old-meter-unit\n"
+    (spec.installed_unit_directory / spec.meter_unit).write_bytes(old_meter)
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+    assert not spec.activation_marker.exists()
+    assert (spec.installed_unit_directory / spec.cycle_unit).exists()
+
+    code, _, error = execute_psychlo_cycle_activation_marker(plan.rollback_steps[0].command, systemctl_runner=systemctl)
+
+    assert (code, error) == (0, "")
+    assert (spec.installed_unit_directory / spec.meter_unit).read_bytes() == old_meter
+    assert not (spec.installed_unit_directory / spec.cycle_unit).exists()
+    assert not spec.activation_marker.exists()
+
+
 def test_concurrent_exact_plan_is_blocked_before_commands_or_rollback(tmp_path: Path):
     spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
     plan = replace(

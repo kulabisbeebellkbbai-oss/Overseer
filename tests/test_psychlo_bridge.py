@@ -3107,6 +3107,9 @@ def test_operational_failure_retry_reuses_exact_payload_and_fences_claim(tmp_pat
     assert calls[0][2] == calls[1][2]
     assert calls[0][2]["callbackCapability"] == "capability:operational-failure-retry-1234567890"
     assert restarted.store.get_round(request["roundId"])[4] == "failed"
+    replay = restarted.report_operational_failure(request["roundId"], "transport-failed")
+    assert replay["status"] == "already-accepted"
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize("response", [

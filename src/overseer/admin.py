@@ -20,6 +20,7 @@ class AdminChangeKind(StrEnum):
     # execution adapter or command steps; the policy-exception bridge owns its
     # paired ApprovalRequest decision path.
     PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
+    PSYCHLO_LEGACY_ROUND_RECONCILIATION = "psychlo_legacy_round_reconciliation"
     PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
     PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
     USER_SERVICE_RESTART = "user_service_restart"
@@ -151,7 +152,7 @@ class AdminChangePlan:
         return (
             not self.archived
             and not self.canceled
-            and self.kind is not AdminChangeKind.PSYCHLO_POLICY_EXCEPTION
+            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION}
             and (self.approved or not self.requires_explicit_approval())
             and not missing_admin_change_fields(self)
         )
@@ -405,6 +406,39 @@ def plan_user_service_restart(plan_id: str, service_name: str, reason: str, curr
                 "confirm the service reached the expected active state",
             ),
         ),
+    )
+
+
+def plan_psychlo_legacy_round_reconciliation(
+    plan_id: str,
+    round_id: str,
+    manifest_digest: str,
+    source_commit: str,
+    reason: str,
+    current_state: str = "legacy uncertain round binding requires attestation",
+) -> AdminChangePlan:
+    """Create non-executable human authority for one legacy binding attestation."""
+    if not all(isinstance(value, str) and value.strip() for value in (plan_id, round_id, manifest_digest, source_commit, reason, current_state)):
+        raise ValueError("legacy round reconciliation plan identity is required")
+    if len(manifest_digest) != 64 or any(char not in "0123456789abcdef" for char in manifest_digest.lower()):
+        raise ValueError("legacy round reconciliation manifest digest is invalid")
+    if len(source_commit) not in {40, 64} or any(char not in "0123456789abcdef" for char in source_commit.lower()):
+        raise ValueError("legacy round reconciliation source commit is invalid")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION,
+        owner_domain=OwnerDomain.SISKO,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.HUMAN,
+        target=round_id,
+        reason=reason,
+        current_state=current_state,
+        proposed_state="persist one immutable Codex execution binding and attestation for this exact round",
+        steps=(AdminCommandStep("Record attested binding only", ("__overseer_psychlo_legacy_round_reconciliation__",), "This marker is not an executable host command"),),
+        rollback_steps=(AdminCommandStep("Retain immutable attestation", ("__overseer_psychlo_legacy_round_reconciliation_retention__",), "Attestation records are append-only and have no rollback command"),),
+        risks=("incorrect legacy conversation identity", "stale dispatch evidence", "binding an already-delivered prompt"),
+        verification_steps=(AdminCommandStep("Verify attestation evidence", ("__overseer_psychlo_legacy_round_reconciliation_verify__",), "Recheck manifest, rollout provenance, and exact-prompt absence"),),
+        adapter_metadata={"legacy_round_reconciliation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit}},
     )
 
 

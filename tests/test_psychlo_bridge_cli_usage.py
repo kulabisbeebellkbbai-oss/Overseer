@@ -121,6 +121,13 @@ def test_cli_exposes_only_one_exact_operational_failure_command():
     assert args.failure_code == "transport-failed"
 
 
+def test_cli_exposes_only_one_exact_legacy_attestation_command():
+    args = build_parser().parse_args(["attest-legacy-round", "--round-id", "round-uncertain", "--manifest-path", "/private/attestation.json"])
+    assert args.command == "attest-legacy-round"
+    assert args.round_id == "round-uncertain"
+    assert args.manifest_path == "/private/attestation.json"
+
+
 def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Path, capsys):
     captured = {}
 

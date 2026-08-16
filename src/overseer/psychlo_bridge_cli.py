@@ -46,6 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("--round-id", required=True)
     failure.add_argument("--failure-code", required=True, choices=("provider-unavailable", "provider-timeout", "provider-rate-limited", "execution-failed", "transport-failed", "resource-unavailable", "cancelled-by-lead"))
     failure.add_argument("--owner-id", default=None)
+    legacy = subparsers.add_parser("attest-legacy-round", help="one-shot owner-attested binding migration for one exact legacy round")
+    legacy.add_argument("--round-id", required=True)
+    legacy.add_argument("--manifest-path", required=True)
     subparsers.add_parser("tick")
     return parser
 
@@ -91,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report-operational-failure":
         bridge = create_bridge_from_environment()
         result = bridge.report_operational_failure(args.round_id, args.failure_code, owner_id=args.owner_id)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "attest-legacy-round":
+        bridge = create_bridge_from_environment()
+        result = bridge.attest_legacy_round_binding(args.round_id, args.manifest_path)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "tick":

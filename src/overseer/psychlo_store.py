@@ -68,6 +68,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
@@ -724,6 +725,42 @@ class PsychloBridgeStore:
 
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
+
+    def round_binding_attestation(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT manifest_digest,attestation_json,inserted_at FROM round_binding_attestations WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            return None
+        return {"roundId": round_id, "manifestDigest": row[0], "attestation": json.loads(row[1]), "insertedAt": row[2]}
+
+    def migrate_legacy_round_binding(self, round_id: str, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, binding: Mapping[str, Any], attestation: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+        encoded_binding = _dump_wire(binding)
+        encoded_attestation = _dump_wire(attestation)
+        manifest_digest = str(attestation.get("manifestDigest", ""))
+        if not manifest_digest:
+            raise ValueError("legacy binding attestation digest is required")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or row[0] != _dump_wire(request) or row[1] != _dump_wire(receipt) or row[2] != _token_hash(capability) or row[3] != capability or row[4] != "started" or row[5] is not None or row[6] is not None:
+                raise ValueError("legacy binding round changed before attestation")
+            if self.connection.execute("SELECT 1 FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone() is not None:
+                raise ValueError("legacy binding recovery record already exists")
+            if self.connection.execute("SELECT 1 FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone() is not None:
+                raise ValueError("legacy binding operational failure intent already exists")
+            if self.connection.execute("SELECT 1 FROM round_binding_attestations WHERE round_id=? OR manifest_digest=?", (round_id, manifest_digest)).fetchone() is not None:
+                raise ValueError("legacy binding attestation already exists")
+            update = self.connection.execute("UPDATE rounds SET codex_binding_json=? WHERE round_id=? AND request_json=? AND receipt_json=? AND capability_hash=? AND capability_token=? AND dispatch_state='started' AND result_json IS NULL AND codex_binding_json IS NULL AND NOT EXISTS (SELECT 1 FROM round_recoveries WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?)", (encoded_binding, round_id, _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability, round_id, round_id))
+            if update.rowcount != 1:
+                raise ValueError("legacy binding round changed before attestation")
+            self.connection.execute("INSERT INTO round_binding_attestations(round_id,manifest_digest,attestation_json,inserted_at) VALUES (?,?,?,?)", (round_id, manifest_digest, encoded_attestation, now))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        record = self.round_binding_attestation(round_id)
+        if record is None:
+            raise ValueError("legacy binding attestation is missing")
+        return {"accepted": True, "roundId": round_id, "binding": dict(binding), "attestation": record}
 
     def operational_failure_intent(self, round_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,payload_json,payload_digest,state,owner_id,claim_token,lease_expires_at,attempts,outcome_json,last_error,updated_at FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()

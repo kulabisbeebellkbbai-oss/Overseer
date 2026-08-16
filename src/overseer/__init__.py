@@ -70,6 +70,7 @@ from .admin import (
     plan_npm_global_install,
     plan_storage_mount_test,
     plan_user_service_restart,
+    plan_psychlo_legacy_round_reconciliation,
     unarchive_admin_change_plan,
 )
 from .python_venv import (
@@ -341,6 +342,7 @@ __all__ = [
     "psychlo_cycle_activation_spec_from_private_file",
     "validate_psychlo_cycle_activation_plan",
     "plan_user_service_restart",
+    "plan_psychlo_legacy_round_reconciliation",
     "ApprovalRequest",
     "ApprovalStatus",
     "AuditEvent",

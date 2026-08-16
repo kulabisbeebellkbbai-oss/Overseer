@@ -662,6 +662,11 @@ class PsychloBridge:
         self.store.finish_operational_failure(round_id, owner, claim_token, accepted=True, outcome=response, now=self.clock())
         return {"accepted": True, "status": "accepted", "receipt": response}
 
+    def attest_legacy_round_binding(self, round_id: str, manifest_path: str | Path) -> dict[str, Any]:
+        """Run the one-shot owner-attested legacy binding migration."""
+        from .psychlo_legacy_binding import attest_legacy_round_binding
+        return attest_legacy_round_binding(self, round_id, manifest_path)
+
     def recover_round(self, round_id: str, *, owner_id: str | None = None) -> dict[str, Any]:
         """Recover exactly one uncertain started round without synthesizing a result."""
         if not isinstance(round_id, str) or not round_id.strip():

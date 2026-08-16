@@ -48,6 +48,7 @@ _EXPECTED_KEYS = {
 _HEX_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_MANIFEST_BYTES = 128 * 1024
+_MAX_MARKER_BYTES = 128 * 1024
 
 
 def _canonical_json(value: Any) -> str:
@@ -464,6 +465,10 @@ def _ownership(plan_id: str, digest: str) -> dict[str, str]:
     return {"planId": plan_id, "specDigest": digest}
 
 
+def _ownership_marker_bytes(plan_id: str, digest: str) -> bytes:
+    return (_canonical_json(_ownership(plan_id, digest)) + "\n").encode()
+
+
 def _backup_record(spec: PsychloCycleActivationSpec) -> Path:
     return spec.backup_directory / "record.json"
 
@@ -472,12 +477,96 @@ def _completion_record(spec: PsychloCycleActivationSpec) -> Path:
     return spec.backup_directory / "completed.json"
 
 
+def _read_owner_only_bytes(path: Path, label: str, *, max_bytes: int) -> tuple[bytes, int]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(descriptor)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{label} must be an owner-only regular file")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError(f"{label} must be an owner-only regular file")
+        content = bytearray()
+        while len(content) <= max_bytes:
+            chunk = os.read(descriptor, min(8192, max_bytes + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > max_bytes:
+            raise ValueError(f"{label} is too large")
+        return bytes(content), stat.S_IMODE(info.st_mode)
+    finally:
+        os.close(descriptor)
+
+
 def _load_owned_json(path: Path, expected: dict[str, str], label: str) -> dict[str, Any]:
-    _owner_only_regular(path, label)
-    value = json.loads(path.read_text(encoding="utf-8"))
+    content, _ = _read_owner_only_bytes(path, label, max_bytes=_MAX_MARKER_BYTES)
+    try:
+        value = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is invalid JSON") from error
     if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
         raise ValueError(f"{label} ownership mismatch")
     return value
+
+
+def _capture_activation_marker(path: Path) -> dict[str, object]:
+    try:
+        content, mode = _read_owner_only_bytes(
+            path,
+            "Psychlo cycle activation marker",
+            max_bytes=_MAX_MARKER_BYTES,
+        )
+    except FileNotFoundError:
+        return {"present": False}
+    return {
+        "present": True,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "content": base64.b64encode(content).decode("ascii"),
+        "mode": mode,
+    }
+
+
+def _validate_marker_snapshot(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or value.get("present") is not True:
+        if value == {"present": False}:
+            return {"present": False}
+        raise ValueError("Psychlo cycle backup marker snapshot is invalid")
+    if set(value) != {"present", "sha256", "content", "mode"}:
+        raise ValueError("Psychlo cycle backup marker snapshot is invalid")
+    content = value["content"]
+    mode = value["mode"]
+    digest = value["sha256"]
+    if not isinstance(content, str) or not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        raise ValueError("Psychlo cycle backup marker snapshot is invalid")
+    if not isinstance(mode, int) or mode < 0 or mode > 0o777 or mode & 0o077:
+        raise ValueError("Psychlo cycle backup marker snapshot is invalid")
+    try:
+        decoded = base64.b64decode(content, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise ValueError("Psychlo cycle backup marker snapshot is invalid") from error
+    if hashlib.sha256(decoded).hexdigest() != digest:
+        raise ValueError("Psychlo cycle backup marker snapshot digest mismatch")
+    return {
+        "present": True,
+        "sha256": digest,
+        "content": content,
+        "mode": mode,
+    }
+
+
+def _marker_snapshot_matches(left: dict[str, object], right: dict[str, object]) -> bool:
+    return left == right
+
+
+def _restore_activation_marker(path: Path, snapshot: dict[str, object]) -> None:
+    snapshot = _validate_marker_snapshot(snapshot)
+    if snapshot["present"] is False:
+        if path.exists() or path.is_symlink():
+            _owner_only_regular(path, "Psychlo cycle activation marker")
+            path.unlink()
+        return
+    content = base64.b64decode(str(snapshot["content"]), validate=True)
+    _atomic_write(path, content, int(snapshot["mode"]))
 
 
 def _run_checked(runner: SystemctlRunner, args: Sequence[str], label: str) -> subprocess.CompletedProcess[str]:
@@ -518,7 +607,9 @@ def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner:
     expected = _ownership(plan_id, digest)
     record_path = _backup_record(spec)
     if record_path.exists():
-        _load_owned_json(record_path, expected, "Psychlo cycle backup record")
+        record = _load_owned_json(record_path, expected, "Psychlo cycle backup record")
+        if "activationMarker" in record:
+            _validate_marker_snapshot(record["activationMarker"])
         return "backup replay verified"
     if spec.backup_directory.exists():
         raise ValueError("unowned Psychlo cycle backup directory already exists")
@@ -533,7 +624,12 @@ def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner:
             units[name] = {"present": True, "sha256": hashlib.sha256(content).hexdigest(), "content": base64.b64encode(content).decode()}
         else:
             units[name] = {"present": False}
-    record = {**expected, "timerPreviouslyEnabled": enabled, "units": units}
+    record = {
+        **expected,
+        "timerPreviouslyEnabled": enabled,
+        "units": units,
+        "activationMarker": _capture_activation_marker(spec.activation_marker),
+    }
     staging = Path(tempfile.mkdtemp(prefix=f".{spec.backup_directory.name}.", dir=spec.backup_directory.parent))
     try:
         staging.chmod(0o700)
@@ -562,10 +658,30 @@ def _install(plan_id: str, digest: str, spec: PsychloCycleActivationSpec) -> str
 
 def _publish_marker(plan_id: str, digest: str, spec: PsychloCycleActivationSpec) -> str:
     expected = _ownership(plan_id, digest)
-    if spec.activation_marker.exists():
-        _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+    record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
+    predecessor = (
+        _validate_marker_snapshot(record["activationMarker"])
+        if "activationMarker" in record
+        else None
+    )
+    current = _capture_activation_marker(spec.activation_marker)
+    current_bytes = _ownership_marker_bytes(plan_id, digest)
+    current_is_exact_replay = (
+        current.get("present") is True
+        and current.get("sha256") == hashlib.sha256(current_bytes).hexdigest()
+        and base64.b64decode(str(current["content"]), validate=True) == current_bytes
+        and current.get("mode") == 0o600
+    )
+    if current_is_exact_replay:
         return "activation marker replay verified"
-    _atomic_create(spec.activation_marker, (_canonical_json(expected) + "\n").encode(), 0o600)
+    if predecessor is None:
+        raise ValueError("Psychlo cycle backup lacks predecessor activation marker snapshot")
+    if not _marker_snapshot_matches(current, predecessor):
+        raise ValueError("Psychlo cycle predecessor activation marker changed")
+    if predecessor["present"] is False:
+        _atomic_create(spec.activation_marker, current_bytes, 0o600)
+    else:
+        _atomic_write(spec.activation_marker, current_bytes, 0o600)
     return "activation marker published"
 
 
@@ -615,8 +731,21 @@ def _verify_installed(spec: PsychloCycleActivationSpec) -> None:
 def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
     expected = _ownership(plan_id, digest)
     record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
-    if spec.activation_marker.exists():
-        _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+    predecessor = (
+        _validate_marker_snapshot(record["activationMarker"])
+        if "activationMarker" in record
+        else {"present": False}
+    )
+    current = _capture_activation_marker(spec.activation_marker)
+    current_bytes = _ownership_marker_bytes(plan_id, digest)
+    current_is_exact_owner = (
+        current.get("present") is True
+        and current.get("sha256") == hashlib.sha256(current_bytes).hexdigest()
+        and base64.b64decode(str(current["content"]), validate=True) == current_bytes
+        and current.get("mode") == 0o600
+    )
+    if not current_is_exact_owner and not _marker_snapshot_matches(current, predecessor):
+        raise ValueError("Psychlo cycle activation marker changed during rollback")
     _run_checked(
         runner,
         ("disable", "--now", spec.timer_unit),
@@ -637,8 +766,10 @@ def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runne
             _atomic_write(installed, content, 0o644)
         elif installed.exists():
             installed.unlink()
-    if spec.activation_marker.exists():
-        spec.activation_marker.unlink()
+    after_restore = _capture_activation_marker(spec.activation_marker)
+    if not _marker_snapshot_matches(after_restore, current):
+        raise ValueError("Psychlo cycle activation marker changed during rollback")
+    _restore_activation_marker(spec.activation_marker, predecessor)
     _run_checked(runner, ("daemon-reload",), "user systemd rollback reload")
     if record.get("timerPreviouslyEnabled") is True:
         _run_checked(runner, ("enable", "--now", spec.timer_unit), "restore prior timer state")

@@ -392,3 +392,111 @@ def test_concurrent_exact_plan_is_blocked_before_commands_or_rollback(tmp_path: 
 
     assert result.status.value == "blocked"
     assert called is False
+
+
+def test_successor_plan_hands_off_existing_predecessor_marker(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.successor", spec, "activate", "disabled")
+    predecessor = b'{"planId":"admin.predecessor","specDigest":"prior-digest"}\n'
+    spec.activation_marker.write_bytes(predecessor)
+    spec.activation_marker.chmod(0o600)
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.steps[2].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert (code, error) == (0, "")
+    assert json.loads(spec.activation_marker.read_text()) == {
+        "planId": plan.id,
+        "specDigest": psychlo_cycle_activation_plan_digest(spec),
+    }
+    record = json.loads((spec.backup_directory / "record.json").read_text())
+    assert record["activationMarker"]["present"] is True
+    assert record["activationMarker"]["content"]
+    assert record["activationMarker"]["sha256"] == hashlib.sha256(predecessor).hexdigest()
+
+
+def test_successor_publish_rejects_tampered_predecessor_marker(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.successor", spec, "activate", "disabled")
+    spec.activation_marker.write_bytes(b'{"planId":"admin.predecessor","specDigest":"prior-digest"}\n')
+    spec.activation_marker.chmod(0o600)
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+    tampered = b'{"planId":"attacker","specDigest":"changed"}\n'
+    spec.activation_marker.write_bytes(tampered)
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.steps[2].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert code == 1
+    assert "predecessor" in error
+    assert spec.activation_marker.read_bytes() == tampered
+
+
+def test_rollback_allows_unchanged_predecessor_before_publish(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.successor", spec, "activate", "disabled")
+    predecessor = b'{"planId":"admin.predecessor","specDigest":"prior-digest"}\n'
+    spec.activation_marker.write_bytes(predecessor)
+    spec.activation_marker.chmod(0o600)
+    old_meter = b"old-meter-unit\n"
+    (spec.installed_unit_directory / spec.meter_unit).write_bytes(old_meter)
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:2]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.rollback_steps[0].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert (code, error) == (0, "")
+    assert spec.activation_marker.read_bytes() == predecessor
+    assert (spec.installed_unit_directory / spec.meter_unit).read_bytes() == old_meter
+    assert not (spec.installed_unit_directory / spec.cycle_unit).exists()
+
+
+def test_rollback_restores_predecessor_marker_bytes_and_mode_exactly(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.successor", spec, "activate", "disabled")
+    predecessor = b'{ "specDigest": "prior-digest", "planId": "admin.predecessor", "extra": 7 }\n'
+    spec.activation_marker.write_bytes(predecessor)
+    spec.activation_marker.chmod(0o600)
+    predecessor_mode = os.stat(spec.activation_marker).st_mode & 0o777
+
+    def systemctl(args):
+        value = tuple(args)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:3]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+    assert spec.activation_marker.read_bytes() != predecessor
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.rollback_steps[0].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert (code, error) == (0, "")
+    assert spec.activation_marker.read_bytes() == predecessor
+    assert os.stat(spec.activation_marker).st_mode & 0o777 == predecessor_mode

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import base64
+from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import json
@@ -47,10 +48,18 @@ _EXPECTED_KEYS = {
 }
 _HEX_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_SYSTEMD_TIMESPAN_RE = re.compile(
-    r"(?P<value>\d+(?:\.\d+)?)(?:us|ms|s|min|h|d|w)"
-    r"(?:\s+(?P<tail>\d+(?:\.\d+)?)(?:us|ms|s|min|h|d|w))*"
+_SYSTEMD_TIMESPAN_TOKEN_RE = re.compile(
+    r"(?P<value>\d+(?:\.\d+)?)(?P<unit>us|ms|s|min|h|d|w)"
 )
+_SYSTEMD_TIMESPAN_MICROSECONDS = {
+    "us": Decimal(1),
+    "ms": Decimal(1_000),
+    "s": Decimal(1_000_000),
+    "min": Decimal(60_000_000),
+    "h": Decimal(3_600_000_000),
+    "d": Decimal(86_400_000_000),
+    "w": Decimal(604_800_000_000),
+}
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_MARKER_BYTES = 128 * 1024
 
@@ -611,6 +620,8 @@ def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> str:
         "verify recurring timer next trigger",
     )
     raw = completed.stdout.strip()
+    if any(separator in raw for separator in ("\r", "\n", "\t")):
+        raise RuntimeError("recurring timer next trigger must be one scalar value")
     if "=" in raw:
         # Be tolerant of a runner/systemctl version that includes the property
         # name even though --value was requested, while still requiring one
@@ -625,10 +636,24 @@ def _next_timer_trigger(runner: SystemctlRunner, timer_unit: str) -> str:
         if int(raw, 10) <= 0:
             raise RuntimeError("recurring timer has no finite next trigger")
         return raw
-    if _SYSTEMD_TIMESPAN_RE.fullmatch(raw) is None:
+    tokens = raw.split(" ")
+    if not tokens or any(not token for token in tokens):
         raise RuntimeError("recurring timer next trigger is not a valid systemd timespan")
-    numeric_parts = re.findall(r"\d+(?:\.\d+)?", raw)
-    if not any(any(character in "123456789" for character in part) for part in numeric_parts):
+    total_microseconds = Decimal(0)
+    try:
+        for token in tokens:
+            match = _SYSTEMD_TIMESPAN_TOKEN_RE.fullmatch(token)
+            if match is None:
+                raise RuntimeError("recurring timer next trigger is not a valid systemd timespan")
+            total_microseconds += (
+                Decimal(match.group("value"))
+                * _SYSTEMD_TIMESPAN_MICROSECONDS[match.group("unit")]
+            )
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            "recurring timer next trigger is not a valid systemd timespan"
+        ) from exc
+    if total_microseconds < 1:
         raise RuntimeError("recurring timer has no finite next trigger")
     return raw
 

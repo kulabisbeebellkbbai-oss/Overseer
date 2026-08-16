@@ -356,7 +356,19 @@ def test_publish_rejects_missing_predecessor_marker_without_creating_one(tmp_pat
     assert not spec.activation_marker.exists()
 
 
-@pytest.mark.parametrize("next_trigger", ["", "0", "infinity", "Infinity"])
+@pytest.mark.parametrize(
+    "next_trigger",
+    [
+        "",
+        "0",
+        "infinity",
+        "Infinity",
+        "1h\n2min",
+        "1h\t2min",
+        "NextElapseUSecMonotonic=1h\n2min",
+        "0.0000001us",
+    ],
+)
 def test_verification_rejects_missing_or_infinite_next_trigger_without_completion(
     tmp_path: Path,
     next_trigger: str,
@@ -387,7 +399,7 @@ def test_verification_rejects_missing_or_infinite_next_trigger_without_completio
     )
 
     assert code == 1
-    assert "finite next trigger" in error
+    assert "next trigger" in error
     assert not (spec.backup_directory / "completed.json").exists()
 
 
@@ -402,7 +414,19 @@ def test_next_timer_trigger_accepts_systemd_finite_timespans(next_trigger: str):
     assert cycle_activation._next_timer_trigger(systemctl, "example.timer") == next_trigger
 
 
-@pytest.mark.parametrize("next_trigger", ["garbage", "0s", "0min 0s", "1 fortnight"])
+@pytest.mark.parametrize(
+    "next_trigger",
+    [
+        "garbage",
+        "0s",
+        "0min 0s",
+        "1 fortnight",
+        "1h\n2min",
+        "1h\t2min",
+        "NextElapseUSecMonotonic=1h\n2min",
+        "0.0000001us",
+    ],
+)
 def test_next_timer_trigger_rejects_malformed_or_zero_timespans(next_trigger: str):
     def systemctl(args):
         return _completed(tuple(args), stdout=next_trigger)

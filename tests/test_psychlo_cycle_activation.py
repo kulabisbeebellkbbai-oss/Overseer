@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+import overseer.psychlo_cycle_activation as cycle_activation
 from overseer.admin import (
     AdminAdapterStatus,
     AdminChangeKind,
@@ -14,11 +15,15 @@ from overseer.admin import (
     OwnerDomain,
     RiskLevel,
     admin_execution_capability_for,
+    execute_admin_change_plan,
 )
 from overseer.psychlo_cycle_activation import (
     PsychloCycleActivationSpec,
+    acquire_psychlo_cycle_activation_lock,
+    execute_psychlo_cycle_activation_marker,
     plan_psychlo_recurring_cycle_activation,
     psychlo_cycle_activation_plan_digest,
+    psychlo_cycle_activation_replay_verified,
     validate_psychlo_cycle_activation_plan,
 )
 
@@ -146,3 +151,98 @@ def test_approved_plan_rejects_immutable_mutation(tmp_path: Path):
         validate_psychlo_cycle_activation_plan(
             replace(approved, steps=(replace(approved.steps[0], title="changed"), *approved.steps[1:]))
         )
+
+
+def _completed(args: tuple[str, ...], returncode: int = 0):
+    return subprocess.CompletedProcess(args, returncode, stdout="ok", stderr="")
+
+
+def test_fixed_marker_lifecycle_installs_canaries_and_verifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(args):
+        value = tuple(args)
+        calls.append(value)
+        return _completed(value, 1 if value[0] == "is-enabled" and len(calls) == 1 else 0)
+
+    observations = iter((("old", "old-digest"), ("new", "new-digest")))
+    monkeypatch.setattr(cycle_activation, "_observation_identity", lambda: next(observations))
+    monkeypatch.setattr(cycle_activation, "_delivered_observation", lambda observation_id: observation_id == "new")
+
+    for step in plan.steps:
+        code, _, error = execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)
+        assert (code, error) == (0, "")
+    code, _, error = execute_psychlo_cycle_activation_marker(plan.verification_steps[0].command, systemctl_runner=systemctl)
+
+    assert (code, error) == (0, "")
+    assert calls == [
+        ("is-enabled", "overseer-psychlo-usage.timer"),
+        ("daemon-reload",),
+        ("start", "--wait", "overseer-psychlo-cycle.service"),
+        ("enable", "--now", "overseer-psychlo-usage.timer"),
+        ("is-enabled", "overseer-psychlo-usage.timer"),
+        ("is-active", "overseer-psychlo-usage.timer"),
+    ]
+    assert json.loads(spec.activation_marker.read_text())["planId"] == plan.id
+    for name, digest in spec.unit_sha256:
+        assert hashlib.sha256((spec.installed_unit_directory / name).read_bytes()).hexdigest() == digest
+    assert psychlo_cycle_activation_replay_verified(plan, systemctl_runner=systemctl) is True
+
+
+def test_meter_canary_failure_prevents_timer_enable_and_triggers_rollback(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = replace(
+        plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled"),
+        approved=True,
+        approved_by="human-user",
+        approved_at="2026-08-16T12:00:00Z",
+    )
+    seen: list[str] = []
+
+    def runner(step):
+        from overseer.admin import AdminCommandResult
+
+        operation = step.command[0]
+        seen.append(operation)
+        return AdminCommandResult(step.title, step.command, 1 if operation.endswith("_canary") else 0, "", "meter failed")
+
+    result = execute_admin_change_plan(
+        plan,
+        runner=runner,
+        enabled_adapter_kinds=(AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION,),
+    )
+
+    assert result.status.value == "failed"
+    assert "__overseer_psychlo_cycle_enable_timer" not in seen
+    assert seen[-1] == "__overseer_psychlo_cycle_rollback"
+
+
+def test_concurrent_exact_plan_is_blocked_before_commands_or_rollback(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = replace(
+        plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled"),
+        approved=True,
+        approved_by="human-user",
+        approved_at="2026-08-16T12:00:00Z",
+    )
+    lock = acquire_psychlo_cycle_activation_lock(plan)
+    called = False
+
+    def runner(_step):
+        nonlocal called
+        called = True
+        raise AssertionError("contender must not run commands")
+
+    try:
+        result = execute_admin_change_plan(
+            plan,
+            runner=runner,
+            enabled_adapter_kinds=(AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION,),
+        )
+    finally:
+        lock.release()
+
+    assert result.status.value == "blocked"
+    assert called is False

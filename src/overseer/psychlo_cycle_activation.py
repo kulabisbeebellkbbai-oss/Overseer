@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -10,7 +12,8 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import Any
+import tempfile
+from typing import Any, Callable, Sequence
 
 from .admin import AdminChangeKind, AdminChangePlan, AdminCommandStep
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
@@ -233,7 +236,7 @@ def _canonical_plan(
     current_state: str,
 ) -> AdminChangePlan:
     digest = psychlo_cycle_activation_plan_digest(spec)
-    marker_args = (digest, _canonical_json(spec.to_json()))
+    marker_args = (plan_id, digest, _canonical_json(spec.to_json()))
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION,
@@ -305,3 +308,297 @@ def validate_psychlo_cycle_activation_plan(plan: AdminChangePlan) -> PsychloCycl
     if normalized != canonical:
         raise ValueError("Psychlo cycle activation plan is not canonical")
     return spec
+
+
+class PsychloCycleActivationBusy(RuntimeError):
+    """Another process owns this exact activation target."""
+
+
+@dataclass
+class PsychloCycleActivationLock:
+    descriptor: int
+
+    def release(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+
+def acquire_psychlo_cycle_activation_lock(plan: AdminChangePlan) -> PsychloCycleActivationLock:
+    spec = validate_psychlo_cycle_activation_plan(plan)
+    identity = hashlib.sha256(str(spec.installed_unit_directory).encode()).hexdigest()
+    path = spec.backup_directory.parent / f".psychlo-cycle-{identity}.lock"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("Psychlo cycle activation lock is not owner-only")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise PsychloCycleActivationBusy("Psychlo cycle activation lifecycle is busy") from error
+        return PsychloCycleActivationLock(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+SystemctlRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+
+def _default_systemctl(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ("/usr/bin/systemctl", "--user", *args),
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LANG": "C", "LC_ALL": "C"},
+    )
+
+
+def _atomic_write(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, mode)
+        os.write(descriptor, content)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _marker_context(command: Sequence[str]) -> tuple[str, str, PsychloCycleActivationSpec]:
+    if len(command) != 4 or not command[0].startswith("__overseer_psychlo_cycle_"):
+        raise ValueError("Psychlo cycle marker command is invalid")
+    plan_id, expected_digest, encoded = command[1:]
+    try:
+        value = json.loads(encoded)
+    except json.JSONDecodeError as error:
+        raise ValueError("Psychlo cycle marker spec is invalid") from error
+    if not isinstance(value, dict):
+        raise ValueError("Psychlo cycle marker spec is invalid")
+    value.pop("unitSha256", None)
+    spec = PsychloCycleActivationSpec.from_json(value)
+    if psychlo_cycle_activation_plan_digest(spec) != expected_digest:
+        raise ValueError("Psychlo cycle marker digest mismatch")
+    return plan_id, expected_digest, spec
+
+
+def _ownership(plan_id: str, digest: str) -> dict[str, str]:
+    return {"planId": plan_id, "specDigest": digest}
+
+
+def _backup_record(spec: PsychloCycleActivationSpec) -> Path:
+    return spec.backup_directory / "record.json"
+
+
+def _completion_record(spec: PsychloCycleActivationSpec) -> Path:
+    return spec.backup_directory / "completed.json"
+
+
+def _load_owned_json(path: Path, expected: dict[str, str], label: str) -> dict[str, Any]:
+    _owner_only_regular(path, label)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
+        raise ValueError(f"{label} ownership mismatch")
+    return value
+
+
+def _run_checked(runner: SystemctlRunner, args: Sequence[str], label: str) -> subprocess.CompletedProcess[str]:
+    completed = runner(args)
+    if completed.returncode != 0:
+        raise RuntimeError(f"{label} failed: {completed.stderr.strip()[:300]}")
+    return completed
+
+
+def _backup(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
+    expected = _ownership(plan_id, digest)
+    record_path = _backup_record(spec)
+    if record_path.exists():
+        _load_owned_json(record_path, expected, "Psychlo cycle backup record")
+        return "backup replay verified"
+    if spec.backup_directory.exists():
+        raise ValueError("unowned Psychlo cycle backup directory already exists")
+    spec.backup_directory.mkdir(mode=0o700)
+    enabled = runner(("is-enabled", spec.timer_unit)).returncode == 0
+    units: dict[str, object] = {}
+    for name in spec.unit_names:
+        installed = spec.installed_unit_directory / name
+        if installed.exists():
+            if installed.is_symlink() or not installed.is_file():
+                raise ValueError(f"installed unit is not a regular file: {name}")
+            content = installed.read_bytes()
+            units[name] = {"present": True, "sha256": hashlib.sha256(content).hexdigest(), "content": base64.b64encode(content).decode()}
+        else:
+            units[name] = {"present": False}
+    record = {**expected, "timerPreviouslyEnabled": enabled, "units": units}
+    _atomic_write(record_path, (_canonical_json(record) + "\n").encode(), 0o600)
+    return "backup recorded"
+
+
+def _install(plan_id: str, digest: str, spec: PsychloCycleActivationSpec) -> str:
+    _load_owned_json(_backup_record(spec), _ownership(plan_id, digest), "Psychlo cycle backup record")
+    for name, expected_hash in spec.unit_sha256:
+        source = spec.source_root / "systemd" / name
+        if _sha256(source) != expected_hash:
+            raise ValueError(f"reviewed unit changed after approval: {name}")
+        _atomic_write(spec.installed_unit_directory / name, source.read_bytes(), 0o644)
+    return "reviewed units installed"
+
+
+def _publish_marker(plan_id: str, digest: str, spec: PsychloCycleActivationSpec) -> str:
+    expected = _ownership(plan_id, digest)
+    if spec.activation_marker.exists():
+        _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+        return "activation marker replay verified"
+    _atomic_write(spec.activation_marker, (_canonical_json(expected) + "\n").encode(), 0o600)
+    return "activation marker published"
+
+
+def _observation_identity() -> tuple[str | None, str | None]:
+    path = Path.home() / ".local/share/overseer/psychlo-meter/latest-observation.json"
+    if not path.exists():
+        return None, None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value.get("observationId"), value.get("digest")
+
+
+def _delivered_observation(observation_id: str) -> bool:
+    import sqlite3
+
+    ledger = Path.home() / ".local/share/overseer/psychlo/usage-attribution.sqlite3"
+    if not ledger.exists():
+        return False
+    connection = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT state,receipt_json FROM usage_snapshot_intents WHERE observation_id=?",
+            (observation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return bool(row and row[0] == "delivered" and row[1])
+
+
+def _canary(spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
+    _, before_digest = _observation_identity()
+    _run_checked(runner, ("start", "--wait", spec.cycle_unit), "Psychlo accounting cycle canary")
+    observation_id, after_digest = _observation_identity()
+    if not observation_id or not after_digest or after_digest == before_digest:
+        raise RuntimeError("Psychlo accounting cycle canary did not publish a fresh observation")
+    if not _delivered_observation(observation_id):
+        raise RuntimeError("Psychlo accounting cycle canary lacks a durable delivery receipt")
+    return f"canary delivered observation {observation_id}"
+
+
+def _verify_installed(spec: PsychloCycleActivationSpec) -> None:
+    for name, expected in spec.unit_sha256:
+        path = spec.installed_unit_directory / name
+        if not path.is_file() or path.is_symlink() or _sha256(path) != expected:
+            raise ValueError(f"installed unit verification failed: {name}")
+
+
+def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runner: SystemctlRunner) -> str:
+    expected = _ownership(plan_id, digest)
+    record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
+    _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+    runner(("disable", "--now", spec.timer_unit))
+    units = record.get("units")
+    if not isinstance(units, dict):
+        raise ValueError("Psychlo cycle backup unit record is invalid")
+    for name in spec.unit_names:
+        item = units.get(name)
+        if not isinstance(item, dict):
+            raise ValueError("Psychlo cycle backup unit record is invalid")
+        installed = spec.installed_unit_directory / name
+        if item.get("present") is True:
+            content = base64.b64decode(str(item["content"]), validate=True)
+            if hashlib.sha256(content).hexdigest() != item.get("sha256"):
+                raise ValueError("Psychlo cycle backup content digest mismatch")
+            _atomic_write(installed, content, 0o644)
+        elif installed.exists():
+            installed.unlink()
+    spec.activation_marker.unlink()
+    _run_checked(runner, ("daemon-reload",), "user systemd rollback reload")
+    if record.get("timerPreviouslyEnabled") is True:
+        _run_checked(runner, ("enable", "--now", spec.timer_unit), "restore prior timer state")
+    return "recurring cycle rolled back"
+
+
+def execute_psychlo_cycle_activation_marker(
+    command: Sequence[str],
+    *,
+    systemctl_runner: SystemctlRunner | None = None,
+) -> tuple[int, str, str]:
+    plan_id, digest, spec = _marker_context(command)
+    runner = systemctl_runner or _default_systemctl
+    operation = command[0]
+    try:
+        if operation == "__overseer_psychlo_cycle_backup":
+            result = _backup(plan_id, digest, spec, runner)
+        elif operation == "__overseer_psychlo_cycle_install_units":
+            result = _install(plan_id, digest, spec)
+        elif operation == "__overseer_psychlo_cycle_publish_marker":
+            result = _publish_marker(plan_id, digest, spec)
+        elif operation == "__overseer_psychlo_cycle_daemon_reload":
+            _run_checked(runner, ("daemon-reload",), "user systemd reload")
+            result = "user systemd reloaded"
+        elif operation == "__overseer_psychlo_cycle_canary":
+            result = _canary(spec, runner)
+        elif operation == "__overseer_psychlo_cycle_enable_timer":
+            _run_checked(runner, ("enable", "--now", spec.timer_unit), "enable recurring Psychlo timer")
+            result = "recurring timer enabled"
+        elif operation == "__overseer_psychlo_cycle_verify":
+            _verify_installed(spec)
+            _load_owned_json(spec.activation_marker, _ownership(plan_id, digest), "Psychlo cycle activation marker")
+            _run_checked(runner, ("is-enabled", spec.timer_unit), "verify recurring timer enabled")
+            _run_checked(runner, ("is-active", spec.timer_unit), "verify recurring timer active")
+            _atomic_write(
+                _completion_record(spec),
+                (_canonical_json(_ownership(plan_id, digest)) + "\n").encode(),
+                0o600,
+            )
+            result = "recurring cycle verified"
+        elif operation == "__overseer_psychlo_cycle_rollback":
+            result = _rollback(plan_id, digest, spec, runner)
+        else:
+            raise ValueError("unsupported Psychlo cycle marker operation")
+        return 0, result, ""
+    except (OSError, RuntimeError, ValueError) as error:
+        return 1, "", str(error)
+
+
+def psychlo_cycle_activation_replay_verified(
+    plan: AdminChangePlan,
+    *,
+    systemctl_runner: SystemctlRunner | None = None,
+) -> bool:
+    """Return true only when a prior exact execution remains fully active."""
+    try:
+        spec = validate_psychlo_cycle_activation_plan(plan)
+        expected = _ownership(plan.id, psychlo_cycle_activation_plan_digest(spec))
+        _load_owned_json(_completion_record(spec), expected, "Psychlo cycle completion record")
+        _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
+        _verify_installed(spec)
+        runner = systemctl_runner or _default_systemctl
+        if runner(("is-enabled", spec.timer_unit)).returncode != 0:
+            return False
+        if runner(("is-active", spec.timer_unit)).returncode != 0:
+            return False
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False

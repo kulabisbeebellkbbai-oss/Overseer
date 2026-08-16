@@ -1300,6 +1300,46 @@ def execute_admin_change_plan(
     enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
 ) -> AdminExecutionResult:
     """Execute a plan, serializing the full Python venv lifecycle."""
+    if AdminChangeKind(plan.kind) == AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION:
+        enabled_adapter_kinds = tuple(enabled_adapter_kinds)
+        capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
+        if capability.can_execute_live() and plan.can_execute():
+            try:
+                from .psychlo_cycle_activation import (
+                    PsychloCycleActivationBusy,
+                    acquire_psychlo_cycle_activation_lock,
+                    psychlo_cycle_activation_replay_verified,
+                )
+
+                lifecycle_lock = acquire_psychlo_cycle_activation_lock(plan)
+            except PsychloCycleActivationBusy as exc:
+                return AdminExecutionResult(
+                    id=f"admin.exec.{plan.id}.blocked",
+                    plan_id=plan.id,
+                    status=AdminExecutionStatus.BLOCKED,
+                    summary=f"Psychlo cycle activation is busy; no command or rollback ran: {exc}",
+                    command_results=(),
+                )
+            except (OSError, ValueError) as exc:
+                return AdminExecutionResult(
+                    id=f"admin.exec.{plan.id}.blocked",
+                    plan_id=plan.id,
+                    status=AdminExecutionStatus.BLOCKED,
+                    summary=f"Psychlo cycle activation validation blocked execution: {exc}",
+                    command_results=(),
+                )
+            try:
+                if psychlo_cycle_activation_replay_verified(plan):
+                    return AdminExecutionResult(
+                        id=f"admin.exec.{plan.id}.completed",
+                        plan_id=plan.id,
+                        status=AdminExecutionStatus.COMPLETED,
+                        summary="exact Psychlo recurring cycle activation replay verified; no command ran",
+                        command_results=(),
+                    )
+                return _execute_admin_change_plan_body(plan, runner, enabled_adapter_kinds)
+            finally:
+                lifecycle_lock.release()
     if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
         enabled_adapter_kinds = tuple(enabled_adapter_kinds)
         capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
@@ -1383,6 +1423,19 @@ def _execute_admin_change_plan_body(
                 summary=f"python venv manifest validation blocked execution: {exc}",
                 command_results=(),
             )
+    if AdminChangeKind(plan.kind) == AdminChangeKind.PSYCHLO_RECURRING_CYCLE_ACTIVATION:
+        try:
+            from .psychlo_cycle_activation import validate_psychlo_cycle_activation_plan
+
+            validate_psychlo_cycle_activation_plan(plan)
+        except (OSError, ValueError) as exc:
+            return AdminExecutionResult(
+                id=f"admin.exec.{plan.id}.blocked",
+                plan_id=plan.id,
+                status=AdminExecutionStatus.BLOCKED,
+                summary=f"Psychlo cycle activation validation blocked execution: {exc}",
+                command_results=(),
+            )
     command_results_list: list[AdminCommandResult] = []
     for step in plan.steps:
         result = command_runner(step)
@@ -1453,6 +1506,14 @@ def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecuti
 
 
 def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
+    if step.command and step.command[0].startswith("__overseer_psychlo_cycle_"):
+        try:
+            from .psychlo_cycle_activation import execute_psychlo_cycle_activation_marker
+
+            exit_code, stdout, stderr = execute_psychlo_cycle_activation_marker(step.command)
+        except (OSError, ValueError) as exc:
+            exit_code, stdout, stderr = 1, "", str(exc)
+        return AdminCommandResult(step.title, step.command, exit_code, stdout, stderr)
     if step.command and step.command[0].startswith("__overseer_python_venv_"):
         try:
             from .python_venv import execute_python_venv_marker

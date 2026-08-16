@@ -337,6 +337,34 @@ def test_rollback_restores_partial_install_before_marker_publication(tmp_path: P
     assert not spec.activation_marker.exists()
 
 
+def test_rollback_fails_closed_when_timer_cannot_be_disabled(tmp_path: Path):
+    spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
+    plan = plan_psychlo_recurring_cycle_activation("admin.cycle", spec, "activate", "disabled")
+    old_meter = b"old-meter-unit\n"
+    (spec.installed_unit_directory / spec.meter_unit).write_bytes(old_meter)
+
+    def systemctl(args):
+        value = tuple(args)
+        if value[:2] == ("disable", "--now"):
+            return _completed(value, 1)
+        return _completed(value, 1 if value[0] == "is-enabled" else 0)
+
+    for step in plan.steps[:3]:
+        assert execute_psychlo_cycle_activation_marker(step.command, systemctl_runner=systemctl)[0] == 0
+    installed_meter = (spec.installed_unit_directory / spec.meter_unit).read_bytes()
+    marker = spec.activation_marker.read_bytes()
+
+    code, _, error = execute_psychlo_cycle_activation_marker(
+        plan.rollback_steps[0].command,
+        systemctl_runner=systemctl,
+    )
+
+    assert code == 1
+    assert "disable recurring timer during rollback" in error
+    assert (spec.installed_unit_directory / spec.meter_unit).read_bytes() == installed_meter
+    assert spec.activation_marker.read_bytes() == marker
+
+
 def test_concurrent_exact_plan_is_blocked_before_commands_or_rollback(tmp_path: Path):
     spec = PsychloCycleActivationSpec.from_json(_manifest(tmp_path))
     plan = replace(

@@ -617,7 +617,11 @@ def _rollback(plan_id: str, digest: str, spec: PsychloCycleActivationSpec, runne
     record = _load_owned_json(_backup_record(spec), expected, "Psychlo cycle backup record")
     if spec.activation_marker.exists():
         _load_owned_json(spec.activation_marker, expected, "Psychlo cycle activation marker")
-    runner(("disable", "--now", spec.timer_unit))
+    _run_checked(
+        runner,
+        ("disable", "--now", spec.timer_unit),
+        "disable recurring timer during rollback",
+    )
     units = record.get("units")
     if not isinstance(units, dict):
         raise ValueError("Psychlo cycle backup unit record is invalid")

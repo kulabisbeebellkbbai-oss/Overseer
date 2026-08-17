@@ -392,6 +392,25 @@ class SQLiteStore:
             "roadex_approval_fixtures",
         }:
             return False
+        triggers = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name IN ('psychlo_process_observations_no_delete', "
+                "'psychlo_process_observations_immutable')"
+            ).fetchall()
+        }
+        if triggers != {
+            "psychlo_process_observations_no_delete",
+            "psychlo_process_observations_immutable",
+        }:
+            return False
+        observation_table = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'psychlo_process_observations'"
+        ).fetchone()
+        if observation_table is None:
+            return False
         schema_current = self._connection.execute(
             "SELECT MAX(version) AS version FROM schema_migrations"
         ).fetchone()

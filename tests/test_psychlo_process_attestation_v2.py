@@ -4,6 +4,7 @@ import json
 import os
 import inspect
 import hashlib
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,20 @@ def _manifest(round_id: str = "round", plan_id: str = "plan") -> dict:
     }
 
 
-def _runtime(tmp_path, monkeypatch):
+def _seed_pre_feature_v3_primary(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);"
+        "CREATE TABLE agent_schema_migrations (version TEXT PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL);"
+        "CREATE TABLE roadex_approval_fixtures (id TEXT PRIMARY KEY, payload TEXT NOT NULL);"
+        "INSERT INTO schema_migrations VALUES (3, 'pre-observation schema', '2099-01-01T00:00:00+00:00');"
+        "INSERT INTO agent_schema_migrations VALUES ('agent_driver_v9', 'pre-observation agent schema', '2099-01-01T00:00:00+00:00');"
+    )
+    connection.commit()
+    connection.close()
+
+
+def _runtime(tmp_path, monkeypatch, *, pre_feature_primary=False):
     bridge = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = {"roundId": "round", "projectId": "arcade", "projectLeadId": "hermione", "idempotencyKey": "idem"}
     receipt = {**request, "status": "accepted", "sourceId": "hermione", "provenanceId": "prov"}
@@ -46,7 +60,10 @@ def _runtime(tmp_path, monkeypatch):
     binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "b" * 64, "rolloutDev": 1, "rolloutIno": 2}
     bridge.connection.execute("UPDATE rounds SET codex_binding_json=? WHERE round_id='round'", (json.dumps(binding, separators=(",", ":")),))
     bridge.record_round_prompt_delivery_phase("round", request, capability, binding, "4" * 64, "submitted", now="2099-01-01T00:00:00+00:00")
-    primary = SQLiteStore(tmp_path / "primary.sqlite3")
+    primary_path = tmp_path / "primary.sqlite3"
+    if pre_feature_primary:
+        _seed_pre_feature_v3_primary(primary_path)
+    primary = SQLiteStore(primary_path)
     value = _manifest()
     value["requestDigest"] = bridge._round_request_digest(request)
     value["bridge"]["requestDigest"] = value["requestDigest"]
@@ -96,6 +113,31 @@ def test_primary_only_stage_approval_and_completed_lookup(tmp_path, monkeypatch)
     assert runtime.collector.revalidate_calls == 0
     assert runtime.bridge.store.connection.total_changes == bridge_changes
     assert runtime.bridge.store.connection.execute("SELECT name FROM sqlite_master WHERE name='psychlo_process_observations'").fetchone() is None
+    runtime.bridge.store.close(); runtime.primary.close()
+
+
+def test_pre_feature_version3_primary_initializes_observation_schema_before_stage(tmp_path, monkeypatch):
+    runtime, value = _runtime(tmp_path, monkeypatch, pre_feature_primary=True)
+
+    staged = stage_process_observation(round_id="round", plan_id="plan")
+    assert staged["observationDigest"] == manifest_digest(value)
+    assert runtime.primary._connection.execute(
+        "SELECT state FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone()[0] == "prepared"
+    objects = {
+        row[0]
+        for row in runtime.primary._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','trigger') "
+            "AND name IN ('psychlo_process_observations', "
+            "'psychlo_process_observations_no_delete', "
+            "'psychlo_process_observations_immutable')"
+        )
+    }
+    assert objects == {
+        "psychlo_process_observations",
+        "psychlo_process_observations_no_delete",
+        "psychlo_process_observations_immutable",
+    }
     runtime.bridge.store.close(); runtime.primary.close()
 
 

@@ -447,6 +447,21 @@ def _private_workspace_mode(metadata: os.stat_result) -> bool:
             and (not bits & 0o020 or _private_group_is_safe(metadata.st_gid)))
 
 
+def _trusted_observation_module(path: Path, source_root: Path) -> tuple[Path, os.stat_result, bytes]:
+    """Bind and read the loaded module through a private no-follow handle."""
+    try:
+        content, metadata = _private_group_file_content(path, "loaded observation module")
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(source_root.resolve())
+        resolved_metadata = resolved.stat(follow_symlinks=False)
+    except (OSError, ValueError) as error:
+        raise ProcessAttestationError("loaded observation module is not trusted") from error
+    if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != (
+            resolved_metadata.st_dev, resolved_metadata.st_ino, resolved_metadata.st_nlink):
+        raise ProcessAttestationError("loaded observation module is not trusted")
+    return resolved, metadata, content
+
+
 def _parse_utc_timestamp(value: Any, label: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise ProcessAttestationError(f"{label} timestamp is required")
@@ -927,18 +942,13 @@ def capture_source_identity(source_root: str | Path) -> dict[str, str]:
     status = subprocess.run((_GIT, "-C", str(root), "status", "--porcelain", "--untracked-files=all", "--", "src", "pyproject.toml"), check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
     if status.returncode != 0 or status.stdout.strip():
         raise ProcessAttestationError("source runtime tree is dirty")
-    module = Path(__file__).resolve()
-    try:
-        module.relative_to(root.resolve())
-    except ValueError as error:
-        raise ProcessAttestationError("loaded observation module is outside the source root") from error
-    module_meta = module.stat(follow_symlinks=False)
-    if module_meta.st_uid != os.getuid() or stat.S_IMODE(module_meta.st_mode) & 0o022:
-        raise ProcessAttestationError("loaded observation module is not trusted")
-    try:
-        module_bytes = module.read_bytes()
-    except OSError as error:
-        raise ProcessAttestationError("loaded observation module cannot be read") from error
+    # Validate the loaded module itself with the same private-primary-group
+    # policy used for the source workspace.  In particular, a tracked module
+    # may be group-readable/writable when its group is the verified sole
+    # private primary group (for example, mode 0664).  Do not resolve a
+    # symlink first: doing so would turn an untrusted module substitution into
+    # an apparently trusted regular file.
+    module, _module_meta, module_bytes = _trusted_observation_module(Path(__file__), root)
     try:
         git_meta = executable.stat(follow_symlinks=False)
         if not stat.S_ISREG(git_meta.st_mode) or git_meta.st_uid != 0 or stat.S_IMODE(git_meta.st_mode) & 0o022:

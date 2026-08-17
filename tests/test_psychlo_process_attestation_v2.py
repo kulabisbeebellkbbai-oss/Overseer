@@ -427,6 +427,57 @@ def test_workspace_private_primary_group_policy_allows_0775_only_for_private_gro
     assert module._private_workspace_mode(metadata) is False
 
 
+def test_loaded_observation_module_allows_0664_private_primary_group(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    source = tmp_path / "source"
+    source.mkdir()
+    loaded = source / "psychlo_process_attestation.py"
+    loaded.write_text("# reviewed module\n")
+    loaded.chmod(0o664)
+    metadata = loaded.stat()
+    monkeypatch.setattr(module, "_private_group_is_safe", lambda gid: gid == metadata.st_gid)
+
+    resolved, bound, content = module._trusted_observation_module(loaded, source)
+    assert resolved == loaded
+    assert bound.st_ino == metadata.st_ino
+    assert content == b"# reviewed module\n"
+
+
+@pytest.mark.parametrize(
+    ("mode", "safe_group", "owner_matches", "symlink"),
+    [
+        (0o664, False, True, False),   # unsafe group-write group
+        (0o666, True, True, False),    # other-write remains forbidden
+        (0o664, True, False, False),   # non-owner remains forbidden
+        (0o664, True, True, True),      # final symlink is never followed
+    ],
+)
+def test_loaded_observation_module_rejects_unsafe_identity(
+    tmp_path, monkeypatch, mode, safe_group, owner_matches, symlink
+):
+    import overseer.psychlo_process_attestation as module
+
+    source = tmp_path / "source"
+    source.mkdir()
+    target = source / "reviewed.py"
+    target.write_text("# reviewed module\n")
+    target.chmod(mode)
+    loaded = source / "loaded.py"
+    if symlink:
+        loaded.symlink_to(target)
+    else:
+        loaded.write_bytes(target.read_bytes())
+        loaded.chmod(mode)
+    metadata = target.stat() if symlink else loaded.stat()
+    monkeypatch.setattr(module, "_private_group_is_safe", lambda _gid: safe_group)
+    if not owner_matches:
+        monkeypatch.setattr(module.os, "getuid", lambda: metadata.st_uid + 1)
+
+    with pytest.raises(module.ProcessAttestationError, match="trusted"):
+        module._trusted_observation_module(loaded, source)
+
+
 def test_tmux_scan_binds_pane_by_start_chain_not_launcher_name(monkeypatch, tmp_path):
     import overseer.psychlo_process_attestation as module
 

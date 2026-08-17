@@ -464,12 +464,12 @@ class PsychloBridgeStore:
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def active_round(self) -> str | None:
-        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') LIMIT 1").fetchone()
+        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') LIMIT 1").fetchone()
         return None if row is None else str(row[0])
 
     def active_rounds(self) -> list[dict[str, Any]]:
         """Return the immutable request identity for every unfinished round."""
-        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') ORDER BY rowid").fetchall()
+        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') ORDER BY rowid").fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def record_canary_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, authorization_id: str, expected_revision: int, now: str) -> None:
@@ -510,7 +510,7 @@ class PsychloBridgeStore:
             bound = next((item for item in projects if isinstance(item, dict) and item.get("projectId") == request.get("projectId")), None)
             if bound is None or any(request.get(field) != bound.get(source) for field, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
                 raise ValueError("concurrency canary round identity is not authorized")
-            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') ORDER BY rowid").fetchall()
+            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') ORDER BY rowid").fetchall()
             active = [json.loads(row[0]) for row in rows]
             if len(active) >= 2:
                 raise ValueError("single_stream_busy")
@@ -614,7 +614,7 @@ class PsychloBridgeStore:
             expected_decision = {"decisionId": authorization.get("decisionId"), "projectId": authorization.get("projectId"), "planId": authorization.get("planId"), "workflowId": authorization.get("workflowId"), "decisionVersion": authorization.get("decisionVersion"), "question": authorization.get("question"), "resultProvenanceId": authorization.get("digest")}
             if any(decision.get(field) != value for field, value in expected_decision.items()):
                 raise ValueError("concurrency ceiling decision binding is invalid")
-            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') ORDER BY rowid").fetchall()]
+            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
@@ -695,7 +695,7 @@ class PsychloBridgeStore:
         """Atomically preserve the default global ceiling of one."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') LIMIT 1").fetchone() is not None:
+            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")

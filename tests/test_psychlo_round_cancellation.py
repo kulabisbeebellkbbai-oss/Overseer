@@ -169,13 +169,16 @@ def test_cancel_pending_round_binds_exact_request_digest_and_cancellation_id(tmp
     assert store.round_cancellation(second["roundId"]) is None
 
 
-def test_active_round_queries_admit_only_explicit_open_states(tmp_path: Path):
+def test_unknown_future_round_state_remains_active_and_blocks_admission(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = _round()
     _record_pending(store, request)
     store.connection.execute("UPDATE rounds SET dispatch_state='unknown-future-state' WHERE round_id=?", (request["roundId"],))
-    assert store.active_round() is None
-    assert store.active_rounds() == []
+    assert store.active_round() == request["roundId"]
+    assert store.active_rounds() == [request]
+    second = _round("round-after-unknown-state")
+    with pytest.raises(ValueError, match="single_stream_busy"):
+        store.record_single_stream_round(second, {**second, "sourceId": second["projectLeadId"], "provenanceId": "must-not-admit", "status": "accepted"}, "capability:round-after-unknown-state")
 
 
 def test_signed_http_round_cancel_route_returns_persisted_receipt(tmp_path: Path):

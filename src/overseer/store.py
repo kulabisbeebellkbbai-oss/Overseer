@@ -519,6 +519,7 @@ class SQLiteStore:
                 round_id TEXT NOT NULL,
                 manifest_digest TEXT NOT NULL,
                 plan_digest TEXT NOT NULL,
+                state TEXT NOT NULL,
                 inserted_at TEXT NOT NULL,
                 PRIMARY KEY(plan_id, round_id)
             );

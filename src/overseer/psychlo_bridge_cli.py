@@ -98,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _create_process_attestation_bridge():
     """Create request-scoped handles without running startup recovery."""
-    template = create_bridge_from_environment(recover=False)
+    template = create_bridge_from_environment(recover=False, require_distinct_authority_store=True)
     try:
         return template.request_scoped()
     finally:

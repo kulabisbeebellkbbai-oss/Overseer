@@ -2415,12 +2415,24 @@ class CodexProjectDispatcher:
         launcher = references.get("launcher")
         if not isinstance(session.workspace, str) or not session.workspace.strip() or not isinstance(command, str) or not command.strip() or not isinstance(launcher, str) or not launcher.strip():
             raise ValueError("canonical project registry process identity is incomplete")
+        workspace_path = Path(session.workspace)
+        launcher_path = Path(launcher)
+        if not workspace_path.is_absolute() or workspace_path.is_symlink() or not workspace_path.is_dir() or not launcher_path.is_absolute() or launcher_path.is_symlink() or not launcher_path.is_file():
+            raise ValueError("canonical project registry paths are not absolute and trusted")
+        workspace_stat = workspace_path.stat(follow_symlinks=False)
+        launcher_stat = launcher_path.stat(follow_symlinks=False)
+        if workspace_stat.st_uid != os.getuid() or workspace_stat.st_mode & 0o022 or launcher_stat.st_uid not in {0, os.getuid()} or launcher_stat.st_mode & 0o022:
+            raise ValueError("canonical project registry paths are not private")
         return {
             "conversationId": session.external_session_id or "",
             "sessionId": session.id,
             "workspace": session.workspace,
             "command": command,
             "launcher": launcher,
+            "workspaceDev": str(workspace_stat.st_dev),
+            "workspaceIno": str(workspace_stat.st_ino),
+            "launcherDev": str(launcher_stat.st_dev),
+            "launcherIno": str(launcher_stat.st_ino),
             "registryPath": str(driver.registry_path),
         }
 
@@ -2470,13 +2482,25 @@ class AuthoritativeAgentResultCollector:
         return value
 
 
-def create_bridge_from_environment(environment: Mapping[str, str] | None = None, *, recover: bool = True) -> PsychloBridge:
+def create_bridge_from_environment(environment: Mapping[str, str] | None = None, *, recover: bool = True, require_distinct_authority_store: bool = False) -> PsychloBridge:
     selected = environment or os.environ
+    if require_distinct_authority_store:
+        bridge_path = selected.get("OVERSEER_PSYCHLO_BRIDGE_DATABASE")
+        primary_path = selected.get("OVERSEER_STORE_DATABASE") or selected.get("OVERSEER_STORE_PATH")
+        if not primary_path:
+            raise ValueError("OVERSEER_STORE_DATABASE is required for process attestation")
+        if bridge_path and Path(primary_path).resolve() == Path(bridge_path).resolve():
+            raise ValueError("process attestation authority store must be distinct from the Psychlo bridge store")
     secret = _read_secret(Path(selected["OVERSEER_PSYCHLO_PEER_SECRET_FILE"]))
     store = PsychloBridgeStore(selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"])
     dispatcher = CodexProjectDispatcher(selected["OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE"])
     sender = PsychloPeerSender(selected.get("OVERSEER_PSYCHLO_ENDPOINT", "http://127.0.0.1:8798"), secret)
-    primary_store_path = selected.get("OVERSEER_STORE_DATABASE", selected.get("OVERSEER_STORE_PATH", selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"]))
+    primary_store_value = selected.get("OVERSEER_STORE_DATABASE") or selected.get("OVERSEER_STORE_PATH")
+    if require_distinct_authority_store and not primary_store_value:
+        raise ValueError("OVERSEER_STORE_DATABASE is required for process attestation")
+    primary_store_path = primary_store_value or selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"]
+    if require_distinct_authority_store and Path(primary_store_path).resolve() == Path(selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"]).resolve():
+        raise ValueError("process attestation authority store must be distinct from the Psychlo bridge store")
     return PsychloBridge(
         store=store,
         dispatcher=dispatcher,

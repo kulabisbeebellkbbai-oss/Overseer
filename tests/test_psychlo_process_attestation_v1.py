@@ -23,6 +23,7 @@ from overseer.psychlo_process_attestation import (
     plan_psychlo_legacy_process_binding_attestation,
     stage_process_attestation,
     capture_process_identity,
+    capture_direct_codex_child,
     capture_tmux_identity,
     capture_source_identity,
     collect_process_binding_evidence,
@@ -149,7 +150,9 @@ def test_process_attestation_insert_preserves_codex_binding_and_is_replay_exact(
         def binding_provenance(self, _lead):
             return {"found": False, **binding}
         def process_binding_provenance(self, _lead):
-            return {"conversationId": binding["conversationId"], "sessionId": binding["sessionId"], "workspace": "arcade", "command": "codex", "launcher": "/usr/bin/codex", "registryPath": str(secure / "codex-projects.csv")}
+            workspace = secure / "arcade"
+            workspace.mkdir(exist_ok=True)
+            return {"conversationId": binding["conversationId"], "sessionId": binding["sessionId"], "workspace": str(workspace), "command": "codex", "launcher": "/bin/sh", "workspaceDev": "1", "workspaceIno": "2", "launcherDev": "1", "launcherIno": "3", "registryPath": str(secure / "codex-projects.csv")}
     class Bridge:
         def __init__(self): self.store = bridge; self.dispatcher = Dispatcher()
         def _round_prompt(self, _request, _capability): return "derived prompt"
@@ -159,13 +162,21 @@ def test_process_attestation_insert_preserves_codex_binding_and_is_replay_exact(
     canonical_registry = secure / "codex-projects.csv"
     canonical_registry.write_text("conversation_id,project,command,launcher\nconversation-arcade,arcade,codex,/usr/bin/codex\n")
     canonical_registry.chmod(0o600)
+    tmux_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    tmux_socket_path = secure / "tmux.sock"
+    tmux_listener.bind(str(tmux_socket_path)); tmux_listener.listen(1); tmux_socket_path.chmod(0o700)
     identity = {"pid": 10, "startTicks": 1, "exeDigest": "a" * 64, "argvDigest": "b" * 64, "cgroupDigest": "c" * 64, "pidfdSupported": True}
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr("overseer.psychlo_process_attestation.capture_tmux_identity", lambda *_args, **_kwargs: {"socket": {"dev": 1, "ino": 2, "mode": 448, "uid": os.getuid(), "pathDigest": "6" * 64}, "sessionId": "$1", "windowId": "@1", "paneId": "%1", "paneCommandDigest": "d" * 64, "serverProcess": {**identity, "pid": 9}, "paneProcess": {**identity, "pid": 10}, "serverEvidence": "list-sessions-and-list-panes-explicit-socket"})
     monkeypatch.setattr("overseer.psychlo_process_attestation.capture_direct_codex_child", lambda *_args, **_kwargs: {**identity, "pid": 11, "parentPid": 10})
-    monkeypatch.setattr(os, "pidfd_open", lambda _pid: os.open("/dev/null", os.O_RDONLY))
+    held_writes = []
+    def fake_pidfd(_pid):
+        read_fd, write_fd = os.pipe()
+        held_writes.append(write_fd)
+        return read_fd
+    monkeypatch.setattr(os, "pidfd_open", fake_pidfd)
     monkeypatch.setattr("overseer.psychlo_process_attestation.capture_source_identity", lambda *_args: manifest["source"])
-    authority = AuthoritativeProcessEvidenceCollector(Bridge(), str(registry), "/tmp/tmux.sock", "%1", str(secure))
+    authority = AuthoritativeProcessEvidenceCollector(Bridge(), str(registry), str(tmux_socket_path), "%1", str(secure))
     live = authority.collect(round_id, plan_id)
     plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, manifest_digest(live), source["commit"], source["treeDigest"], source["moduleDigest"])
     primary._connection.execute("DELETE FROM admin_change_plans")
@@ -180,6 +191,9 @@ def test_process_attestation_insert_preserves_codex_binding_and_is_replay_exact(
     assert bridge.connection.execute("SELECT codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()[0] == before
     assert bridge.process_binding_attestation(round_id)["manifestDigest"]
     primary.close(); bridge.close()
+    tmux_listener.close()
+    for write_fd in held_writes:
+        os.close(write_fd)
 
 
 def test_proc_identity_has_starttime_and_no_raw_argv(tmp_path: Path):
@@ -265,6 +279,34 @@ def test_cli_attestation_bridge_is_request_scoped_and_never_runs_recovery(monkey
             return "scoped"
         def close(self):
             calls.append("template-close")
-    monkeypatch.setattr(psychlo_bridge_cli, "create_bridge_from_environment", lambda *, recover=True: (calls.append(recover) or Template()))
+    monkeypatch.setattr(psychlo_bridge_cli, "create_bridge_from_environment", lambda *, recover=True, require_distinct_authority_store=False: (calls.append((recover, require_distinct_authority_store)) or Template()))
     assert psychlo_bridge_cli._create_process_attestation_bridge() == "scoped"
-    assert calls == [False, "request-scoped", "template-close"]
+    assert calls == [(False, True), "request-scoped", "template-close"]
+
+
+def test_process_bridge_rejects_missing_or_same_authority_store(tmp_path: Path):
+    from overseer.psychlo_bridge import create_bridge_from_environment
+    base = {"OVERSEER_PSYCHLO_BRIDGE_DATABASE": str(tmp_path / "bridge.sqlite3")}
+    with pytest.raises(ValueError, match="OVERSEER_STORE_DATABASE"):
+        create_bridge_from_environment(base, recover=False, require_distinct_authority_store=True)
+    with pytest.raises(ValueError, match="distinct"):
+        create_bridge_from_environment({**base, "OVERSEER_STORE_DATABASE": base["OVERSEER_PSYCHLO_BRIDGE_DATABASE"]}, recover=False, require_distinct_authority_store=True)
+
+
+def test_attestation_rejects_collector_subclass_overrides(tmp_path: Path):
+    class SpoofedCollector(AuthoritativeProcessEvidenceCollector):
+        def collect(self, *_args):
+            return {}
+    with pytest.raises(ProcessAttestationError, match="AuthoritativeProcessEvidenceCollector"):
+        stage_process_attestation(round_id="round", plan_id="plan", manifest_path=tmp_path / "manifest.json", authority=object.__new__(SpoofedCollector), primary_store=object())
+
+
+def test_direct_shell_child_is_rejected_even_when_conversation_token_matches(monkeypatch, tmp_path: Path):
+    workspace = tmp_path / "arcade"
+    workspace.mkdir(mode=0o700)
+    identity = {"pid": 22, "startTicks": 1, "exeDigest": "a" * 64, "argvDigest": "b" * 64, "cgroupDigest": "c" * 64, "pidfdSupported": True}
+    monkeypatch.setattr("overseer.psychlo_process_attestation.capture_process_identity", lambda pid: {**identity, "pid": pid})
+    monkeypatch.setattr("overseer.psychlo_process_attestation._read_proc_bytes", lambda path: b"123\n" if str(path).endswith("children") else b"resume\0conversation-arcade\0--cd\0" + str(workspace).encode() + b"\0")
+    monkeypatch.setattr("overseer.psychlo_process_attestation.os.readlink", lambda path: "/bin/sh" if str(path).endswith("/exe") else str(workspace))
+    with pytest.raises(ProcessAttestationError, match="trusted executable"):
+        capture_direct_codex_child(22, expected_conversation_id="conversation-arcade", expected_exe_path="/usr/bin/codex", expected_workspace=str(workspace))

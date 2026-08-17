@@ -71,6 +71,31 @@ AGENT_DRIVER_SCHEMA_V6 = "agent_driver_v6"
 AGENT_DRIVER_SCHEMA_V7 = "agent_driver_v7"
 AGENT_DRIVER_SCHEMA_V8 = "agent_driver_v8"
 AGENT_DRIVER_SCHEMA_V9 = "agent_driver_v9"
+_OBSERVATION_TABLE_NAME = "psychlo_process_observations"
+_OBSERVATION_NO_DELETE_TRIGGER = "psychlo_process_observations_no_delete"
+_OBSERVATION_IMMUTABLE_TRIGGER = "psychlo_process_observations_immutable"
+_OBSERVATION_TABLE_SQL = (
+    "create table psychlo_process_observations ( observation_id text primary key, "
+    "round_id text not null unique, plan_id text not null, "
+    "observation_digest text not null unique, plan_digest text not null default '', "
+    "state text not null check(state in ('prepared','recorded')), "
+    "manifest_json text not null, inserted_at text not null, recorded_at text )"
+)
+_OBSERVATION_NO_DELETE_TRIGGER_SQL = (
+    "create trigger psychlo_process_observations_no_delete before delete on "
+    "psychlo_process_observations begin select raise(abort, 'process observations are append-only'); end"
+)
+_OBSERVATION_IMMUTABLE_TRIGGER_SQL = (
+    "create trigger psychlo_process_observations_immutable before update on "
+    "psychlo_process_observations when new.observation_id <> old.observation_id "
+    "or new.round_id <> old.round_id or new.plan_id <> old.plan_id "
+    "or new.observation_digest <> old.observation_digest "
+    "or new.manifest_json <> old.manifest_json or new.inserted_at <> old.inserted_at "
+    "or old.state = 'recorded' or old.state <> 'prepared' or old.plan_digest <> '' "
+    "or old.recorded_at is not null or new.state <> 'recorded' "
+    "or new.plan_digest = '' or new.recorded_at is null begin select raise(abort, "
+    "'historical process observation identity is immutable'); end"
+)
 _AGENT_TRANSITION_SUCCESSORS = {
     AgentTransitionState.IMPORTING: {
         AgentTransitionState.IMPORT_ACKNOWLEDGED,
@@ -363,13 +388,19 @@ class SQLiteStore:
         retry that result for us.
         """
 
+        if self._observation_schema_status() == "invalid":
+            raise sqlite3.DatabaseError("psychlo process observation schema is incompatible")
         if self._schema_is_current():
             return
         for attempt in range(10):
             try:
+                if self._observation_schema_status() == "invalid":
+                    raise sqlite3.DatabaseError("psychlo process observation schema is incompatible")
                 if self._schema_is_current():
                     return
                 self.initialize()
+                if self._observation_schema_status() != "exact":
+                    raise sqlite3.DatabaseError("psychlo process observation schema is incomplete")
                 return
             except sqlite3.OperationalError as error:
                 self._connection.rollback()
@@ -377,7 +408,77 @@ class SQLiteStore:
                     raise
                 time.sleep(0.05 * (attempt + 1))
 
+    @staticmethod
+    def _normalize_schema_sql(sql: str | None) -> str:
+        return " ".join((sql or "").strip().lower().split())
+
+    def _observation_schema_status(self) -> str:
+        """Classify the additive observation schema before any initialization."""
+        objects = {
+            str(row[1]): (str(row[0]), row[2])
+            for row in self._connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE name IN (?, ?, ?)"
+                , (_OBSERVATION_TABLE_NAME, _OBSERVATION_NO_DELETE_TRIGGER,
+                   _OBSERVATION_IMMUTABLE_TRIGGER)
+            ).fetchall()
+        }
+        table = objects.get(_OBSERVATION_TABLE_NAME)
+        if table is None:
+            if any(name in objects for name in (
+                    _OBSERVATION_NO_DELETE_TRIGGER, _OBSERVATION_IMMUTABLE_TRIGGER)):
+                return "invalid"
+            return "absent"
+        if table[0] != "table":
+            return "invalid"
+        columns = [
+            (str(row[1]), str(row[2]), int(row[3]), row[4], int(row[5]))
+            for row in self._connection.execute(
+                "PRAGMA table_info(psychlo_process_observations)"
+            ).fetchall()
+        ]
+        expected_columns = [
+            ("observation_id", "TEXT", 0, None, 1),
+            ("round_id", "TEXT", 1, None, 0),
+            ("plan_id", "TEXT", 1, None, 0),
+            ("observation_digest", "TEXT", 1, None, 0),
+            ("plan_digest", "TEXT", 1, "''", 0),
+            ("state", "TEXT", 1, None, 0),
+            ("manifest_json", "TEXT", 1, None, 0),
+            ("inserted_at", "TEXT", 1, None, 0),
+            ("recorded_at", "TEXT", 0, None, 0),
+        ]
+        if columns != expected_columns or self._normalize_schema_sql(table[1]) != _OBSERVATION_TABLE_SQL:
+            return "invalid"
+        unique_columns: set[tuple[str, ...]] = set()
+        for index in self._connection.execute(
+                "PRAGMA index_list(psychlo_process_observations)").fetchall():
+            if int(index[2]) != 1:
+                continue
+            index_columns = self._connection.execute(
+                "SELECT name, seqno, cid FROM pragma_index_info(?)", (str(index[1]),)
+            ).fetchall()
+            names = tuple(str(row[0]) for row in index_columns)
+            unique_columns.add(names)
+        if {("round_id",), ("observation_digest",)} - unique_columns:
+            return "invalid"
+        for name, expected_sql in (
+            (_OBSERVATION_NO_DELETE_TRIGGER, _OBSERVATION_NO_DELETE_TRIGGER_SQL),
+            (_OBSERVATION_IMMUTABLE_TRIGGER, _OBSERVATION_IMMUTABLE_TRIGGER_SQL),
+        ):
+            trigger = objects.get(name)
+            if trigger is None:
+                continue
+            if trigger[0] != "trigger" or self._normalize_schema_sql(trigger[1]) != expected_sql:
+                return "invalid"
+        if all(name in objects for name in (
+                _OBSERVATION_NO_DELETE_TRIGGER, _OBSERVATION_IMMUTABLE_TRIGGER)):
+            return "exact"
+        return "missing_triggers"
+
     def _schema_is_current(self) -> bool:
+        if self._observation_schema_status() != "exact":
+            return False
         tables = {
             str(row[0])
             for row in self._connection.execute(
@@ -391,25 +492,6 @@ class SQLiteStore:
             "agent_schema_migrations",
             "roadex_approval_fixtures",
         }:
-            return False
-        triggers = {
-            str(row[0])
-            for row in self._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                "AND name IN ('psychlo_process_observations_no_delete', "
-                "'psychlo_process_observations_immutable')"
-            ).fetchall()
-        }
-        if triggers != {
-            "psychlo_process_observations_no_delete",
-            "psychlo_process_observations_immutable",
-        }:
-            return False
-        observation_table = self._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'psychlo_process_observations'"
-        ).fetchone()
-        if observation_table is None:
             return False
         schema_current = self._connection.execute(
             "SELECT MAX(version) AS version FROM schema_migrations"

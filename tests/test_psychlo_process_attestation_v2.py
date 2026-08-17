@@ -50,6 +50,29 @@ def _seed_pre_feature_v3_primary(path: Path) -> None:
     connection.close()
 
 
+_OBSERVATION_TABLE_SQL = """
+    CREATE TABLE psychlo_process_observations (
+        observation_id TEXT PRIMARY KEY,
+        round_id TEXT NOT NULL UNIQUE,
+        plan_id TEXT NOT NULL,
+        observation_digest TEXT NOT NULL UNIQUE,
+        plan_digest TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL CHECK(state IN ('prepared','recorded')),
+        manifest_json TEXT NOT NULL,
+        inserted_at TEXT NOT NULL,
+        recorded_at TEXT
+    )
+"""
+
+
+def _seed_observation_variant(path: Path, *, table_sql: str, triggers: str = "") -> None:
+    _seed_pre_feature_v3_primary(path)
+    connection = sqlite3.connect(path)
+    connection.executescript(table_sql + ";" + triggers)
+    connection.commit()
+    connection.close()
+
+
 def _runtime(tmp_path, monkeypatch, *, pre_feature_primary=False):
     bridge = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = {"roundId": "round", "projectId": "arcade", "projectLeadId": "hermione", "idempotencyKey": "idem"}
@@ -139,6 +162,60 @@ def test_pre_feature_version3_primary_initializes_observation_schema_before_stag
         "psychlo_process_observations_immutable",
     }
     runtime.bridge.store.close(); runtime.primary.close()
+
+
+def test_exact_observation_table_with_missing_triggers_is_completed(tmp_path):
+    path = tmp_path / "primary.sqlite3"
+    _seed_observation_variant(path, table_sql=_OBSERVATION_TABLE_SQL)
+    store = SQLiteStore(path)
+    assert store._observation_schema_status() == "exact"
+    store.close()
+
+
+def test_exact_observation_schema_skips_reinitialization(tmp_path, monkeypatch):
+    store = SQLiteStore(tmp_path / "primary.sqlite3")
+
+    def unexpected_initialize():
+        raise AssertionError("exact schema must not reinitialize")
+
+    monkeypatch.setattr(store, "initialize", unexpected_initialize)
+    store._initialize_with_lock_retry()
+    store.close()
+
+
+@pytest.mark.parametrize("variant", ["one_column", "no_op_both", "no_op_one", "wrong_unique"])
+def test_incompatible_observation_schema_fails_before_initialization(tmp_path, variant):
+    path = tmp_path / f"{variant}.sqlite3"
+    if variant == "one_column":
+        table_sql = "CREATE TABLE psychlo_process_observations (id TEXT)"
+        triggers = ""
+    elif variant == "wrong_unique":
+        table_sql = _OBSERVATION_TABLE_SQL.replace("round_id TEXT NOT NULL UNIQUE", "round_id TEXT NOT NULL")
+        triggers = ""
+    elif variant == "no_op_both":
+        table_sql = _OBSERVATION_TABLE_SQL
+        triggers = (
+            "CREATE TRIGGER psychlo_process_observations_no_delete BEFORE DELETE ON psychlo_process_observations BEGIN SELECT 1; END;"
+            "CREATE TRIGGER psychlo_process_observations_immutable BEFORE UPDATE ON psychlo_process_observations BEGIN SELECT 1; END;"
+        )
+    else:
+        table_sql = _OBSERVATION_TABLE_SQL
+        triggers = "CREATE TRIGGER psychlo_process_observations_no_delete BEFORE DELETE ON psychlo_process_observations BEGIN SELECT 1; END;"
+    _seed_observation_variant(path, table_sql=table_sql, triggers=triggers)
+    with pytest.raises(sqlite3.DatabaseError, match="incompatible"):
+        SQLiteStore(path)
+    check = sqlite3.connect(path)
+    names = {
+        row[0] for row in check.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'psychlo_process_observations%'")
+    }
+    check.close()
+    if variant == "one_column":
+        assert names == {"psychlo_process_observations"}
+    elif variant == "no_op_one":
+        assert names == {"psychlo_process_observations", "psychlo_process_observations_no_delete"}
+    else:
+        assert "psychlo_process_observations" in names
 
 
 def test_record_uses_immutable_prepared_snapshot_without_live_recollection(tmp_path, monkeypatch):

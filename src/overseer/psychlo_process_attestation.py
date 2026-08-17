@@ -41,6 +41,7 @@ _FORBIDDEN_KEYS = {"prompt", "rawprompt", "callback", "panecapture", "capture", 
 _TMUX = "/usr/bin/tmux"
 _GIT = "/usr/bin/git"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_PRIVATE_FILE_BYTES = 16 << 20
 
 # Historical observation is a fixed non-authoritative operation, not a configurable adapter.
 # These are the only accepted live endpoints.  Tests may replace this whole
@@ -471,6 +472,14 @@ def _trusted_observation_module(path: Path, source_root: Path) -> tuple[Path, os
             or identity(metadata) != identity(lexical_metadata)
             or identity(metadata) != identity(resolved_metadata)):
         raise ProcessAttestationError("loaded observation module is not trusted")
+    reopened_content, reopened_metadata = _private_group_file_content(path, "loaded observation module")
+    try:
+        final_metadata = path.lstat()
+    except OSError as error:
+        raise ProcessAttestationError("loaded observation module is not trusted") from error
+    if (reopened_content != content or identity(metadata) != identity(reopened_metadata)
+            or identity(metadata) != identity(final_metadata)):
+        raise ProcessAttestationError("loaded observation module is not trusted")
     return resolved, metadata, content
 
 
@@ -500,12 +509,14 @@ def _observation_clock(bridge: Any) -> str:
     return value
 
 
-def _private_group_file_content(path: Path, label: str) -> tuple[bytes, os.stat_result]:
+def _private_group_file_content(
+    path: Path, label: str, max_bytes: int = _MAX_PRIVATE_FILE_BYTES,
+) -> tuple[bytes, os.stat_result]:
     """Read a private-primary-group file through one no-follow descriptor."""
     if not path.is_absolute() or path.is_symlink():
         raise ProcessAttestationError(f"{label} path is not canonical")
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as error:
         raise ProcessAttestationError(f"{label} cannot be opened safely") from error
     try:
@@ -514,8 +525,18 @@ def _private_group_file_content(path: Path, label: str) -> tuple[bytes, os.stat_
                 or not _private_workspace_mode(before)):
             raise ProcessAttestationError(f"{label} ownership or mode is unsafe")
         chunks: list[bytes] = []
-        while chunk := os.read(fd, 1 << 20):
+        total = 0
+        while True:
+            remaining = max_bytes - total
+            if remaining <= 0:
+                if os.read(fd, 1):
+                    raise ProcessAttestationError(f"{label} exceeds the bounded read size")
+                break
+            chunk = os.read(fd, min(1 << 20, remaining))
+            if not chunk:
+                break
             chunks.append(chunk)
+            total += len(chunk)
         after = os.fstat(fd)
         identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid,
                     before.st_gid, before.st_nlink, before.st_size,

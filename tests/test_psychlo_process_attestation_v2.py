@@ -560,6 +560,43 @@ def test_loaded_observation_module_rejects_replacement_after_read(tmp_path, monk
         module._trusted_observation_module(loaded, source)
 
 
+def test_loaded_observation_module_rejects_equal_length_rewrite_on_reopen(tmp_path, monkeypatch):
+    module, source, loaded = _loaded_module_race_fixture(tmp_path, monkeypatch)
+    original = module._private_group_file_content
+    original_metadata = loaded.stat()
+    calls = {"read": 0}
+
+    def race(path, label):
+        result = original(path, label)
+        calls["read"] += 1
+        if calls["read"] == 1:
+            with path.open("r+b") as handle:
+                handle.write(b"# changed module\n")
+                handle.flush()
+            os.utime(path, ns=(original_metadata.st_atime_ns, original_metadata.st_mtime_ns))
+        return result
+
+    monkeypatch.setattr(module, "_private_group_file_content", race)
+    with pytest.raises(module.ProcessAttestationError, match="trusted"):
+        module._trusted_observation_module(loaded, source)
+
+
+def test_loaded_observation_module_rejects_unsafe_mode_on_reopen(tmp_path, monkeypatch):
+    module, source, loaded = _loaded_module_race_fixture(tmp_path, monkeypatch)
+    original = module._private_group_file_content
+    calls = {"read": 0}
+
+    def race(path, label):
+        calls["read"] += 1
+        if calls["read"] == 2:
+            path.chmod(0o666)
+        return original(path, label)
+
+    monkeypatch.setattr(module, "_private_group_file_content", race)
+    with pytest.raises(module.ProcessAttestationError, match="trusted|ownership|mode"):
+        module._trusted_observation_module(loaded, source)
+
+
 def test_tmux_scan_binds_pane_by_start_chain_not_launcher_name(monkeypatch, tmp_path):
     import overseer.psychlo_process_attestation as module
 

@@ -22,6 +22,7 @@ class AdminChangeKind(StrEnum):
     # paired ApprovalRequest decision path.
     PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
     PSYCHLO_LEGACY_ROUND_RECONCILIATION = "psychlo_legacy_round_reconciliation"
+    PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION = "psychlo_legacy_process_binding_attestation"
     PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
     PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
     USER_SERVICE_RESTART = "user_service_restart"
@@ -153,7 +154,7 @@ class AdminChangePlan:
         return (
             not self.archived
             and not self.canceled
-            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION}
+            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION, AdminChangeKind.PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION}
             and (self.approved or not self.requires_explicit_approval())
             and not missing_admin_change_fields(self)
         )
@@ -440,6 +441,42 @@ def plan_psychlo_legacy_round_reconciliation(
         risks=("incorrect legacy conversation identity", "stale dispatch evidence", "binding an already-delivered prompt"),
         verification_steps=(AdminCommandStep("Verify attestation evidence", ("__overseer_psychlo_legacy_round_reconciliation_verify__",), "Recheck manifest, rollout provenance, and exact-prompt absence"),),
         adapter_metadata={"legacy_round_reconciliation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit}},
+    )
+
+
+def plan_psychlo_legacy_process_binding_attestation(
+    plan_id: str,
+    round_id: str,
+    manifest_digest: str,
+    source_commit: str,
+    source_tree_digest: str,
+    reason: str = "approve one immutable legacy process-binding attestation",
+) -> AdminChangePlan:
+    """Create exact Sisko/HUMAN authority for a process identity record."""
+    values = (plan_id, round_id, manifest_digest, source_commit, source_tree_digest, reason)
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("legacy process attestation plan identity is required")
+    if len(manifest_digest) != 64 or any(char not in "0123456789abcdef" for char in manifest_digest.lower()):
+        raise ValueError("legacy process attestation manifest digest is invalid")
+    if len(source_commit) not in {40, 64} or any(char not in "0123456789abcdef" for char in source_commit.lower()):
+        raise ValueError("legacy process attestation source commit is invalid")
+    if len(source_tree_digest) not in {40, 64} or any(char not in "0123456789abcdef" for char in source_tree_digest.lower()):
+        raise ValueError("legacy process attestation source tree digest is invalid")
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION,
+        owner_domain=OwnerDomain.SISKO,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.HUMAN,
+        target=round_id,
+        reason=reason,
+        current_state="legacy process binding is uncertain and untrusted",
+        proposed_state="persist one immutable process identity attestation in a separate record",
+        steps=(AdminCommandStep("Record process identity attestation", ("__overseer_psychlo_legacy_process_binding_attestation__",), "marker consumed only by attestation adapter"),),
+        rollback_steps=(AdminCommandStep("Retain immutable process attestation", ("__overseer_psychlo_legacy_process_binding_attestation_retention__",), "attestation records have no rollback"),),
+        risks=("binding the wrong process identity", "stale or reused PID", "conflicting tmux or rollout evidence"),
+        verification_steps=(AdminCommandStep("Verify process identity evidence", ("__overseer_psychlo_legacy_process_binding_attestation_verify__",), "recheck every identity immediately before insert"),),
+        adapter_metadata={"legacy_process_binding_attestation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit, "sourceTreeDigest": source_tree_digest}},
     )
 
 

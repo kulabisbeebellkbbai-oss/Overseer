@@ -13,6 +13,13 @@ from .psychlo_legacy_binding import (
     finalize_legacy_round_attestation,
     prepare_legacy_round_attestation,
 )
+from .psychlo_process_attestation import (
+    AuthoritativeProcessEvidenceCollector,
+    attest_process_binding,
+    finalize_process_attestation,
+    stage_process_attestation,
+)
+from .store import SQLiteStore
 from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, _validate_usage_snapshot_receipt, managed_receipt_validator
 
 
@@ -67,6 +74,28 @@ def build_parser() -> argparse.ArgumentParser:
     finalize = subparsers.add_parser("finalize-legacy-round-attestation", aliases=["finalize-legacy-round"], help="bind one exact approved plan to a prepared manifest")
     finalize.add_argument("--plan-id", required=True)
     finalize.add_argument("--manifest-path", required=True)
+    process_stage = subparsers.add_parser("stage-process-attestation", help="stage one redacted legacy process identity manifest")
+    process_stage.add_argument("--round-id", required=True)
+    process_stage.add_argument("--plan-id", required=True)
+    process_stage.add_argument("--manifest-path", required=True)
+    process_stage.add_argument("--registry-path", default=os.environ.get("OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE"))
+    process_stage.add_argument("--tmux-socket", default=os.environ.get("OVERSEER_PSYCHLO_TMUX_SOCKET"))
+    process_stage.add_argument("--tmux-target", default=os.environ.get("OVERSEER_PSYCHLO_TMUX_TARGET"))
+    process_stage.add_argument("--source-root", default=os.environ.get("OVERSEER_PSYCHLO_SOURCE_ROOT", str(Path(__file__).resolve().parents[2])))
+    process_finalize = subparsers.add_parser("finalize-process-attestation", help="finalize one exact approved process identity plan")
+    process_finalize.add_argument("--plan-id", required=True)
+    process_finalize.add_argument("--manifest-path", required=True)
+    process_finalize.add_argument("--primary-store", required=True)
+    process_attest = subparsers.add_parser("attest-process-binding", help="insert one immutable process identity attestation")
+    process_attest.add_argument("--round-id", required=True)
+    process_attest.add_argument("--plan-id", required=True)
+    process_attest.add_argument("--manifest-path", required=True)
+    process_attest.add_argument("--bridge-store", required=True)
+    process_attest.add_argument("--primary-store", required=True)
+    process_attest.add_argument("--registry-path", default=os.environ.get("OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE"))
+    process_attest.add_argument("--tmux-socket", default=os.environ.get("OVERSEER_PSYCHLO_TMUX_SOCKET"))
+    process_attest.add_argument("--tmux-target", default=os.environ.get("OVERSEER_PSYCHLO_TMUX_TARGET"))
+    process_attest.add_argument("--source-root", default=os.environ.get("OVERSEER_PSYCHLO_SOURCE_ROOT", str(Path(__file__).resolve().parents[2])))
     subparsers.add_parser("tick")
     return parser
 
@@ -130,6 +159,41 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command in {"finalize-legacy-round-attestation", "finalize-legacy-round"}:
         result = finalize_legacy_round_attestation(plan_id=args.plan_id, manifest_path=args.manifest_path)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "stage-process-attestation":
+        if not all(isinstance(value, str) and value.strip() for value in (args.registry_path, args.tmux_socket, args.tmux_target, args.source_root)):
+            raise ValueError("authoritative process endpoint configuration is required")
+        bridge = create_bridge_from_environment()
+        try:
+            authority = AuthoritativeProcessEvidenceCollector(bridge, args.registry_path, args.tmux_socket, args.tmux_target, args.source_root)
+            result = stage_process_attestation(round_id=args.round_id, plan_id=args.plan_id, manifest_path=args.manifest_path, authority=authority)
+        finally:
+            bridge.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "finalize-process-attestation":
+        primary = SQLiteStore(args.primary_store)
+        try:
+            plan = primary.load_admin_change_plan(args.plan_id)
+            result = finalize_process_attestation(args.manifest_path, plan)
+        finally:
+            primary.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "attest-process-binding":
+        if not all(isinstance(value, str) and value.strip() for value in (args.registry_path, args.tmux_socket, args.tmux_target, args.source_root)):
+            raise ValueError("authoritative process endpoint configuration is required")
+        bridge = create_bridge_from_environment()
+        primary = SQLiteStore(args.primary_store)
+        try:
+            if Path(str(bridge.store.filename)).resolve() != Path(args.bridge_store).resolve():
+                raise ValueError("bridge store path does not match the environment-owned bridge")
+            authority = AuthoritativeProcessEvidenceCollector(bridge, args.registry_path, args.tmux_socket, args.tmux_target, args.source_root)
+            result = attest_process_binding(bridge, args.round_id, args.plan_id, manifest_path=args.manifest_path, primary_store=primary, authority=authority)
+        finally:
+            primary.close()
+            bridge.close()
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "tick":

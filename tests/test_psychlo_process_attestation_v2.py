@@ -671,3 +671,44 @@ def test_non_boolean_plan_lifecycle_flags_cannot_record_or_update(tmp_path, monk
     ).fetchone()
     assert tuple(row) == ("prepared", None)
     runtime.bridge.store.close(); runtime.primary.close()
+
+
+def _store_existing_unapproved_plan(runtime, value):
+    import overseer.psychlo_process_attestation as module
+
+    digest = module.manifest_digest(value)
+    plan = module.plan_psychlo_legacy_process_observation(
+        "plan", "round", digest, value["source"]["commit"],
+        value["source"]["treeDigest"], value["source"]["moduleDigest"],
+    )
+    runtime.primary.save_admin_change_plan(plan)
+    return plan
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("approved", 1), ("approved", [True]), ("approved", None),
+     ("canceled", "no"), ("canceled", 1), ("canceled", None),
+     ("archived", True), ("archived", 1), ("archived", [])],
+)
+def test_stage_rejects_poisoned_existing_plan_before_insert(tmp_path, monkeypatch, field, value):
+    runtime, manifest_value = _runtime(tmp_path, monkeypatch)
+    plan = _store_existing_unapproved_plan(runtime, manifest_value)
+    runtime.primary.save_admin_change_plan(replace(plan, **{field: value}))
+    with pytest.raises(Exception, match="boolean|lifecycle|approval"):
+        stage_process_observation(round_id="round", plan_id="plan")
+    assert runtime.primary._connection.execute(
+        "SELECT 1 FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone() is None
+    runtime.bridge.store.close(); runtime.primary.close()
+
+
+def test_stage_accepts_exact_existing_unapproved_plan_idempotently(tmp_path, monkeypatch):
+    runtime, manifest_value = _runtime(tmp_path, monkeypatch)
+    _store_existing_unapproved_plan(runtime, manifest_value)
+    result = stage_process_observation(round_id="round", plan_id="plan")
+    assert result["staged"] is True
+    assert runtime.primary._connection.execute(
+        "SELECT state FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone()[0] == "prepared"
+    runtime.bridge.store.close(); runtime.primary.close()

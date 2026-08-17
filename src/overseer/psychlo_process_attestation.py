@@ -1255,10 +1255,9 @@ def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
             except KeyError:
                 primary._connection.execute("INSERT INTO admin_change_plans(id,payload) VALUES (?,?)", (plan_id, _store_dump(plan)))
             else:
+                _validate_plan_lifecycle(existing, approved_required=False)
                 if _immutable_plan_digest(existing) != _immutable_plan_digest(plan):
                     raise ProcessAttestationError("staged authority plan identity changed")
-                if existing.approved or existing.canceled:
-                    raise ProcessAttestationError("staged process plan lifecycle is not mutable")
             inserted_at = _observation_clock(runtime.bridge)
             _validate_plan_lifecycle(plan, approved_required=False)
             if _parse_utc_timestamp(value["observedWindowEnd"], "observation end") > _parse_utc_timestamp(inserted_at, "observation inserted timestamp"):

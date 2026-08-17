@@ -66,7 +66,7 @@ def _runtime(tmp_path, monkeypatch):
             return None
 
     runtime = SimpleNamespace(
-        bridge=SimpleNamespace(store=bridge, clock=lambda: "2099-01-01T00:00:00+00:00"),
+        bridge=SimpleNamespace(store=bridge, clock=lambda: "2099-01-01T00:00:02+00:00"),
         primary=primary, collector=Collector(), close=lambda: None,
     )
     primary.clock = lambda: runtime.bridge.clock()
@@ -86,7 +86,7 @@ def test_primary_only_stage_approval_and_completed_lookup(tmp_path, monkeypatch)
     assert runtime.primary._connection.execute("SELECT state FROM psychlo_process_observations").fetchone()[0] == "prepared"
     assert runtime.primary.process_observation("round") is None
     plan = runtime.primary.load_admin_change_plan("plan")
-    runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:00+00:00"))
+    runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:02+00:00"))
     bridge_changes = runtime.bridge.store.connection.total_changes
     result = record_process_observation(round_id="round", plan_id="plan")
     assert result["recorded"] is True
@@ -130,7 +130,7 @@ def test_record_does_not_report_success_when_postcommit_primary_revalidation_fai
     assert runtime.primary.process_observation("round")["planId"] == "plan"
     monkeypatch.setattr("overseer.psychlo_process_attestation._revalidate_primary_database_after_commit", lambda _runtime, **_kwargs: None)
     replay = record_process_observation(round_id="round", plan_id="plan")
-    assert replay["recorded"] is True and replay["recordedAt"] == "2099-01-01T00:00:00+00:00"
+    assert replay["recorded"] is True and replay["recordedAt"] == "2099-01-01T00:00:02+00:00"
     runtime.bridge.store.close(); runtime.primary.close()
 
 
@@ -612,3 +612,42 @@ def test_readonly_connection_rejects_close_reuse_decoy_fd(tmp_path, monkeypatch)
         module._open_verified_readonly_connection(
             canonical, (expected.st_dev, expected.st_ino, expected.st_nlink),
         )
+
+
+@pytest.mark.parametrize(
+    "approval_at,pattern",
+    [
+        ("2100-01-01T00:00:00+00:00", "chronology"),
+        ("2099-01-01T00:00:01-05:00", "UTC|canonical"),
+        ("2099-01-01T00:00:01+00:00", "chronology|precedes"),
+    ],
+)
+def test_future_malformed_or_pre_persistence_approval_keeps_row_prepared(tmp_path, monkeypatch, approval_at, pattern):
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    stage_process_observation(round_id="round", plan_id="plan")
+    plan = runtime.primary.load_admin_change_plan("plan")
+    runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", approval_at))
+    with pytest.raises(Exception, match=pattern):
+        record_process_observation(round_id="round", plan_id="plan")
+    row = runtime.primary._connection.execute(
+        "SELECT state,recorded_at FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone()
+    assert tuple(row) == ("prepared", None)
+    runtime.bridge.store.close(); runtime.primary.close()
+
+
+def test_stage_replay_returns_recorded_at_not_inserted_at(tmp_path, monkeypatch):
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    stage_process_observation(round_id="round", plan_id="plan")
+    runtime.bridge.clock = lambda: "2099-01-01T00:00:03+00:00"
+    plan = runtime.primary.load_admin_change_plan("plan")
+    runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:03+00:00"))
+    recorded = record_process_observation(round_id="round", plan_id="plan")
+    replay = stage_process_observation(round_id="round", plan_id="plan")
+    row = runtime.primary._connection.execute(
+        "SELECT inserted_at,recorded_at FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone()
+    assert row[0] == "2099-01-01T00:00:02+00:00"
+    assert row[1] == "2099-01-01T00:00:03+00:00"
+    assert replay["recordedAt"] == recorded["recordedAt"] == row[1]
+    runtime.bridge.store.close(); runtime.primary.close()

@@ -456,7 +456,10 @@ def _parse_utc_timestamp(value: Any, label: str) -> datetime:
         raise ProcessAttestationError(f"{label} timestamp is not parseable") from error
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ProcessAttestationError(f"{label} timestamp must be UTC")
-    return parsed.astimezone(timezone.utc)
+    canonical = parsed.astimezone(timezone.utc)
+    if value != canonical.isoformat():
+        raise ProcessAttestationError(f"{label} timestamp is not canonical UTC")
+    return canonical
 
 
 def _observation_clock(bridge: Any) -> str:
@@ -1066,6 +1069,8 @@ def _assert_exact_plan(primary: SQLiteStore, plan_id: str, round_id: str, manife
     _assert_plan_identity(plan, plan_id, round_id, manifest)
     if approved and (not plan.approved or plan.approved_by != "sisko" or plan.canceled or not plan.approved_at):
         raise ProcessAttestationError("exact approved Sisko plan is required")
+    if approved:
+        _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
     if not approved and plan.approved:
         raise ProcessAttestationError("staged process plan is unexpectedly approved")
     return plan
@@ -1104,7 +1109,7 @@ def _validate_process_observation_row(
         raise ProcessAttestationError("process observation row identity is invalid")
     if expected_state is not None and state != expected_state:
         raise ProcessAttestationError("process observation state is not exact")
-    _parse_utc_timestamp(inserted_at, "observation inserted timestamp")
+    inserted_time = _parse_utc_timestamp(inserted_at, "observation inserted timestamp")
     try:
         manifest_value = json.loads(manifest_json)
     except (TypeError, json.JSONDecodeError) as error:
@@ -1123,19 +1128,48 @@ def _validate_process_observation_row(
     _assert_plan_identity(plan, plan_id, round_id, manifest)
     if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION or plan.canceled:
         raise ProcessAttestationError("process observation plan kind or lifecycle is invalid")
+    observed_end = _parse_utc_timestamp(manifest["observedWindowEnd"], "observation end")
+    if observed_end > inserted_time:
+        raise ProcessAttestationError("observation was persisted before its collection ended")
     if state == "prepared":
         if plan_digest != "" or recorded_at is not None:
             raise ProcessAttestationError("prepared process observation recording fields are invalid")
+        if plan.approved:
+            if plan.approved_by != "sisko" or not plan.approved_at:
+                raise ProcessAttestationError("approved prepared process plan is incomplete")
+            approved_time = _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
+            if inserted_time > approved_time:
+                raise ProcessAttestationError("plan approval precedes prepared observation persistence")
+        elif any(value is not None for value in (plan.approved_by, plan.approved_at)):
+            raise ProcessAttestationError("unapproved prepared process plan has approval fields")
     else:
         if not isinstance(recorded_at, str) or not recorded_at.strip():
             raise ProcessAttestationError("recorded process observation timestamp is missing")
-        _parse_utc_timestamp(recorded_at, "recorded process observation timestamp")
+        recorded_time = _parse_utc_timestamp(recorded_at, "recorded process observation timestamp")
         if not plan.approved or plan.approved_by != "sisko" or not plan.approved_at:
             raise ProcessAttestationError("recorded process observation plan is not approved")
-        _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
+        approved_time = _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
+        if inserted_time > approved_time or approved_time > recorded_time:
+            raise ProcessAttestationError("process observation persistence chronology is invalid")
         if plan_digest != admin_plan_digest(plan):
             raise ProcessAttestationError("recorded process observation plan digest is not exact")
     return manifest, plan, encoded, observation_digest
+
+
+def _validate_recording_envelope(
+    manifest: Mapping[str, Any], plan: AdminChangePlan, inserted_at: str, recorded_at: str,
+) -> None:
+    """Validate the proposed record timestamp before the UPDATE/commit."""
+    inserted_time = _parse_utc_timestamp(inserted_at, "observation inserted timestamp")
+    observed_end = _parse_utc_timestamp(manifest["observedWindowEnd"], "observation end")
+    if observed_end > inserted_time:
+        raise ProcessAttestationError("observation was persisted before its collection ended")
+    if not plan.approved or plan.approved_by != "sisko" or plan.canceled or not plan.approved_at:
+        raise ProcessAttestationError("exact approved Sisko plan is required")
+    approved_time = _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
+    recorded_time = _parse_utc_timestamp(recorded_at, "recorded process observation timestamp")
+    if inserted_time > approved_time or approved_time > recorded_time:
+        raise ProcessAttestationError("recording timestamp chronology is invalid")
 
 
 def _assert_runtime_source_integrity() -> None:
@@ -1171,7 +1205,7 @@ def _load_existing_process_observation(round_id: str, plan_id: str) -> dict[str,
         if row[5] == "recorded":
             return {"recorded": True, "historical": True, "authoritative": False, "executable": False,
                     "roundId": round_id, "observationId": row[0], "observationDigest": row[3],
-                    "planDigest": row[4], "recordedAt": row[7]}
+                    "planDigest": row[4], "recordedAt": row[8]}
         return {"staged": True, "replayed": True, "historical": True, "authoritative": False,
                 "executable": False, "roundId": round_id, "planId": plan_id,
                 "observationDigest": digest}
@@ -1214,9 +1248,16 @@ def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
                     raise ProcessAttestationError("staged authority plan identity changed")
                 if existing.approved or existing.canceled:
                     raise ProcessAttestationError("staged process plan lifecycle is not mutable")
+            inserted_at = _observation_clock(runtime.bridge)
+            if plan.approved:
+                raise ProcessAttestationError("staged process plan is unexpectedly approved")
+            if plan.approved_by is not None or plan.approved_at is not None:
+                raise ProcessAttestationError("unapproved prepared process plan has approval fields")
+            if _parse_utc_timestamp(value["observedWindowEnd"], "observation end") > _parse_utc_timestamp(inserted_at, "observation inserted timestamp"):
+                raise ProcessAttestationError("observation was persisted before its collection ended")
             primary.insert_prepared_process_observation(
                 observation_id=str(value["observationId"]), round_id=round_id, plan_id=plan_id,
-                observation_digest=digest, manifest=value, inserted_at=_observation_clock(runtime.bridge),
+                observation_digest=digest, manifest=value, inserted_at=inserted_at,
             )
             _revalidate_runtime_databases(runtime)
             primary._connection.commit()
@@ -1571,9 +1612,11 @@ def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]
                 raise ProcessAttestationError("prepared process observation state is invalid")
             plan = _assert_exact_plan(primary, plan_id, round_id, manifest, approved=True)
             plan_digest = admin_plan_digest(plan)
+            recorded_at = _primary_recording_clock(primary)
+            _validate_recording_envelope(manifest, plan, row[7], recorded_at)
             result = primary.record_process_observation(
                 round_id=round_id, plan_id=plan_id, observation_digest=digest,
-                plan_digest=plan_digest, recorded_at=_primary_recording_clock(primary),
+                plan_digest=plan_digest, recorded_at=recorded_at,
             )
             primary_connection.commit()
             _revalidate_primary_database_after_commit(

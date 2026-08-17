@@ -111,6 +111,19 @@ from .codex_projects import (
     legacy_codex_session_resource,
 )
 from .agent_adapters.codex import CodexDriver, codex_adapter_factory
+from .codex_quarantine_recovery import (
+    AppServerCapabilityProbe,
+    ApprovalEvidence,
+    CodexAppServerTransport,
+    ProcessIdentity,
+    QuarantineLedger,
+    QuarantinePhase,
+    QuarantineRecovery,
+    QuarantineRecoveryError,
+    RoundQuarantineBinding,
+    ThreadSnapshot,
+    TmuxProcessController,
+)
 from .core import (
     ApprovalLevel,
     Claim,
@@ -353,6 +366,17 @@ __all__ = [
     "CodexProjectResumeResult",
     "CodexProjectThread",
     "CodexProjectThreadAdapter",
+    "AppServerCapabilityProbe",
+    "ApprovalEvidence",
+    "CodexAppServerTransport",
+    "ProcessIdentity",
+    "QuarantineLedger",
+    "QuarantinePhase",
+    "QuarantineRecovery",
+    "QuarantineRecoveryError",
+    "RoundQuarantineBinding",
+    "ThreadSnapshot",
+    "TmuxProcessController",
     "CodexDriver",
     "codex_adapter_factory",
     "legacy_codex_session_resource",

@@ -805,7 +805,7 @@ class PsychloBridge:
     def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
         binding_loader = getattr(self.dispatcher, "binding_provenance", None)
         if callable(binding_loader):
-            self.store.bind_round_execution(str(request["roundId"]), _require_rollout_binding(binding_loader(str(request["projectLeadId"]))))
+            self.store.bind_round_execution(str(request["roundId"]), _require_rollout_binding_provenance(binding_loader(str(request["projectLeadId"]))))
         self.store.mark_dispatch_started(str(request["roundId"]), self.clock())
         provider_reference = self._dispatch_round(request, self._round_prompt(request, capability))
         delivered = {**receipt, "provenanceId": str(provider_reference)}
@@ -2558,6 +2558,26 @@ def _require_rollout_binding(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value["rolloutDev"], int) or isinstance(value["rolloutDev"], bool) or value["rolloutDev"] < 0 or not isinstance(value["rolloutIno"], int) or isinstance(value["rolloutIno"], bool) or value["rolloutIno"] < 0 or not SHA256_RE.fullmatch(value["rolloutPathDigest"]):
         raise ValueError("rollout identity evidence is invalid")
     return {field: value[field] for field in fields}
+
+
+def _require_rollout_binding_provenance(value: object) -> dict[str, Any]:
+    """Validate the immutable rollout identity returned before dispatch.
+
+    Older Codex adapters expose the identity in the same envelope used by a
+    prompt scan, with ``found`` set to ``False``.  ``found`` is not part of a
+    binding: it describes a prompt lookup, not the rollout identity.  Accept
+    that one exact compatibility envelope and normalize it to the closed
+    five-field binding.  A positive scan, missing fields, or any extra field
+    must fail closed rather than allowing a round to start on ambiguous data.
+    """
+    fields = ("conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno")
+    if not isinstance(value, Mapping):
+        raise ValueError("rollout identity evidence is invalid")
+    if set(value) == set(fields):
+        return _require_rollout_binding(value)
+    if set(value) != set(fields) | {"found"} or value.get("found") is not False:
+        raise ValueError("rollout identity evidence is invalid")
+    return _require_rollout_binding({field: value[field] for field in fields})
 
 
 def _require_operational_failure_report(report: Mapping[str, Any], request: Mapping[str, Any], capability: str) -> None:

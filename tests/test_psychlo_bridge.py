@@ -2135,6 +2135,105 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
         bridge.request_round(request, callback_capability="capability:different-round-binding")
 
 
+@pytest.mark.parametrize(
+    ("found", "extra"),
+    [(True, False), (False, True)],
+)
+def test_round_dispatch_rejects_non_identity_rollout_provenance(tmp_path: Path, found: bool, extra: bool):
+    class Dispatcher:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("invalid binding must not dispatch")
+
+        def binding_provenance(self, _lead):
+            value = {
+                "found": found,
+                "conversationId": "conversation-arcade",
+                "sessionId": "session-arcade",
+                "rolloutPathDigest": "a" * 64,
+                "rolloutDev": 1,
+                "rolloutIno": 2,
+            }
+            if extra:
+                value["unexpected"] = "reject"
+            return value
+
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=Dispatcher(),
+        sender=lambda *_args: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        token_factory=lambda: "capability_binding_1234567890abcdef",
+    )
+    request = {
+        "roundId": "round-invalid-binding",
+        "projectId": "arcade",
+        "projectLeadId": "member-hermione",
+        "planId": "arcade-plan",
+        "planVersion": "v2",
+        "correlationId": "corr-invalid-binding",
+        "idempotencyKey": "round-invalid-binding",
+        "snapshotId": "snapshot-invalid-binding",
+        "policyVersion": "2026-08-09",
+        "expectedUsageCost": 1,
+        "scope": "one bounded round",
+        "selectionReason": "priority-selected",
+        "priorityRationale": "project-id",
+    }
+    with pytest.raises(ValueError, match="rollout identity evidence"):
+        bridge.request_round(request)
+    assert bridge.store.get_round(request["roundId"])[4] == "pending"
+
+
+def test_round_dispatch_normalizes_legacy_negative_rollout_provenance(tmp_path: Path):
+    class Dispatcher:
+        def __call__(self, *_args, **_kwargs):
+            return "dispatch:bound"
+
+        def binding_provenance(self, _lead):
+            return {
+                "found": False,
+                "conversationId": "conversation-arcade",
+                "sessionId": "session-arcade",
+                "rolloutPathDigest": "a" * 64,
+                "rolloutDev": 1,
+                "rolloutIno": 2,
+            }
+
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"),
+        dispatcher=Dispatcher(),
+        sender=lambda *_args: {"accepted": True},
+        callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+        token_factory=lambda: "capability_binding_1234567890abcdef",
+    )
+    request = {
+        "roundId": "round-legacy-binding",
+        "projectId": "arcade",
+        "projectLeadId": "member-hermione",
+        "planId": "arcade-plan",
+        "planVersion": "v2",
+        "correlationId": "corr-legacy-binding",
+        "idempotencyKey": "round-legacy-binding",
+        "snapshotId": "snapshot-legacy-binding",
+        "policyVersion": "2026-08-09",
+        "expectedUsageCost": 1,
+        "scope": "one bounded round",
+        "selectionReason": "priority-selected",
+        "priorityRationale": "project-id",
+    }
+    result = bridge.request_round(request)
+    assert result["accepted"] is True
+    assert bridge.store.round_binding(request["roundId"]) == {
+        "conversationId": "conversation-arcade",
+        "sessionId": "session-arcade",
+        "rolloutPathDigest": "a" * 64,
+        "rolloutDev": 1,
+        "rolloutIno": 2,
+    }
+
+
 def test_cancels_only_a_provably_never_started_pending_round(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = {"roundId": "round-cancel", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-cancel", "idempotencyKey": "round-cancel", "snapshotId": "snapshot-cancel", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}

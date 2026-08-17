@@ -654,7 +654,8 @@ class PsychloBridge:
         if binding is None:
             raise ValueError("original Codex execution binding is missing")
         delivery = self.store.round_prompt_delivery(round_id)
-        if delivery is not None and delivery["phase"] in {"paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved"}:
+        retrying_fenced_failure = existing is not None and existing["state"] == "forward-pending" and delivery is not None and delivery["phase"] == "failure-fence"
+        if delivery is not None and delivery["phase"] in {"failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved"} and not retrying_fenced_failure:
             raise ValueError("operational failure is unsafe while prompt delivery is unresolved")
         scan = _require_rollout_scan(scanner(request["projectLeadId"], self._round_prompt(request, capability)))
         if scan["binding"] != binding:
@@ -662,12 +663,9 @@ class PsychloBridge:
         if scan["found"]:
             raise ValueError("prompt delivery proof exists; operational failure is unsafe")
         now = self.clock()
-        intent, _ = self.store.create_operational_failure_intent(round_id, request, capability, payload, now=now)
-        if intent["state"] == "accepted":
-            return {"accepted": True, "status": "already-accepted", "receipt": intent["outcome"]}
         owner = owner_id or self.coordination_owner_id
         lease_until = (_time(now) + timedelta(seconds=self.coordination_lease_seconds)).isoformat()
-        claim = self.store.claim_operational_failure(round_id, request, capability, owner_id=owner, lease_expires_at=lease_until, now=now)
+        claim = self.store.claim_operational_failure_with_fence(round_id, request, capability, binding, payload, owner_id=owner, lease_expires_at=lease_until, now=now)
         if claim is None:
             current = self.store.operational_failure_intent(round_id)
             if current is not None and current["state"] == "accepted":
@@ -740,7 +738,7 @@ class PsychloBridge:
                 return {"accepted": True, "status": "recovered", "receipt": recovered_receipt}
             durable_delivery = self.store.round_prompt_delivery(round_id)
             prior_phase = durable_delivery.get("phase") if durable_delivery is not None else (prior_evidence.get("phase") if isinstance(prior_evidence, dict) else None)
-            if prior_phase in {"paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved"}:
+            if prior_phase in {"failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved"}:
                 raise ValueError("rollout delivery proof is missing; redelivery already attempted (prompt delivery phase is unresolved)")
             if isinstance(prior_evidence, dict) and prior_evidence.get("redeliveryAttempted") is True and prior_phase not in {"prepared"}:
                 evidence = {**prior_evidence, "source": "recovery-rescan-no-proof", "observedAt": now}

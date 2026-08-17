@@ -889,6 +889,59 @@ class PsychloBridgeStore:
             raise ValueError("operational failure intent is missing")
         return record, inserted
 
+    def claim_operational_failure_with_fence(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], payload: Mapping[str, Any], *, owner_id: str, lease_expires_at: str, now: str) -> dict[str, Any] | None:
+        """Atomically fence prompt dispatch and claim one exact failure intent."""
+        request_digest = self._round_request_digest(request)
+        capability_hash = _token_hash(capability)
+        payload_digest = hashlib.sha256(_dump_wire(payload).encode("utf-8")).hexdigest()
+        encoded_payload = _dump_wire(payload)
+        encoded_binding = _dump_wire(binding)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json,codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or json.loads(row[0]) != dict(request) or row[1] != capability_hash or row[2] != capability or row[3] != "started" or row[4] is not None or row[5] != encoded_binding:
+                raise ValueError("operational failure round binding is invalid")
+            delivery = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,payload_digest,payload_json,state,owner_id,claim_token,lease_expires_at FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
+            if existing is not None and existing[:5] != (request_digest, capability_hash, str(request["idempotencyKey"]), payload_digest, encoded_payload):
+                raise ValueError("operational failure intent conflict")
+            if delivery is not None:
+                if delivery[0] != request_digest or delivery[1] != capability_hash or delivery[2] != encoded_binding or delivery[3] not in {"prepared", "failure-fence"}:
+                    raise ValueError("operational failure prompt fence is unavailable")
+                if delivery[3] == "failure-fence" and (existing is None or existing[5] not in {"claimed", "forward-pending"}):
+                    raise ValueError("operational failure prompt fence is unavailable")
+            if existing is None:
+                conflict = self.connection.execute("SELECT round_id FROM operational_failure_intents WHERE idempotency_key=? OR payload_digest=?", (str(request["idempotencyKey"]), payload_digest)).fetchone()
+                if conflict is not None and conflict[0] != round_id:
+                    raise ValueError("operational failure idempotency conflict")
+            elif existing[5] == "accepted":
+                self.connection.execute("COMMIT")
+                return None
+            elif existing[6] and existing[7] and existing[8]:
+                try:
+                    if datetime.fromisoformat(str(existing[8]).replace("Z", "+00:00")) > datetime.fromisoformat(now.replace("Z", "+00:00")):
+                        self.connection.execute("COMMIT")
+                        return None
+                except ValueError as error:
+                    raise ValueError("operational failure lease is invalid") from error
+            token = secrets.token_urlsafe(32)
+            if existing is None:
+                self.connection.execute("INSERT INTO operational_failure_intents(round_id,request_digest,capability_hash,idempotency_key,payload_json,payload_digest,state,owner_id,claim_token,lease_expires_at,attempts,updated_at) VALUES (?,?,?,?,?,?, 'claimed',?,?,?,1,?)", (round_id, request_digest, capability_hash, str(request["idempotencyKey"]), encoded_payload, payload_digest, owner_id, token, lease_expires_at, now))
+            else:
+                self.connection.execute("UPDATE operational_failure_intents SET state='claimed',owner_id=?,claim_token=?,lease_expires_at=?,attempts=attempts+1,updated_at=? WHERE round_id=? AND state != 'accepted'", (owner_id, token, lease_expires_at, now, round_id))
+            if delivery is not None and delivery[3] == "prepared":
+                fenced = self.connection.execute("UPDATE round_prompt_deliveries SET phase='failure-fence',updated_at=? WHERE round_id=? AND request_digest=? AND capability_hash=? AND binding_json=? AND phase='prepared'", (now, round_id, request_digest, capability_hash, encoded_binding))
+                if fenced.rowcount != 1:
+                    raise ValueError("operational failure prompt fence is unavailable")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        record = self.operational_failure_intent(round_id)
+        if record is None:
+            raise ValueError("operational failure intent is missing")
+        return record
+
     def claim_operational_failure(self, round_id: str, request: Mapping[str, Any], capability: str, *, owner_id: str, lease_expires_at: str, now: str) -> dict[str, Any] | None:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -924,6 +977,12 @@ class PsychloBridgeStore:
                     self.connection.execute("COMMIT")
                     return existing
                 raise ValueError("operational failure claim is unavailable")
+            round_row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if round_row is None or round_row[0] != "started" or round_row[1] is not None:
+                raise ValueError("operational failure round state changed")
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if delivery is not None and delivery[0] != "failure-fence":
+                raise ValueError("operational failure prompt fence changed")
             if accepted:
                 updated = self.connection.execute("UPDATE operational_failure_intents SET state='accepted',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,outcome_json=?,last_error=NULL,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (_dump_wire(outcome or {}), now, round_id, owner_id, claim_token))
                 if updated.rowcount != 1:
@@ -961,7 +1020,7 @@ class PsychloBridgeStore:
         return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "binding": json.loads(row[2]), "phase": row[3], "promptDigest": row[4], "updatedAt": row[5]}
 
     def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str, expected_phase: str | None = None) -> dict[str, Any]:
-        phases = ("prepared", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved")
+        phases = ("prepared", "failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved")
         if phase not in phases or not isinstance(prompt_digest, str) or len(prompt_digest) != 64:
             raise ValueError("round prompt delivery phase is invalid")
         request_digest = self._round_request_digest(request)

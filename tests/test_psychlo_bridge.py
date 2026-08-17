@@ -2523,6 +2523,82 @@ def test_operational_failure_cannot_claim_round_during_prompt_settle(tmp_path: P
     assert bridge.store.get_round(request["roundId"])[4] == "dispatched"
 
 
+@pytest.mark.parametrize("winner", ["dispatch", "failure"])
+def test_operational_failure_barrier_race_has_one_winner_and_no_unfenced_paste(tmp_path: Path, winner: str):
+    request = _started_round(store := PsychloBridgeStore(tmp_path / "bridge.sqlite3"), f"round-race-{winner}")
+    store.connection.execute("UPDATE rounds SET dispatch_state='pending', started_at=NULL WHERE round_id=?", (request["roundId"],))
+    capability = f"capability:round-race-{winner}-1234567890abcdef"
+    store.connection.execute("UPDATE rounds SET capability_hash=?, capability_token=? WHERE round_id=?", (hashlib.sha256(capability.encode()).hexdigest(), capability, request["roundId"]))
+    barrier = threading.Barrier(2)
+    dispatch_entered = threading.Event()
+    paste_intent = threading.Event()
+    release = threading.Event()
+
+    class BarrierDispatcher:
+        def __init__(self):
+            self.paste_count = 0
+
+        def binding_provenance(self, _lead):
+            return {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+        def scan_rollout(self, _lead, _prompt):
+            if winner == "dispatch":
+                barrier.wait(2)
+                assert paste_intent.wait(2)
+            else:
+                barrier.wait(2)
+            return {"found": False, **self.binding_provenance(_lead)}
+
+        def __call__(self, _lead, _prompt, idempotency_key=None, phase_callback=None):
+            dispatch_entered.set()
+            if winner == "failure":
+                barrier.wait(2)
+                assert release.wait(2)
+                phase_callback("paste-intent")
+                self.paste_count += 1
+                return "dispatch:race-failure-lost"
+            barrier.wait(2)
+            phase_callback("paste-intent")
+            self.paste_count += 1
+            paste_intent.set()
+            assert release.wait(2)
+            phase_callback("submit-intent")
+            phase_callback("submitted")
+            return "dispatch:race-won"
+
+    dispatcher = BarrierDispatcher()
+    sender = lambda *_args: {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1, "status_code": 202}
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: capability)
+    errors = []
+
+    def dispatch():
+        try:
+            bridge.request_round(request, callback_capability=capability)
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=dispatch)
+    thread.start()
+    assert dispatch_entered.wait(2)
+    if winner == "failure":
+        result = bridge.request_scoped().report_operational_failure(request["roundId"], "provider-timeout")
+        assert result["accepted"] is True
+        release.set()
+        thread.join(2)
+        assert errors and isinstance(errors[0], ValueError)
+        assert dispatcher.paste_count == 0
+        assert bridge.store.round_prompt_delivery(request["roundId"])["phase"] == "failure-fence"
+        assert bridge.store.get_round(request["roundId"])[4] == "failed"
+    else:
+        with pytest.raises(ValueError, match="prompt delivery is unresolved|prompt fence is unavailable"):
+            bridge.request_scoped().report_operational_failure(request["roundId"], "provider-timeout")
+        release.set()
+        thread.join(2)
+        assert errors == []
+        assert dispatcher.paste_count == 1
+        assert bridge.store.get_round(request["roundId"])[4] == "dispatched"
+
+
 def test_recovery_claim_excludes_a_second_recoverer(tmp_path: Path):
     store_path = tmp_path / "bridge.sqlite3"
     store = PsychloBridgeStore(store_path)
@@ -3373,6 +3449,46 @@ def test_operational_failure_retry_reuses_exact_payload_and_fences_claim(tmp_pat
     replay = restarted.report_operational_failure(request["roundId"], "transport-failed")
     assert replay["status"] == "already-accepted"
     assert len(calls) == 2
+
+
+def test_operational_failure_retry_reuses_failure_fence_without_repasting(tmp_path: Path):
+    class PhaseFailureDispatcher:
+        def __init__(self):
+            self.dispatch_calls = 0
+
+        def binding_provenance(self, _lead):
+            return {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+        def scan_rollout(self, _lead, _prompt):
+            return {"found": False, **self.binding_provenance(_lead)}
+
+        def __call__(self, _lead, _prompt, idempotency_key=None, phase_callback=None):
+            self.dispatch_calls += 1
+            raise RuntimeError("provider unavailable")
+
+    accepted = {"value": False}
+    def sender(_kind, _message_id, _payload):
+        if not accepted["value"]:
+            return {"accepted": False}
+        return {"accepted": True, "inserted": True, "projectId": "arcade", "failureCount": 1, "status_code": 202}
+
+    path = tmp_path / "bridge.sqlite3"
+    dispatcher = PhaseFailureDispatcher()
+    bridge = PsychloBridge(store=PsychloBridgeStore(path), dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "capability:failure-fence-retry-1234567890")
+    request = _uncertain_round_request()
+    with pytest.raises(RuntimeError):
+        bridge.request_round(request)
+    with pytest.raises(ValueError, match="rejected"):
+        bridge.report_operational_failure(request["roundId"], "transport-failed")
+    assert bridge.store.round_prompt_delivery(request["roundId"])["phase"] == "failure-fence"
+    assert bridge.store.operational_failure_intent(request["roundId"])["state"] == "forward-pending"
+
+    accepted["value"] = True
+    restarted = PsychloBridge(store=PsychloBridgeStore(path), dispatcher=dispatcher, sender=sender, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    result = restarted.report_operational_failure(request["roundId"], "transport-failed")
+    assert result["accepted"] is True
+    assert restarted.store.get_round(request["roundId"])[4] == "failed"
+    assert dispatcher.dispatch_calls == 1
 
 
 @pytest.mark.parametrize("response", [

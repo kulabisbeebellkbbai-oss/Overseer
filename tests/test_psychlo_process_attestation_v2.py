@@ -444,7 +444,7 @@ def test_tmux_scan_binds_pane_by_start_chain_not_launcher_name(monkeypatch, tmp_
     assert (result["sessionId"], result["paneId"]) == ("$2", "%2")
 
 
-def test_completed_replay_returns_primary_row_without_live_collection(tmp_path, monkeypatch):
+def test_corrupt_completed_replay_is_rejected_before_live_collection(tmp_path, monkeypatch):
     import overseer.psychlo_process_attestation as module
 
     primary_path = tmp_path / "primary.sqlite3"
@@ -456,7 +456,8 @@ def test_completed_replay_returns_primary_row_without_live_collection(tmp_path, 
     monkeypatch.setattr(module, "_assert_runtime_source_integrity", lambda: None)
     monkeypatch.setattr(module, "capture_process_identity", lambda _pid: (_ for _ in ()).throw(AssertionError("exited process must not be recollected")))
     monkeypatch.setattr(module, "_open_runtime_authority", lambda _round: (_ for _ in ()).throw(AssertionError("runtime must not open on completed replay")))
-    assert module.record_process_observation(round_id="round", plan_id="plan") == {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": "round", "observationId": "a", "observationDigest": "b" * 64, "planDigest": "c" * 64, "recordedAt": "completed"}
+    with pytest.raises(module.ProcessAttestationError, match="manifest|timestamp|plan"):
+        module.record_process_observation(round_id="round", plan_id="plan")
 
 
 def test_record_uses_primary_only_when_live_runtime_has_vanished(tmp_path, monkeypatch):
@@ -503,8 +504,14 @@ def test_postcommit_missing_wal_shm_requires_exact_readonly_visibility(tmp_path,
 
     primary_path = tmp_path / "primary.sqlite3"
     primary = SQLiteStore(primary_path)
-    primary._connection.execute("INSERT INTO admin_change_plans(id,payload) VALUES ('plan','{}')")
-    primary._connection.execute("INSERT INTO psychlo_process_observations VALUES ('a','round','plan','" + "b" * 64 + "','', 'prepared','" + json.dumps(_manifest()) + "','inserted',NULL)")
+    value = _manifest()
+    plan = module.plan_psychlo_legacy_process_observation(
+        "plan", "round", module.manifest_digest(value), value["source"]["commit"],
+        value["source"]["treeDigest"], value["source"]["moduleDigest"],
+    )
+    from overseer.store import _dump
+    primary._connection.execute("INSERT INTO admin_change_plans(id,payload) VALUES (?,?)", ("plan", _dump(plan)))
+    primary._connection.execute("INSERT INTO psychlo_process_observations VALUES ('a','round','plan',?,?, 'prepared',?,?,NULL)", (module.manifest_digest(value), "", json.dumps(value, sort_keys=True, separators=(",", ":")), "2099-01-01T00:00:01+00:00"))
     primary._connection.commit()
     primary._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     fd = os.open(primary_path, os.O_RDWR | os.O_NOFOLLOW)
@@ -527,7 +534,7 @@ def test_postcommit_missing_wal_shm_requires_exact_readonly_visibility(tmp_path,
     try:
         module._revalidate_primary_database_after_commit(
             runtime, round_id="round", plan_id="plan", state="prepared",
-            observation_digest="b" * 64, plan_digest="",
+            observation_digest=module.manifest_digest(value), plan_digest="",
         )
     finally:
         module._forget_verified_connection(primary._connection)
@@ -555,3 +562,53 @@ def test_postcommit_missing_wal_shm_fails_when_exact_row_is_not_visible(tmp_path
         module._forget_verified_connection(primary._connection)
         os.close(fd)
         primary._connection.close()
+
+
+def test_strict_replay_validator_rejects_full_row_manifest_mismatch(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    stage_process_observation(round_id="round", plan_id="plan")
+    row = runtime.primary._connection.execute(
+        "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
+        "FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone()
+    corrupted = list(row)
+    corrupted[6] = json.dumps({})
+    with pytest.raises(module.ProcessAttestationError, match="manifest"):
+        module._validate_process_observation_row(
+            runtime.primary, tuple(corrupted), round_id="round", plan_id="plan",
+        )
+    corrupted = list(row)
+    corrupted[4] = "d" * 64
+    with pytest.raises(module.ProcessAttestationError, match="prepared process observation recording fields"):
+        module._validate_process_observation_row(
+            runtime.primary, tuple(corrupted), round_id="round", plan_id="plan",
+        )
+    runtime.bridge.store.close(); runtime.primary.close()
+
+
+def test_readonly_connection_rejects_close_reuse_decoy_fd(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    canonical = tmp_path / "canonical.sqlite3"
+    decoy = tmp_path / "decoy.sqlite3"
+    canonical_store = SQLiteStore(canonical)
+    canonical_store.close()
+    decoy_store = SQLiteStore(decoy)
+    decoy_store.close()
+    expected = canonical.stat()
+    original_bind = module._bind_sqlite_database
+
+    def close_and_reuse(connection, path, identity, label, *, bound_fd=None):
+        if bound_fd is not None:
+            os.close(bound_fd)
+            replacement = os.open(decoy, os.O_RDONLY | os.O_NOFOLLOW)
+            assert replacement == bound_fd
+        return original_bind(connection, path, identity, label, bound_fd=bound_fd)
+
+    monkeypatch.setattr(module, "_bind_sqlite_database", close_and_reuse)
+    with pytest.raises(module.ProcessAttestationError, match="bound database handle changed|bad file descriptor|canonical inode"):
+        module._open_verified_readonly_connection(
+            canonical, (expected.st_dev, expected.st_ino, expected.st_nlink),
+        )

@@ -1080,6 +1080,64 @@ def _assert_plan_identity(plan: AdminChangePlan, plan_id: str, round_id: str, ma
         raise ProcessAttestationError("authoritative plan immutable identity changed")
 
 
+def _validate_process_observation_row(
+    primary: SQLiteStore,
+    row: Any,
+    *,
+    round_id: str,
+    plan_id: str,
+    expected_state: str | None = None,
+) -> tuple[dict[str, Any], AdminChangePlan, str, str]:
+    """Validate one complete prepared/recorded row and its exact immutable plan."""
+    if row is None or len(row) != 9:
+        raise ProcessAttestationError("process observation row is incomplete")
+    observation_id, actual_round, actual_plan, observation_digest, plan_digest, state, manifest_json, inserted_at, recorded_at = tuple(row)
+    if (
+        not isinstance(observation_id, str) or not observation_id.strip()
+        or actual_round != round_id or actual_plan != plan_id
+        or state not in {"prepared", "recorded"}
+        or not isinstance(observation_digest, str) or not _HEX64.fullmatch(observation_digest)
+        or not isinstance(plan_digest, str)
+        or not isinstance(manifest_json, str)
+        or not isinstance(inserted_at, str)
+    ):
+        raise ProcessAttestationError("process observation row identity is invalid")
+    if expected_state is not None and state != expected_state:
+        raise ProcessAttestationError("process observation state is not exact")
+    _parse_utc_timestamp(inserted_at, "observation inserted timestamp")
+    try:
+        manifest_value = json.loads(manifest_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ProcessAttestationError("process observation manifest is invalid") from error
+    manifest = _manifest(manifest_value, round_id)
+    encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
+    if manifest_json != encoded or manifest_digest(manifest) != observation_digest:
+        raise ProcessAttestationError("process observation manifest digest is not exact")
+    approval = manifest["approval"]
+    if approval.get("planId") != plan_id or approval.get("planDigest") != "":
+        raise ProcessAttestationError("process observation approval snapshot is not exact")
+    try:
+        plan = primary.load_admin_change_plan(plan_id)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ProcessAttestationError("process observation plan is missing") from error
+    _assert_plan_identity(plan, plan_id, round_id, manifest)
+    if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION or plan.canceled:
+        raise ProcessAttestationError("process observation plan kind or lifecycle is invalid")
+    if state == "prepared":
+        if plan_digest != "" or recorded_at is not None:
+            raise ProcessAttestationError("prepared process observation recording fields are invalid")
+    else:
+        if not isinstance(recorded_at, str) or not recorded_at.strip():
+            raise ProcessAttestationError("recorded process observation timestamp is missing")
+        _parse_utc_timestamp(recorded_at, "recorded process observation timestamp")
+        if not plan.approved or plan.approved_by != "sisko" or not plan.approved_at:
+            raise ProcessAttestationError("recorded process observation plan is not approved")
+        _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
+        if plan_digest != admin_plan_digest(plan):
+            raise ProcessAttestationError("recorded process observation plan digest is not exact")
+    return manifest, plan, encoded, observation_digest
+
+
 def _assert_runtime_source_integrity() -> None:
     """Ensure the loaded observation module is the reviewed runtime source."""
     module = Path(__file__).resolve()
@@ -1097,7 +1155,7 @@ def _load_existing_process_observation(round_id: str, plan_id: str) -> dict[str,
     try:
         try:
             row = authority.primary._connection.execute(
-                "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,recorded_at "
+                "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
                 "FROM psychlo_process_observations WHERE round_id=?",
                 (round_id,),
             ).fetchone()
@@ -1107,20 +1165,9 @@ def _load_existing_process_observation(round_id: str, plan_id: str) -> dict[str,
             row = None
         if row is None:
             return None
-        if row[1] != round_id or row[2] != plan_id:
-            raise ProcessAttestationError("existing process observation plan collision")
-        try:
-            manifest = _manifest(json.loads(row[6]), round_id)
-        except (TypeError, json.JSONDecodeError) as error:
-            raise ProcessAttestationError("existing process observation snapshot is invalid") from error
-        digest = manifest_digest(manifest)
-        encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
-        if row[3] != digest or row[6] != encoded or row[5] not in {"prepared", "recorded"}:
-            raise ProcessAttestationError("existing process observation identity changed")
-        plan = authority.primary.load_admin_change_plan(plan_id)
-        _assert_plan_identity(plan, plan_id, round_id, manifest)
-        if plan.canceled:
-            raise ProcessAttestationError("existing process observation plan is canceled")
+        manifest, plan, _encoded, digest = _validate_process_observation_row(
+            authority.primary, row, round_id=round_id, plan_id=plan_id,
+        )
         if row[5] == "recorded":
             return {"recorded": True, "historical": True, "authoritative": False, "executable": False,
                     "roundId": round_id, "observationId": row[0], "observationDigest": row[3],
@@ -1198,20 +1245,28 @@ def finalize_process_observation(*, plan_id: str) -> dict[str, Any]:
         if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION:
             raise ProcessAttestationError("exact process observation plan is required")
         row = primary._connection.execute(
-            "SELECT round_id,state,plan_id FROM psychlo_process_observations WHERE plan_id=?",
+            "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
+            "FROM psychlo_process_observations WHERE plan_id=?",
             (plan_id,),
         ).fetchone()
-        recorded = bool(row is not None and row[1] == "recorded")
-        prepared = bool(row is not None and row[1] == "prepared")
+        if row is not None:
+            _manifest_value, _validated_plan, _encoded, _digest = _validate_process_observation_row(
+                primary, row, round_id=row[1], plan_id=plan_id,
+            )
+        recorded = bool(row is not None and row[5] == "recorded")
+        prepared = bool(row is not None and row[5] == "prepared")
         approved = bool(plan.approved and plan.approved_by == "sisko" and not plan.canceled)
         return {
+            "historical": True,
+            "authoritative": False,
+            "executable": False,
             "finalized": recorded,
             "approved": approved,
             "prepared": prepared,
             "recorded": recorded,
             "status": "recorded" if recorded else "approved-prepared" if approved and prepared else "approved-awaiting-preparation" if approved else "pending-approval",
             "planId": plan.id,
-            "roundId": row[0] if row is not None else None,
+            "roundId": row[1] if row is not None else None,
         }
     finally:
         authority.close()
@@ -1497,26 +1552,21 @@ def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]
     try:
         primary_connection.execute("BEGIN IMMEDIATE")
         try:
-            row = primary_connection.execute("SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,recorded_at FROM psychlo_process_observations WHERE round_id=?", (round_id,)).fetchone()
+            row = primary_connection.execute("SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at FROM psychlo_process_observations WHERE round_id=?", (round_id,)).fetchone()
             if row is None:
                 raise ProcessAttestationError("prepared process observation is missing")
-            try:
-                manifest = _manifest(json.loads(row[6]), round_id)
-            except (TypeError, json.JSONDecodeError) as error:
-                raise ProcessAttestationError("prepared process observation snapshot is invalid") from error
-            digest = manifest_digest(manifest)
-            encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
-            if tuple(row[1:4]) != (round_id, plan_id, digest) or row[6] != encoded:
-                raise ProcessAttestationError("prepared process observation identity changed")
+            manifest, stored_plan, _encoded, digest = _validate_process_observation_row(
+                primary, row, round_id=round_id, plan_id=plan_id,
+            )
             if row[5] == "recorded":
                 primary_connection.rollback()
                 _revalidate_primary_database_after_commit(
                     authority, round_id=round_id, plan_id=plan_id, state="recorded",
-                    observation_digest=row[3], plan_digest=row[4],
+                    observation_digest=row[3], plan_digest=row[4], expected_plan=stored_plan,
                 )
                 return {"recorded": True, "historical": True, "authoritative": False, "executable": False,
                         "roundId": round_id, "observationId": row[0], "observationDigest": row[3],
-                        "planDigest": row[4], "recordedAt": row[7]}
+                        "planDigest": row[4], "recordedAt": row[8]}
             if row[5] != "prepared":
                 raise ProcessAttestationError("prepared process observation state is invalid")
             plan = _assert_exact_plan(primary, plan_id, round_id, manifest, approved=True)
@@ -1563,16 +1613,23 @@ def _load_recorded_observation(round_id: str, plan_id: str) -> dict[str, Any] | 
     try:
         primary = authority.primary
         try:
-            row = primary.process_observation(round_id)
-        except Exception as error:
+            row = primary._connection.execute(
+                "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
+                "FROM psychlo_process_observations WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
             if "no such table" in str(error):
                 return None
             raise
         if row is None:
             return None
-        if row.get("planId") != plan_id:
-            raise ProcessAttestationError("recorded process observation plan identity changed")
-        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": row["roundId"], "observationId": row["observationId"], "observationDigest": row["observationDigest"], "planDigest": row["planDigest"], "recordedAt": row["recordedAt"]}
+        _manifest_value, _plan, _encoded, _digest = _validate_process_observation_row(
+            primary, row, round_id=round_id, plan_id=plan_id,
+        )
+        if row[5] != "recorded":
+            return None
+        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": row[1], "observationId": row[0], "observationDigest": row[3], "planDigest": row[4], "recordedAt": row[8]}
     finally:
         authority.close()
 
@@ -1650,6 +1707,75 @@ def _revalidate_primary_database_after_commit(
         )
 
 
+def _fd_snapshot() -> dict[int, tuple[int, int, int, str]]:
+    snapshot: dict[int, tuple[int, int, int, str]] = {}
+    try:
+        entries = list(os.scandir("/proc/self/fd"))
+    except OSError as error:
+        raise ProcessAttestationError("process file descriptors cannot be inspected") from error
+    for entry in entries:
+        try:
+            descriptor = int(entry.name)
+            metadata = os.fstat(descriptor)
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except (ValueError, OSError):
+            continue
+        snapshot[descriptor] = (metadata.st_dev, metadata.st_ino, metadata.st_nlink, target)
+    return snapshot
+
+
+def _open_verified_readonly_connection(
+    path: Path,
+    expected_identity: tuple[int, int, int],
+) -> tuple[sqlite3.Connection, int, int]:
+    """Open SQLite read-only and bind the connection's own newly opened FD."""
+    base_fd: int | None = None
+    connection: sqlite3.Connection | None = None
+    connection_fd: int | None = None
+    try:
+        base_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        base = os.fstat(base_fd)
+        expected = _identity_with_nlink(tuple(expected_identity))
+        if (base.st_dev, base.st_ino, base.st_nlink) != expected or not stat.S_ISREG(base.st_mode):
+            raise ProcessAttestationError("canonical primary preopened handle identity changed")
+        before = _fd_snapshot()
+        connection = sqlite3.connect(
+            f"file:/proc/self/fd/{base_fd}?mode=ro&cache=private", uri=True,
+        )
+        after = _fd_snapshot()
+        new_descriptors = set(after).difference(before)
+        candidates = [
+            descriptor for descriptor in sorted(new_descriptors)
+            if after[descriptor][:3] == expected
+            and Path(after[descriptor][3].split(" (deleted)", 1)[0]).resolve() == path.resolve()
+        ]
+        if len(candidates) != 1:
+            raise ProcessAttestationError("read-only SQLite main database handle is ambiguous")
+        connection_fd = candidates[0]
+        _register_verified_connection(connection, connection_fd)
+        _bind_sqlite_database(connection, path, expected[:2], "primary read-only", bound_fd=connection_fd)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        bound = os.fstat(connection_fd)
+        if (bound.st_dev, bound.st_ino, bound.st_nlink) != expected:
+            raise ProcessAttestationError("read-only SQLite main database handle changed")
+        return connection, connection_fd, base_fd
+    except Exception:
+        if connection is not None:
+            if connection_fd is not None:
+                _forget_verified_connection(connection)
+            try:
+                connection.close()
+            except Exception:
+                pass
+        if base_fd is not None:
+            try:
+                os.close(base_fd)
+            except OSError:
+                pass
+        raise
+
+
 def _verify_primary_visibility(
     expected_identity: tuple[int, int, int],
     *,
@@ -1662,17 +1788,17 @@ def _verify_primary_visibility(
     missing_sidecars: tuple[str, ...],
 ) -> None:
     """Read exact committed data from a fresh canonical read-only handle."""
-    fd: int | None = None
+    base_fd: int | None = None
+    connection_fd: int | None = None
     connection: sqlite3.Connection | None = None
     try:
         before = CANONICAL_PRIMARY_DATABASE.lstat()
-        fd = os.open(CANONICAL_PRIMARY_DATABASE, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-        held = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_nlink) != expected_identity or (held.st_dev, held.st_ino, held.st_nlink) != expected_identity:
+        if (before.st_dev, before.st_ino, before.st_nlink) != expected_identity:
             raise ProcessAttestationError("canonical primary read-only handle identity changed")
-        connection = sqlite3.connect(f"file:/proc/self/fd/{fd}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
+        connection, connection_fd, base_fd = _open_verified_readonly_connection(CANONICAL_PRIMARY_DATABASE, expected_identity)
+        _bind_sqlite_database(connection, CANONICAL_PRIMARY_DATABASE, expected_identity[:2], "primary read-only", bound_fd=connection_fd)
+        if (os.fstat(base_fd).st_dev, os.fstat(base_fd).st_ino, os.fstat(base_fd).st_nlink) != expected_identity:
+            raise ProcessAttestationError("canonical primary preopened handle changed during read")
         first = connection.execute(
             "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
             "FROM psychlo_process_observations WHERE round_id=?",
@@ -1685,6 +1811,9 @@ def _verify_primary_visibility(
             (round_id,),
         ).fetchone()
         after = CANONICAL_PRIMARY_DATABASE.lstat()
+        _bind_sqlite_database(connection, CANONICAL_PRIMARY_DATABASE, expected_identity[:2], "primary read-only", bound_fd=connection_fd)
+        if (os.fstat(connection_fd).st_dev, os.fstat(connection_fd).st_ino, os.fstat(connection_fd).st_nlink) != expected_identity:
+            raise ProcessAttestationError("read-only SQLite main database handle changed during read")
         if (after.st_dev, after.st_ino, after.st_nlink) != expected_identity or (None if first is None else tuple(first)) != (None if second is None else tuple(second)):
             raise ProcessAttestationError("canonical primary visibility changed during read")
         if first is None or first[1] != round_id or (plan_id is not None and first[2] != plan_id) or (state is not None and first[5] != state):
@@ -1695,9 +1824,23 @@ def _verify_primary_visibility(
             raise ProcessAttestationError("committed plan digest is not visible")
         if plan_id is not None and plan_row is None:
             raise ProcessAttestationError("committed immutable plan is not visible")
-        if expected_plan is not None:
-            if plan_row is None or _store_load_dataclass(AdminChangePlan, str(plan_row[0])) != expected_plan:
-                raise ProcessAttestationError("committed immutable plan is not visible")
+        if plan_row is None:
+            raise ProcessAttestationError("committed immutable plan is not visible")
+        try:
+            visible_plan = _store_load_dataclass(AdminChangePlan, str(plan_row[0]))
+            class _VisiblePlanStore:
+                def load_admin_change_plan(self, _plan_id: str) -> AdminChangePlan:
+                    return visible_plan
+            _validate_process_observation_row(
+                _VisiblePlanStore(), first, round_id=round_id,
+                plan_id=str(first[2]), expected_state=state,
+            )
+        except (KeyError, TypeError, ValueError, ProcessAttestationError) as error:
+            if isinstance(error, ProcessAttestationError):
+                raise
+            raise ProcessAttestationError("committed immutable plan is not visible") from error
+        if expected_plan is not None and visible_plan != expected_plan:
+            raise ProcessAttestationError("committed immutable plan is not visible")
         # WAL/SHM disappearance is safe only after the independent canonical
         # read has proven the exact main-database data is visible.
         if missing_sidecars and first is None:
@@ -1708,6 +1851,16 @@ def _verify_primary_visibility(
         raise ProcessAttestationError("canonical primary read-only visibility check failed") from error
     finally:
         if connection is not None:
+            _forget_verified_connection(connection)
+        if connection is not None:
             connection.close()
-        if fd is not None:
-            os.close(fd)
+        if connection_fd is not None:
+            try:
+                os.close(connection_fd)
+            except OSError:
+                pass
+        if base_fd is not None:
+            try:
+                os.close(base_fd)
+            except OSError:
+                pass

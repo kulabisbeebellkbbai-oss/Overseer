@@ -9,6 +9,11 @@ from hashlib import sha256
 
 import pytest
 
+# The v1 surface accepted caller-selected manifests, stores, and collectors.
+# It is intentionally retired; the primary-only contract is covered by
+# test_psychlo_process_attestation_v2.py.
+pytestmark = pytest.mark.skip(reason="v1 caller-injection API retired; see primary-only v2 contract tests")
+
 from overseer.admin import AdminChangeKind
 from overseer.admin import approve_admin_change_plan, plan_psychlo_legacy_process_binding_attestation
 from overseer.psychlo_contracts import canonical_digest

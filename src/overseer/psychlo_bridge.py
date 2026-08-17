@@ -2423,6 +2423,22 @@ class CodexProjectDispatcher:
         launcher_stat = launcher_path.stat(follow_symlinks=False)
         if workspace_stat.st_uid != os.getuid() or workspace_stat.st_mode & 0o022 or launcher_stat.st_uid not in {0, os.getuid()} or launcher_stat.st_mode & 0o022:
             raise ValueError("canonical project registry paths are not private")
+        try:
+            launcher_fd = os.open(str(launcher_path), os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                before = os.fstat(launcher_fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_uid not in {0, os.getuid()} or before.st_mode & 0o022:
+                    raise ValueError("canonical launcher is not trusted")
+                launcher_bytes = b""
+                while chunk := os.read(launcher_fd, 1 << 20):
+                    launcher_bytes += chunk
+                after = os.fstat(launcher_fd)
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    raise ValueError("canonical launcher changed during digest")
+            finally:
+                os.close(launcher_fd)
+        except OSError as error:
+            raise ValueError("canonical launcher cannot be digested") from error
         return {
             "conversationId": session.external_session_id or "",
             "sessionId": session.id,
@@ -2433,7 +2449,7 @@ class CodexProjectDispatcher:
             "workspaceIno": str(workspace_stat.st_ino),
             "launcherDev": str(launcher_stat.st_dev),
             "launcherIno": str(launcher_stat.st_ino),
-            "launcherDigest": hashlib.sha256(launcher_path.read_bytes()).hexdigest(),
+            "launcherDigest": hashlib.sha256(launcher_bytes).hexdigest(),
             "registryPath": str(driver.registry_path),
         }
 

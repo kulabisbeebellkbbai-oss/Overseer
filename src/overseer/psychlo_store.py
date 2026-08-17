@@ -70,9 +70,6 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS round_prompt_deliveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL UNIQUE, capability_hash TEXT NOT NULL UNIQUE, binding_json TEXT NOT NULL, phase TEXT NOT NULL, prompt_digest TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS round_process_binding_attestations(attestation_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, manifest_digest TEXT NOT NULL UNIQUE, plan_digest TEXT NOT NULL, manifest_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
-            CREATE TRIGGER IF NOT EXISTS round_process_binding_attestations_no_update BEFORE UPDATE ON round_process_binding_attestations BEGIN SELECT RAISE(ABORT, 'process binding attestations are append-only'); END;
-            CREATE TRIGGER IF NOT EXISTS round_process_binding_attestations_no_delete BEFORE DELETE ON round_process_binding_attestations BEGIN SELECT RAISE(ABORT, 'process binding attestations are append-only'); END;
             CREATE TABLE IF NOT EXISTS round_cancellations(cancellation_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, receipt_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -825,46 +822,6 @@ class PsychloBridgeStore:
         if row is None:
             return None
         return {"roundId": round_id, "manifestDigest": row[0], "attestation": json.loads(row[1]), "insertedAt": row[2]}
-
-    def process_binding_attestation(self, round_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("SELECT attestation_id,manifest_digest,plan_digest,manifest_json,inserted_at FROM round_process_binding_attestations WHERE round_id=?", (round_id,)).fetchone()
-        if row is None:
-            return None
-        return {"attestationId": row[0], "roundId": round_id, "manifestDigest": row[1], "planDigest": row[2], "manifest": json.loads(row[3]), "insertedAt": row[4]}
-
-    def insert_process_binding_attestation(self, round_id: str, attestation_id: str, manifest_digest: str, plan_digest: str, manifest: Mapping[str, Any], *, now: str) -> dict[str, Any]:
-        """Insert one attestation without changing the rounds projection."""
-        if not all(isinstance(value, str) and value.strip() for value in (round_id, attestation_id, manifest_digest, plan_digest, now)):
-            raise ValueError("process attestation identity is required")
-        if len(manifest_digest) != 64 or any(char not in "0123456789abcdef" for char in manifest_digest.lower()) or len(plan_digest) != 64 or any(char not in "0123456789abcdef" for char in plan_digest.lower()):
-            raise ValueError("process attestation digest is invalid")
-        approval = manifest.get("approval") if isinstance(manifest, Mapping) else None
-        if not isinstance(approval, Mapping) or approval.get("planDigest") != plan_digest:
-            raise ValueError("process attestation plan digest is not finalized")
-        encoded = _dump(manifest)
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            row = self.connection.execute("SELECT request_json,capability_hash,dispatch_state,result_json,codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
-            bridge_state = manifest.get("bridge") if isinstance(manifest, Mapping) else None
-            delivery = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
-            forbidden = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations"))
-            request_digest = self._round_request_digest(json.loads(row[0])) if row is not None else None
-            if row is None or row[2] != "started" or row[3] is not None or not isinstance(row[4], str) or forbidden or not isinstance(bridge_state, Mapping) or bridge_state.get("requestDigest") != request_digest or bridge_state.get("capabilityHash") != row[1] or bridge_state.get("bindingDigest") != hashlib.sha256(row[4].encode("utf-8")).hexdigest() or delivery is None or delivery[0] != request_digest or delivery[1] != row[1] or delivery[2] != row[4] or delivery[3] != "submitted" or delivery[4] != bridge_state.get("promptDigest"):
-                raise ValueError("process attestation round is not started and result-less")
-            existing = self.connection.execute("SELECT attestation_id,manifest_digest,plan_digest,manifest_json FROM round_process_binding_attestations WHERE round_id=? OR attestation_id=? OR manifest_digest=?", (round_id, attestation_id, manifest_digest)).fetchone()
-            if existing is not None:
-                if existing[0] != attestation_id or existing[1] != manifest_digest or existing[2] != plan_digest or existing[3] != encoded:
-                    raise ValueError("process attestation replay identity changed")
-            else:
-                self.connection.execute("INSERT INTO round_process_binding_attestations(attestation_id,round_id,manifest_digest,plan_digest,manifest_json,inserted_at) VALUES (?,?,?,?,?,?)", (attestation_id, round_id, manifest_digest, plan_digest, encoded, now))
-            self.connection.execute("COMMIT")
-        except Exception:
-            self.connection.execute("ROLLBACK")
-            raise
-        record = self.process_binding_attestation(round_id)
-        if record is None:
-            raise ValueError("process attestation missing after insert")
-        return record
 
     def migrate_legacy_round_binding(self, round_id: str, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, binding: Mapping[str, Any], attestation: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         encoded_binding = _dump_wire(binding)

@@ -707,6 +707,30 @@ class PsychloBridgeStore:
     def record_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str) -> None:
         self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
 
+    def start_round_dispatch(self, round_id: str, request: Mapping[str, Any], capability: str, started_at: str, *, binding: Mapping[str, Any] | None = None, prompt_digest: str | None = None) -> bool:
+        """CAS pending round ownership and seed its prompt ledger atomically."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json,codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or json.loads(row[0]) != dict(request) or row[1] != _token_hash(capability) or row[2] != capability:
+                raise ValueError("round dispatch binding is invalid")
+            if row[3] != "pending" or row[4] is not None:
+                self.connection.execute("COMMIT")
+                return False
+            encoded_binding = _dump_wire(binding) if binding is not None else None
+            if row[5] is not None and row[5] != encoded_binding:
+                raise ValueError("round execution binding is immutable")
+            self.connection.execute("UPDATE rounds SET dispatch_state='started',started_at=COALESCE(started_at,?),codex_binding_json=COALESCE(codex_binding_json,?) WHERE round_id=? AND dispatch_state='pending' AND result_json IS NULL", (started_at, encoded_binding, round_id))
+            if binding is not None and prompt_digest is not None:
+                if not isinstance(prompt_digest, str) or len(prompt_digest) != 64:
+                    raise ValueError("round prompt digest is invalid")
+                self.connection.execute("INSERT INTO round_prompt_deliveries(round_id,request_digest,capability_hash,binding_json,phase,prompt_digest,updated_at) VALUES (?,?,?,?,?,?,?)", (round_id, self._round_request_digest(request), _token_hash(capability), encoded_binding, "prepared", prompt_digest, started_at))
+            self.connection.execute("COMMIT")
+            return True
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def mark_dispatch_started(self, round_id: str, started_at: str) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='started',started_at=COALESCE(started_at,?) WHERE round_id=? AND dispatch_state='pending'", (started_at, round_id))
 
@@ -726,7 +750,21 @@ class PsychloBridgeStore:
         return None if row is None or row[0] is None else json.loads(row[0])
 
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
-        self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or row[0] != "started" or row[1] is not None:
+                raise ValueError("round dispatch state changed")
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if delivery is not None and delivery[0] != "confirmed":
+                raise ValueError("round prompt delivery is not confirmed")
+            updated = self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL", (_dump_wire(receipt), round_id))
+            if updated.rowcount != 1:
+                raise ValueError("round dispatch state changed")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def round_cancellation(self, round_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT cancellation_id,request_digest,attestation_json,receipt_json,inserted_at FROM round_cancellations WHERE round_id=?", (round_id,)).fetchone()
@@ -922,7 +960,7 @@ class PsychloBridgeStore:
             return None
         return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "binding": json.loads(row[2]), "phase": row[3], "promptDigest": row[4], "updatedAt": row[5]}
 
-    def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str) -> dict[str, Any]:
+    def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str, expected_phase: str | None = None) -> dict[str, Any]:
         phases = ("prepared", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved")
         if phase not in phases or not isinstance(prompt_digest, str) or len(prompt_digest) != 64:
             raise ValueError("round prompt delivery phase is invalid")
@@ -937,6 +975,8 @@ class PsychloBridgeStore:
             else:
                 if (row[0], row[1], row[2], row[4]) != (request_digest, capability_hash, encoded_binding, prompt_digest):
                     raise ValueError("round prompt delivery binding conflict")
+                if expected_phase is not None and row[3] != expected_phase:
+                    raise ValueError("round prompt delivery predecessor changed")
                 if phases.index(phase) < phases.index(str(row[3])):
                     raise ValueError("round prompt delivery phase regressed")
                 self.connection.execute("UPDATE round_prompt_deliveries SET phase=?,updated_at=? WHERE round_id=?", (phase, now, round_id))
@@ -1045,6 +1085,9 @@ class PsychloBridgeStore:
             round_update = self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL", (encoded_receipt, round_id))
             if round_update.rowcount != 1:
                 raise ValueError("started round state changed")
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if delivery is not None and delivery[0] != "confirmed":
+                raise ValueError("round prompt delivery is not confirmed")
             recovery_update = self.connection.execute("UPDATE round_recoveries SET state='completed',owner_id=NULL,claim_token=NULL,lease_expires_at=NULL,evidence_json=?,updated_at=? WHERE round_id=? AND owner_id=? AND claim_token=? AND state='claimed'", (encoded_evidence, now, round_id, owner_id, claim_token))
             if recovery_update.rowcount != 1:
                 raise ValueError("round recovery claim is unavailable")

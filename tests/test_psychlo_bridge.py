@@ -2135,6 +2135,45 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
         bridge.request_round(request, callback_capability="capability:different-round-binding")
 
 
+def test_pending_round_start_is_an_atomic_single_dispatch_claim(tmp_path: Path):
+    request = {"roundId": "round-cas-start", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-cas-start", "idempotencyKey": "round-cas-start", "snapshotId": "snapshot-cas-start", "policyVersion": "2026-08-09", "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    capability = "capability_cas_start_1234567890abcdef"
+    receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": "overseer-dispatch:round-cas-start", "status": "accepted"}
+    first = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    first.record_round(request, receipt, capability)
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def claim(path: Path):
+        store = PsychloBridgeStore(path)
+        barrier.wait()
+        outcomes.append(store.start_round_dispatch(request["roundId"], request, capability, NOW, binding=binding, prompt_digest="b" * 64))
+
+    threads = [threading.Thread(target=claim, args=(tmp_path / "bridge.sqlite3",)) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert sorted(outcomes) == [False, True]
+    assert first.get_round(request["roundId"])[4] == "started"
+    assert first.round_prompt_delivery(request["roundId"])["phase"] == "prepared"
+
+
+def test_mark_dispatched_requires_confirmed_prompt_phase_and_started_predecessor(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-confirmed-cas")
+    binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+    store.connection.execute("UPDATE rounds SET dispatch_state='pending', started_at=NULL WHERE round_id=?", (request["roundId"],))
+    capability = "capability-round-confirmed-cas-1234567890abcdef"
+    store.connection.execute("UPDATE rounds SET capability_hash=?, capability_token=? WHERE round_id=?", (hashlib.sha256(capability.encode()).hexdigest(), capability, request["roundId"]))
+    assert store.start_round_dispatch(request["roundId"], request, capability, NOW, binding=binding, prompt_digest="b" * 64)
+    with pytest.raises(ValueError, match="not confirmed"):
+        store.mark_dispatched(request["roundId"], {**request, "status": "accepted"})
+    for phase, predecessor in (("paste-intent", "prepared"), ("submit-intent", "paste-intent"), ("submitted", "submit-intent"), ("confirmed", "submitted")):
+        store.record_round_prompt_delivery_phase(request["roundId"], request, capability, binding, "b" * 64, phase, now=NOW, expected_phase=predecessor)
+    store.mark_dispatched(request["roundId"], {**request, "status": "accepted"})
+    assert store.get_round(request["roundId"])[4] == "dispatched"
+
+
 @pytest.mark.parametrize(
     ("found", "extra"),
     [(True, False), (False, True)],
@@ -2437,6 +2476,51 @@ def test_initial_dispatch_crash_after_paste_intent_is_scan_only(tmp_path: Path):
     with pytest.raises(ValueError, match="already attempted"):
         restarted.recover_round(request["roundId"], owner_id="recoverer-b")
     assert dispatcher.calls == 1
+
+
+def test_operational_failure_cannot_claim_round_during_prompt_settle(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = _started_round(store, "round-operational-failure-paste-intent")
+    store.connection.execute("UPDATE rounds SET dispatch_state='pending', started_at=NULL WHERE round_id=?", (request["roundId"],))
+    capability = "capability:round-operational-failure-paste-intent-1234567890abcdef"
+    store.connection.execute("UPDATE rounds SET capability_hash=?, capability_token=? WHERE round_id=?", (hashlib.sha256(capability.encode()).hexdigest(), capability, request["roundId"]))
+    paste_intent = threading.Event()
+    release = threading.Event()
+
+    class SettlingDispatcher:
+        def binding_provenance(self, _lead):
+            return {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+        def scan_rollout(self, _lead, _prompt):
+            return {"found": False, **self.binding_provenance(_lead)}
+
+        def __call__(self, _lead, _prompt, idempotency_key=None, phase_callback=None):
+            phase_callback("paste-intent")
+            paste_intent.set()
+            assert release.wait(2)
+            phase_callback("submit-intent")
+            phase_callback("submitted")
+            return "dispatch:settled"
+
+    dispatcher = SettlingDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    errors = []
+
+    def dispatch():
+        try:
+            bridge.request_round(request, callback_capability=capability)
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=dispatch)
+    thread.start()
+    assert paste_intent.wait(2)
+    with pytest.raises(ValueError, match="prompt delivery is unresolved"):
+        bridge.report_operational_failure(request["roundId"], "provider-timeout")
+    release.set()
+    thread.join()
+    assert errors == []
+    assert bridge.store.get_round(request["roundId"])[4] == "dispatched"
 
 
 def test_recovery_claim_excludes_a_second_recoverer(tmp_path: Path):

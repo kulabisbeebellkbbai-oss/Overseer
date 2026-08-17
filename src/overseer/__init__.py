@@ -115,6 +115,7 @@ from .codex_quarantine_recovery import (
     AppServerCapabilityProbe,
     ApprovalEvidence,
     CodexAppServerTransport,
+    PsychloBridgeRoundAuthority,
     ProcessIdentity,
     QuarantineLedger,
     QuarantinePhase,
@@ -123,6 +124,7 @@ from .codex_quarantine_recovery import (
     RoundQuarantineBinding,
     ThreadSnapshot,
     TmuxProcessController,
+    SQLiteStoreApprovalAuthority,
 )
 from .core import (
     ApprovalLevel,
@@ -369,6 +371,7 @@ __all__ = [
     "AppServerCapabilityProbe",
     "ApprovalEvidence",
     "CodexAppServerTransport",
+    "PsychloBridgeRoundAuthority",
     "ProcessIdentity",
     "QuarantineLedger",
     "QuarantinePhase",
@@ -377,6 +380,7 @@ __all__ = [
     "RoundQuarantineBinding",
     "ThreadSnapshot",
     "TmuxProcessController",
+    "SQLiteStoreApprovalAuthority",
     "CodexDriver",
     "codex_adapter_factory",
     "legacy_codex_session_resource",

@@ -9,6 +9,16 @@ import base64
 from pathlib import Path
 
 from .psychlo_bridge import MAX_BODY_BYTES, _read_private_file, create_bridge_from_environment
+from .codex_quarantine_recovery import (
+    ApprovalEvidence,
+    CodexAppServerTransport,
+    PsychloBridgeRoundAuthority,
+    QuarantineLedger,
+    QuarantineRecovery,
+    RoundQuarantineBinding,
+    SQLiteStoreApprovalAuthority,
+    TmuxProcessController,
+)
 from .psychlo_legacy_binding import (
     finalize_legacy_round_attestation,
     prepare_legacy_round_attestation,
@@ -46,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     recover_round = subparsers.add_parser("recover-round", help="recover one exact started Psychlo round")
     recover_round.add_argument("--round-id", required=True)
     recover_round.add_argument("--owner-id", default=None)
+    quarantine = subparsers.add_parser("quarantine-round-recovery", help="stage and execute one exact approved submitted-round recovery")
+    quarantine.add_argument("--round-id", required=True)
+    quarantine.add_argument("--operation-id", required=True)
+    quarantine.add_argument("--approval-id", required=True)
+    quarantine.add_argument("--ledger", required=True)
+    quarantine.add_argument("--tmux", default="/usr/bin/tmux")
     failure = subparsers.add_parser("report-operational-failure", help="report one exact uncertain Psychlo round failure")
     failure.add_argument("--round-id", required=True)
     failure.add_argument("--failure-code", required=True, choices=("provider-unavailable", "provider-timeout", "provider-rate-limited", "execution-failed", "transport-failed", "resource-unavailable", "cancelled-by-lead"))
@@ -109,6 +125,28 @@ def main(argv: list[str] | None = None) -> int:
         result = bridge.recover_round(args.round_id, owner_id=args.owner_id)
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.command == "quarantine-round-recovery":
+        bridge = create_bridge_from_environment()
+        authority = PsychloBridgeRoundAuthority(bridge.store, prompt_loader=bridge._round_prompt)
+        approvals = SQLiteStoreApprovalAuthority(bridge.approval_store)
+        target = authority.load_recovery_target(args.round_id)
+        raw_binding = target.get("binding")
+        if not isinstance(raw_binding, dict):
+            raise ValueError("authoritative round binding is incomplete; recovery remains quarantined")
+        binding = RoundQuarantineBinding(**{_camel_to_snake(key): value for key, value in raw_binding.items()})
+        plan = approvals.load_approved_plan(args.approval_id)
+        approval = ApprovalEvidence(args.approval_id, str(plan["planDigest"]), "approved")
+        ledger = QuarantineLedger(args.ledger)
+        try:
+            try:
+                ledger.get(args.operation_id)
+            except Exception:
+                ledger.stage(operation_id=args.operation_id, binding=binding, prompt=str(target["prompt"]), approval=approval, round_authority=authority, approval_authority=approvals)
+            result = QuarantineRecovery(ledger, TmuxProcessController(args.tmux), CodexAppServerTransport(), round_authority=authority, approval_authority=approvals).execute(args.operation_id, approval=approval)
+        finally:
+            ledger.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "report-operational-failure":
         bridge = create_bridge_from_environment()
         result = bridge.report_operational_failure(args.round_id, args.failure_code, owner_id=args.owner_id)
@@ -144,6 +182,13 @@ def _closed_json(path: Path, keys: set[str] | None) -> object:
     if keys is not None and (not isinstance(value, dict) or set(value) != keys or any(not isinstance(value[key], str) for key in keys)):
         raise ValueError("usage authority configuration is invalid")
     return value
+
+
+def _camel_to_snake(value: str) -> str:
+    output: list[str] = []
+    for char in value:
+        output.append("_" + char.lower() if char.isupper() else char)
+    return "".join(output)
 
 
 def _usage_delivery_output(result: object, ledger: UsageAttributionLedger) -> tuple[dict[str, object], int]:

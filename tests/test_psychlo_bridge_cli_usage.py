@@ -114,6 +114,18 @@ def test_cli_exposes_only_one_exact_round_recovery_command():
     assert args.owner_id == "recoverer-a"
 
 
+def test_cli_exposes_approval_bound_quarantine_round_recovery_command():
+    args = build_parser().parse_args([
+        "quarantine-round-recovery",
+        "--round-id", "round:arcade:test",
+        "--operation-id", "quarantine-op-1",
+        "--approval-id", "admin-plan-1",
+        "--ledger", "/private/quarantine.sqlite3",
+    ])
+    assert args.command == "quarantine-round-recovery"
+    assert args.approval_id == "admin-plan-1"
+
+
 def test_cli_exposes_only_one_exact_operational_failure_command():
     args = build_parser().parse_args(["report-operational-failure", "--round-id", "round-uncertain", "--failure-code", "transport-failed"])
     assert args.command == "report-operational-failure"

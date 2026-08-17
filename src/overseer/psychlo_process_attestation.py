@@ -49,6 +49,7 @@ CANONICAL_SOURCE_ROOT = Path("/home/god/.local/share/overseer/project")
 CANONICAL_SOURCE_REAL_ROOT = Path("/home/god/Documents/Codex Workspace/Overseer")
 CANONICAL_CODEX_RELEASES = Path("/home/god/.codex/packages/standalone/releases")
 CANONICAL_CODEX_MEMORY_SESSION = "/home/god/.local/bin/codex-memory-session"
+CANONICAL_CODEX_MEMORY_SESSION_SCRIPT = Path("/home/god/.codex/skills/private-ai-memory/scripts/codex-session-with-memory.sh")
 
 
 class ProcessAttestationError(ValueError):
@@ -170,6 +171,20 @@ def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int]
         raise ProcessAttestationError(f"{label} database disappeared") from error
     if (metadata.st_dev, metadata.st_ino) != expected or metadata.st_nlink != 1 or not stat.S_ISREG(metadata.st_mode):
         raise ProcessAttestationError(f"{label} database identity changed")
+    matches: list[tuple[int, int, int]] = []
+    try:
+        for entry in os.scandir("/proc/self/fd"):
+            try:
+                fd = int(entry.name)
+                fd_meta = os.fstat(fd)
+            except (ValueError, OSError):
+                continue
+            if (fd_meta.st_dev, fd_meta.st_ino, fd_meta.st_nlink) == (expected[0], expected[1], 1):
+                matches.append((fd_meta.st_dev, fd_meta.st_ino, fd_meta.st_nlink))
+    except OSError as error:
+        raise ProcessAttestationError(f"{label} backing handle cannot be inspected") from error
+    if len(matches) != 1:
+        raise ProcessAttestationError(f"{label} SQLite handle is not bound to the canonical inode")
     return metadata.st_dev, metadata.st_ino, metadata.st_nlink
 
 
@@ -286,6 +301,19 @@ def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -
         raise ProcessAttestationError("canonical launcher cannot be read safely") from error
     if CANONICAL_CODEX_MEMORY_SESSION.encode() not in launcher_bytes:
         raise ProcessAttestationError("canonical launcher does not bind the memory-session chain")
+    memory_session = Path(CANONICAL_CODEX_MEMORY_SESSION)
+    if not memory_session.is_symlink():
+        raise ProcessAttestationError("memory-session wrapper is not the canonical link")
+    try:
+        if memory_session.resolve(strict=True) != CANONICAL_CODEX_MEMORY_SESSION_SCRIPT:
+            raise ProcessAttestationError("memory-session wrapper target is not reviewed")
+        wrapper_meta = CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.lstat()
+        if (not stat.S_ISREG(wrapper_meta.st_mode) or wrapper_meta.st_uid != os.getuid()
+                or wrapper_meta.st_nlink != 1 or stat.S_IMODE(wrapper_meta.st_mode) & 0o022):
+            raise ProcessAttestationError("memory-session wrapper ownership or mode is unsafe")
+        _trusted_executable_snapshot(CANONICAL_CODEX_MEMORY_SESSION_SCRIPT)
+    except OSError as error:
+        raise ProcessAttestationError("memory-session wrapper cannot be verified") from error
 
 
 @dataclass(frozen=True)
@@ -368,8 +396,15 @@ class AuthoritativeProcessEvidenceCollector:
             except OSError as error:
                 raise ProcessAttestationError("held process identity became invalid") from error
 
+    def revalidate_exact(self, round_id: str, plan_id: str, expected: Mapping[str, Any]) -> None:
+        """Re-read every mutable source immediately before primary commit."""
+        latest = self.collect(round_id, plan_id)
+        if manifest_digest(_manifest(latest, round_id)) != manifest_digest(expected) or _manifest(latest, round_id) != dict(expected):
+            raise ProcessAttestationError("process, rollout, registry, or source evidence changed before commit")
+        self.revalidate_held_identities()
+
     def __post_init__(self) -> None:
-        if not hasattr(self.bridge, "store") or not isinstance(self.tmux_socket, str) or not self.tmux_socket.startswith("/") or not isinstance(self.tmux_target, str) or not self.tmux_target.strip():
+        if not hasattr(self.bridge, "store") or not isinstance(self.tmux_socket, str) or not self.tmux_socket.startswith("/") or not isinstance(self.tmux_target, str):
             raise ProcessAttestationError("authoritative bridge and process endpoints are required")
         dispatcher = getattr(self.bridge, "dispatcher", None)
         if not callable(getattr(dispatcher, "scan_rollout", None)) or not callable(getattr(dispatcher, "binding_provenance", None)):
@@ -596,7 +631,7 @@ def capture_source_identity(source_root: str | Path) -> dict[str, str]:
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise ProcessAttestationError("source root is not a trusted directory")
     metadata = root.stat(follow_symlinks=False)
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+    if not _private_workspace_mode(metadata):
         raise ProcessAttestationError("source root is not private")
     executable = Path(_GIT)
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "LANG": "C", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_NOGLOBAL": "1", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
@@ -1119,7 +1154,11 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
             if tuple(row[1:4]) != (round_id, plan_id, digest) or row[6] != encoded or row[5] not in {"prepared", "completed"}:
                 raise ProcessAttestationError("prepared process attestation identity changed")
             plan_digest = admin_plan_digest(plan)
-            runtime.collector.revalidate_held_identities()
+            revalidate = getattr(runtime.collector, "revalidate_exact", None)
+            if callable(revalidate):
+                revalidate(round_id, plan_id, manifest)
+            else:
+                runtime.collector.revalidate_held_identities()
             _revalidate_runtime_databases(runtime)
             result = runtime.primary.complete_process_binding_attestation(round_id=round_id, plan_id=plan_id, manifest_digest=digest, plan_digest=plan_digest, completed_at=runtime.bridge.clock())
             primary_connection.commit()

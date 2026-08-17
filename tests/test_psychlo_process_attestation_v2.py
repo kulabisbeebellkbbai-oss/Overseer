@@ -50,8 +50,12 @@ def _runtime(tmp_path, monkeypatch):
     value["bridge"]["bindingDigest"] = __import__("hashlib").sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
 
     class Collector:
+        revalidate_calls = 0
         def collect(self, _round_id, _plan_id):
             return json.loads(json.dumps(value))
+        def revalidate_exact(self, _round_id, _plan_id, _expected):
+            self.revalidate_calls += 1
+            self.revalidate_held_identities()
         def revalidate_held_identities(self):
             return None
         def release_held_identities(self):
@@ -78,6 +82,7 @@ def test_primary_only_stage_approval_and_completed_lookup(tmp_path, monkeypatch)
     result = attest_process_binding(round_id="round", plan_id="plan")
     assert result["accepted"] is True
     assert runtime.primary.process_binding_attestation("round")["planId"] == "plan"
+    assert runtime.collector.revalidate_calls == 1
     assert runtime.bridge.store.connection.total_changes == bridge_changes
     assert runtime.bridge.store.connection.execute("SELECT name FROM sqlite_master WHERE name='round_process_binding_attestations'").fetchone() is None
     runtime.bridge.store.close(); runtime.primary.close()
@@ -115,6 +120,31 @@ def test_runtime_hardlink_database_is_rejected(tmp_path):
         assert "unique" in str(error)
     else:
         raise AssertionError("hard-linked authority database was accepted")
+
+
+def test_sqlite_binding_rejects_decoy_connection_after_canonical_path_restore(tmp_path):
+    import overseer.psychlo_process_attestation as module
+
+    canonical = tmp_path / "canonical.sqlite3"
+    decoy = tmp_path / "decoy.sqlite3"
+    original = SQLiteStore(canonical)
+    original.close()
+    decoy_store_init = SQLiteStore(decoy)
+    decoy_store_init.close()
+    expected = canonical.stat()
+    os.replace(canonical, tmp_path / "original.sqlite3")
+    os.replace(decoy, canonical)
+    decoy_store = SQLiteStore(canonical)
+    os.unlink(canonical)
+    os.replace(tmp_path / "original.sqlite3", canonical)
+    try:
+        with pytest.raises(module.ProcessAttestationError, match="backing|canonical inode"):
+            module._bind_sqlite_database(decoy_store._connection, canonical, (expected.st_dev, expected.st_ino), "primary")
+    finally:
+        try:
+            decoy_store.close()
+        except ValueError:
+            decoy_store._connection.close()
 
 
 def test_process_cli_rejects_endpoint_arguments():

@@ -11,7 +11,7 @@ from typing import Callable
 
 import pytest
 
-from overseer.agent_adapters.codex import CodexDriver
+from overseer.agent_adapters.codex import CODEX_PASTE_SETTLE_SECONDS, CodexDriver
 from overseer.agent_adapters.claude import ClaudeDriver
 from overseer.agent_adapters.antigravity import antigravity_adapter_factory
 from overseer.agent_adapters.mistral_vibe import mistral_vibe_adapter_factory
@@ -483,6 +483,76 @@ def test_dispatch_preserves_request_bindings_and_exact_tmux_sequence(
         ("/tmp/tmux", "capture-pane", "-p", "-t", "example", "-S", "-200"),
     ]
     assert runner.inputs[3] == request.prompt
+
+
+def test_dispatch_waits_for_paste_settle_before_one_submit(
+    codex_csv: Path,
+) -> None:
+    sleeps: list[float] = []
+    runner = RecordingRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+        sleep=sleeps.append,
+    )
+
+    result = adapter.dispatch(
+        AgentDispatchRequest(
+            id="dispatch.paste-settle",
+            instance_id="overseer.default",
+            session_id=adapter.discover()[0].id,
+            driver_epoch_id="epoch.paste-settle",
+            idempotency_key="dispatch-key.paste-settle",
+            prompt="Continue after the paste settles.",
+        )
+    )
+
+    assert result.state is AgentOperationState.ACKNOWLEDGED
+    assert sleeps == [CODEX_PASTE_SETTLE_SECONDS]
+    paste_index = next(index for index, command in enumerate(runner.commands) if command[1] == "paste-buffer")
+    enter_index = next(index for index, command in enumerate(runner.commands) if command[1] == "send-keys")
+    assert enter_index == paste_index + 1
+    assert sum(command[1] == "paste-buffer" for command in runner.commands) == 1
+    assert sum(command[1] == "send-keys" and command[-1] == "Enter" for command in runner.commands) == 1
+
+
+def test_dispatch_fails_closed_if_paste_settle_wait_fails(
+    codex_csv: Path,
+) -> None:
+    def fail_sleep(_delay: float) -> None:
+        raise RuntimeError("test settle failure")
+
+    runner = RecordingRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+        sleep=fail_sleep,
+    )
+
+    result = adapter.dispatch(
+        AgentDispatchRequest(
+            id="dispatch.paste-settle-failed",
+            instance_id="overseer.default",
+            session_id=adapter.discover()[0].id,
+            driver_epoch_id="epoch.paste-settle-failed",
+            idempotency_key="dispatch-key.paste-settle-failed",
+            prompt="Do not submit before settling.",
+        )
+    )
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_category is AgentErrorCategory.PROVIDER_PROTOCOL_ERROR
+    assert result.error_message == "tmux prompt settle wait failed"
+    assert sum(command[1] == "paste-buffer" for command in runner.commands) == 1
+    assert not any(command[1] == "send-keys" for command in runner.commands)
 
 
 def test_prepare_legacy_dispatch_is_stable_and_has_no_external_effect(codex_csv: Path) -> None:

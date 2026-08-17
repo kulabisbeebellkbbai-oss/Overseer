@@ -13,7 +13,7 @@ import re
 import sqlite3
 import subprocess
 import time
-from typing import Protocol
+from typing import Callable, Protocol
 
 from ..agent_contracts import (
     AgentCapabilities,
@@ -56,6 +56,12 @@ _CODEX_CAPABILITIES = AgentCapabilities(
 
 CODEX_COMMAND_TIMEOUT_SECONDS = 30
 CODEX_OUTPUT_LIMIT_BYTES = 65_536
+# Codex's interactive prompt keeps pasted text in its bracketed paste
+# aggregation window for a short period. Sending Enter immediately after
+# paste-buffer can leave the text queued instead of submitting it. Keep this
+# interval explicit and bounded so dispatch has one deterministic submit
+# attempt and tests can inject a non-blocking sleeper.
+CODEX_PASTE_SETTLE_SECONDS = 3.0
 
 
 class BoundedCommandRunner(Protocol):
@@ -246,6 +252,7 @@ class CodexDriver:
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: BoundedCommandRunner | None = None,
         delivery_evidence_factory=None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
             raise ValueError("CodexDriver requires the codex provider and adapter")
@@ -285,6 +292,9 @@ class CodexDriver:
         self._legacy_resume_details: dict[str, LegacyResumeDetails] = {}
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
         self.delivery_evidence_factory = delivery_evidence_factory or (lambda session: RolloutPromptDeliveryEvidence(session))
+        if not callable(sleep):
+            raise TypeError("Codex sleep hook must be callable")
+        self._sleep = sleep
 
     @classmethod
     def from_legacy_registry(
@@ -299,6 +309,7 @@ class CodexDriver:
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: CliCommandRunner | SubprocessRunner | None = None,
         delivery_evidence_factory=None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> CodexDriver:
         selected_provider = provider or AgentProvider(
             id="codex",
@@ -323,6 +334,7 @@ class CodexDriver:
             codex_memory_session_path=codex_memory_session_path,
             runner=runner,
             delivery_evidence_factory=delivery_evidence_factory,
+            sleep=sleep,
         )
 
     def discover(self, workspace: str | None = None) -> tuple[AgentSession, ...]:
@@ -878,6 +890,23 @@ class CodexDriver:
                 enter_exit_code=paste_result.returncode,
                 stdout=paste_result.stdout,
                 stderr=paste_result.stderr,
+            )
+        # Codex aggregates bracketed paste input for a short window. Wait for
+        # that window to close before the one and only submit key; retrying
+        # Enter or pasting again could duplicate an already accepted prompt.
+        try:
+            self._sleep(CODEX_PASTE_SETTLE_SECONDS)
+        except Exception as error:
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="failed",
+                reason="tmux prompt settle wait failed",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                prompt_exit_code=prompt_result.returncode,
+                stdout=paste_result.stdout,
+                stderr=str(error),
             )
         enter_result = self._run(
             [

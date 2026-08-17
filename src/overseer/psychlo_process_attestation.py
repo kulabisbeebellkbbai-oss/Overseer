@@ -1071,6 +1071,10 @@ def _validate_plan_lifecycle(plan: AdminChangePlan, *, approved_required: bool |
             raise ProcessAttestationError(f"plan {field_name} flag is not a boolean")
     if plan.canceled is not False or plan.archived is not False:
         raise ProcessAttestationError("process observation plan lifecycle is not active")
+    if any(getattr(plan, field_name, None) is not None for field_name in ("canceled_by", "canceled_at", "cancellation_reason")):
+        raise ProcessAttestationError("uncanceled process plan has cancellation metadata")
+    if any(getattr(plan, field_name, None) is not None for field_name in ("archived_by", "archived_at", "archive_record_id")):
+        raise ProcessAttestationError("unarchived process plan has archive metadata")
     if approved_required is None:
         approved_required = plan.approved
     if approved_required is True:

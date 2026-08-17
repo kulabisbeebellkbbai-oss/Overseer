@@ -712,3 +712,21 @@ def test_stage_accepts_exact_existing_unapproved_plan_idempotently(tmp_path, mon
         "SELECT state FROM psychlo_process_observations WHERE round_id='round'"
     ).fetchone()[0] == "prepared"
     runtime.bridge.store.close(); runtime.primary.close()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("canceled_by", "operator"), ("canceled_at", "2099-01-01T00:00:00+00:00"),
+     ("cancellation_reason", "orphan"), ("archived_by", "operator"),
+     ("archived_at", "2099-01-01T00:00:00+00:00"), ("archive_record_id", "orphan")],
+)
+def test_stage_rejects_orphan_lifecycle_metadata_before_insert(tmp_path, monkeypatch, field, value):
+    runtime, manifest_value = _runtime(tmp_path, monkeypatch)
+    plan = _store_existing_unapproved_plan(runtime, manifest_value)
+    runtime.primary.save_admin_change_plan(replace(plan, **{field: value}))
+    with pytest.raises(Exception, match="metadata|lifecycle"):
+        stage_process_observation(round_id="round", plan_id="plan")
+    assert runtime.primary._connection.execute(
+        "SELECT 1 FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone() is None
+    runtime.bridge.store.close(); runtime.primary.close()

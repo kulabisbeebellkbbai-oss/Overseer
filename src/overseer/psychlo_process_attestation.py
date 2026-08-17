@@ -8,7 +8,7 @@ snapshot in ``round_process_binding_attestations`` only.
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 import os
@@ -64,8 +64,34 @@ class AuthoritativeProcessEvidenceCollector:
     tmux_socket: str
     tmux_target: str
     source_root: str | Path
+    _held_pidfds: list[int] = field(default_factory=list, init=False, repr=False, compare=False)
 
     trusted = True
+
+    def release_held_identities(self) -> None:
+        while self._held_pidfds:
+            try:
+                os.close(self._held_pidfds.pop())
+            except OSError:
+                pass
+
+    def _hold_identities(self, tmux: Mapping[str, Any], child: Mapping[str, Any]) -> None:
+        self.release_held_identities()
+        for identity in (tmux["serverProcess"], tmux["paneProcess"], child):
+            try:
+                self._held_pidfds.append(os.pidfd_open(int(identity["pid"])))
+            except (AttributeError, OSError) as error:
+                self.release_held_identities()
+                raise ProcessAttestationError("process identity cannot be held through attestation") from error
+
+    def revalidate_held_identities(self) -> None:
+        if len(self._held_pidfds) != 3:
+            raise ProcessAttestationError("held process identities are incomplete")
+        for fd in self._held_pidfds:
+            try:
+                os.fstat(fd)
+            except OSError as error:
+                raise ProcessAttestationError("held process identity became invalid") from error
 
     def __post_init__(self) -> None:
         if not hasattr(self.bridge, "store") or not isinstance(self.tmux_socket, str) or not self.tmux_socket.startswith("/") or not isinstance(self.tmux_target, str) or not self.tmux_target.strip():
@@ -108,32 +134,46 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("round lead identity is missing")
         registry, registry_meta = read_private_json(self.registry_path)
         row = registry.get(lead_id)
-        if not isinstance(row, Mapping) or set(row) != {"conversationId", "workspace", "command"} or any(not isinstance(row[key], str) or not row[key].strip() for key in row):
-            raise ProcessAttestationError("exact registry row identity is invalid")
-        if binding.get("conversationId") != row["conversationId"]:
+        if not isinstance(row, Mapping) or set(row) != {"conversationId"} or not isinstance(row.get("conversationId"), str) or not row["conversationId"].strip():
+            raise ProcessAttestationError("exact protected binding row identity is invalid")
+        canonical = getattr(self.bridge.dispatcher, "process_binding_provenance", None)
+        if not callable(canonical):
+            raise ProcessAttestationError("canonical project registry process identity is required")
+        try:
+            process_binding = canonical(lead_id)
+        except Exception as error:
+            raise ProcessAttestationError("canonical project registry process identity is unavailable") from error
+        required_process = {"conversationId", "sessionId", "workspace", "command", "launcher", "registryPath"}
+        if not isinstance(process_binding, Mapping) or set(process_binding) != required_process or any(not isinstance(process_binding[key], str) or not process_binding[key].strip() for key in required_process):
+            raise ProcessAttestationError("canonical project registry process identity is invalid")
+        if binding.get("conversationId") != row["conversationId"] or process_binding["conversationId"] != row["conversationId"] or process_binding["sessionId"] != binding.get("sessionId"):
             raise ProcessAttestationError("registry and round binding conversation identity differ")
-        tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_command=row["command"])
+        if process_binding["workspace"] != request.get("projectId"):
+            raise ProcessAttestationError("canonical workspace is not bound to the round project")
+        tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_command=process_binding["command"])
         pane_pid = int(tmux["paneProcess"]["pid"])
-        child = capture_direct_codex_child(pane_pid, expected_conversation_id=row["conversationId"])
+        child = capture_direct_codex_child(pane_pid, expected_conversation_id=process_binding["conversationId"])
+        self._hold_identities(tmux, child)
         if child.get("parentPid") != pane_pid:
             raise ProcessAttestationError("Codex child is not bound to the pane process")
         prompt = self.bridge._round_prompt(request, capability)
         scanner = self.bridge.dispatcher.scan_rollout
-        scan_before = scanner(lead_id, prompt)
-        scan = _require_negative_rollout(scan_before, binding)
+        if scanner(lead_id, prompt) is not False:
+            raise ProcessAttestationError("rollout scan is not an authoritative strict negative result")
+        scan = _require_negative_rollout(self.bridge.dispatcher.binding_provenance(lead_id), binding)
         source = capture_source_identity(self.source_root)
         # Re-read the mutable sources before returning the manifest.  The
         # attestation caller performs one more full collect immediately before
         # the CAS insert, so this is not a caller-authored snapshot.
-        if _require_negative_rollout(scanner(lead_id, prompt), binding) != scan:
+        if scanner(lead_id, prompt) is not False or _require_negative_rollout(self.bridge.dispatcher.binding_provenance(lead_id), binding) != scan:
             raise ProcessAttestationError("rollout evidence changed during collection")
-        if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_command=row["command"]) != tmux:
+        if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_command=process_binding["command"]) != tmux:
             raise ProcessAttestationError("tmux identity changed during collection")
         return {
             "schemaVersion": SCHEMA, "attestationId": f"attestation-{round_id}", "roundId": round_id,
             "requestDigest": request_digest,
             "startedAt": (self.bridge.store.round_timing(round_id) or {}).get("startedAt"),
-            "registry": {"pathDigest": registry_meta["digest"], "rowDigest": canonical_digest(dict(row)), "conversationId": row["conversationId"], "workspaceDigest": sha256(row["workspace"].encode()).hexdigest(), "commandDigest": sha256(row["command"].encode()).hexdigest()},
+            "registry": {"pathDigest": registry_meta["digest"], "rowDigest": canonical_digest(dict(process_binding)), "conversationId": process_binding["conversationId"], "sessionId": process_binding["sessionId"], "workspaceDigest": sha256(process_binding["workspace"].encode()).hexdigest(), "commandDigest": sha256(process_binding["command"].encode()).hexdigest(), "launcherDigest": sha256(process_binding["launcher"].encode()).hexdigest(), "canonicalPathDigest": capture_private_file_digest(process_binding["registryPath"])},
             "tmux": tmux, "process": {"pane": tmux["paneProcess"], "codexChild": child},
             "rollout": scan, "bridge": bridge_state,
             "approval": {"planId": plan_id, "planDigest": ""}, "source": source,
@@ -215,6 +255,21 @@ def read_private_json(path: str | Path, *, expected_digest: str | None = None) -
         os.close(fd)
 
 
+def capture_private_file_digest(path: str | Path) -> str:
+    """Read and digest an owner-only canonical registry without following links."""
+    fd, before, _ = _open_private(Path(path))
+    try:
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 65536):
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if before != after:
+            raise ProcessAttestationError("canonical registry changed during read")
+        return sha256(b"".join(chunks)).hexdigest()
+    finally:
+        os.close(fd)
+
+
 def _atomic_private_write(path: Path, content: bytes) -> None:
     """Create/replace a private manifest without following a temp symlink."""
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
@@ -264,13 +319,28 @@ def capture_source_identity(source_root: str | Path) -> dict[str, str]:
     if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
         raise ProcessAttestationError("source root is not private")
     executable = Path(_GIT)
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "LANG": "C", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_NOGLOBAL": "1", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+    status = subprocess.run((_GIT, "-C", str(root), "status", "--porcelain", "--untracked-files=all", "--", "src", "pyproject.toml"), check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+    if status.returncode != 0 or status.stdout.strip():
+        raise ProcessAttestationError("source runtime tree is dirty")
+    module = Path(__file__).resolve()
+    try:
+        module.relative_to(root.resolve())
+    except ValueError as error:
+        raise ProcessAttestationError("loaded attestation module is outside the source root") from error
+    module_meta = module.stat(follow_symlinks=False)
+    if module_meta.st_uid != os.getuid() or stat.S_IMODE(module_meta.st_mode) & 0o022:
+        raise ProcessAttestationError("loaded attestation module is not trusted")
+    try:
+        module_bytes = module.read_bytes()
+    except OSError as error:
+        raise ProcessAttestationError("loaded attestation module cannot be read") from error
     try:
         git_meta = executable.stat(follow_symlinks=False)
         if not stat.S_ISREG(git_meta.st_mode) or git_meta.st_uid != 0 or stat.S_IMODE(git_meta.st_mode) & 0o022:
             raise OSError("unsafe git executable")
     except OSError as error:
         raise ProcessAttestationError("git executable is not trusted") from error
-    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "LANG": "C", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_NOGLOBAL": "1", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
     try:
         commit = subprocess.run((_GIT, "-C", str(root), "rev-parse", "--verify", "HEAD"), check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
         tree = subprocess.run((_GIT, "-C", str(root), "rev-parse", "--verify", "HEAD^{tree}"), check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
@@ -280,7 +350,7 @@ def capture_source_identity(source_root: str | Path) -> dict[str, str]:
     tree_id = tree.stdout.strip()
     if commit.returncode != 0 or tree.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit_id) or not re.fullmatch(r"[0-9a-f]{40}", tree_id):
         raise ProcessAttestationError("source lineage is not a verified commit/tree")
-    return {"commit": commit_id, "treeDigest": tree_id}
+    return {"commit": commit_id, "treeDigest": tree_id, "moduleDigest": sha256(module_bytes).hexdigest()}
 
 
 def _validate_redacted(value: Any, *, path: str = "manifest") -> None:
@@ -317,9 +387,9 @@ def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
     if any(not isinstance(bridge.get(key), str) or not _HEX64.fullmatch(bridge[key]) for key in ("requestDigest", "capabilityHash", "bindingDigest", "promptDigest")):
         raise ProcessAttestationError("bridge digest evidence is invalid")
     registry = value.get("registry")
-    if not isinstance(registry, Mapping) or set(registry) != {"pathDigest", "rowDigest", "conversationId", "workspaceDigest", "commandDigest"} or any(not isinstance(registry[key], str) or not registry[key].strip() for key in registry):
+    if not isinstance(registry, Mapping) or set(registry) != {"pathDigest", "rowDigest", "conversationId", "sessionId", "workspaceDigest", "commandDigest", "launcherDigest", "canonicalPathDigest"} or any(not isinstance(registry[key], str) or not registry[key].strip() for key in registry):
         raise ProcessAttestationError("registry identity evidence is invalid")
-    if any(not _HEX64.fullmatch(str(registry[key])) for key in ("pathDigest", "rowDigest", "workspaceDigest", "commandDigest")):
+    if any(not _HEX64.fullmatch(str(registry[key])) for key in ("pathDigest", "rowDigest", "workspaceDigest", "commandDigest", "launcherDigest", "canonicalPathDigest")):
         raise ProcessAttestationError("registry digest evidence is invalid")
     tmux = value.get("tmux")
     if not isinstance(tmux, Mapping) or set(tmux) != {"socket", "sessionId", "windowId", "paneId", "paneCommandDigest", "serverProcess", "paneProcess", "serverEvidence"} or tmux.get("serverEvidence") != "list-sessions-and-list-panes-explicit-socket":
@@ -336,9 +406,9 @@ def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
         if any(not isinstance(identity[key], int) or isinstance(identity[key], bool) or identity[key] <= 0 for key in ("pid", "startTicks")) or any(not isinstance(identity[key], str) or not _HEX64.fullmatch(identity[key]) for key in ("exeDigest", "argvDigest", "cgroupDigest")) or identity["pidfdSupported"] is not True:
             raise ProcessAttestationError("tmux process identity evidence is invalid")
     source = value.get("source")
-    if not isinstance(source, Mapping) or set(source) != {"commit", "treeDigest"}:
+    if not isinstance(source, Mapping) or set(source) != {"commit", "treeDigest", "moduleDigest"}:
         raise ProcessAttestationError("source lineage evidence is invalid")
-    if any(not isinstance(source[key], str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", source[key]) for key in source):
+    if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(source["commit"])) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(source["treeDigest"])) or not _HEX64.fullmatch(str(source["moduleDigest"])):
         raise ProcessAttestationError("source lineage evidence is invalid")
     process = value.get("process")
     if not isinstance(process, Mapping) or set(process) != {"pane", "codexChild"} or not isinstance(process["pane"], Mapping) or not isinstance(process["codexChild"], Mapping):
@@ -367,8 +437,8 @@ def stage_process_attestation(*, round_id: str, plan_id: str, manifest_path: str
         raise ProcessAttestationError("attestation path is a symlink")
     if evidence is not None or collector is not None:
         raise ProcessAttestationError("operator evidence collectors are not supported")
-    if not isinstance(authority, AuthoritativeProcessEvidenceCollector):
-        raise ProcessAttestationError("AuthoritativeProcessEvidenceCollector is required")
+    if not isinstance(authority, AuthoritativeProcessEvidenceCollector) or primary_store is None:
+        raise ProcessAttestationError("AuthoritativeProcessEvidenceCollector and authority store are required")
     try:
         data = authority.collect(round_id, plan_id)
     except Exception as error:
@@ -382,6 +452,15 @@ def stage_process_attestation(*, round_id: str, plan_id: str, manifest_path: str
     if value["approval"]["planId"] != plan_id:
         raise ProcessAttestationError("manifest plan identity is not exact")
     digest = manifest_digest(value)
+    source = value["source"]
+    plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, digest, source["commit"], source["treeDigest"], source["moduleDigest"])
+    try:
+        existing_plan = primary_store.load_admin_change_plan(plan_id)
+    except KeyError:
+        primary_store.save_admin_change_plan(plan)
+    else:
+        if admin_plan_digest(existing_plan) != admin_plan_digest(plan) and not (existing_plan.approved and existing_plan.adapter_metadata == plan.adapter_metadata and existing_plan.target == round_id):
+            raise ProcessAttestationError("staged authority plan identity changed")
     if path.exists() or path.is_symlink():
         existing, _ = read_private_json(path)
         if manifest_digest(existing) != digest:
@@ -392,6 +471,7 @@ def stage_process_attestation(*, round_id: str, plan_id: str, manifest_path: str
             raise ProcessAttestationError("manifest directory is not private")
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
         _atomic_private_write(path, encoded)
+    authority.release_held_identities()
     return {"staged": True, "roundId": round_id, "planId": plan_id, "manifestDigest": digest, "manifestPath": str(path)}
 
 
@@ -402,10 +482,10 @@ def finalize_process_attestation(path: str | Path, approved_plan: AdminChangePla
         raise ProcessAttestationError("exact approved Sisko plan is required")
     value, _ = read_private_json(path)
     manifest = _manifest(value, str(value.get("roundId")))
-    if manifest["approval"]["planId"] != approved_plan.id:
+    if manifest["approval"]["planId"] != approved_plan.id or approved_plan.target != manifest["roundId"]:
         raise ProcessAttestationError("approved plan does not bind manifest")
     metadata = approved_plan.adapter_metadata.get("legacy_process_binding_attestation")
-    if not isinstance(metadata, Mapping) or metadata.get("manifestDigest") != manifest_digest(manifest) or metadata.get("roundId") != manifest["roundId"] or metadata.get("sourceCommit") != manifest.get("source", {}).get("commit") or metadata.get("sourceTreeDigest") != manifest.get("source", {}).get("treeDigest"):
+    if not isinstance(metadata, Mapping) or metadata.get("manifestDigest") != manifest_digest(manifest) or metadata.get("roundId") != manifest["roundId"] or metadata.get("sourceCommit") != manifest.get("source", {}).get("commit") or metadata.get("sourceTreeDigest") != manifest.get("source", {}).get("treeDigest") or metadata.get("sourceModuleDigest") != manifest.get("source", {}).get("moduleDigest"):
         raise ProcessAttestationError("approved plan manifest/source binding is not exact")
     digest = admin_plan_digest(approved_plan)
     current = manifest["approval"]["planDigest"]
@@ -478,7 +558,7 @@ def _read_proc_bytes(path: Path) -> bytes:
             os.close(parent_fd)
 
 
-def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | None = None, expected_conversation_id: str | None = None) -> dict[str, Any]:
+def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | None = None, expected_conversation_id: str | None = None, expected_exe_digest: str | None = None) -> dict[str, Any]:
     """Require exactly one direct child and persist only redacted identity."""
     parent_before = capture_process_identity(parent_pid)
     try:
@@ -494,6 +574,16 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
         raw = _read_proc_bytes(Path(f"/proc/{children[0]}/cmdline"))
         if expected_conversation_id.encode("utf-8") not in raw.split(b"\0"):
             raise ProcessAttestationError("direct child command is not bound to the expected conversation")
+    try:
+        executable = os.readlink(Path(f"/proc/{children[0]}/exe"))
+    except OSError as error:
+        raise ProcessAttestationError("direct child executable cannot be verified") from error
+    if Path(executable).name not in {"codex", "codex-cli"}:
+        raise ProcessAttestationError("direct child is not the trusted Codex executable")
+    if expected_exe_digest is not None and identity["exeDigest"] != expected_exe_digest:
+        raise ProcessAttestationError("direct child executable identity changed")
+    if identity["cgroupDigest"] != parent_before["cgroupDigest"]:
+        raise ProcessAttestationError("direct child is outside the pane cgroup")
     try:
         after = [int(item) for item in _read_proc_bytes(Path(f"/proc/{parent_pid}/task/{parent_pid}/children")).decode().split()]
     except (OSError, ValueError) as error:
@@ -569,6 +659,10 @@ def attest_process_binding(bridge: str | Path | PsychloBridgeStore, round_id: st
     authoritative_store = getattr(authority.bridge, "store", None)
     if not isinstance(authoritative_store, PsychloBridgeStore):
         raise ProcessAttestationError("authoritative collector is not bound to a Psychlo bridge store")
+    if getattr(authority.bridge, "approval_store", None) is not None and Path(primary_store.path).resolve() != Path(authority.bridge.approval_store.path).resolve():
+        raise ProcessAttestationError("approval store is not the authority-owned primary store")
+    if hasattr(bridge, "store") and isinstance(getattr(bridge, "store"), PsychloBridgeStore):
+        bridge = bridge.store
     requested_path = bridge.filename if isinstance(bridge, PsychloBridgeStore) else Path(bridge)
     if Path(requested_path).resolve() != Path(authoritative_store.filename).resolve():
         raise ProcessAttestationError("attestation store does not match the authority-owned bridge")
@@ -591,11 +685,33 @@ def attest_process_binding(bridge: str | Path | PsychloBridgeStore, round_id: st
         raise ProcessAttestationError("process evidence changed before attestation")
     store = bridge if isinstance(bridge, PsychloBridgeStore) else PsychloBridgeStore(bridge)
     own_store = not isinstance(bridge, PsychloBridgeStore)
+    authority_connection = getattr(primary_store, "_connection", None)
+    if authority_connection is None:
+        raise ProcessAttestationError("primary authority transaction is unavailable")
     try:
+        authority_connection.execute("BEGIN IMMEDIATE")
+        latest_plan = primary_store.load_admin_change_plan(plan_id)
+        if admin_plan_digest(latest_plan) != finalized["planDigest"] or not latest_plan.approved or latest_plan.canceled or latest_plan.target != round_id:
+            raise ProcessAttestationError("approval authority changed during evidence collection")
+        fence = authority_connection.execute("SELECT manifest_digest,plan_digest FROM psychlo_process_attestation_fences WHERE plan_id=? AND round_id=?", (plan_id, round_id)).fetchone()
+        if fence is not None and (fence[0] != manifest_digest(manifest) or fence[1] != finalized["planDigest"]):
+            raise ProcessAttestationError("attestation authority fence identity changed")
+        if fence is None:
+            authority_connection.execute("INSERT INTO psychlo_process_attestation_fences(plan_id,round_id,manifest_digest,plan_digest,inserted_at) VALUES (?,?,?,?,?)", (plan_id, round_id, manifest_digest(manifest), finalized["planDigest"], now or store._now()))
+        authority.revalidate_held_identities()
         result = store.insert_process_binding_attestation(round_id, str(manifest["attestationId"]), manifest_digest(manifest), finalized["planDigest"], manifest, now=now or store._now())
+        authority.revalidate_held_identities()
+        if store.process_binding_attestation(round_id) is None:
+            raise ProcessAttestationError("attestation postcondition is missing")
+        authority_connection.execute("COMMIT")
     except Exception as error:
+        try:
+            authority_connection.execute("ROLLBACK")
+        except Exception:
+            pass
         raise ProcessAttestationError(str(error)) from error
     finally:
+        authority.release_held_identities()
         if own_store:
             store.close()
     return {"accepted": True, "roundId": round_id, "attestationId": result["attestationId"], "manifestDigest": result["manifestDigest"], "planDigest": result["planDigest"]}

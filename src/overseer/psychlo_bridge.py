@@ -2390,11 +2390,39 @@ class CodexProjectDispatcher:
     def scan_rollout(self, project_lead_id: str, prompt: str) -> bool:
         """Search the complete bound Codex rollout before any recovery paste."""
         driver, session = self._resolve(project_lead_id)
-        return driver.scan_rollout_prompt(session, prompt)
+        result = driver.scan_rollout_prompt(session, prompt)
+        if isinstance(result, bool):
+            return result
+        if not isinstance(result, Mapping) or not isinstance(result.get("found"), bool):
+            raise ValueError("project lead rollout scan lacks exact identity provenance")
+        return bool(result["found"])
 
     def binding_provenance(self, project_lead_id: str) -> dict[str, object]:
         driver, session = self._resolve(project_lead_id)
         return driver.rollout_provenance(session)
+
+    def process_binding_provenance(self, project_lead_id: str) -> dict[str, object]:
+        """Return canonical project-registry identity for process attestation.
+
+        The protected JSON binding intentionally contains only the conversation
+        identity.  Workspace, launcher, and command are derived from the
+        driver's canonical codex-projects registry, never from that JSON or a
+        caller-supplied attestation manifest.
+        """
+        driver, session = self._resolve(project_lead_id)
+        references = session.legacy_references
+        command = references.get("command")
+        launcher = references.get("launcher")
+        if not isinstance(session.workspace, str) or not session.workspace.strip() or not isinstance(command, str) or not command.strip() or not isinstance(launcher, str) or not launcher.strip():
+            raise ValueError("canonical project registry process identity is incomplete")
+        return {
+            "conversationId": session.external_session_id or "",
+            "sessionId": session.id,
+            "workspace": session.workspace,
+            "command": command,
+            "launcher": launcher,
+            "registryPath": str(driver.registry_path),
+        }
 
     def prepare(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:
         """Resolve the exact stable result identity without dispatching a prompt."""
@@ -2442,7 +2470,7 @@ class AuthoritativeAgentResultCollector:
         return value
 
 
-def create_bridge_from_environment(environment: Mapping[str, str] | None = None) -> PsychloBridge:
+def create_bridge_from_environment(environment: Mapping[str, str] | None = None, *, recover: bool = True) -> PsychloBridge:
     selected = environment or os.environ
     secret = _read_secret(Path(selected["OVERSEER_PSYCHLO_PEER_SECRET_FILE"]))
     store = PsychloBridgeStore(selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"])
@@ -2460,6 +2488,7 @@ def create_bridge_from_environment(environment: Mapping[str, str] | None = None)
         project_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "participant_result"),
         supervisor_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "supervisor_result"),
         require_external_binding=True,
+        recover=recover,
     )
 
 

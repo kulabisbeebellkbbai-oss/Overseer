@@ -514,6 +514,14 @@ class SQLiteStore:
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS psychlo_process_attestation_fences (
+                plan_id TEXT NOT NULL,
+                round_id TEXT NOT NULL,
+                manifest_digest TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                inserted_at TEXT NOT NULL,
+                PRIMARY KEY(plan_id, round_id)
+            );
             CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
                 approval_ref TEXT PRIMARY KEY,
                 source_kind TEXT NOT NULL,

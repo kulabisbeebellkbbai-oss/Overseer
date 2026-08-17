@@ -450,6 +450,7 @@ def plan_psychlo_legacy_process_binding_attestation(
     manifest_digest: str,
     source_commit: str,
     source_tree_digest: str,
+    source_module_digest: str | None = None,
     reason: str = "approve one immutable legacy process-binding attestation",
 ) -> AdminChangePlan:
     """Create exact Sisko/HUMAN authority for a process identity record."""
@@ -462,6 +463,8 @@ def plan_psychlo_legacy_process_binding_attestation(
         raise ValueError("legacy process attestation source commit is invalid")
     if len(source_tree_digest) not in {40, 64} or any(char not in "0123456789abcdef" for char in source_tree_digest.lower()):
         raise ValueError("legacy process attestation source tree digest is invalid")
+    if source_module_digest is not None and (len(source_module_digest) != 64 or any(char not in "0123456789abcdef" for char in source_module_digest.lower())):
+        raise ValueError("legacy process attestation module digest is invalid")
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION,
@@ -476,7 +479,7 @@ def plan_psychlo_legacy_process_binding_attestation(
         rollback_steps=(AdminCommandStep("Retain immutable process attestation", ("__overseer_psychlo_legacy_process_binding_attestation_retention__",), "attestation records have no rollback"),),
         risks=("binding the wrong process identity", "stale or reused PID", "conflicting tmux or rollout evidence"),
         verification_steps=(AdminCommandStep("Verify process identity evidence", ("__overseer_psychlo_legacy_process_binding_attestation_verify__",), "recheck every identity immediately before insert"),),
-        adapter_metadata={"legacy_process_binding_attestation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit, "sourceTreeDigest": source_tree_digest}},
+        adapter_metadata={"legacy_process_binding_attestation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit, "sourceTreeDigest": source_tree_digest, "sourceModuleDigest": source_module_digest or ""}},
     )
 
 

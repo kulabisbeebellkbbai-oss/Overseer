@@ -81,12 +81,12 @@ def _valid_evidence(round_id: str, plan_id: str) -> dict:
     return {
         "schemaVersion": SCHEMA, "attestationId": f"attestation-{round_id}", "roundId": round_id,
         "requestDigest": "1" * 64, "startedAt": "2099-01-01T00:00:00+00:00",
-        "registry": {"pathDigest": "2" * 64, "rowDigest": "3" * 64, "conversationId": "conversation-arcade", "workspaceDigest": "4" * 64, "commandDigest": "5" * 64},
+        "registry": {"pathDigest": "2" * 64, "rowDigest": "3" * 64, "conversationId": "conversation-arcade", "sessionId": "session-arcade", "workspaceDigest": "4" * 64, "commandDigest": "5" * 64, "launcherDigest": "6" * 64, "canonicalPathDigest": "7" * 64},
         "tmux": {"socket": {"dev": 1, "ino": 2, "mode": 0o700, "uid": os.getuid()}, "socketPathDigest": "6" * 64, "serverProcess": {"pid": 10, "startTicks": 1, "exeDigest": "7" * 64, "cgroupDigest": "8" * 64, "argvDigest": "9" * 64, "pidfdSupported": True}, "sessionId": "$33", "windowId": "@33", "paneId": "%33"},
         "process": {"pane": {"pid": 10, "startTicks": 1, "exeDigest": "a" * 64, "cgroupDigest": "b" * 64, "argvDigest": "c" * 64, "pidfdSupported": True}, "codexChild": {"pid": 11, "startTicks": 2, "exeDigest": "d" * 64, "cgroupDigest": "e" * 64, "argvDigest": "f" * 64, "pidfdSupported": True}},
         "rollout": {"negativeBefore": True, "negativeAfter": True, "bindingDigest": "0" * 64},
         "bridge": {"dispatchState": "started", "resultPresent": False, "deliveryPhase": "submitted", "recoveryPresent": False, "failurePresent": False, "cancelPresent": False, "requestDigest": "1" * 64, "capabilityHash": "2" * 64, "bindingDigest": "3" * 64, "promptDigest": "4" * 64},
-        "approval": {"planId": plan_id, "planDigest": ""}, "source": {"commit": "a" * 40, "treeDigest": "b" * 40},
+        "approval": {"planId": plan_id, "planDigest": ""}, "source": {"commit": "a" * 40, "treeDigest": "b" * 40, "moduleDigest": "c" * 64},
     }
 
 
@@ -140,32 +140,38 @@ def test_process_attestation_insert_preserves_codex_binding_and_is_replay_exact(
     manifest["bridge"]["bindingDigest"] = __import__("hashlib").sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
     primary = SQLiteStore(secure / "primary.sqlite3")
     source = manifest["source"]
-    plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, manifest_digest(manifest), source["commit"], source["treeDigest"])
+    plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, manifest_digest(manifest), source["commit"], source["treeDigest"], source["moduleDigest"])
     primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:00+00:00"))
     path = secure / "manifest.json"
     class Dispatcher:
         def scan_rollout(self, _lead, _prompt):
-            return {"found": False, "conversationId": binding["conversationId"], "sessionId": binding["sessionId"], "rolloutPathDigest": binding["rolloutPathDigest"], "rolloutDev": binding["rolloutDev"], "rolloutIno": binding["rolloutIno"]}
+            return False
         def binding_provenance(self, _lead):
             return {"found": False, **binding}
+        def process_binding_provenance(self, _lead):
+            return {"conversationId": binding["conversationId"], "sessionId": binding["sessionId"], "workspace": "arcade", "command": "codex", "launcher": "/usr/bin/codex", "registryPath": str(secure / "codex-projects.csv")}
     class Bridge:
         def __init__(self): self.store = bridge; self.dispatcher = Dispatcher()
         def _round_prompt(self, _request, _capability): return "derived prompt"
     registry = secure / "registry.json"
-    registry.write_text(json.dumps({"hermione": {"conversationId": binding["conversationId"], "workspace": "arcade", "command": "codex"}}, separators=(",", ":")))
+    registry.write_text(json.dumps({"hermione": {"conversationId": binding["conversationId"]}}, separators=(",", ":")))
     registry.chmod(0o600)
+    canonical_registry = secure / "codex-projects.csv"
+    canonical_registry.write_text("conversation_id,project,command,launcher\nconversation-arcade,arcade,codex,/usr/bin/codex\n")
+    canonical_registry.chmod(0o600)
     identity = {"pid": 10, "startTicks": 1, "exeDigest": "a" * 64, "argvDigest": "b" * 64, "cgroupDigest": "c" * 64, "pidfdSupported": True}
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr("overseer.psychlo_process_attestation.capture_tmux_identity", lambda *_args, **_kwargs: {"socket": {"dev": 1, "ino": 2, "mode": 448, "uid": os.getuid(), "pathDigest": "6" * 64}, "sessionId": "$1", "windowId": "@1", "paneId": "%1", "paneCommandDigest": "d" * 64, "serverProcess": {**identity, "pid": 9}, "paneProcess": {**identity, "pid": 10}, "serverEvidence": "list-sessions-and-list-panes-explicit-socket"})
     monkeypatch.setattr("overseer.psychlo_process_attestation.capture_direct_codex_child", lambda *_args, **_kwargs: {**identity, "pid": 11, "parentPid": 10})
+    monkeypatch.setattr(os, "pidfd_open", lambda _pid: os.open("/dev/null", os.O_RDONLY))
     monkeypatch.setattr("overseer.psychlo_process_attestation.capture_source_identity", lambda *_args: manifest["source"])
     authority = AuthoritativeProcessEvidenceCollector(Bridge(), str(registry), "/tmp/tmux.sock", "%1", str(secure))
     live = authority.collect(round_id, plan_id)
-    plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, manifest_digest(live), source["commit"], source["treeDigest"])
+    plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, manifest_digest(live), source["commit"], source["treeDigest"], source["moduleDigest"])
     primary._connection.execute("DELETE FROM admin_change_plans")
     primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:00+00:00"))
     path = secure / "manifest.json"
-    stage_process_attestation(round_id=round_id, plan_id=plan_id, manifest_path=path, authority=authority)
+    stage_process_attestation(round_id=round_id, plan_id=plan_id, manifest_path=path, authority=authority, primary_store=primary)
     finalize_process_attestation(path, primary.load_admin_change_plan(plan_id))
     accepted = attest_process_binding(bridge, round_id, plan_id, manifest_path=path, primary_store=primary, authority=authority)
     replay = attest_process_binding(bridge, round_id, plan_id, manifest_path=path, primary_store=primary, authority=authority)
@@ -227,7 +233,7 @@ def test_authoritative_collector_rejects_operator_evidence_and_insecure_source(t
         collect_process_binding_evidence(round_id="round", evidence={"bridge": "claimed"})
     insecure = tmp_path / "source"
     insecure.mkdir(mode=0o755)
-    with pytest.raises(ProcessAttestationError, match="private|trusted|verified"):
+    with pytest.raises(ProcessAttestationError, match="private|trusted|verified|dirty"):
         capture_source_identity(insecure)
 
 
@@ -248,3 +254,17 @@ def test_tmux_query_rejects_changed_second_snapshot(monkeypatch, tmp_path: Path)
     with pytest.raises(ProcessAttestationError, match="changed"):
         capture_tmux_identity(str(socket_path), "%1")
     server.close()
+
+
+def test_cli_attestation_bridge_is_request_scoped_and_never_runs_recovery(monkeypatch):
+    from overseer import psychlo_bridge_cli
+    calls = []
+    class Template:
+        def request_scoped(self):
+            calls.append("request-scoped")
+            return "scoped"
+        def close(self):
+            calls.append("template-close")
+    monkeypatch.setattr(psychlo_bridge_cli, "create_bridge_from_environment", lambda *, recover=True: (calls.append(recover) or Template()))
+    assert psychlo_bridge_cli._create_process_attestation_bridge() == "scoped"
+    assert calls == [False, "request-scoped", "template-close"]

@@ -5,6 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 import socket
+from hashlib import sha256
 
 import pytest
 
@@ -152,7 +153,7 @@ def test_process_attestation_insert_preserves_codex_binding_and_is_replay_exact(
         def process_binding_provenance(self, _lead):
             workspace = secure / "arcade"
             workspace.mkdir(exist_ok=True)
-            return {"conversationId": binding["conversationId"], "sessionId": binding["sessionId"], "workspace": str(workspace), "command": "codex", "launcher": "/bin/sh", "workspaceDev": "1", "workspaceIno": "2", "launcherDev": "1", "launcherIno": "3", "registryPath": str(secure / "codex-projects.csv")}
+            return {"conversationId": binding["conversationId"], "sessionId": binding["sessionId"], "workspace": str(workspace), "command": "codex", "launcher": "/bin/sh", "workspaceDev": "1", "workspaceIno": "2", "launcherDev": "1", "launcherIno": "3", "launcherDigest": "e" * 64, "registryPath": str(secure / "codex-projects.csv")}
     class Bridge:
         def __init__(self): self.store = bridge; self.dispatcher = Dispatcher()
         def _round_prompt(self, _request, _capability): return "derived prompt"
@@ -184,10 +185,28 @@ def test_process_attestation_insert_preserves_codex_binding_and_is_replay_exact(
     path = secure / "manifest.json"
     stage_process_attestation(round_id=round_id, plan_id=plan_id, manifest_path=path, authority=authority, primary_store=primary)
     finalize_process_attestation(path, primary.load_admin_change_plan(plan_id))
+    # Simulate a crash/error after the bridge CAS has committed but before the
+    # primary authority fence can be completed.  Replay must see the durable
+    # prepared fence and complete the exact same attestation, never inventing a
+    # new identity or approving an unbound bridge row.
+    calls = {"count": 0}
+    original_revalidate = AuthoritativeProcessEvidenceCollector.revalidate_held_identities
+    def fail_after_bridge_insert(self):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise ProcessAttestationError("simulated post-CAS crash")
+        return original_revalidate(self)
+    with pytest.MonkeyPatch.context() as failure_patch:
+        failure_patch.setattr(AuthoritativeProcessEvidenceCollector, "revalidate_held_identities", fail_after_bridge_insert)
+        with pytest.raises(ProcessAttestationError, match="simulated post-CAS crash"):
+            attest_process_binding(bridge, round_id, plan_id, manifest_path=path, primary_store=primary, authority=authority)
+    assert primary._connection.execute("SELECT state FROM psychlo_process_attestation_fences WHERE plan_id=? AND round_id=?", (plan_id, round_id)).fetchone()[0] == "prepared"
+    assert bridge.process_binding_attestation(round_id) is not None
     accepted = attest_process_binding(bridge, round_id, plan_id, manifest_path=path, primary_store=primary, authority=authority)
     replay = attest_process_binding(bridge, round_id, plan_id, manifest_path=path, primary_store=primary, authority=authority)
     monkeypatch.undo()
     assert accepted == replay
+    assert primary._connection.execute("SELECT state FROM psychlo_process_attestation_fences WHERE plan_id=? AND round_id=?", (plan_id, round_id)).fetchone()[0] == "completed"
     assert bridge.connection.execute("SELECT codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()[0] == before
     assert bridge.process_binding_attestation(round_id)["manifestDigest"]
     primary.close(); bridge.close()
@@ -310,3 +329,164 @@ def test_direct_shell_child_is_rejected_even_when_conversation_token_matches(mon
     monkeypatch.setattr("overseer.psychlo_process_attestation.os.readlink", lambda path: "/bin/sh" if str(path).endswith("/exe") else str(workspace))
     with pytest.raises(ProcessAttestationError, match="trusted executable"):
         capture_direct_codex_child(22, expected_conversation_id="conversation-arcade", expected_exe_path="/usr/bin/codex", expected_workspace=str(workspace))
+
+
+def test_finalize_rejects_mallory_even_when_plan_is_otherwise_approved(tmp_path: Path):
+    evidence = _valid_evidence("round", "plan")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(evidence), encoding="utf-8")
+    source = evidence["source"]
+    plan = plan_psychlo_legacy_process_binding_attestation(
+        "plan", "round", manifest_digest(evidence), source["commit"], source["treeDigest"], source["moduleDigest"],
+    )
+    mallory = approve_admin_change_plan(plan, "mallory", "2099-01-01T00:00:00+00:00")
+    with pytest.raises(ProcessAttestationError, match="Sisko"):
+        finalize_process_attestation(manifest_path, mallory)
+
+
+def _identity_collector_probe(tmp_path: Path):
+    socket_path = tmp_path / "tmux.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    socket_path.chmod(0o700)
+    socket_fd = os.open(socket_path, getattr(os, "O_PATH", os.O_RDONLY) | os.O_NOFOLLOW)
+    socket_stat = os.fstat(socket_fd)
+    reads, writes = [], []
+    for _ in range(3):
+        read_fd, write_fd = os.pipe()
+        reads.append(read_fd)
+        writes.append(write_fd)
+    collector = object.__new__(AuthoritativeProcessEvidenceCollector)
+    object.__setattr__(collector, "tmux_socket", str(socket_path))
+    object.__setattr__(collector, "_held_pidfds", reads)
+    object.__setattr__(collector, "_held_socket_fd", socket_fd)
+    object.__setattr__(collector, "_held_socket_identity", (socket_stat.st_dev, socket_stat.st_ino))
+    return collector, socket_path, listener, writes
+
+
+def test_revalidate_rejects_pidfd_that_reports_exit(tmp_path: Path, monkeypatch):
+    collector, socket_path, listener, writes = _identity_collector_probe(tmp_path)
+    socket_stat = os.stat(socket_path, follow_symlinks=False)
+    monkeypatch.setattr("overseer.psychlo_process_attestation.capture_socket_identity", lambda _path: {"dev": socket_stat.st_dev, "ino": socket_stat.st_ino})
+    os.close(writes[1])
+    with pytest.raises(ProcessAttestationError, match="exited"):
+        collector.revalidate_held_identities()
+    collector.release_held_identities()
+    for fd in (writes[0], writes[2]):
+        os.close(fd)
+    listener.close()
+
+
+def test_revalidate_rejects_replaced_tmux_socket(tmp_path: Path):
+    collector, socket_path, listener, writes = _identity_collector_probe(tmp_path)
+    listener.close()
+    socket_path.unlink()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement.bind(str(socket_path))
+    replacement.listen(1)
+    socket_path.chmod(0o700)
+    with pytest.raises(ProcessAttestationError, match="socket identity changed"):
+        collector.revalidate_held_identities()
+    collector.release_held_identities()
+    for fd in writes:
+        os.close(fd)
+    replacement.close()
+
+
+def _mock_direct_child(monkeypatch, tmp_path: Path, *, argv: bytes, child_cgroup: str = "c", child_workspace: Path | None = None, expected_dev_delta: int = 0):
+    workspace = tmp_path / "arcade"
+    workspace.mkdir(mode=0o700)
+    other_workspace = child_workspace or workspace
+    if not other_workspace.exists():
+        other_workspace.mkdir(mode=0o700)
+    executable = tmp_path / "codex-real"
+    executable.write_bytes(b"trusted codex executable")
+    executable.chmod(0o755)
+    executable_stat = executable.stat(follow_symlinks=False)
+    identity = {"pid": 22, "startTicks": 1, "exeDigest": sha256(executable.read_bytes()).hexdigest(), "argvDigest": "b" * 64, "cgroupDigest": "c", "pidfdSupported": True}
+    monkeypatch.setattr("overseer.psychlo_process_attestation.capture_process_identity", lambda pid: {**identity, "pid": pid, "cgroupDigest": child_cgroup if pid == 123 else "c"})
+    def read_proc(path):
+        text = str(path)
+        if text.endswith("children"):
+            return b"123\n"
+        if text.endswith("cmdline"):
+            return argv
+        raise AssertionError(text)
+    monkeypatch.setattr("overseer.psychlo_process_attestation._read_proc_bytes", read_proc)
+    monkeypatch.setattr("overseer.psychlo_process_attestation.os.readlink", lambda path: str(executable) if str(path).endswith("/exe") else str(other_workspace if str(path).endswith("/cwd") and "123" in str(path) else workspace))
+    return workspace, executable, executable_stat
+
+
+def test_direct_child_requires_exact_resume_conversation_cd_argv(monkeypatch, tmp_path: Path):
+    workspace_path = tmp_path / "arcade"
+    workspace, executable, executable_stat = _mock_direct_child(
+        monkeypatch, tmp_path,
+        argv=b"python\0resume\0conversation-arcade-old\0--cd\0" + str(workspace_path).encode() + b"\0",
+    )
+    with pytest.raises(ProcessAttestationError, match="conversation"):
+        capture_direct_codex_child(
+            22, expected_conversation_id="conversation-arcade", expected_exe_path=str(executable),
+            expected_exe_digest=sha256(executable.read_bytes()).hexdigest(), expected_exe_dev=executable_stat.st_dev,
+            expected_exe_ino=executable_stat.st_ino, expected_workspace=str(workspace),
+        )
+
+
+def test_direct_child_accepts_exact_trusted_identity(monkeypatch, tmp_path: Path):
+    workspace_path = tmp_path / "arcade"
+    workspace, executable, executable_stat = _mock_direct_child(
+        monkeypatch, tmp_path,
+        argv=b"resume\0conversation-arcade\0--cd\0" + str(workspace_path).encode() + b"\0",
+    )
+    result = capture_direct_codex_child(
+        22, expected_conversation_id="conversation-arcade", expected_exe_path=str(executable),
+        expected_exe_digest=sha256(executable.read_bytes()).hexdigest(), expected_exe_dev=executable_stat.st_dev,
+        expected_exe_ino=executable_stat.st_ino, expected_workspace=str(workspace),
+    )
+    assert result["parentPid"] == 22
+
+
+def test_direct_child_rejects_cgroup_mismatch(monkeypatch, tmp_path: Path):
+    workspace_path = tmp_path / "arcade"
+    workspace, executable, executable_stat = _mock_direct_child(
+        monkeypatch, tmp_path,
+        argv=b"resume\0conversation-arcade\0--cd\0" + str(workspace_path).encode() + b"\0",
+        child_cgroup="d",
+    )
+    with pytest.raises(ProcessAttestationError, match="cgroup"):
+        capture_direct_codex_child(
+            22, expected_conversation_id="conversation-arcade", expected_exe_path=str(executable),
+            expected_exe_digest=sha256(executable.read_bytes()).hexdigest(), expected_exe_dev=executable_stat.st_dev,
+            expected_exe_ino=executable_stat.st_ino, expected_workspace=str(workspace),
+        )
+
+
+def test_direct_child_rejects_cwd_mismatch(monkeypatch, tmp_path: Path):
+    other_workspace = tmp_path / "wrong-project"
+    workspace_path = tmp_path / "arcade"
+    workspace, executable, executable_stat = _mock_direct_child(
+        monkeypatch, tmp_path,
+        argv=b"resume\0conversation-arcade\0--cd\0" + str(workspace_path).encode() + b"\0",
+        child_workspace=other_workspace,
+    )
+    with pytest.raises(ProcessAttestationError, match="cwd"):
+        capture_direct_codex_child(
+            22, expected_conversation_id="conversation-arcade", expected_exe_path=str(executable),
+            expected_exe_digest=sha256(executable.read_bytes()).hexdigest(), expected_exe_dev=executable_stat.st_dev,
+            expected_exe_ino=executable_stat.st_ino, expected_workspace=str(workspace),
+        )
+
+
+def test_direct_child_rejects_executable_file_identity_change(monkeypatch, tmp_path: Path):
+    workspace_path = tmp_path / "arcade"
+    workspace, executable, executable_stat = _mock_direct_child(
+        monkeypatch, tmp_path,
+        argv=b"resume\0conversation-arcade\0--cd\0" + str(workspace_path).encode() + b"\0",
+        expected_dev_delta=1,
+    )
+    with pytest.raises(ProcessAttestationError, match="file identity"):
+        capture_direct_codex_child(
+            22, expected_conversation_id="conversation-arcade", expected_exe_path=str(executable),
+            expected_exe_digest=sha256(executable.read_bytes()).hexdigest(), expected_exe_dev=executable_stat.st_dev + 1,
+            expected_exe_ino=executable_stat.st_ino, expected_workspace=str(workspace),
+        )

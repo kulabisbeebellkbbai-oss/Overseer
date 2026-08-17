@@ -2433,6 +2433,7 @@ class CodexProjectDispatcher:
             "workspaceIno": str(workspace_stat.st_ino),
             "launcherDev": str(launcher_stat.st_dev),
             "launcherIno": str(launcher_stat.st_ino),
+            "launcherDigest": hashlib.sha256(launcher_path.read_bytes()).hexdigest(),
             "registryPath": str(driver.registry_path),
         }
 

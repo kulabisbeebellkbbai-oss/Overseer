@@ -169,7 +169,7 @@ class AuthoritativeProcessEvidenceCollector:
             process_binding = canonical(lead_id)
         except Exception as error:
             raise ProcessAttestationError("canonical project registry process identity is unavailable") from error
-        required_process = {"conversationId", "sessionId", "workspace", "command", "launcher", "workspaceDev", "workspaceIno", "launcherDev", "launcherIno", "registryPath"}
+        required_process = {"conversationId", "sessionId", "workspace", "command", "launcher", "workspaceDev", "workspaceIno", "launcherDev", "launcherIno", "launcherDigest", "registryPath"}
         if not isinstance(process_binding, Mapping) or set(process_binding) != required_process or any(not isinstance(process_binding[key], str) or not process_binding[key].strip() for key in required_process):
             raise ProcessAttestationError("canonical project registry process identity is invalid")
         if binding.get("conversationId") != row["conversationId"] or process_binding["conversationId"] != row["conversationId"] or process_binding["sessionId"] != binding.get("sessionId"):
@@ -178,7 +178,7 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("canonical workspace is not bound to the round project")
         tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target)
         pane_pid = int(tmux["paneProcess"]["pid"])
-        child = capture_direct_codex_child(pane_pid, expected_conversation_id=process_binding["conversationId"], expected_exe_path=process_binding["launcher"], expected_workspace=process_binding["workspace"])
+        child = capture_direct_codex_child(pane_pid, expected_conversation_id=process_binding["conversationId"], expected_exe_digest=process_binding["launcherDigest"], expected_exe_path=process_binding["launcher"], expected_exe_dev=int(process_binding["launcherDev"]), expected_exe_ino=int(process_binding["launcherIno"]), expected_workspace=process_binding["workspace"])
         self._hold_identities(tmux, child)
         if child.get("parentPid") != pane_pid:
             raise ProcessAttestationError("Codex child is not bound to the pane process")
@@ -554,7 +554,36 @@ def capture_process_identity(pid: int) -> dict[str, Any]:
     finally:
         if pidfd is not None:
             os.close(pidfd)
-    return {"pid": pid, "startTicks": start_ticks, "exeDigest": sha256(exe_target.encode()).hexdigest(), "argvDigest": argv_digest, "cgroupDigest": cgroup_digest, "pidfdSupported": pidfd_supported}
+    executable_digest, _ = _trusted_executable_snapshot(exe_target)
+    return {"pid": pid, "startTicks": start_ticks, "exeDigest": executable_digest, "argvDigest": argv_digest, "cgroupDigest": cgroup_digest, "pidfdSupported": pidfd_supported}
+
+
+def _trusted_executable_snapshot(path: str | Path) -> tuple[str, os.stat_result]:
+    """Digest one exact executable inode without following a replacement link."""
+    executable = Path(path)
+    if not executable.is_absolute():
+        raise ProcessAttestationError("process executable path is not absolute")
+    try:
+        fd = os.open(str(executable), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ProcessAttestationError("process executable cannot be opened safely") from error
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid not in {0, os.getuid()} or stat.S_IMODE(before.st_mode) & 0o022:
+            raise ProcessAttestationError("process executable ownership is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        identity_before = (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if identity_before != identity_after:
+            raise ProcessAttestationError("process executable changed during digest")
+        return sha256(b"".join(chunks)).hexdigest(), before
+    except OSError as error:
+        raise ProcessAttestationError("process executable cannot be digested") from error
+    finally:
+        os.close(fd)
 
 
 def _read_proc_bytes(path: Path) -> bytes:
@@ -584,7 +613,7 @@ def _read_proc_bytes(path: Path) -> bytes:
             os.close(parent_fd)
 
 
-def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | None = None, expected_conversation_id: str | None = None, expected_exe_digest: str | None = None, expected_exe_path: str | None = None, expected_workspace: str | None = None) -> dict[str, Any]:
+def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | None = None, expected_conversation_id: str | None = None, expected_exe_digest: str | None = None, expected_exe_path: str | None = None, expected_exe_dev: int | None = None, expected_exe_ino: int | None = None, expected_workspace: str | None = None) -> dict[str, Any]:
     """Require exactly one direct child and persist only redacted identity."""
     parent_before = capture_process_identity(parent_pid)
     workspace_identity = _cwd_identity(parent_pid, expected_workspace) if expected_workspace is not None else None
@@ -614,8 +643,13 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
     exe_stat = Path(executable).stat(follow_symlinks=False)
     if exe_stat.st_uid != os.getuid() and exe_stat.st_uid != 0 or stat.S_IMODE(exe_stat.st_mode) & 0o022:
         raise ProcessAttestationError("direct child executable ownership is unsafe")
-    if expected_exe_digest is not None and identity["exeDigest"] != expected_exe_digest:
+    executable_digest, executable_meta = _trusted_executable_snapshot(executable)
+    if identity["exeDigest"] != executable_digest:
         raise ProcessAttestationError("direct child executable identity changed")
+    if expected_exe_digest is not None and executable_digest != expected_exe_digest:
+        raise ProcessAttestationError("direct child executable identity changed")
+    if expected_exe_dev is not None and expected_exe_ino is not None and (executable_meta.st_dev != expected_exe_dev or executable_meta.st_ino != expected_exe_ino):
+        raise ProcessAttestationError("direct child executable file identity changed")
     if identity["cgroupDigest"] != parent_before["cgroupDigest"]:
         raise ProcessAttestationError("direct child is outside the pane cgroup")
     if expected_workspace is not None and _cwd_identity(children[0], expected_workspace) != workspace_identity:
@@ -625,7 +659,8 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
     except (OSError, ValueError) as error:
         raise ProcessAttestationError("direct child list cannot be revalidated") from error
     parent_after = capture_process_identity(parent_pid)
-    if after != children or parent_after["startTicks"] != parent_before["startTicks"] or parent_after["exeDigest"] != parent_before["exeDigest"]:
+    child_after = capture_process_identity(children[0])
+    if after != children or parent_after["startTicks"] != parent_before["startTicks"] or parent_after["exeDigest"] != parent_before["exeDigest"] or child_after["startTicks"] != identity["startTicks"] or child_after["exeDigest"] != identity["exeDigest"] or child_after["cgroupDigest"] != identity["cgroupDigest"]:
         raise ProcessAttestationError("direct child changed during attestation")
     identity["parentPid"] = parent_pid
     return identity

@@ -1,8 +1,12 @@
-"""Immutable, source-only identity attestation for a legacy Psychlo process.
+"""Immutable, source-only historical observation for a legacy Psychlo process.
 
 This module deliberately has no terminal-input, tmux-send, process-kill, or
 round-projection operation.  It records an independently revalidated identity
-snapshot in the canonical primary authority database only.
+snapshot in the canonical primary database only.  The resulting record is
+historical evidence, never current authority: no consumer may use it to
+recover, dispatch, send input, kill, or otherwise mutate a live process.
+Any future recovery requires a separate high-risk human/Sisko plan and fresh-live
+validation.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ import select
 import sys
 from typing import Any, Mapping
 
-from .admin import AdminChangeKind, AdminChangePlan, plan_psychlo_legacy_process_binding_attestation
+from .admin import AdminChangeKind, AdminChangePlan, plan_psychlo_legacy_process_observation as _plan_observation
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 from .psychlo_contracts import canonical_digest
 from .psychlo_bridge import CodexProjectDispatcher, PsychloBridge
@@ -30,7 +34,7 @@ from .store import SQLiteStore, _dump as _store_dump
 from .psychlo_legacy_binding import _private_group_is_safe
 
 
-SCHEMA = "psychlo.legacy-process-binding-attestation.v1"
+SCHEMA = "psychlo.legacy-process-observation.v1"
 _FORBIDDEN_KEYS = {"prompt", "rawprompt", "callback", "panecapture", "capture", "argv", "commandline"}
 _TMUX = "/usr/bin/tmux"
 _GIT = "/usr/bin/git"
@@ -49,7 +53,13 @@ CANONICAL_SOURCE_ROOT = Path("/home/god/.local/share/overseer/project")
 CANONICAL_SOURCE_REAL_ROOT = Path("/home/god/Documents/Codex Workspace/Overseer")
 CANONICAL_CODEX_RELEASES = Path("/home/god/.codex/packages/standalone/releases")
 CANONICAL_CODEX_MEMORY_SESSION = "/home/god/.local/bin/codex-memory-session"
-CANONICAL_CODEX_MEMORY_SESSION_SCRIPT = Path("/home/god/.codex/skills/private-ai-memory/scripts/codex-session-with-memory.sh")
+CANONICAL_CODEX_MEMORY_SESSION_SCRIPT = Path("/home/god/Documents/Private AI Memory Storage System/scripts/codex-session-with-memory.sh")
+
+# A connection opened through a prevalidated `/proc/self/fd/N` URI is bound to
+# that exact file description.  Keep the binding private to this module so a
+# caller cannot pass an unrelated cover descriptor alongside a decoy SQLite
+# connection and have it accepted as authority.
+_VERIFIED_CONNECTIONS: dict[int, tuple[int, int]] = {}
 
 
 class ProcessAttestationError(ValueError):
@@ -108,10 +118,19 @@ class _RuntimeAuthority:
     collector: "AuthoritativeProcessEvidenceCollector"
     bridge_identity: tuple[int, int, int]
     primary_identity: tuple[int, int, int]
+    bridge_fd: int
+    primary_fd: int
 
     def close(self) -> None:
         self.collector.release_held_identities()
+        _forget_verified_connection(self.bridge.store.connection)
+        _forget_verified_connection(self.primary._connection)
         self.bridge.close()
+        for fd in (self.bridge_fd, self.primary_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
@@ -123,10 +142,33 @@ def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
     _validate_runtime_path(CANONICAL_PROTECTED_BINDING, label="protected binding")
     _validate_runtime_path(CANONICAL_CODEX_REGISTRY, label="canonical Codex registry")
     _validate_runtime_path(CANONICAL_TMUX_SOCKET, label="tmux socket", regular=False)
-    bridge_store = PsychloBridgeStore(CANONICAL_BRIDGE_DATABASE)
-    primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE)
-    _bind_sqlite_database(bridge_store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge")
-    _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary")
+    bridge_fd = _open_verified_database_fd(CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge")
+    try:
+        primary_fd = _open_verified_database_fd(CANONICAL_PRIMARY_DATABASE, primary_identity, "primary")
+    except Exception:
+        try:
+            os.close(bridge_fd)
+        except OSError:
+            pass
+        raise
+    try:
+        bridge_store = PsychloBridgeStore(CANONICAL_BRIDGE_DATABASE, verified_fd=bridge_fd)
+        primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE, verified_fd=primary_fd)
+        _register_verified_connection(bridge_store.connection, bridge_fd)
+        _register_verified_connection(primary._connection, primary_fd)
+        _bind_sqlite_database(bridge_store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge", bound_fd=bridge_fd)
+        _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary", bound_fd=primary_fd)
+    except Exception:
+        if "bridge_store" in locals():
+            _forget_verified_connection(bridge_store.connection)
+        if "primary" in locals():
+            _forget_verified_connection(primary._connection)
+        for fd in (bridge_fd, primary_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
     dispatcher = CodexProjectDispatcher(CANONICAL_PROTECTED_BINDING)
     bridge = PsychloBridge(
         store=bridge_store,
@@ -138,12 +180,26 @@ def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
     )
     record = bridge_store.get_round(round_id)
     if record is None:
+        _forget_verified_connection(bridge_store.connection)
+        _forget_verified_connection(primary._connection)
         bridge.close()
+        for fd in (bridge_fd, primary_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise ProcessAttestationError("round is missing")
     request = record[0]
     lead_id = request.get("projectLeadId") if isinstance(request, Mapping) else None
     if not isinstance(lead_id, str) or not lead_id.strip():
+        _forget_verified_connection(bridge_store.connection)
+        _forget_verified_connection(primary._connection)
         bridge.close()
+        for fd in (bridge_fd, primary_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise ProcessAttestationError("round lead identity is missing")
     try:
         process_binding = dispatcher.process_binding_provenance(lead_id)
@@ -154,12 +210,50 @@ def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
             bridge, CANONICAL_PROTECTED_BINDING, str(CANONICAL_TMUX_SOCKET), "", _resolve_canonical_source_root(),
         )
     except Exception as error:
+        _forget_verified_connection(bridge_store.connection)
+        _forget_verified_connection(primary._connection)
         bridge.close()
+        for fd in (bridge_fd, primary_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise ProcessAttestationError("canonical process runtime is unavailable") from error
-    return _RuntimeAuthority(bridge, primary, collector, bridge_identity, primary_identity)
+    return _RuntimeAuthority(bridge, primary, collector, bridge_identity, primary_identity, bridge_fd, primary_fd)
 
 
-def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int], label: str) -> tuple[int, int, int]:
+def _open_verified_database_fd(path: Path, expected: tuple[int, int], label: str) -> int:
+    fd: int | None = None
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        metadata = os.fstat(fd)
+    except OSError as error:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise ProcessAttestationError(f"{label} database cannot be opened by identity") from error
+    if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != (*expected, 1) or not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise ProcessAttestationError(f"{label} database identity changed before open")
+    return fd
+
+
+def _register_verified_connection(connection: Any, fd: int) -> None:
+    """Record the exact descriptor used to create one authority connection."""
+    try:
+        metadata = os.fstat(fd)
+    except OSError as error:
+        raise ProcessAttestationError("verified database connection handle is invalid") from error
+    _VERIFIED_CONNECTIONS[id(connection)] = (metadata.st_dev, metadata.st_ino)
+
+
+def _forget_verified_connection(connection: Any) -> None:
+    _VERIFIED_CONNECTIONS.pop(id(connection), None)
+
+
+def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int], label: str, *, bound_fd: int | None = None) -> tuple[int, int, int]:
     """Bind an opened SQLite main database to the prevalidated inode."""
     rows = connection.execute("PRAGMA database_list").fetchall()
     main = next((row for row in rows if str(row[1]) == "main"), None)
@@ -171,6 +265,17 @@ def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int]
         raise ProcessAttestationError(f"{label} database disappeared") from error
     if (metadata.st_dev, metadata.st_ino) != expected or metadata.st_nlink != 1 or not stat.S_ISREG(metadata.st_mode):
         raise ProcessAttestationError(f"{label} database identity changed")
+    if bound_fd is not None:
+        registered = _VERIFIED_CONNECTIONS.get(id(connection))
+        if registered != expected:
+            raise ProcessAttestationError(f"{label} SQLite connection was not opened from the bound authority handle")
+        try:
+            bound = os.fstat(bound_fd)
+        except OSError as error:
+            raise ProcessAttestationError(f"{label} bound database handle is invalid") from error
+        if (bound.st_dev, bound.st_ino, bound.st_nlink) != (*expected, 1):
+            raise ProcessAttestationError(f"{label} bound database handle changed")
+        return metadata.st_dev, metadata.st_ino, metadata.st_nlink
     matches: list[tuple[int, int, int]] = []
     try:
         for entry in os.scandir("/proc/self/fd"):
@@ -188,8 +293,8 @@ def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int]
     return metadata.st_dev, metadata.st_ino, metadata.st_nlink
 
 
-def _revalidate_sqlite_database(connection: Any, path: Path, expected: tuple[int, int, int], label: str) -> None:
-    current = _bind_sqlite_database(connection, path, expected[:2], label)
+def _revalidate_sqlite_database(connection: Any, path: Path, expected: tuple[int, int, int], label: str, *, bound_fd: int | None = None) -> None:
+    current = _bind_sqlite_database(connection, path, expected[:2], label, bound_fd=bound_fd)
     if current != expected:
         raise ProcessAttestationError(f"{label} database identity changed during commit")
 
@@ -263,6 +368,37 @@ def _private_workspace_mode(metadata: os.stat_result) -> bool:
             and (not bits & 0o020 or _private_group_is_safe(metadata.st_gid)))
 
 
+def _private_group_file_digest(path: Path, label: str) -> tuple[str, os.stat_result]:
+    """Digest a private-primary-group file through one no-follow descriptor."""
+    if not path.is_absolute() or path.is_symlink():
+        raise ProcessAttestationError(f"{label} path is not canonical")
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ProcessAttestationError(f"{label} cannot be opened safely") from error
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or not _private_workspace_mode(before)):
+            raise ProcessAttestationError(f"{label} ownership or mode is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+                    before.st_gid, before.st_nlink, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns)
+        if identity != (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                        after.st_gid, after.st_nlink, after.st_size,
+                        after.st_mtime_ns, after.st_ctime_ns):
+            raise ProcessAttestationError(f"{label} changed during digest")
+        return sha256(b"".join(chunks)).hexdigest(), before
+    except OSError as error:
+        raise ProcessAttestationError(f"{label} cannot be read safely") from error
+    finally:
+        os.close(fd)
+
+
 def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -> None:
     """Bind the pane shell and registry launcher, including file identity."""
     try:
@@ -307,11 +443,22 @@ def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -
     try:
         if memory_session.resolve(strict=True) != CANONICAL_CODEX_MEMORY_SESSION_SCRIPT:
             raise ProcessAttestationError("memory-session wrapper target is not reviewed")
-        wrapper_meta = CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.lstat()
-        if (not stat.S_ISREG(wrapper_meta.st_mode) or wrapper_meta.st_uid != os.getuid()
-                or wrapper_meta.st_nlink != 1 or stat.S_IMODE(wrapper_meta.st_mode) & 0o022):
-            raise ProcessAttestationError("memory-session wrapper ownership or mode is unsafe")
-        _trusted_executable_snapshot(CANONICAL_CODEX_MEMORY_SESSION_SCRIPT)
+        _validate_runtime_path(CANONICAL_CODEX_MEMORY_SESSION_SCRIPT, label="memory-session wrapper")
+        wrapper_digest, wrapper_meta = _private_group_file_digest(
+            CANONICAL_CODEX_MEMORY_SESSION_SCRIPT, "memory-session wrapper"
+        )
+        # The pane must execute this exact reviewed wrapper path, not merely a
+        # basename or the compatibility symlink target.  The wrapper digest is
+        # deliberately checked from the same descriptor used for its identity.
+        raw_cmdline = _read_proc_bytes(Path(f"/proc/{pane_pid}/cmdline"))
+        argv = raw_cmdline.split(b"\0")[:-1]
+        conversation = process_binding["conversationId"].encode("utf-8")
+        workspace = process_binding["workspace"].encode("utf-8")
+        expected_tail = [CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.as_posix().encode(), b"resume", conversation, b"--cd", workspace]
+        if len(argv) != len(expected_tail) + 1 or argv[0] not in {b"bash", b"/usr/bin/bash"} or argv[1:] != expected_tail:
+            raise ProcessAttestationError("tmux pane does not execute the exact reviewed memory-session wrapper")
+        if not wrapper_digest or wrapper_meta.st_nlink != 1:
+            raise ProcessAttestationError("memory-session wrapper identity is incomplete")
     except OSError as error:
         raise ProcessAttestationError("memory-session wrapper cannot be verified") from error
 
@@ -321,7 +468,7 @@ class AuthoritativeProcessEvidenceCollector:
     """Derive one manifest exclusively from live, application-owned sources.
 
     The constructor accepts handles and immutable paths, not evidence.  Both
-    stage and attest call :meth:`collect`; there is no injection point for a
+    stage and record call :meth:`collect`; there is no injection point for a
     prebuilt bridge, process, rollout, or source claim.
     """
 
@@ -477,16 +624,20 @@ class AuthoritativeProcessEvidenceCollector:
         scan = _require_negative_rollout(self.bridge.dispatcher.binding_provenance(lead_id), binding)
         source = capture_source_identity(self.source_root)
         # Re-read the mutable sources before returning the manifest.  The
-        # attestation caller performs one more full collect immediately before
+        # recording caller performs one more full collect immediately before
         # the CAS insert, so this is not a caller-authored snapshot.
         if scanner(lead_id, prompt) is not False or _require_negative_rollout(self.bridge.dispatcher.binding_provenance(lead_id), binding) != scan:
             raise ProcessAttestationError("rollout evidence changed during collection")
         if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_command=expected_start) != tmux:
             raise ProcessAttestationError("tmux identity changed during collection")
+        observed_at = (self.bridge.store.clock() if callable(getattr(self.bridge.store, "clock", None)) else self.bridge.clock())
+        started_at = (self.bridge.store.round_timing(round_id) or {}).get("startedAt")
         return {
-            "schemaVersion": SCHEMA, "attestationId": f"attestation-{round_id}", "roundId": round_id,
+            "schemaVersion": SCHEMA, "observationId": f"observation-{round_id}", "roundId": round_id,
             "requestDigest": request_digest,
-            "startedAt": (self.bridge.store.round_timing(round_id) or {}).get("startedAt"),
+            "startedAt": started_at,
+            "historical": True, "authoritative": False, "executable": False,
+            "observedWindowStart": started_at, "observedWindowEnd": observed_at, "recordedAt": observed_at,
             "registry": {"pathDigest": registry_meta["digest"], "rowDigest": canonical_digest(dict(process_binding)), "conversationId": process_binding["conversationId"], "sessionId": process_binding["sessionId"], "workspaceDigest": sha256(process_binding["workspace"].encode()).hexdigest(), "commandDigest": sha256(process_binding["command"].encode()).hexdigest(), "launcherDigest": process_binding["launcherDigest"], "canonicalPathDigest": capture_private_file_digest(process_binding["registryPath"])},
             "tmux": tmux, "process": {"pane": tmux["paneProcess"], "codexChild": child},
             "rollout": scan, "bridge": bridge_state,
@@ -512,9 +663,9 @@ def manifest_digest(manifest: Mapping[str, Any]) -> str:
     return canonical_digest(value)
 
 
-def plan_psychlo_legacy_process_binding(*args: Any, **kwargs: Any) -> AdminChangePlan:
-    """Compatibility alias with an intentionally explicit name."""
-    return plan_psychlo_legacy_process_binding_attestation(*args, **kwargs)
+def plan_psychlo_legacy_process_observation(*args: Any, **kwargs: Any) -> AdminChangePlan:
+    """Build the historical, non-authoritative observation plan."""
+    return _plan_observation(*args, **kwargs)
 
 
 def _open_private(path: Path) -> tuple[int, os.stat_result, os.stat_result]:
@@ -702,12 +853,14 @@ def _validate_redacted(value: Any, *, path: str = "manifest") -> None:
 
 
 def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
-    if set(value) != {"schemaVersion", "attestationId", "roundId", "requestDigest", "startedAt", "registry", "tmux", "process", "rollout", "bridge", "approval", "source"}:
+    if set(value) != {"schemaVersion", "observationId", "roundId", "requestDigest", "startedAt", "historical", "authoritative", "executable", "observedWindowStart", "observedWindowEnd", "recordedAt", "registry", "tmux", "process", "rollout", "bridge", "approval", "source"}:
         raise ProcessAttestationError("manifest fields are not exact")
     if value.get("schemaVersion") != SCHEMA or value.get("roundId") != round_id:
         raise ProcessAttestationError("manifest identity is invalid")
     _validate_redacted(value)
-    if not isinstance(value.get("startedAt"), str) or not value["startedAt"].strip():
+    if not isinstance(value.get("observationId"), str) or not value["observationId"].strip() or value.get("historical") is not True or value.get("authoritative") is not False or value.get("executable") is not False:
+        raise ProcessAttestationError("historical observation flags are invalid")
+    if not isinstance(value.get("startedAt"), str) or not value["startedAt"].strip() or value.get("observedWindowStart") != value.get("startedAt") or not isinstance(value.get("observedWindowEnd"), str) or not value["observedWindowEnd"].strip() or value.get("recordedAt") != value.get("observedWindowEnd"):
         raise ProcessAttestationError("round start identity is invalid")
     for key in ("requestDigest",):
         if not isinstance(value.get(key), str) or not _HEX64.fullmatch(value[key]):
@@ -773,7 +926,7 @@ def _immutable_plan_digest(plan: AdminChangePlan) -> str:
 def _assert_exact_plan(primary: SQLiteStore, plan_id: str, round_id: str, manifest: Mapping[str, Any], *, approved: bool) -> AdminChangePlan:
     plan = primary.load_admin_change_plan(plan_id)
     source = manifest["source"]
-    expected = plan_psychlo_legacy_process_binding_attestation(
+    expected = plan_psychlo_legacy_process_observation(
         plan_id, round_id, manifest_digest(manifest), source["commit"], source["treeDigest"], source["moduleDigest"],
     )
     if _immutable_plan_digest(plan) != _immutable_plan_digest(expected):
@@ -796,7 +949,7 @@ def _assert_runtime_source_integrity() -> None:
     capture_source_identity(root)
 
 
-def stage_process_attestation(*, round_id: str, plan_id: str) -> dict[str, Any]:
+def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
     """Derive and durably prepare one exact plan in the canonical primary DB."""
     if not all(isinstance(value, str) and value.strip() for value in (round_id, plan_id)):
         raise ProcessAttestationError("round and plan identities are required")
@@ -806,7 +959,7 @@ def stage_process_attestation(*, round_id: str, plan_id: str) -> dict[str, Any]:
         data = runtime.collector.collect(round_id, plan_id)
         data = dict(data)
         data.setdefault("schemaVersion", SCHEMA)
-        data.setdefault("attestationId", f"attestation-{round_id}")
+        data.setdefault("observationId", f"observation-{round_id}")
         data.setdefault("roundId", round_id)
         data.setdefault("approval", {"planId": plan_id, "planDigest": ""})
         value = _manifest(data, round_id)
@@ -814,7 +967,7 @@ def stage_process_attestation(*, round_id: str, plan_id: str) -> dict[str, Any]:
             raise ProcessAttestationError("manifest plan identity is not exact")
         digest = manifest_digest(value)
         source = value["source"]
-        plan = plan_psychlo_legacy_process_binding_attestation(plan_id, round_id, digest, source["commit"], source["treeDigest"], source["moduleDigest"])
+        plan = plan_psychlo_legacy_process_observation(plan_id, round_id, digest, source["commit"], source["treeDigest"], source["moduleDigest"])
         primary = runtime.primary
         primary._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -828,29 +981,29 @@ def stage_process_attestation(*, round_id: str, plan_id: str) -> dict[str, Any]:
                     raise ProcessAttestationError("staged authority plan identity changed")
                 if existing.approved or existing.canceled:
                     raise ProcessAttestationError("staged process plan lifecycle is not mutable")
-            primary.insert_prepared_process_binding_attestation(
-                attestation_id=str(value["attestationId"]), round_id=round_id, plan_id=plan_id,
-                manifest_digest=digest, manifest=value, inserted_at=runtime.bridge.clock(),
+            primary.insert_prepared_process_observation(
+                observation_id=str(value["observationId"]), round_id=round_id, plan_id=plan_id,
+                observation_digest=digest, manifest=value, inserted_at=runtime.bridge.clock(),
             )
             primary._connection.commit()
         except Exception:
             primary._connection.rollback()
             raise
-        return {"staged": True, "roundId": round_id, "planId": plan_id, "manifestDigest": digest}
+        return {"staged": True, "historical": True, "authoritative": False, "executable": False, "roundId": round_id, "planId": plan_id, "observationDigest": digest}
     except Exception as error:
         raise ProcessAttestationError("authoritative evidence collection failed") from error
     finally:
         runtime.close()
 
 
-def finalize_process_attestation(*, plan_id: str) -> dict[str, Any]:
-    """Compatibility command: report the exact current plan lifecycle only."""
+def finalize_process_observation(*, plan_id: str) -> dict[str, Any]:
+    """Compatibility command: report the plan lifecycle without any action."""
     _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
     primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE)
     try:
         plan = primary.load_admin_change_plan(plan_id)
-        if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION:
-            raise ProcessAttestationError("exact process attestation plan is required")
+        if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION:
+            raise ProcessAttestationError("exact process observation plan is required")
         return {"finalized": bool(plan.approved and plan.approved_by == "sisko" and not plan.canceled), "planId": plan.id}
     finally:
         primary.close()
@@ -1118,16 +1271,16 @@ def _validate_bridge_round(bridge: PsychloBridgeStore, round_id: str, manifest: 
         raise ProcessAttestationError("bridge state changed before primary publication")
 
 
-def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
-    """Publish one exact completed attestation in the canonical primary DB.
+def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
+    """Record one exact historical observation in the canonical primary DB.
 
     The bridge transaction is a read fence only.  The primary transaction owns
     the sole publication and is committed before the bridge read fence closes;
-    replay returns that exact completed primary row.
+    replay returns that exact recorded primary row.
     """
     if not all(isinstance(value, str) and value.strip() for value in (round_id, plan_id)):
         raise ProcessAttestationError("round and plan identities are required")
-    replay = _load_completed_replay(round_id, plan_id)
+    replay = _load_recorded_observation(round_id, plan_id)
     if replay is not None:
         return replay
     _assert_runtime_source_integrity()
@@ -1147,12 +1300,12 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
         try:
             _revalidate_runtime_databases(runtime)
             plan = _assert_exact_plan(runtime.primary, plan_id, round_id, manifest, approved=True)
-            row = primary_connection.execute("SELECT attestation_id,round_id,plan_id,manifest_digest,plan_digest,state,manifest_json FROM psychlo_process_binding_attestations WHERE round_id=?", (round_id,)).fetchone()
+            row = primary_connection.execute("SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json FROM psychlo_process_observations WHERE round_id=?", (round_id,)).fetchone()
             encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
             if row is None:
-                raise ProcessAttestationError("prepared process attestation is missing")
-            if tuple(row[1:4]) != (round_id, plan_id, digest) or row[6] != encoded or row[5] not in {"prepared", "completed"}:
-                raise ProcessAttestationError("prepared process attestation identity changed")
+                raise ProcessAttestationError("prepared process observation is missing")
+            if tuple(row[1:4]) != (round_id, plan_id, digest) or row[6] != encoded or row[5] != "prepared":
+                raise ProcessAttestationError("prepared process observation identity changed")
             plan_digest = admin_plan_digest(plan)
             revalidate = getattr(runtime.collector, "revalidate_exact", None)
             if callable(revalidate):
@@ -1160,13 +1313,13 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
             else:
                 runtime.collector.revalidate_held_identities()
             _revalidate_runtime_databases(runtime)
-            result = runtime.primary.complete_process_binding_attestation(round_id=round_id, plan_id=plan_id, manifest_digest=digest, plan_digest=plan_digest, completed_at=runtime.bridge.clock())
+            result = runtime.primary.record_process_observation(round_id=round_id, plan_id=plan_id, observation_digest=digest, plan_digest=plan_digest, recorded_at=runtime.bridge.clock())
             primary_connection.commit()
         except Exception:
             primary_connection.rollback()
             raise
         bridge_connection.commit()
-        return {"accepted": True, "roundId": round_id, "attestationId": result["attestationId"], "manifestDigest": result["manifestDigest"], "planDigest": result["planDigest"]}
+        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": round_id, "observationId": result["observationId"], "observationDigest": result["observationDigest"], "planDigest": result["planDigest"]}
     except Exception as error:
         try:
             if primary_connection.in_transaction:
@@ -1183,17 +1336,26 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
         runtime.close()
 
 
-def _load_completed_replay(round_id: str, plan_id: str) -> dict[str, Any] | None:
+def _load_recorded_observation(round_id: str, plan_id: str) -> dict[str, Any] | None:
     """Return the immutable primary result before touching live process state."""
+    fd: int | None = None
+    primary: SQLiteStore | None = None
     try:
         identity = _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
-        primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE)
+        fd = _open_verified_database_fd(CANONICAL_PRIMARY_DATABASE, identity, "primary")
+        primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE, verified_fd=fd)
+        _register_verified_connection(primary._connection, fd)
     except (KeyError, ProcessAttestationError, OSError):
+        if primary is not None:
+            _forget_verified_connection(primary._connection)
+            primary.close()
+        if fd is not None:
+            os.close(fd)
         return None
     try:
-        _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary")
+        _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary", bound_fd=fd)
         try:
-            row = primary.process_binding_attestation(round_id)
+            row = primary.process_observation(round_id)
         except Exception as error:
             if "no such table" in str(error):
                 return None
@@ -1201,16 +1363,19 @@ def _load_completed_replay(round_id: str, plan_id: str) -> dict[str, Any] | None
         if row is None:
             return None
         if row.get("planId") != plan_id:
-            raise ProcessAttestationError("completed process attestation plan identity changed")
-        return {"accepted": True, "roundId": row["roundId"], "attestationId": row["attestationId"], "manifestDigest": row["manifestDigest"], "planDigest": row["planDigest"]}
+            raise ProcessAttestationError("recorded process observation plan identity changed")
+        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": row["roundId"], "observationId": row["observationId"], "observationDigest": row["observationDigest"], "planDigest": row["planDigest"]}
     finally:
+        _forget_verified_connection(primary._connection)
         primary.close()
+        if fd is not None:
+            os.close(fd)
 
 
 def _revalidate_runtime_databases(runtime: Any) -> None:
     bridge_identity = getattr(runtime, "bridge_identity", None)
     primary_identity = getattr(runtime, "primary_identity", None)
     if bridge_identity is not None:
-        _revalidate_sqlite_database(runtime.bridge.store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge")
+        _revalidate_sqlite_database(runtime.bridge.store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge", bound_fd=getattr(runtime, "bridge_fd", None))
     if primary_identity is not None:
-        _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary")
+        _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary", bound_fd=getattr(runtime, "primary_fd", None))

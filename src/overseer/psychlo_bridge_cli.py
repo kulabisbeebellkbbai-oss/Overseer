@@ -13,7 +13,7 @@ from .psychlo_legacy_binding import (
     finalize_legacy_round_attestation,
     prepare_legacy_round_attestation,
 )
-from .psychlo_process_attestation import attest_process_binding, finalize_process_attestation, stage_process_attestation
+from .psychlo_process_attestation import record_process_observation, finalize_process_observation, stage_process_observation
 from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, _validate_usage_snapshot_receipt, managed_receipt_validator
 
 
@@ -68,12 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     finalize = subparsers.add_parser("finalize-legacy-round-attestation", aliases=["finalize-legacy-round"], help="bind one exact approved plan to a prepared manifest")
     finalize.add_argument("--plan-id", required=True)
     finalize.add_argument("--manifest-path", required=True)
-    process_stage = subparsers.add_parser("stage-process-attestation", help="stage one redacted legacy process identity manifest")
+    process_stage = subparsers.add_parser("stage-process-observation", help="stage one redacted historical process observation")
     process_stage.add_argument("--round-id", required=True)
     process_stage.add_argument("--plan-id", required=True)
-    process_finalize = subparsers.add_parser("finalize-process-attestation", help="finalize one exact approved process identity plan")
+    process_finalize = subparsers.add_parser("finalize-process-observation", help="record one exact approved historical process observation")
     process_finalize.add_argument("--plan-id", required=True)
-    process_attest = subparsers.add_parser("attest-process-binding", help="insert one immutable process identity attestation")
+    process_attest = subparsers.add_parser("record-process-observation", help="record one immutable historical process observation")
     process_attest.add_argument("--round-id", required=True)
     process_attest.add_argument("--plan-id", required=True)
     subparsers.add_parser("tick")
@@ -141,16 +141,16 @@ def main(argv: list[str] | None = None) -> int:
         result = finalize_legacy_round_attestation(plan_id=args.plan_id, manifest_path=args.manifest_path)
         print(json.dumps(result, sort_keys=True))
         return 0
-    if args.command == "stage-process-attestation":
-        result = stage_process_attestation(round_id=args.round_id, plan_id=args.plan_id)
+    if args.command == "stage-process-observation":
+        result = stage_process_observation(round_id=args.round_id, plan_id=args.plan_id)
         print(json.dumps(result, sort_keys=True))
         return 0
-    if args.command == "finalize-process-attestation":
-        result = finalize_process_attestation(plan_id=args.plan_id)
+    if args.command == "finalize-process-observation":
+        result = finalize_process_observation(plan_id=args.plan_id)
         print(json.dumps(result, sort_keys=True))
         return 0
-    if args.command == "attest-process-binding":
-        result = attest_process_binding(round_id=args.round_id, plan_id=args.plan_id)
+    if args.command == "record-process-observation":
+        result = record_process_observation(round_id=args.round_id, plan_id=args.plan_id)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "tick":

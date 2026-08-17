@@ -49,7 +49,7 @@ def _requested_values_equal(left: Any, right: Any) -> bool:
 
 
 class PsychloBridgeStore:
-    def __init__(self, filename: str | Path):
+    def __init__(self, filename: str | Path, *, verified_fd: int | None = None):
         self.filename = Path(filename)
         self.filename.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         parent = self.filename.parent.stat(follow_symlinks=False)
@@ -59,7 +59,10 @@ class PsychloBridgeStore:
             metadata = self.filename.stat(follow_symlinks=False)
             if self.filename.is_symlink() or not self.filename.is_file() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
                 raise ValueError("Psychlo bridge database must be private")
-        self.connection = sqlite3.connect(self.filename, check_same_thread=False, isolation_level=None, timeout=30.0)
+        if verified_fd is None:
+            self.connection = sqlite3.connect(self.filename, check_same_thread=False, isolation_level=None, timeout=30.0)
+        else:
+            self.connection = sqlite3.connect(f"file:/proc/self/fd/{verified_fd}?mode=rw", uri=True, check_same_thread=False, isolation_level=None, timeout=30.0)
         self.filename.chmod(0o600)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=5000")

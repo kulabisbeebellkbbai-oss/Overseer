@@ -190,13 +190,21 @@ class SQLiteStore:
     otherwise changed.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, verified_fd: int | None = None) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._database_identity = self._prepare_database_file()
+        if verified_fd is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._database_identity = self._prepare_database_file()
+        else:
+            status = os.fstat(verified_fd)
+            self._validate_artifact_status(self.path, status)
+            self._database_identity = (status.st_dev, status.st_ino)
         self._sidecar_identities: dict[str, tuple[int, int]] = {}
         self._compromised_sidecars: set[str] = set()
-        self._connection = sqlite3.connect(self.path, timeout=30.0)
+        if verified_fd is None:
+            self._connection = sqlite3.connect(self.path, timeout=30.0)
+        else:
+            self._connection = sqlite3.connect(f"file:/proc/self/fd/{verified_fd}?mode=rw", uri=True, timeout=30.0)
         try:
             self._harden_database_files()
         except Exception:
@@ -514,36 +522,36 @@ class SQLiteStore:
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS psychlo_process_binding_attestations (
-                attestation_id TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS psychlo_process_observations (
+                observation_id TEXT PRIMARY KEY,
                 round_id TEXT NOT NULL UNIQUE,
                 plan_id TEXT NOT NULL,
-                manifest_digest TEXT NOT NULL UNIQUE,
+                observation_digest TEXT NOT NULL UNIQUE,
                 plan_digest TEXT NOT NULL DEFAULT '',
-                state TEXT NOT NULL CHECK(state IN ('prepared','completed')),
+                state TEXT NOT NULL CHECK(state IN ('prepared','recorded')),
                 manifest_json TEXT NOT NULL,
                 inserted_at TEXT NOT NULL,
-                completed_at TEXT
+                recorded_at TEXT
             );
-            CREATE TRIGGER IF NOT EXISTS psychlo_process_binding_attestations_no_delete
-            BEFORE DELETE ON psychlo_process_binding_attestations
-            BEGIN SELECT RAISE(ABORT, 'process binding attestations are append-only'); END;
-            CREATE TRIGGER IF NOT EXISTS psychlo_process_binding_attestations_immutable
-            BEFORE UPDATE ON psychlo_process_binding_attestations
-            WHEN NEW.attestation_id <> OLD.attestation_id
+            CREATE TRIGGER IF NOT EXISTS psychlo_process_observations_no_delete
+            BEFORE DELETE ON psychlo_process_observations
+            BEGIN SELECT RAISE(ABORT, 'process observations are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS psychlo_process_observations_immutable
+            BEFORE UPDATE ON psychlo_process_observations
+            WHEN NEW.observation_id <> OLD.observation_id
               OR NEW.round_id <> OLD.round_id
               OR NEW.plan_id <> OLD.plan_id
-              OR NEW.manifest_digest <> OLD.manifest_digest
+              OR NEW.observation_digest <> OLD.observation_digest
               OR NEW.manifest_json <> OLD.manifest_json
               OR NEW.inserted_at <> OLD.inserted_at
-              OR OLD.state = 'completed'
+              OR OLD.state = 'recorded'
               OR OLD.state <> 'prepared'
               OR OLD.plan_digest <> ''
-              OR OLD.completed_at IS NOT NULL
-              OR NEW.state <> 'completed'
+              OR OLD.recorded_at IS NOT NULL
+              OR NEW.state <> 'recorded'
               OR NEW.plan_digest = ''
-              OR NEW.completed_at IS NULL
-            BEGIN SELECT RAISE(ABORT, 'process binding attestation identity is immutable'); END;
+              OR NEW.recorded_at IS NULL
+            BEGIN SELECT RAISE(ABORT, 'historical process observation identity is immutable'); END;
             CREATE TABLE IF NOT EXISTS roadex_approval_bindings (
                 approval_ref TEXT PRIMARY KEY,
                 source_kind TEXT NOT NULL,
@@ -2418,61 +2426,61 @@ class SQLiteStore:
     def load_admin_change_plan(self, plan_id: str) -> AdminChangePlan:
         return _load_dataclass(AdminChangePlan, self._get_payload("admin_change_plans", plan_id))
 
-    def process_binding_attestation(self, round_id: str) -> dict[str, Any] | None:
-        """Return only a completed primary-authority process attestation."""
+    def process_observation(self, round_id: str) -> dict[str, Any] | None:
+        """Return only a recorded historical, non-authoritative observation."""
         row = self._connection.execute(
-            "SELECT attestation_id,round_id,plan_id,manifest_digest,plan_digest,manifest_json,inserted_at,completed_at "
-            "FROM psychlo_process_binding_attestations WHERE round_id=? AND state='completed'",
+            "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,manifest_json,inserted_at,recorded_at "
+            "FROM psychlo_process_observations WHERE round_id=? AND state='recorded'",
             (round_id,),
         ).fetchone()
         if row is None:
             return None
         return {
-            "attestationId": row[0], "roundId": row[1], "planId": row[2],
-            "manifestDigest": row[3], "planDigest": row[4],
+            "observationId": row[0], "roundId": row[1], "planId": row[2],
+            "observationDigest": row[3], "planDigest": row[4],
             "manifest": json.loads(row[5]), "insertedAt": row[6],
-            "completedAt": row[7],
+            "recordedAt": row[7],
         }
 
-    def insert_prepared_process_binding_attestation(
-        self, *, attestation_id: str, round_id: str, plan_id: str,
-        manifest_digest: str, manifest: Mapping[str, Any], inserted_at: str,
+    def insert_prepared_process_observation(
+        self, *, observation_id: str, round_id: str, plan_id: str,
+        observation_digest: str, manifest: Mapping[str, Any], inserted_at: str,
     ) -> dict[str, Any]:
         encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
         row = self._connection.execute(
-            "SELECT attestation_id,round_id,plan_id,manifest_digest,manifest_json,state "
-            "FROM psychlo_process_binding_attestations WHERE round_id=? OR attestation_id=? OR manifest_digest=?",
-            (round_id, attestation_id, manifest_digest),
+            "SELECT observation_id,round_id,plan_id,observation_digest,manifest_json,state "
+            "FROM psychlo_process_observations WHERE round_id=? OR observation_id=? OR observation_digest=?",
+            (round_id, observation_id, observation_digest),
         ).fetchone()
         if row is not None:
-            if tuple(row[:5]) != (attestation_id, round_id, plan_id, manifest_digest, encoded) or row[5] not in {"prepared", "completed"}:
-                raise ValueError("process attestation replay identity changed")
-            return {"attestationId": row[0], "roundId": row[1], "planId": row[2], "manifestDigest": row[3], "state": row[5]}
+            if tuple(row[:5]) != (observation_id, round_id, plan_id, observation_digest, encoded) or row[5] not in {"prepared", "recorded"}:
+                raise ValueError("historical process observation replay identity changed")
+            return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "state": row[5]}
         self._connection.execute(
-            "INSERT INTO psychlo_process_binding_attestations(attestation_id,round_id,plan_id,manifest_digest,plan_digest,state,manifest_json,inserted_at) VALUES (?,?,?,?,?,?,?,?)",
-            (attestation_id, round_id, plan_id, manifest_digest, "", "prepared", encoded, inserted_at),
+            "INSERT INTO psychlo_process_observations(observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at) VALUES (?,?,?,?,?,?,?,?)",
+            (observation_id, round_id, plan_id, observation_digest, "", "prepared", encoded, inserted_at),
         )
-        return {"attestationId": attestation_id, "roundId": round_id, "planId": plan_id, "manifestDigest": manifest_digest, "state": "prepared"}
+        return {"observationId": observation_id, "roundId": round_id, "planId": plan_id, "observationDigest": observation_digest, "state": "prepared"}
 
-    def complete_process_binding_attestation(self, *, round_id: str, plan_id: str, manifest_digest: str, plan_digest: str, completed_at: str) -> dict[str, Any]:
+    def record_process_observation(self, *, round_id: str, plan_id: str, observation_digest: str, plan_digest: str, recorded_at: str) -> dict[str, Any]:
         row = self._connection.execute(
-            "SELECT attestation_id,round_id,plan_id,manifest_digest,plan_digest,state,manifest_json,inserted_at,completed_at "
-            "FROM psychlo_process_binding_attestations WHERE round_id=?",
+            "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
+            "FROM psychlo_process_observations WHERE round_id=?",
             (round_id,),
         ).fetchone()
-        if row is None or tuple(row[1:4]) != (round_id, plan_id, manifest_digest) or row[5] not in {"prepared", "completed"}:
-            raise ValueError("prepared process attestation is missing or changed")
-        if row[5] == "completed":
+        if row is None or tuple(row[1:4]) != (round_id, plan_id, observation_digest) or row[5] not in {"prepared", "recorded"}:
+            raise ValueError("prepared process observation is missing or changed")
+        if row[5] == "recorded":
             if row[4] != plan_digest:
-                raise ValueError("completed process attestation replay identity changed")
-            return {"attestationId": row[0], "roundId": row[1], "planId": row[2], "manifestDigest": row[3], "planDigest": row[4], "state": row[5]}
+                raise ValueError("recorded process observation replay identity changed")
+            return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "planDigest": row[4], "state": row[5]}
         self._connection.execute(
-            "UPDATE psychlo_process_binding_attestations SET plan_digest=?,state='completed',completed_at=? WHERE round_id=? AND state='prepared' AND manifest_digest=? AND plan_id=?",
-            (plan_digest, completed_at, round_id, manifest_digest, plan_id),
+            "UPDATE psychlo_process_observations SET plan_digest=?,state='recorded',recorded_at=? WHERE round_id=? AND state='prepared' AND observation_digest=? AND plan_id=?",
+            (plan_digest, recorded_at, round_id, observation_digest, plan_id),
         )
         if self._connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise ValueError("process attestation changed before completion")
-        return {"attestationId": row[0], "roundId": row[1], "planId": row[2], "manifestDigest": row[3], "planDigest": plan_digest, "state": "completed"}
+            raise ValueError("process observation changed before recording")
+        return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "planDigest": plan_digest, "state": "recorded"}
 
     def _ensure_roadex_approval_bindings(self) -> None:
         self._connection.execute(

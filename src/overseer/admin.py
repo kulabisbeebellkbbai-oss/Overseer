@@ -22,7 +22,7 @@ class AdminChangeKind(StrEnum):
     # paired ApprovalRequest decision path.
     PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
     PSYCHLO_LEGACY_ROUND_RECONCILIATION = "psychlo_legacy_round_reconciliation"
-    PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION = "psychlo_legacy_process_binding_attestation"
+    PSYCHLO_LEGACY_PROCESS_OBSERVATION = "psychlo_legacy_process_observation"
     PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
     PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
     USER_SERVICE_RESTART = "user_service_restart"
@@ -154,7 +154,7 @@ class AdminChangePlan:
         return (
             not self.archived
             and not self.canceled
-            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION, AdminChangeKind.PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION}
+            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION, AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION}
             and (self.approved or not self.requires_explicit_approval())
             and not missing_admin_change_fields(self)
         )
@@ -444,42 +444,42 @@ def plan_psychlo_legacy_round_reconciliation(
     )
 
 
-def plan_psychlo_legacy_process_binding_attestation(
+def plan_psychlo_legacy_process_observation(
     plan_id: str,
     round_id: str,
     manifest_digest: str,
     source_commit: str,
     source_tree_digest: str,
     source_module_digest: str | None = None,
-    reason: str = "approve one immutable legacy process-binding attestation",
+    reason: str = "record one immutable historical legacy process observation only",
 ) -> AdminChangePlan:
-    """Create exact Sisko/HUMAN authority for a process identity record."""
+    """Create exact Sisko/HUMAN authority to record a historical observation only."""
     values = (plan_id, round_id, manifest_digest, source_commit, source_tree_digest, reason)
     if not all(isinstance(value, str) and value.strip() for value in values):
-        raise ValueError("legacy process attestation plan identity is required")
+        raise ValueError("legacy process observation plan identity is required")
     if len(manifest_digest) != 64 or any(char not in "0123456789abcdef" for char in manifest_digest.lower()):
-        raise ValueError("legacy process attestation manifest digest is invalid")
+        raise ValueError("legacy process observation digest is invalid")
     if len(source_commit) not in {40, 64} or any(char not in "0123456789abcdef" for char in source_commit.lower()):
-        raise ValueError("legacy process attestation source commit is invalid")
+        raise ValueError("legacy process observation source commit is invalid")
     if len(source_tree_digest) not in {40, 64} or any(char not in "0123456789abcdef" for char in source_tree_digest.lower()):
-        raise ValueError("legacy process attestation source tree digest is invalid")
+        raise ValueError("legacy process observation source tree digest is invalid")
     if source_module_digest is not None and (len(source_module_digest) != 64 or any(char not in "0123456789abcdef" for char in source_module_digest.lower())):
-        raise ValueError("legacy process attestation module digest is invalid")
+        raise ValueError("legacy process observation module digest is invalid")
     return AdminChangePlan(
         id=plan_id,
-        kind=AdminChangeKind.PSYCHLO_LEGACY_PROCESS_BINDING_ATTESTATION,
+        kind=AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION,
         owner_domain=OwnerDomain.SISKO,
         risk_level=RiskLevel.HIGH,
         approval_level=ApprovalLevel.HUMAN,
         target=round_id,
-        reason=reason,
-        current_state="legacy process binding is uncertain and untrusted",
-        proposed_state="persist one immutable process identity attestation in a separate record",
-        steps=(AdminCommandStep("Record process identity attestation", ("__overseer_psychlo_legacy_process_binding_attestation__",), "marker consumed only by attestation adapter"),),
-        rollback_steps=(AdminCommandStep("Retain immutable process attestation", ("__overseer_psychlo_legacy_process_binding_attestation_retention__",), "attestation records have no rollback"),),
-        risks=("binding the wrong process identity", "stale or reused PID", "conflicting tmux or rollout evidence"),
-        verification_steps=(AdminCommandStep("Verify process identity evidence", ("__overseer_psychlo_legacy_process_binding_attestation_verify__",), "recheck every identity immediately before insert"),),
-        adapter_metadata={"legacy_process_binding_attestation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit, "sourceTreeDigest": source_tree_digest, "sourceModuleDigest": source_module_digest or ""}},
+        reason=reason + "; historical recording only; no action or recovery authorization",
+        current_state="legacy process state is uncertain and untrusted",
+        proposed_state="persist one immutable historical process observation; it is non-authoritative and non-executable",
+        steps=(AdminCommandStep("Record historical process observation", ("__overseer_psychlo_legacy_process_observation__",), "record only; never dispatch, recover, send input, or terminate"),),
+        rollback_steps=(AdminCommandStep("Retain immutable historical observation", ("__overseer_psychlo_legacy_process_observation_retention__",), "historical observations have no action or rollback"),),
+        risks=("recording the wrong historical identity", "stale or reused PID", "conflicting tmux or rollout evidence"),
+        verification_steps=(AdminCommandStep("Verify observation evidence", ("__overseer_psychlo_legacy_process_observation_verify__",), "recheck evidence within the observation window only"),),
+        adapter_metadata={"legacy_process_observation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit, "sourceTreeDigest": source_tree_digest, "sourceModuleDigest": source_module_digest or "", "historical": True, "authoritative": False, "executable": False}},
     )
 
 

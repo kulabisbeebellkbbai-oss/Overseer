@@ -15,7 +15,7 @@ import pytest
 pytestmark = pytest.mark.skip(reason="v1 caller-injection API retired; see primary-only v2 contract tests")
 
 from overseer.admin import AdminChangeKind
-from overseer.admin import approve_admin_change_plan, plan_psychlo_legacy_process_binding_attestation
+from overseer.admin import approve_admin_change_plan, plan_psychlo_legacy_process_observation
 from overseer.psychlo_contracts import canonical_digest
 from overseer.psychlo_store import PsychloBridgeStore
 from overseer.store import SQLiteStore
@@ -23,11 +23,11 @@ from overseer.psychlo_process_attestation import (
     AuthoritativeProcessEvidenceCollector,
     SCHEMA,
     ProcessAttestationError,
-    attest_process_binding,
-    finalize_process_attestation,
+    record_process_observation,
+    finalize_process_observation,
     manifest_digest,
-    plan_psychlo_legacy_process_binding_attestation,
-    stage_process_attestation,
+    plan_psychlo_legacy_process_observation,
+    stage_process_observation,
     capture_process_identity,
     capture_direct_codex_child,
     capture_tmux_identity,

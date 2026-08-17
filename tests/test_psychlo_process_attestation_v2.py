@@ -9,9 +9,9 @@ import pytest
 from overseer.admin import approve_admin_change_plan
 from overseer.psychlo_process_attestation import (
     SCHEMA,
-    attest_process_binding,
+    record_process_observation,
     manifest_digest,
-    stage_process_attestation,
+    stage_process_observation,
 )
 from overseer.psychlo_store import PsychloBridgeStore
 from overseer.store import SQLiteStore
@@ -20,8 +20,9 @@ from overseer.store import SQLiteStore
 def _manifest(round_id: str = "round", plan_id: str = "plan") -> dict:
     identity = {"pid": 10, "startTicks": 1, "exeDigest": "a" * 64, "argvDigest": "b" * 64, "cgroupDigest": "c" * 64, "pidfdSupported": True}
     return {
-        "schemaVersion": SCHEMA, "attestationId": f"attestation-{round_id}", "roundId": round_id,
-        "requestDigest": "1" * 64, "startedAt": "2099-01-01T00:00:00+00:00",
+        "schemaVersion": SCHEMA, "observationId": f"observation-{round_id}", "roundId": round_id,
+        "requestDigest": "1" * 64, "startedAt": "2099-01-01T00:00:00+00:00", "historical": True, "authoritative": False, "executable": False,
+        "observedWindowStart": "2099-01-01T00:00:00+00:00", "observedWindowEnd": "2099-01-01T00:00:01+00:00", "recordedAt": "2099-01-01T00:00:01+00:00",
         "registry": {"pathDigest": "2" * 64, "rowDigest": "3" * 64, "conversationId": "conversation-arcade", "sessionId": "session-arcade", "workspaceDigest": "4" * 64, "commandDigest": "5" * 64, "launcherDigest": "6" * 64, "canonicalPathDigest": "7" * 64},
         "tmux": {"socket": {"dev": 1, "ino": 2, "mode": 448, "uid": os.getuid(), "pathDigest": "8" * 64}, "sessionId": "$1", "windowId": "@1", "paneId": "%1", "paneCommandDigest": "9" * 64, "paneStartCommandDigest": "a" * 64, "serverProcess": {**identity, "pid": 9}, "paneProcess": identity, "paneParentPid": 9, "serverEvidence": "list-sessions-and-list-panes-explicit-socket"},
         "process": {"pane": identity, "codexChild": {**identity, "pid": 11, "parentPid": 10}},
@@ -72,39 +73,39 @@ def _runtime(tmp_path, monkeypatch):
 
 def test_primary_only_stage_approval_and_completed_lookup(tmp_path, monkeypatch):
     runtime, value = _runtime(tmp_path, monkeypatch)
-    staged = stage_process_attestation(round_id="round", plan_id="plan")
-    assert staged["manifestDigest"] == manifest_digest(value)
-    assert runtime.primary._connection.execute("SELECT state FROM psychlo_process_binding_attestations").fetchone()[0] == "prepared"
-    assert runtime.primary.process_binding_attestation("round") is None
+    staged = stage_process_observation(round_id="round", plan_id="plan")
+    assert staged["observationDigest"] == manifest_digest(value)
+    assert runtime.primary._connection.execute("SELECT state FROM psychlo_process_observations").fetchone()[0] == "prepared"
+    assert runtime.primary.process_observation("round") is None
     plan = runtime.primary.load_admin_change_plan("plan")
     runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:00+00:00"))
     bridge_changes = runtime.bridge.store.connection.total_changes
-    result = attest_process_binding(round_id="round", plan_id="plan")
-    assert result["accepted"] is True
-    assert runtime.primary.process_binding_attestation("round")["planId"] == "plan"
+    result = record_process_observation(round_id="round", plan_id="plan")
+    assert result["recorded"] is True
+    assert runtime.primary.process_observation("round")["planId"] == "plan"
     assert runtime.collector.revalidate_calls == 1
     assert runtime.bridge.store.connection.total_changes == bridge_changes
-    assert runtime.bridge.store.connection.execute("SELECT name FROM sqlite_master WHERE name='round_process_binding_attestations'").fetchone() is None
+    assert runtime.bridge.store.connection.execute("SELECT name FROM sqlite_master WHERE name='psychlo_process_observations'").fetchone() is None
     runtime.bridge.store.close(); runtime.primary.close()
 
 
 def test_primary_attestation_transition_is_immutable(tmp_path):
     primary = SQLiteStore(tmp_path / "primary.sqlite3")
-    primary._connection.execute("INSERT INTO psychlo_process_binding_attestations VALUES ('a','r','p','" + "a" * 64 + "','', 'prepared','{}','now',NULL)")
+    primary._connection.execute("INSERT INTO psychlo_process_observations VALUES ('a','r','p','" + "a" * 64 + "','', 'prepared','{}','now',NULL)")
     try:
-        primary._connection.execute("UPDATE psychlo_process_binding_attestations SET manifest_json='{" + "x" + "}' WHERE round_id='r'")
+        primary._connection.execute("UPDATE psychlo_process_observations SET manifest_json='{" + "x" + "}' WHERE round_id='r'")
     except Exception as error:
         assert "immutable" in str(error)
     else:
         raise AssertionError("prepared attestation identity was mutable")
-    primary._connection.execute("UPDATE psychlo_process_binding_attestations SET plan_digest='" + "b" * 64 + "',state='completed',completed_at='done' WHERE round_id='r'")
-    assert primary.process_binding_attestation("r")["planDigest"] == "b" * 64
+    primary._connection.execute("UPDATE psychlo_process_observations SET plan_digest='" + "b" * 64 + "',state='recorded',recorded_at='done' WHERE round_id='r'")
+    assert primary.process_observation("r")["planDigest"] == "b" * 64
     primary.close()
 
 
 def test_public_operations_have_no_caller_selected_authority_endpoints():
-    assert set(inspect.signature(stage_process_attestation).parameters) == {"round_id", "plan_id"}
-    assert set(inspect.signature(attest_process_binding).parameters) == {"round_id", "plan_id"}
+    assert set(inspect.signature(stage_process_observation).parameters) == {"round_id", "plan_id"}
+    assert set(inspect.signature(record_process_observation).parameters) == {"round_id", "plan_id"}
 
 
 def test_runtime_hardlink_database_is_rejected(tmp_path):
@@ -145,6 +146,60 @@ def test_sqlite_binding_rejects_decoy_connection_after_canonical_path_restore(tm
             decoy_store.close()
         except ValueError:
             decoy_store._connection.close()
+
+
+def test_sqlite_binding_rejects_cover_fd_not_bound_to_connection(tmp_path):
+    """A canonical cover descriptor must not bless a decoy SQLite connection."""
+    import overseer.psychlo_process_attestation as module
+
+    canonical = tmp_path / "canonical.sqlite3"
+    decoy = tmp_path / "decoy.sqlite3"
+    canonical_store = SQLiteStore(canonical)
+    canonical_store.close()
+    decoy_store = SQLiteStore(decoy)
+    decoy_store.close()
+    expected = canonical.stat()
+    os.replace(canonical, tmp_path / "original.sqlite3")
+    os.replace(decoy, canonical)
+    decoy_connection = SQLiteStore(canonical)
+    os.unlink(canonical)
+    os.replace(tmp_path / "original.sqlite3", canonical)
+    cover_fd = os.open(canonical, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(module.ProcessAttestationError, match="connection was not opened"):
+            module._bind_sqlite_database(
+                decoy_connection._connection, canonical,
+                (expected.st_dev, expected.st_ino), "primary", bound_fd=cover_fd,
+            )
+    finally:
+        os.close(cover_fd)
+        module._forget_verified_connection(decoy_connection._connection)
+        try:
+            decoy_connection.close()
+        except ValueError:
+            decoy_connection._connection.close()
+
+
+def test_historical_observation_contract_has_no_action_consumer():
+    import pathlib
+    import overseer.psychlo_process_attestation as module
+
+    value = _manifest()
+    assert module._manifest(value, "round")["historical"] is True
+    assert module._manifest(value, "round")["authoritative"] is False
+    assert module._manifest(value, "round")["executable"] is False
+    source = pathlib.Path(module.__file__).read_text()
+    for forbidden in ("tmux send-keys", "kill-session", "os.kill(", "send_keys("):
+        assert forbidden not in source
+    assert "fresh-live" in source
+
+
+def test_live_wrapper_binding_uses_actual_documents_path():
+    import overseer.psychlo_process_attestation as module
+
+    assert module.CANONICAL_CODEX_MEMORY_SESSION_SCRIPT == __import__("pathlib").Path(
+        "/home/god/Documents/Private AI Memory Storage System/scripts/codex-session-with-memory.sh"
+    )
 
 
 def test_process_cli_rejects_endpoint_arguments():
@@ -234,11 +289,11 @@ def test_completed_replay_returns_primary_row_without_live_collection(tmp_path, 
 
     primary_path = tmp_path / "primary.sqlite3"
     primary = SQLiteStore(primary_path)
-    primary._connection.execute("INSERT INTO psychlo_process_binding_attestations VALUES ('a','round','plan','" + "b" * 64 + "','" + "c" * 64 + "','completed','{}','inserted','completed')")
+    primary._connection.execute("INSERT INTO psychlo_process_observations VALUES ('a','round','plan','" + "b" * 64 + "','" + "c" * 64 + "','recorded','{}','inserted','completed')")
     primary._connection.commit()
     primary.close()
     monkeypatch.setattr(module, "CANONICAL_PRIMARY_DATABASE", primary_path)
     monkeypatch.setattr(module, "_assert_runtime_source_integrity", lambda: None)
     monkeypatch.setattr(module, "capture_process_identity", lambda _pid: (_ for _ in ()).throw(AssertionError("exited process must not be recollected")))
     monkeypatch.setattr(module, "_open_runtime_authority", lambda _round: (_ for _ in ()).throw(AssertionError("runtime must not open on completed replay")))
-    assert module.attest_process_binding(round_id="round", plan_id="plan") == {"accepted": True, "roundId": "round", "attestationId": "a", "manifestDigest": "b" * 64, "planDigest": "c" * 64}
+    assert module.record_process_observation(round_id="round", plan_id="plan") == {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": "round", "observationId": "a", "observationDigest": "b" * 64, "planDigest": "c" * 64}

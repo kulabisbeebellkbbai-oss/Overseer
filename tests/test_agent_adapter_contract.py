@@ -520,6 +520,32 @@ def test_dispatch_waits_for_paste_settle_before_one_submit(
     assert sum(command[1] == "send-keys" and command[-1] == "Enter" for command in runner.commands) == 1
 
 
+def test_dispatch_persists_external_effect_phases_before_each_irreversible_step(
+    codex_csv: Path,
+) -> None:
+    phases: list[str] = []
+    runner = RecordingRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+        sleep=lambda _delay: None,
+    )
+
+    result = adapter.dispatch_legacy(
+        adapter.discover()[0],
+        "Persist each dispatch phase.",
+        idempotency_key="dispatch-key.phases",
+        phase_callback=phases.append,
+    )
+
+    assert result.state is AgentOperationState.ACKNOWLEDGED
+    assert phases == ["prepared", "paste-intent", "submit-intent", "submitted"]
+
+
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(
     codex_csv: Path,
 ) -> None:

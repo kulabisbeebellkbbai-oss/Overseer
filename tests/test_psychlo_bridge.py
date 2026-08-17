@@ -2373,6 +2373,72 @@ def test_recovery_after_crash_rescans_and_never_redelivers_again(tmp_path: Path)
     assert restarted.store.get_round(request["roundId"])[4] == "dispatched"
 
 
+def test_recovery_crash_after_paste_intent_is_scan_only_and_never_repastes(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    request = _started_round(store, "round-paste-intent-crash")
+
+    class PasteIntentCrashDispatcher:
+        def __init__(self):
+            self.calls = 0
+
+        def scan_rollout(self, _lead, _prompt):
+            return {"found": False, "conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+        def __call__(self, _lead, _prompt, idempotency_key=None, phase_callback=None):
+            self.calls += 1
+            assert idempotency_key == request["idempotencyKey"]
+            assert phase_callback is not None
+            phase_callback("paste-intent")
+            raise RuntimeError("crashed after paste intent")
+
+    dispatcher = PasteIntentCrashDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="delivery proof"):
+        bridge.recover_round(request["roundId"], owner_id="recoverer-a")
+
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="already attempted"):
+        restarted.recover_round(request["roundId"], owner_id="recoverer-b")
+    assert dispatcher.calls == 1
+    assert restarted.store.round_prompt_delivery(request["roundId"])["phase"] == "unresolved"
+
+
+def test_initial_dispatch_crash_after_paste_intent_is_scan_only(tmp_path: Path):
+    store_path = tmp_path / "bridge.sqlite3"
+    store = PsychloBridgeStore(store_path)
+    request = _started_round(store, "round-initial-paste-intent-crash")
+    store.connection.execute("UPDATE rounds SET dispatch_state='pending', started_at=NULL WHERE round_id=?", (request["roundId"],))
+
+    class InitialPasteIntentCrashDispatcher:
+        def __init__(self):
+            self.calls = 0
+            self.binding = {"conversationId": "conversation-arcade", "sessionId": "session-arcade", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+        def binding_provenance(self, _lead):
+            return self.binding
+
+        def scan_rollout(self, _lead, _prompt):
+            return {"found": False, **self.binding}
+
+        def __call__(self, _lead, _prompt, idempotency_key=None, phase_callback=None):
+            self.calls += 1
+            assert idempotency_key == request["idempotencyKey"]
+            phase_callback("paste-intent")
+            raise SystemExit("crashed after initial paste intent")
+
+    dispatcher = InitialPasteIntentCrashDispatcher()
+    bridge = PsychloBridge(store=store, dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(SystemExit, match="initial paste intent"):
+        bridge.request_round(request)
+    assert store.round_prompt_delivery(request["roundId"])["phase"] == "paste-intent"
+
+    restarted = PsychloBridge(store=PsychloBridgeStore(store_path), dispatcher=dispatcher, sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    with pytest.raises(ValueError, match="already attempted"):
+        restarted.recover_round(request["roundId"], owner_id="recoverer-b")
+    assert dispatcher.calls == 1
+
+
 def test_recovery_claim_excludes_a_second_recoverer(tmp_path: Path):
     store_path = tmp_path / "bridge.sqlite3"
     store = PsychloBridgeStore(store_path)

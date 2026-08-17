@@ -67,6 +67,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS peer_nonces(nonce TEXT PRIMARY KEY, message_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, capability_hash TEXT NOT NULL UNIQUE, capability_token TEXT NOT NULL, dispatch_state TEXT NOT NULL, result_json TEXT, result_forwarded INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS round_prompt_deliveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL UNIQUE, capability_hash TEXT NOT NULL UNIQUE, binding_json TEXT NOT NULL, phase TEXT NOT NULL, prompt_digest TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_cancellations(cancellation_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, receipt_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
@@ -914,6 +915,39 @@ class PsychloBridgeStore:
         if row is None:
             return None
         return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "idempotencyKey": row[2], "ownerId": row[3], "claimToken": row[4], "leaseExpiresAt": row[5], "state": row[6], "attempts": row[7], "evidence": json.loads(row[8]) if row[8] else None, "binding": json.loads(row[9]) if row[9] else None, "updatedAt": row[10]}
+
+    def round_prompt_delivery(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest,updated_at FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            return None
+        return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "binding": json.loads(row[2]), "phase": row[3], "promptDigest": row[4], "updatedAt": row[5]}
+
+    def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str) -> dict[str, Any]:
+        phases = ("prepared", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved")
+        if phase not in phases or not isinstance(prompt_digest, str) or len(prompt_digest) != 64:
+            raise ValueError("round prompt delivery phase is invalid")
+        request_digest = self._round_request_digest(request)
+        capability_hash = _token_hash(capability)
+        encoded_binding = _dump_wire(binding)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            if row is None:
+                self.connection.execute("INSERT INTO round_prompt_deliveries(round_id,request_digest,capability_hash,binding_json,phase,prompt_digest,updated_at) VALUES (?,?,?,?,?,?,?)", (round_id, request_digest, capability_hash, encoded_binding, phase, prompt_digest, now))
+            else:
+                if (row[0], row[1], row[2], row[4]) != (request_digest, capability_hash, encoded_binding, prompt_digest):
+                    raise ValueError("round prompt delivery binding conflict")
+                if phases.index(phase) < phases.index(str(row[3])):
+                    raise ValueError("round prompt delivery phase regressed")
+                self.connection.execute("UPDATE round_prompt_deliveries SET phase=?,updated_at=? WHERE round_id=?", (phase, now, round_id))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.round_prompt_delivery(round_id)
+        if result is None:
+            raise ValueError("round prompt delivery record is missing")
+        return result
 
     def claim_round_recovery(self, round_id: str, request: Mapping[str, Any], capability: str, *, owner_id: str, lease_expires_at: str, now: str) -> bool:
         if not all(isinstance(value, str) and value.strip() for value in (round_id, capability, owner_id, lease_expires_at, now)):

@@ -61,7 +61,10 @@ CODEX_OUTPUT_LIMIT_BYTES = 65_536
 # paste-buffer can leave the text queued instead of submitting it. Keep this
 # interval explicit and bounded so dispatch has one deterministic submit
 # attempt and tests can inject a non-blocking sleeper.
-CODEX_PASTE_SETTLE_SECONDS = 3.0
+# Live Codex testing showed submission only after more than four seconds of
+# post-paste aggregation. A 4.5 second margin stays bounded while covering
+# that observed boundary before the single Enter attempt.
+CODEX_PASTE_SETTLE_SECONDS = 4.5
 
 
 class BoundedCommandRunner(Protocol):
@@ -508,6 +511,7 @@ class CodexDriver:
         *,
         idempotency_key: str | None = None,
         prompt_marker: str | None = None,
+        phase_callback: Callable[[str], None] | None = None,
     ) -> AgentDispatchResult:
         """Dispatch the exact legacy prompt without weakening the generic DTO."""
 
@@ -524,6 +528,7 @@ class CodexDriver:
             request,
             prompt_text=prompt,
             prompt_marker=prompt_marker,
+            phase_callback=phase_callback,
         )
 
     def prepare_legacy_dispatch(
@@ -805,6 +810,7 @@ class CodexDriver:
         *,
         prompt_text: str | None = None,
         prompt_marker: str | None = None,
+        phase_callback: Callable[[str], None] | None = None,
     ) -> AgentDispatchResult:
         dispatch_prompt = request.prompt if prompt_text is None else prompt_text
         resume_result, resume_details = self._resume_session(
@@ -852,6 +858,19 @@ class CodexDriver:
         baseline_output = (
             baseline_result.stdout.casefold() if baseline_result.returncode == 0 else ""
         )
+        if phase_callback is not None:
+            try:
+                phase_callback("prepared")
+            except Exception as error:
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="failed",
+                    reason="codex dispatch phase persistence failed",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    stderr=str(error),
+                )
         prompt_result = self._run(
             [str(self.tmux_path), "load-buffer", "-b", "overseer-dispatch", "-"],
             input_text=dispatch_prompt,
@@ -868,6 +887,21 @@ class CodexDriver:
                 stdout=prompt_result.stdout,
                 stderr=prompt_result.stderr,
             )
+        if phase_callback is not None:
+            try:
+                phase_callback("paste-intent")
+            except Exception as error:
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="failed",
+                    reason="codex dispatch phase persistence failed",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    prompt_exit_code=prompt_result.returncode,
+                    stdout=prompt_result.stdout,
+                    stderr=str(error),
+                )
         paste_result = self._run(
             [
                 str(self.tmux_path),
@@ -908,6 +942,21 @@ class CodexDriver:
                 stdout=paste_result.stdout,
                 stderr=str(error),
             )
+        if phase_callback is not None:
+            try:
+                phase_callback("submit-intent")
+            except Exception as error:
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="failed",
+                    reason="codex dispatch phase persistence failed",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    prompt_exit_code=prompt_result.returncode,
+                    stdout=paste_result.stdout,
+                    stderr=str(error),
+                )
         enter_result = self._run(
             [
                 str(self.tmux_path),
@@ -930,6 +979,22 @@ class CodexDriver:
                 stdout=enter_result.stdout,
                 stderr=enter_result.stderr,
             )
+        if phase_callback is not None:
+            try:
+                phase_callback("submitted")
+            except Exception as error:
+                return self._prompt_failure(
+                    request,
+                    session,
+                    resume_details,
+                    status="failed",
+                    reason="codex dispatch phase persistence failed",
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    prompt_exit_code=prompt_result.returncode,
+                    enter_exit_code=enter_result.returncode,
+                    stdout=enter_result.stdout,
+                    stderr=str(error),
+                )
         pane_result = self._run(pane_command)
         pane_output = pane_result.stdout.casefold() if pane_result.returncode == 0 else ""
         rejection_marker = next(

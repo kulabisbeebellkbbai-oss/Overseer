@@ -451,13 +451,25 @@ def _trusted_observation_module(path: Path, source_root: Path) -> tuple[Path, os
     """Bind and read the loaded module through a private no-follow handle."""
     try:
         content, metadata = _private_group_file_content(path, "loaded observation module")
+        # The descriptor read above proves what was read.  Revalidate the
+        # original lexical pathname as well: a rename-to-symlink, replacement,
+        # chmod, chown, or other metadata change must not turn that read into
+        # a different pathname identity after the no-follow operation.
+        lexical_metadata = path.lstat()
         resolved = path.resolve(strict=True)
         resolved.relative_to(source_root.resolve())
         resolved_metadata = resolved.stat(follow_symlinks=False)
     except (OSError, ValueError) as error:
         raise ProcessAttestationError("loaded observation module is not trusted") from error
-    if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != (
-            resolved_metadata.st_dev, resolved_metadata.st_ino, resolved_metadata.st_nlink):
+    def identity(value: os.stat_result) -> tuple[int, ...]:
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_gid, value.st_nlink, value.st_size, value.st_mtime_ns,
+                value.st_ctime_ns)
+
+    if (not stat.S_ISREG(lexical_metadata.st_mode)
+            or not stat.S_ISREG(resolved_metadata.st_mode)
+            or identity(metadata) != identity(lexical_metadata)
+            or identity(metadata) != identity(resolved_metadata)):
         raise ProcessAttestationError("loaded observation module is not trusted")
     return resolved, metadata, content
 

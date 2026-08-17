@@ -5,6 +5,7 @@ import os
 import inspect
 import hashlib
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
 
@@ -474,6 +475,87 @@ def test_loaded_observation_module_rejects_unsafe_identity(
     if not owner_matches:
         monkeypatch.setattr(module.os, "getuid", lambda: metadata.st_uid + 1)
 
+    with pytest.raises(module.ProcessAttestationError, match="trusted"):
+        module._trusted_observation_module(loaded, source)
+
+
+def _loaded_module_race_fixture(tmp_path: Path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    source = tmp_path / "source"
+    source.mkdir()
+    loaded = source / "loaded.py"
+    loaded.write_text("# reviewed module\n")
+    loaded.chmod(0o664)
+    metadata = loaded.stat()
+    monkeypatch.setattr(module, "_private_group_is_safe", lambda gid: gid == metadata.st_gid)
+    return module, source, loaded
+
+
+def test_loaded_observation_module_rejects_rename_to_symlink_after_read(tmp_path, monkeypatch):
+    module, source, loaded = _loaded_module_race_fixture(tmp_path, monkeypatch)
+    relocated = source / "relocated.py"
+    relocated.write_bytes(loaded.read_bytes())
+    relocated.chmod(0o664)
+    original = module._private_group_file_content
+
+    def race(path, label):
+        result = original(path, label)
+        loaded.unlink()
+        loaded.symlink_to(relocated)
+        return result
+
+    monkeypatch.setattr(module, "_private_group_file_content", race)
+    with pytest.raises(module.ProcessAttestationError, match="trusted"):
+        module._trusted_observation_module(loaded, source)
+
+
+def test_loaded_observation_module_rejects_mode_change_after_read(tmp_path, monkeypatch):
+    module, source, loaded = _loaded_module_race_fixture(tmp_path, monkeypatch)
+    original = module._private_group_file_content
+
+    def race(path, label):
+        result = original(path, label)
+        path.chmod(0o666)
+        return result
+
+    monkeypatch.setattr(module, "_private_group_file_content", race)
+    with pytest.raises(module.ProcessAttestationError, match="trusted"):
+        module._trusted_observation_module(loaded, source)
+
+
+def test_loaded_observation_module_rejects_owner_change_after_read(tmp_path, monkeypatch):
+    module, source, loaded = _loaded_module_race_fixture(tmp_path, monkeypatch)
+    original_lstat = Path.lstat
+    calls = {"loaded": 0}
+
+    def race(path):
+        metadata = original_lstat(path)
+        if path == loaded:
+            calls["loaded"] += 1
+            if calls["loaded"] == 2:
+                fields = list(metadata)
+                fields[4] = metadata.st_uid + 1
+                return os.stat_result(fields)
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", race)
+    with pytest.raises(module.ProcessAttestationError, match="trusted"):
+        module._trusted_observation_module(loaded, source)
+
+
+def test_loaded_observation_module_rejects_replacement_after_read(tmp_path, monkeypatch):
+    module, source, loaded = _loaded_module_race_fixture(tmp_path, monkeypatch)
+    original = module._private_group_file_content
+
+    def race(path, label):
+        result = original(path, label)
+        loaded.unlink()
+        loaded.write_text("# replacement\n")
+        loaded.chmod(0o664)
+        return result
+
+    monkeypatch.setattr(module, "_private_group_file_content", race)
     with pytest.raises(module.ProcessAttestationError, match="trusted"):
         module._trusted_observation_module(loaded, source)
 

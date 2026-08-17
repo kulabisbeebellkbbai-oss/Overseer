@@ -183,6 +183,37 @@ def test_exact_observation_schema_skips_reinitialization(tmp_path, monkeypatch):
     store.close()
 
 
+def test_observation_schema_allows_extra_nonunique_index(tmp_path):
+    path = tmp_path / "nonunique.sqlite3"
+    store = SQLiteStore(path)
+    store.close()
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE INDEX observation_state_lookup ON psychlo_process_observations(state)")
+    connection.commit(); connection.close()
+    store = SQLiteStore(path)
+    assert store._observation_schema_status() == "exact"
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "index_sql",
+    [
+        "CREATE UNIQUE INDEX extra_state_unique ON psychlo_process_observations(state)",
+        "CREATE UNIQUE INDEX extra_expression_unique ON psychlo_process_observations(lower(plan_id))",
+        "CREATE UNIQUE INDEX extra_partial_unique ON psychlo_process_observations(plan_id) WHERE state='prepared'",
+    ],
+)
+def test_observation_schema_rejects_extra_unique_index_forms(tmp_path, index_sql):
+    path = tmp_path / "extra_unique.sqlite3"
+    store = SQLiteStore(path)
+    store.close()
+    connection = sqlite3.connect(path)
+    connection.execute(index_sql)
+    connection.commit(); connection.close()
+    with pytest.raises(sqlite3.DatabaseError, match="incompatible"):
+        SQLiteStore(path)
+
+
 @pytest.mark.parametrize("variant", ["one_column", "no_op_both", "no_op_one", "wrong_unique"])
 def test_incompatible_observation_schema_fails_before_initialization(tmp_path, variant):
     path = tmp_path / f"{variant}.sqlite3"

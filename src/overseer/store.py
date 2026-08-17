@@ -450,17 +450,38 @@ class SQLiteStore:
         ]
         if columns != expected_columns or self._normalize_schema_sql(table[1]) != _OBSERVATION_TABLE_SQL:
             return "invalid"
-        unique_columns: set[tuple[str, ...]] = set()
+        expected_unique_indexes = {
+            ("pk", ("observation_id",)),
+            ("u", ("round_id",)),
+            ("u", ("observation_digest",)),
+        }
+        unique_indexes: set[tuple[str, tuple[str, ...]]] = set()
         for index in self._connection.execute(
                 "PRAGMA index_list(psychlo_process_observations)").fetchall():
             if int(index[2]) != 1:
+                # Additional non-unique indexes are allowed; they cannot
+                # change the identity/uniqueness contract.
                 continue
+            origin = str(index[3])
+            partial = int(index[4])
             index_columns = self._connection.execute(
                 "SELECT name, seqno, cid FROM pragma_index_info(?)", (str(index[1]),)
             ).fetchall()
             names = tuple(str(row[0]) for row in index_columns)
-            unique_columns.add(names)
-        if {("round_id",), ("observation_digest",)} - unique_columns:
+            if len(index_columns) != 1 or int(index_columns[0][1]) != 0:
+                return "invalid"
+            xinfo = [tuple(row) for row in self._connection.execute(
+                "SELECT seqno, cid, name, desc, coll, key FROM pragma_index_xinfo(?)",
+                (str(index[1]),)
+            ).fetchall()]
+            cid = int(index_columns[0][2])
+            if xinfo != [(0, cid, names[0], 0, "BINARY", 1),
+                         (1, -1, None, 0, "BINARY", 0)]:
+                return "invalid"
+            unique_indexes.add((origin, names))
+            if partial != 0:
+                return "invalid"
+        if unique_indexes != expected_unique_indexes:
             return "invalid"
         for name, expected_sql in (
             (_OBSERVATION_NO_DELETE_TRIGGER, _OBSERVATION_NO_DELETE_TRIGGER_SQL),

@@ -840,7 +840,7 @@ class PsychloBridge:
         if stored_result is not None and stored_result != dict(result): raise ValueError("round result conflict")
         if stored_result is None: self.store.record_result(str(request["roundId"]), result, self.clock())
         if not forwarded:
-            response = dict(self.sender("round-result", str(result["provenanceId"]), result))
+            response = dict(self.sender("round-result", str(request["roundId"]), result))
             if response.get("accepted") is not True: raise ValueError("Psychlo rejected round result")
             self.store.mark_forwarded(str(request["roundId"]))
         return {"accepted": True}

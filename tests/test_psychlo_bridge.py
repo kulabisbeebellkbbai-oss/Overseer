@@ -2126,10 +2126,10 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
     assert receipt["receipt"]["status"] == "accepted"
     assert len(dispatched) == 1
     assert "approved A-Team project lead" in dispatched[0][1]
-    result = {**request, "sourceId": "member-hermione", "provenanceId": "result:1", "status": "completed", "actualUsageCost": 4, "deliveredScope": "foundation", "remainingEstimate": 8, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": NOW}
+    result = {**request, "sourceId": "member-hermione", "provenanceId": "git:kulabisbeebellkbbai-oss/Arcade@65658e91ac22b832a07eafe6b7128e337da0688c", "status": "completed", "actualUsageCost": 4, "deliveredScope": "foundation", "remainingEstimate": 8, "blockers": [], "questions": [], "reachedExplicitGates": [], "occurredAt": NOW}
     accepted = bridge.receive_round_result("capability_1234567890abcdef1234567890", result)
     assert accepted == {"accepted": True}
-    assert forwarded == [("round-result", "result:1", result)]
+    assert forwarded == [("round-result", "round-1", result)]
     assert bridge.request_round(request) == receipt
     with pytest.raises(ValueError, match="callback capability"):
         bridge.request_round(request, callback_capability="capability:different-round-binding")

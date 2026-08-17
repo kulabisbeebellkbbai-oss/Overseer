@@ -9,6 +9,10 @@ import base64
 from pathlib import Path
 
 from .psychlo_bridge import MAX_BODY_BYTES, _read_private_file, create_bridge_from_environment
+from .psychlo_legacy_binding import (
+    finalize_legacy_round_attestation,
+    prepare_legacy_round_attestation,
+)
 from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, _validate_usage_snapshot_receipt, managed_receipt_validator
 
 
@@ -49,6 +53,20 @@ def build_parser() -> argparse.ArgumentParser:
     legacy = subparsers.add_parser("attest-legacy-round", help="one-shot owner-attested binding migration for one exact legacy round")
     legacy.add_argument("--round-id", required=True)
     legacy.add_argument("--manifest-path", required=True)
+    prepare = subparsers.add_parser("prepare-legacy-round-attestation", aliases=["stage-legacy-round-attestation"], help="derive one exact unapproved legacy-round attestation plan")
+    prepare.add_argument("--round-id", required=True)
+    prepare.add_argument("--plan-id", required=True)
+    prepare.add_argument("--manifest-path", required=True)
+    prepare.add_argument("--journal-path", required=True)
+    prepare.add_argument("--invocation-id", required=True)
+    prepare.add_argument("--boot-id", required=True)
+    prepare.add_argument("--unit-path", default=str(Path.home() / ".config/systemd/user/overseer-api.service"))
+    prepare.add_argument("--drop-in-path", default=str(Path.home() / ".config/systemd/user/overseer-api.service.d/psychlo-bridge.conf"))
+    prepare.add_argument("--source-root", default=str(Path(__file__).resolve().parents[2]))
+    prepare.add_argument("--reason", default="approve one immutable legacy Arcade binding attestation")
+    finalize = subparsers.add_parser("finalize-legacy-round-attestation", aliases=["finalize-legacy-round"], help="bind one exact approved plan to a prepared manifest")
+    finalize.add_argument("--plan-id", required=True)
+    finalize.add_argument("--manifest-path", required=True)
     subparsers.add_parser("tick")
     return parser
 
@@ -99,6 +117,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "attest-legacy-round":
         bridge = create_bridge_from_environment()
         result = bridge.attest_legacy_round_binding(args.round_id, args.manifest_path)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command in {"prepare-legacy-round-attestation", "stage-legacy-round-attestation"}:
+        result = prepare_legacy_round_attestation(
+            round_id=args.round_id, plan_id=args.plan_id, manifest_path=args.manifest_path,
+            journal_path=args.journal_path, invocation_id=args.invocation_id, boot_id=args.boot_id,
+            unit_path=args.unit_path, drop_in_path=args.drop_in_path, source_root=args.source_root,
+            reason=args.reason,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command in {"finalize-legacy-round-attestation", "finalize-legacy-round"}:
+        result = finalize_legacy_round_attestation(plan_id=args.plan_id, manifest_path=args.manifest_path)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "tick":

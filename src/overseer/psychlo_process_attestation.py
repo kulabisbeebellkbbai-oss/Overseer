@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import sqlite3
 import stat
 import subprocess
 import re
@@ -31,7 +32,7 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 from .psychlo_contracts import canonical_digest
 from .psychlo_bridge import CodexProjectDispatcher, PsychloBridge
 from .psychlo_store import PsychloBridgeStore
-from .store import SQLiteStore, _dump as _store_dump
+from .store import SQLiteStore, _dump as _store_dump, _load_dataclass as _store_load_dataclass
 from .psychlo_legacy_binding import _private_group_is_safe
 
 
@@ -150,6 +151,35 @@ class _RuntimeAuthority:
             raise close_error
 
 
+@dataclass
+class _PrimaryObservationAuthority:
+    """Primary-only handle used for historical replay and publication.
+
+    This deliberately has no bridge, dispatcher, collector, tmux, registry,
+    source, or lead fields.  A prepared historical observation can therefore
+    be recorded after its live runtime has disappeared without recollecting or
+    treating the old runtime as an authority.
+    """
+
+    primary: SQLiteStore
+    primary_identity: tuple[int, int]
+    primary_fd: int
+
+    def close(self) -> None:
+        _forget_verified_connection(self.primary._connection)
+        close_error: Exception | None = None
+        try:
+            self.primary._connection.close()
+        except Exception as error:
+            close_error = error
+        try:
+            os.close(self.primary_fd)
+        except OSError:
+            pass
+        if close_error is not None:
+            raise close_error
+
+
 def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
     """Open only the fixed live authority stores and derive the exact session."""
     primary_identity = _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
@@ -239,6 +269,37 @@ def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
     return _RuntimeAuthority(bridge, primary, collector, bridge_identity, primary_identity, bridge_fd, primary_fd)
 
 
+def _open_primary_observation_authority() -> _PrimaryObservationAuthority:
+    """Open the canonical primary database through one verified descriptor.
+
+    This is the only opener used by historical replay/record/finalize paths.
+    It intentionally does not inspect the bridge, project lead, dispatcher,
+    tmux, registry, rollout, or source checkout.
+    """
+    identity = _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
+    fd: int | None = None
+    primary: SQLiteStore | None = None
+    try:
+        fd = _open_verified_database_fd(CANONICAL_PRIMARY_DATABASE, identity, "primary")
+        primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE, verified_fd=fd)
+        _register_verified_connection(primary._connection, fd)
+        _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary", bound_fd=fd)
+        return _PrimaryObservationAuthority(primary, identity, fd)
+    except Exception:
+        if primary is not None:
+            _forget_verified_connection(primary._connection)
+            try:
+                primary._connection.close()
+            except Exception:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
 def _open_verified_database_fd(path: Path, expected: tuple[int, int], label: str) -> int:
     fd: int | None = None
     try:
@@ -311,8 +372,9 @@ def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int]
 
 
 def _revalidate_sqlite_database(connection: Any, path: Path, expected: tuple[int, int, int], label: str, *, bound_fd: int | None = None) -> None:
-    current = _bind_sqlite_database(connection, path, expected[:2], label, bound_fd=bound_fd)
-    if current != expected:
+    expected_identity = _identity_with_nlink(tuple(expected))
+    current = _bind_sqlite_database(connection, path, expected_identity[:2], label, bound_fd=bound_fd)
+    if current != expected_identity:
         raise ProcessAttestationError(f"{label} database identity changed during commit")
 
 
@@ -1001,17 +1063,21 @@ def _immutable_plan_digest(plan: AdminChangePlan) -> str:
 
 def _assert_exact_plan(primary: SQLiteStore, plan_id: str, round_id: str, manifest: Mapping[str, Any], *, approved: bool) -> AdminChangePlan:
     plan = primary.load_admin_change_plan(plan_id)
+    _assert_plan_identity(plan, plan_id, round_id, manifest)
+    if approved and (not plan.approved or plan.approved_by != "sisko" or plan.canceled or not plan.approved_at):
+        raise ProcessAttestationError("exact approved Sisko plan is required")
+    if not approved and plan.approved:
+        raise ProcessAttestationError("staged process plan is unexpectedly approved")
+    return plan
+
+
+def _assert_plan_identity(plan: AdminChangePlan, plan_id: str, round_id: str, manifest: Mapping[str, Any]) -> None:
     source = manifest["source"]
     expected = plan_psychlo_legacy_process_observation(
         plan_id, round_id, manifest_digest(manifest), source["commit"], source["treeDigest"], source["moduleDigest"],
     )
     if _immutable_plan_digest(plan) != _immutable_plan_digest(expected):
         raise ProcessAttestationError("authoritative plan immutable identity changed")
-    if approved and (not plan.approved or plan.approved_by != "sisko" or plan.canceled or not plan.approved_at):
-        raise ProcessAttestationError("exact approved Sisko plan is required")
-    if not approved and plan.approved:
-        raise ProcessAttestationError("staged process plan is unexpectedly approved")
-    return plan
 
 
 def _assert_runtime_source_integrity() -> None:
@@ -1025,10 +1091,54 @@ def _assert_runtime_source_integrity() -> None:
     capture_source_identity(root)
 
 
+def _load_existing_process_observation(round_id: str, plan_id: str) -> dict[str, Any] | None:
+    """Reconcile an exact prepared/recorded row before any live collection."""
+    authority = _open_primary_observation_authority()
+    try:
+        try:
+            row = authority.primary._connection.execute(
+                "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,recorded_at "
+                "FROM psychlo_process_observations WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error):
+                raise
+            row = None
+        if row is None:
+            return None
+        if row[1] != round_id or row[2] != plan_id:
+            raise ProcessAttestationError("existing process observation plan collision")
+        try:
+            manifest = _manifest(json.loads(row[6]), round_id)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ProcessAttestationError("existing process observation snapshot is invalid") from error
+        digest = manifest_digest(manifest)
+        encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
+        if row[3] != digest or row[6] != encoded or row[5] not in {"prepared", "recorded"}:
+            raise ProcessAttestationError("existing process observation identity changed")
+        plan = authority.primary.load_admin_change_plan(plan_id)
+        _assert_plan_identity(plan, plan_id, round_id, manifest)
+        if plan.canceled:
+            raise ProcessAttestationError("existing process observation plan is canceled")
+        if row[5] == "recorded":
+            return {"recorded": True, "historical": True, "authoritative": False, "executable": False,
+                    "roundId": round_id, "observationId": row[0], "observationDigest": row[3],
+                    "planDigest": row[4], "recordedAt": row[7]}
+        return {"staged": True, "replayed": True, "historical": True, "authoritative": False,
+                "executable": False, "roundId": round_id, "planId": plan_id,
+                "observationDigest": digest}
+    finally:
+        authority.close()
+
+
 def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
     """Derive and durably prepare one exact plan in the canonical primary DB."""
     if not all(isinstance(value, str) and value.strip() for value in (round_id, plan_id)):
         raise ProcessAttestationError("round and plan identities are required")
+    existing = _load_existing_process_observation(round_id, plan_id)
+    if existing is not None:
+        return existing
     _assert_runtime_source_integrity()
     runtime = _open_runtime_authority(round_id)
     try:
@@ -1063,7 +1173,10 @@ def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
             )
             _revalidate_runtime_databases(runtime)
             primary._connection.commit()
-            _revalidate_primary_database_after_commit(runtime)
+            _revalidate_primary_database_after_commit(
+                runtime, round_id=round_id, plan_id=plan_id, state="prepared",
+                observation_digest=digest, plan_digest="", expected_plan=plan,
+            )
         except Exception:
             primary._connection.rollback()
             raise
@@ -1075,16 +1188,33 @@ def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
 
 
 def finalize_process_observation(*, plan_id: str) -> dict[str, Any]:
-    """Compatibility command: report the plan lifecycle without any action."""
-    _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
-    primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE)
+    """Report plan/observation state; approval alone never claims recording."""
+    if not isinstance(plan_id, str) or not plan_id.strip():
+        raise ProcessAttestationError("plan identity is required")
+    authority = _open_primary_observation_authority()
     try:
+        primary = authority.primary
         plan = primary.load_admin_change_plan(plan_id)
         if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION:
             raise ProcessAttestationError("exact process observation plan is required")
-        return {"finalized": bool(plan.approved and plan.approved_by == "sisko" and not plan.canceled), "planId": plan.id}
+        row = primary._connection.execute(
+            "SELECT round_id,state,plan_id FROM psychlo_process_observations WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        recorded = bool(row is not None and row[1] == "recorded")
+        prepared = bool(row is not None and row[1] == "prepared")
+        approved = bool(plan.approved and plan.approved_by == "sisko" and not plan.canceled)
+        return {
+            "finalized": recorded,
+            "approved": approved,
+            "prepared": prepared,
+            "recorded": recorded,
+            "status": "recorded" if recorded else "approved-prepared" if approved and prepared else "approved-awaiting-preparation" if approved else "pending-approval",
+            "planId": plan.id,
+            "roundId": row[0] if row is not None else None,
+        }
     finally:
-        primary.close()
+        authority.close()
 
 
 def capture_process_identity(pid: int) -> dict[str, Any]:
@@ -1352,21 +1482,19 @@ def _validate_bridge_round(bridge: PsychloBridgeStore, round_id: str, manifest: 
 def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
     """Record one exact historical observation in the canonical primary DB.
 
-    The bridge transaction is a read fence only.  The primary transaction owns
-    the sole publication and is committed before the bridge read fence closes;
-    replay returns that exact recorded primary row.
+    The primary transaction owns the sole publication; replay returns that
+    exact recorded primary row.  No live runtime, bridge, or source read is
+    required once the immutable prepared snapshot exists.
     """
     if not all(isinstance(value, str) and value.strip() for value in (round_id, plan_id)):
         raise ProcessAttestationError("round and plan identities are required")
     replay = _load_recorded_observation(round_id, plan_id)
     if replay is not None:
         return replay
-    _assert_runtime_source_integrity()
-    runtime = _open_runtime_authority(round_id)
-    bridge_connection = runtime.bridge.store.connection
-    primary_connection = runtime.primary._connection
+    authority = _open_primary_observation_authority()
+    primary = authority.primary
+    primary_connection = primary._connection
     try:
-        bridge_connection.execute("BEGIN IMMEDIATE")
         primary_connection.execute("BEGIN IMMEDIATE")
         try:
             row = primary_connection.execute("SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,recorded_at FROM psychlo_process_observations WHERE round_id=?", (round_id,)).fetchone()
@@ -1382,25 +1510,29 @@ def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]
                 raise ProcessAttestationError("prepared process observation identity changed")
             if row[5] == "recorded":
                 primary_connection.rollback()
-                _revalidate_primary_database_after_commit(runtime)
-                bridge_connection.commit()
+                _revalidate_primary_database_after_commit(
+                    authority, round_id=round_id, plan_id=plan_id, state="recorded",
+                    observation_digest=row[3], plan_digest=row[4],
+                )
                 return {"recorded": True, "historical": True, "authoritative": False, "executable": False,
                         "roundId": round_id, "observationId": row[0], "observationDigest": row[3],
                         "planDigest": row[4], "recordedAt": row[7]}
             if row[5] != "prepared":
                 raise ProcessAttestationError("prepared process observation state is invalid")
-            _validate_bridge_round(runtime.bridge.store, round_id, manifest)
-            _revalidate_runtime_databases(runtime)
-            plan = _assert_exact_plan(runtime.primary, plan_id, round_id, manifest, approved=True)
+            plan = _assert_exact_plan(primary, plan_id, round_id, manifest, approved=True)
             plan_digest = admin_plan_digest(plan)
-            _revalidate_runtime_databases(runtime)
-            result = runtime.primary.record_process_observation(round_id=round_id, plan_id=plan_id, observation_digest=digest, plan_digest=plan_digest, recorded_at=_observation_clock(runtime.bridge))
+            result = primary.record_process_observation(
+                round_id=round_id, plan_id=plan_id, observation_digest=digest,
+                plan_digest=plan_digest, recorded_at=_primary_recording_clock(primary),
+            )
             primary_connection.commit()
-            _revalidate_primary_database_after_commit(runtime)
+            _revalidate_primary_database_after_commit(
+                authority, round_id=round_id, plan_id=plan_id, state="recorded",
+                observation_digest=digest, plan_digest=plan_digest, expected_plan=plan,
+            )
         except Exception:
             primary_connection.rollback()
             raise
-        bridge_connection.commit()
         return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": round_id, "observationId": result["observationId"], "observationDigest": result["observationDigest"], "planDigest": result["planDigest"], "recordedAt": result["recordedAt"]}
     except Exception as error:
         try:
@@ -1408,34 +1540,28 @@ def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]
                 primary_connection.rollback()
         except Exception:
             pass
-        try:
-            if bridge_connection.in_transaction:
-                bridge_connection.rollback()
-        except Exception:
-            pass
         raise ProcessAttestationError(str(error)) from error
     finally:
-        runtime.close()
+        authority.close()
+
+
+def _primary_recording_clock(primary: SQLiteStore) -> str:
+    """Generate the record envelope timestamp without consulting live runtime."""
+    clock = getattr(primary, "clock", None)
+    if callable(clock):
+        return _parse_utc_timestamp(clock(), "record timestamp").isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _load_recorded_observation(round_id: str, plan_id: str) -> dict[str, Any] | None:
     """Return the immutable primary result before touching live process state."""
-    fd: int | None = None
-    primary: SQLiteStore | None = None
+    authority: _PrimaryObservationAuthority | None = None
     try:
-        identity = _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
-        fd = _open_verified_database_fd(CANONICAL_PRIMARY_DATABASE, identity, "primary")
-        primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE, verified_fd=fd)
-        _register_verified_connection(primary._connection, fd)
+        authority = _open_primary_observation_authority()
     except (KeyError, ProcessAttestationError, OSError):
-        if primary is not None:
-            _forget_verified_connection(primary._connection)
-            primary.close()
-        if fd is not None:
-            os.close(fd)
         return None
     try:
-        _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary", bound_fd=fd)
+        primary = authority.primary
         try:
             row = primary.process_observation(round_id)
         except Exception as error:
@@ -1448,10 +1574,7 @@ def _load_recorded_observation(round_id: str, plan_id: str) -> dict[str, Any] | 
             raise ProcessAttestationError("recorded process observation plan identity changed")
         return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": row["roundId"], "observationId": row["observationId"], "observationDigest": row["observationDigest"], "planDigest": row["planDigest"], "recordedAt": row["recordedAt"]}
     finally:
-        _forget_verified_connection(primary._connection)
-        primary.close()
-        if fd is not None:
-            os.close(fd)
+        authority.close()
 
 
 def _revalidate_runtime_databases(runtime: Any) -> None:
@@ -1463,12 +1586,35 @@ def _revalidate_runtime_databases(runtime: Any) -> None:
         _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary", bound_fd=getattr(runtime, "primary_fd", None))
 
 
-def _revalidate_primary_database_after_commit(runtime: Any) -> None:
-    """Verify the committed row is still reachable through the bound primary inode."""
+def _identity_with_nlink(identity: tuple[int, ...]) -> tuple[int, int, int]:
+    if len(identity) == 2:
+        return identity[0], identity[1], 1
+    if len(identity) == 3:
+        return identity[0], identity[1], identity[2]
+    raise ProcessAttestationError("database identity is incomplete")
+
+
+def _revalidate_primary_database_after_commit(
+    runtime: Any,
+    *,
+    round_id: str | None = None,
+    plan_id: str | None = None,
+    state: str | None = None,
+    observation_digest: str | None = None,
+    plan_digest: str | None = None,
+    expected_plan: AdminChangePlan | None = None,
+) -> None:
+    """Verify canonical identity and, after publication, independent visibility.
+
+    The visibility query uses a newly opened read-only descriptor.  It never
+    runs SQLite schema initialization/checkpointing and compares the complete
+    observation row plus immutable plan payload before and after the SELECT.
+    """
     identity = getattr(runtime, "primary_identity", None)
     fd = getattr(runtime, "primary_fd", None)
     if identity is None or fd is None:
         return
+    expected_identity = _identity_with_nlink(tuple(identity))
     _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary", bound_fd=fd)
     try:
         path_before = CANONICAL_PRIMARY_DATABASE.lstat()
@@ -1476,17 +1622,92 @@ def _revalidate_primary_database_after_commit(runtime: Any) -> None:
         path_after = CANONICAL_PRIMARY_DATABASE.lstat()
     except OSError as error:
         raise ProcessAttestationError("canonical primary path cannot be revalidated after commit") from error
-    expected = (*identity[:2], identity[2])
     for metadata in (path_before, path_after):
-        if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != expected or not stat.S_ISREG(metadata.st_mode):
+        if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != expected_identity or not stat.S_ISREG(metadata.st_mode):
             raise ProcessAttestationError("canonical primary path changed after commit")
-    if (held.st_dev, held.st_ino, held.st_nlink) != expected:
+    if (held.st_dev, held.st_ino, held.st_nlink) != expected_identity:
         raise ProcessAttestationError("bound primary database handle changed after commit")
+    missing_sidecars: list[str] = []
     for suffix, sidecar_identity in getattr(runtime.primary, "_sidecar_identities", {}).items():
         sidecar = Path(f"{CANONICAL_PRIMARY_DATABASE}{suffix}")
         try:
             metadata = sidecar.lstat()
         except FileNotFoundError:
+            missing_sidecars.append(suffix)
             continue
         if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != (*sidecar_identity, 1) or not stat.S_ISREG(metadata.st_mode):
             raise ProcessAttestationError(f"primary database sidecar changed after commit: {suffix}")
+    if round_id is not None:
+        _verify_primary_visibility(
+            expected_identity,
+            round_id=round_id,
+            plan_id=plan_id,
+            state=state,
+            observation_digest=observation_digest,
+            plan_digest=plan_digest,
+            expected_plan=expected_plan,
+            missing_sidecars=tuple(missing_sidecars),
+        )
+
+
+def _verify_primary_visibility(
+    expected_identity: tuple[int, int, int],
+    *,
+    round_id: str,
+    plan_id: str | None,
+    state: str | None,
+    observation_digest: str | None,
+    plan_digest: str | None,
+    expected_plan: AdminChangePlan | None,
+    missing_sidecars: tuple[str, ...],
+) -> None:
+    """Read exact committed data from a fresh canonical read-only handle."""
+    fd: int | None = None
+    connection: sqlite3.Connection | None = None
+    try:
+        before = CANONICAL_PRIMARY_DATABASE.lstat()
+        fd = os.open(CANONICAL_PRIMARY_DATABASE, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        held = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_nlink) != expected_identity or (held.st_dev, held.st_ino, held.st_nlink) != expected_identity:
+            raise ProcessAttestationError("canonical primary read-only handle identity changed")
+        connection = sqlite3.connect(f"file:/proc/self/fd/{fd}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        first = connection.execute(
+            "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
+            "FROM psychlo_process_observations WHERE round_id=?",
+            (round_id,),
+        ).fetchone()
+        plan_row = connection.execute("SELECT payload FROM admin_change_plans WHERE id=?", (plan_id,)).fetchone() if plan_id else None
+        second = connection.execute(
+            "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
+            "FROM psychlo_process_observations WHERE round_id=?",
+            (round_id,),
+        ).fetchone()
+        after = CANONICAL_PRIMARY_DATABASE.lstat()
+        if (after.st_dev, after.st_ino, after.st_nlink) != expected_identity or (None if first is None else tuple(first)) != (None if second is None else tuple(second)):
+            raise ProcessAttestationError("canonical primary visibility changed during read")
+        if first is None or first[1] != round_id or (plan_id is not None and first[2] != plan_id) or (state is not None and first[5] != state):
+            raise ProcessAttestationError("committed historical observation is not visible")
+        if observation_digest is not None and first[3] != observation_digest:
+            raise ProcessAttestationError("committed observation digest is not visible")
+        if plan_digest is not None and first[4] != plan_digest:
+            raise ProcessAttestationError("committed plan digest is not visible")
+        if plan_id is not None and plan_row is None:
+            raise ProcessAttestationError("committed immutable plan is not visible")
+        if expected_plan is not None:
+            if plan_row is None or _store_load_dataclass(AdminChangePlan, str(plan_row[0])) != expected_plan:
+                raise ProcessAttestationError("committed immutable plan is not visible")
+        # WAL/SHM disappearance is safe only after the independent canonical
+        # read has proven the exact main-database data is visible.
+        if missing_sidecars and first is None:
+            raise ProcessAttestationError("tracked primary sidecar disappeared before committed data became visible")
+    except sqlite3.Error as error:
+        raise ProcessAttestationError("canonical primary committed data is not readable") from error
+    except OSError as error:
+        raise ProcessAttestationError("canonical primary read-only visibility check failed") from error
+    finally:
+        if connection is not None:
+            connection.close()
+        if fd is not None:
+            os.close(fd)

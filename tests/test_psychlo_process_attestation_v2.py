@@ -69,7 +69,12 @@ def _runtime(tmp_path, monkeypatch):
         bridge=SimpleNamespace(store=bridge, clock=lambda: "2099-01-01T00:00:00+00:00"),
         primary=primary, collector=Collector(), close=lambda: None,
     )
+    primary.clock = lambda: runtime.bridge.clock()
     monkeypatch.setattr("overseer.psychlo_process_attestation._open_runtime_authority", lambda _round_id: runtime)
+    monkeypatch.setattr(
+        "overseer.psychlo_process_attestation._open_primary_observation_authority",
+        lambda: SimpleNamespace(primary=primary, primary_identity=None, primary_fd=None, close=lambda: None),
+    )
     monkeypatch.setattr("overseer.psychlo_process_attestation._assert_runtime_source_integrity", lambda: None)
     return runtime, value
 
@@ -116,14 +121,14 @@ def test_record_does_not_report_success_when_postcommit_primary_revalidation_fai
     runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:02+00:00"))
     monkeypatch.setattr(
         "overseer.psychlo_process_attestation._revalidate_primary_database_after_commit",
-        lambda _runtime: (_ for _ in ()).throw(Exception("canonical primary path changed after commit")),
+        lambda _runtime, **_kwargs: (_ for _ in ()).throw(Exception("canonical primary path changed after commit")),
     )
     with pytest.raises(Exception, match="canonical primary path changed"):
         record_process_observation(round_id="round", plan_id="plan")
     # The historical row is committed on its bound inode; retry can reconcile
     # it once the canonical path is restored, but the failed call did not lie.
     assert runtime.primary.process_observation("round")["planId"] == "plan"
-    monkeypatch.setattr("overseer.psychlo_process_attestation._revalidate_primary_database_after_commit", lambda _runtime: None)
+    monkeypatch.setattr("overseer.psychlo_process_attestation._revalidate_primary_database_after_commit", lambda _runtime, **_kwargs: None)
     replay = record_process_observation(round_id="round", plan_id="plan")
     assert replay["recorded"] is True and replay["recordedAt"] == "2099-01-01T00:00:00+00:00"
     runtime.bridge.store.close(); runtime.primary.close()
@@ -133,7 +138,7 @@ def test_stage_does_not_report_success_when_postcommit_primary_revalidation_fail
     runtime, _value = _runtime(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "overseer.psychlo_process_attestation._revalidate_primary_database_after_commit",
-        lambda _runtime: (_ for _ in ()).throw(Exception("canonical primary path changed after stage commit")),
+        lambda _runtime, **_kwargs: (_ for _ in ()).throw(Exception("canonical primary path changed after stage commit")),
     )
     with pytest.raises(Exception, match="canonical primary path changed after stage commit"):
         stage_process_observation(round_id="round", plan_id="plan")
@@ -452,3 +457,101 @@ def test_completed_replay_returns_primary_row_without_live_collection(tmp_path, 
     monkeypatch.setattr(module, "capture_process_identity", lambda _pid: (_ for _ in ()).throw(AssertionError("exited process must not be recollected")))
     monkeypatch.setattr(module, "_open_runtime_authority", lambda _round: (_ for _ in ()).throw(AssertionError("runtime must not open on completed replay")))
     assert module.record_process_observation(round_id="round", plan_id="plan") == {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": "round", "observationId": "a", "observationDigest": "b" * 64, "planDigest": "c" * 64, "recordedAt": "completed"}
+
+
+def test_record_uses_primary_only_when_live_runtime_has_vanished(tmp_path, monkeypatch):
+    module = __import__("overseer.psychlo_process_attestation", fromlist=["module"])
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    stage_process_observation(round_id="round", plan_id="plan")
+    plan = runtime.primary.load_admin_change_plan("plan")
+    runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:02+00:00"))
+    monkeypatch.setattr(module, "_open_runtime_authority", lambda _round: (_ for _ in ()).throw(AssertionError("vanished runtime must not open")))
+    monkeypatch.setattr(module, "_assert_runtime_source_integrity", lambda: (_ for _ in ()).throw(AssertionError("record must not read source")))
+    result = record_process_observation(round_id="round", plan_id="plan")
+    assert result["recorded"] is True and result["authoritative"] is False
+
+
+def test_stage_reconciles_prepared_snapshot_before_runtime_or_clock(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    first = stage_process_observation(round_id="round", plan_id="plan")
+    collect_calls = runtime.collector.collect_calls
+    monkeypatch.setattr(module, "_open_runtime_authority", lambda _round: (_ for _ in ()).throw(AssertionError("stage replay must not open runtime")))
+    monkeypatch.setattr(module, "_assert_runtime_source_integrity", lambda: (_ for _ in ()).throw(AssertionError("stage replay must not read source")))
+    replay = stage_process_observation(round_id="round", plan_id="plan")
+    assert replay["replayed"] is True
+    assert replay["observationDigest"] == first["observationDigest"]
+    assert runtime.collector.collect_calls == collect_calls
+
+
+def test_finalize_reports_approved_prepared_without_claiming_recorded(tmp_path, monkeypatch):
+    from overseer.psychlo_process_attestation import finalize_process_observation
+
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    stage_process_observation(round_id="round", plan_id="plan")
+    plan = runtime.primary.load_admin_change_plan("plan")
+    runtime.primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", "2099-01-01T00:00:02+00:00"))
+    result = finalize_process_observation(plan_id="plan")
+    assert result["approved"] is True and result["prepared"] is True
+    assert result["recorded"] is False and result["finalized"] is False
+    assert result["status"] == "approved-prepared"
+
+
+def test_postcommit_missing_wal_shm_requires_exact_readonly_visibility(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    primary_path = tmp_path / "primary.sqlite3"
+    primary = SQLiteStore(primary_path)
+    primary._connection.execute("INSERT INTO admin_change_plans(id,payload) VALUES ('plan','{}')")
+    primary._connection.execute("INSERT INTO psychlo_process_observations VALUES ('a','round','plan','" + "b" * 64 + "','', 'prepared','" + json.dumps(_manifest()) + "','inserted',NULL)")
+    primary._connection.commit()
+    primary._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    fd = os.open(primary_path, os.O_RDWR | os.O_NOFOLLOW)
+    metadata = os.fstat(fd)
+    sidecar_wal = tmp_path / "primary.sqlite3-wal"
+    sidecar_shm = tmp_path / "primary.sqlite3-shm"
+    sidecar_wal.write_bytes(b"wal")
+    sidecar_shm.write_bytes(b"shm")
+    runtime = SimpleNamespace(
+        primary=primary, primary_fd=fd,
+        primary_identity=(metadata.st_dev, metadata.st_ino),
+    )
+    module._register_verified_connection(primary._connection, fd)
+    monkeypatch.setattr(module, "CANONICAL_PRIMARY_DATABASE", primary_path)
+    runtime.primary._sidecar_identities = {
+        "-wal": (sidecar_wal.stat().st_dev, sidecar_wal.stat().st_ino),
+        "-shm": (sidecar_shm.stat().st_dev, sidecar_shm.stat().st_ino),
+    }
+    sidecar_wal.unlink(); sidecar_shm.unlink()
+    try:
+        module._revalidate_primary_database_after_commit(
+            runtime, round_id="round", plan_id="plan", state="prepared",
+            observation_digest="b" * 64, plan_digest="",
+        )
+    finally:
+        module._forget_verified_connection(primary._connection)
+        os.close(fd)
+        primary._connection.close()
+
+
+def test_postcommit_missing_wal_shm_fails_when_exact_row_is_not_visible(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    primary_path = tmp_path / "primary.sqlite3"
+    primary = SQLiteStore(primary_path)
+    fd = os.open(primary_path, os.O_RDWR | os.O_NOFOLLOW)
+    metadata = os.fstat(fd)
+    runtime = SimpleNamespace(primary=primary, primary_fd=fd, primary_identity=(metadata.st_dev, metadata.st_ino), primary_sidecars={})
+    module._register_verified_connection(primary._connection, fd)
+    monkeypatch.setattr(module, "CANONICAL_PRIMARY_DATABASE", primary_path)
+    try:
+        with pytest.raises(module.ProcessAttestationError, match="not visible"):
+            module._revalidate_primary_database_after_commit(
+                runtime, round_id="round", plan_id="plan", state="prepared",
+                observation_digest="b" * 64, plan_digest="",
+            )
+    finally:
+        module._forget_verified_connection(primary._connection)
+        os.close(fd)
+        primary._connection.close()

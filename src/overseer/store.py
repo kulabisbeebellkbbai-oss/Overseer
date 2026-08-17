@@ -2473,14 +2473,14 @@ class SQLiteStore:
         if row[5] == "recorded":
             if row[4] != plan_digest:
                 raise ValueError("recorded process observation replay identity changed")
-            return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "planDigest": row[4], "state": row[5]}
+            return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "planDigest": row[4], "recordedAt": row[8], "state": row[5]}
         self._connection.execute(
             "UPDATE psychlo_process_observations SET plan_digest=?,state='recorded',recorded_at=? WHERE round_id=? AND state='prepared' AND observation_digest=? AND plan_id=?",
             (plan_digest, recorded_at, round_id, observation_digest, plan_id),
         )
         if self._connection.execute("SELECT changes()").fetchone()[0] != 1:
             raise ValueError("process observation changed before recording")
-        return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "planDigest": plan_digest, "state": "recorded"}
+        return {"observationId": row[0], "roundId": row[1], "planId": row[2], "observationDigest": row[3], "planDigest": plan_digest, "recordedAt": recorded_at, "state": "recorded"}
 
     def _ensure_roadex_approval_bindings(self) -> None:
         self._connection.execute(

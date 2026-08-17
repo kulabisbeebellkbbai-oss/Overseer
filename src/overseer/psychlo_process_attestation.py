@@ -3,7 +3,7 @@
 This module deliberately has no terminal-input, tmux-send, process-kill, or
 round-projection operation.  It records an independently revalidated identity
 snapshot in the canonical primary database only.  The resulting record is
-historical evidence, never current authority: no consumer may use it to
+historical evidence, never authorization: no consumer may use it to
 recover, dispatch, send input, kill, or otherwise mutate a live process.
 Any future recovery requires a separate high-risk human/Sisko plan and fresh-live
 validation.
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import os
@@ -40,7 +41,7 @@ _TMUX = "/usr/bin/tmux"
 _GIT = "/usr/bin/git"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
-# Process attestation is an authority operation, not a configurable adapter.
+# Historical observation is a fixed non-authoritative operation, not a configurable adapter.
 # These are the only accepted live endpoints.  Tests may replace this whole
 # resolver before constructing an internal runtime, but no public operation
 # accepts endpoint or evidence arguments.
@@ -53,6 +54,7 @@ CANONICAL_SOURCE_ROOT = Path("/home/god/.local/share/overseer/project")
 CANONICAL_SOURCE_REAL_ROOT = Path("/home/god/Documents/Codex Workspace/Overseer")
 CANONICAL_CODEX_RELEASES = Path("/home/god/.codex/packages/standalone/releases")
 CANONICAL_CODEX_MEMORY_SESSION = "/home/god/.local/bin/codex-memory-session"
+CANONICAL_CODEX_MEMORY_SESSION_TRAMPOLINE = Path("/home/god/.codex/skills/private-ai-memory/scripts/codex-session-with-memory.sh")
 CANONICAL_CODEX_MEMORY_SESSION_SCRIPT = Path("/home/god/Documents/Private AI Memory Storage System/scripts/codex-session-with-memory.sh")
 
 # A connection opened through a prevalidated `/proc/self/fd/N` URI is bound to
@@ -84,6 +86,21 @@ def _validate_runtime_path(path: Path, *, label: str, regular: bool = True) -> t
     """Validate a fixed runtime artifact without resolving caller-selected links."""
     if not path.is_absolute() or path.is_symlink():
         raise ProcessAttestationError(f"{label} path is not canonical")
+    _validate_trusted_parent_chain(path, label)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ProcessAttestationError(f"{label} does not exist") from error
+    if regular and (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_nlink != 1):
+        raise ProcessAttestationError(f"{label} is not a unique owned regular file")
+    if not regular and (not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid()):
+        raise ProcessAttestationError(f"{label} is not a trusted socket")
+    if stat.S_IMODE(metadata.st_mode) & 0o002:
+        raise ProcessAttestationError(f"{label} is world-writable")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _validate_trusted_parent_chain(path: Path, label: str) -> None:
     current = Path("/")
     for component in path.parts[1:-1]:
         current /= component
@@ -96,19 +113,9 @@ def _validate_runtime_path(path: Path, *, label: str, regular: bool = True) -> t
         user_private = (metadata.st_uid == os.getuid() and metadata.st_gid == os.getegid()
                         and not (stat.S_IMODE(metadata.st_mode) & 0o002)
                         and (not stat.S_IMODE(metadata.st_mode) & 0o020 or _private_group_is_safe(metadata.st_gid)))
-        if not stat.S_ISDIR(metadata.st_mode) or (not sticky_shared and not system_private and not user_private):
+        if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode)
+                or (not sticky_shared and not system_private and not user_private)):
             raise ProcessAttestationError(f"{label} parent is not a trusted private-group directory")
-    try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise ProcessAttestationError(f"{label} does not exist") from error
-    if regular and (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_nlink != 1):
-        raise ProcessAttestationError(f"{label} is not a unique owned regular file")
-    if not regular and (not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid()):
-        raise ProcessAttestationError(f"{label} is not a trusted socket")
-    if stat.S_IMODE(metadata.st_mode) & 0o002:
-        raise ProcessAttestationError(f"{label} is world-writable")
-    return metadata.st_dev, metadata.st_ino
 
 
 @dataclass
@@ -125,12 +132,22 @@ class _RuntimeAuthority:
         self.collector.release_held_identities()
         _forget_verified_connection(self.bridge.store.connection)
         _forget_verified_connection(self.primary._connection)
-        self.bridge.close()
+        close_error: Exception | None = None
+        try:
+            self.bridge.store.close()
+        except Exception as error:
+            close_error = error
+        try:
+            self.primary._connection.close()
+        except Exception as error:
+            close_error = close_error or error
         for fd in (self.bridge_fd, self.primary_fd):
             try:
                 os.close(fd)
             except OSError:
                 pass
+        if close_error is not None:
+            raise close_error
 
 
 def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
@@ -368,8 +385,31 @@ def _private_workspace_mode(metadata: os.stat_result) -> bool:
             and (not bits & 0o020 or _private_group_is_safe(metadata.st_gid)))
 
 
-def _private_group_file_digest(path: Path, label: str) -> tuple[str, os.stat_result]:
-    """Digest a private-primary-group file through one no-follow descriptor."""
+def _parse_utc_timestamp(value: Any, label: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ProcessAttestationError(f"{label} timestamp is required")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ProcessAttestationError(f"{label} timestamp is not parseable") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ProcessAttestationError(f"{label} timestamp must be UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def _observation_clock(bridge: Any) -> str:
+    clock = getattr(getattr(bridge, "store", None), "clock", None)
+    if not callable(clock):
+        clock = getattr(bridge, "clock", None)
+    if not callable(clock):
+        raise ProcessAttestationError("observation clock is unavailable")
+    value = clock()
+    _parse_utc_timestamp(value, "observation")
+    return value
+
+
+def _private_group_file_content(path: Path, label: str) -> tuple[bytes, os.stat_result]:
+    """Read a private-primary-group file through one no-follow descriptor."""
     if not path.is_absolute() or path.is_symlink():
         raise ProcessAttestationError(f"{label} path is not canonical")
     try:
@@ -392,15 +432,101 @@ def _private_group_file_digest(path: Path, label: str) -> tuple[str, os.stat_res
                         after.st_gid, after.st_nlink, after.st_size,
                         after.st_mtime_ns, after.st_ctime_ns):
             raise ProcessAttestationError(f"{label} changed during digest")
-        return sha256(b"".join(chunks)).hexdigest(), before
+        try:
+            path_after = path.lstat()
+        except OSError as error:
+            raise ProcessAttestationError(f"{label} path cannot be revalidated") from error
+        if (before.st_dev, before.st_ino, before.st_nlink, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns) != (path_after.st_dev,
+                path_after.st_ino, path_after.st_nlink, path_after.st_size,
+                path_after.st_mtime_ns, path_after.st_ctime_ns):
+            raise ProcessAttestationError(f"{label} path changed during read")
+        return b"".join(chunks), before
     except OSError as error:
         raise ProcessAttestationError(f"{label} cannot be read safely") from error
     finally:
         os.close(fd)
 
 
+def _private_group_file_digest(path: Path, label: str) -> tuple[str, os.stat_result]:
+    content, metadata = _private_group_file_content(path, label)
+    return sha256(content).hexdigest(), metadata
+
+
+def _canonical_link_identity(path: Path, target: Path, label: str) -> dict[str, Any]:
+    if not path.is_absolute() or not path.is_symlink() or not target.is_absolute():
+        raise ProcessAttestationError(f"{label} link is not canonical")
+    _validate_trusted_parent_chain(path, label)
+    try:
+        metadata = path.lstat()
+        target_text = os.readlink(path)
+        resolved = path.resolve(strict=True)
+        after = path.lstat()
+        after_text = os.readlink(path)
+    except OSError as error:
+        raise ProcessAttestationError(f"{label} link cannot be read safely") from error
+    if (not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1 or resolved != target or target_text != str(target)):
+        raise ProcessAttestationError(f"{label} target or ownership is unsafe")
+    if ((metadata.st_dev, metadata.st_ino, metadata.st_nlink, metadata.st_uid) !=
+            (after.st_dev, after.st_ino, after.st_nlink, after.st_uid) or after_text != target_text):
+        raise ProcessAttestationError(f"{label} link changed during identity capture")
+    return {"path": str(path), "target": str(target), "dev": metadata.st_dev,
+            "ino": metadata.st_ino, "nlink": metadata.st_nlink,
+            "uid": metadata.st_uid, "digest": sha256(target_text.encode()).hexdigest()}
+
+
+def _file_identity(path: Path, label: str, *, executable: bool = False) -> dict[str, Any]:
+    _validate_runtime_path(path, label=label)
+    digest, metadata = _private_group_file_digest(path, label)
+    if executable and not os.access(path, os.X_OK):
+        raise ProcessAttestationError(f"{label} is not executable")
+    return {"path": str(path), "dev": metadata.st_dev, "ino": metadata.st_ino,
+            "nlink": metadata.st_nlink, "uid": metadata.st_uid,
+            "gid": metadata.st_gid, "mode": stat.S_IMODE(metadata.st_mode),
+            "digest": digest}
+
+
+def _capture_launcher_chain(pane_pid: int, process_binding: Mapping[str, str]) -> dict[str, Any]:
+    """Bind launcher -> skill trampoline -> reviewed Documents wrapper."""
+    launcher = Path(process_binding["launcher"])
+    launcher_identity = _file_identity(launcher, "canonical launcher", executable=True)
+    if launcher_identity["digest"] != process_binding["launcherDigest"]:
+        raise ProcessAttestationError("canonical launcher identity changed")
+    launcher_bytes, _ = _private_group_file_content(launcher, "canonical launcher")
+    if CANONICAL_CODEX_MEMORY_SESSION.encode() not in launcher_bytes:
+        raise ProcessAttestationError("canonical launcher does not bind the memory-session chain")
+    memory_session = Path(CANONICAL_CODEX_MEMORY_SESSION)
+    link_identity = _canonical_link_identity(memory_session, CANONICAL_CODEX_MEMORY_SESSION_TRAMPOLINE, "memory-session")
+    trampoline_identity = _file_identity(CANONICAL_CODEX_MEMORY_SESSION_TRAMPOLINE, "memory-session trampoline", executable=True)
+    wrapper_identity = _file_identity(CANONICAL_CODEX_MEMORY_SESSION_SCRIPT, "memory-session wrapper", executable=True)
+    expected_root = CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.parent.parent
+    expected_trampoline = (
+        "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+        f'project_root="${{MEMORY_VAULT_PROJECT:-{expected_root}}}"\n'
+        'exec "${project_root}/scripts/codex-session-with-memory.sh" "$@"\n'
+    ).encode()
+    trampoline_bytes, _ = _private_group_file_content(CANONICAL_CODEX_MEMORY_SESSION_TRAMPOLINE, "memory-session trampoline")
+    if trampoline_bytes != expected_trampoline:
+        raise ProcessAttestationError("memory-session trampoline does not bind the reviewed Documents wrapper")
+    raw_cmdline = _read_proc_bytes(Path(f"/proc/{pane_pid}/cmdline"))
+    argv = raw_cmdline.split(b"\0")[:-1]
+    expected_tail = [CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.as_posix().encode(), b"resume",
+                     process_binding["conversationId"].encode(), b"--cd",
+                     process_binding["workspace"].encode()]
+    if len(argv) != len(expected_tail) + 1 or argv[0] not in {b"bash", b"/usr/bin/bash"} or argv[1:] != expected_tail:
+        raise ProcessAttestationError("tmux pane does not execute the exact reviewed memory-session wrapper")
+    raw_environment = _read_proc_bytes(Path(f"/proc/{pane_pid}/environ"))
+    overrides = [entry.split(b"=", 1)[1].decode(errors="strict") for entry in raw_environment.split(b"\0") if entry.startswith(b"MEMORY_VAULT_PROJECT=")]
+    if overrides and overrides != [str(expected_root)]:
+        raise ProcessAttestationError("memory-session environment override is unsafe")
+    return {"launcher": launcher_identity, "memorySession": link_identity,
+            "trampoline": trampoline_identity, "wrapper": wrapper_identity,
+            "paneArgvDigest": sha256(raw_cmdline).hexdigest()}
+
+
 def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -> None:
-    """Bind the pane shell and registry launcher, including file identity."""
+    """Bind the pane shell and complete launcher chain, including file identity."""
     try:
         pane_executable = Path(os.readlink(Path(f"/proc/{pane_pid}/exe")))
     except OSError as error:
@@ -411,56 +537,7 @@ def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -
     pane_identity = capture_process_identity(pane_pid)
     if pane_identity["exeDigest"] != pane_digest or pane_meta.st_nlink != 1:
         raise ProcessAttestationError("tmux pane shell identity changed")
-    launcher = Path(process_binding["launcher"])
-    if not launcher.is_absolute() or launcher.is_symlink():
-        raise ProcessAttestationError("canonical launcher path is not trusted")
-    try:
-        launcher_meta = launcher.lstat()
-        if (not stat.S_ISREG(launcher_meta.st_mode) or launcher_meta.st_uid != os.getuid()
-                or launcher_meta.st_nlink != 1 or stat.S_IMODE(launcher_meta.st_mode) & 0o022):
-            raise ProcessAttestationError("canonical launcher ownership or mode is unsafe")
-        launcher_digest, snapshot = _trusted_executable_snapshot(launcher)
-        if launcher_digest != process_binding["launcherDigest"] or (snapshot.st_dev, snapshot.st_ino) != (launcher_meta.st_dev, launcher_meta.st_ino):
-            raise ProcessAttestationError("canonical launcher identity changed")
-        fd = os.open(str(launcher), os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            before = os.fstat(fd)
-            launcher_bytes = b""
-            while chunk := os.read(fd, 1 << 20):
-                launcher_bytes += chunk
-            after = os.fstat(fd)
-        finally:
-            os.close(fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-            raise ProcessAttestationError("canonical launcher changed during read")
-    except OSError as error:
-        raise ProcessAttestationError("canonical launcher cannot be read safely") from error
-    if CANONICAL_CODEX_MEMORY_SESSION.encode() not in launcher_bytes:
-        raise ProcessAttestationError("canonical launcher does not bind the memory-session chain")
-    memory_session = Path(CANONICAL_CODEX_MEMORY_SESSION)
-    if not memory_session.is_symlink():
-        raise ProcessAttestationError("memory-session wrapper is not the canonical link")
-    try:
-        if memory_session.resolve(strict=True) != CANONICAL_CODEX_MEMORY_SESSION_SCRIPT:
-            raise ProcessAttestationError("memory-session wrapper target is not reviewed")
-        _validate_runtime_path(CANONICAL_CODEX_MEMORY_SESSION_SCRIPT, label="memory-session wrapper")
-        wrapper_digest, wrapper_meta = _private_group_file_digest(
-            CANONICAL_CODEX_MEMORY_SESSION_SCRIPT, "memory-session wrapper"
-        )
-        # The pane must execute this exact reviewed wrapper path, not merely a
-        # basename or the compatibility symlink target.  The wrapper digest is
-        # deliberately checked from the same descriptor used for its identity.
-        raw_cmdline = _read_proc_bytes(Path(f"/proc/{pane_pid}/cmdline"))
-        argv = raw_cmdline.split(b"\0")[:-1]
-        conversation = process_binding["conversationId"].encode("utf-8")
-        workspace = process_binding["workspace"].encode("utf-8")
-        expected_tail = [CANONICAL_CODEX_MEMORY_SESSION_SCRIPT.as_posix().encode(), b"resume", conversation, b"--cd", workspace]
-        if len(argv) != len(expected_tail) + 1 or argv[0] not in {b"bash", b"/usr/bin/bash"} or argv[1:] != expected_tail:
-            raise ProcessAttestationError("tmux pane does not execute the exact reviewed memory-session wrapper")
-        if not wrapper_digest or wrapper_meta.st_nlink != 1:
-            raise ProcessAttestationError("memory-session wrapper identity is incomplete")
-    except OSError as error:
-        raise ProcessAttestationError("memory-session wrapper cannot be verified") from error
+    _capture_launcher_chain(pane_pid, process_binding)
 
 
 @dataclass(frozen=True)
@@ -512,14 +589,14 @@ class AuthoritativeProcessEvidenceCollector:
             object.__setattr__(self, "_held_socket_identity", (socket_meta.st_dev, socket_meta.st_ino))
         except OSError as error:
             self.release_held_identities()
-            raise ProcessAttestationError("tmux socket identity cannot be held through attestation") from error
+            raise ProcessAttestationError("tmux socket identity cannot be held through observation") from error
         for identity in (tmux["serverProcess"], tmux["paneProcess"], child):
             try:
                 self._held_pidfds.append(os.pidfd_open(int(identity["pid"])))
                 self._held_proc_fds.append(os.open(f"/proc/{int(identity['pid'])}", getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW))
             except (AttributeError, OSError) as error:
                 self.release_held_identities()
-                raise ProcessAttestationError("process identity cannot be held through attestation") from error
+                raise ProcessAttestationError("process identity cannot be held through observation") from error
 
     def revalidate_held_identities(self) -> None:
         if len(self._held_pidfds) != 3 or len(self._held_proc_fds) != 3:
@@ -539,16 +616,9 @@ class AuthoritativeProcessEvidenceCollector:
                 poller = select.poll()
                 poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
                 if poller.poll(0):
-                    raise ProcessAttestationError("held process identity exited during attestation")
+                    raise ProcessAttestationError("held process identity exited during observation")
             except OSError as error:
                 raise ProcessAttestationError("held process identity became invalid") from error
-
-    def revalidate_exact(self, round_id: str, plan_id: str, expected: Mapping[str, Any]) -> None:
-        """Re-read every mutable source immediately before primary commit."""
-        latest = self.collect(round_id, plan_id)
-        if manifest_digest(_manifest(latest, round_id)) != manifest_digest(expected) or _manifest(latest, round_id) != dict(expected):
-            raise ProcessAttestationError("process, rollout, registry, or source evidence changed before commit")
-        self.revalidate_held_identities()
 
     def __post_init__(self) -> None:
         if not hasattr(self.bridge, "store") or not isinstance(self.tmux_socket, str) or not self.tmux_socket.startswith("/") or not isinstance(self.tmux_target, str):
@@ -560,6 +630,7 @@ class AuthoritativeProcessEvidenceCollector:
     def collect(self, round_id: str, plan_id: str) -> dict[str, Any]:
         if not isinstance(round_id, str) or not round_id.strip() or not isinstance(plan_id, str) or not plan_id.strip():
             raise ProcessAttestationError("round and plan identities are required")
+        observed_window_start = _observation_clock(self.bridge)
         record = self.bridge.store.get_round(round_id)
         if record is None:
             raise ProcessAttestationError("round is missing")
@@ -630,14 +701,16 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("rollout evidence changed during collection")
         if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_command=expected_start) != tmux:
             raise ProcessAttestationError("tmux identity changed during collection")
-        observed_at = (self.bridge.store.clock() if callable(getattr(self.bridge.store, "clock", None)) else self.bridge.clock())
+        observed_window_end = _observation_clock(self.bridge)
+        if _parse_utc_timestamp(observed_window_start, "observation start") > _parse_utc_timestamp(observed_window_end, "observation end"):
+            raise ProcessAttestationError("observation window is not chronological")
         started_at = (self.bridge.store.round_timing(round_id) or {}).get("startedAt")
         return {
             "schemaVersion": SCHEMA, "observationId": f"observation-{round_id}", "roundId": round_id,
             "requestDigest": request_digest,
             "startedAt": started_at,
             "historical": True, "authoritative": False, "executable": False,
-            "observedWindowStart": started_at, "observedWindowEnd": observed_at, "recordedAt": observed_at,
+            "observedWindowStart": observed_window_start, "observedWindowEnd": observed_window_end,
             "registry": {"pathDigest": registry_meta["digest"], "rowDigest": canonical_digest(dict(process_binding)), "conversationId": process_binding["conversationId"], "sessionId": process_binding["sessionId"], "workspaceDigest": sha256(process_binding["workspace"].encode()).hexdigest(), "commandDigest": sha256(process_binding["command"].encode()).hexdigest(), "launcherDigest": process_binding["launcherDigest"], "canonicalPathDigest": capture_private_file_digest(process_binding["registryPath"])},
             "tmux": tmux, "process": {"pane": tmux["paneProcess"], "codexChild": child},
             "rollout": scan, "bridge": bridge_state,
@@ -670,7 +743,7 @@ def plan_psychlo_legacy_process_observation(*args: Any, **kwargs: Any) -> AdminC
 
 def _open_private(path: Path) -> tuple[int, os.stat_result, os.stat_result]:
     if not path.is_absolute() or path.is_symlink():
-        raise ProcessAttestationError("attestation path must be absolute and not a symlink")
+        raise ProcessAttestationError("observation path must be absolute and not a symlink")
     flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
     parent = os.open("/", flags)
     try:
@@ -681,7 +754,7 @@ def _open_private(path: Path) -> tuple[int, os.stat_result, os.stat_result]:
             unsafe_group_write = (parent_stat.st_mode & 0o020) and not _private_group_is_safe(parent_stat.st_gid)
             if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid not in {0, os.getuid()} or ((parent_stat.st_mode & 0o002) and not sticky_shared) or (unsafe_group_write and not sticky_shared):
                 os.close(child)
-                raise ProcessAttestationError("attestation parent is not private")
+                raise ProcessAttestationError("observation parent is not private")
             os.close(parent)
             parent = child
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
@@ -690,11 +763,11 @@ def _open_private(path: Path) -> tuple[int, os.stat_result, os.stat_result]:
     before = os.fstat(fd)
     if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) & 0o077:
         os.close(fd)
-        raise ProcessAttestationError("attestation file is not a private regular file")
+        raise ProcessAttestationError("observation file is not a private regular file")
     path_stat = os.stat(path, follow_symlinks=False)
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (path_stat.st_dev, path_stat.st_ino, path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_ctime_ns):
         os.close(fd)
-        raise ProcessAttestationError("attestation file changed during open")
+        raise ProcessAttestationError("observation file changed during open")
     return fd, before, path_stat
 
 
@@ -708,13 +781,13 @@ def read_private_json(path: str | Path, *, expected_digest: str | None = None) -
         after = os.fstat(fd)
         digest = sha256(content).hexdigest()
         if before != after or expected_digest is not None and digest != expected_digest:
-            raise ProcessAttestationError("attestation file changed during read")
+            raise ProcessAttestationError("observation file changed during read")
         try:
             value = json.loads(content.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ProcessAttestationError("attestation JSON is invalid") from error
+            raise ProcessAttestationError("observation JSON is invalid") from error
         if not isinstance(value, dict):
-            raise ProcessAttestationError("attestation JSON must be an object")
+            raise ProcessAttestationError("observation JSON must be an object")
         metadata = {"dev": before.st_dev, "ino": before.st_ino, "size": before.st_size, "mtime": before.st_mtime_ns, "ctime": before.st_ctime_ns, "digest": digest}
         return value, metadata
     finally:
@@ -793,14 +866,14 @@ def capture_source_identity(source_root: str | Path) -> dict[str, str]:
     try:
         module.relative_to(root.resolve())
     except ValueError as error:
-        raise ProcessAttestationError("loaded attestation module is outside the source root") from error
+        raise ProcessAttestationError("loaded observation module is outside the source root") from error
     module_meta = module.stat(follow_symlinks=False)
     if module_meta.st_uid != os.getuid() or stat.S_IMODE(module_meta.st_mode) & 0o022:
-        raise ProcessAttestationError("loaded attestation module is not trusted")
+        raise ProcessAttestationError("loaded observation module is not trusted")
     try:
         module_bytes = module.read_bytes()
     except OSError as error:
-        raise ProcessAttestationError("loaded attestation module cannot be read") from error
+        raise ProcessAttestationError("loaded observation module cannot be read") from error
     try:
         git_meta = executable.stat(follow_symlinks=False)
         if not stat.S_ISREG(git_meta.st_mode) or git_meta.st_uid != 0 or stat.S_IMODE(git_meta.st_mode) & 0o022:
@@ -853,14 +926,17 @@ def _validate_redacted(value: Any, *, path: str = "manifest") -> None:
 
 
 def _manifest(value: Mapping[str, Any], round_id: str) -> dict[str, Any]:
-    if set(value) != {"schemaVersion", "observationId", "roundId", "requestDigest", "startedAt", "historical", "authoritative", "executable", "observedWindowStart", "observedWindowEnd", "recordedAt", "registry", "tmux", "process", "rollout", "bridge", "approval", "source"}:
+    if set(value) != {"schemaVersion", "observationId", "roundId", "requestDigest", "startedAt", "historical", "authoritative", "executable", "observedWindowStart", "observedWindowEnd", "registry", "tmux", "process", "rollout", "bridge", "approval", "source"}:
         raise ProcessAttestationError("manifest fields are not exact")
     if value.get("schemaVersion") != SCHEMA or value.get("roundId") != round_id:
         raise ProcessAttestationError("manifest identity is invalid")
     _validate_redacted(value)
     if not isinstance(value.get("observationId"), str) or not value["observationId"].strip() or value.get("historical") is not True or value.get("authoritative") is not False or value.get("executable") is not False:
         raise ProcessAttestationError("historical observation flags are invalid")
-    if not isinstance(value.get("startedAt"), str) or not value["startedAt"].strip() or value.get("observedWindowStart") != value.get("startedAt") or not isinstance(value.get("observedWindowEnd"), str) or not value["observedWindowEnd"].strip() or value.get("recordedAt") != value.get("observedWindowEnd"):
+    started_at = _parse_utc_timestamp(value.get("startedAt"), "round start")
+    observed_start = _parse_utc_timestamp(value.get("observedWindowStart"), "observation start")
+    observed_end = _parse_utc_timestamp(value.get("observedWindowEnd"), "observation end")
+    if started_at > observed_start or observed_start > observed_end:
         raise ProcessAttestationError("round start identity is invalid")
     for key in ("requestDigest",):
         if not isinstance(value.get(key), str) or not _HEX64.fullmatch(value[key]):
@@ -939,13 +1015,13 @@ def _assert_exact_plan(primary: SQLiteStore, plan_id: str, round_id: str, manife
 
 
 def _assert_runtime_source_integrity() -> None:
-    """Ensure the loaded attestation module is the reviewed runtime source."""
+    """Ensure the loaded observation module is the reviewed runtime source."""
     module = Path(__file__).resolve()
     root = _resolve_canonical_source_root()
     try:
         module.relative_to(root)
     except ValueError as error:
-        raise ProcessAttestationError("loaded process attestation module is outside canonical source") from error
+        raise ProcessAttestationError("loaded process observation module is outside canonical source") from error
     capture_source_identity(root)
 
 
@@ -983,15 +1059,17 @@ def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
                     raise ProcessAttestationError("staged process plan lifecycle is not mutable")
             primary.insert_prepared_process_observation(
                 observation_id=str(value["observationId"]), round_id=round_id, plan_id=plan_id,
-                observation_digest=digest, manifest=value, inserted_at=runtime.bridge.clock(),
+                observation_digest=digest, manifest=value, inserted_at=_observation_clock(runtime.bridge),
             )
+            _revalidate_runtime_databases(runtime)
             primary._connection.commit()
+            _revalidate_primary_database_after_commit(runtime)
         except Exception:
             primary._connection.rollback()
             raise
         return {"staged": True, "historical": True, "authoritative": False, "executable": False, "roundId": round_id, "planId": plan_id, "observationDigest": digest}
     except Exception as error:
-        raise ProcessAttestationError("authoritative evidence collection failed") from error
+        raise ProcessAttestationError(str(error)) from error
     finally:
         runtime.close()
 
@@ -1159,7 +1237,7 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
     parent_after = capture_process_identity(parent_pid)
     child_after = capture_process_identity(children[0])
     if after != children or parent_after["startTicks"] != parent_before["startTicks"] or parent_after["exeDigest"] != parent_before["exeDigest"] or child_after["startTicks"] != identity["startTicks"] or child_after["exeDigest"] != identity["exeDigest"] or child_after["cgroupDigest"] != identity["cgroupDigest"]:
-        raise ProcessAttestationError("direct child changed during attestation")
+        raise ProcessAttestationError("direct child changed during observation")
     identity["parentPid"] = parent_pid
     return identity
 
@@ -1188,7 +1266,7 @@ def capture_socket_identity(socket_path: str | Path) -> dict[str, Any]:
     except OSError as error:
         raise ProcessAttestationError("tmux socket identity cannot be established") from error
     if (before.st_dev, before.st_ino, before.st_mode, before.st_uid) != (after.st_dev, after.st_ino, after.st_mode, after.st_uid):
-        raise ProcessAttestationError("tmux socket changed during attestation")
+        raise ProcessAttestationError("tmux socket changed during observation")
     return {"dev": before.st_dev, "ino": before.st_ino, "mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid}
 
 
@@ -1214,7 +1292,7 @@ def capture_tmux_identity(socket_path: str, target: str, *, expected_command: st
     sessions_stdout, panes_stdout = query()
     sessions_again, panes_again = query()
     if (sessions_stdout, panes_stdout) != (sessions_again, panes_again):
-        raise ProcessAttestationError("tmux identity changed during attestation")
+        raise ProcessAttestationError("tmux identity changed during observation")
     if capture_socket_identity(socket_path) != socket_identity:
         raise ProcessAttestationError("tmux identity query failed")
     rows = [line.split("|") for line in panes_stdout.splitlines() if len(line.split("|")) in {4, 5, 6}]
@@ -1289,37 +1367,41 @@ def record_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]
     primary_connection = runtime.primary._connection
     try:
         bridge_connection.execute("BEGIN IMMEDIATE")
-        fresh = runtime.collector.collect(round_id, plan_id)
-        fresh_again = runtime.collector.collect(round_id, plan_id)
-        if manifest_digest(fresh) != manifest_digest(fresh_again) or fresh != fresh_again:
-            raise ProcessAttestationError("process evidence changed before publication")
-        manifest = _manifest(fresh_again, round_id)
-        digest = manifest_digest(manifest)
-        _validate_bridge_round(runtime.bridge.store, round_id, manifest)
         primary_connection.execute("BEGIN IMMEDIATE")
         try:
-            _revalidate_runtime_databases(runtime)
-            plan = _assert_exact_plan(runtime.primary, plan_id, round_id, manifest, approved=True)
-            row = primary_connection.execute("SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json FROM psychlo_process_observations WHERE round_id=?", (round_id,)).fetchone()
-            encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
+            row = primary_connection.execute("SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,recorded_at FROM psychlo_process_observations WHERE round_id=?", (round_id,)).fetchone()
             if row is None:
                 raise ProcessAttestationError("prepared process observation is missing")
-            if tuple(row[1:4]) != (round_id, plan_id, digest) or row[6] != encoded or row[5] != "prepared":
+            try:
+                manifest = _manifest(json.loads(row[6]), round_id)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ProcessAttestationError("prepared process observation snapshot is invalid") from error
+            digest = manifest_digest(manifest)
+            encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
+            if tuple(row[1:4]) != (round_id, plan_id, digest) or row[6] != encoded:
                 raise ProcessAttestationError("prepared process observation identity changed")
-            plan_digest = admin_plan_digest(plan)
-            revalidate = getattr(runtime.collector, "revalidate_exact", None)
-            if callable(revalidate):
-                revalidate(round_id, plan_id, manifest)
-            else:
-                runtime.collector.revalidate_held_identities()
+            if row[5] == "recorded":
+                primary_connection.rollback()
+                _revalidate_primary_database_after_commit(runtime)
+                bridge_connection.commit()
+                return {"recorded": True, "historical": True, "authoritative": False, "executable": False,
+                        "roundId": round_id, "observationId": row[0], "observationDigest": row[3],
+                        "planDigest": row[4], "recordedAt": row[7]}
+            if row[5] != "prepared":
+                raise ProcessAttestationError("prepared process observation state is invalid")
+            _validate_bridge_round(runtime.bridge.store, round_id, manifest)
             _revalidate_runtime_databases(runtime)
-            result = runtime.primary.record_process_observation(round_id=round_id, plan_id=plan_id, observation_digest=digest, plan_digest=plan_digest, recorded_at=runtime.bridge.clock())
+            plan = _assert_exact_plan(runtime.primary, plan_id, round_id, manifest, approved=True)
+            plan_digest = admin_plan_digest(plan)
+            _revalidate_runtime_databases(runtime)
+            result = runtime.primary.record_process_observation(round_id=round_id, plan_id=plan_id, observation_digest=digest, plan_digest=plan_digest, recorded_at=_observation_clock(runtime.bridge))
             primary_connection.commit()
+            _revalidate_primary_database_after_commit(runtime)
         except Exception:
             primary_connection.rollback()
             raise
         bridge_connection.commit()
-        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": round_id, "observationId": result["observationId"], "observationDigest": result["observationDigest"], "planDigest": result["planDigest"]}
+        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": round_id, "observationId": result["observationId"], "observationDigest": result["observationDigest"], "planDigest": result["planDigest"], "recordedAt": result["recordedAt"]}
     except Exception as error:
         try:
             if primary_connection.in_transaction:
@@ -1364,7 +1446,7 @@ def _load_recorded_observation(round_id: str, plan_id: str) -> dict[str, Any] | 
             return None
         if row.get("planId") != plan_id:
             raise ProcessAttestationError("recorded process observation plan identity changed")
-        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": row["roundId"], "observationId": row["observationId"], "observationDigest": row["observationDigest"], "planDigest": row["planDigest"]}
+        return {"recorded": True, "historical": True, "authoritative": False, "executable": False, "roundId": row["roundId"], "observationId": row["observationId"], "observationDigest": row["observationDigest"], "planDigest": row["planDigest"], "recordedAt": row["recordedAt"]}
     finally:
         _forget_verified_connection(primary._connection)
         primary.close()
@@ -1379,3 +1461,32 @@ def _revalidate_runtime_databases(runtime: Any) -> None:
         _revalidate_sqlite_database(runtime.bridge.store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge", bound_fd=getattr(runtime, "bridge_fd", None))
     if primary_identity is not None:
         _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary", bound_fd=getattr(runtime, "primary_fd", None))
+
+
+def _revalidate_primary_database_after_commit(runtime: Any) -> None:
+    """Verify the committed row is still reachable through the bound primary inode."""
+    identity = getattr(runtime, "primary_identity", None)
+    fd = getattr(runtime, "primary_fd", None)
+    if identity is None or fd is None:
+        return
+    _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary", bound_fd=fd)
+    try:
+        path_before = CANONICAL_PRIMARY_DATABASE.lstat()
+        held = os.fstat(fd)
+        path_after = CANONICAL_PRIMARY_DATABASE.lstat()
+    except OSError as error:
+        raise ProcessAttestationError("canonical primary path cannot be revalidated after commit") from error
+    expected = (*identity[:2], identity[2])
+    for metadata in (path_before, path_after):
+        if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != expected or not stat.S_ISREG(metadata.st_mode):
+            raise ProcessAttestationError("canonical primary path changed after commit")
+    if (held.st_dev, held.st_ino, held.st_nlink) != expected:
+        raise ProcessAttestationError("bound primary database handle changed after commit")
+    for suffix, sidecar_identity in getattr(runtime.primary, "_sidecar_identities", {}).items():
+        sidecar = Path(f"{CANONICAL_PRIMARY_DATABASE}{suffix}")
+        try:
+            metadata = sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        if (metadata.st_dev, metadata.st_ino, metadata.st_nlink) != (*sidecar_identity, 1) or not stat.S_ISREG(metadata.st_mode):
+            raise ProcessAttestationError(f"primary database sidecar changed after commit: {suffix}")

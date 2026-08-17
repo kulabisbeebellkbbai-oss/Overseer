@@ -13,6 +13,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import re
@@ -26,6 +27,7 @@ from .psychlo_contracts import canonical_digest
 from .psychlo_bridge import CodexProjectDispatcher, PsychloBridge
 from .psychlo_store import PsychloBridgeStore
 from .store import SQLiteStore, _dump as _store_dump
+from .psychlo_legacy_binding import _private_group_is_safe
 
 
 SCHEMA = "psychlo.legacy-process-binding-attestation.v1"
@@ -38,13 +40,15 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 # These are the only accepted live endpoints.  Tests may replace this whole
 # resolver before constructing an internal runtime, but no public operation
 # accepts endpoint or evidence arguments.
-CANONICAL_PRIMARY_DATABASE = Path("/home/god/.local/share/overseer/project/state/overseer.sqlite3")
+CANONICAL_PRIMARY_DATABASE = Path("/home/god/Documents/Codex Workspace/Overseer/state/overseer.sqlite3")
 CANONICAL_BRIDGE_DATABASE = Path("/home/god/.local/share/overseer/psychlo/bridge.sqlite3")
 CANONICAL_PROTECTED_BINDING = Path("/home/god/.config/overseer/psychlo-project-bindings.json")
 CANONICAL_CODEX_REGISTRY = Path("/home/god/.codex/codex-projects.csv")
 CANONICAL_TMUX_SOCKET = Path(f"/tmp/tmux-{os.getuid()}/default")
 CANONICAL_SOURCE_ROOT = Path("/home/god/.local/share/overseer/project")
+CANONICAL_SOURCE_REAL_ROOT = Path("/home/god/Documents/Codex Workspace/Overseer")
 CANONICAL_CODEX_RELEASES = Path("/home/god/.codex/packages/standalone/releases")
+CANONICAL_CODEX_MEMORY_SESSION = "/home/god/.local/bin/codex-memory-session"
 
 
 class ProcessAttestationError(ValueError):
@@ -78,7 +82,9 @@ def _validate_runtime_path(path: Path, *, label: str, regular: bool = True) -> t
             raise ProcessAttestationError(f"{label} parent is unavailable") from error
         sticky_shared = metadata.st_uid == 0 and bool(metadata.st_mode & stat.S_ISVTX)
         system_private = metadata.st_uid == 0 and metadata.st_gid == 0 and not (stat.S_IMODE(metadata.st_mode) & 0o022)
-        user_private = metadata.st_uid == os.getuid() and metadata.st_gid == os.getegid() and not (stat.S_IMODE(metadata.st_mode) & 0o002)
+        user_private = (metadata.st_uid == os.getuid() and metadata.st_gid == os.getegid()
+                        and not (stat.S_IMODE(metadata.st_mode) & 0o002)
+                        and (not stat.S_IMODE(metadata.st_mode) & 0o020 or _private_group_is_safe(metadata.st_gid)))
         if not stat.S_ISDIR(metadata.st_mode) or (not sticky_shared and not system_private and not user_private):
             raise ProcessAttestationError(f"{label} parent is not a trusted private-group directory")
     try:
@@ -99,6 +105,8 @@ class _RuntimeAuthority:
     bridge: PsychloBridge
     primary: SQLiteStore
     collector: "AuthoritativeProcessEvidenceCollector"
+    bridge_identity: tuple[int, int, int]
+    primary_identity: tuple[int, int, int]
 
     def close(self) -> None:
         self.collector.release_held_identities()
@@ -116,6 +124,8 @@ def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
     _validate_runtime_path(CANONICAL_TMUX_SOCKET, label="tmux socket", regular=False)
     bridge_store = PsychloBridgeStore(CANONICAL_BRIDGE_DATABASE)
     primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE)
+    _bind_sqlite_database(bridge_store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge")
+    _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary")
     dispatcher = CodexProjectDispatcher(CANONICAL_PROTECTED_BINDING)
     bridge = PsychloBridge(
         store=bridge_store,
@@ -140,31 +150,142 @@ def _open_runtime_authority(round_id: str) -> _RuntimeAuthority:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("canonical tmux target is missing")
         collector = AuthoritativeProcessEvidenceCollector(
-            bridge, CANONICAL_PROTECTED_BINDING, str(CANONICAL_TMUX_SOCKET), target, CANONICAL_SOURCE_ROOT,
+            bridge, CANONICAL_PROTECTED_BINDING, str(CANONICAL_TMUX_SOCKET), "", _resolve_canonical_source_root(),
         )
     except Exception as error:
         bridge.close()
         raise ProcessAttestationError("canonical process runtime is unavailable") from error
-    return _RuntimeAuthority(bridge, primary, collector)
+    return _RuntimeAuthority(bridge, primary, collector, bridge_identity, primary_identity)
 
 
-def _trusted_codex_executable() -> tuple[str, int, int, str]:
-    """Resolve exactly one private Codex release executable, never a wrapper."""
+def _bind_sqlite_database(connection: Any, path: Path, expected: tuple[int, int], label: str) -> tuple[int, int, int]:
+    """Bind an opened SQLite main database to the prevalidated inode."""
+    rows = connection.execute("PRAGMA database_list").fetchall()
+    main = next((row for row in rows if str(row[1]) == "main"), None)
+    if main is None or Path(str(main[2])).resolve() != path.resolve():
+        raise ProcessAttestationError(f"{label} database handle is not canonical")
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ProcessAttestationError(f"{label} database disappeared") from error
+    if (metadata.st_dev, metadata.st_ino) != expected or metadata.st_nlink != 1 or not stat.S_ISREG(metadata.st_mode):
+        raise ProcessAttestationError(f"{label} database identity changed")
+    return metadata.st_dev, metadata.st_ino, metadata.st_nlink
+
+
+def _revalidate_sqlite_database(connection: Any, path: Path, expected: tuple[int, int, int], label: str) -> None:
+    current = _bind_sqlite_database(connection, path, expected[:2], label)
+    if current != expected:
+        raise ProcessAttestationError(f"{label} database identity changed during commit")
+
+
+def _trusted_codex_executable(pid: int | None = None) -> tuple[str, int, int, str]:
+    """Bind the executable of one already-selected direct child to a release inode.
+
+    There are normally many installed Codex releases.  Selecting one by
+    directory enumeration is not an identity binding, so the caller must
+    provide the PID obtained from the exact tmux pane's direct-child list.
+    """
+    if pid is None or not isinstance(pid, int) or pid <= 0:
+        raise ProcessAttestationError("direct Codex process identity is required")
     root = CANONICAL_CODEX_RELEASES
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise ProcessAttestationError("trusted Codex release directory is unavailable")
-    candidates: list[Path] = []
-    for candidate in root.rglob("codex"):
+    try:
+        candidate = Path(os.readlink(Path(f"/proc/{pid}/exe")))
+    except OSError as error:
+        raise ProcessAttestationError("direct Codex executable cannot be resolved") from error
+    if not candidate.is_absolute() or candidate.name != "codex":
+        raise ProcessAttestationError("direct child is not a Codex release executable")
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise ProcessAttestationError("direct child executable is outside trusted Codex releases") from error
+    # Reject symlinked path components as well as a symlinked final file.  A
+    # lexical prefix check alone would permit a release path substitution.
+    current = Path("/")
+    for component in candidate.parts[1:]:
+        current /= component
         try:
-            metadata = candidate.lstat()
-        except OSError:
-            continue
-        if stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid() and metadata.st_gid == os.getegid() and stat.S_IMODE(metadata.st_mode) & 0o022 == 0 and metadata.st_nlink == 1 and os.access(candidate, os.X_OK):
-            candidates.append(candidate)
-    if len(candidates) != 1:
-        raise ProcessAttestationError("trusted Codex release executable is not unique")
-    digest, metadata = _trusted_executable_snapshot(candidates[0])
-    return str(candidates[0]), metadata.st_dev, metadata.st_ino, digest
+            metadata = current.lstat()
+        except OSError as error:
+            raise ProcessAttestationError("direct child executable path is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ProcessAttestationError("direct child executable path contains a symlink")
+    try:
+        metadata = candidate.lstat()
+    except OSError as error:
+        raise ProcessAttestationError("direct child executable is unavailable") from error
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or metadata.st_gid != os.getegid() or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o022 or not os.access(candidate, os.X_OK)):
+        raise ProcessAttestationError("direct child executable ownership or mode is unsafe")
+    digest, snapshot = _trusted_executable_snapshot(candidate)
+    if (snapshot.st_dev, snapshot.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise ProcessAttestationError("direct child executable changed during identity binding")
+    return str(candidate), snapshot.st_dev, snapshot.st_ino, digest
+
+
+def _resolve_canonical_source_root() -> Path:
+    """Resolve the fixed source link and require its reviewed real checkout."""
+    try:
+        resolved = CANONICAL_SOURCE_ROOT.resolve(strict=True)
+    except OSError as error:
+        raise ProcessAttestationError("canonical source root cannot be resolved") from error
+    if resolved != CANONICAL_SOURCE_REAL_ROOT or not resolved.is_dir():
+        raise ProcessAttestationError("canonical source root resolves outside the reviewed checkout")
+    metadata = resolved.stat(follow_symlinks=False)
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o002:
+        raise ProcessAttestationError("canonical source root is not private")
+    if stat.S_IMODE(metadata.st_mode) & 0o020 and not _private_group_is_safe(metadata.st_gid):
+        raise ProcessAttestationError("canonical source root group is not private")
+    return resolved
+
+
+def _private_workspace_mode(metadata: os.stat_result) -> bool:
+    bits = stat.S_IMODE(metadata.st_mode)
+    return (metadata.st_uid == os.getuid() and not bits & 0o002
+            and (not bits & 0o020 or _private_group_is_safe(metadata.st_gid)))
+
+
+def _validate_pane_launcher(pane_pid: int, process_binding: Mapping[str, str]) -> None:
+    """Bind the pane shell and registry launcher, including file identity."""
+    try:
+        pane_executable = Path(os.readlink(Path(f"/proc/{pane_pid}/exe")))
+    except OSError as error:
+        raise ProcessAttestationError("tmux pane executable cannot be verified") from error
+    if pane_executable not in {Path("/usr/bin/bash"), Path("/usr/bin/sh"), Path("/usr/bin/dash")}:
+        raise ProcessAttestationError("tmux pane executable is not an approved shell")
+    pane_digest, pane_meta = _trusted_executable_snapshot(pane_executable)
+    pane_identity = capture_process_identity(pane_pid)
+    if pane_identity["exeDigest"] != pane_digest or pane_meta.st_nlink != 1:
+        raise ProcessAttestationError("tmux pane shell identity changed")
+    launcher = Path(process_binding["launcher"])
+    if not launcher.is_absolute() or launcher.is_symlink():
+        raise ProcessAttestationError("canonical launcher path is not trusted")
+    try:
+        launcher_meta = launcher.lstat()
+        if (not stat.S_ISREG(launcher_meta.st_mode) or launcher_meta.st_uid != os.getuid()
+                or launcher_meta.st_nlink != 1 or stat.S_IMODE(launcher_meta.st_mode) & 0o022):
+            raise ProcessAttestationError("canonical launcher ownership or mode is unsafe")
+        launcher_digest, snapshot = _trusted_executable_snapshot(launcher)
+        if launcher_digest != process_binding["launcherDigest"] or (snapshot.st_dev, snapshot.st_ino) != (launcher_meta.st_dev, launcher_meta.st_ino):
+            raise ProcessAttestationError("canonical launcher identity changed")
+        fd = os.open(str(launcher), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(fd)
+            launcher_bytes = b""
+            while chunk := os.read(fd, 1 << 20):
+                launcher_bytes += chunk
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ProcessAttestationError("canonical launcher changed during read")
+    except OSError as error:
+        raise ProcessAttestationError("canonical launcher cannot be read safely") from error
+    if CANONICAL_CODEX_MEMORY_SESSION.encode() not in launcher_bytes:
+        raise ProcessAttestationError("canonical launcher does not bind the memory-session chain")
 
 
 @dataclass(frozen=True)
@@ -304,16 +425,13 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("registry and round binding conversation identity differ")
         if Path(process_binding["workspace"]).name.casefold() != str(request.get("projectId", "")).casefold():
             raise ProcessAttestationError("canonical workspace is not bound to the round project")
-        codex_executable, codex_dev, codex_ino, codex_digest = _trusted_codex_executable()
-        expected_start = f"codex resume {process_binding['conversationId']} --cd {process_binding['workspace']}"
+        expected_start = f"{CANONICAL_CODEX_MEMORY_SESSION} resume {process_binding['conversationId']} --cd {shlex.quote(process_binding['workspace'])}"
         tmux = capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_command=expected_start)
         pane_pid = int(tmux["paneProcess"]["pid"])
         if tmux.get("paneParentPid") != int(tmux["serverProcess"]["pid"]):
             raise ProcessAttestationError("tmux pane is not directly owned by its server")
-        pane_executable = os.readlink(Path(f"/proc/{pane_pid}/exe"))
-        if Path(pane_executable).name not in {"bash", "sh", "dash"} and not pane_executable.endswith(".sh"):
-            raise ProcessAttestationError("tmux pane is not a trusted shell or launcher script")
-        child = capture_direct_codex_child(pane_pid, expected_conversation_id=process_binding["conversationId"], expected_exe_digest=codex_digest, expected_exe_path=codex_executable, expected_exe_dev=codex_dev, expected_exe_ino=codex_ino, expected_workspace=process_binding["workspace"])
+        _validate_pane_launcher(pane_pid, process_binding)
+        child = capture_direct_codex_child(pane_pid, expected_conversation_id=process_binding["conversationId"], expected_workspace=process_binding["workspace"])
         self._hold_identities(tmux, child)
         if child.get("parentPid") != pane_pid:
             raise ProcessAttestationError("Codex child is not bound to the pane process")
@@ -374,7 +492,8 @@ def _open_private(path: Path) -> tuple[int, os.stat_result, os.stat_result]:
             child = os.open(component, flags, dir_fd=parent)
             parent_stat = os.fstat(child)
             sticky_shared = parent_stat.st_uid == 0 and bool(parent_stat.st_mode & stat.S_ISVTX)
-            if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid not in {0, os.getuid()} or ((parent_stat.st_mode & 0o022) and not sticky_shared):
+            unsafe_group_write = (parent_stat.st_mode & 0o020) and not _private_group_is_safe(parent_stat.st_gid)
+            if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid not in {0, os.getuid()} or ((parent_stat.st_mode & 0o002) and not sticky_shared) or (unsafe_group_write and not sticky_shared):
                 os.close(child)
                 raise ProcessAttestationError("attestation parent is not private")
             os.close(parent)
@@ -634,7 +753,7 @@ def _assert_exact_plan(primary: SQLiteStore, plan_id: str, round_id: str, manife
 def _assert_runtime_source_integrity() -> None:
     """Ensure the loaded attestation module is the reviewed runtime source."""
     module = Path(__file__).resolve()
-    root = CANONICAL_SOURCE_ROOT.resolve()
+    root = _resolve_canonical_source_root()
     try:
         module.relative_to(root)
     except ValueError as error:
@@ -826,8 +945,11 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
         executable = os.readlink(Path(f"/proc/{children[0]}/exe"))
     except OSError as error:
         raise ProcessAttestationError("direct child executable cannot be verified") from error
-    if expected_exe_path is None or executable != expected_exe_path:
+    trusted_path, trusted_dev, trusted_ino, trusted_digest = _trusted_codex_executable(children[0])
+    if executable != trusted_path:
         raise ProcessAttestationError("direct child is not the exact trusted executable")
+    if expected_exe_path is not None and expected_exe_path != trusted_path:
+        raise ProcessAttestationError("direct child executable expectation is not authoritative")
     exe_stat = Path(executable).stat(follow_symlinks=False)
     if exe_stat.st_uid != os.getuid() and exe_stat.st_uid != 0 or stat.S_IMODE(exe_stat.st_mode) & 0o022:
         raise ProcessAttestationError("direct child executable ownership is unsafe")
@@ -836,7 +958,9 @@ def capture_direct_codex_child(parent_pid: int, *, expected_argv_digest: str | N
         raise ProcessAttestationError("direct child executable identity changed")
     if expected_exe_digest is not None and executable_digest != expected_exe_digest:
         raise ProcessAttestationError("direct child executable identity changed")
-    if expected_exe_dev is not None and expected_exe_ino is not None and (executable_meta.st_dev != expected_exe_dev or executable_meta.st_ino != expected_exe_ino):
+    if trusted_digest is not None and executable_digest != trusted_digest:
+        raise ProcessAttestationError("direct child executable identity changed")
+    if trusted_dev is not None and trusted_ino is not None and (executable_meta.st_dev != trusted_dev or executable_meta.st_ino != trusted_ino):
         raise ProcessAttestationError("direct child executable file identity changed")
     if expected_workspace is not None and _cwd_identity(children[0], expected_workspace) != workspace_identity:
         raise ProcessAttestationError("direct child cwd is not the canonical workspace")
@@ -859,7 +983,7 @@ def _cwd_identity(pid: int, expected_workspace: str) -> tuple[int, int]:
     except OSError as error:
         raise ProcessAttestationError("process workspace cannot be verified") from error
     expected = Path(expected_workspace)
-    if not expected.is_absolute() or cwd != str(expected) or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+    if not expected.is_absolute() or cwd != str(expected) or not stat.S_ISDIR(metadata.st_mode) or not _private_workspace_mode(metadata):
         raise ProcessAttestationError("process cwd is not the canonical workspace")
     return metadata.st_dev, metadata.st_ino
 
@@ -868,7 +992,9 @@ def capture_socket_identity(socket_path: str | Path) -> dict[str, Any]:
     path = Path(socket_path)
     try:
         before = path.stat(follow_symlinks=False)
-        if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) & 0o077:
+        socket_bits = stat.S_IMODE(before.st_mode)
+        if (not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid()
+                or socket_bits & 0o007 or (socket_bits & 0o070 and not _private_group_is_safe(before.st_gid))):
             raise OSError("unsafe tmux socket")
         after = path.stat(follow_symlinks=False)
     except OSError as error:
@@ -880,7 +1006,7 @@ def capture_socket_identity(socket_path: str | Path) -> dict[str, Any]:
 
 def capture_tmux_identity(socket_path: str, target: str, *, expected_command: str | None = None, expected_start_command: str | None = None) -> dict[str, Any]:
     """Capture headless-safe tmux evidence through explicit socket/list-panes."""
-    if not Path(socket_path).is_absolute() or not target.strip():
+    if not Path(socket_path).is_absolute() or (not target.strip() and expected_start_command is None):
         raise ProcessAttestationError("tmux socket and target are required")
     socket_identity = capture_socket_identity(socket_path)
     executable = Path(_TMUX)
@@ -903,7 +1029,16 @@ def capture_tmux_identity(socket_path: str, target: str, *, expected_command: st
         raise ProcessAttestationError("tmux identity changed during attestation")
     if capture_socket_identity(socket_path) != socket_identity:
         raise ProcessAttestationError("tmux identity query failed")
-    raw_matches = [line.split("|") for line in panes_stdout.splitlines() if len(line.split("|")) in {4, 5, 6} and (line.split("|")[0] == target or line.split("|")[2] == target)]
+    rows = [line.split("|") for line in panes_stdout.splitlines() if len(line.split("|")) in {4, 5, 6}]
+    if target.strip():
+        raw_matches = [row for row in rows if row[0] == target or row[2] == target]
+    else:
+        raw_matches = rows
+    if expected_start_command is not None:
+        expected_tokens = _command_tokens(expected_start_command)
+        raw_matches = [row for row in raw_matches if len(row) == 6 and _command_tokens(row[5]) == expected_tokens]
+    if expected_command is not None:
+        raw_matches = [row for row in raw_matches if len(row) >= 5 and row[4] == expected_command]
     if len(raw_matches) != 1 or ((expected_command is not None or expected_start_command is not None) and len(raw_matches[0]) != 6):
         raise ProcessAttestationError("tmux target identity is not unique")
     if len(raw_matches[0]) == 4:
@@ -915,7 +1050,7 @@ def capture_tmux_identity(socket_path: str, target: str, *, expected_command: st
         pane_start_command = raw_matches[0][5] if len(raw_matches[0]) == 6 else ""
     if expected_command is not None and pane_command != expected_command:
         raise ProcessAttestationError("tmux pane command is not bound to the registry command")
-    if expected_start_command is not None and pane_start_command != expected_start_command:
+    if expected_start_command is not None and _command_tokens(pane_start_command) != _command_tokens(expected_start_command):
         raise ProcessAttestationError("tmux pane start command is not the exact Codex resume chain")
     if (expected_command is not None or expected_start_command is not None) and not pane_start_command:
         raise ProcessAttestationError("tmux pane start command is unavailable")
@@ -923,6 +1058,16 @@ def capture_tmux_identity(socket_path: str, target: str, *, expected_command: st
     if len(server_rows) != 1 or not server_rows[0][1].isdigit():
         raise ProcessAttestationError("tmux server identity is not unique")
     return {"socket": {**socket_identity, "pathDigest": sha256(socket_path.encode()).hexdigest()}, "sessionId": session_id, "windowId": window_id, "paneId": pane_id, "paneCommandDigest": sha256(pane_command.encode()).hexdigest(), "paneStartCommandDigest": sha256(pane_start_command.encode()).hexdigest(), "serverProcess": capture_process_identity(int(server_rows[0][1])), "paneProcess": capture_process_identity(int(pane_pid)), "paneParentPid": _proc_parent_pid(int(pane_pid)), "serverEvidence": "list-sessions-and-list-panes-explicit-socket"}
+
+
+def _command_tokens(command: str) -> tuple[str, ...]:
+    try:
+        tokens = tuple(shlex.split(command, posix=True))
+    except ValueError as error:
+        raise ProcessAttestationError("tmux pane start command is not parseable") from error
+    if not tokens:
+        raise ProcessAttestationError("tmux pane start command is empty")
+    return tokens
 
 
 def _validate_bridge_round(bridge: PsychloBridgeStore, round_id: str, manifest: Mapping[str, Any]) -> None:
@@ -947,21 +1092,25 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
     """
     if not all(isinstance(value, str) and value.strip() for value in (round_id, plan_id)):
         raise ProcessAttestationError("round and plan identities are required")
+    replay = _load_completed_replay(round_id, plan_id)
+    if replay is not None:
+        return replay
     _assert_runtime_source_integrity()
     runtime = _open_runtime_authority(round_id)
     bridge_connection = runtime.bridge.store.connection
     primary_connection = runtime.primary._connection
     try:
+        bridge_connection.execute("BEGIN IMMEDIATE")
         fresh = runtime.collector.collect(round_id, plan_id)
         fresh_again = runtime.collector.collect(round_id, plan_id)
         if manifest_digest(fresh) != manifest_digest(fresh_again) or fresh != fresh_again:
             raise ProcessAttestationError("process evidence changed before publication")
-        manifest = _manifest(fresh, round_id)
+        manifest = _manifest(fresh_again, round_id)
         digest = manifest_digest(manifest)
-        bridge_connection.execute("BEGIN IMMEDIATE")
         _validate_bridge_round(runtime.bridge.store, round_id, manifest)
         primary_connection.execute("BEGIN IMMEDIATE")
         try:
+            _revalidate_runtime_databases(runtime)
             plan = _assert_exact_plan(runtime.primary, plan_id, round_id, manifest, approved=True)
             row = primary_connection.execute("SELECT attestation_id,round_id,plan_id,manifest_digest,plan_digest,state,manifest_json FROM psychlo_process_binding_attestations WHERE round_id=?", (round_id,)).fetchone()
             encoded = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":"))
@@ -971,6 +1120,7 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
                 raise ProcessAttestationError("prepared process attestation identity changed")
             plan_digest = admin_plan_digest(plan)
             runtime.collector.revalidate_held_identities()
+            _revalidate_runtime_databases(runtime)
             result = runtime.primary.complete_process_binding_attestation(round_id=round_id, plan_id=plan_id, manifest_digest=digest, plan_digest=plan_digest, completed_at=runtime.bridge.clock())
             primary_connection.commit()
         except Exception:
@@ -992,3 +1142,36 @@ def attest_process_binding(*, round_id: str, plan_id: str) -> dict[str, Any]:
         raise ProcessAttestationError(str(error)) from error
     finally:
         runtime.close()
+
+
+def _load_completed_replay(round_id: str, plan_id: str) -> dict[str, Any] | None:
+    """Return the immutable primary result before touching live process state."""
+    try:
+        identity = _validate_runtime_path(CANONICAL_PRIMARY_DATABASE, label="primary authority database")
+        primary = SQLiteStore(CANONICAL_PRIMARY_DATABASE)
+    except (KeyError, ProcessAttestationError, OSError):
+        return None
+    try:
+        _bind_sqlite_database(primary._connection, CANONICAL_PRIMARY_DATABASE, identity, "primary")
+        try:
+            row = primary.process_binding_attestation(round_id)
+        except Exception as error:
+            if "no such table" in str(error):
+                return None
+            raise
+        if row is None:
+            return None
+        if row.get("planId") != plan_id:
+            raise ProcessAttestationError("completed process attestation plan identity changed")
+        return {"accepted": True, "roundId": row["roundId"], "attestationId": row["attestationId"], "manifestDigest": row["manifestDigest"], "planDigest": row["planDigest"]}
+    finally:
+        primary.close()
+
+
+def _revalidate_runtime_databases(runtime: Any) -> None:
+    bridge_identity = getattr(runtime, "bridge_identity", None)
+    primary_identity = getattr(runtime, "primary_identity", None)
+    if bridge_identity is not None:
+        _revalidate_sqlite_database(runtime.bridge.store.connection, CANONICAL_BRIDGE_DATABASE, bridge_identity, "bridge")
+    if primary_identity is not None:
+        _revalidate_sqlite_database(runtime.primary._connection, CANONICAL_PRIMARY_DATABASE, primary_identity, "primary")

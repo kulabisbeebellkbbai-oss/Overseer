@@ -53,6 +53,7 @@ from .audit import ApprovalRequest, ApprovalStatus
 from .core import ApprovalLevel
 from .admin import AdminChangePlan
 from .store import SQLiteStore
+from .psychlo_legacy_binding import _private_group_is_safe
 
 
 MAX_BODY_BYTES = 256 * 1024
@@ -2421,7 +2422,11 @@ class CodexProjectDispatcher:
             raise ValueError("canonical project registry paths are not absolute and trusted")
         workspace_stat = workspace_path.stat(follow_symlinks=False)
         launcher_stat = launcher_path.stat(follow_symlinks=False)
-        if workspace_stat.st_uid != os.getuid() or workspace_stat.st_mode & 0o022 or launcher_stat.st_uid not in {0, os.getuid()} or launcher_stat.st_mode & 0o022:
+        workspace_bits = stat.S_IMODE(workspace_stat.st_mode)
+        launcher_bits = stat.S_IMODE(launcher_stat.st_mode)
+        if (workspace_stat.st_uid != os.getuid() or workspace_bits & 0o002
+                or (workspace_bits & 0o020 and not _private_group_is_safe(workspace_stat.st_gid))
+                or launcher_stat.st_uid not in {0, os.getuid()} or launcher_bits & 0o022):
             raise ValueError("canonical project registry paths are not private")
         try:
             launcher_fd = os.open(str(launcher_path), os.O_RDONLY | os.O_NOFOLLOW)

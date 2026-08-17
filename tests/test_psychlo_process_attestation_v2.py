@@ -4,6 +4,7 @@ import json
 import os
 import inspect
 from types import SimpleNamespace
+import pytest
 
 from overseer.admin import approve_admin_change_plan
 from overseer.psychlo_process_attestation import (
@@ -125,3 +126,89 @@ def test_process_cli_rejects_endpoint_arguments():
         assert error.code != 0
     else:
         raise AssertionError("caller-selected manifest endpoint was accepted")
+
+
+def test_release_selection_binds_the_actual_child_when_many_releases_exist(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    releases = tmp_path / "releases"
+    first = releases / "one" / "bin"; second = releases / "two" / "bin"
+    first.mkdir(parents=True); second.mkdir(parents=True)
+    (first / "codex").write_bytes(b"first"); (second / "codex").write_bytes(b"second")
+    (first / "codex").chmod(0o755); (second / "codex").chmod(0o755)
+    monkeypatch.setattr(module, "CANONICAL_CODEX_RELEASES", releases)
+    monkeypatch.setattr(module.os, "readlink", lambda path: str(second / "codex") if str(path) == "/proc/77/exe" else (_ for _ in ()).throw(OSError("unexpected read")))
+    path, dev, ino, digest = module._trusted_codex_executable(77)
+    assert path == str(second / "codex")
+    assert (dev, ino) == ((second / "codex").stat().st_dev, (second / "codex").stat().st_ino)
+    assert digest
+
+
+def test_release_selection_rejects_symlinked_child_path(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    releases = tmp_path / "releases"; real = tmp_path / "real"
+    (releases / "one" / "bin").mkdir(parents=True); real.write_bytes(b"codex"); real.chmod(0o755)
+    (releases / "one" / "bin" / "codex").symlink_to(real)
+    monkeypatch.setattr(module, "CANONICAL_CODEX_RELEASES", releases)
+    monkeypatch.setattr(module.os, "readlink", lambda path: str(releases / "one" / "bin" / "codex"))
+    with pytest.raises(module.ProcessAttestationError, match="symlink"):
+        module._trusted_codex_executable(77)
+
+
+def test_canonical_source_symlink_must_resolve_to_reviewed_checkout(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    expected = tmp_path / "reviewed"; expected.mkdir()
+    link = tmp_path / "source"; link.symlink_to(expected, target_is_directory=True)
+    monkeypatch.setattr(module, "CANONICAL_SOURCE_ROOT", link)
+    monkeypatch.setattr(module, "CANONICAL_SOURCE_REAL_ROOT", expected)
+    assert module._resolve_canonical_source_root() == expected
+    other = tmp_path / "other"; other.mkdir()
+    monkeypatch.setattr(module, "CANONICAL_SOURCE_REAL_ROOT", other)
+    with pytest.raises(module.ProcessAttestationError, match="reviewed checkout"):
+        module._resolve_canonical_source_root()
+
+
+def test_workspace_private_primary_group_policy_allows_0775_only_for_private_group(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    workspace = tmp_path / "arcade"; workspace.mkdir(mode=0o775)
+    metadata = workspace.stat()
+    monkeypatch.setattr(module, "_private_group_is_safe", lambda gid: gid == metadata.st_gid)
+    assert module._private_workspace_mode(metadata) is True
+    monkeypatch.setattr(module, "_private_group_is_safe", lambda _gid: False)
+    assert module._private_workspace_mode(metadata) is False
+
+
+def test_tmux_scan_binds_pane_by_start_chain_not_launcher_name(monkeypatch, tmp_path):
+    import overseer.psychlo_process_attestation as module
+
+    socket_path = tmp_path / "tmux.sock"
+    expected = "/home/god/.local/bin/codex-memory-session resume conversation-arcade --cd '/home/god/Documents/Codex Workspace/Arcade'"
+    rows = "$1|@1|%1|101|bash|/home/god/.local/bin/codex-memory-session resume conversation-other --cd '/tmp/Other'\n$2|@2|%2|102|bash|/home/god/.local/bin/codex-memory-session resume conversation-arcade --cd \"/home/god/Documents/Codex Workspace/Arcade\"\n"
+    class Result:
+        returncode = 0
+        def __init__(self, stdout): self.stdout = stdout
+    monkeypatch.setattr(module, "capture_socket_identity", lambda _path: {"dev": 1, "ino": 2, "mode": 0o770, "uid": os.getuid()})
+    monkeypatch.setattr(module.subprocess, "run", lambda command, **_kwargs: Result("$1|11\n$2|12\n") if "list-sessions" in command else Result(rows))
+    identity = {"pid": 12, "startTicks": 1, "exeDigest": "a" * 64, "argvDigest": "b" * 64, "cgroupDigest": "c" * 64, "pidfdSupported": True}
+    monkeypatch.setattr(module, "capture_process_identity", lambda pid: {**identity, "pid": pid})
+    monkeypatch.setattr(module, "_proc_parent_pid", lambda _pid: 11)
+    result = module.capture_tmux_identity(str(socket_path), "", expected_start_command=expected)
+    assert (result["sessionId"], result["paneId"]) == ("$2", "%2")
+
+
+def test_completed_replay_returns_primary_row_without_live_collection(tmp_path, monkeypatch):
+    import overseer.psychlo_process_attestation as module
+
+    primary_path = tmp_path / "primary.sqlite3"
+    primary = SQLiteStore(primary_path)
+    primary._connection.execute("INSERT INTO psychlo_process_binding_attestations VALUES ('a','round','plan','" + "b" * 64 + "','" + "c" * 64 + "','completed','{}','inserted','completed')")
+    primary._connection.commit()
+    primary.close()
+    monkeypatch.setattr(module, "CANONICAL_PRIMARY_DATABASE", primary_path)
+    monkeypatch.setattr(module, "_assert_runtime_source_integrity", lambda: None)
+    monkeypatch.setattr(module, "capture_process_identity", lambda _pid: (_ for _ in ()).throw(AssertionError("exited process must not be recollected")))
+    monkeypatch.setattr(module, "_open_runtime_authority", lambda _round: (_ for _ in ()).throw(AssertionError("runtime must not open on completed replay")))
+    assert module.attest_process_binding(round_id="round", plan_id="plan") == {"accepted": True, "roundId": "round", "attestationId": "a", "manifestDigest": "b" * 64, "planDigest": "c" * 64}

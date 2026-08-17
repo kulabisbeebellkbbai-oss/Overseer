@@ -2135,6 +2135,20 @@ def test_dispatches_one_round_and_forwards_one_bound_result(tmp_path: Path):
         bridge.request_round(request, callback_capability="capability:different-round-binding")
 
 
+def test_cancels_only_a_provably_never_started_pending_round(tmp_path: Path):
+    store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
+    request = {"roundId": "round-cancel", "projectId": "arcade", "projectLeadId": "member-hermione", "planId": "arcade-plan", "planVersion": "v1", "correlationId": "corr-cancel", "idempotencyKey": "round-cancel", "snapshotId": "snapshot-cancel", "policyVersion": "2026-08-09", "expectedUsageCost": 5, "scope": "one bounded round", "selectionReason": "priority-selected", "priorityRationale": "sole-eligible-project"}
+    initial_receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": "overseer-dispatch:round-cancel", "status": "accepted"}
+    store.record_single_stream_round(request, initial_receipt, "capability_cancel_1234567890abcdef")
+    bridge = PsychloBridge(store=store, dispatcher=lambda *_: (_ for _ in ()).throw(AssertionError("cancel must not dispatch")), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    cancelled = bridge.cancel_round_before_start({"cancellationId": "cancel-round-cancel", "request": request, "requestDigest": canonical_digest(request)})
+    assert cancelled["accepted"] is True
+    assert cancelled["receipt"]["before"] == {"dispatchState": "pending", "startedAt": None, "codexBinding": None, "result": None, "recovery": False, "operationalFailure": False}
+    assert store.get_round(request["roundId"])[4] == "cancelled-before-start"
+    assert store.get_round(request["roundId"])[5] is None
+    assert store.round_cancellation(request["roundId"])["receipt"] == cancelled["receipt"]
+
+
 def test_round_completion_timing_uses_trusted_receipt_time_not_lead_occurred_at(tmp_path: Path):
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     bridge = PsychloBridge(

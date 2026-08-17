@@ -69,6 +69,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS round_recoveries(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, evidence_json TEXT, binding_json TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS round_cancellations(cancellation_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, receipt_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
@@ -463,12 +464,12 @@ class PsychloBridgeStore:
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def active_round(self) -> str | None:
-        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' LIMIT 1").fetchone()
+        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') LIMIT 1").fetchone()
         return None if row is None else str(row[0])
 
     def active_rounds(self) -> list[dict[str, Any]]:
         """Return the immutable request identity for every unfinished round."""
-        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' ORDER BY rowid").fetchall()
+        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') ORDER BY rowid").fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def record_canary_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, authorization_id: str, expected_revision: int, now: str) -> None:
@@ -509,7 +510,7 @@ class PsychloBridgeStore:
             bound = next((item for item in projects if isinstance(item, dict) and item.get("projectId") == request.get("projectId")), None)
             if bound is None or any(request.get(field) != bound.get(source) for field, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
                 raise ValueError("concurrency canary round identity is not authorized")
-            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' ORDER BY rowid").fetchall()
+            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') ORDER BY rowid").fetchall()
             active = [json.loads(row[0]) for row in rows]
             if len(active) >= 2:
                 raise ValueError("single_stream_busy")
@@ -613,7 +614,7 @@ class PsychloBridgeStore:
             expected_decision = {"decisionId": authorization.get("decisionId"), "projectId": authorization.get("projectId"), "planId": authorization.get("planId"), "workflowId": authorization.get("workflowId"), "decisionVersion": authorization.get("decisionVersion"), "question": authorization.get("question"), "resultProvenanceId": authorization.get("digest")}
             if any(decision.get(field) != value for field, value in expected_decision.items()):
                 raise ValueError("concurrency ceiling decision binding is invalid")
-            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' ORDER BY rowid").fetchall()]
+            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
@@ -694,7 +695,7 @@ class PsychloBridgeStore:
         """Atomically preserve the default global ceiling of one."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state != 'failed' LIMIT 1").fetchone() is not None:
+            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state IN ('pending','started','dispatched') LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
@@ -725,6 +726,57 @@ class PsychloBridgeStore:
 
     def mark_dispatched(self, round_id: str, receipt: Mapping[str, Any]) -> None:
         self.connection.execute("UPDATE rounds SET dispatch_state='dispatched',receipt_json=? WHERE round_id=?", (_dump_wire(receipt), round_id))
+
+    def round_cancellation(self, round_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT cancellation_id,request_digest,attestation_json,receipt_json,inserted_at FROM round_cancellations WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            return None
+        return {"cancellationId": row[0], "roundId": round_id, "requestDigest": row[1], "attestation": json.loads(row[2]), "receipt": json.loads(row[3]), "insertedAt": row[4]}
+
+    def cancel_round_before_start(self, cancellation_id: str, request: Mapping[str, Any], request_digest: str, *, now: str) -> dict[str, Any]:
+        if not isinstance(cancellation_id, str) or not cancellation_id.strip() or len(cancellation_id) > 256 or not isinstance(request_digest, str) or request_digest != canonical_digest(request):
+            raise ValueError("round cancellation request binding is invalid")
+        round_id = str(request.get("roundId", ""))
+        attestation = {"cancellationId": cancellation_id, "request": dict(request), "requestDigest": request_digest}
+        encoded_attestation = _dump_wire(attestation)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT cancellation_id,round_id,request_digest,attestation_json,receipt_json FROM round_cancellations WHERE cancellation_id=? OR round_id=?",
+                (cancellation_id, round_id),
+            ).fetchone()
+            if existing is not None:
+                round_state = self.connection.execute("SELECT dispatch_state,started_at,codex_binding_json,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+                if existing[:4] != (cancellation_id, round_id, request_digest, encoded_attestation) or round_state != ("cancelled-before-start", None, None, None):
+                    raise ValueError("round cancellation conflict")
+                self.connection.execute("COMMIT")
+                return {"accepted": True, "inserted": False, "receipt": json.loads(existing[4])}
+            row = self.connection.execute(
+                "SELECT request_json,dispatch_state,result_json,started_at,codex_binding_json FROM rounds WHERE round_id=?",
+                (round_id,),
+            ).fetchone()
+            recovery = self.connection.execute("SELECT 1 FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
+            failure = self.connection.execute("SELECT 1 FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or json.loads(row[0]) != dict(request) or canonical_digest(json.loads(row[0])) != request_digest or row[1] != "pending" or row[2] is not None or row[3] is not None or row[4] is not None or recovery is not None or failure is not None:
+                raise ValueError("round is not provably pending before start")
+            before = {"dispatchState": "pending", "startedAt": None, "codexBinding": None, "result": None, "recovery": False, "operationalFailure": False}
+            unsigned = {"schemaVersion": "psychlo.round-cancel-before-start.v1", "kind": "round-cancel-before-start", "status": "cancelled", "roundId": round_id, "projectId": str(request["projectId"]), "requestDigest": request_digest, "before": before, "cancelledAt": now}
+            receipt = {**unsigned, "digest": canonical_digest(unsigned)}
+            updated = self.connection.execute(
+                "UPDATE rounds SET dispatch_state='cancelled-before-start' WHERE round_id=? AND request_json=? AND dispatch_state='pending' AND result_json IS NULL AND started_at IS NULL AND codex_binding_json IS NULL AND NOT EXISTS (SELECT 1 FROM round_recoveries WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?)",
+                (round_id, row[0], round_id, round_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("round changed before cancellation")
+            self.connection.execute(
+                "INSERT INTO round_cancellations(cancellation_id,round_id,request_digest,attestation_json,receipt_json,inserted_at) VALUES (?,?,?,?,?,?)",
+                (cancellation_id, round_id, request_digest, encoded_attestation, _dump_wire(receipt), now),
+            )
+            self.connection.execute("COMMIT")
+            return {"accepted": True, "inserted": True, "receipt": receipt}
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def round_binding_attestation(self, round_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT manifest_digest,attestation_json,inserted_at FROM round_binding_attestations WHERE round_id=?", (round_id,)).fetchone()

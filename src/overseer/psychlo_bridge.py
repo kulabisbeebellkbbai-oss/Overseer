@@ -448,6 +448,7 @@ class PsychloBridge:
             if existing[4] == "pending": return self._dispatch_reserved(existing[0], existing[3], existing[1])
             if existing[4] == "started": raise ValueError("round dispatch is uncertain and requires operational-failure reconciliation")
             if existing[4] == "failed": raise ValueError("round dispatch ended with an operational failure")
+            if existing[4] == "cancelled-before-start": raise ValueError("round was cancelled before start")
             return {"accepted": True, "receipt": existing[1]}
         capability = callback_capability or self.token_factory()
         receipt = {**request, "sourceId": request["projectLeadId"], "provenanceId": f"overseer-dispatch:{request['roundId']}", "status": "accepted"}
@@ -587,8 +588,26 @@ class PsychloBridge:
                 return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-uncertain:{request.get('roundId')}", "status": "unknown"}}
             if existing[4] == "failed":
                 return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-operational-failure:{request.get('roundId')}", "status": "rejected"}}
+            if existing[4] == "cancelled-before-start":
+                cancellation = self.store.round_cancellation(str(request.get("roundId", "")))
+                if cancellation is None:
+                    raise ValueError("round cancellation receipt is missing")
+                return {"accepted": True, "receipt": cancellation["receipt"]}
             return {"accepted": True, "receipt": existing[1]}
         return {"accepted": True, "receipt": {**request, "sourceId": request.get("projectLeadId"), "provenanceId": f"overseer-unknown:{request.get('roundId')}", "status": "unknown"}}
+
+    def cancel_round_before_start(self, request: Mapping[str, Any], *, message_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {"cancellationId", "request", "requestDigest"}:
+            raise ValueError("round cancellation request is invalid")
+        cancellation_id = request.get("cancellationId")
+        round_request = request.get("request")
+        request_digest = request.get("requestDigest")
+        if not isinstance(cancellation_id, str) or not cancellation_id.strip() or len(cancellation_id) > 256 or (message_id is not None and cancellation_id != message_id) or not isinstance(round_request, Mapping) or not isinstance(request_digest, str) or not SHA256_RE.fullmatch(request_digest):
+            raise ValueError("round cancellation request is invalid")
+        _require_round(round_request)
+        if canonical_digest(round_request) != request_digest:
+            raise ValueError("round cancellation request digest is invalid")
+        return self.store.cancel_round_before_start(cancellation_id, round_request, request_digest, now=self.clock())
 
     def report_operational_failure(self, round_id: str, failure_code: str, *, owner_id: str | None = None) -> dict[str, Any]:
         """Report one uncertain dispatch failure without replaying its prompt.

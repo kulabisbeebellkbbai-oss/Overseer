@@ -721,6 +721,7 @@ def make_api_handler(
                 "/psychlo/projects": "project-register",
                 "/psychlo/rounds": "round-request",
                 "/psychlo/rounds/reconcile": "round-reconcile",
+                "/psychlo/rounds/cancel-before-start": "round-cancel-before-start",
                 "/psychlo/decisions": "decision-stage",
                 "/psychlo/decision-outcomes": "decision-outcome",
                 "/psychlo/decisions/outcome": "decision-outcome",
@@ -1405,6 +1406,8 @@ def make_api_handler(
                     result = request_bridge.request_round(payload["request"], callback_capability=payload["callbackCapability"])
                 elif kind == "round-reconcile":
                     result = request_bridge.reconcile_round(message["payload"])
+                elif kind == "round-cancel-before-start":
+                    result = request_bridge.cancel_round_before_start(message["payload"], message_id=message["messageId"])
                 elif kind == "decision-stage":
                     result = request_bridge.stage_decision(message["payload"])
                 elif kind == "telemetry-checkpoint":

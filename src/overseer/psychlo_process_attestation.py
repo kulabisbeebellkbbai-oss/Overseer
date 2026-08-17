@@ -182,6 +182,7 @@ class AuthoritativeProcessEvidenceCollector:
     tmux_target: str
     source_root: str | Path
     _held_pidfds: list[int] = field(default_factory=list, init=False, repr=False, compare=False)
+    _held_proc_fds: list[int] = field(default_factory=list, init=False, repr=False, compare=False)
     _held_socket_fd: int | None = field(default=None, init=False, repr=False, compare=False)
     _held_socket_identity: tuple[int, int] | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -191,6 +192,11 @@ class AuthoritativeProcessEvidenceCollector:
         while self._held_pidfds:
             try:
                 os.close(self._held_pidfds.pop())
+            except OSError:
+                pass
+        while self._held_proc_fds:
+            try:
+                os.close(self._held_proc_fds.pop())
             except OSError:
                 pass
         if self._held_socket_fd is not None:
@@ -214,17 +220,23 @@ class AuthoritativeProcessEvidenceCollector:
         for identity in (tmux["serverProcess"], tmux["paneProcess"], child):
             try:
                 self._held_pidfds.append(os.pidfd_open(int(identity["pid"])))
+                self._held_proc_fds.append(os.open(f"/proc/{int(identity['pid'])}", getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW))
             except (AttributeError, OSError) as error:
                 self.release_held_identities()
                 raise ProcessAttestationError("process identity cannot be held through attestation") from error
 
     def revalidate_held_identities(self) -> None:
-        if len(self._held_pidfds) != 3:
+        if len(self._held_pidfds) != 3 or len(self._held_proc_fds) != 3:
             raise ProcessAttestationError("held process identities are incomplete")
         if self._held_socket_fd is None or self._held_socket_identity is None:
             raise ProcessAttestationError("held tmux socket identity is incomplete")
         if (os.fstat(self._held_socket_fd).st_dev, os.fstat(self._held_socket_fd).st_ino) != self._held_socket_identity or (capture_socket_identity(self.tmux_socket)["dev"], capture_socket_identity(self.tmux_socket)["ino"]) != self._held_socket_identity:
             raise ProcessAttestationError("tmux socket identity changed")
+        for proc_fd in self._held_proc_fds:
+            try:
+                os.fstat(proc_fd)
+            except OSError as error:
+                raise ProcessAttestationError("held process proc identity became invalid") from error
         for fd in self._held_pidfds:
             try:
                 os.fstat(fd)

@@ -4,6 +4,7 @@ import json
 import os
 import inspect
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 import pytest
 
@@ -650,4 +651,23 @@ def test_stage_replay_returns_recorded_at_not_inserted_at(tmp_path, monkeypatch)
     assert row[0] == "2099-01-01T00:00:02+00:00"
     assert row[1] == "2099-01-01T00:00:03+00:00"
     assert replay["recordedAt"] == recorded["recordedAt"] == row[1]
+    runtime.bridge.store.close(); runtime.primary.close()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("approved", 1), ("approved", [True]), ("approved", None),
+     ("canceled", 0), ("canceled", None), ("archived", [])],
+)
+def test_non_boolean_plan_lifecycle_flags_cannot_record_or_update(tmp_path, monkeypatch, field, value):
+    runtime, _value = _runtime(tmp_path, monkeypatch)
+    stage_process_observation(round_id="round", plan_id="plan")
+    plan = runtime.primary.load_admin_change_plan("plan")
+    runtime.primary.save_admin_change_plan(replace(plan, **{field: value}))
+    with pytest.raises(Exception, match="boolean|lifecycle|approval"):
+        record_process_observation(round_id="round", plan_id="plan")
+    row = runtime.primary._connection.execute(
+        "SELECT state,recorded_at FROM psychlo_process_observations WHERE round_id='round'"
+    ).fetchone()
+    assert tuple(row) == ("prepared", None)
     runtime.bridge.store.close(); runtime.primary.close()

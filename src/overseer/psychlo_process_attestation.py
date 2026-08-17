@@ -1064,15 +1064,28 @@ def _immutable_plan_digest(plan: AdminChangePlan) -> str:
     return canonical_digest(value)
 
 
+def _validate_plan_lifecycle(plan: AdminChangePlan, *, approved_required: bool | None = None) -> None:
+    """Require literal lifecycle booleans, never truthy coercions."""
+    for field_name in ("approved", "canceled", "archived"):
+        if type(getattr(plan, field_name, None)) is not bool:
+            raise ProcessAttestationError(f"plan {field_name} flag is not a boolean")
+    if plan.canceled is not False or plan.archived is not False:
+        raise ProcessAttestationError("process observation plan lifecycle is not active")
+    if approved_required is None:
+        approved_required = plan.approved
+    if approved_required is True:
+        if plan.approved is not True or plan.approved_by != "sisko" or not isinstance(plan.approved_at, str) or not plan.approved_at:
+            raise ProcessAttestationError("exact approved Sisko plan is required")
+        _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
+    elif approved_required is False:
+        if plan.approved is not False or plan.approved_by is not None or plan.approved_at is not None:
+            raise ProcessAttestationError("unapproved prepared process plan has approval fields")
+
+
 def _assert_exact_plan(primary: SQLiteStore, plan_id: str, round_id: str, manifest: Mapping[str, Any], *, approved: bool) -> AdminChangePlan:
     plan = primary.load_admin_change_plan(plan_id)
     _assert_plan_identity(plan, plan_id, round_id, manifest)
-    if approved and (not plan.approved or plan.approved_by != "sisko" or plan.canceled or not plan.approved_at):
-        raise ProcessAttestationError("exact approved Sisko plan is required")
-    if approved:
-        _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
-    if not approved and plan.approved:
-        raise ProcessAttestationError("staged process plan is unexpectedly approved")
+    _validate_plan_lifecycle(plan, approved_required=approved)
     return plan
 
 
@@ -1126,7 +1139,8 @@ def _validate_process_observation_row(
     except (KeyError, TypeError, ValueError) as error:
         raise ProcessAttestationError("process observation plan is missing") from error
     _assert_plan_identity(plan, plan_id, round_id, manifest)
-    if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION or plan.canceled:
+    _validate_plan_lifecycle(plan)
+    if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION:
         raise ProcessAttestationError("process observation plan kind or lifecycle is invalid")
     observed_end = _parse_utc_timestamp(manifest["observedWindowEnd"], "observation end")
     if observed_end > inserted_time:
@@ -1135,19 +1149,17 @@ def _validate_process_observation_row(
         if plan_digest != "" or recorded_at is not None:
             raise ProcessAttestationError("prepared process observation recording fields are invalid")
         if plan.approved:
-            if plan.approved_by != "sisko" or not plan.approved_at:
-                raise ProcessAttestationError("approved prepared process plan is incomplete")
+            _validate_plan_lifecycle(plan, approved_required=True)
             approved_time = _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
             if inserted_time > approved_time:
                 raise ProcessAttestationError("plan approval precedes prepared observation persistence")
-        elif any(value is not None for value in (plan.approved_by, plan.approved_at)):
-            raise ProcessAttestationError("unapproved prepared process plan has approval fields")
+        else:
+            _validate_plan_lifecycle(plan, approved_required=False)
     else:
         if not isinstance(recorded_at, str) or not recorded_at.strip():
             raise ProcessAttestationError("recorded process observation timestamp is missing")
         recorded_time = _parse_utc_timestamp(recorded_at, "recorded process observation timestamp")
-        if not plan.approved or plan.approved_by != "sisko" or not plan.approved_at:
-            raise ProcessAttestationError("recorded process observation plan is not approved")
+        _validate_plan_lifecycle(plan, approved_required=True)
         approved_time = _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
         if inserted_time > approved_time or approved_time > recorded_time:
             raise ProcessAttestationError("process observation persistence chronology is invalid")
@@ -1164,8 +1176,7 @@ def _validate_recording_envelope(
     observed_end = _parse_utc_timestamp(manifest["observedWindowEnd"], "observation end")
     if observed_end > inserted_time:
         raise ProcessAttestationError("observation was persisted before its collection ended")
-    if not plan.approved or plan.approved_by != "sisko" or plan.canceled or not plan.approved_at:
-        raise ProcessAttestationError("exact approved Sisko plan is required")
+    _validate_plan_lifecycle(plan, approved_required=True)
     approved_time = _parse_utc_timestamp(plan.approved_at, "plan approval timestamp")
     recorded_time = _parse_utc_timestamp(recorded_at, "recorded process observation timestamp")
     if inserted_time > approved_time or approved_time > recorded_time:
@@ -1249,10 +1260,7 @@ def stage_process_observation(*, round_id: str, plan_id: str) -> dict[str, Any]:
                 if existing.approved or existing.canceled:
                     raise ProcessAttestationError("staged process plan lifecycle is not mutable")
             inserted_at = _observation_clock(runtime.bridge)
-            if plan.approved:
-                raise ProcessAttestationError("staged process plan is unexpectedly approved")
-            if plan.approved_by is not None or plan.approved_at is not None:
-                raise ProcessAttestationError("unapproved prepared process plan has approval fields")
+            _validate_plan_lifecycle(plan, approved_required=False)
             if _parse_utc_timestamp(value["observedWindowEnd"], "observation end") > _parse_utc_timestamp(inserted_at, "observation inserted timestamp"):
                 raise ProcessAttestationError("observation was persisted before its collection ended")
             primary.insert_prepared_process_observation(
@@ -1285,6 +1293,7 @@ def finalize_process_observation(*, plan_id: str) -> dict[str, Any]:
         plan = primary.load_admin_change_plan(plan_id)
         if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION:
             raise ProcessAttestationError("exact process observation plan is required")
+        _validate_plan_lifecycle(plan)
         row = primary._connection.execute(
             "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at "
             "FROM psychlo_process_observations WHERE plan_id=?",
@@ -1296,7 +1305,9 @@ def finalize_process_observation(*, plan_id: str) -> dict[str, Any]:
             )
         recorded = bool(row is not None and row[5] == "recorded")
         prepared = bool(row is not None and row[5] == "prepared")
-        approved = bool(plan.approved and plan.approved_by == "sisko" and not plan.canceled)
+        approved = plan.approved is True and plan.approved_by == "sisko" and isinstance(plan.approved_at, str) and bool(plan.approved_at)
+        if approved:
+            _validate_plan_lifecycle(plan, approved_required=True)
         return {
             "historical": True,
             "authoritative": False,

@@ -819,9 +819,12 @@ def _drop_in_path() -> Path:
 def _run_install(command: Sequence[str], manifest: ImmutableReleaseManifest) -> None:
     validate_sudo_install_argv(command, manifest)
     opened: list[tuple[int, ReleaseFile, tuple[int, ...]]] = []
+    # A pathname rename legitimately changes ctime while the already-open
+    # inode remains authoritative.  Content is independently required to
+    # match the manifest hash during the complete descriptor stream.
     identity = lambda info: (
         info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
-        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+        info.st_nlink, info.st_size,
     )
     process: subprocess.Popen[bytes] | None = None
     try:

@@ -342,8 +342,10 @@ def _run_stream(command: Sequence[str], frames: Sequence[bytes], expected: Mappi
 def _run_activation_stream(command: Sequence[str], capability: Mapping[str, object],
                            manifest: ImmutableReleaseManifest) -> None:
     opened: list[tuple[int, ReleaseFile, tuple[int, ...]]] = []
+    # Renaming the pathname changes ctime but cannot redirect this held fd;
+    # streamed bytes still have to match the approved full-content digest.
     identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
-                             info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                             info.st_nlink, info.st_size)
     process = None
     try:
         for item in manifest.files:

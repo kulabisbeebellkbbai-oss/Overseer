@@ -1574,6 +1574,7 @@ def test_concurrent_execution_allows_only_one_owner(tmp_path: Path, monkeypatch:
 def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from overseer import cli
     from overseer import codex_dispatch_release_activation as release
+    from overseer import codex_dispatch_system_activation as system
 
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
@@ -1591,22 +1592,33 @@ def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_pa
          "sha256": "c" * 64, "size": 100},
         hashlib.sha256(unit.encode()).hexdigest(),
     )
-    release_spec = release.ReleaseActivationSpec(
-        manifest, {"peerPid": 1329}, {"pid": 99}, unit,
+    system_spec = system.SystemActivationSpec(
+        manifest,
+        {"sourceCommit": "a" * 40, "blob": "d" * 40, "sha256": "e" * 64,
+         "size": 123, "path": system.ROOT_HELPER_SOURCE},
+        {"bootId": "boot", "peerPid": 1329, "startTicks": 44},
+        {"bootId": "boot", "pid": 99, "startTicks": 55, "cmdlineHex": "00", "cwd": "/old"},
+        (), None, system.system_unit_content(manifest),
     )
-    monkeypatch.setattr(cli, "build_codex_dispatch_activation_spec", lambda: release_spec)
-    staged = cli.plan_admin_change_status(
-        store, "admin.codex-dispatch.e2e", AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
-        "overseer-api.service", "activate reviewed dispatch", "disabled",
-    )
+    monkeypatch.setattr(cli, "build_codex_dispatch_activation_spec", lambda: system_spec)
+    with system.external_activation_cli():
+        staged = cli.plan_admin_change_status(
+            store, "admin.codex-dispatch.e2e", AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
+            "overseer-api.service", "activate reviewed dispatch", "disabled",
+        )
     assert staged["approved"] is False
     approved = cli.approve_admin_change_status(store, "admin.codex-dispatch.e2e", "sisko", "2026-08-18T00:00:00+00:00")
     assert approved["approved"] is True
     request = cli.request_admin_adapter_enablement_status(store, AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value, "sisko")
     cli.approve_admin_adapter_enablement_status(store, request["approval_id"], "sisko", "2026-08-18T00:01:00+00:00")
-    monkeypatch.setattr(release, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(system, "_reject_api_context", lambda: None)
+    monkeypatch.setattr(system, "verify_system_activation_spec", lambda _spec: None)
     runner = lambda step: AdminCommandResult(step.title, step.command, 0)
-    result = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
+    blocked = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
+    assert blocked["status"] == "blocked"
+    assert "external isolated CLI" in blocked["summary"]
+    with system.external_activation_cli():
+        result = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
     assert result["status"] == "completed"
     with cli.SQLiteStore(store) as persisted:
         assert persisted.load_admin_change_plan("admin.codex-dispatch.e2e").approved is True

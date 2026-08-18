@@ -175,12 +175,14 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
     ),
     AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION: AdminExecutionCapability(
         kind=AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
-        adapter_name="codex-immutable-release-dispatch-activation-v1",
+        adapter_name="codex-root-system-service-activation-v2",
         status=AdminAdapterStatus.DISABLED,
-        summary="approved high-risk root-owned immutable release and pidfd lifecycle activation requires this exact plan",
+        summary="external-CLI-only reviewed root helper and immutable system-service migration requires this exact plan",
         authorization_required_before_enable=True,
         approval_plan_required=True,
-        supported_commands=(("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"), ("__overseer_codex_dispatch_release_v1",)),
+        supported_commands=(("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"),
+                            ("/usr/bin/sudo", "-n", "/usr/local/libexec/overseer-codex-dispatch-activation"),
+                            ("__overseer_codex_dispatch_system_v1",)),
     ),
     AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(
         kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,
@@ -1594,7 +1596,7 @@ def _execute_admin_change_plan_body(
 
     command_runner = runner or run_admin_command_step
     if codex_dispatch_activation:
-        from .codex_dispatch_release_activation import execute_codex_dispatch_activation_plan
+        from .codex_dispatch_system_activation import execute_codex_dispatch_activation_plan
 
         return execute_codex_dispatch_activation_plan(plan, runner=command_runner, adapter_enabled=True)
     if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
@@ -1625,7 +1627,7 @@ def _execute_admin_change_plan_body(
             )
     if AdminChangeKind(plan.kind) == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
         try:
-            from .codex_dispatch_release_activation import validate_codex_dispatch_activation_plan
+            from .codex_dispatch_system_activation import validate_codex_dispatch_activation_plan
 
             validate_codex_dispatch_activation_plan(plan)
         except (OSError, ValueError) as exc:
@@ -1708,7 +1710,7 @@ def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecuti
 def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
     if step.command and step.command[0].startswith("__overseer_codex_dispatch_"):
         try:
-            from .codex_dispatch_release_activation import execute_codex_dispatch_activation_marker
+            from .codex_dispatch_system_activation import execute_codex_dispatch_activation_marker
 
             exit_code, stdout, stderr = execute_codex_dispatch_activation_marker(step.command)
         except (OSError, ValueError) as exc:

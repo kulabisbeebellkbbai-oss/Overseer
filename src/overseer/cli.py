@@ -54,11 +54,13 @@ from .psychlo_cycle_activation import (
     plan_psychlo_recurring_cycle_activation,
     psychlo_cycle_activation_spec_from_private_file,
 )
-from .codex_dispatch_release_activation import (
-    ReleaseActivationSpec as CodexDispatchActivationSpec,
+from .codex_dispatch_system_activation import (
+    SystemActivationSpec as CodexDispatchActivationSpec,
     build_codex_dispatch_activation_spec,
+    external_activation_cli,
     execute_codex_dispatch_activation_marker,
     plan_codex_dispatch_activation,
+    require_external_activation_context,
     require_isolated_activation_entry,
     validate_codex_dispatch_activation_plan,
 )
@@ -4351,6 +4353,7 @@ def plan_admin_change_status(
             raise ValueError("psychlo_cycle_spec is required for psychlo_recurring_cycle_activation")
         plan = plan_psychlo_recurring_cycle_activation(plan_id, psychlo_cycle_spec, reason, current_state)
     elif plan_kind == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
+        require_external_activation_context()
         if codex_dispatch_spec is not None:
             raise ValueError("caller-supplied Codex dispatch manifests are not authoritative")
         plan = plan_codex_dispatch_activation(plan_id, build_codex_dispatch_activation_spec(), reason, current_state)
@@ -12119,20 +12122,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "stage-codex-dispatch-activation":
         require_isolated_activation_entry()
-        print(
-            json.dumps(
-                plan_admin_change_status(
-                    args.store,
-                    args.plan_id,
-                    AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
-                    "overseer-api.service",
-                    args.reason,
-                    args.current_state,
-                    codex_dispatch_spec=None,
-                ),
-                sort_keys=True,
+        with external_activation_cli():
+            print(
+                json.dumps(
+                    plan_admin_change_status(
+                        args.store,
+                        args.plan_id,
+                        AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
+                        "overseer-api.service",
+                        args.reason,
+                        args.current_state,
+                        codex_dispatch_spec=None,
+                    ),
+                    sort_keys=True,
+                )
             )
-        )
         return 0
 
     if args.command == "codex-dispatch-activation-status":
@@ -12148,7 +12152,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "execute-codex-dispatch-activation":
         require_isolated_activation_entry()
-        print(json.dumps(execute_admin_change_status(args.store, args.plan_id, policy_profile_path=args.policy_profile), sort_keys=True))
+        with external_activation_cli():
+            print(json.dumps(execute_admin_change_status(args.store, args.plan_id, policy_profile_path=args.policy_profile), sort_keys=True))
         return 0
 
     if args.command == "authorizations-required":

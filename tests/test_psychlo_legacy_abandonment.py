@@ -27,13 +27,17 @@ from tests.test_psychlo_process_attestation_v2 import _manifest as _process_mani
 NOW = "2099-01-01T00:00:10+00:00"
 
 
-def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW):
+def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thread_id="old-conversation"):
     bridge_store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     request = {
         "roundId": "round-arcade", "projectId": "arcade", "projectLeadId": "hermione",
-        "planId": "arcade-plan", "planVersion": "1.0", "threadId": "old-thread",
+        "planId": "arcade-plan", "planVersion": "1.0",
         "snapshotId": "snapshot-1", "policyVersion": "policy-1", "correlationId": "corr-1", "idempotencyKey": "idem-1",
+        "expectedUsageCost": 1, "scope": "one bounded round", "selectionReason": "priority-selected",
+        "priorityRationale": "manual-priority",
     }
+    if request_thread_id is not None:
+        request["threadId"] = request_thread_id
     receipt = {**request, "sourceId": "hermione", "provenanceId": "overseer-dispatch:round-arcade", "status": "accepted"}
     capability = "capability-arcade-123"
     binding = {"conversationId": "old-conversation", "sessionId": "old-session"}
@@ -97,7 +101,7 @@ def test_stage_exact_replay_returns_frozen_intent_and_divergence_conflicts(tmp_p
 
 @pytest.mark.parametrize(
     ("conversation_id", "thread_id"),
-    [("old-conversation", "new-thread"), ("new-conversation", "old-thread")],
+    [("old-conversation", "new-thread"), ("new-conversation", "old-conversation")],
 )
 def test_successor_conversation_and_thread_must_each_be_distinct(tmp_path, conversation_id, thread_id):
     bridge, primary = _runtime(tmp_path)
@@ -108,6 +112,31 @@ def test_successor_conversation_and_thread_must_each_be_distinct(tmp_path, conve
             successor_plan_version="2.0", successor_conversation_id=conversation_id,
             successor_thread_id=thread_id,
         )
+
+
+def test_stage_derives_original_thread_from_binding_for_canonical_request_without_thread_id(tmp_path):
+    bridge, primary = _runtime(tmp_path, request_thread_id=None)
+
+    staged = _stage(bridge)
+
+    intent = bridge.store.legacy_abandonment(staged["actionId"])
+    assert intent["payload"]["originalPlan"]["threadId"] == "old-conversation"
+    plan = primary.load_admin_change_plan("abandon-plan")
+    assert plan.adapter_metadata["legacy_abandonment"]["originalThreadId"] == "old-conversation"
+
+
+def test_stage_rejects_legacy_request_thread_that_differs_from_binding(tmp_path):
+    bridge, _primary_store = _runtime(tmp_path, request_thread_id="different-thread")
+
+    with pytest.raises(LegacyAbandonmentError, match="original thread.*binding"):
+        _stage(bridge)
+
+
+def test_stage_rejects_invalid_legacy_request_thread_even_when_binding_is_valid(tmp_path):
+    bridge, _primary_store = _runtime(tmp_path, request_thread_id="invalid thread")
+
+    with pytest.raises(LegacyAbandonmentError, match="original thread id is invalid"):
+        _stage(bridge)
 
 
 def test_execute_fences_delivery_and_persists_terminal_non_result(tmp_path):

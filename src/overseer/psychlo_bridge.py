@@ -2494,11 +2494,16 @@ class CodexProjectDispatcher:
         """Search the complete bound Codex rollout before any recovery paste."""
         driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)
         result = driver.scan_rollout_prompt(session, prompt)
+        provenance = _require_rollout_binding_provenance(driver.rollout_provenance(session))
         if isinstance(result, bool):
-            return {"found": result, **driver.rollout_provenance(session)}
-        if not isinstance(result, Mapping) or not isinstance(result.get("found"), bool):
-            raise ValueError("project lead rollout scan lacks exact identity provenance")
-        return {"found": bool(result["found"]), **driver.rollout_provenance(session)}
+            return {"found": result, **provenance}
+        try:
+            scan = _require_rollout_scan(result)
+        except ValueError as error:
+            raise ValueError("project lead rollout scan lacks exact identity provenance") from error
+        if scan["binding"] != provenance:
+            raise ValueError("project lead rollout scan identity provenance changed")
+        return {"found": scan["found"], **scan["binding"]}
 
     def binding_provenance(self, project_lead_id: str, *, conversation_id: str | None = None, thread_id: str | None = None) -> dict[str, object]:
         driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)

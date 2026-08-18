@@ -110,3 +110,62 @@ def test_codex_project_dispatcher_preserves_provenance_rich_scan(monkeypatch, tm
         conversation_id=BOUND["conversationId"],
     )
     assert result == {"found": False, **BOUND}
+
+
+@pytest.mark.parametrize(
+    "raw_scan",
+    [
+        {"found": False, **{**BOUND, "conversationId": "conversation-other"}},
+        {"found": False, **BOUND, "unexpected": "field"},
+        {"found": False, **{**BOUND, "rolloutPathDigest": "b" * 64}},
+    ],
+)
+def test_codex_project_dispatcher_rejects_raw_scan_provenance_laundering(
+    monkeypatch, tmp_path: Path, raw_scan
+):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text(json.dumps({"member-hermione": {"conversationId": BOUND["conversationId"]}}))
+    bindings.chmod(0o600)
+    session = SimpleNamespace(id="session-arcade", external_session_id=BOUND["conversationId"])
+
+    class Driver:
+        def discover(self):
+            return [session]
+
+        def scan_rollout_prompt(self, _session, _prompt):
+            return raw_scan
+
+        def rollout_provenance(self, _session):
+            return dict(BOUND)
+
+    monkeypatch.setattr("overseer.agent_adapters.codex.CodexDriver.from_legacy_registry", lambda: Driver())
+    dispatcher = CodexProjectDispatcher(bindings)
+    with pytest.raises(ValueError, match="rollout scan|identity provenance"):
+        dispatcher.scan_rollout(
+            "member-hermione",
+            "prompt",
+            conversation_id=BOUND["conversationId"],
+        )
+
+
+def test_codex_project_dispatcher_legacy_bool_uses_independent_provenance(monkeypatch, tmp_path: Path):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text(json.dumps({"member-hermione": {"conversationId": BOUND["conversationId"]}}))
+    bindings.chmod(0o600)
+    session = SimpleNamespace(id="session-arcade", external_session_id=BOUND["conversationId"])
+
+    class Driver:
+        def discover(self):
+            return [session]
+
+        def scan_rollout_prompt(self, _session, _prompt):
+            return False
+
+        def rollout_provenance(self, _session):
+            return dict(BOUND)
+
+    monkeypatch.setattr("overseer.agent_adapters.codex.CodexDriver.from_legacy_registry", lambda: Driver())
+    dispatcher = CodexProjectDispatcher(bindings)
+    assert dispatcher.scan_rollout(
+        "member-hermione", "prompt", conversation_id=BOUND["conversationId"]
+    ) == {"found": False, **BOUND}

@@ -59,6 +59,7 @@ from .codex_dispatch_activation import (
     build_codex_dispatch_activation_spec,
     execute_codex_dispatch_activation_marker,
     plan_codex_dispatch_activation,
+    require_isolated_activation_entry,
     validate_codex_dispatch_activation_plan,
 )
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
@@ -12117,6 +12118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "stage-codex-dispatch-activation":
+        require_isolated_activation_entry()
         print(
             json.dumps(
                 plan_admin_change_status(
@@ -12145,6 +12147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "execute-codex-dispatch-activation":
+        require_isolated_activation_entry()
         print(json.dumps(execute_admin_change_status(args.store, args.plan_id, policy_profile_path=args.policy_profile), sort_keys=True))
         return 0
 

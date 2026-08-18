@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import py_compile
 import stat
 import subprocess
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -126,6 +129,138 @@ def test_reviewed_source_inventory_covers_preimport_python_anywhere_under_src(mo
     assert calls
     assert all(command[-1] == "src" for command in calls)
     assert all("--exclude-standard" not in command for command in calls)
+
+
+def test_reviewed_source_inventory_rejects_untracked_sourceless_bytecode(monkeypatch: pytest.MonkeyPatch):
+    tracked = "src/overseer/__init__.py\nsrc/overseer/cli.py\n"
+
+    def git(command):
+        return "src/sitecustomize.pyc" if "--others" in command else tracked
+
+    monkeypatch.setattr(activation, "_git", git)
+    with pytest.raises(ValueError, match="untracked Python"):
+        activation._reviewed_source_files()
+
+
+def test_dispatch_drop_in_uses_isolated_launcher_and_exact_service_arguments():
+    content = activation._drop_in_content(_spec()).decode("utf-8")
+    assert "Environment=PYTHONPATH=" in content
+    assert "ExecStart=" in content
+    assert " -I -S " in content
+    assert "overseer_codex_dispatch_launcher.py" in content
+    assert "serve-api --store /home/god/.local/share/overseer/project/state/overseer.sqlite3" in content
+    assert "--host 127.0.0.1 --port 8766" in content
+    assert "--auth-token-file /home/god/.local/share/overseer/project/state/api-token" in content
+
+
+def test_isolated_launcher_rejects_nonisolated_invocation_before_dispatch():
+    launcher = activation.CANONICAL_SOURCE_ROOT / "src/overseer_codex_dispatch_launcher.py"
+    assert launcher.is_file(), "isolated launcher is missing"
+    completed = subprocess.run(
+        ["/usr/bin/python3", str(launcher), "probe"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+    )
+    assert completed.returncode != 0
+    assert "-I -S" in completed.stderr
+
+
+def test_activation_cli_stage_and_execute_fail_closed_outside_launcher(tmp_path: Path):
+    from overseer import cli
+
+    with pytest.raises(RuntimeError, match="isolated launcher"):
+        cli.main([
+            "stage-codex-dispatch-activation", "--store", str(tmp_path / "store.sqlite3"),
+            "--plan-id", "admin.isolated.test", "--reason", "test isolated boundary",
+        ])
+    with pytest.raises(RuntimeError, match="isolated launcher"):
+        cli.main([
+            "execute-codex-dispatch-activation", "--store", str(tmp_path / "store.sqlite3"),
+            "--plan-id", "admin.isolated.test",
+        ])
+
+
+def _isolated_probe_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
+    root = tmp_path / "reviewed"
+    launcher = root / "src/overseer_codex_dispatch_launcher.py"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes((activation.CANONICAL_SOURCE_ROOT / "src/overseer_codex_dispatch_launcher.py").read_bytes())
+    (root / "src/overseer").mkdir()
+    (root / "src/overseer/__init__.py").write_text("", encoding="utf-8")
+    (root / "src/overseer/codex_dispatch_activation.py").write_text(
+        "def authorize_isolated_activation_entry(_digest): return None\n",
+        encoding="utf-8",
+    )
+    (root / "src/overseer/cli.py").write_text(
+        "import cryptography, pydantic, starlette\ndef main(_argv): return 0\n",
+        encoding="utf-8",
+    )
+    (root / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1'\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q", str(root)), check=True)
+    subprocess.run(("git", "-C", str(root), "add", "src", "pyproject.toml"), check=True)
+    subprocess.run(
+        ("git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"),
+        check=True,
+    )
+    inventory = tuple(sorted(
+        item for item in subprocess.check_output(("git", "-C", str(root), "ls-files", "--", "src"), text=True).splitlines()
+        if item.endswith((".py", ".pyc"))
+    ))
+    module_hasher = hashlib.sha256()
+    for relative in inventory:
+        module_hasher.update(relative.encode() + b"\0" + (root / relative).read_bytes())
+    commit = subprocess.check_output(("git", "-C", str(root), "rev-parse", "HEAD"), text=True).strip()
+    tree = subprocess.check_output(("git", "-C", str(root), "rev-parse", "HEAD^{tree}"), text=True).strip()
+    module = module_hasher.hexdigest()
+    review = activation._review_digest(commit, tree, module, inventory)
+    spec = CodexDispatchActivationSpec(
+        CODEX_DISPATCH_ACTIVATION_SCHEMA, commit, tree, module, review, source_files=inventory,
+    )
+    arguments = [
+        "/usr/bin/python3", "-I", "-S", str(launcher),
+        "--source-root", str(root), "--source-commit", commit, "--source-tree", tree,
+        "--source-module", module, "--review-digest", review,
+        "--spec-digest", activation.codex_dispatch_activation_plan_digest(spec), "probe",
+    ]
+    return launcher, arguments
+
+
+def test_isolated_launcher_blocks_transient_sitecustomize_and_sourceless_pyc(tmp_path: Path):
+    _, arguments = _isolated_probe_fixture(tmp_path)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    sentinel = tmp_path / "executed"
+    transient = attacker / "sitecustomize.py"
+    transient.write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed')\nPath(__file__).unlink()\n",
+        encoding="utf-8",
+    )
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "PYTHONPATH": str(attacker)}
+    clean = subprocess.run(arguments, capture_output=True, text=True, check=False, env=environment)
+    assert clean.returncode == 0, clean.stderr
+    assert transient.exists()
+    assert not sentinel.exists()
+
+    site_packages = activation.SERVICE_SITE_PACKAGES
+    service = arguments[:-1] + [
+        "--site-packages", str(site_packages), "service", "--",
+        "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+        "--auth-token-file", str(activation.SERVICE_TOKEN),
+    ]
+    imported = subprocess.run(service, capture_output=True, text=True, check=False, env=environment)
+    assert imported.returncode == 0, imported.stderr
+
+    root = Path(arguments[arguments.index("--source-root") + 1])
+    malicious_source = tmp_path / "sitecustomize-source.py"
+    malicious_source.write_text(f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('pyc')\n", encoding="utf-8")
+    py_compile.compile(str(malicious_source), cfile=str(root / "src/sitecustomize.pyc"), doraise=True)
+    malicious_source.unlink()
+    rejected = subprocess.run(arguments, capture_output=True, text=True, check=False, env=environment)
+    assert rejected.returncode != 0
+    assert "untracked executable Python" in rejected.stderr
+    assert not sentinel.exists()
 
 
 def test_plan_rejects_review_digest_or_metadata_drift():
@@ -311,6 +446,26 @@ def test_activation_lock_detects_replacement_and_keeps_second_owner_out(tmp_path
             validate_lock()
 
 
+def test_activation_lock_acquires_stable_runtime_anchor_before_local_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    events: list[str] = []
+
+    @contextmanager
+    def runtime_anchor():
+        events.append("runtime-enter")
+        yield lambda: events.append("runtime-validate")
+        events.append("runtime-exit")
+
+    monkeypatch.setattr(activation, "_runtime_anchor_lock", runtime_anchor, raising=False)
+    with activation._activation_lock() as validate:
+        events.append("body")
+        validate()
+    assert events[0] == "runtime-enter"
+    assert events[-1] == "runtime-exit"
+    assert events.count("runtime-validate") >= 2
+
+
 def test_journal_secure_read_rejects_symlink_and_unknown_enums(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
@@ -340,6 +495,34 @@ def test_environment_verification_preserves_existing_variables(monkeypatch: pyte
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OVERSEER_CODEX_APP_SERVER_DISPATCH=1")
     with pytest.raises(ValueError, match="exactly one"):
         activation._verify_environment()
+
+
+def test_environment_verification_requires_effective_isolated_execstart(monkeypatch: pytest.MonkeyPatch):
+    spec = _spec()
+    command = " ".join(activation._systemd_quote(item) for item in activation._isolated_launcher_command(
+        spec,
+        "service",
+        (
+            "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+            "--auth-token-file", str(activation.SERVICE_TOKEN),
+        ),
+    ))
+
+    def checked(command_args, **_kwargs):
+        return command if any("ExecStart" in item for item in command_args) else "OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OTHER=ok"
+
+    monkeypatch.setattr(activation, "_run_checked", checked)
+    activation._verify_environment(spec)
+    monkeypatch.setattr(
+        activation,
+        "_run_checked",
+        lambda command_args, **_kwargs: (
+            "/usr/bin/python3 -m overseer.cli serve-api" if any("ExecStart" in item for item in command_args)
+            else "OVERSEER_CODEX_APP_SERVER_DISPATCH=1"
+        ),
+    )
+    with pytest.raises(ValueError, match="ExecStart"):
+        activation._verify_environment(spec)
 
 
 def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -414,8 +597,8 @@ def test_drop_in_crash_after_write_is_reconciled_from_intent_journal(tmp_path: P
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     original = activation._publish_drop_in_noreplace
 
-    def crash_after_dropin(path):
-        original(path)
+    def crash_after_dropin(path, content=activation.DROP_IN_CONTENT):
+        original(path, content)
         raise RuntimeError("crash after drop-in effect")
 
     monkeypatch.setattr(activation, "_publish_drop_in_noreplace", crash_after_dropin)
@@ -583,7 +766,10 @@ def test_stop_failure_keeps_retryable_rollback_phase(tmp_path: Path, monkeypatch
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     plan = _plan()
-    activation._write_journal(activation._journal(plan.id, plan.steps[0].command[2], "started", daemonOwnership="started-by-operation"))
+    spec = CodexDispatchActivationSpec.from_json(plan.adapter_metadata["spec"])
+    activation._write_journal(activation._journal(
+        plan.id, plan.steps[0].command[2], "started", spec=spec, daemonOwnership="started-by-operation",
+    ))
     monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
     monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop failed")) if tuple(command)[-1:] == ("stop",) else "ok")
     assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 1
@@ -698,6 +884,7 @@ def test_rollback_quarantines_replacement_after_validation_without_deleting_it(t
 
 def test_normal_rollback_retains_inert_quarantine_and_never_unlinks_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     plan = _plan()
+    expected_drop_in = activation._drop_in_content(CodexDispatchActivationSpec.from_json(plan.adapter_metadata["spec"]))
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
@@ -723,7 +910,7 @@ def test_normal_rollback_retains_inert_quarantine_and_never_unlinks_it(tmp_path:
     assert len(quarantined) == 1
     assert not quarantined[0].name.endswith(".conf")
     assert quarantined[0] not in list(drop_in.parent.glob("*.conf"))
-    assert quarantined[0].read_bytes() == activation.DROP_IN_CONTENT
+    assert quarantined[0].read_bytes() == expected_drop_in
     assert unrelated.read_text(encoding="utf-8") == "preserve me"
     inode = quarantined[0].stat().st_ino
     journal = activation._load_journal(plan.id, plan.steps[0].command[2])
@@ -737,6 +924,7 @@ def test_normal_rollback_retains_inert_quarantine_and_never_unlinks_it(tmp_path:
 
 def test_rollback_never_replaces_concurrently_created_quarantine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     plan = _plan()
+    expected_drop_in = activation._drop_in_content(CodexDispatchActivationSpec.from_json(plan.adapter_metadata["spec"]))
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
@@ -763,7 +951,7 @@ def test_rollback_never_replaces_concurrently_created_quarantine(tmp_path: Path,
     code, _, error = execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)
     assert code == 1
     assert "already exists" in error
-    assert drop_in.read_bytes() == activation.DROP_IN_CONTENT
+    assert drop_in.read_bytes() == expected_drop_in
     quarantined = list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))
     assert len(quarantined) == 1
     assert quarantined[0].read_bytes() == unrelated
@@ -812,10 +1000,11 @@ def test_rolled_back_approved_plan_is_terminal_before_any_effect(tmp_path: Path,
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     plan = _approved_plan()
+    spec = CodexDispatchActivationSpec.from_json(plan.adapter_metadata["spec"])
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
     digest = plan.steps[0].command[2]
-    assert activation._install_drop_in(plan.id, digest) == "exact owner-only service drop-in installed"
-    assert activation._rollback(plan.id, digest).startswith("exact Codex dispatch activation rolled back")
+    assert activation._install_drop_in(plan.id, digest, spec) == "exact owner-only service drop-in installed"
+    assert activation._rollback(plan.id, digest, spec).startswith("exact Codex dispatch activation rolled back")
     drop_in, _, _, _ = activation._paths()
     journal_before = activation._load_journal(plan.id, digest)
     quarantine = Path(str(journal_before["dropInQuarantinePath"]))
@@ -897,7 +1086,10 @@ def test_rollback_reconciles_daemon_started_by_operation_even_if_already_stopped
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     plan = _plan()
-    journal = activation._journal(plan.id, plan.steps[0].command[2], "started", daemonOwnership="started-by-operation")
+    spec = CodexDispatchActivationSpec.from_json(plan.adapter_metadata["spec"])
+    journal = activation._journal(
+        plan.id, plan.steps[0].command[2], "started", spec=spec, daemonOwnership="started-by-operation",
+    )
     activation._write_journal(journal)
     monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
     calls: list[tuple[str, ...]] = []

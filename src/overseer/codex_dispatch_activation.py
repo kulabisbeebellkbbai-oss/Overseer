@@ -18,6 +18,7 @@ import shlex
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from contextlib import contextmanager
@@ -44,10 +45,17 @@ DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer
 DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
 SOURCE_ROOTS = ("src",)
+SOURCE_EXECUTABLE_SUFFIXES = (".py", ".pyc")
 DROP_IN_CONTENT = b"[Service]\nEnvironment=OVERSEER_CODEX_APP_SERVER_DISPATCH=1\n"
 CANONICAL_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 EUID_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
 CODEX_HOME = EUID_HOME / ".codex"
+ISOLATED_LAUNCHER = CANONICAL_SOURCE_ROOT / "src/overseer_codex_dispatch_launcher.py"
+SERVICE_PYTHON = EUID_HOME / ".local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python"
+SERVICE_SITE_PACKAGES = SERVICE_PYTHON.parents[1] / "lib/python3.13/site-packages"
+SERVICE_STORE = EUID_HOME / ".local/share/overseer/project/state/overseer.sqlite3"
+SERVICE_TOKEN = EUID_HOME / ".local/share/overseer/project/state/api-token"
+RUNTIME_USER_ROOT = Path("/run/user")
 _HEX = set("0123456789abcdef")
 _JOURNAL_KEYS = {
     "schemaVersion", "planId", "specDigest", "phase", "dropInPath", "dropInDigest",
@@ -81,6 +89,7 @@ _BOOTSTRAP_OUTPUT_KEYS = {
 }
 _REMOTE_CONTROL_REQUIRED_KEYS = {"status", "remoteControlEnabled", "socketPath", "cliVersion"}
 _REMOTE_CONTROL_OPTIONAL_KEYS = {"backend", "appServerVersion"}
+_ISOLATED_ENTRY_BINDING: str | None = None
 
 
 def _canonical(value: object) -> str:
@@ -93,6 +102,19 @@ def _digest(value: object) -> str:
 
 def _valid_hex(value: object, lengths: set[int]) -> bool:
     return isinstance(value, str) and len(value) in lengths and set(value.lower()) <= _HEX
+
+
+def authorize_isolated_activation_entry(spec_digest: str) -> None:
+    global _ISOLATED_ENTRY_BINDING
+    if not sys.flags.isolated or not sys.flags.no_site or not _valid_hex(spec_digest, {64}):
+        raise RuntimeError("Codex dispatch activation requires the reviewed -I -S isolated launcher")
+    _ISOLATED_ENTRY_BINDING = spec_digest
+
+
+def require_isolated_activation_entry() -> None:
+    if (not sys.flags.isolated or not sys.flags.no_site
+            or not _valid_hex(_ISOLATED_ENTRY_BINDING, {64})):
+        raise RuntimeError("Codex dispatch activation stage/execute requires the reviewed -I -S isolated launcher")
 
 
 def _owner_only(path: Path, label: str) -> None:
@@ -131,14 +153,19 @@ def _reviewed_source_files() -> tuple[str, ...]:
     tracked = tuple(
         sorted(
             item for item in _git(("ls-files", "--", *SOURCE_ROOTS)).splitlines()
-            if item.endswith(".py")
+            if item.endswith(SOURCE_EXECUTABLE_SUFFIXES)
         )
     )
-    untracked = tuple(
+    untracked_candidates = tuple(
         sorted(
             item for item in _git(("ls-files", "--others", "--", *SOURCE_ROOTS)).splitlines()
-            if item.endswith(".py")
+            if item.endswith(SOURCE_EXECUTABLE_SUFFIXES)
         )
+    )
+    tracked_sources = set(item for item in tracked if item.endswith(".py"))
+    untracked = tuple(
+        item for item in untracked_candidates
+        if not _is_nonexecutable_cache(item, tracked_sources)
     )
     if untracked:
         raise ValueError("untracked Python exists in a reviewed source root")
@@ -147,13 +174,21 @@ def _reviewed_source_files() -> tuple[str, ...]:
     return tracked
 
 
+def _is_nonexecutable_cache(relative: str, tracked_sources: set[str]) -> bool:
+    path = Path(relative)
+    if path.suffix != ".pyc" or path.parent.name != "__pycache__" or ".cpython-" not in path.name:
+        return False
+    source_name = path.name.split(".cpython-", 1)[0] + ".py"
+    source = str(path.parent.parent / source_name)
+    return source in tracked_sources
+
+
 def _module_digest(source_files: Sequence[str]) -> str:
     hasher = hashlib.sha256()
     for relative in source_files:
         path = CANONICAL_SOURCE_ROOT / relative
-        if not path.is_file() or path.is_symlink():
-            raise ValueError("reviewed source module is missing")
-        hasher.update(relative.encode() + b"\0" + path.read_bytes())
+        content = _secure_read_stable(path, "reviewed source module", owner_only=False)
+        hasher.update(relative.encode() + b"\0" + content)
     return hasher.hexdigest()
 
 
@@ -236,7 +271,7 @@ class CodexDispatchActivationSpec:
             raise ValueError("Codex endpoint binding is not reviewed")
         raw_files = value["sourceFiles"]
         if (not isinstance(raw_files, list) or not raw_files
-                or any(not isinstance(item, str) or not item.endswith(".py")
+                or any(not isinstance(item, str) or not item.endswith(SOURCE_EXECUTABLE_SUFFIXES)
                        or not any(item.startswith(f"{root}/") for root in SOURCE_ROOTS)
                        for item in raw_files)
                 or raw_files != sorted(set(raw_files))):
@@ -266,6 +301,7 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
     source_commit = _git(("rev-parse", "HEAD")).lower()
     source_tree = _git(("rev-parse", "HEAD^{tree}")).lower()
     source_module = _module_digest(source_files)
+    _source_clean()
     return CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA,
         source_commit,
@@ -278,6 +314,45 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
 
 def codex_dispatch_activation_plan_digest(spec: CodexDispatchActivationSpec) -> str:
     return _digest(spec.to_json())
+
+
+def _systemd_quote(value: object) -> str:
+    rendered = str(value)
+    if rendered and all(character.isalnum() or character in "/._:@+-" for character in rendered):
+        return rendered
+    return '"' + rendered.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _isolated_launcher_command(
+    spec: CodexDispatchActivationSpec,
+    mode: str,
+    payload: Sequence[str],
+) -> tuple[str, ...]:
+    return (
+        str(SERVICE_PYTHON), "-I", "-S", str(ISOLATED_LAUNCHER),
+        "--source-root", str(CANONICAL_SOURCE_ROOT),
+        "--source-commit", spec.source_commit,
+        "--source-tree", spec.source_tree_digest,
+        "--source-module", spec.source_module_digest,
+        "--review-digest", spec.review_digest,
+        "--spec-digest", codex_dispatch_activation_plan_digest(spec),
+        "--site-packages", str(SERVICE_SITE_PACKAGES), mode, "--", *payload,
+    )
+
+
+def _drop_in_content(spec: CodexDispatchActivationSpec) -> bytes:
+    service_payload = (
+        "serve-api", "--store", str(SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+        "--auth-token-file", str(SERVICE_TOKEN),
+    )
+    command = " ".join(_systemd_quote(item) for item in _isolated_launcher_command(spec, "service", service_payload))
+    return (
+        "[Service]\n"
+        "Environment=OVERSEER_CODEX_APP_SERVER_DISPATCH=1\n"
+        "Environment=PYTHONPATH=\n"
+        "ExecStart=\n"
+        f"ExecStart={command}\n"
+    ).encode()
 
 
 def _marker_context(plan_id: str, spec: CodexDispatchActivationSpec) -> tuple[str, ...]:
@@ -351,6 +426,7 @@ def verify_reviewed_source_binding(spec: CodexDispatchActivationSpec) -> None:
         raise ValueError("reviewed source file inventory changed")
     if _module_digest(reviewed_files) != spec.source_module_digest:
         raise ValueError("reviewed source module digest changed")
+    _source_clean()
     if spec.review_digest != _review_digest(
         spec.source_commit, spec.source_tree_digest, spec.source_module_digest, reviewed_files
     ):
@@ -477,11 +553,19 @@ def _secure_read_exact(path: Path, expected: bytes) -> bytes:
     return data
 
 
-def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) -> dict[str, object]:
+def _journal(
+    plan_id: str,
+    digest: str,
+    phase: str = "none",
+    *,
+    spec: CodexDispatchActivationSpec | None = None,
+    **updates: object,
+) -> dict[str, object]:
     drop_in, _, _, socket_path = _paths()
+    drop_in_content = _drop_in_content(spec) if spec is not None else DROP_IN_CONTENT
     value: dict[str, object] = {
         "schemaVersion": JOURNAL_SCHEMA, "planId": plan_id, "specDigest": digest, "phase": phase,
-        "dropInPath": str(drop_in), "dropInDigest": hashlib.sha256(DROP_IN_CONTENT).hexdigest(),
+        "dropInPath": str(drop_in), "dropInDigest": hashlib.sha256(drop_in_content).hexdigest(),
         "dropInOwnership": "unknown", "daemonSocketPath": str(socket_path), "daemonOwnership": "unknown",
         "dropInDevice": None, "dropInInode": None,
         "dropInQuarantinePath": None, "dropInQuarantineDevice": None, "dropInQuarantineInode": None,
@@ -532,7 +616,11 @@ def _link_fd_noreplace_at(source_fd: int, destination: str, *, dir_fd: int) -> N
         raise OSError(error_number, os.strerror(error_number), destination)
 
 
-def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
+def _load_journal(
+    plan_id: str,
+    digest: str,
+    spec: CodexDispatchActivationSpec | None = None,
+) -> dict[str, object] | None:
     drop_in, path, _, socket_path = _paths()
     try:
         raw = _secure_read_stable(path, "activation journal")
@@ -542,9 +630,11 @@ def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     if (not isinstance(value, dict) or set(value) != _JOURNAL_KEYS
             or value["schemaVersion"] != JOURNAL_SCHEMA or value["planId"] != plan_id
             or value["specDigest"] != digest or value["dropInPath"] != str(drop_in)
-            or value["dropInDigest"] != hashlib.sha256(DROP_IN_CONTENT).hexdigest()
+            or not _valid_hex(value["dropInDigest"], {64})
             or value["daemonSocketPath"] != str(socket_path)):
         raise ValueError("activation journal binding is invalid")
+    if spec is not None and value["dropInDigest"] != hashlib.sha256(_drop_in_content(spec)).hexdigest():
+        raise ValueError("activation journal drop-in digest is not bound to the reviewed spec")
     if value["phase"] not in _JOURNAL_PHASES:
         raise ValueError("activation journal phase is invalid")
     if value["dropInOwnership"] not in _DROP_IN_OWNERSHIP:
@@ -587,8 +677,12 @@ def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     return value
 
 
-def _reject_terminal_plan_reuse(plan_id: str, digest: str) -> None:
-    journal = _load_journal(plan_id, digest)
+def _reject_terminal_plan_reuse(
+    plan_id: str,
+    digest: str,
+    spec: CodexDispatchActivationSpec | None = None,
+) -> None:
+    journal = _load_journal(plan_id, digest, spec)
     if journal is not None and (
         journal["phase"] == "rolled-back" or journal["dropInOwnership"] == "quarantined"
     ):
@@ -601,7 +695,7 @@ def _write_journal(value: Mapping[str, object]) -> None:
 
 
 @contextmanager
-def _activation_lock():
+def _replaceable_activation_lock():
     _, _, path, _ = _paths()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     lexical_parent = path.parent.lstat()
@@ -667,6 +761,72 @@ def _activation_lock():
             fcntl.flock(parent_fd, fcntl.LOCK_UN)
     finally:
         os.close(parent_fd)
+
+
+@contextmanager
+def _runtime_anchor_lock():
+    root_lexical = RUNTIME_USER_ROOT.lstat()
+    if (not stat.S_ISDIR(root_lexical.st_mode) or root_lexical.st_uid != 0
+            or stat.S_IMODE(root_lexical.st_mode) & 0o022):
+        raise ValueError("runtime anchor root is not root-controlled")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(RUNTIME_USER_ROOT, flags)
+    user_fd: int | None = None
+    try:
+        root_info = os.fstat(root_fd)
+        if _directory_binding(root_info) != _directory_binding(root_lexical):
+            raise ValueError("runtime anchor root changed during validation")
+        user_name = str(os.geteuid())
+        user_lexical = os.stat(user_name, dir_fd=root_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(user_lexical.st_mode) or user_lexical.st_uid != os.geteuid()
+                or stat.S_IMODE(user_lexical.st_mode) != 0o700):
+            raise ValueError("runtime user anchor is not private and euid-owned")
+        user_fd = os.open(user_name, flags, dir_fd=root_fd)
+        user_info = os.fstat(user_fd)
+        if _directory_binding(user_info) != _directory_binding(user_lexical):
+            raise ValueError("runtime user anchor changed before locking")
+        try:
+            fcntl.flock(user_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Codex dispatch activation is already running") from exc
+
+        def validate_runtime_anchor() -> None:
+            root_now = RUNTIME_USER_ROOT.lstat()
+            user_now = os.stat(user_name, dir_fd=root_fd, follow_symlinks=False)
+            if (_directory_binding(os.fstat(root_fd)) != _directory_binding(root_info)
+                    or _directory_binding(root_now) != _directory_binding(root_info)
+                    or _directory_binding(os.fstat(user_fd)) != _directory_binding(user_info)
+                    or _directory_binding(user_now) != _directory_binding(user_info)):
+                raise ValueError("stable runtime activation anchor changed or was replaced")
+
+        try:
+            validate_runtime_anchor()
+            yield validate_runtime_anchor
+        finally:
+            try:
+                validate_runtime_anchor()
+            finally:
+                fcntl.flock(user_fd, fcntl.LOCK_UN)
+    finally:
+        if user_fd is not None:
+            os.close(user_fd)
+        os.close(root_fd)
+
+
+@contextmanager
+def _activation_lock():
+    with _runtime_anchor_lock() as validate_runtime:
+        validate_runtime()
+        with _replaceable_activation_lock() as validate_local:
+            def validate() -> None:
+                validate_runtime()
+                validate_local()
+
+            validate()
+            try:
+                yield validate
+            finally:
+                validate()
 
 
 def _parse_marker(command: Sequence[str]) -> tuple[str, str, CodexDispatchActivationSpec]:
@@ -819,15 +979,30 @@ def _probe_proxy() -> None:
         client.close()
 
 
-def _verify_environment() -> None:
+def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None:
     output = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=Environment", "--value"))
     assignments = shlex.split(output)
     matches = [item for item in assignments if item.startswith("OVERSEER_CODEX_APP_SERVER_DISPATCH=")]
     if matches != ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]:
         raise ValueError("Overseer service environment does not contain exactly one correct dispatch flag")
+    if spec is not None:
+        service_payload = (
+            "serve-api", "--store", str(SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+            "--auth-token-file", str(SERVICE_TOKEN),
+        )
+        expected = _isolated_launcher_command(spec, "service", service_payload)
+        effective = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=ExecStart", "--value"))
+        position = 0
+        for argument in expected:
+            found = effective.find(argument, position)
+            if found < 0:
+                raise ValueError("Overseer effective ExecStart is not the exact isolated launcher binding")
+            position = found + len(argument)
+        if " -m overseer.cli " in effective:
+            raise ValueError("Overseer effective ExecStart retains the non-isolated service entry")
 
 
-def _publish_drop_in_noreplace(drop_in: Path) -> None:
+def _publish_drop_in_noreplace(drop_in: Path, content: bytes = DROP_IN_CONTENT) -> None:
     lexical_parent = drop_in.parent.lstat()
     if (not stat.S_ISDIR(lexical_parent.st_mode) or lexical_parent.st_uid != os.geteuid()
             or stat.S_IMODE(lexical_parent.st_mode) & 0o077):
@@ -847,7 +1022,7 @@ def _publish_drop_in_noreplace(drop_in: Path) -> None:
         if not getattr(os, "O_TMPFILE", 0):
             raise RuntimeError("anonymous no-replace drop-in publication is unavailable")
         anonymous_fd = os.open(".", temporary_flags, 0o600, dir_fd=parent_fd)
-        remaining = memoryview(DROP_IN_CONTENT)
+        remaining = memoryview(content)
         while remaining:
             written = os.write(anonymous_fd, remaining)
             if written <= 0:
@@ -858,7 +1033,7 @@ def _publish_drop_in_noreplace(drop_in: Path) -> None:
         anonymous_info = os.fstat(anonymous_fd)
         if (not stat.S_ISREG(anonymous_info.st_mode) or anonymous_info.st_uid != os.geteuid()
                 or stat.S_IMODE(anonymous_info.st_mode) != 0o600 or anonymous_info.st_nlink != 0
-                or anonymous_info.st_size != len(DROP_IN_CONTENT)):
+                or anonymous_info.st_size != len(content)):
             raise ValueError("anonymous drop-in inode is unsafe")
         _link_fd_noreplace_at(anonymous_fd, drop_in.name, dir_fd=parent_fd)
         linked_info = os.fstat(anonymous_fd)
@@ -873,17 +1048,23 @@ def _publish_drop_in_noreplace(drop_in: Path) -> None:
         os.close(parent_fd)
 
 
-def _install_drop_in(plan_id: str, digest: str) -> str:
+def _install_drop_in(
+    plan_id: str,
+    digest: str,
+    spec: CodexDispatchActivationSpec | None = None,
+) -> str:
     drop_in, _, _, _ = _paths()
+    expected_content = _drop_in_content(spec) if spec is not None else DROP_IN_CONTENT
     drop_in.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _owner_only(drop_in.parent, "systemd drop-in directory")
-    journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+    journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
     if journal["phase"] == "rolled-back" or journal["dropInOwnership"] == "quarantined":
         raise RuntimeError("rolled-back activation plan is terminal and cannot reinstall the drop-in")
+    journal["dropInDigest"] = hashlib.sha256(expected_content).hexdigest()
     prior_ownership = str(journal["dropInOwnership"])
     try:
         existing, existing_info = _secure_snapshot(drop_in, "drop-in")
-        if existing != DROP_IN_CONTENT:
+        if existing != expected_content:
             raise ValueError("drop-in content is not the reviewed override")
     except FileNotFoundError:
         existing = None
@@ -909,10 +1090,10 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     journal["phase"] = "intent-drop-in"
     _write_journal(journal)
     try:
-        _publish_drop_in_noreplace(drop_in)
+        _publish_drop_in_noreplace(drop_in, expected_content)
     except FileExistsError:
         concurrent, _ = _secure_snapshot(drop_in, "concurrent drop-in")
-        if concurrent != DROP_IN_CONTENT:
+        if concurrent != expected_content:
             raise ValueError("concurrent drop-in content is not the reviewed override")
         journal["dropInOwnership"] = "preexisting"
         journal["dropInDevice"] = None
@@ -921,7 +1102,7 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
         _write_journal(journal)
         return "exact owner-only service drop-in concurrently present"
     installed, installed_info = _secure_snapshot(drop_in, "drop-in")
-    if installed != DROP_IN_CONTENT:
+    if installed != expected_content:
         raise ValueError("installed drop-in is not the reviewed override")
     journal["dropInOwnership"] = "created-by-operation"
     journal["dropInDevice"] = installed_info.st_dev
@@ -931,12 +1112,16 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     return "exact owner-only service drop-in installed"
 
 
-def _revalidate_journal_drop_in(plan_id: str, digest: str) -> None:
-    journal = _load_journal(plan_id, digest)
+def _revalidate_journal_drop_in(
+    plan_id: str,
+    digest: str,
+    spec: CodexDispatchActivationSpec | None = None,
+) -> None:
+    journal = _load_journal(plan_id, digest, spec)
     if journal is None or journal["dropInOwnership"] not in {"preexisting", "created-by-operation"}:
         raise ValueError("drop-in intent is not ready for systemd transition")
     content, info = _secure_snapshot(Path(str(journal["dropInPath"])), "drop-in")
-    if content != DROP_IN_CONTENT:
+    if hashlib.sha256(content).hexdigest() != journal["dropInDigest"]:
         raise ValueError("drop-in content is not the reviewed override")
     if journal["dropInOwnership"] == "created-by-operation" and (
         journal["dropInDevice"], journal["dropInInode"]
@@ -985,7 +1170,7 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
         if original_exists:
             fd, content, info = _open_stable_at(parent_fd, drop_in.name, "operation-owned drop-in")
             os.close(fd)
-            if content != DROP_IN_CONTENT:
+            if hashlib.sha256(content).hexdigest() != journal["dropInDigest"]:
                 raise ValueError("operation-owned drop-in content changed")
             recorded = (journal["dropInDevice"], journal["dropInInode"])
             if recorded == (None, None) and journal["dropInOwnership"] == "write-issued":
@@ -998,7 +1183,7 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
 
         fd, content, info = _open_stable_at(parent_fd, quarantine, "quarantined operation drop-in")
         os.close(fd)
-        if content != DROP_IN_CONTENT:
+        if hashlib.sha256(content).hexdigest() != journal["dropInDigest"]:
             raise ValueError("quarantined drop-in content changed")
         if (journal["dropInDevice"], journal["dropInInode"]) != (info.st_dev, info.st_ino):
             raise ValueError("quarantined drop-in identity changed")
@@ -1016,7 +1201,7 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
             parent_fd, quarantine, "retained inert drop-in quarantine"
         )
         os.close(retained_fd)
-        if retained_content != DROP_IN_CONTENT or (retained_info.st_dev, retained_info.st_ino) != (
+        if hashlib.sha256(retained_content).hexdigest() != journal["dropInDigest"] or (retained_info.st_dev, retained_info.st_ino) != (
             info.st_dev, info.st_ino
         ):
             raise ValueError("retained drop-in quarantine changed after directory sync")
@@ -1057,7 +1242,7 @@ def _revalidate_retained_drop_in_quarantine(journal: Mapping[str, object]) -> No
         )
         os.close(fd)
         expected_identity = (journal["dropInQuarantineDevice"], journal["dropInQuarantineInode"])
-        if (content != DROP_IN_CONTENT or (info.st_dev, info.st_ino) != expected_identity
+        if (hashlib.sha256(content).hexdigest() != journal["dropInDigest"] or (info.st_dev, info.st_ino) != expected_identity
                 or expected_identity != (journal["dropInDevice"], journal["dropInInode"])):
             raise ValueError("retained drop-in quarantine identity changed")
         try:
@@ -1073,8 +1258,12 @@ def _revalidate_retained_drop_in_quarantine(journal: Mapping[str, object]) -> No
         os.close(parent_fd)
 
 
-def _rollback(plan_id: str, digest: str) -> str:
-    journal = _load_journal(plan_id, digest)
+def _rollback(
+    plan_id: str,
+    digest: str,
+    spec: CodexDispatchActivationSpec | None = None,
+) -> str:
+    journal = _load_journal(plan_id, digest, spec)
     if journal is None:
         return "no activation journal owned by this plan"
     if journal["phase"] == "rolled-back":
@@ -1146,9 +1335,9 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
         if operation in {"bootstrap", "start", "install-drop-in", "daemon-reload", "restart-overseer"}:
             verify_reviewed_source_binding(spec)
         if operation != "rollback":
-            _reject_terminal_plan_reuse(plan_id, digest)
+            _reject_terminal_plan_reuse(plan_id, digest, spec)
         if operation == "bootstrap":
-            journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
             state = _bootstrap_state()
             if (journal["bootstrapOwnership"] in {"bootstrap-issued", "created-by-operation"}
                     and state.configured and state.updater_running
@@ -1195,7 +1384,7 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             _write_journal(journal)
             return 0, "daemon bootstrapped without remote control", ""
         if operation == "start":
-            journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
             prior_ownership = str(journal["daemonOwnership"])
             journal["phase"] = "intent-start"
             _write_journal(journal)
@@ -1217,25 +1406,25 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             _write_journal(journal)
             return 0, "local daemon started", ""
         if operation == "install-drop-in":
-            return 0, _install_drop_in(plan_id, digest), ""
+            return 0, _install_drop_in(plan_id, digest, spec), ""
         if operation == "daemon-reload":
-            _revalidate_journal_drop_in(plan_id, digest)
+            _revalidate_journal_drop_in(plan_id, digest, spec)
             _run_checked(("systemctl", "--user", "daemon-reload"))
-            _revalidate_journal_drop_in(plan_id, digest)
-            journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            _revalidate_journal_drop_in(plan_id, digest, spec)
+            journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
             journal["phase"] = "reloaded"
             _write_journal(journal)
             return 0, "user systemd reloaded", ""
         if operation == "restart-overseer":
-            _revalidate_journal_drop_in(plan_id, digest)
+            _revalidate_journal_drop_in(plan_id, digest, spec)
             _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
-            _revalidate_journal_drop_in(plan_id, digest)
-            journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            _revalidate_journal_drop_in(plan_id, digest, spec)
+            journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
             journal["phase"] = "restarted"
             _write_journal(journal)
             return 0, "Overseer API restarted", ""
         if operation == "rollback":
-            return 0, _rollback(plan_id, digest), ""
+            return 0, _rollback(plan_id, digest, spec), ""
         if operation == "verify-daemon":
             _daemon_version()
             return 0, "daemon state contract verified", ""
@@ -1243,7 +1432,7 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             _probe_proxy()
             return 0, "local proxy readiness verified", ""
         if operation == "verify-environment":
-            _verify_environment()
+            _verify_environment(spec)
             return 0, "Overseer dispatch environment verified", ""
         if operation == "verify-health":
             with urllib.request.urlopen(HEALTH_URL, timeout=5) as response:
@@ -1252,7 +1441,7 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             return 0, "Overseer health verified", ""
         if operation == "verify-source":
             verify_reviewed_source_binding(spec)
-            journal = _load_journal(plan_id, digest)
+            journal = _load_journal(plan_id, digest, spec)
             if journal is not None:
                 journal["phase"] = "verified"
                 _write_journal(journal)
@@ -1304,7 +1493,7 @@ def execute_codex_dispatch_activation_plan(
         runner = run_admin_command_step
     try:
         with _activation_lock() as validate_lock:
-            _reject_terminal_plan_reuse(plan.id, codex_dispatch_activation_plan_digest(spec))
+            _reject_terminal_plan_reuse(plan.id, codex_dispatch_activation_plan_digest(spec), spec)
             command_results: list[AdminCommandResult] = []
             for step in plan.steps:
                 validate_lock()

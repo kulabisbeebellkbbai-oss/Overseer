@@ -749,6 +749,57 @@ def test_structured_thread_fence_blocks_concurrent_and_later_legacy_transport(co
     assert restarted_result.error_message == "structured Codex thread cannot be resumed through tmux"
 
 
+def test_structured_thread_fence_uses_canonical_registry_namespace(codex_csv: Path) -> None:
+    alias = codex_csv.with_name("codex-projects-alias.csv")
+    alias.symlink_to(codex_csv)
+
+    class StructuredClient:
+        def submit_bound_turn(self, *, thread_id, prompt, client_message_id, cwd, phase_callback):
+            for phase in ("prepared", "paste-intent", "submit-intent", "submitted"):
+                phase_callback(phase)
+            return {
+                "thread_id": thread_id,
+                "turn_id": "turn.canonical-fence",
+                "client_message_id": client_message_id,
+                "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                "delivery_proof": "app-server-user-message",
+            }
+
+    structured = CodexDriver.from_legacy_registry(
+        codex_csv,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=RecordingRunner(),
+        structured_turn_client=StructuredClient(),
+    )
+    result = structured.dispatch_legacy(
+        structured.discover()[0],
+        "Fence the canonical registry thread.",
+        idempotency_key="round.canonical-fence",
+        phase_callback=lambda _phase: None,
+    )
+    assert result.state is AgentOperationState.ACKNOWLEDGED
+
+    legacy_runner = RecordingRunner()
+    legacy = CodexDriver.from_legacy_registry(
+        alias,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=legacy_runner,
+        sleep=lambda _delay: None,
+    )
+    assert legacy.registry_path == structured.registry_path
+    assert legacy.structured_thread_fence_root == structured.structured_thread_fence_root
+    legacy_result = legacy.dispatch_legacy(
+        legacy.discover()[0],
+        "The alias must not bypass the fence.",
+        idempotency_key="legacy.alias",
+    )
+    assert legacy_result.state is AgentOperationState.FAILED
+    assert legacy_result.error_message == "structured Codex thread cannot be resumed through tmux"
+    assert legacy_runner.commands == []
+
+
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(
     codex_csv: Path,
 ) -> None:

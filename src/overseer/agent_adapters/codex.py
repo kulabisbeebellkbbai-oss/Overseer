@@ -319,7 +319,9 @@ class CodexDriver:
             raise ValueError("Codex provider has unsupported capability claims")
         self.provider = provider
         self.profile = profile
-        self.registry_path = Path(registry_path)
+        # One registry inode must map to one cross-process transport-fence
+        # namespace even when callers supply relative or symlink aliases.
+        self.registry_path = Path(registry_path).expanduser().resolve(strict=False)
         self.tmux_path = Path(tmux_path)
         self.codex_memory_session_path = Path(codex_memory_session_path)
         self.runner: BoundedCommandRunner = runner or CliCommandRunner(
@@ -1334,7 +1336,12 @@ class CodexDriver:
 
     def _ensure_structured_fence_root(self) -> Path:
         root = self.structured_thread_fence_root
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        created = False
+        try:
+            root.mkdir(mode=0o700, parents=False, exist_ok=False)
+            created = True
+        except FileExistsError:
+            pass
         metadata = root.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
@@ -1342,6 +1349,15 @@ class CodexDriver:
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise RuntimeError("structured Codex thread fence directory is unsafe")
+        if created:
+            parent_descriptor = os.open(
+                root.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
         return root
 
     @contextmanager

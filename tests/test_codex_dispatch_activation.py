@@ -614,12 +614,83 @@ def test_rollback_is_safe_when_drop_in_was_removed_and_retry_is_idempotent(tmp_p
     code, _, err = execute_codex_dispatch_activation_marker(plan.steps[2].command)
     assert code == 0, err
     drop_in, journal, _, _ = activation._paths()
+    installed_journal = activation._load_journal(plan.id, plan.steps[2].command[2])
+    assert installed_journal["dropInDevice"] == drop_in.stat().st_dev
+    assert installed_journal["dropInInode"] == drop_in.stat().st_ino
     drop_in.unlink()
     rollback = plan.rollback_steps[0].command
     assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
     assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
     assert journal.exists()
     assert calls.count(("systemctl", "--user", "daemon-reload")) == 1
+
+
+def test_rollback_quarantines_replacement_after_validation_without_deleting_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[2].command)
+    assert code == 0, err
+    drop_in, _, _, _ = activation._paths()
+    replacement = drop_in.parent / "replacement.conf"
+    replacement.write_bytes(activation.DROP_IN_CONTENT)
+    replacement.chmod(0o600)
+    saved_original = drop_in.parent / "saved-original.conf"
+    original_rename = activation.os.rename
+    raced = False
+
+    def replacing_rename(src, dst, *args, **kwargs):
+        nonlocal raced
+        if not raced and src == drop_in.name and str(dst).startswith(f".{drop_in.name}.rollback-"):
+            raced = True
+            source_fd = kwargs["src_dir_fd"]
+            destination_fd = kwargs["dst_dir_fd"]
+            original_rename(src, saved_original.name, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+            original_rename(replacement.name, src, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+        return original_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(activation.os, "rename", replacing_rename)
+    rollback_code, _, rollback_err = execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)
+    assert rollback_code == 1
+    assert "identity" in rollback_err or "changed" in rollback_err
+    assert saved_original.exists()
+    quarantined = list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == activation.DROP_IN_CONTENT
+    assert activation._load_journal(plan.id, plan.steps[0].command[2])["phase"] == "rollback-pending"
+
+
+def test_rollback_retries_from_exact_quarantine_after_rename_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    assert execute_codex_dispatch_activation_marker(plan.steps[2].command)[0] == 0
+    drop_in, _, _, _ = activation._paths()
+    original_rename = activation.os.rename
+    crashed = False
+
+    def crash_after_rename(src, dst, *args, **kwargs):
+        nonlocal crashed
+        original_rename(src, dst, *args, **kwargs)
+        if not crashed and src == drop_in.name:
+            crashed = True
+            raise RuntimeError("crash after quarantine rename")
+
+    monkeypatch.setattr(activation.os, "rename", crash_after_rename)
+    rollback = plan.rollback_steps[0].command
+    assert execute_codex_dispatch_activation_marker(rollback)[0] == 1
+    assert not drop_in.exists()
+    assert len(list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))) == 1
+    monkeypatch.setattr(activation.os, "rename", original_rename)
+    assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
+    assert not list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert journal["phase"] == "rolled-back"
+    assert journal["dropInOwnership"] == "removed"
 
 
 def test_rollback_reconciles_daemon_started_by_operation_even_if_already_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

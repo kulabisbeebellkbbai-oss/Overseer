@@ -35,7 +35,7 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
 CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v2"
-JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v3"
+JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v4"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 # This path is relative to CODEX_HOME exactly once.
@@ -50,7 +50,7 @@ _HEX = set("0123456789abcdef")
 _JOURNAL_KEYS = {
     "schemaVersion", "planId", "specDigest", "phase", "dropInPath", "dropInDigest",
     "dropInOwnership", "daemonSocketPath", "daemonOwnership", "bootstrapOwnership",
-    "remoteControlPrior", "remoteControlOwnership",
+    "remoteControlPrior", "remoteControlOwnership", "dropInDevice", "dropInInode",
 }
 _DAEMON_VERSION_KEYS = {"cliVersion", "daemonVersion", "state", "remoteControlEnabled", "socketPath"}
 _JOURNAL_PHASES = {
@@ -395,6 +395,11 @@ def _stable_stat(info: os.stat_result) -> tuple[int, ...]:
 
 def _secure_read_stable(path: Path, label: str, *, owner_only: bool = True) -> bytes:
     """Double-read one stable, euid-owned regular file through one nofollow fd."""
+    return _secure_snapshot(path, label, owner_only=owner_only)[0]
+
+
+def _secure_snapshot(path: Path, label: str, *, owner_only: bool = True) -> tuple[bytes, os.stat_result]:
+    """Return stable content and the exact descriptor identity for one path."""
     lexical_before = path.lstat()
     if lexical_before.st_uid != os.geteuid():
         raise ValueError(f"{label} is not euid-owned")
@@ -408,28 +413,52 @@ def _secure_read_stable(path: Path, label: str, *, owner_only: bool = True) -> b
         before = os.fstat(fd)
         if _stable_stat(before) != _stable_stat(lexical_before):
             raise ValueError(f"{label} changed before secure read")
-        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid()
-                or (owner_only and stat.S_IMODE(before.st_mode) & 0o077)):
-            raise ValueError(f"{label} descriptor is unsafe")
-
-        def read_all() -> bytes:
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    return b"".join(chunks)
-                chunks.append(chunk)
-
-        first = read_all()
+        first = _read_all_fd(fd)
         os.lseek(fd, 0, os.SEEK_SET)
-        second = read_all()
+        second = _read_all_fd(fd)
         after = os.fstat(fd)
         lexical_after = path.lstat()
-        if first != second or _stable_stat(after) != _stable_stat(before) or _stable_stat(lexical_after) != _stable_stat(before):
+        if (first != second or _stable_stat(after) != _stable_stat(before)
+                or _stable_stat(lexical_after) != _stable_stat(before)):
             raise ValueError(f"{label} changed during stable secure read")
-        return first
+        return first, after
     finally:
         os.close(fd)
+
+
+def _read_all_fd(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _open_stable_at(parent_fd: int, name: str, label: str) -> tuple[int, bytes, os.stat_result]:
+    """Open and double-read a private file relative to one validated directory fd."""
+    lexical_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (not stat.S_ISREG(lexical_before.st_mode) or lexical_before.st_uid != os.geteuid()
+            or stat.S_IMODE(lexical_before.st_mode) & 0o077 or lexical_before.st_nlink != 1):
+        raise ValueError(f"{label} is not a private euid-owned single-link regular file")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        if _stable_stat(before) != _stable_stat(lexical_before):
+            raise ValueError(f"{label} changed before secure read")
+        first = _read_all_fd(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        second = _read_all_fd(fd)
+        after = os.fstat(fd)
+        lexical_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (first != second or _stable_stat(after) != _stable_stat(before)
+                or _stable_stat(lexical_after) != _stable_stat(before)):
+            raise ValueError(f"{label} changed during stable secure read")
+        return fd, first, after
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _secure_read_exact(path: Path, expected: bytes) -> bytes:
@@ -445,6 +474,7 @@ def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) 
         "schemaVersion": JOURNAL_SCHEMA, "planId": plan_id, "specDigest": digest, "phase": phase,
         "dropInPath": str(drop_in), "dropInDigest": hashlib.sha256(DROP_IN_CONTENT).hexdigest(),
         "dropInOwnership": "unknown", "daemonSocketPath": str(socket_path), "daemonOwnership": "unknown",
+        "dropInDevice": None, "dropInInode": None,
         "bootstrapOwnership": "unknown", "remoteControlPrior": "unknown",
         "remoteControlOwnership": "unknown",
     }
@@ -469,6 +499,15 @@ def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
         raise ValueError("activation journal phase is invalid")
     if value["dropInOwnership"] not in _DROP_IN_OWNERSHIP:
         raise ValueError("activation journal drop-in ownership is invalid")
+    if not ((value["dropInDevice"] is None and value["dropInInode"] is None)
+            or (isinstance(value["dropInDevice"], int) and not isinstance(value["dropInDevice"], bool)
+                and value["dropInDevice"] >= 0 and isinstance(value["dropInInode"], int)
+                and not isinstance(value["dropInInode"], bool) and value["dropInInode"] > 0)):
+        raise ValueError("activation journal drop-in identity is invalid")
+    has_drop_in_identity = value["dropInDevice"] is not None
+    if (value["dropInOwnership"] == "created-by-operation" and not has_drop_in_identity
+            or value["dropInOwnership"] in {"unknown", "preexisting"} and has_drop_in_identity):
+        raise ValueError("activation journal drop-in identity ownership is invalid")
     if value["daemonOwnership"] not in _DAEMON_OWNERSHIP:
         raise ValueError("activation journal daemon ownership is invalid")
     if value["bootstrapOwnership"] not in _BOOTSTRAP_OWNERSHIP:
@@ -680,10 +719,12 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
     prior_ownership = str(journal["dropInOwnership"])
     try:
-        _secure_read_exact(drop_in, DROP_IN_CONTENT)
-        existing = DROP_IN_CONTENT
+        existing, existing_info = _secure_snapshot(drop_in, "drop-in")
+        if existing != DROP_IN_CONTENT:
+            raise ValueError("drop-in content is not the reviewed override")
     except FileNotFoundError:
         existing = None
+        existing_info = None
     if existing is not None:
         # An exact file left by a persisted write intent belongs to this
         # operation even when a retry observes it before the success phase.
@@ -692,6 +733,9 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
             if prior_ownership in {"write-issued", "created-by-operation"}
             else "preexisting"
         )
+        if journal["dropInOwnership"] == "created-by-operation":
+            journal["dropInDevice"] = existing_info.st_dev
+            journal["dropInInode"] = existing_info.st_ino
         journal["phase"] = "drop-in-installed"
         _write_journal(journal)
         return "exact owner-only service drop-in already present"
@@ -701,7 +745,12 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     journal["phase"] = "intent-drop-in"
     _write_journal(journal)
     _atomic_write(drop_in, DROP_IN_CONTENT)
+    installed, installed_info = _secure_snapshot(drop_in, "drop-in")
+    if installed != DROP_IN_CONTENT:
+        raise ValueError("installed drop-in is not the reviewed override")
     journal["dropInOwnership"] = "created-by-operation"
+    journal["dropInDevice"] = installed_info.st_dev
+    journal["dropInInode"] = installed_info.st_ino
     journal["phase"] = "drop-in-installed"
     _write_journal(journal)
     return "exact owner-only service drop-in installed"
@@ -711,7 +760,98 @@ def _revalidate_journal_drop_in(plan_id: str, digest: str) -> None:
     journal = _load_journal(plan_id, digest)
     if journal is None or journal["dropInOwnership"] not in {"preexisting", "created-by-operation"}:
         raise ValueError("drop-in intent is not ready for systemd transition")
-    _secure_read_exact(Path(str(journal["dropInPath"])), DROP_IN_CONTENT)
+    content, info = _secure_snapshot(Path(str(journal["dropInPath"])), "drop-in")
+    if content != DROP_IN_CONTENT:
+        raise ValueError("drop-in content is not the reviewed override")
+    if journal["dropInOwnership"] == "created-by-operation" and (
+        journal["dropInDevice"], journal["dropInInode"]
+    ) != (info.st_dev, info.st_ino):
+        raise ValueError("operation-owned drop-in identity changed")
+
+
+def _remove_operation_drop_in(journal: dict[str, object]) -> None:
+    """Quarantine and unlink only the exact operation-owned drop-in inode."""
+    drop_in, _, _, _ = _paths()
+    parent = drop_in.parent
+    lexical_parent = parent.lstat()
+    if (not stat.S_ISDIR(lexical_parent.st_mode) or lexical_parent.st_uid != os.geteuid()
+            or stat.S_IMODE(lexical_parent.st_mode) & 0o077):
+        raise ValueError("systemd drop-in directory is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(parent, flags)
+    plan_suffix = _digest({"planId": journal["planId"], "specDigest": journal["specDigest"]})[:16]
+    quarantine = f".{drop_in.name}.rollback-{plan_suffix}"
+    try:
+        parent_info = os.fstat(parent_fd)
+        if ((parent_info.st_dev, parent_info.st_ino) != (lexical_parent.st_dev, lexical_parent.st_ino)
+                or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_info.st_mode) & 0o077):
+            raise ValueError("systemd drop-in directory changed before rollback")
+
+        def exists(name: str) -> bool:
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            return True
+
+        original_exists = exists(drop_in.name)
+        quarantine_exists = exists(quarantine)
+        if original_exists and quarantine_exists:
+            raise ValueError("drop-in rollback has conflicting original and quarantine paths")
+        if not original_exists and not quarantine_exists:
+            journal["dropInOwnership"] = "removed"
+            return
+
+        if original_exists:
+            fd, content, info = _open_stable_at(parent_fd, drop_in.name, "operation-owned drop-in")
+            os.close(fd)
+            if content != DROP_IN_CONTENT:
+                raise ValueError("operation-owned drop-in content changed")
+            recorded = (journal["dropInDevice"], journal["dropInInode"])
+            if recorded == (None, None) and journal["dropInOwnership"] == "write-issued":
+                journal["dropInDevice"] = info.st_dev
+                journal["dropInInode"] = info.st_ino
+                _write_journal(journal)
+            elif recorded != (info.st_dev, info.st_ino):
+                raise ValueError("operation-owned drop-in identity changed")
+            os.rename(
+                drop_in.name,
+                quarantine,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+
+        fd, content, info = _open_stable_at(parent_fd, quarantine, "quarantined operation drop-in")
+        try:
+            if content != DROP_IN_CONTENT:
+                raise ValueError("quarantined drop-in content changed")
+            if (journal["dropInDevice"], journal["dropInInode"]) != (info.st_dev, info.st_ino):
+                raise ValueError("quarantined drop-in identity changed")
+            if exists(drop_in.name):
+                raise ValueError("drop-in path was replaced during rollback")
+            lexical = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+            current = os.fstat(fd)
+            if _stable_stat(lexical) != _stable_stat(current):
+                raise ValueError("quarantined drop-in changed before unlink")
+            os.unlink(quarantine, dir_fd=parent_fd)
+            unlinked = os.fstat(fd)
+            if ((unlinked.st_dev, unlinked.st_ino) != (info.st_dev, info.st_ino)
+                    or unlinked.st_nlink != 0):
+                raise ValueError("drop-in unlink did not remove the validated inode")
+        finally:
+            os.close(fd)
+        if exists(drop_in.name) or exists(quarantine):
+            raise ValueError("drop-in rollback path is not absent after unlink")
+        parent_after = os.fstat(parent_fd)
+        if ((parent_after.st_dev, parent_after.st_ino) != (parent_info.st_dev, parent_info.st_ino)
+                or not stat.S_ISDIR(parent_after.st_mode) or parent_after.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_after.st_mode) & 0o077):
+            raise ValueError("systemd drop-in directory changed during rollback")
+        os.fsync(parent_fd)
+        journal["dropInOwnership"] = "removed"
+    finally:
+        os.close(parent_fd)
 
 
 def _rollback(plan_id: str, digest: str) -> str:
@@ -723,13 +863,8 @@ def _rollback(plan_id: str, digest: str) -> str:
     prior_phase = str(journal["phase"])
     journal["phase"] = "rollback-pending"
     _write_journal(journal)
-    drop_in, _, _, _ = _paths()
     if journal["dropInOwnership"] in {"write-issued", "created-by-operation"}:
-        if drop_in.exists():
-            if hashlib.sha256(drop_in.read_bytes()).hexdigest() != journal["dropInDigest"]:
-                raise ValueError("drop-in changed after activation; refusing unrelated removal")
-            drop_in.unlink()
-        journal["dropInOwnership"] = "removed"
+        _remove_operation_drop_in(journal)
     if prior_phase in {"rollback-pending", "drop-in-installed", "reloaded", "restarted", "verified"} and journal["dropInOwnership"] in {"removed", "preexisting"}:
         _run_checked(("systemctl", "--user", "daemon-reload"))
         _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))

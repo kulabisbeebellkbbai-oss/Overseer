@@ -860,7 +860,14 @@ def test_canary_result_rejects_sender_invented_overlap_against_persisted_sequent
 
 
 def test_round_request_matches_psychlo_strict_shape_and_closed_values(tmp_path: Path):
-    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    class StrictShapeDispatcher:
+        def binding_provenance(self, _lead: str, **_kwargs):
+            return {"conversationId": "thread-1", "sessionId": "session-thread-1", "rolloutPathDigest": "a" * 64, "rolloutDev": 1, "rolloutIno": 2}
+
+        def __call__(self, *_args, **_kwargs):
+            return "unused"
+
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=StrictShapeDispatcher(), sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     request = _canary_round("strict-round", "arcade", "plan-arcade", "lead-arcade")
     assert bridge.request_round({**request, "threadId": "thread-1", "model": "gpt-5.6-luna", "featureClass": "typescript-feature"})["accepted"] is True
     for mutation in ({"extra": True}, {"expectedUsageCost": True}, {"expectedUsageCost": float("nan")}, {"model": "unsupported"}, {"threadId": "x" * 201}, {"priorityRationale": "unsupported"}):

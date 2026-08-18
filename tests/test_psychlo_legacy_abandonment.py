@@ -25,6 +25,11 @@ from tests.test_psychlo_process_attestation_v2 import _manifest as _process_mani
 
 
 NOW = "2099-01-01T00:00:10+00:00"
+ENVELOPE_SCHEMA = "overseer.psychlo.legacy-round-abandon-envelope.v1"
+
+
+def _payload_action(payload):
+    return payload.get("action", payload)
 
 
 def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thread_id="old-conversation"):
@@ -63,7 +68,8 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thre
     if sender is None:
         def sender(kind, key, payload):
             sent.append((kind, key, payload))
-            return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "legacy-abandoned-uncertain", "status_code": 202}
+            action = _payload_action(payload)
+            return {"accepted": True, "actionId": action["actionId"], "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"], "status": "legacy-abandoned-uncertain", "status_code": 202}
     bridge = PsychloBridge(store=bridge_store, dispatcher=lambda *args: "", sender=sender, callback_origin="http://127.0.0.1", approval_store=primary, clock=lambda: NOW, recover=False)
     bridge._test_sent = sent
     return bridge, primary
@@ -141,7 +147,9 @@ def test_stage_rejects_invalid_legacy_request_thread_even_when_binding_is_valid(
 
 def test_execute_fences_delivery_and_persists_terminal_non_result(tmp_path):
     bridge, primary = _runtime(tmp_path)
-    _stage(bridge)
+    staged = _stage(bridge)
+    frozen_intent = bridge.store.legacy_abandonment(staged["actionId"])
+    frozen_wire = frozen_intent["payload"]["wire"]
     plan = primary.load_admin_change_plan("abandon-plan")
     primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", NOW))
     result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
@@ -151,8 +159,14 @@ def test_execute_fences_delivery_and_persists_terminal_non_result(tmp_path):
     assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
     assert bridge.store.legacy_abandonment(result["actionId"])["state"] == "completed"
     assert bridge._test_sent[0][0] == "round-legacy-abandon"
-    assert set(bridge._test_sent[0][2]) == {"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId", "reason", "occurredAt"}
-    wire = bridge._test_sent[0][2]
+    envelope = bridge._test_sent[0][2]
+    assert set(envelope) == {"schemaVersion", "action", "originalConversationId"}
+    assert envelope["schemaVersion"] == ENVELOPE_SCHEMA
+    assert envelope["originalConversationId"] == "old-conversation"
+    wire = envelope["action"]
+    assert wire == frozen_wire
+    assert wire["actionDigest"] == staged["actionDigest"]
+    assert bridge.store.legacy_abandonment(staged["actionId"])["payload"]["wire"] == frozen_wire
     assert wire["schemaVersion"] == "psychlo.legacy-round-abandon.v1"
     assert {key: wire[key] for key in ("successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId")} == {"successorPlanId": "arcade-plan-2", "successorPlanVersion": "2.0", "successorConversationId": "new-conversation", "successorThreadId": "new-thread"}
     assert wire["actionDigest"] == canonical_digest({key: value for key, value in wire.items() if key != "actionDigest"})
@@ -176,12 +190,59 @@ def test_signed_wire_successor_identity_cannot_be_substituted(tmp_path):
     assert bridge._test_sent == []
 
 
+def test_transport_original_conversation_substitution_is_rejected_before_send(tmp_path):
+    bridge, primary = _runtime(tmp_path)
+    staged = _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    intent = bridge.store.legacy_abandonment(staged["actionId"])
+    payload = intent["payload"]
+    payload["originalPlan"]["conversationId"] = "substituted-conversation"
+    bridge.store.connection.execute(
+        "UPDATE legacy_abandonment_intents SET payload_json=? WHERE action_id=?",
+        (json.dumps(payload, separators=(",", ":")), staged["actionId"]),
+    )
+
+    with pytest.raises(LegacyAbandonmentError, match="plan or action identity changed"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert bridge._test_sent == []
+
+
+def test_existing_peer_pending_approved_claim_resumes_with_transport_envelope(tmp_path):
+    from overseer.psychlo_legacy_abandonment import _immutable_plan_digest
+
+    bridge, primary = _runtime(tmp_path)
+    staged = _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    intent = bridge.store.legacy_abandonment(staged["actionId"])
+    frozen_payload = json.loads(json.dumps(intent["payload"]))
+    bridge.store.claim_legacy_abandonment(staged["actionId"], staged["actionDigest"], now=NOW)
+    primary.claim_psychlo_legacy_abandonment_execution(
+        "abandon-plan", staged["actionId"], staged["actionDigest"],
+        _immutable_plan_digest(approved), claimed_at=NOW,
+    )
+
+    result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+
+    assert result["status"] == "legacy-abandoned-uncertain"
+    envelope = bridge._test_sent[0][2]
+    assert envelope == {
+        "schemaVersion": ENVELOPE_SCHEMA,
+        "action": frozen_payload["wire"],
+        "originalConversationId": frozen_payload["originalPlan"]["conversationId"],
+    }
+    completed = bridge.store.legacy_abandonment(staged["actionId"])
+    assert completed["payload"] == frozen_payload
+    assert completed["actionDigest"] == staged["actionDigest"]
+
+
 def test_wire_is_accepted_by_psychlo_contract_parser(tmp_path):
     bridge, primary = _runtime(tmp_path)
     _stage(bridge)
     primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
     execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
-    wire = bridge._test_sent[0][2]
+    wire = bridge._test_sent[0][2]["action"]
     configured = os.environ.get("PSYCHLO_LEGACY_ABANDONMENT_PARSER")
     workspace = Path(__file__).resolve().parents[4]
     candidates = [
@@ -221,7 +282,8 @@ def test_transport_failure_leaves_replayable_outbox(tmp_path):
         calls.append(payload)
         if len(calls) == 1:
             raise RuntimeError("transport down")
-        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "legacy-abandoned-uncertain", "status_code": 202}
+        action = _payload_action(payload)
+        return {"accepted": True, "actionId": action["actionId"], "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"], "status": "legacy-abandoned-uncertain", "status_code": 202}
     bridge, primary = _runtime(tmp_path, sender=sender)
     _stage(bridge)
     plan = primary.load_admin_change_plan("abandon-plan")
@@ -234,6 +296,7 @@ def test_transport_failure_leaves_replayable_outbox(tmp_path):
     result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
     assert result["status"] == "legacy-abandoned-uncertain"
     assert calls[0] == calls[1]
+    assert json.dumps(calls[0], sort_keys=True, separators=(",", ":")) == json.dumps(calls[1], sort_keys=True, separators=(",", ":"))
 
 
 def test_cancellation_wins_before_authoritative_execution_claim(tmp_path):
@@ -381,11 +444,12 @@ def test_invalid_peer_response_remains_pending_and_replays_after_remote_commit(t
     calls = []
     def sender(kind, key, payload):
         calls.append(dict(payload))
+        action = _payload_action(payload)
         if len(calls) == 1:
             # The receiver may have committed before its response was
             # truncated or corrupted in transport.
-            return {"accepted": True, "actionId": payload["actionId"]}
-        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned", "status_code": 202}
+            return {"accepted": True, "actionId": action["actionId"]}
+        return {"accepted": True, "actionId": action["actionId"], "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"], "status": "already-abandoned", "status_code": 202}
     bridge, primary = _runtime(tmp_path, sender=sender)
     _stage(bridge)
     plan = primary.load_admin_change_plan("abandon-plan")
@@ -415,7 +479,8 @@ def test_every_unverifiable_peer_response_stays_replayable(tmp_path, invalid):
 @pytest.mark.parametrize("status_code", [200, 201, 409, "202", None])
 def test_peer_transport_status_must_be_exact_for_abandonment(tmp_path, status_code):
     def sender(_kind, _key, payload):
-        response = {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned"}
+        action = _payload_action(payload)
+        response = {"accepted": True, "actionId": action["actionId"], "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"], "status": "already-abandoned"}
         if status_code is not None:
             response["status_code"] = status_code
         return response
@@ -429,7 +494,8 @@ def test_peer_transport_status_must_be_exact_for_abandonment(tmp_path, status_co
 
 def test_peer_response_rejects_extra_transport_or_body_fields(tmp_path):
     def sender(_kind, _key, payload):
-        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned", "status_code": 202, "extra": "forbidden"}
+        action = _payload_action(payload)
+        return {"accepted": True, "actionId": action["actionId"], "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"], "status": "already-abandoned", "status_code": 202, "extra": "forbidden"}
     bridge, primary = _runtime(tmp_path, sender=sender)
     _stage(bridge)
     primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))

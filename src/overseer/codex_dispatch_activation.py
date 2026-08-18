@@ -35,7 +35,7 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
 CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v2"
-JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v1"
+JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v2"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 # This path is relative to CODEX_HOME exactly once.

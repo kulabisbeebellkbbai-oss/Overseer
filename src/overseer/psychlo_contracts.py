@@ -259,13 +259,36 @@ def parse_project_registration(payload: Mapping[str, Any]) -> dict[str, Any]:
         _parse_handoff_lifecycle(envelope.get("lifecycle"), project, lead["id"])
     if version == "a-team.psychlo.handoff.v3":
         binding = _object(envelope.get("requestBinding"), name="handoff request binding")
-        if set(binding) != {"psychloRequestId", "requestedCommand"} or binding.get("requestedCommand") not in {"start", "continue", "plan-change", "decommission"}:
+        binding_keys = {"psychloRequestId", "requestedCommand"} | ({"legacyRoundSuccessor"} if "legacyRoundSuccessor" in binding else set())
+        if set(binding) != binding_keys or binding.get("requestedCommand") not in {"start", "continue", "plan-change", "decommission"}:
             raise ContractError("handoff request binding is invalid")
         _id(binding.get("psychloRequestId"), name="psychloRequestId")
         command = binding["requestedCommand"]
+        if "legacyRoundSuccessor" in binding:
+            if command != "continue":
+                raise ContractError("legacy successor binding requires a Continue handoff")
+            successor = _object(binding["legacyRoundSuccessor"], name="legacy successor binding")
+            successor_keys = {"actionId", "actionDigest", "roundId", "oldPlanId", "oldPlanVersion", "oldConversationId", "successorConversationId", "successorThreadId"}
+            if set(successor) != successor_keys:
+                raise ContractError("legacy successor binding is invalid")
+            for field in successor_keys - {"actionDigest"}:
+                _id(successor.get(field), name=f"legacy successor {field}")
+            _digest(successor.get("actionDigest"), name="legacy successor actionDigest")
         lifecycle_kind = envelope.get("lifecycle", {}).get("kind") if isinstance(envelope.get("lifecycle"), Mapping) else None
         if (command == "start" and lifecycle_kind is not None) or (command in {"continue", "plan-change"} and lifecycle_kind != "change") or (command == "decommission" and lifecycle_kind != "decommission"):
             raise ContractError("handoff request binding does not match lifecycle")
+        if "legacyRoundSuccessor" in binding:
+            successor = binding["legacyRoundSuccessor"]
+            lifecycle = envelope["lifecycle"]
+            if (
+                successor["oldPlanId"] != lifecycle["supersedesPlanId"]
+                or successor["oldPlanVersion"] != lifecycle["supersedesVersion"]
+                or project["planId"] == successor["oldPlanId"]
+                or project["planVersion"] == successor["oldPlanVersion"]
+                or successor["successorConversationId"] == successor["oldConversationId"]
+                or successor["successorThreadId"] == successor["oldConversationId"]
+            ):
+                raise ContractError("legacy successor binding does not match the exact Continue lineage")
     _digest(envelope.get("digest"), name="handoff digest")
     if canonical_digest(envelope) != envelope["digest"]: raise ContractError("handoff envelope digest does not match canonical content")
     receipt = _object(registration["receipt"], name="handoff receipt")

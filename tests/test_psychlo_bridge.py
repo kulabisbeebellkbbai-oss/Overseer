@@ -2789,6 +2789,70 @@ def test_register_project_advances_exact_v3_change_registration_across_restart(t
     assert restarted.store.project("arcade") == stored
 
 
+def test_register_project_accepts_exact_v3_legacy_successor_binding(tmp_path: Path):
+    sent = []
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda kind, message_id, payload: sent.append((kind, message_id, payload)) or {"accepted": True},
+        callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    initial = _registration_payload("arcade", "member-hermione", plan_id="arcade-v2", plan_version="v2", team_id="team-arcade")
+    changed = _project_v3_change_registration(initial, plan_id="arcade-v3", version="v3")
+    changed["envelope"]["requestBinding"]["legacyRoundSuccessor"] = {
+        "actionId": "legacy-abandonment:round-arcade:arcade-v3",
+        "actionDigest": "a" * 64,
+        "roundId": "round:arcade:usage-attribution-old",
+        "oldPlanId": "arcade-v2",
+        "oldPlanVersion": "v2",
+        "oldConversationId": "conversation-old",
+        "successorConversationId": "conversation-v3",
+        "successorThreadId": "conversation-v3",
+    }
+    changed["envelope"]["digest"] = canonical_digest({key: value for key, value in changed["envelope"].items() if key != "digest"})
+    changed["receipt"]["envelopeDigest"] = changed["envelope"]["digest"]
+
+    assert bridge.register_project(initial) == {"accepted": True}
+    assert bridge.register_project(changed) == {"accepted": True}
+    assert bridge.store.project("arcade")[0] == changed
+    assert len(sent) == 2
+
+
+@pytest.mark.parametrize("defect", [
+    "extra", "digest", "command", "old_plan", "old_version", "reused_plan", "reused_version",
+    "reused_conversation", "reused_thread",
+])
+def test_register_project_rejects_malformed_v3_legacy_successor_binding(tmp_path: Path, defect: str):
+    initial = _registration_payload("arcade", "member-hermione", plan_id="arcade-v2", plan_version="v2", team_id="team-arcade")
+    changed = _project_v3_change_registration(initial, plan_id="arcade-v3", version="v3")
+    successor = {
+        "actionId": "legacy-abandonment:round-arcade:arcade-v3", "actionDigest": "a" * 64,
+        "roundId": "round:arcade:usage-attribution-old", "oldPlanId": "arcade-v2", "oldPlanVersion": "v2",
+        "oldConversationId": "conversation-old", "successorConversationId": "conversation-v3", "successorThreadId": "conversation-v3",
+    }
+    changed["envelope"]["requestBinding"]["legacyRoundSuccessor"] = successor
+    if defect == "extra": successor["unexpected"] = "nope"
+    elif defect == "digest": successor["actionDigest"] = "not-a-digest"
+    elif defect == "command": changed["envelope"]["requestBinding"]["requestedCommand"] = "plan-change"
+    elif defect == "old_plan": successor["oldPlanId"] = "other-plan"
+    elif defect == "old_version": successor["oldPlanVersion"] = "other-version"
+    elif defect == "reused_plan": changed["envelope"]["project"]["planId"] = successor["oldPlanId"]
+    elif defect == "reused_version": changed["envelope"]["project"]["planVersion"] = successor["oldPlanVersion"]
+    elif defect == "reused_conversation": successor["successorConversationId"] = successor["oldConversationId"]
+    else: successor["successorThreadId"] = successor["oldConversationId"]
+    changed["envelope"]["digest"] = canonical_digest({key: value for key, value in changed["envelope"].items() if key != "digest"})
+    changed["receipt"]["envelopeDigest"] = changed["envelope"]["digest"]
+    sent = []
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda _lead, _prompt: "unused",
+        sender=lambda *args: sent.append(args) or {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW,
+    )
+    assert bridge.register_project(initial) == {"accepted": True}
+    with pytest.raises(ValueError):
+        bridge.register_project(changed)
+    assert bridge.store.project("arcade")[0] == initial
+    assert len(sent) == 1
+
+
 def test_register_project_rejects_v3_decommission_without_persistence(tmp_path: Path):
     registration = _registration_payload("arcade", "member-hermione")
     changed = json.loads(json.dumps(registration))

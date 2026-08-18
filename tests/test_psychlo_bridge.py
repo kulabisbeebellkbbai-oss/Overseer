@@ -2814,7 +2814,8 @@ def test_register_project_accepts_exact_v3_legacy_successor_binding(tmp_path: Pa
     assert bridge.register_project(initial) == {"accepted": True}
     assert bridge.register_project(changed) == {"accepted": True}
     assert bridge.store.project("arcade")[0] == changed
-    assert len(sent) == 2
+    assert len(sent) == 1
+    assert sent[0][2]["projectId"] == "arcade"
 
 
 @pytest.mark.parametrize("defect", [

@@ -559,7 +559,15 @@ class PsychloBridge:
                 or (isinstance(request_binding, dict) and request_binding.get("requestedCommand") not in {"continue", "plan-change"})
             ):
                 raise ValueError("project registration conflict")
+            legacy_successor = request_binding.get("legacyRoundSuccessor") if isinstance(request_binding, dict) else None
             def deliver_change() -> None:
+                # Psychlo atomically installs the exact plan/thread scheduling
+                # projection while admitting a legacy-successor Continue
+                # handoff. A generic scheduling-input here would be both
+                # redundant and less authoritative, so only persist the
+                # matching Overseer registration on this return path.
+                if isinstance(legacy_successor, dict):
+                    return
                 response = self.sender("scheduling-input", scheduling["idempotencyKey"], scheduling)
                 if response.get("accepted") is not True: raise ValueError("Psychlo rejected project scheduling")
             self.store.replace_project(project_id, existing[0], registration, scheduling, deliver_change)

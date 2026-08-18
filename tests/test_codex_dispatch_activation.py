@@ -31,6 +31,7 @@ def _spec() -> CodexDispatchActivationSpec:
     source_commit = "a" * 40
     source_tree = "b" * 40
     source_module = "c" * 64
+    bootstrap_binding = {**activation._bootstrap_binding(), "sourceCommit": source_commit, "sourceTree": source_tree}
     return CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA,
         source_commit,
@@ -38,7 +39,11 @@ def _spec() -> CodexDispatchActivationSpec:
         source_module,
         activation._review_digest(source_commit, source_tree, source_module),
         dependency_digest="d" * 64,
-        bootstrap_binding=activation._bootstrap_binding(),
+        bootstrap_binding=bootstrap_binding,
+        bus_peer_binding=activation._capture_user_bus_peer_binding(),
+        launcher_blob=str(bootstrap_binding["launcherBlob"]),
+        launcher_sha256=str(bootstrap_binding["launcherSha256"]),
+        launcher_size=int(bootstrap_binding["launcherSize"]),
         source_files=activation._reviewed_source_files(),
     )
 
@@ -139,6 +144,37 @@ def test_mutable_checkout_launcher_is_never_executed(tmp_path: Path):
         assert not sentinel.exists()
     finally:
         launcher.write_bytes(original)
+
+
+def test_bootstrap_rejects_unrelated_or_arbitrary_self_consistent_blob_before_exec():
+    head = activation._git(("rev-parse", "HEAD"))
+    tree = activation._git(("rev-parse", "HEAD^{tree}"))
+    spec = replace(_spec(), source_commit=head, source_tree_digest=tree,
+                   bootstrap_binding=activation._bootstrap_binding(head, tree))
+    command = list(activation._isolated_launcher_command(spec, "probe", ()))
+    config = json.loads(command[5])
+    unrelated = subprocess.check_output(
+        ("git", "-C", str(activation.CANONICAL_SOURCE_ROOT), "rev-parse", f"{head}:src/overseer/core.py"),
+        text=True,
+    ).strip()
+    unrelated_bytes = subprocess.check_output(
+        ("git", "-C", str(activation.CANONICAL_SOURCE_ROOT), "cat-file", "blob", unrelated),
+    )
+    candidates = [
+        (unrelated, hashlib.sha256(unrelated_bytes).hexdigest(), len(unrelated_bytes)),
+        ("f" * 40, hashlib.sha256(b"arbitrary").hexdigest(), len(b"arbitrary")),
+    ]
+    for blob, digest, size in candidates:
+        tampered = dict(config)
+        tampered.update(launcherBlob=blob, launcherSha256=digest, launcherSize=size)
+        tampered["bootstrapBinding"] = {
+            **tampered["bootstrapBinding"], "launcherBlob": blob, "launcherSha256": digest, "launcherSize": size,
+        }
+        command[5] = activation._canonical(tampered)
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, env={
+            "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+        })
+        assert completed.returncode != 0
 
 
 def test_caller_manifest_and_source_root_cannot_supply_authority(tmp_path: Path):
@@ -305,9 +341,14 @@ def _isolated_probe_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
     review = activation._review_digest(commit, tree, module, inventory)
     site_packages = activation.SERVICE_SITE_PACKAGES
     dependency = activation._dependency_digest(site_packages)
+    bootstrap_binding = {**activation._bootstrap_binding(), "sourceCommit": commit, "sourceTree": tree}
     spec = CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA, commit, tree, module, review, dependency, source_files=inventory,
-        bootstrap_binding=activation._bootstrap_binding(),
+        bootstrap_binding=bootstrap_binding,
+        bus_peer_binding=activation._capture_user_bus_peer_binding(),
+        launcher_blob=str(bootstrap_binding["launcherBlob"]),
+        launcher_sha256=str(bootstrap_binding["launcherSha256"]),
+        launcher_size=int(bootstrap_binding["launcherSize"]),
     )
     arguments = [
         "/usr/bin/python3", "-I", "-S", str(launcher),
@@ -315,6 +356,9 @@ def _isolated_probe_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
         "--source-module", module, "--review-digest", review,
         "--spec-digest", activation.codex_dispatch_activation_plan_digest(spec),
         "--dependency-digest", dependency, "--bootstrap-binding", activation._canonical(spec.bootstrap_binding),
+        "--bus-peer-binding", activation._canonical(spec.bus_peer_binding),
+        "--launcher-blob", spec.launcher_blob, "--launcher-sha256", spec.launcher_sha256,
+        "--launcher-size", str(spec.launcher_size),
         "--site-packages", str(site_packages), "probe",
     ]
     return launcher, arguments
@@ -370,6 +414,9 @@ def test_isolated_launcher_rejects_dependency_injection_before_import(tmp_path: 
             ("git", "-C", str(source_root), "ls-files", "--", "src"), text=True,
         ).splitlines() if item.endswith(activation.SOURCE_EXECUTABLE_SUFFIXES)
     ))
+    bootstrap_binding = {**activation._bootstrap_binding(),
+         "sourceCommit": arguments[arguments.index("--source-commit") + 1],
+         "sourceTree": arguments[arguments.index("--source-tree") + 1]}
     spec = CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA,
         arguments[arguments.index("--source-commit") + 1],
@@ -377,7 +424,10 @@ def test_isolated_launcher_rejects_dependency_injection_before_import(tmp_path: 
         arguments[arguments.index("--source-module") + 1],
         arguments[arguments.index("--review-digest") + 1],
         dependency_digest,
-        activation._bootstrap_binding(),
+        bootstrap_binding,
+        activation._capture_user_bus_peer_binding(),
+        str(bootstrap_binding["launcherBlob"]), str(bootstrap_binding["launcherSha256"]),
+        int(bootstrap_binding["launcherSize"]),
         source_files=inventory,
     )
     arguments[arguments.index("--site-packages") + 1] = str(dependency_root)
@@ -800,6 +850,32 @@ def test_same_euid_fake_user_bus_peer_is_rejected():
     finally:
         first.close()
         second.close()
+
+
+def test_live_staged_spec_captures_exact_current_user_manager_identity():
+    binding = _spec().bus_peer_binding
+    assert binding["peerPid"] == 1329
+    assert binding["peerUid"] == os.geteuid()
+    assert binding["peerGid"] == os.getegid()
+    assert binding["ppid"] == 1
+    assert binding["argv"] == ["/usr/lib/systemd/systemd", "--user"]
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("peerPid", 999999),
+    ("startTicks", 1),
+    ("bootId", "00000000-0000-0000-0000-000000000000"),
+])
+def test_approved_user_manager_pid_starttick_and_boot_drift_reject_before_busctl(
+    field: str, replacement: object, monkeypatch: pytest.MonkeyPatch,
+):
+    expected = activation._capture_user_bus_peer_binding()
+    expected[field] = replacement
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "")
+    with pytest.raises(ValueError, match="approved staged identity"):
+        activation._read_user_bus_property("Environment", "as", expected)
+    assert calls == []
 
 
 @pytest.mark.parametrize("bad_field", [True, -1, 2**64])

@@ -39,7 +39,7 @@ from .admin import (
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
-CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v4"
+CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v5"
 JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v5"
 SERVICE_NAME = "overseer-api.service"
 BUSCTL = "/usr/bin/busctl"
@@ -107,12 +107,16 @@ _REMOTE_CONTROL_OPTIONAL_KEYS = {"backend", "appServerVersion"}
 _ISOLATED_ENTRY_BINDING: str | None = None
 
 IMMUTABLE_BOOTSTRAP = r'''import hashlib,json,os,subprocess,sys
-c=json.loads(sys.argv[1]); required={"sourceRoot","sourceCommit","sourceTree","sourceModule","reviewDigest","specDigest","dependencyDigest","sitePackages","launcherBlob","launcherSha256","launcherSize","bootstrapBinding","mode","payload"}
+c=json.loads(sys.argv[1]); required={"sourceRoot","sourceCommit","sourceTree","sourceModule","reviewDigest","specDigest","dependencyDigest","sitePackages","launcherBlob","launcherSha256","launcherSize","bootstrapBinding","busPeerBinding","mode","payload"}
 assert isinstance(c,dict) and set(c)==required and c["sourceRoot"]=="/home/god/Documents/Codex Workspace/Overseer" and c["sitePackages"]=="/home/god/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/lib/python3.13/site-packages"
 e={"PATH":"/usr/bin:/bin","LANG":"C","LC_ALL":"C","GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":"/dev/null","GIT_CONFIG_GLOBAL":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
-p=subprocess.run(("/usr/bin/git","--no-replace-objects","-C",c["sourceRoot"],"cat-file","blob",c["launcherBlob"]),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=e,check=False)
+def g(*a): return subprocess.run(("/usr/bin/git","--no-replace-objects","-C",c["sourceRoot"],*a),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=e,check=False)
+b=c["bootstrapBinding"]; assert b["sourceCommit"]==c["sourceCommit"] and b["sourceTree"]==c["sourceTree"] and b["launcherBlob"]==c["launcherBlob"] and b["launcherSha256"]==c["launcherSha256"] and b["launcherSize"]==c["launcherSize"]
+t=g("rev-parse",c["sourceCommit"]+"^{tree}"); r=g("rev-parse",c["sourceCommit"]+":src/overseer_codex_dispatch_launcher.py")
+assert t.returncode==0 and t.stdout.strip().decode()==c["sourceTree"] and r.returncode==0 and r.stdout.strip().decode()==c["launcherBlob"]
+p=g("cat-file","blob",c["launcherBlob"])
 assert p.returncode==0 and len(p.stdout)==c["launcherSize"] and hashlib.sha256(p.stdout).hexdigest()==c["launcherSha256"]
-sys.argv=["reviewed:overseer_codex_dispatch_launcher.py","--source-root",c["sourceRoot"],"--source-commit",c["sourceCommit"],"--source-tree",c["sourceTree"],"--source-module",c["sourceModule"],"--review-digest",c["reviewDigest"],"--spec-digest",c["specDigest"],"--dependency-digest",c["dependencyDigest"],"--bootstrap-binding",json.dumps(c["bootstrapBinding"],sort_keys=True,separators=(",",":")),"--site-packages",c["sitePackages"],c["mode"],"--",*c["payload"]]
+sys.argv=["reviewed:overseer_codex_dispatch_launcher.py","--source-root",c["sourceRoot"],"--source-commit",c["sourceCommit"],"--source-tree",c["sourceTree"],"--source-module",c["sourceModule"],"--review-digest",c["reviewDigest"],"--spec-digest",c["specDigest"],"--dependency-digest",c["dependencyDigest"],"--launcher-blob",c["launcherBlob"],"--launcher-sha256",c["launcherSha256"],"--launcher-size",str(c["launcherSize"]),"--bootstrap-binding",json.dumps(c["bootstrapBinding"],sort_keys=True,separators=(",",":")),"--bus-peer-binding",json.dumps(c["busPeerBinding"],sort_keys=True,separators=(",",":")),"--site-packages",c["sitePackages"],c["mode"],"--",*c["payload"]]
 exec(compile(p.stdout,"reviewed:overseer_codex_dispatch_launcher.py","exec",dont_inherit=True),{"__name__":"__main__","__file__":"reviewed:overseer_codex_dispatch_launcher.py"})'''
 
 
@@ -153,12 +157,12 @@ def _root_binary_identity(path: Path, label: str) -> dict[str, object]:
     }
 
 
-def _launcher_blob_binding() -> dict[str, object]:
-    listing = _git(("ls-files", "-s", "--", "src/overseer_codex_dispatch_launcher.py"))
-    fields = listing.split()
-    if len(fields) != 4 or fields[0] != "100644" or fields[2] != "0":
-        raise ValueError("reviewed launcher Git index binding is invalid")
-    blob = fields[1].lower()
+def _launcher_blob_binding(source_commit: str, source_tree: str) -> dict[str, object]:
+    if _git(("rev-parse", f"{source_commit}^{{tree}}")).lower() != source_tree:
+        raise ValueError("reviewed launcher source tree binding is invalid")
+    blob = _git(("rev-parse", f"{source_commit}:src/overseer_codex_dispatch_launcher.py")).lower()
+    if not _valid_hex(blob, {40, 64}):
+        raise ValueError("reviewed launcher commit path binding is invalid")
     completed = subprocess.run(
         (str(ROOT_GIT), "--no-replace-objects", "-C", str(CANONICAL_SOURCE_ROOT), "cat-file", "blob", blob),
         check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -171,15 +175,18 @@ def _launcher_blob_binding() -> dict[str, object]:
             "launcherSize": len(completed.stdout)}
 
 
-def _bootstrap_binding() -> dict[str, object]:
+def _bootstrap_binding(source_commit: str | None = None, source_tree: str | None = None) -> dict[str, object]:
+    source_commit = source_commit or _git(("rev-parse", "HEAD")).lower()
+    source_tree = source_tree or _git(("rev-parse", f"{source_commit}^{{tree}}")).lower()
     git_dir = CANONICAL_SOURCE_ROOT / ".git"
     git_dir_info = git_dir.lstat()
     if not stat.S_ISDIR(git_dir_info.st_mode) or git_dir.is_symlink():
         raise ValueError("canonical Git directory identity is unsafe")
     return {
         "schema": "overseer.codex-dispatch-bootstrap.v1",
+        "sourceCommit": source_commit, "sourceTree": source_tree,
         "bootstrapSha256": hashlib.sha256(IMMUTABLE_BOOTSTRAP.encode()).hexdigest(),
-        **_launcher_blob_binding(),
+        **_launcher_blob_binding(source_commit, source_tree),
         "python": _root_binary_identity(ROOT_PYTHON, "Python"),
         "git": _root_binary_identity(ROOT_GIT, "Git"),
         "systemd": _root_binary_identity(ROOT_SYSTEMD, "systemd user manager"),
@@ -190,10 +197,11 @@ def _bootstrap_binding() -> dict[str, object]:
 
 def _validate_bootstrap_binding(value: object) -> dict[str, object]:
     if (not isinstance(value, dict)
-            or set(value) != {"schema", "bootstrapSha256", "launcherBlob", "launcherSha256", "launcherSize",
+            or set(value) != {"schema", "sourceCommit", "sourceTree", "bootstrapSha256", "launcherBlob", "launcherSha256", "launcherSize",
                               "python", "git", "systemd", "gitDir"}
             or value["schema"] != "overseer.codex-dispatch-bootstrap.v1"
             or value["bootstrapSha256"] != hashlib.sha256(IMMUTABLE_BOOTSTRAP.encode()).hexdigest()
+            or not _valid_hex(value["sourceCommit"], {40, 64}) or not _valid_hex(value["sourceTree"], {40, 64})
             or not _valid_hex(value["launcherBlob"], {40, 64})
             or not _valid_hex(value["launcherSha256"], {64})
             or not isinstance(value["launcherSize"], int) or isinstance(value["launcherSize"], bool)
@@ -214,6 +222,25 @@ def _validate_bootstrap_binding(value: object) -> dict[str, object]:
             or any(not isinstance(git_dir[key], int) or isinstance(git_dir[key], bool) or git_dir[key] < 0
                    for key in ("device", "inode", "mode", "uid"))):
         raise ValueError("canonical Git directory identity is malformed")
+    return value
+
+
+def _validate_bus_peer_binding(value: object) -> dict[str, object]:
+    keys = {"bootId", "peerPid", "peerUid", "peerGid", "startTicks", "ppid", "comm", "argv",
+            "cgroup", "statusUid", "statusGid"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("staged user-bus peer binding is malformed")
+    for key in ("peerPid", "peerUid", "peerGid", "startTicks", "ppid"):
+        if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0:
+            raise ValueError("staged user-bus peer numeric identity is malformed")
+    uid, gid = value["peerUid"], value["peerGid"]
+    if (value["peerPid"] <= 1 or value["startTicks"] <= 0 or value["ppid"] != 1
+            or value["comm"] != "systemd" or value["argv"] != ["/usr/lib/systemd/systemd", "--user"]
+            or value["cgroup"] != f"0::/user.slice/user-{uid}.slice/user@{uid}.service/init.scope"
+            or value["statusUid"] != f"{uid}\t{uid}\t{uid}\t{uid}"
+            or value["statusGid"] != f"{gid}\t{gid}\t{gid}\t{gid}"
+            or not isinstance(value["bootId"], str) or len(value["bootId"]) != 36):
+        raise ValueError("staged user-bus peer is not the exact systemd user manager identity")
     return value
 
 
@@ -384,6 +411,10 @@ class CodexDispatchActivationSpec:
     review_digest: str
     dependency_digest: str
     bootstrap_binding: Mapping[str, object]
+    bus_peer_binding: Mapping[str, object]
+    launcher_blob: str
+    launcher_sha256: str
+    launcher_size: int
     service_name: str = SERVICE_NAME
     drop_in_relative_path: str = DROP_IN_RELATIVE_PATH
     daemon_socket: str = DAEMON_SOCKET_RELATIVE_PATH
@@ -403,6 +434,10 @@ class CodexDispatchActivationSpec:
             "reviewDigest": self.review_digest,
             "dependencyDigest": self.dependency_digest,
             "bootstrapBinding": dict(self.bootstrap_binding),
+            "busPeerBinding": dict(self.bus_peer_binding),
+            "launcherBlob": self.launcher_blob,
+            "launcherSha256": self.launcher_sha256,
+            "launcherSize": self.launcher_size,
             "serviceName": self.service_name,
             "dropInRelativePath": self.drop_in_relative_path,
             "daemonSocket": self.daemon_socket,
@@ -416,6 +451,8 @@ class CodexDispatchActivationSpec:
             "schemaVersion", "sourceCommit", "sourceTreeDigest", "sourceModuleDigest", "reviewDigest",
             "serviceName", "dropInRelativePath", "daemonSocket", "healthUrl", "sourceFiles", "dependencyDigest",
             "bootstrapBinding",
+            "busPeerBinding",
+            "launcherBlob", "launcherSha256", "launcherSize",
         }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("Codex dispatch activation spec must contain exact keys")
@@ -446,6 +483,15 @@ class CodexDispatchActivationSpec:
         source_commit = str(value["sourceCommit"]).lower()
         source_tree = str(value["sourceTreeDigest"]).lower()
         source_module = str(value["sourceModuleDigest"]).lower()
+        bootstrap_binding = _validate_bootstrap_binding(value["bootstrapBinding"])
+        if (bootstrap_binding["sourceCommit"] != source_commit
+                or bootstrap_binding["sourceTree"] != source_tree):
+            raise ValueError("immutable bootstrap is not bound to the reviewed source commit and tree")
+        bus_peer_binding = _validate_bus_peer_binding(value["busPeerBinding"])
+        if (value["launcherBlob"] != bootstrap_binding["launcherBlob"]
+                or value["launcherSha256"] != bootstrap_binding["launcherSha256"]
+                or value["launcherSize"] != bootstrap_binding["launcherSize"]):
+            raise ValueError("top-level launcher identity is not equal to the bootstrap binding")
         if str(value["reviewDigest"]).lower() != _review_digest(source_commit, source_tree, source_module, reviewed_files):
             raise ValueError("review digest is not derived from the reviewed binding")
         return cls(
@@ -455,7 +501,9 @@ class CodexDispatchActivationSpec:
             source_module,
             str(value["reviewDigest"]).lower(),
             str(value["dependencyDigest"]).lower(),
-            _validate_bootstrap_binding(value["bootstrapBinding"]),
+            bootstrap_binding,
+            bus_peer_binding,
+            str(value["launcherBlob"]), str(value["launcherSha256"]), int(value["launcherSize"]),
             source_files=reviewed_files,
         )
 
@@ -470,6 +518,7 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
     source_tree = _git(("rev-parse", "HEAD^{tree}")).lower()
     source_module = _module_digest(source_files)
     _source_clean()
+    bootstrap_binding = _bootstrap_binding(source_commit, source_tree)
     return CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA,
         source_commit,
@@ -477,7 +526,10 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
         source_module,
         _review_digest(source_commit, source_tree, source_module, source_files),
         _dependency_digest(),
-        _bootstrap_binding(),
+        bootstrap_binding,
+        _capture_user_bus_peer_binding(),
+        str(bootstrap_binding["launcherBlob"]), str(bootstrap_binding["launcherSha256"]),
+        int(bootstrap_binding["launcherSize"]),
         source_files=source_files,
     )
 
@@ -499,14 +551,20 @@ def _isolated_launcher_command(
     payload: Sequence[str],
 ) -> tuple[str, ...]:
     binding = _validate_bootstrap_binding(dict(spec.bootstrap_binding))
+    if binding["sourceCommit"] != spec.source_commit or binding["sourceTree"] != spec.source_tree_digest:
+        raise ValueError("immutable bootstrap command source binding is invalid")
+    if (spec.launcher_blob != binding["launcherBlob"] or spec.launcher_sha256 != binding["launcherSha256"]
+            or spec.launcher_size != binding["launcherSize"]):
+        raise ValueError("immutable bootstrap command launcher identity is inconsistent")
     config = {
         "sourceRoot": str(CANONICAL_SOURCE_ROOT), "sourceCommit": spec.source_commit,
         "sourceTree": spec.source_tree_digest, "sourceModule": spec.source_module_digest,
         "reviewDigest": spec.review_digest, "specDigest": codex_dispatch_activation_plan_digest(spec),
         "dependencyDigest": spec.dependency_digest, "sitePackages": str(SERVICE_SITE_PACKAGES),
-        "launcherBlob": binding["launcherBlob"], "launcherSha256": binding["launcherSha256"],
-        "launcherSize": binding["launcherSize"], "mode": mode, "payload": list(payload),
+        "launcherBlob": spec.launcher_blob, "launcherSha256": spec.launcher_sha256,
+        "launcherSize": spec.launcher_size, "mode": mode, "payload": list(payload),
         "bootstrapBinding": binding,
+        "busPeerBinding": dict(spec.bus_peer_binding),
     }
     return (
         str(ROOT_PYTHON), "-I", "-S", "-c", IMMUTABLE_BOOTSTRAP, _canonical(config),
@@ -592,8 +650,10 @@ def verify_reviewed_source_binding(spec: CodexDispatchActivationSpec) -> None:
     if spec.source_root != CANONICAL_SOURCE_ROOT:
         raise ValueError("source root is not canonical")
     _validate_bootstrap_binding(dict(spec.bootstrap_binding))
-    if dict(spec.bootstrap_binding) != _bootstrap_binding():
+    if dict(spec.bootstrap_binding) != _bootstrap_binding(spec.source_commit, spec.source_tree_digest):
         raise ValueError("immutable bootstrap host binding changed")
+    if dict(spec.bus_peer_binding) != _capture_user_bus_peer_binding():
+        raise ValueError("approved user-bus peer identity changed; restaging is required")
     _source_clean()
     if _git(("rev-parse", "HEAD")).lower() != spec.source_commit or _git(("rev-parse", "HEAD^{tree}")).lower() != spec.source_tree_digest:
         raise ValueError("reviewed source commit or tree binding changed")
@@ -1010,6 +1070,28 @@ def _proc_bytes(pid: int, name: str) -> bytes:
         os.close(fd)
 
 
+def _kernel_boot_id() -> str:
+    path = Path("/proc/sys/kernel/random/boot_id")
+    lexical = path.lstat()
+    if not stat.S_ISREG(lexical.st_mode) or lexical.st_uid != 0:
+        raise ValueError("kernel boot identity is unsafe")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        first = _read_all_fd(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        second = _read_all_fd(fd)
+        after = os.fstat(fd)
+        if first != second or _stable_stat(before) != _stable_stat(after):
+            raise ValueError("kernel boot identity changed during read")
+    finally:
+        os.close(fd)
+    value = first.decode("ascii").strip()
+    if len(value) != 36:
+        raise ValueError("kernel boot identity is invalid")
+    return value
+
+
 def _user_manager_process_binding(pid: int, uid: int, gid: int) -> dict[str, object]:
     if uid != os.geteuid() or gid != os.getegid() or pid <= 1:
         raise ValueError("user-bus peer credentials are invalid")
@@ -1034,31 +1116,42 @@ def _user_manager_process_binding(pid: int, uid: int, gid: int) -> dict[str, obj
             or status_fields.get("Uid") != expected_ids or status_fields.get("Gid") != expected_gids):
         raise ValueError("user-bus peer is not the exact systemd user manager")
     _root_binary_identity(ROOT_SYSTEMD, "systemd user manager")
-    return {"pid": pid, "uid": uid, "gid": gid, "startTicks": start_ticks,
-            "ppid": ppid, "comm": comm, "cmdline": b"/usr/lib/systemd/systemd\0--user\0",
-            "cgroup": expected_cgroup, "statusUid": expected_ids, "statusGid": expected_gids}
+    boot_id = _kernel_boot_id()
+    return {"bootId": boot_id, "peerPid": pid, "peerUid": uid, "peerGid": gid,
+            "startTicks": start_ticks, "ppid": ppid, "comm": comm,
+            "argv": ["/usr/lib/systemd/systemd", "--user"],
+            "cgroup": expected_cgroup.decode("ascii").strip(),
+            "statusUid": expected_ids, "statusGid": expected_gids}
 
 
 def _validate_user_bus_peer(peer: socket.socket) -> tuple[int, dict[str, object]]:
     pid, uid, gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    binding = _user_manager_process_binding(pid, uid, gid)
     pidfd = os.pidfd_open(pid, 0)
-    if select.select([pidfd], [], [], 0)[0]:
+    try:
+        binding = _user_manager_process_binding(pid, uid, gid)
+        if select.select([pidfd], [], [], 0)[0]:
+            raise ValueError("user-bus peer exited during validation")
+        return pidfd, binding
+    except Exception:
         os.close(pidfd)
-        raise ValueError("user-bus peer exited during validation")
-    return pidfd, binding
+        raise
 
 
 def _revalidate_user_bus_peer(pidfd: int, binding: Mapping[str, object]) -> None:
     if select.select([pidfd], [], [], 0)[0]:
         raise ValueError("user-bus peer exited during property query")
-    current = _user_manager_process_binding(int(binding["pid"]), int(binding["uid"]), int(binding["gid"]))
+    current = _user_manager_process_binding(
+        int(binding["peerPid"]), int(binding["peerUid"]), int(binding["peerGid"]),
+    )
     if current != binding:
         raise ValueError("user-bus peer identity changed during property query")
 
 
 @contextmanager
-def _validated_user_bus():
+def _validated_user_bus(
+    expected_peer: Mapping[str, object] | None = None,
+    captured: list[dict[str, object]] | None = None,
+):
     root_lexical = RUNTIME_USER_ROOT.lstat()
     if (not stat.S_ISDIR(root_lexical.st_mode) or root_lexical.st_uid != 0
             or stat.S_IMODE(root_lexical.st_mode) & 0o022):
@@ -1086,6 +1179,10 @@ def _validated_user_bus():
         peer.settimeout(5)
         peer.connect(f"/proc/self/fd/{user_fd}/bus")
         pidfd, peer_binding = _validate_user_bus_peer(peer)
+        if expected_peer is not None and dict(expected_peer) != peer_binding:
+            raise ValueError("user-bus peer does not match the approved staged identity")
+        if captured is not None:
+            captured.append(dict(peer_binding))
 
         def validate() -> None:
             root_now = RUNTIME_USER_ROOT.lstat()
@@ -1113,10 +1210,23 @@ def _validated_user_bus():
         os.close(root_fd)
 
 
-def _read_user_bus_property(name: str, signature: str) -> object:
+def _capture_user_bus_peer_binding() -> dict[str, object]:
+    captured: list[dict[str, object]] = []
+    with _validated_user_bus(captured=captured) as validate:
+        validate()
+    if len(captured) != 1:
+        raise ValueError("user-bus peer capture failed")
+    return captured[0]
+
+
+def _read_user_bus_property(
+    name: str,
+    signature: str,
+    expected_peer: Mapping[str, object] | None = None,
+) -> object:
     if (name, signature) not in {("Environment", "as"), ("ExecStart", "a(sasbttttuii)")}:
         raise ValueError("unsupported user-bus property contract")
-    with _validated_user_bus() as validate:
+    with _validated_user_bus(expected_peer=expected_peer) as validate:
         validate()
         output = _run_checked((
             BUSCTL, f"--address={USER_BUS_ADDRESS}", "--json=short", "get-property",
@@ -1297,7 +1407,7 @@ def _probe_proxy() -> None:
 
 
 def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None:
-    environment = _read_user_bus_property("Environment", "as")
+    environment = _read_user_bus_property("Environment", "as", spec.bus_peer_binding if spec else None)
     if (not isinstance(environment, list)
             or any(not isinstance(item, str) or "=" not in item for item in environment)):
         raise ValueError("Overseer effective environment output contract is invalid")
@@ -1316,7 +1426,7 @@ def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None
             "--auth-token-file", str(SERVICE_TOKEN),
         )
         expected = _isolated_launcher_command(spec, "service", service_payload)
-        effective = _read_user_bus_property("ExecStart", "a(sasbttttuii)")
+        effective = _read_user_bus_property("ExecStart", "a(sasbttttuii)", spec.bus_peer_binding)
         if not isinstance(effective, list) or len(effective) != 1:
             raise ValueError("Overseer effective ExecStart output contract is invalid")
         command = effective[0]

@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA = "overseer.codex-dispatch-activation.v4"
+SCHEMA = "overseer.codex-dispatch-activation.v5"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 DAEMON_SOCKET = "app-server-control/app-server-control.sock"
@@ -221,6 +221,10 @@ def _validate(args: argparse.Namespace) -> Path:
         "reviewDigest": review,
         "dependencyDigest": args.dependency_digest.lower(),
         "bootstrapBinding": json.loads(args.bootstrap_binding),
+        "busPeerBinding": json.loads(args.bus_peer_binding),
+        "launcherBlob": args.launcher_blob,
+        "launcherSha256": args.launcher_sha256,
+        "launcherSize": args.launcher_size,
         "serviceName": SERVICE_NAME,
         "dropInRelativePath": DROP_IN_RELATIVE_PATH,
         "daemonSocket": DAEMON_SOCKET,
@@ -252,6 +256,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--spec-digest", required=True)
     parser.add_argument("--dependency-digest", required=True)
     parser.add_argument("--bootstrap-binding", required=True)
+    parser.add_argument("--bus-peer-binding", required=True)
+    parser.add_argument("--launcher-blob", required=True)
+    parser.add_argument("--launcher-sha256", required=True)
+    parser.add_argument("--launcher-size", required=True, type=int)
     parser.add_argument("--site-packages")
     parser.add_argument("payload", nargs=argparse.REMAINDER)
     return parser

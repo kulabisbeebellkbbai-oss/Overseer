@@ -810,6 +810,40 @@ def test_codex_registry_hardlink_alias_is_rejected(codex_csv: Path, tmp_path: Pa
         CodexDriver.from_legacy_registry(alias)
 
 
+@pytest.mark.parametrize("alias_kind", ["hardlink", "symlink"])
+def test_late_registry_alias_cannot_bypass_structured_fence(
+    codex_csv: Path,
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    alias_directory = tmp_path / "late-alias"
+    alias_directory.mkdir()
+    alias = alias_directory / "codex-projects.csv"
+    legacy = CodexDriver.from_legacy_registry(
+        alias,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=RecordingRunner(),
+        sleep=lambda _delay: None,
+    )
+    if alias_kind == "hardlink":
+        os.link(codex_csv, alias)
+    else:
+        alias.symlink_to(codex_csv)
+
+    session = legacy.discover()[0]
+    with pytest.raises(RuntimeError, match="registry (identity was unavailable|path identity changed)"):
+        legacy.dispatch_legacy(session, "Alias must fail before tmux.", idempotency_key="late.alias")
+
+
+def test_structured_fence_root_cannot_be_overridden(codex_csv: Path, tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        CodexDriver.from_legacy_registry(
+            codex_csv,
+            structured_thread_fence_root=tmp_path / "split-fence",
+        )
+
+
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(
     codex_csv: Path,
 ) -> None:

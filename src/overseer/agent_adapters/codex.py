@@ -291,7 +291,6 @@ class CodexDriver:
         runner: BoundedCommandRunner | None = None,
         delivery_evidence_factory=None,
         structured_turn_client: StructuredTurnClient | None = None,
-        structured_thread_fence_root: str | Path | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
@@ -321,9 +320,14 @@ class CodexDriver:
         self.profile = profile
         # One registry inode must map to one cross-process transport-fence
         # namespace even when callers supply relative or symlink aliases.
-        self.registry_path = Path(registry_path).expanduser().resolve(strict=False)
-        if self.registry_path.exists() and self.registry_path.stat(follow_symlinks=False).st_nlink != 1:
-            raise ValueError("Codex projects registry must not have hardlink aliases")
+        self._registry_source_path = Path(registry_path).expanduser().absolute()
+        self.registry_path = self._registry_source_path.resolve(strict=False)
+        self._registry_identity: tuple[int, int] | None = None
+        if self.registry_path.exists():
+            registry_metadata = self.registry_path.stat(follow_symlinks=False)
+            if registry_metadata.st_nlink != 1:
+                raise ValueError("Codex projects registry must not have hardlink aliases")
+            self._registry_identity = (registry_metadata.st_dev, registry_metadata.st_ino)
         self.tmux_path = Path(tmux_path)
         self.codex_memory_session_path = Path(codex_memory_session_path)
         self.runner: BoundedCommandRunner = runner or CliCommandRunner(
@@ -337,11 +341,7 @@ class CodexDriver:
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
         self.delivery_evidence_factory = delivery_evidence_factory or (lambda session: RolloutPromptDeliveryEvidence(session))
         self.structured_turn_client = structured_turn_client
-        self.structured_thread_fence_root = Path(
-            structured_thread_fence_root
-            if structured_thread_fence_root is not None
-            else self.registry_path.parent / ".overseer-structured-threads"
-        )
+        self.structured_thread_fence_root = self.registry_path.parent / ".overseer-structured-threads"
         if not callable(sleep):
             raise TypeError("Codex sleep hook must be callable")
         self._sleep = sleep
@@ -360,7 +360,6 @@ class CodexDriver:
         runner: CliCommandRunner | SubprocessRunner | None = None,
         delivery_evidence_factory=None,
         structured_turn_client: StructuredTurnClient | None = None,
-        structured_thread_fence_root: str | Path | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> CodexDriver:
         selected_structured_turn_client = structured_turn_client
@@ -392,7 +391,6 @@ class CodexDriver:
             runner=runner,
             delivery_evidence_factory=delivery_evidence_factory,
             structured_turn_client=selected_structured_turn_client,
-            structured_thread_fence_root=structured_thread_fence_root,
             sleep=sleep,
         )
 
@@ -1365,6 +1363,7 @@ class CodexDriver:
     def _thread_operation_lock(self, session: AgentSession):
         """Serialize legacy and structured effects across processes."""
         with _thread_dispatch_lock(session):
+            self._revalidate_registry_identity()
             root = self._ensure_structured_fence_root()
             thread_id = session.external_session_id or session.id
             lock_path = root / (hashlib.sha256(thread_id.encode("utf-8")).hexdigest() + ".lock")
@@ -1386,6 +1385,19 @@ class CodexDriver:
                 yield
             finally:
                 os.close(descriptor)
+
+    def _revalidate_registry_identity(self) -> None:
+        if self._registry_identity is None:
+            raise RuntimeError("Codex projects registry identity was unavailable at driver creation")
+        current_path = self._registry_source_path.resolve(strict=False)
+        if current_path != self.registry_path:
+            raise RuntimeError("Codex projects registry path identity changed")
+        try:
+            metadata = current_path.stat(follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise RuntimeError("Codex projects registry identity changed") from error
+        if metadata.st_nlink != 1 or (metadata.st_dev, metadata.st_ino) != self._registry_identity:
+            raise RuntimeError("Codex projects registry identity changed")
 
     @contextmanager
     def _claim_structured_thread(self, session: AgentSession):

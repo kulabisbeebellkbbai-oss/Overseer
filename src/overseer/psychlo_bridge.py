@@ -401,6 +401,12 @@ class PsychloBridge:
                 resource.close()
             except Exception as error:
                 errors.append(error)
+        for descriptor in getattr(self, "_verified_store_fds", ()):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                errors.append(error)
+        self._verified_store_fds = ()
         if errors:
             raise errors[0]
 
@@ -2516,38 +2522,111 @@ class AuthoritativeAgentResultCollector:
         return value
 
 
+def _strict_store_path_identity(value: str | None, label: str) -> tuple[Path, tuple[int, int]]:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} database path is required")
+    path = Path(value)
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError(f"{label} database path is not canonical")
+    try:
+        canonical = path.resolve(strict=True)
+        metadata = path.lstat()
+        parent = path.parent.lstat()
+    except OSError as error:
+        raise ValueError(f"{label} database must preexist") from error
+    if canonical != path or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} database path is not canonical")
+    if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ValueError(f"{label} database must be a unique owned private file")
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+        raise ValueError(f"{label} database parent is not trusted")
+    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_nlink) != (metadata.st_dev, metadata.st_ino, 1):
+            raise ValueError(f"{label} database opened identity changed")
+    finally:
+        os.close(descriptor)
+    return path, (metadata.st_dev, metadata.st_ino)
+
+
+def _strict_distinct_store_paths(bridge_value: str | None, primary_value: str | None) -> tuple[tuple[int, int], tuple[int, int]]:
+    bridge_path, bridge_identity = _strict_store_path_identity(bridge_value, "Psychlo bridge")
+    primary_path, primary_identity = _strict_store_path_identity(primary_value, "primary authority")
+    if bridge_path == primary_path or bridge_identity == primary_identity:
+        raise ValueError("primary authority store must be distinct from the Psychlo bridge store")
+    return bridge_identity, primary_identity
+
+
+def _open_store_by_identity(path: Path, expected: tuple[int, int], label: str) -> int:
+    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino, opened.st_nlink) != (*expected, 1):
+        os.close(descriptor)
+        raise ValueError(f"{label} database opened identity changed")
+    return descriptor
+
+
 def create_bridge_from_environment(environment: Mapping[str, str] | None = None, *, recover: bool = True, require_distinct_authority_store: bool = False) -> PsychloBridge:
     selected = environment or os.environ
+    bridge_path_value = selected.get("OVERSEER_PSYCHLO_BRIDGE_DATABASE")
+    primary_store_value = selected.get("OVERSEER_STORE_DATABASE") or selected.get("OVERSEER_STORE_PATH")
+    strict_identities: tuple[tuple[int, int], tuple[int, int]] | None = None
     if require_distinct_authority_store:
-        bridge_path = selected.get("OVERSEER_PSYCHLO_BRIDGE_DATABASE")
-        primary_path = selected.get("OVERSEER_STORE_DATABASE") or selected.get("OVERSEER_STORE_PATH")
-        if not primary_path:
-            raise ValueError("OVERSEER_STORE_DATABASE is required for process attestation")
-        if bridge_path and Path(primary_path).resolve() == Path(bridge_path).resolve():
-            raise ValueError("process attestation authority store must be distinct from the Psychlo bridge store")
+        if not primary_store_value:
+            raise ValueError("OVERSEER_STORE_DATABASE is required for distinct authority operations")
+        strict_identities = _strict_distinct_store_paths(bridge_path_value, primary_store_value)
     secret = _read_secret(Path(selected["OVERSEER_PSYCHLO_PEER_SECRET_FILE"]))
-    store = PsychloBridgeStore(selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"])
     dispatcher = CodexProjectDispatcher(selected["OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE"])
     sender = PsychloPeerSender(selected.get("OVERSEER_PSYCHLO_ENDPOINT", "http://127.0.0.1:8798"), secret)
-    primary_store_value = selected.get("OVERSEER_STORE_DATABASE") or selected.get("OVERSEER_STORE_PATH")
-    if require_distinct_authority_store and not primary_store_value:
-        raise ValueError("OVERSEER_STORE_DATABASE is required for process attestation")
-    primary_store_path = primary_store_value or selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"]
-    if require_distinct_authority_store and Path(primary_store_path).resolve() == Path(selected["OVERSEER_PSYCHLO_BRIDGE_DATABASE"]).resolve():
-        raise ValueError("process attestation authority store must be distinct from the Psychlo bridge store")
-    return PsychloBridge(
-        store=store,
-        dispatcher=dispatcher,
-        sender=sender,
-        callback_origin="http://127.0.0.1:8766",
-        approval_store=SQLiteStore(primary_store_path),
-        approval_owner_domain=selected.get("OVERSEER_PSYCHLO_APPROVAL_OWNER_DOMAIN", "sisko"),
-        supervisor_dispatcher=dispatcher,
-        project_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "participant_result"),
-        supervisor_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "supervisor_result"),
-        require_external_binding=True,
-        recover=recover,
-    )
+    if bridge_path_value is None:
+        raise ValueError("OVERSEER_PSYCHLO_BRIDGE_DATABASE is required")
+    primary_store_path = primary_store_value or bridge_path_value
+    descriptors: tuple[int, ...] = ()
+    store: PsychloBridgeStore | None = None
+    primary: SQLiteStore | None = None
+    try:
+        if strict_identities is not None:
+            bridge_fd = _open_store_by_identity(Path(bridge_path_value), strict_identities[0], "Psychlo bridge")
+            try:
+                primary_fd = _open_store_by_identity(Path(primary_store_path), strict_identities[1], "primary authority")
+            except Exception:
+                os.close(bridge_fd)
+                raise
+            descriptors = (bridge_fd, primary_fd)
+            store = PsychloBridgeStore(bridge_path_value, verified_fd=bridge_fd)
+            primary = SQLiteStore(primary_store_path, verified_fd=primary_fd)
+        else:
+            store = PsychloBridgeStore(bridge_path_value)
+            primary = SQLiteStore(primary_store_path)
+        bridge = PsychloBridge(
+            store=store,
+            dispatcher=dispatcher,
+            sender=sender,
+            callback_origin="http://127.0.0.1:8766",
+            approval_store=primary,
+            approval_owner_domain=selected.get("OVERSEER_PSYCHLO_APPROVAL_OWNER_DOMAIN", "sisko"),
+            supervisor_dispatcher=dispatcher,
+            project_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "participant_result"),
+            supervisor_result_collector=AuthoritativeAgentResultCollector(primary_store_path, "supervisor_result"),
+            require_external_binding=True,
+            recover=recover,
+        )
+        bridge._verified_store_fds = descriptors
+        return bridge
+    except Exception:
+        for resource in (store, primary):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
 
 
 def _weekly_window(snapshot: Mapping[str, Any] | None) -> Mapping[str, Any]:

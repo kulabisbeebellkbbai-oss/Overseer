@@ -301,17 +301,39 @@ def test_crash_after_bridge_completion_replays_without_resending(tmp_path, monke
     assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan")["state"] == "completed"
 
 
-def test_peer_rejection_is_terminal_and_never_changes_round(tmp_path):
+def test_invalid_peer_response_remains_pending_and_replays_after_remote_commit(tmp_path):
+    calls = []
     def sender(kind, key, payload):
-        return {"accepted": False, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "rejected"}
+        calls.append(dict(payload))
+        if len(calls) == 1:
+            # The receiver may have committed before its response was
+            # truncated or corrupted in transport.
+            return {"accepted": True, "actionId": payload["actionId"]}
+        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned"}
     bridge, primary = _runtime(tmp_path, sender=sender)
     _stage(bridge)
     plan = primary.load_admin_change_plan("abandon-plan")
     primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", NOW))
     with pytest.raises(LegacyAbandonmentError):
         execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
-    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "rejected"
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "peer-pending"
     assert bridge.store.get_round("round-arcade")[4] == "started"
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
+    result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert result["status"] == "legacy-abandoned-uncertain"
+    assert calls[0] == calls[1]
+
+
+@pytest.mark.parametrize("invalid", [None, {}, {"accepted": False}, "truncated"])
+def test_every_unverifiable_peer_response_stays_replayable(tmp_path, invalid):
+    bridge, primary = _runtime(tmp_path, sender=lambda *_args: invalid)
+    _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    with pytest.raises(LegacyAbandonmentError):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    intent = bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")
+    assert intent["state"] == "peer-pending" and intent["receipt"] is None
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
 
 
 def test_abandonment_fence_rejects_recovery_and_late_result(tmp_path):
@@ -366,3 +388,75 @@ def test_source_observation_requires_exact_utc_sisko_authority(tmp_path):
     bridge, primary = _runtime(tmp_path, observation_approved_at="2099-01-01T01:00:10+01:00")
     with pytest.raises(LegacyAbandonmentError, match="invalid"):
         _stage(bridge)
+
+
+def test_strict_distinct_store_guard_rejects_missing_same_alias_and_hardlink(tmp_path):
+    from overseer.psychlo_bridge import _strict_distinct_store_paths, create_bridge_from_environment
+
+    bridge = tmp_path / "bridge.sqlite3"
+    primary = tmp_path / "primary.sqlite3"
+    with pytest.raises(ValueError, match="OVERSEER_STORE_DATABASE"):
+        create_bridge_from_environment(
+            {"OVERSEER_PSYCHLO_BRIDGE_DATABASE": str(bridge)},
+            recover=False,
+            require_distinct_authority_store=True,
+        )
+    with pytest.raises(ValueError, match="required"):
+        _strict_distinct_store_paths(None, None)
+    with pytest.raises(ValueError, match="preexist|required"):
+        _strict_distinct_store_paths(str(bridge), str(primary))
+    bridge.touch(mode=0o600)
+    primary.touch(mode=0o600)
+    with pytest.raises(ValueError, match="distinct"):
+        _strict_distinct_store_paths(str(bridge), str(bridge))
+    alias = tmp_path / "bridge-alias.sqlite3"
+    alias.symlink_to(bridge)
+    with pytest.raises(ValueError, match="canonical"):
+        _strict_distinct_store_paths(str(alias), str(primary))
+    hardlink = tmp_path / "bridge-hardlink.sqlite3"
+    os.link(bridge, hardlink)
+    with pytest.raises(ValueError, match="unique"):
+        _strict_distinct_store_paths(str(bridge), str(primary))
+    hardlink.unlink()
+    bridge_identity, primary_identity = _strict_distinct_store_paths(str(bridge), str(primary))
+    assert bridge_identity != primary_identity
+
+
+def test_legacy_abandonment_cli_requires_strict_distinct_authority_store(monkeypatch):
+    from overseer import psychlo_bridge_cli
+
+    calls = []
+    marker = object()
+    monkeypatch.setattr(
+        psychlo_bridge_cli,
+        "create_bridge_from_environment",
+        lambda *, recover=True, require_distinct_authority_store=False: calls.append((recover, require_distinct_authority_store)) or marker,
+    )
+    assert psychlo_bridge_cli._create_legacy_abandonment_bridge() is marker
+    assert calls == [(False, True)]
+
+
+def test_every_legacy_abandonment_cli_operation_uses_strict_bridge(monkeypatch, capsys):
+    from overseer import psychlo_bridge_cli
+
+    class Bridge:
+        def stage_legacy_abandonment(self, **_kwargs):
+            return {"staged": True}
+
+        def finalize_legacy_abandonment(self, **_kwargs):
+            return {"completed": False}
+
+        def execute_legacy_abandonment(self, **_kwargs):
+            return {"accepted": True}
+
+    calls = []
+    monkeypatch.setattr(psychlo_bridge_cli, "_create_legacy_abandonment_bridge", lambda: calls.append("strict") or Bridge())
+    commands = [
+        ["stage-legacy-abandonment", "--round-id", "round", "--plan-id", "plan", "--observation-plan-id", "observation-plan", "--successor-plan-id", "successor", "--successor-plan-version", "2", "--successor-conversation-id", "conversation", "--successor-thread-id", "thread"],
+        ["finalize-legacy-abandonment", "--plan-id", "plan"],
+        ["execute-legacy-abandonment", "--plan-id", "plan"],
+    ]
+    for command in commands:
+        assert psychlo_bridge_cli.main(command) == 0
+    assert calls == ["strict", "strict", "strict"]
+    assert len(capsys.readouterr().out.splitlines()) == 3

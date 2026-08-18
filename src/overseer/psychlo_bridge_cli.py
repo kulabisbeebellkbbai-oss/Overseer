@@ -17,6 +17,11 @@ from .psychlo_process_attestation import record_process_observation, finalize_pr
 from .usage_attribution import UsageAttributionLedger, UsageSnapshotProducer, _validate_usage_snapshot_receipt, managed_receipt_validator
 
 
+def _create_legacy_abandonment_bridge():
+    """Open the typed adapter only with separate bridge and authority stores."""
+    return create_bridge_from_environment(recover=False, require_distinct_authority_store=True)
+
+
 def _delivery_lease_seconds(value: str) -> int:
     try:
         parsed = int(value)
@@ -166,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "stage-legacy-abandonment":
-        bridge = create_bridge_from_environment()
+        bridge = _create_legacy_abandonment_bridge()
         result = bridge.stage_legacy_abandonment(
             plan_id=args.plan_id, observation_plan_id=args.observation_plan_id, round_id=args.round_id,
             successor_plan_id=args.successor_plan_id, successor_plan_version=args.successor_plan_version,
@@ -175,11 +180,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "finalize-legacy-abandonment":
-        bridge = create_bridge_from_environment()
+        bridge = _create_legacy_abandonment_bridge()
         print(json.dumps(bridge.finalize_legacy_abandonment(plan_id=args.plan_id), sort_keys=True))
         return 0
     if args.command == "execute-legacy-abandonment":
-        bridge = create_bridge_from_environment()
+        bridge = _create_legacy_abandonment_bridge()
         print(json.dumps(bridge.execute_legacy_abandonment(plan_id=args.plan_id), sort_keys=True))
         return 0
     if args.command == "tick":

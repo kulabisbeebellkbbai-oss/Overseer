@@ -343,11 +343,12 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
         # A transport/process failure is recoverable: leave the outbox in
         # peer-pending so the exact action can be replayed later.
         raise
-    try:
-        response = _validate_response(raw_response, wire)
-    except Exception as error:
-        bridge.store.reject_legacy_abandonment(action_id, intent["actionDigest"], str(error), now=_now(bridge))
-        raise
+    # Any invalid, malformed, or truncated response is an ambiguous transport
+    # outcome: Psychlo may already have committed.  Preserve peer-pending and
+    # replay the exact action until an authenticated success/already receipt is
+    # observed.  The current peer contract has no provably pre-commit semantic
+    # rejection, so no response can terminalize this intent as rejected.
+    response = _validate_response(raw_response, wire)
     receipt = {**response, "status": STATUS, "actionId": action_id, "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"]}
     completed = bridge.store.complete_legacy_abandonment(action_id, intent["actionDigest"], receipt, now=_now(bridge))
     primary.complete_psychlo_legacy_abandonment_execution(

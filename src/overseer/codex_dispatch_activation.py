@@ -44,6 +44,7 @@ BUSCTL = "/usr/bin/busctl"
 SYSTEMD_BUS_NAME = "org.freedesktop.systemd1"
 SERVICE_OBJECT = "/org/freedesktop/systemd1/unit/overseer_2dapi_2eservice"
 SERVICE_INTERFACE = "org.freedesktop.systemd1.Service"
+USER_BUS_ADDRESS = f"unix:path=/run/user/{os.geteuid()}/bus"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 # This path is relative to CODEX_HOME exactly once.
 DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
@@ -877,6 +878,78 @@ def _runtime_anchor_lock():
         os.close(root_fd)
 
 
+def _validate_user_bus_socket(user_fd: int, expected: tuple[int, ...] | None = None) -> tuple[int, ...]:
+    info = os.stat("bus", dir_fd=user_fd, follow_symlinks=False)
+    binding = _stable_stat(info)
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1):
+        raise ValueError("user D-Bus endpoint is not an euid-owned socket")
+    if expected is not None and binding != expected:
+        raise ValueError("user D-Bus socket changed or was replaced")
+    return binding
+
+
+@contextmanager
+def _validated_user_bus():
+    root_lexical = RUNTIME_USER_ROOT.lstat()
+    if (not stat.S_ISDIR(root_lexical.st_mode) or root_lexical.st_uid != 0
+            or stat.S_IMODE(root_lexical.st_mode) & 0o022):
+        raise ValueError("runtime anchor root is not root-controlled")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(RUNTIME_USER_ROOT, flags)
+    user_fd: int | None = None
+    try:
+        root_info = os.fstat(root_fd)
+        if _directory_binding(root_info) != _directory_binding(root_lexical):
+            raise ValueError("runtime anchor root changed during user-bus validation")
+        user_name = str(os.geteuid())
+        user_lexical = os.stat(user_name, dir_fd=root_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(user_lexical.st_mode) or user_lexical.st_uid != os.geteuid()
+                or stat.S_IMODE(user_lexical.st_mode) != 0o700):
+            raise ValueError("runtime user anchor is not private and euid-owned")
+        user_fd = os.open(user_name, flags, dir_fd=root_fd)
+        user_info = os.fstat(user_fd)
+        if _directory_binding(user_info) != _directory_binding(user_lexical):
+            raise ValueError("runtime user anchor changed before user-bus validation")
+        bus_binding = _validate_user_bus_socket(user_fd)
+
+        def validate() -> None:
+            root_now = RUNTIME_USER_ROOT.lstat()
+            user_now = os.stat(user_name, dir_fd=root_fd, follow_symlinks=False)
+            if (_directory_binding(os.fstat(root_fd)) != _directory_binding(root_info)
+                    or _directory_binding(root_now) != _directory_binding(root_info)
+                    or _directory_binding(os.fstat(user_fd)) != _directory_binding(user_info)
+                    or _directory_binding(user_now) != _directory_binding(user_info)):
+                raise ValueError("stable runtime user-bus anchor changed or was replaced")
+            _validate_user_bus_socket(user_fd, bus_binding)
+
+        validate()
+        try:
+            yield validate
+        finally:
+            validate()
+    finally:
+        if user_fd is not None:
+            os.close(user_fd)
+        os.close(root_fd)
+
+
+def _read_user_bus_property(name: str, signature: str) -> object:
+    if (name, signature) not in {("Environment", "as"), ("ExecStart", "a(sasbttttuii)")}:
+        raise ValueError("unsupported user-bus property contract")
+    with _validated_user_bus() as validate:
+        validate()
+        output = _run_checked((
+            BUSCTL, f"--address={USER_BUS_ADDRESS}", "--json=short", "get-property",
+            SYSTEMD_BUS_NAME, SERVICE_OBJECT, SERVICE_INTERFACE, name,
+        ))
+        validate()
+    value = json.loads(output)
+    if (not isinstance(value, dict) or set(value) != {"type", "data"}
+            or value["type"] != signature):
+        raise ValueError(f"Overseer effective {name} output contract is invalid")
+    return value["data"]
+
+
 @contextmanager
 def _activation_lock():
     with _runtime_anchor_lock() as validate_runtime:
@@ -1044,18 +1117,7 @@ def _probe_proxy() -> None:
 
 
 def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None:
-    def property_value(name: str, signature: str) -> object:
-        output = _run_checked((
-            BUSCTL, "--user", "--json=short", "get-property", SYSTEMD_BUS_NAME,
-            SERVICE_OBJECT, SERVICE_INTERFACE, name,
-        ))
-        value = json.loads(output)
-        if (not isinstance(value, dict) or set(value) != {"type", "data"}
-                or value["type"] != signature):
-            raise ValueError(f"Overseer effective {name} output contract is invalid")
-        return value["data"]
-
-    environment = property_value("Environment", "as")
+    environment = _read_user_bus_property("Environment", "as")
     if (not isinstance(environment, list)
             or any(not isinstance(item, str) or "=" not in item for item in environment)):
         raise ValueError("Overseer effective environment output contract is invalid")
@@ -1074,7 +1136,7 @@ def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None
             "--auth-token-file", str(SERVICE_TOKEN),
         )
         expected = _isolated_launcher_command(spec, "service", service_payload)
-        effective = property_value("ExecStart", "a(sasbttttuii)")
+        effective = _read_user_bus_property("ExecStart", "a(sasbttttuii)")
         if not isinstance(effective, list) or len(effective) != 1:
             raise ValueError("Overseer effective ExecStart output contract is invalid")
         command = effective[0]

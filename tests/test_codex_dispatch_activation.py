@@ -5,6 +5,7 @@ import hashlib
 import os
 import py_compile
 import stat
+import socket
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -695,10 +696,52 @@ def test_busctl_uses_exact_fixed_service_property_contract(monkeypatch: pytest.M
     monkeypatch.setattr(activation, "_run_checked", checked)
     activation._verify_environment(spec)
     prefix = (
-        activation.BUSCTL, "--user", "--json=short", "get-property", activation.SYSTEMD_BUS_NAME,
+        activation.BUSCTL, f"--address={activation.USER_BUS_ADDRESS}", "--json=short", "get-property", activation.SYSTEMD_BUS_NAME,
         activation.SERVICE_OBJECT, activation.SERVICE_INTERFACE,
     )
     assert calls == [(*prefix, "Environment"), (*prefix, "ExecStart")]
+
+
+def test_user_bus_socket_validation_rejects_missing_wrong_type_and_replacement(tmp_path: Path):
+    tmp_path.chmod(0o700)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FileNotFoundError):
+            activation._validate_user_bus_socket(directory_fd)
+        (tmp_path / "bus").write_text("not a socket", encoding="utf-8")
+        with pytest.raises(ValueError, match="socket"):
+            activation._validate_user_bus_socket(directory_fd)
+        (tmp_path / "bus").unlink()
+        first_socket = socket.socket(socket.AF_UNIX)
+        first_socket.bind(str(tmp_path / "bus"))
+        binding = activation._validate_user_bus_socket(directory_fd)
+        (tmp_path / "bus").unlink()
+        second_socket = socket.socket(socket.AF_UNIX)
+        second_socket.bind(str(tmp_path / "bus"))
+        try:
+            with pytest.raises(ValueError, match="changed"):
+                activation._validate_user_bus_socket(directory_fd, binding)
+        finally:
+            second_socket.close()
+            first_socket.close()
+    finally:
+        os.close(directory_fd)
+
+
+def test_fixed_address_busctl_contract_works_with_sanitized_environment():
+    value = activation._read_user_bus_property("Environment", "as")
+    assert isinstance(value, list)
+    assert all(isinstance(item, str) for item in value)
+
+
+def test_fixed_address_busctl_contract_works_under_env_i():
+    command = (
+        activation.BUSCTL, f"--address={activation.USER_BUS_ADDRESS}", "--json=short", "get-property",
+        activation.SYSTEMD_BUS_NAME, activation.SERVICE_OBJECT, activation.SERVICE_INTERFACE, "Environment",
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, check=False, env={})
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["type"] == "as"
 
 
 @pytest.mark.parametrize("bad_field", [True, -1, 2**64])

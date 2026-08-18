@@ -23,7 +23,9 @@ SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 DAEMON_SOCKET = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
-EXECUTABLE_SUFFIXES = (".py", ".pyc")
+EXECUTABLE_SUFFIXES = tuple(dict.fromkeys(
+    (".py", ".pyc", ".pyd", *importlib.machinery.EXTENSION_SUFFIXES)
+))
 ALLOWED_ACTIVATION_COMMANDS = {
     "stage-codex-dispatch-activation",
     "codex-dispatch-activation-status",
@@ -76,7 +78,7 @@ def _inventory(root: Path) -> tuple[str, ...]:
         if not _is_nonexecutable_cache(item, tracked_sources)
     )
     if untracked:
-        raise ValueError("untracked executable Python exists under reviewed src")
+        raise ValueError("untracked executable Python or import artifact exists under reviewed src")
     if not tracked or "src/overseer_codex_dispatch_launcher.py" not in tracked:
         raise ValueError("reviewed executable source inventory is incomplete")
     return tracked
@@ -217,11 +219,29 @@ def main(argv: list[str] | None = None) -> int:
         if (not site_packages.is_absolute() or not site_packages.is_dir()
                 or site_packages.is_symlink()):
             raise ValueError("reviewed site-packages path is unavailable")
+        interpreter_path_hooks = tuple(sys.path_hooks)
         source_only_hook = importlib.machinery.FileFinder.path_hook(
+            (importlib.machinery.SourceFileLoader, importlib.machinery.SOURCE_SUFFIXES),
+        )
+        dependency_hook = importlib.machinery.FileFinder.path_hook(
             (importlib.machinery.SourceFileLoader, importlib.machinery.SOURCE_SUFFIXES),
             (importlib.machinery.ExtensionFileLoader, importlib.machinery.EXTENSION_SUFFIXES),
         )
-        sys.path_hooks[:] = [source_only_hook]
+        source_directory = root / "src"
+
+        def reviewed_path_hook(path: str):
+            candidate = Path(path)
+            try:
+                candidate.relative_to(source_directory)
+            except ValueError:
+                try:
+                    candidate.relative_to(site_packages)
+                except ValueError as error:
+                    raise ImportError("import path is outside reviewed roots") from error
+                return dependency_hook(path)
+            return source_only_hook(path)
+
+        sys.path_hooks[:] = [reviewed_path_hook, *interpreter_path_hooks]
         sys.path_importer_cache.clear()
         sys.path.insert(0, str(site_packages))
         sys.path.insert(0, str(root / "src"))

@@ -11,10 +11,10 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import importlib.machinery
 import json
 import os
 import pwd
-import shlex
 import socket
 import stat
 import subprocess
@@ -45,7 +45,9 @@ DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer
 DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
 SOURCE_ROOTS = ("src",)
-SOURCE_EXECUTABLE_SUFFIXES = (".py", ".pyc")
+SOURCE_EXECUTABLE_SUFFIXES = tuple(dict.fromkeys(
+    (".py", ".pyc", ".pyd", *importlib.machinery.EXTENSION_SUFFIXES)
+))
 DROP_IN_CONTENT = b"[Service]\nEnvironment=OVERSEER_CODEX_APP_SERVER_DISPATCH=1\n"
 CANONICAL_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 EUID_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
@@ -168,7 +170,7 @@ def _reviewed_source_files() -> tuple[str, ...]:
         if not _is_nonexecutable_cache(item, tracked_sources)
     )
     if untracked:
-        raise ValueError("untracked Python exists in a reviewed source root")
+        raise ValueError("untracked Python or executable import artifact exists in a reviewed source root")
     if not tracked:
         raise ValueError("reviewed Python source inventory is empty")
     return tracked
@@ -980,8 +982,13 @@ def _probe_proxy() -> None:
 
 
 def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None:
-    output = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=Environment", "--value"))
-    assignments = shlex.split(output)
+    output = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=Environment", "--output=json"))
+    environment = json.loads(output)
+    if (not isinstance(environment, dict) or set(environment) != {"Environment"}
+            or not isinstance(environment["Environment"], list)
+            or any(not isinstance(item, str) for item in environment["Environment"])):
+        raise ValueError("Overseer effective environment output contract is invalid")
+    assignments = environment["Environment"]
     matches = [item for item in assignments if item.startswith("OVERSEER_CODEX_APP_SERVER_DISPATCH=")]
     if matches != ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]:
         raise ValueError("Overseer service environment does not contain exactly one correct dispatch flag")
@@ -991,15 +998,18 @@ def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None
             "--auth-token-file", str(SERVICE_TOKEN),
         )
         expected = _isolated_launcher_command(spec, "service", service_payload)
-        effective = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=ExecStart", "--value"))
-        position = 0
-        for argument in expected:
-            found = effective.find(argument, position)
-            if found < 0:
-                raise ValueError("Overseer effective ExecStart is not the exact isolated launcher binding")
-            position = found + len(argument)
-        if " -m overseer.cli " in effective:
-            raise ValueError("Overseer effective ExecStart retains the non-isolated service entry")
+        output = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=ExecStart", "--output=json"))
+        effective = json.loads(output)
+        if (not isinstance(effective, dict) or set(effective) != {"ExecStart"}
+                or not isinstance(effective["ExecStart"], list) or len(effective["ExecStart"]) != 1):
+            raise ValueError("Overseer effective ExecStart output contract is invalid")
+        command = effective["ExecStart"][0]
+        if (not isinstance(command, dict)
+                or set(command) != {"path", "argv", "ignore_errors"}
+                or command["path"] != expected[0]
+                or command["argv"] != list(expected)
+                or command["ignore_errors"] is not False):
+            raise ValueError("Overseer effective ExecStart is not the exact isolated launcher binding")
 
 
 def _publish_drop_in_noreplace(drop_in: Path, content: bytes = DROP_IN_CONTENT) -> None:
@@ -1411,14 +1421,17 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             _revalidate_journal_drop_in(plan_id, digest, spec)
             _run_checked(("systemctl", "--user", "daemon-reload"))
             _revalidate_journal_drop_in(plan_id, digest, spec)
+            _verify_environment(spec)
             journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
             journal["phase"] = "reloaded"
             _write_journal(journal)
             return 0, "user systemd reloaded", ""
         if operation == "restart-overseer":
             _revalidate_journal_drop_in(plan_id, digest, spec)
+            _verify_environment(spec)
             _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
             _revalidate_journal_drop_in(plan_id, digest, spec)
+            _verify_environment(spec)
             journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
             journal["phase"] = "restarted"
             _write_journal(journal)

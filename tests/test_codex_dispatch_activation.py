@@ -114,6 +114,19 @@ def test_reviewed_source_inventory_rejects_untracked_python_but_allows_unrelated
         activation._reviewed_source_files()
 
 
+def test_reviewed_source_inventory_rejects_untracked_native_extension(monkeypatch: pytest.MonkeyPatch):
+    tracked = "src/overseer/a.py\nsrc/overseer_codex_dispatch_launcher.py\n"
+
+    def git(command):
+        if "--others" in command:
+            return "src/overseer/injected.cpython-313-x86_64-linux-gnu.so"
+        return tracked
+
+    monkeypatch.setattr(activation, "_git", git)
+    with pytest.raises(ValueError, match="executable import artifact"):
+        activation._reviewed_source_files()
+
+
 def test_reviewed_source_inventory_covers_preimport_python_anywhere_under_src(monkeypatch: pytest.MonkeyPatch):
     calls: list[tuple[str, ...]] = []
 
@@ -490,26 +503,32 @@ def test_journal_secure_read_rejects_symlink_and_unknown_enums(tmp_path: Path, m
 
 
 def test_environment_verification_preserves_existing_variables(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "PATH=/usr/bin OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OTHER=ok")
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: json.dumps(
+        {"Environment": ["PATH=/usr/bin", "OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OTHER=ok"]}
+    ))
     activation._verify_environment()
-    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OVERSEER_CODEX_APP_SERVER_DISPATCH=1")
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: json.dumps(
+        {"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]}
+    ))
     with pytest.raises(ValueError, match="exactly one"):
         activation._verify_environment()
 
 
 def test_environment_verification_requires_effective_isolated_execstart(monkeypatch: pytest.MonkeyPatch):
     spec = _spec()
-    command = " ".join(activation._systemd_quote(item) for item in activation._isolated_launcher_command(
+    command = activation._isolated_launcher_command(
         spec,
         "service",
         (
             "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(activation.SERVICE_TOKEN),
         ),
-    ))
+    )
 
     def checked(command_args, **_kwargs):
-        return command if any("ExecStart" in item for item in command_args) else "OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OTHER=ok"
+        if any("ExecStart" in item for item in command_args):
+            return json.dumps({"ExecStart": [{"path": command[0], "argv": list(command), "ignore_errors": False}]})
+        return json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OTHER=ok"]})
 
     monkeypatch.setattr(activation, "_run_checked", checked)
     activation._verify_environment(spec)
@@ -517,12 +536,67 @@ def test_environment_verification_requires_effective_isolated_execstart(monkeypa
         activation,
         "_run_checked",
         lambda command_args, **_kwargs: (
-            "/usr/bin/python3 -m overseer.cli serve-api" if any("ExecStart" in item for item in command_args)
-            else "OVERSEER_CODEX_APP_SERVER_DISPATCH=1"
+            json.dumps({"ExecStart": [{"path": "/usr/bin/python3", "argv": ["/usr/bin/python3", "-m", "overseer.cli"], "ignore_errors": False}]})
+            if any("ExecStart" in item for item in command_args)
+            else json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]})
         ),
     )
     with pytest.raises(ValueError, match="ExecStart"):
         activation._verify_environment(spec)
+
+
+def test_environment_verification_rejects_wrapper_containing_expected_tokens(monkeypatch: pytest.MonkeyPatch):
+    spec = _spec()
+    expected = activation._isolated_launcher_command(
+        spec,
+        "service",
+        (
+            "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+            "--auth-token-file", str(activation.SERVICE_TOKEN),
+        ),
+    )
+
+    def checked(command_args, **_kwargs):
+        if any("ExecStart" in item for item in command_args):
+            evil = ["/bin/sh", "-c", " ".join(expected)]
+            return json.dumps({"ExecStart": [{"path": "/bin/sh", "argv": evil, "ignore_errors": False}]})
+        return json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]})
+
+    monkeypatch.setattr(activation, "_run_checked", checked)
+    with pytest.raises(ValueError, match="ExecStart"):
+        activation._verify_environment(spec)
+
+
+def test_restart_rejects_alternate_effective_execstart_before_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    spec = _spec()
+    expected = activation._isolated_launcher_command(
+        spec,
+        "service",
+        (
+            "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+            "--auth-token-file", str(activation.SERVICE_TOKEN),
+        ),
+    )
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(activation, "_revalidate_journal_drop_in", lambda *_args: None)
+    calls: list[tuple[str, ...]] = []
+
+    def checked(command_args, **_kwargs):
+        calls.append(tuple(command_args))
+        if any("ExecStart" in item for item in command_args):
+            return json.dumps({"ExecStart": [{
+                "path": "/bin/sh", "argv": ["/bin/sh", "-c", " ".join(expected)], "ignore_errors": False,
+            }]})
+        return json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]})
+
+    monkeypatch.setattr(activation, "_run_checked", checked)
+    code, _, error = execute_codex_dispatch_activation_marker(plan.steps[4].command)
+    assert code == 1
+    assert "ExecStart" in error
+    assert ("systemctl", "--user", "restart", activation.SERVICE_NAME) not in calls
 
 
 def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

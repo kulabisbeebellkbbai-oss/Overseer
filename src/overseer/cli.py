@@ -56,7 +56,6 @@ from .psychlo_cycle_activation import (
 )
 from .codex_dispatch_activation import (
     CodexDispatchActivationSpec,
-    SERVICE_NAME,
     build_codex_dispatch_activation_spec,
     execute_codex_dispatch_activation_marker,
     plan_codex_dispatch_activation,

@@ -122,12 +122,29 @@ def test_execute_fences_delivery_and_persists_terminal_non_result(tmp_path):
     assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
     assert bridge.store.legacy_abandonment(result["actionId"])["state"] == "completed"
     assert bridge._test_sent[0][0] == "round-legacy-abandon"
-    assert set(bridge._test_sent[0][2]) == {"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "reason", "occurredAt"}
+    assert set(bridge._test_sent[0][2]) == {"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId", "reason", "occurredAt"}
     wire = bridge._test_sent[0][2]
     assert wire["schemaVersion"] == "psychlo.legacy-round-abandon.v1"
+    assert {key: wire[key] for key in ("successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId")} == {"successorPlanId": "arcade-plan-2", "successorPlanVersion": "2.0", "successorConversationId": "new-conversation", "successorThreadId": "new-thread"}
     assert wire["actionDigest"] == canonical_digest({key: value for key, value in wire.items() if key != "actionDigest"})
     replay = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
     assert replay["replay"] is True
+
+
+def test_signed_wire_successor_identity_cannot_be_substituted(tmp_path):
+    bridge, primary = _runtime(tmp_path)
+    staged = _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    intent = bridge.store.legacy_abandonment(staged["actionId"])
+    payload = intent["payload"]
+    payload["wire"]["successorConversationId"] = "substituted-conversation"
+    bridge.store.connection.execute(
+        "UPDATE legacy_abandonment_intents SET payload_json=? WHERE action_id=?",
+        (json.dumps(payload, separators=(",", ":")), staged["actionId"]),
+    )
+    with pytest.raises(LegacyAbandonmentError, match="wire binding changed"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
 
 
 def test_wire_is_accepted_by_psychlo_contract_parser(tmp_path):
@@ -153,7 +170,7 @@ def test_wire_is_accepted_by_psychlo_contract_parser(tmp_path):
     fixture_action = local_fixture["action"]
     fixture_body = {key: value for key, value in fixture_action.items() if key != "actionDigest"}
     assert json.dumps(fixture_body, sort_keys=True, separators=(",", ":")) == local_fixture["canonicalActionBody"]
-    assert canonical_digest(fixture_body) == "f11c897d6c7d61ff4935891a8538c8f6bd95301807916997678495691f6eb4d8"
+    assert canonical_digest(fixture_body) == "d03a56210541ffb2307dbabba647fe80ef71bef8682b8b0795225b1c761fa56c"
     script = """
 const { parseLegacyRoundAbandonment } = await import(process.argv[1]);
 let body = '';

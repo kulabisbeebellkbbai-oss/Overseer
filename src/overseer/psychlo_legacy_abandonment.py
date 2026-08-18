@@ -188,7 +188,7 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version, "conversationId": original_conversation_id, "threadId": original_thread_id},
         "successorPlan": dict(successor), "observationPlanId": observation_plan_id, "reason": REASON,
     }
-    wire_body = {"schemaVersion": SCHEMA, "actionId": action_id, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "reason": REASON, "occurredAt": _now(bridge)}
+    wire_body = {"schemaVersion": SCHEMA, "actionId": action_id, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "successorPlanId": successor["successorPlanId"], "successorPlanVersion": successor["successorPlanVersion"], "successorConversationId": successor["successorConversationId"], "successorThreadId": successor["successorThreadId"], "reason": REASON, "occurredAt": _now(bridge)}
     action_digest = canonical_digest(wire_body)
     action["actionDigest"] = action_digest
     wire = {**wire_body, "actionDigest": action_digest}
@@ -253,7 +253,7 @@ def _action_core(value: Mapping[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key not in {"actionDigest", "wire", "planDigest", "planId"}}
 
 
-_WIRE_KEYS = frozenset({"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "reason", "occurredAt"})
+_WIRE_KEYS = frozenset({"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId", "reason", "occurredAt"})
 _RESPONSE_KEYS = frozenset({"accepted", "actionId", "actionDigest", "roundId", "requestDigest", "status"})
 _SENDER_RESPONSE_KEYS = _RESPONSE_KEYS | {"status_code"}
 _ABANDONMENT_HTTP_STATUS = 202
@@ -276,6 +276,10 @@ def _validate_wire(wire: Any, action: Mapping[str, Any]) -> dict[str, Any]:
         or wire.get("planVersion") != action.get("originalPlan", {}).get("planVersion")
         or wire.get("observationId") != action.get("observationId")
         or wire.get("observationDigest") != action.get("observationDigest")
+        or wire.get("successorPlanId") != action.get("successorPlan", {}).get("successorPlanId")
+        or wire.get("successorPlanVersion") != action.get("successorPlan", {}).get("successorPlanVersion")
+        or wire.get("successorConversationId") != action.get("successorPlan", {}).get("successorConversationId")
+        or wire.get("successorThreadId") != action.get("successorPlan", {}).get("successorThreadId")
     ):
         raise LegacyAbandonmentError("legacy abandonment wire binding changed")
     _timestamp(str(wire.get("occurredAt")))

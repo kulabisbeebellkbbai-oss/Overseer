@@ -2,11 +2,11 @@
   "schemaVersion": "psychlo.overseer-peer-fixtures.v1",
   "legacyRoundAbandonment": {
     "producer": "overseer.psychlo_legacy_abandonment",
-    "canonicalActionBody": "{\"actionId\":\"legacy-abandonment:fixture-round\",\"observationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"observationId\":\"fixture-observation\",\"occurredAt\":\"2026-08-17T12:00:00.000Z\",\"planId\":\"fixture-plan\",\"planVersion\":\"v1\",\"projectId\":\"fixture-project\",\"reason\":\"ambiguous-submitted-delivery\",\"requestDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"roundId\":\"fixture-round\",\"schemaVersion\":\"psychlo.legacy-round-abandon.v1\"}",
+    "canonicalActionBody": "{\"actionId\":\"legacy-abandonment:fixture-round\",\"observationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"observationId\":\"fixture-observation\",\"occurredAt\":\"2026-08-17T12:00:00.000Z\",\"planId\":\"fixture-plan\",\"planVersion\":\"v1\",\"projectId\":\"fixture-project\",\"reason\":\"ambiguous-submitted-delivery\",\"requestDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"roundId\":\"fixture-round\",\"schemaVersion\":\"psychlo.legacy-round-abandon.v1\",\"successorConversationId\":\"fixture-successor-conversation\",\"successorPlanId\":\"fixture-successor-plan\",\"successorPlanVersion\":\"v2\",\"successorThreadId\":\"fixture-successor-thread\"}",
     "action": {
       "schemaVersion": "psychlo.legacy-round-abandon.v1",
       "actionId": "legacy-abandonment:fixture-round",
-      "actionDigest": "f11c897d6c7d61ff4935891a8538c8f6bd95301807916997678495691f6eb4d8",
+      "actionDigest": "d03a56210541ffb2307dbabba647fe80ef71bef8682b8b0795225b1c761fa56c",
       "roundId": "fixture-round",
       "projectId": "fixture-project",
       "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -14,6 +14,10 @@
       "planVersion": "v1",
       "observationId": "fixture-observation",
       "observationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "successorPlanId": "fixture-successor-plan",
+      "successorPlanVersion": "v2",
+      "successorConversationId": "fixture-successor-conversation",
+      "successorThreadId": "fixture-successor-thread",
       "reason": "ambiguous-submitted-delivery",
       "occurredAt": "2026-08-17T12:00:00.000Z"
     }

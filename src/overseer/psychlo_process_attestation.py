@@ -781,7 +781,11 @@ class AuthoritativeProcessEvidenceCollector:
         if not callable(canonical):
             raise ProcessAttestationError("canonical project registry process identity is required")
         try:
-            process_binding = canonical(lead_id)
+            # The round's immutable delivery binding is authoritative for
+            # this historical observation.  The request's threadId may be a
+            # stale successor/producer identity and must never select the
+            # process or rollout inspected here.
+            process_binding = canonical(lead_id, conversation_id=binding["conversationId"])
         except Exception as error:
             raise ProcessAttestationError("canonical project registry process identity is unavailable") from error
         required_process = {"conversationId", "sessionId", "workspace", "command", "launcher", "workspaceDev", "workspaceIno", "launcherDev", "launcherIno", "launcherDigest", "registryPath"}
@@ -803,14 +807,13 @@ class AuthoritativeProcessEvidenceCollector:
             raise ProcessAttestationError("Codex child is not bound to the pane process")
         prompt = self.bridge._round_prompt(request, capability)
         scanner = self.bridge.dispatcher.scan_rollout
-        if scanner(lead_id, prompt) is not False:
-            raise ProcessAttestationError("rollout scan is not an authoritative strict negative result")
-        scan = _require_negative_rollout(self.bridge.dispatcher.binding_provenance(lead_id), binding)
+        binding_loader = self.bridge.dispatcher.binding_provenance
+        scan = _collect_bound_rollout_evidence(scanner, binding_loader, lead_id, prompt, binding)
         source = capture_source_identity(self.source_root)
         # Re-read the mutable sources before returning the manifest.  The
         # recording caller performs one more full collect immediately before
         # the CAS insert, so this is not a caller-authored snapshot.
-        if scanner(lead_id, prompt) is not False or _require_negative_rollout(self.bridge.dispatcher.binding_provenance(lead_id), binding) != scan:
+        if _collect_bound_rollout_evidence(scanner, binding_loader, lead_id, prompt, binding) != scan:
             raise ProcessAttestationError("rollout evidence changed during collection")
         if capture_tmux_identity(self.tmux_socket, self.tmux_target, expected_start_command=expected_start) != tmux:
             raise ProcessAttestationError("tmux identity changed during collection")
@@ -949,17 +952,56 @@ def _atomic_private_write(path: Path, content: bytes) -> None:
 
 
 def _require_negative_rollout(value: Any, binding: Mapping[str, Any]) -> dict[str, Any]:
-    """Accept only the driver's exact negative scan and binding identity."""
-    if not isinstance(value, Mapping) or value.get("found") is not False:
-        raise ProcessAttestationError("rollout scan is not an authoritative negative result")
+    """Accept only an exact negative scan and immutable binding identity."""
     required = {"found", "conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno"}
-    if set(value) != required or value.get("conversationId") != binding.get("conversationId") or value.get("sessionId") != binding.get("sessionId") or value.get("rolloutPathDigest") != binding.get("rolloutPathDigest") or value.get("rolloutDev") != binding.get("rolloutDev") or value.get("rolloutIno") != binding.get("rolloutIno"):
+    if not isinstance(value, Mapping) or set(value) != required or value.get("found") is not False:
+        raise ProcessAttestationError("rollout scan is not an authoritative negative result")
+    if any(value.get(field) != binding.get(field) for field in ("conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno")):
         raise ProcessAttestationError("rollout scan binding identity is not exact")
     if not isinstance(value["rolloutPathDigest"], str) or not _HEX64.fullmatch(value["rolloutPathDigest"]):
         raise ProcessAttestationError("rollout scan digest is invalid")
     if isinstance(value["rolloutDev"], bool) or not isinstance(value["rolloutDev"], int) or value["rolloutDev"] <= 0 or isinstance(value["rolloutIno"], bool) or not isinstance(value["rolloutIno"], int) or value["rolloutIno"] <= 0:
         raise ProcessAttestationError("rollout scan file identity is invalid")
     return dict(value)
+
+
+def _collect_bound_rollout_evidence(
+    scanner: Any,
+    binding_loader: Any,
+    lead_id: str,
+    prompt: str,
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Collect one exact negative rollout result for the stored delivery.
+
+    New Codex drivers return the complete, closed scan envelope.  A legacy
+    driver may still return only ``False``; that value is admitted only after
+    an independently fetched, exact binding provenance result proves the
+    same immutable round binding.  Both calls are explicitly routed to the
+    delivery conversation, never to ``request.threadId``.
+    """
+    conversation_id = binding.get("conversationId")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise ProcessAttestationError("rollout delivery conversation identity is missing")
+    try:
+        value = scanner(lead_id, prompt, conversation_id=conversation_id)
+        provenance = binding_loader(lead_id, conversation_id=conversation_id)
+    except Exception as error:
+        raise ProcessAttestationError("authoritative rollout evidence is unavailable") from error
+
+    if isinstance(value, bool):
+        if value is not False:
+            raise ProcessAttestationError("rollout scan is not an authoritative strict negative result")
+        if isinstance(provenance, Mapping) and set(provenance) == {"conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno"}:
+            provenance = {"found": False, **dict(provenance)}
+        return _require_negative_rollout(provenance, binding)
+
+    scan = _require_negative_rollout(value, binding)
+    if isinstance(provenance, Mapping) and set(provenance) == {"conversationId", "sessionId", "rolloutPathDigest", "rolloutDev", "rolloutIno"}:
+        provenance = {"found": False, **dict(provenance)}
+    if _require_negative_rollout(provenance, binding) != scan:
+        raise ProcessAttestationError("rollout scan and binding provenance differ")
+    return scan
 
 
 def capture_source_identity(source_root: str | Path) -> dict[str, str]:

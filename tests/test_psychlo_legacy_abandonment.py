@@ -26,6 +26,7 @@ from tests.test_psychlo_process_attestation_v2 import _manifest as _process_mani
 
 NOW = "2099-01-01T00:00:10+00:00"
 ENVELOPE_SCHEMA = "overseer.psychlo.legacy-round-abandon-envelope.v1"
+ENVELOPE_SCHEMA_V2 = "overseer.psychlo.legacy-round-abandon-envelope.v2"
 
 
 def _payload_action(payload):
@@ -77,6 +78,80 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW, request_thre
 
 def _stage(bridge):
     return stage_legacy_abandonment(bridge=bridge, plan_id="abandon-plan", observation_plan_id="observation-plan", round_id="round-arcade", successor_plan_id="arcade-plan-2", successor_plan_version="2.0", successor_conversation_id="new-conversation", successor_thread_id="new-thread")
+
+
+def _stage_v2(bridge):
+    return stage_legacy_abandonment(bridge=bridge, plan_id="abandon-plan", observation_plan_id="observation-plan", round_id="round-arcade", successor_plan_id="arcade-plan-2", successor_plan_version="2.0", successor_conversation_id="new-conversation", successor_thread_id="new-thread", delivery_conversation_id="old-conversation")
+
+
+def test_v2_historical_misbinding_freezes_both_thread_identities_and_replays_exact_envelope(tmp_path):
+    bridge, primary = _runtime(tmp_path, request_thread_id="requested-thread")
+    binding_before = bridge.store.round_binding("round-arcade")
+    staged = _stage_v2(bridge)
+    intent = bridge.store.legacy_abandonment(staged["actionId"])
+    action = intent["payload"]
+    plan = primary.load_admin_change_plan("abandon-plan")
+    metadata = plan.adapter_metadata["legacy_abandonment"]
+    assert action["requestedThreadId"] == "requested-thread"
+    assert action["deliveryConversationId"] == "old-conversation"
+    assert action["originalPlan"]["conversationId"] == "old-conversation"
+    assert action["originalPlan"]["threadId"] == "requested-thread"
+    assert metadata["requestedThreadId"] == "requested-thread"
+    assert metadata["deliveryConversationId"] == "old-conversation"
+    assert metadata["bindingDigest"] == action["delivery"]["bindingDigest"]
+    assert metadata["promptDigest"] == action["delivery"]["promptDigest"]
+    assert bridge.store.round_binding("round-arcade") == binding_before
+
+    primary.save_admin_change_plan(approve_admin_change_plan(plan, "sisko", NOW))
+    execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    envelope = bridge._test_sent[0][2]
+    assert set(envelope) == {"schemaVersion", "action", "requestedThreadId", "deliveryConversationId"}
+    assert envelope["schemaVersion"] == ENVELOPE_SCHEMA_V2
+    assert envelope["requestedThreadId"] == "requested-thread"
+    assert envelope["deliveryConversationId"] == "old-conversation"
+    assert envelope["action"] == action["wire"]
+    replay = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert replay["replay"] is True
+    assert len(bridge._test_sent) == 1
+    assert bridge.store.round_binding("round-arcade") == binding_before
+
+
+def test_v2_historical_misbinding_requires_the_immutable_delivery_binding(tmp_path):
+    bridge, _primary = _runtime(tmp_path, request_thread_id="requested-thread")
+    with pytest.raises(LegacyAbandonmentError, match="delivery conversation.*binding"):
+        stage_legacy_abandonment(
+            bridge=bridge, plan_id="abandon-plan", observation_plan_id="observation-plan",
+            round_id="round-arcade", successor_plan_id="arcade-plan-2",
+            successor_plan_version="2.0", successor_conversation_id="new-conversation",
+            successor_thread_id="new-thread", delivery_conversation_id="arbitrary-conversation",
+        )
+
+
+def test_v2_historical_misbinding_is_only_stageable_for_submitted_delivery(tmp_path):
+    bridge, _primary = _runtime(tmp_path, request_thread_id="requested-thread")
+    bridge.store.connection.execute(
+        "UPDATE round_prompt_deliveries SET phase='prepared' WHERE round_id=?",
+        ("round-arcade",),
+    )
+    with pytest.raises(LegacyAbandonmentError, match="submitted prompt delivery"):
+        _stage_v2(bridge)
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2") is None
+
+
+def test_v2_historical_misbinding_rejects_tampered_frozen_identity_before_send(tmp_path):
+    bridge, primary = _runtime(tmp_path, request_thread_id="requested-thread")
+    staged = _stage_v2(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    intent = bridge.store.legacy_abandonment(staged["actionId"])
+    payload = intent["payload"]
+    payload["requestedThreadId"] = "attacker-thread"
+    bridge.store.connection.execute(
+        "UPDATE legacy_abandonment_intents SET payload_json=? WHERE action_id=?",
+        (json.dumps(payload, separators=(",", ":")), staged["actionId"]),
+    )
+    with pytest.raises(LegacyAbandonmentError, match="plan or action identity changed"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
 
 
 def test_stage_is_high_human_sisko_and_non_executable(tmp_path):

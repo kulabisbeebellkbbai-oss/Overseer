@@ -24,6 +24,7 @@ from .psychlo_process_attestation import SCHEMA as PROCESS_OBSERVATION_SCHEMA, _
 
 SCHEMA = "psychlo.legacy-round-abandon.v1"
 ENVELOPE_SCHEMA = "overseer.psychlo.legacy-round-abandon-envelope.v1"
+ENVELOPE_SCHEMA_V2 = "overseer.psychlo.legacy-round-abandon-envelope.v2"
 REASON = "ambiguous-submitted-delivery"
 STATUS = "legacy-abandoned-uncertain"
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
@@ -134,7 +135,7 @@ def _strict_source_observation(primary: Any, round_id: str, observation_plan_id:
     }, source_plan, manifest)
 
 
-def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str, successor: Mapping[str, str], *, allow_existing_abandonment: bool = False, allow_fence: bool = False) -> tuple[dict[str, Any], AdminChangePlan]:
+def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str, successor: Mapping[str, str], *, allow_existing_abandonment: bool = False, allow_fence: bool = False, delivery_conversation_id: str | None = None) -> tuple[dict[str, Any], AdminChangePlan]:
     observation, source_plan, manifest = _strict_source_observation(primary, round_id, observation_plan_id)
     observation_digest = _digest(observation.get("observationDigest"), "observation digest")
     observation_plan_digest = _digest(observation.get("planDigest"), "observation plan digest")
@@ -171,12 +172,23 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     original_plan_id = _id(request.get("planId"), "original plan id")
     original_plan_version = _id(request.get("planVersion"), "original plan version")
     original_conversation_id = _id(binding.get("conversationId"), "original conversation id")
-    if "threadId" in request:
-        original_thread_id = _id(request.get("threadId"), "original thread id")
-        if original_thread_id != original_conversation_id:
+    requested_thread_id = _id(request.get("threadId"), "original thread id") if "threadId" in request else None
+    if delivery_conversation_id is None:
+        if requested_thread_id is not None and requested_thread_id != original_conversation_id:
             raise LegacyAbandonmentError("original thread id does not match immutable binding")
+        original_thread_id = requested_thread_id or original_conversation_id
     else:
-        original_thread_id = original_conversation_id
+        delivery_conversation_id = _id(delivery_conversation_id, "delivery conversation id")
+        if requested_thread_id is None:
+            raise LegacyAbandonmentError("historical misbinding requires a stored request thread id")
+        if requested_thread_id == original_conversation_id:
+            raise LegacyAbandonmentError("historical misbinding requires a request thread distinct from binding")
+        if delivery_conversation_id != original_conversation_id:
+            raise LegacyAbandonmentError("delivery conversation does not match immutable binding")
+        delivery_binding = delivery.get("binding")
+        if not isinstance(delivery_binding, Mapping) or delivery_binding.get("conversationId") != delivery_conversation_id:
+            raise LegacyAbandonmentError("delivery conversation does not match immutable delivery binding")
+        original_thread_id = requested_thread_id
     for name in ("successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId"):
         _id(successor.get(name), name)
     if (successor["successorPlanId"] == original_plan_id
@@ -194,6 +206,11 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version, "conversationId": original_conversation_id, "threadId": original_thread_id},
         "successorPlan": dict(successor), "observationPlanId": observation_plan_id, "reason": REASON,
     }
+    if delivery_conversation_id is not None:
+        action.update({
+            "requestedThreadId": requested_thread_id,
+            "deliveryConversationId": delivery_conversation_id,
+        })
     wire_body = {"schemaVersion": SCHEMA, "actionId": action_id, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "successorPlanId": successor["successorPlanId"], "successorPlanVersion": successor["successorPlanVersion"], "successorConversationId": successor["successorConversationId"], "successorThreadId": successor["successorThreadId"], "reason": REASON, "occurredAt": _now(bridge)}
     action_digest = canonical_digest(wire_body)
     action["actionDigest"] = action_digest
@@ -202,7 +219,7 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     return action, source_plan
 
 
-def stage_legacy_abandonment(*, bridge: Any, plan_id: str, observation_plan_id: str, round_id: str, successor_plan_id: str, successor_plan_version: str, successor_conversation_id: str, successor_thread_id: str) -> dict[str, Any]:
+def stage_legacy_abandonment(*, bridge: Any, plan_id: str, observation_plan_id: str, round_id: str, successor_plan_id: str, successor_plan_version: str, successor_conversation_id: str, successor_thread_id: str, delivery_conversation_id: str | None = None) -> dict[str, Any]:
     """Stage one non-executable authority plan and bridge outbox intent."""
     primary = _primary(bridge)
     successor = {"successorPlanId": successor_plan_id, "successorPlanVersion": successor_plan_version, "successorConversationId": successor_conversation_id, "successorThreadId": successor_thread_id}
@@ -212,10 +229,20 @@ def stage_legacy_abandonment(*, bridge: Any, plan_id: str, observation_plan_id: 
         bridge, primary, round_id, observation_plan_id, successor,
         allow_existing_abandonment=existing_intent is not None,
         allow_fence=bool(existing_intent and existing_intent["state"] == "peer-pending"),
+        delivery_conversation_id=delivery_conversation_id,
     )
     metadata = action
+    plan_kwargs = {}
+    if "requestedThreadId" in action or "deliveryConversationId" in action:
+        plan_kwargs = {
+            "requested_thread_id": action.get("requestedThreadId"),
+            "delivery_conversation_id": action.get("deliveryConversationId"),
+            "binding_digest": action["delivery"]["bindingDigest"],
+            "prompt_digest": action["delivery"]["promptDigest"],
+            "project_id": action["projectId"],
+        }
     plan = plan_psychlo_legacy_abandonment(
-        plan_id, round_id, action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], successor_plan_id, successor_plan_version, successor_conversation_id, successor_thread_id,
+        plan_id, round_id, action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], successor_plan_id, successor_plan_version, successor_conversation_id, successor_thread_id, **plan_kwargs,
     )
     metadata["planId"] = plan_id
     metadata["planDigest"] = _immutable_plan_digest(plan)
@@ -252,7 +279,16 @@ def _plan_exists(primary: Any, plan_id: str) -> bool:
 
 
 def _expected_plan(action: Mapping[str, Any], plan_id: str) -> AdminChangePlan:
-    return plan_psychlo_legacy_abandonment(plan_id, action["roundId"], action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], action["successorPlan"]["successorPlanId"], action["successorPlan"]["successorPlanVersion"], action["successorPlan"]["successorConversationId"], action["successorPlan"]["successorThreadId"])
+    plan_kwargs = {}
+    if "requestedThreadId" in action or "deliveryConversationId" in action:
+        plan_kwargs = {
+            "requested_thread_id": action.get("requestedThreadId"),
+            "delivery_conversation_id": action.get("deliveryConversationId"),
+            "binding_digest": action["delivery"]["bindingDigest"],
+            "prompt_digest": action["delivery"]["promptDigest"],
+            "project_id": action["projectId"],
+        }
+    return plan_psychlo_legacy_abandonment(plan_id, action["roundId"], action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], action["successorPlan"]["successorPlanId"], action["successorPlan"]["successorPlanVersion"], action["successorPlan"]["successorConversationId"], action["successorPlan"]["successorThreadId"], **plan_kwargs)
 
 
 def _action_core(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -313,6 +349,31 @@ def _transport_envelope(
     )
     if original_conversation_id != current_conversation_id or original_conversation_id != approved_conversation_id:
         raise LegacyAbandonmentError("transport original conversation identity changed")
+    has_v2_fields = "requestedThreadId" in action or "deliveryConversationId" in action
+    if has_v2_fields:
+        if not {"requestedThreadId", "deliveryConversationId"}.issubset(action):
+            raise LegacyAbandonmentError("historical misbinding envelope identities are incomplete")
+        requested_thread_id = _id(action.get("requestedThreadId"), "requested thread id")
+        delivery_conversation_id = _id(action.get("deliveryConversationId"), "delivery conversation id")
+        current_requested_thread_id = _id(current_action.get("requestedThreadId"), "current requested thread id")
+        current_delivery_conversation_id = _id(current_action.get("deliveryConversationId"), "current delivery conversation id")
+        approved_requested_thread_id = _id(metadata.get("requestedThreadId") if isinstance(metadata, Mapping) else None, "approved requested thread id")
+        approved_delivery_conversation_id = _id(metadata.get("deliveryConversationId") if isinstance(metadata, Mapping) else None, "approved delivery conversation id")
+        if (
+            requested_thread_id == delivery_conversation_id
+            or requested_thread_id != current_requested_thread_id
+            or delivery_conversation_id != current_delivery_conversation_id
+            or delivery_conversation_id != original_conversation_id
+            or requested_thread_id != approved_requested_thread_id
+            or delivery_conversation_id != approved_delivery_conversation_id
+        ):
+            raise LegacyAbandonmentError("historical misbinding envelope identity changed")
+        return {
+            "schemaVersion": ENVELOPE_SCHEMA_V2,
+            "action": dict(wire),
+            "requestedThreadId": requested_thread_id,
+            "deliveryConversationId": delivery_conversation_id,
+        }
     return {
         "schemaVersion": ENVELOPE_SCHEMA,
         "action": dict(wire),
@@ -383,7 +444,7 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
             plan_id, action_id, intent["actionDigest"], completed_at=_now(bridge),
         )
         return {"accepted": True, "replay": True, "status": STATUS, "receipt": intent["receipt"], "actionId": action_id}
-    current_action, _ = _snapshot(bridge, primary, plan.target, action["observationPlanId"], action["successorPlan"], allow_existing_abandonment=True, allow_fence=intent["state"] == "peer-pending")
+    current_action, _ = _snapshot(bridge, primary, plan.target, action["observationPlanId"], action["successorPlan"], allow_existing_abandonment=True, allow_fence=intent["state"] == "peer-pending", delivery_conversation_id=action.get("deliveryConversationId"))
     if _action_core(current_action) != _action_core(action):
         raise LegacyAbandonmentError("current bridge or observation identity differs from staged action")
     envelope = _transport_envelope(action, current_action, plan, wire)

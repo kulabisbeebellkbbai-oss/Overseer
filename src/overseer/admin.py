@@ -503,6 +503,12 @@ def plan_psychlo_legacy_abandonment(
     successor_conversation_id: str,
     successor_thread_id: str,
     reason: str = "authorize one exact ambiguous submitted delivery abandonment",
+    *,
+    requested_thread_id: str | None = None,
+    delivery_conversation_id: str | None = None,
+    binding_digest: str | None = None,
+    prompt_digest: str | None = None,
+    project_id: str | None = None,
 ) -> AdminChangePlan:
     """Create high-risk Sisko/HUMAN authority for one typed legacy abandonment.
 
@@ -524,6 +530,14 @@ def plan_psychlo_legacy_abandonment(
                         ("requestDigest", request_digest), ("capabilityHash", capability_hash), ("deliveryDigest", delivery_digest)):
         if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
             raise ValueError(f"legacy abandonment {name} is invalid")
+    v2_values = (requested_thread_id, delivery_conversation_id, binding_digest, prompt_digest, project_id)
+    if any(value is not None for value in v2_values) and not all(isinstance(value, str) and value.strip() for value in v2_values):
+        raise ValueError("historical misbinding identities must be complete")
+    for name, value in (("bindingDigest", binding_digest), ("promptDigest", prompt_digest)):
+        if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError(f"legacy abandonment {name} is invalid")
+    if requested_thread_id is not None and requested_thread_id == delivery_conversation_id:
+        raise ValueError("historical misbinding thread and delivery conversation must be distinct")
     metadata = {
         "legacy_abandonment": {
             "roundId": round_id, "observationId": observation_id,
@@ -537,6 +551,15 @@ def plan_psychlo_legacy_abandonment(
             "reason": "ambiguous-submitted-delivery",
         }
     }
+    if requested_thread_id is not None:
+        metadata["legacy_abandonment"].update({
+            "projectId": project_id,
+            "requestedThreadId": requested_thread_id,
+            "deliveryConversationId": delivery_conversation_id,
+            "bindingDigest": binding_digest,
+            "promptDigest": prompt_digest,
+            "envelopeSchema": "overseer.psychlo.legacy-round-abandon-envelope.v2",
+        })
     return AdminChangePlan(
         id=plan_id,
         kind=AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT,

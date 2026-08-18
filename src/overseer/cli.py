@@ -54,6 +54,14 @@ from .psychlo_cycle_activation import (
     plan_psychlo_recurring_cycle_activation,
     psychlo_cycle_activation_spec_from_private_file,
 )
+from .codex_dispatch_activation import (
+    SERVICE_NAME,
+    CodexDispatchActivationSpec,
+    codex_dispatch_activation_spec_from_private_file,
+    execute_codex_dispatch_activation_marker,
+    plan_codex_dispatch_activation,
+    validate_codex_dispatch_activation_plan,
+)
 from .config import SECRET_KEY_PARTS, load_config, seed_store_from_config
 from .codex_projects import CodexProjectThreadAdapter, codex_project_thread_resources
 from .agent_adapters.codex import CodexDriver, legacy_codex_session_resource
@@ -4277,6 +4285,7 @@ def plan_admin_change_status(
     filesystem_type: str = "cifs",
     python_venv_spec: dict[str, object] | None = None,
     psychlo_cycle_spec=None,
+    codex_dispatch_spec: CodexDispatchActivationSpec | None = None,
 ) -> dict[str, object]:
     plan_kind = AdminChangeKind(kind)
     if plan_kind == AdminChangeKind.USER_SERVICE_RESTART:
@@ -4341,6 +4350,10 @@ def plan_admin_change_status(
         if psychlo_cycle_spec is None:
             raise ValueError("psychlo_cycle_spec is required for psychlo_recurring_cycle_activation")
         plan = plan_psychlo_recurring_cycle_activation(plan_id, psychlo_cycle_spec, reason, current_state)
+    elif plan_kind == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
+        if codex_dispatch_spec is None:
+            raise ValueError("codex_dispatch_spec is required for codex_app_server_dispatch_activation")
+        plan = plan_codex_dispatch_activation(plan_id, codex_dispatch_spec, reason, current_state)
     else:
         raise ValueError(f"unsupported admin change kind: {kind}")
     status = admin_change_plan_status(plan)
@@ -10704,7 +10717,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--psychlo-cycle-spec",
         help="owner-only JSON manifest for psychlo_recurring_cycle_activation",
     )
+    admin_plan_parser.add_argument(
+        "--codex-dispatch-spec",
+        help="owner-only JSON manifest for codex_app_server_dispatch_activation",
+    )
     admin_plan_parser.add_argument("--use-firewalld", action="store_true", help="stage firewalld-specific firewall_deny_tcp commands")
+    codex_dispatch_stage_parser = subparsers.add_parser(
+        "stage-codex-dispatch-activation",
+        help="stage an approval-gated reviewed Codex app-server dispatch activation",
+    )
+    codex_dispatch_stage_parser.add_argument("--store", required=True)
+    codex_dispatch_stage_parser.add_argument("--plan-id", required=True)
+    codex_dispatch_stage_parser.add_argument("--spec", required=True)
+    codex_dispatch_stage_parser.add_argument("--reason", required=True)
+    codex_dispatch_stage_parser.add_argument("--current-state", default="unknown")
+    codex_dispatch_status_parser = subparsers.add_parser(
+        "codex-dispatch-activation-status",
+        help="read the exact staged Codex dispatch activation plan",
+    )
+    codex_dispatch_status_parser.add_argument("--store", required=True)
+    codex_dispatch_status_parser.add_argument("--plan-id", required=True)
+    codex_dispatch_execute_parser = subparsers.add_parser(
+        "execute-codex-dispatch-activation",
+        help="execute an approved reviewed Codex dispatch activation",
+    )
+    codex_dispatch_execute_parser.add_argument("--store", required=True)
+    codex_dispatch_execute_parser.add_argument("--plan-id", required=True)
+    codex_dispatch_execute_parser.add_argument("--policy-profile")
     auth_required_parser = subparsers.add_parser("authorizations-required", help="list admin plans waiting for explicit approval")
     auth_required_parser.add_argument("--store", required=True, help="explicit SQLite store path")
     approve_admin_parser = subparsers.add_parser("approve-admin-change", help="record approval metadata for an admin change plan")
@@ -12051,6 +12090,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         psychlo_cycle_spec = None
         if args.psychlo_cycle_spec:
             psychlo_cycle_spec = psychlo_cycle_activation_spec_from_private_file(args.psychlo_cycle_spec)
+        codex_dispatch_spec = None
+        if args.codex_dispatch_spec:
+            codex_dispatch_spec = codex_dispatch_activation_spec_from_private_file(args.codex_dispatch_spec)
         print(
             json.dumps(
                 plan_admin_change_status(
@@ -12076,10 +12118,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                     filesystem_type=args.filesystem_type,
                     python_venv_spec=python_venv_spec,
                     psychlo_cycle_spec=psychlo_cycle_spec,
+                    codex_dispatch_spec=codex_dispatch_spec,
                 ),
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "stage-codex-dispatch-activation":
+        spec = codex_dispatch_activation_spec_from_private_file(args.spec)
+        print(
+            json.dumps(
+                plan_admin_change_status(
+                    args.store,
+                    args.plan_id,
+                    AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
+                    SERVICE_NAME,
+                    args.reason,
+                    args.current_state,
+                    codex_dispatch_spec=spec,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "codex-dispatch-activation-status":
+        store = SQLiteStore(args.store)
+        try:
+            plan = store.load_admin_change_plan(args.plan_id)
+            if AdminChangeKind(plan.kind) != AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
+                raise ValueError("admin plan is not a Codex dispatch activation plan")
+            print(json.dumps(admin_change_plan_status(plan), sort_keys=True))
+        finally:
+            store.close()
+        return 0
+
+    if args.command == "execute-codex-dispatch-activation":
+        print(json.dumps(execute_admin_change_status(args.store, args.plan_id, policy_profile_path=args.policy_profile), sort_keys=True))
         return 0
 
     if args.command == "authorizations-required":

@@ -27,6 +27,7 @@ class AdminChangeKind(StrEnum):
     PSYCHLO_LEGACY_ABANDONMENT = "psychlo_legacy_abandonment"
     PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
     PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
+    CODEX_APP_SERVER_DISPATCH_ACTIVATION = "codex_app_server_dispatch_activation"
     USER_SERVICE_RESTART = "user_service_restart"
     APT_INSTALL = "apt_install"
     APT_UPDATE = "apt_update"
@@ -171,6 +172,15 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         authorization_required_before_enable=True,
         approval_plan_required=True,
         supported_commands=(("__overseer_psychlo_cycle_",),),
+    ),
+    AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION: AdminExecutionCapability(
+        kind=AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
+        adapter_name="codex-app-server-dispatch-activation",
+        status=AdminAdapterStatus.DISABLED,
+        summary="approved high-risk local Codex daemon and exact Overseer drop-in activation requires this exact plan",
+        authorization_required_before_enable=True,
+        approval_plan_required=True,
+        supported_commands=(("codex", "app-server", "daemon", "bootstrap"), ("systemctl", "--user", "restart", "overseer-api.service")),
     ),
     AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(
         kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,
@@ -1552,7 +1562,8 @@ def _execute_admin_change_plan_body(
     enabled_adapter_kinds: Iterable[AdminChangeKind | str] = (),
 ) -> AdminExecutionResult:
     capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
-    if not capability.can_execute_live():
+    codex_dispatch_activation = AdminChangeKind(plan.kind) == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
+    if not capability.can_execute_live() and not codex_dispatch_activation:
         return AdminExecutionResult(
             id=f"admin.exec.{plan.id}.blocked",
             plan_id=plan.id,
@@ -1582,6 +1593,10 @@ def _execute_admin_change_plan_body(
         )
 
     command_runner = runner or run_admin_command_step
+    if codex_dispatch_activation:
+        from .codex_dispatch_activation import execute_codex_dispatch_activation_plan
+
+        return execute_codex_dispatch_activation_plan(plan, runner=command_runner)
     if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
         try:
             from .python_venv import validate_python_venv_plan
@@ -1606,6 +1621,19 @@ def _execute_admin_change_plan_body(
                 plan_id=plan.id,
                 status=AdminExecutionStatus.BLOCKED,
                 summary=f"Psychlo cycle activation validation blocked execution: {exc}",
+                command_results=(),
+            )
+    if AdminChangeKind(plan.kind) == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
+        try:
+            from .codex_dispatch_activation import validate_codex_dispatch_activation_plan
+
+            validate_codex_dispatch_activation_plan(plan)
+        except (OSError, ValueError) as exc:
+            return AdminExecutionResult(
+                id=f"admin.exec.{plan.id}.blocked",
+                plan_id=plan.id,
+                status=AdminExecutionStatus.BLOCKED,
+                summary=f"Codex dispatch activation validation blocked execution: {exc}",
                 command_results=(),
             )
     command_results_list: list[AdminCommandResult] = []
@@ -1678,6 +1706,14 @@ def audit_event_from_admin_execution(plan: AdminChangePlan, result: AdminExecuti
 
 
 def run_admin_command_step(step: AdminCommandStep) -> AdminCommandResult:
+    if step.command and step.command[0].startswith("__overseer_codex_dispatch_"):
+        try:
+            from .codex_dispatch_activation import execute_codex_dispatch_activation_marker
+
+            exit_code, stdout, stderr = execute_codex_dispatch_activation_marker(step.command)
+        except (OSError, ValueError) as exc:
+            exit_code, stdout, stderr = 1, "", str(exc)
+        return AdminCommandResult(step.title, step.command, exit_code, stdout, stderr)
     if step.command and step.command[0].startswith("__overseer_psychlo_cycle_"):
         try:
             from .psychlo_cycle_activation import execute_psychlo_cycle_activation_marker

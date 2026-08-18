@@ -856,7 +856,13 @@ class PsychloBridge:
             if (payload.get("projectId") != request.get("projectId")
                     or successor.get("successorPlanId") != request.get("planId")
                     or successor.get("successorPlanVersion") != request.get("planVersion")):
-                raise ValueError("successor round plan identity does not match approved action")
+                continue
+            original_round = self.store.get_round(str(payload.get("roundId")))
+            original_request = original_round[0] if original_round is not None else None
+            if (not isinstance(original_request, Mapping)
+                    or original_request.get("projectId") != request.get("projectId")
+                    or original_request.get("projectLeadId") != request.get("projectLeadId")):
+                raise ValueError("successor round lead identity does not match approved action")
             if self.approval_store is None:
                 raise ValueError("approved successor authority is unavailable")
             try:

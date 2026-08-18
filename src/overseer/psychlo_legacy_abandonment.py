@@ -285,7 +285,6 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
     """Send one exact signed peer action; retries are idempotent."""
     primary = _primary(bridge)
     plan = primary.load_admin_change_plan(plan_id)
-    _require_approved_sisko_plan(plan, AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT, plan.target)
     metadata = plan.adapter_metadata.get("legacy_abandonment") if isinstance(plan.adapter_metadata, Mapping) else None
     successor_id = metadata.get("successorPlanId") if isinstance(metadata, Mapping) else None
     if not isinstance(successor_id, str):
@@ -294,19 +293,30 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
     intent = bridge.store.legacy_abandonment(action_id)
     if intent is None:
         raise LegacyAbandonmentError("legacy abandonment intent is missing")
+    try:
+        _require_approved_sisko_plan(plan, AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT, plan.target)
+    except LegacyAbandonmentError:
+        # A crash may have occurred after the reversible bridge reservation but
+        # before the primary execution claim.  With no primary claim, no peer
+        # send can have begun, so a canceled/replaced authority releases it.
+        if intent["state"] == "peer-pending" and primary.psychlo_legacy_abandonment_execution_claim(plan_id) is None:
+            bridge.store.release_unsent_legacy_abandonment_reservation(
+                action_id, intent["actionDigest"], now=_now(bridge),
+            )
+        raise
     action = intent["payload"]
     expected = _expected_plan(action, plan_id)
     plan_digest = _immutable_plan_digest(plan)
     wire = _validate_wire(action.get("wire"), action)
     if plan_digest != _immutable_plan_digest(expected) or action.get("planDigest") != plan_digest or intent["actionDigest"] != wire["actionDigest"]:
         raise LegacyAbandonmentError("approved abandonment plan or action identity changed")
-    try:
-        primary.claim_psychlo_legacy_abandonment_execution(
-            plan_id, action_id, intent["actionDigest"], plan_digest, claimed_at=_now(bridge),
-        )
-    except ValueError as error:
-        raise LegacyAbandonmentError("exact approved Sisko plan execution claim failed") from error
     if intent["state"] == "completed":
+        try:
+            primary.claim_psychlo_legacy_abandonment_execution(
+                plan_id, action_id, intent["actionDigest"], plan_digest, claimed_at=_now(bridge),
+            )
+        except ValueError as error:
+            raise LegacyAbandonmentError("exact approved Sisko plan execution claim failed") from error
         primary.complete_psychlo_legacy_abandonment_execution(
             plan_id, action_id, intent["actionDigest"], completed_at=_now(bridge),
         )
@@ -314,7 +324,19 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
     current_action, _ = _snapshot(bridge, primary, plan.target, action["observationPlanId"], action["successorPlan"], allow_existing_abandonment=True, allow_fence=intent["state"] == "peer-pending")
     if _action_core(current_action) != _action_core(action):
         raise LegacyAbandonmentError("current bridge or observation identity differs from staged action")
-    claimed = bridge.store.claim_legacy_abandonment(action_id, intent["actionDigest"], now=_now(bridge))
+    bridge.store.claim_legacy_abandonment(action_id, intent["actionDigest"], now=_now(bridge))
+    try:
+        primary.claim_psychlo_legacy_abandonment_execution(
+            plan_id, action_id, intent["actionDigest"], plan_digest, claimed_at=_now(bridge),
+        )
+    except ValueError as error:
+        # The peer sender is strictly below this point.  Release only when the
+        # primary store proves that no irreversible execution claim exists.
+        if primary.psychlo_legacy_abandonment_execution_claim(plan_id) is None:
+            bridge.store.release_unsent_legacy_abandonment_reservation(
+                action_id, intent["actionDigest"], now=_now(bridge),
+            )
+        raise LegacyAbandonmentError("exact approved Sisko plan execution claim failed") from error
     try:
         raw_response = bridge.sender("round-legacy-abandon", action_id, wire)
     except Exception:

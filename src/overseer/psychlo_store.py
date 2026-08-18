@@ -1091,6 +1091,41 @@ class PsychloBridgeStore:
             raise ValueError("legacy abandonment intent is missing")
         return result
 
+    def release_unsent_legacy_abandonment_reservation(self, action_id: str, action_digest: str, *, now: str) -> dict[str, Any]:
+        """Release a bridge fence only when the caller has not invoked the peer sender."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT round_id,action_digest,state,receipt_json FROM legacy_abandonment_intents WHERE action_id=?",
+                (action_id,),
+            ).fetchone()
+            if row is None or row[1] != action_digest or row[2] != "peer-pending" or row[3] is not None:
+                raise ValueError("legacy abandonment reservation is not releasable")
+            delivery = self.connection.execute(
+                "SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (row[0],)
+            ).fetchone()
+            round_row = self.connection.execute(
+                "SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (row[0],)
+            ).fetchone()
+            if delivery is None or delivery[0] != "abandonment-fence" or round_row is None or round_row[0] != "started" or round_row[1] is not None:
+                raise ValueError("legacy abandonment reservation changed before release")
+            self.connection.execute(
+                "UPDATE legacy_abandonment_intents SET state='claimed',last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state='peer-pending'",
+                (now, action_id, action_digest),
+            )
+            self.connection.execute(
+                "UPDATE round_prompt_deliveries SET phase='submitted',updated_at=? WHERE round_id=? AND phase='abandonment-fence'",
+                (now, row[0]),
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.legacy_abandonment(action_id)
+        if result is None:
+            raise ValueError("legacy abandonment intent disappeared")
+        return result
+
     def complete_legacy_abandonment(self, action_id: str, action_digest: str, receipt: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         encoded_receipt = _dump_wire(receipt)
         self.connection.execute("BEGIN IMMEDIATE")

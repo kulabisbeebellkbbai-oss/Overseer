@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -170,6 +171,96 @@ def test_cancellation_wins_before_authoritative_execution_claim(tmp_path):
     assert bridge._test_sent == []
     assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan") is None
     assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "claimed"
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "submitted"
+
+
+@pytest.mark.parametrize("competitor", ["recovery", "failure", "cancellation"])
+def test_competing_bridge_intent_wins_without_sticking_authority_claim(tmp_path, competitor):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    store = bridge.store
+    if competitor == "recovery":
+        store.connection.execute("INSERT INTO round_recoveries(round_id,request_digest,capability_hash,idempotency_key,state,updated_at) VALUES (?,?,?,?,?,?)", ("round-arcade", "1" * 64, "2" * 64, "recovery-idem", "uncertain", NOW))
+    elif competitor == "failure":
+        store.connection.execute("INSERT INTO operational_failure_intents(round_id,request_digest,capability_hash,idempotency_key,payload_json,payload_digest,state,updated_at) VALUES (?,?,?,?,?,?,?,?)", ("round-arcade", "1" * 64, "2" * 64, "failure-idem", "{}", "3" * 64, "queued", NOW))
+    else:
+        store.connection.execute("INSERT INTO round_cancellations(cancellation_id,round_id,request_digest,attestation_json,receipt_json,inserted_at) VALUES (?,?,?,?,?,?)", ("cancel", "round-arcade", "1" * 64, "{}", "{}", NOW))
+    with pytest.raises((LegacyAbandonmentError, ValueError)):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
+    assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan") is None
+    replacement = replace(approved, reason="replacement remains possible before execution claim")
+    primary.save_admin_change_plan(replacement)
+    assert primary.load_admin_change_plan("abandon-plan").reason == replacement.reason
+    primary.save_admin_change_plan(cancel_admin_change_plan(replacement, "sisko", "competitor won", NOW))
+    assert primary.load_admin_change_plan("abandon-plan").canceled is True
+
+
+def test_primary_claim_failure_releases_unsent_bridge_reservation(tmp_path, monkeypatch):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    monkeypatch.setattr(
+        primary,
+        "claim_psychlo_legacy_abandonment_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("authority changed")),
+    )
+    with pytest.raises(LegacyAbandonmentError, match="execution claim failed"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
+    intent = bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")
+    assert intent["state"] == "claimed"
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "submitted"
+    primary.save_admin_change_plan(cancel_admin_change_plan(approved, "sisko", "claim failed", NOW))
+
+
+def test_crash_after_bridge_reservation_can_be_canceled_and_releases_on_replay(tmp_path, monkeypatch):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    original_claim = primary.claim_psychlo_legacy_abandonment_execution
+    monkeypatch.setattr(
+        primary,
+        "claim_psychlo_legacy_abandonment_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("crash before primary claim")),
+    )
+    with pytest.raises(RuntimeError, match="crash before primary claim"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan") is None
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "peer-pending"
+    primary.save_admin_change_plan(cancel_admin_change_plan(approved, "sisko", "cancel after crash", NOW))
+    monkeypatch.setattr(primary, "claim_psychlo_legacy_abandonment_execution", original_claim)
+    with pytest.raises(LegacyAbandonmentError, match="approved Sisko plan"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "claimed"
+    assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "submitted"
+
+
+def test_crash_after_primary_claim_keeps_fence_and_retries_exactly(tmp_path, monkeypatch):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    original_claim = primary.claim_psychlo_legacy_abandonment_execution
+    def claim_then_crash(*args, **kwargs):
+        original_claim(*args, **kwargs)
+        raise RuntimeError("crash after primary claim")
+    monkeypatch.setattr(primary, "claim_psychlo_legacy_abandonment_execution", claim_then_crash)
+    with pytest.raises(RuntimeError, match="crash after primary claim"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
+    assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan")["state"] == "claimed"
+    with pytest.raises(ValueError, match="execution claim"):
+        primary.save_admin_change_plan(cancel_admin_change_plan(approved, "sisko", "too late", NOW))
+    monkeypatch.setattr(primary, "claim_psychlo_legacy_abandonment_execution", original_claim)
+    result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert result["status"] == "legacy-abandoned-uncertain"
+    assert len(bridge._test_sent) == 1
 
 
 def test_execution_claim_wins_and_prohibits_late_cancellation(tmp_path):

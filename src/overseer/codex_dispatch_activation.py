@@ -43,7 +43,7 @@ DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer
 # This path is relative to CODEX_HOME exactly once.
 DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
-SOURCE_ROOTS = ("src/overseer",)
+SOURCE_ROOTS = ("src",)
 DROP_IN_CONTENT = b"[Service]\nEnvironment=OVERSEER_CODEX_APP_SERVER_DISPATCH=1\n"
 CANONICAL_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 EUID_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
@@ -136,7 +136,7 @@ def _reviewed_source_files() -> tuple[str, ...]:
     )
     untracked = tuple(
         sorted(
-            item for item in _git(("ls-files", "--others", "--exclude-standard", "--", *SOURCE_ROOTS)).splitlines()
+            item for item in _git(("ls-files", "--others", "--", *SOURCE_ROOTS)).splitlines()
             if item.endswith(".py")
         )
     )
@@ -398,6 +398,10 @@ def _stable_stat(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _directory_binding(info: os.stat_result) -> tuple[int, ...]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink
+
+
 def _secure_read_stable(path: Path, label: str, *, owner_only: bool = True) -> bytes:
     """Double-read one stable, euid-owned regular file through one nofollow fd."""
     return _secure_snapshot(path, label, owner_only=owner_only)[0]
@@ -511,6 +515,23 @@ def _rename_noreplace_at(source: str, destination: str, *, dir_fd: int) -> None:
         raise OSError(error_number, os.strerror(error_number), destination)
 
 
+def _link_fd_noreplace_at(source_fd: int, destination: str, *, dir_fd: int) -> None:
+    """Publish an anonymous inode without replacing an existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = getattr(libc, "linkat", None)
+    if linkat is None:
+        raise RuntimeError("atomic no-replace publication is unavailable")
+    linkat.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(source_fd, b"", dir_fd, os.fsencode(destination), 0x1000) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, "drop-in destination already exists", destination)
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     drop_in, path, _, socket_path = _paths()
     try:
@@ -566,6 +587,14 @@ def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     return value
 
 
+def _reject_terminal_plan_reuse(plan_id: str, digest: str) -> None:
+    journal = _load_journal(plan_id, digest)
+    if journal is not None and (
+        journal["phase"] == "rolled-back" or journal["dropInOwnership"] == "quarantined"
+    ):
+        raise RuntimeError("rolled-back Codex dispatch activation plan is terminal")
+
+
 def _write_journal(value: Mapping[str, object]) -> None:
     _, path, _, _ = _paths()
     _atomic_write(path, (_canonical(dict(value)) + "\n").encode())
@@ -575,30 +604,69 @@ def _write_journal(value: Mapping[str, object]) -> None:
 def _activation_lock():
     _, _, path, _ = _paths()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _owner_only(path.parent, "activation lock directory")
-    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    lexical_parent = path.parent.lstat()
+    if (not stat.S_ISDIR(lexical_parent.st_mode) or lexical_parent.st_uid != os.geteuid()
+            or stat.S_IMODE(lexical_parent.st_mode) & 0o077):
+        raise ValueError("activation lock directory is unsafe")
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent_fd = os.open(path.parent, directory_flags)
     try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        fd = os.open(path, flags)
-    with os.fdopen(fd, "r+") as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1:
-            raise ValueError("activation lock is not a private euid-owned regular file")
-        if stat.S_IMODE(before.st_mode) & 0o077:
-            raise ValueError("activation lock is not owner-only")
-        os.fchmod(stream.fileno(), 0o600)
-        after = os.fstat(stream.fileno())
-        if _stable_stat(after)[:2] != _stable_stat(before)[:2] or stat.S_IMODE(after.st_mode) != 0o600:
-            raise ValueError("activation lock changed during validation")
+        parent_info = os.fstat(parent_fd)
+        if (_directory_binding(parent_info) != _directory_binding(lexical_parent)
+                or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_info.st_mode) & 0o077):
+            raise ValueError("activation lock directory changed during validation")
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("Codex dispatch activation is already running") from exc
         try:
-            yield
+            flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(path.name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent_fd)
+            except FileExistsError:
+                fd = os.open(path.name, flags, dir_fd=parent_fd)
+            with os.fdopen(fd, "r+") as stream:
+                before = os.fstat(stream.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1:
+                    raise ValueError("activation lock is not a private euid-owned regular file")
+                if stat.S_IMODE(before.st_mode) & 0o077:
+                    raise ValueError("activation lock is not owner-only")
+                os.fchmod(stream.fileno(), 0o600)
+
+                def validate_lock() -> None:
+                    current_parent = os.fstat(parent_fd)
+                    lexical_parent_now = path.parent.lstat()
+                    if (_directory_binding(current_parent) != _directory_binding(parent_info)
+                            or _directory_binding(lexical_parent_now) != _directory_binding(parent_info)):
+                        raise ValueError("activation lock directory changed or was replaced")
+                    locked = os.fstat(stream.fileno())
+                    lexical = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (_stable_stat(locked) != _stable_stat(lexical)
+                            or (locked.st_dev, locked.st_ino) != (before.st_dev, before.st_ino)
+                            or not stat.S_ISREG(locked.st_mode) or locked.st_uid != os.geteuid()
+                            or stat.S_IMODE(locked.st_mode) != 0o600 or locked.st_nlink != 1):
+                        raise ValueError("activation lock changed or was replaced")
+
+                validate_lock()
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError("Codex dispatch activation is already running") from exc
+                try:
+                    validate_lock()
+                    yield validate_lock
+                finally:
+                    try:
+                        validate_lock()
+                    finally:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(parent_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(parent_fd)
 
 
 def _parse_marker(command: Sequence[str]) -> tuple[str, str, CodexDispatchActivationSpec]:
@@ -759,11 +827,59 @@ def _verify_environment() -> None:
         raise ValueError("Overseer service environment does not contain exactly one correct dispatch flag")
 
 
+def _publish_drop_in_noreplace(drop_in: Path) -> None:
+    lexical_parent = drop_in.parent.lstat()
+    if (not stat.S_ISDIR(lexical_parent.st_mode) or lexical_parent.st_uid != os.geteuid()
+            or stat.S_IMODE(lexical_parent.st_mode) & 0o077):
+        raise ValueError("systemd drop-in directory is unsafe")
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent_fd = os.open(drop_in.parent, directory_flags)
+    anonymous_fd: int | None = None
+    try:
+        parent_info = os.fstat(parent_fd)
+        if (_directory_binding(parent_info) != _directory_binding(lexical_parent)
+                or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_info.st_mode) & 0o077):
+            raise ValueError("systemd drop-in directory changed before publication")
+        temporary_flags = os.O_WRONLY | os.O_CLOEXEC | getattr(os, "O_TMPFILE", 0)
+        if not getattr(os, "O_TMPFILE", 0):
+            raise RuntimeError("anonymous no-replace drop-in publication is unavailable")
+        anonymous_fd = os.open(".", temporary_flags, 0o600, dir_fd=parent_fd)
+        remaining = memoryview(DROP_IN_CONTENT)
+        while remaining:
+            written = os.write(anonymous_fd, remaining)
+            if written <= 0:
+                raise OSError("drop-in write made no progress")
+            remaining = remaining[written:]
+        os.fchmod(anonymous_fd, 0o600)
+        os.fsync(anonymous_fd)
+        anonymous_info = os.fstat(anonymous_fd)
+        if (not stat.S_ISREG(anonymous_info.st_mode) or anonymous_info.st_uid != os.geteuid()
+                or stat.S_IMODE(anonymous_info.st_mode) != 0o600 or anonymous_info.st_nlink != 0
+                or anonymous_info.st_size != len(DROP_IN_CONTENT)):
+            raise ValueError("anonymous drop-in inode is unsafe")
+        _link_fd_noreplace_at(anonymous_fd, drop_in.name, dir_fd=parent_fd)
+        linked_info = os.fstat(anonymous_fd)
+        lexical = os.stat(drop_in.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (_stable_stat(linked_info) != _stable_stat(lexical) or linked_info.st_nlink != 1
+                or _directory_binding(os.fstat(parent_fd)) != _directory_binding(parent_info)):
+            raise ValueError("published drop-in identity changed")
+        os.fsync(parent_fd)
+    finally:
+        if anonymous_fd is not None:
+            os.close(anonymous_fd)
+        os.close(parent_fd)
+
+
 def _install_drop_in(plan_id: str, digest: str) -> str:
     drop_in, _, _, _ = _paths()
     drop_in.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _owner_only(drop_in.parent, "systemd drop-in directory")
     journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+    if journal["phase"] == "rolled-back" or journal["dropInOwnership"] == "quarantined":
+        raise RuntimeError("rolled-back activation plan is terminal and cannot reinstall the drop-in")
     prior_ownership = str(journal["dropInOwnership"])
     try:
         existing, existing_info = _secure_snapshot(drop_in, "drop-in")
@@ -786,12 +902,24 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
         journal["phase"] = "drop-in-installed"
         _write_journal(journal)
         return "exact owner-only service drop-in already present"
-    # Record intent before the effect.  A crash after os.replace but before
-    # the success phase leaves write-issued intent for rollback reconciliation.
+    # Record intent before the effect. A crash after anonymous no-replace
+    # publication but before the success phase leaves write-issued intent for
+    # rollback reconciliation.
     journal["dropInOwnership"] = "write-issued"
     journal["phase"] = "intent-drop-in"
     _write_journal(journal)
-    _atomic_write(drop_in, DROP_IN_CONTENT)
+    try:
+        _publish_drop_in_noreplace(drop_in)
+    except FileExistsError:
+        concurrent, _ = _secure_snapshot(drop_in, "concurrent drop-in")
+        if concurrent != DROP_IN_CONTENT:
+            raise ValueError("concurrent drop-in content is not the reviewed override")
+        journal["dropInOwnership"] = "preexisting"
+        journal["dropInDevice"] = None
+        journal["dropInInode"] = None
+        journal["phase"] = "drop-in-installed"
+        _write_journal(journal)
+        return "exact owner-only service drop-in concurrently present"
     installed, installed_info = _secure_snapshot(drop_in, "drop-in")
     if installed != DROP_IN_CONTENT:
         raise ValueError("installed drop-in is not the reviewed override")
@@ -1017,6 +1145,8 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
         digest = command[2]
         if operation in {"bootstrap", "start", "install-drop-in", "daemon-reload", "restart-overseer"}:
             verify_reviewed_source_binding(spec)
+        if operation != "rollback":
+            _reject_terminal_plan_reuse(plan_id, digest)
         if operation == "bootstrap":
             journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
             state = _bootstrap_state()
@@ -1173,23 +1303,32 @@ def execute_codex_dispatch_activation_plan(
         from .admin import run_admin_command_step
         runner = run_admin_command_step
     try:
-        with _activation_lock():
+        with _activation_lock() as validate_lock:
+            _reject_terminal_plan_reuse(plan.id, codex_dispatch_activation_plan_digest(spec))
             command_results: list[AdminCommandResult] = []
             for step in plan.steps:
+                validate_lock()
                 result = _run_audited_step(runner, step)
+                validate_lock()
                 command_results.append(result)
                 if result.exit_code != 0:
+                    validate_lock()
                     rollback = _run_rollback_steps(runner, plan.rollback_steps)
+                    validate_lock()
                     return AdminExecutionResult(f"admin.exec.{plan.id}.failed", plan.id, AdminExecutionStatus.FAILED, f"Codex dispatch activation failed during step: {result.title}; rollback attempted", tuple(command_results), rollback_results=rollback)
             verification: list[AdminCommandResult] = []
             for step in plan.verification_steps:
+                validate_lock()
                 result = _run_audited_step(runner, step)
+                validate_lock()
                 verification.append(result)
                 if result.exit_code != 0:
+                    validate_lock()
                     rollback = _run_rollback_steps(runner, plan.rollback_steps)
+                    validate_lock()
                     return AdminExecutionResult(f"admin.exec.{plan.id}.failed", plan.id, AdminExecutionStatus.FAILED, f"Codex dispatch activation verification failed during step: {result.title}; rollback attempted", tuple(command_results), tuple(verification), rollback)
             return AdminExecutionResult(f"admin.exec.{plan.id}.completed", plan.id, AdminExecutionStatus.COMPLETED, "approved Codex dispatch activation completed and verified", tuple(command_results), tuple(verification))
-    except RuntimeError as error:
+    except (RuntimeError, ValueError) as error:
         return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, str(error), ())
 
 

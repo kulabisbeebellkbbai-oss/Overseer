@@ -111,6 +111,23 @@ def test_reviewed_source_inventory_rejects_untracked_python_but_allows_unrelated
         activation._reviewed_source_files()
 
 
+def test_reviewed_source_inventory_covers_preimport_python_anywhere_under_src(monkeypatch: pytest.MonkeyPatch):
+    calls: list[tuple[str, ...]] = []
+
+    def git(command):
+        calls.append(tuple(command))
+        if "--others" in command:
+            return "src/sitecustomize.py"
+        return "src/overseer/__init__.py\nsrc/launcher.py"
+
+    monkeypatch.setattr(activation, "_git", git)
+    with pytest.raises(ValueError, match="untracked Python"):
+        activation._reviewed_source_files()
+    assert calls
+    assert all(command[-1] == "src" for command in calls)
+    assert all("--exclude-standard" not in command for command in calls)
+
+
 def test_plan_rejects_review_digest_or_metadata_drift():
     plan = _plan()
     validate_codex_dispatch_activation_plan(plan)
@@ -278,6 +295,22 @@ def test_activation_lock_rejects_symlink_and_unsafe_mode_without_chmod(tmp_path:
             pass
 
 
+def test_activation_lock_detects_replacement_and_keeps_second_owner_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    _, _, lock, _ = activation._paths()
+    replaced = lock.with_name("replaced.lock")
+    with pytest.raises(ValueError, match="changed|replaced"):
+        with activation._activation_lock() as validate_lock:
+            lock.rename(replaced)
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+            with pytest.raises(RuntimeError, match="already running"):
+                with activation._activation_lock():
+                    pass
+            validate_lock()
+
+
 def test_journal_secure_read_rejects_symlink_and_unknown_enums(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
@@ -379,14 +412,13 @@ def test_drop_in_crash_after_write_is_reconciled_from_intent_journal(tmp_path: P
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
-    original = activation._atomic_write
+    original = activation._publish_drop_in_noreplace
 
-    def crash_after_dropin(path, content, mode=0o600):
-        original(path, content, mode)
-        if path.name == "10-overseer-codex-dispatch.conf":
-            raise RuntimeError("crash after drop-in effect")
+    def crash_after_dropin(path):
+        original(path)
+        raise RuntimeError("crash after drop-in effect")
 
-    monkeypatch.setattr(activation, "_atomic_write", crash_after_dropin)
+    monkeypatch.setattr(activation, "_publish_drop_in_noreplace", crash_after_dropin)
     plan = _plan()
     code, _, err = execute_codex_dispatch_activation_marker(plan.steps[2].command)
     assert code == 1
@@ -396,7 +428,7 @@ def test_drop_in_crash_after_write_is_reconciled_from_intent_journal(tmp_path: P
     journal = activation._load_journal(plan.id, plan.steps[2].command[2])
     assert journal["phase"] == "intent-drop-in"
     assert journal["dropInOwnership"] == "write-issued"
-    monkeypatch.setattr(activation, "_atomic_write", original)
+    monkeypatch.setattr(activation, "_publish_drop_in_noreplace", original)
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
     retry_code, _, retry_err = execute_codex_dispatch_activation_marker(plan.steps[2].command)
     assert retry_code == 0, retry_err
@@ -575,7 +607,9 @@ def test_disabled_adapter_gate_does_not_run_commands(monkeypatch: pytest.MonkeyP
     assert called is False
 
 
-def test_runner_timeout_after_effect_is_audited_failure_with_rollback(monkeypatch: pytest.MonkeyPatch):
+def test_runner_timeout_after_effect_is_audited_failure_with_rollback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     plan = _approved_plan()
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     rolled_back = False
@@ -773,6 +807,92 @@ def test_rollback_retries_from_exact_quarantine_after_rename_crash(tmp_path: Pat
     assert quarantined[0].stat().st_ino == inode
 
 
+def test_rolled_back_approved_plan_is_terminal_before_any_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    plan = _approved_plan()
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    digest = plan.steps[0].command[2]
+    assert activation._install_drop_in(plan.id, digest) == "exact owner-only service drop-in installed"
+    assert activation._rollback(plan.id, digest).startswith("exact Codex dispatch activation rolled back")
+    drop_in, _, _, _ = activation._paths()
+    journal_before = activation._load_journal(plan.id, digest)
+    quarantine = Path(str(journal_before["dropInQuarantinePath"]))
+    assert not drop_in.exists()
+    assert quarantine.exists()
+    effects: list[str] = []
+
+    def runner(step):
+        effects.append(step.title)
+        return AdminCommandResult(step.title, step.command, 0)
+
+    result = execute_codex_dispatch_activation_plan(plan, runner=runner, adapter_enabled=True)
+    assert result.status.value == "blocked"
+    assert "terminal" in result.summary or "rolled back" in result.summary
+    assert effects == []
+    assert not drop_in.exists()
+    assert quarantine.exists()
+
+
+def test_install_never_overwrites_concurrent_mismatched_drop_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    plan = _plan()
+    drop_in, _, _, _ = activation._paths()
+    raced = False
+
+    def concurrent_publish(_source_fd: int, destination: str, *, dir_fd: int):
+        nonlocal raced
+        if destination == drop_in.name and not raced:
+            raced = True
+            fd = activation.os.open(
+                destination,
+                activation.os.O_WRONLY | activation.os.O_CREAT | activation.os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            try:
+                activation.os.write(fd, b"[Service]\nEnvironment=UNREVIEWED=1\n")
+            finally:
+                activation.os.close(fd)
+        raise FileExistsError("concurrent drop-in")
+
+    monkeypatch.setattr(activation, "_link_fd_noreplace_at", concurrent_publish, raising=False)
+    with pytest.raises(ValueError, match="reviewed|concurrent|content"):
+        activation._install_drop_in(plan.id, plan.steps[0].command[2])
+    assert drop_in.read_bytes() == b"[Service]\nEnvironment=UNREVIEWED=1\n"
+
+
+def test_install_accepts_concurrent_exact_drop_in_only_as_preexisting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    plan = _plan()
+    drop_in, _, _, _ = activation._paths()
+
+    def concurrent_publish(_source_fd: int, destination: str, *, dir_fd: int):
+        fd = activation.os.open(
+            destination,
+            activation.os.O_WRONLY | activation.os.O_CREAT | activation.os.O_EXCL,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        try:
+            activation.os.write(fd, activation.DROP_IN_CONTENT)
+        finally:
+            activation.os.close(fd)
+        raise FileExistsError("concurrent exact drop-in")
+
+    monkeypatch.setattr(activation, "_link_fd_noreplace_at", concurrent_publish)
+    result = activation._install_drop_in(plan.id, plan.steps[0].command[2])
+    assert result == "exact owner-only service drop-in concurrently present"
+    assert drop_in.read_bytes() == activation.DROP_IN_CONTENT
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert journal["dropInOwnership"] == "preexisting"
+    assert journal["dropInDevice"] is None
+    assert journal["dropInInode"] is None
+
+
 def test_rollback_reconciles_daemon_started_by_operation_even_if_already_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
@@ -786,7 +906,9 @@ def test_rollback_reconciles_daemon_started_by_operation_even_if_already_stopped
     assert ("codex", "app-server", "daemon", "stop") in calls
 
 
-def test_concurrent_execution_allows_only_one_owner(monkeypatch: pytest.MonkeyPatch):
+def test_concurrent_execution_allows_only_one_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     entered = threading.Event()
     release = threading.Event()
@@ -811,6 +933,8 @@ def test_concurrent_execution_allows_only_one_owner(monkeypatch: pytest.MonkeyPa
 def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from overseer import cli
 
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     store = tmp_path / "overseer.sqlite3"
     monkeypatch.setattr(cli, "build_codex_dispatch_activation_spec", _spec)
     staged = cli.plan_admin_change_status(

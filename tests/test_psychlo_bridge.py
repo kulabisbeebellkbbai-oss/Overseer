@@ -1558,6 +1558,7 @@ def test_emit_usage_ignores_malformed_lead_result_and_uses_provider_snapshot(tmp
     sent = []
     store = PsychloBridgeStore(tmp_path / "bridge.sqlite3")
     store.record_round({"roundId": "round-bad"}, {}, "capability-bad")
+    store.mark_dispatch_started("round-bad", NOW)
     store.record_result("round-bad", {"occurredAt": "not-a-timestamp", "actualUsageCost": "not-a-number"})
     bridge = PsychloBridge(
         store=store,

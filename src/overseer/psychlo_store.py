@@ -469,12 +469,12 @@ class PsychloBridgeStore:
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def active_round(self) -> str | None:
-        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') LIMIT 1").fetchone()
+        row = self.connection.execute("SELECT round_id FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') LIMIT 1").fetchone()
         return None if row is None else str(row[0])
 
     def active_rounds(self) -> list[dict[str, Any]]:
         """Return the immutable request identity for every unfinished round."""
-        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') ORDER BY rowid").fetchall()
+        rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') ORDER BY rowid").fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def record_canary_round(self, request: Mapping[str, Any], receipt: Mapping[str, Any], capability: str, authorization_id: str, expected_revision: int, now: str) -> None:
@@ -515,7 +515,7 @@ class PsychloBridgeStore:
             bound = next((item for item in projects if isinstance(item, dict) and item.get("projectId") == request.get("projectId")), None)
             if bound is None or any(request.get(field) != bound.get(source) for field, source in (("projectId", "projectId"), ("planId", "planId"), ("planVersion", "planVersion"), ("projectLeadId", "leadId"))):
                 raise ValueError("concurrency canary round identity is not authorized")
-            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') ORDER BY rowid").fetchall()
+            rows = self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') ORDER BY rowid").fetchall()
             active = [json.loads(row[0]) for row in rows]
             if len(active) >= 2:
                 raise ValueError("single_stream_busy")
@@ -619,7 +619,7 @@ class PsychloBridgeStore:
             expected_decision = {"decisionId": authorization.get("decisionId"), "projectId": authorization.get("projectId"), "planId": authorization.get("planId"), "workflowId": authorization.get("workflowId"), "decisionVersion": authorization.get("decisionVersion"), "question": authorization.get("question"), "resultProvenanceId": authorization.get("digest")}
             if any(decision.get(field) != value for field, value in expected_decision.items()):
                 raise ValueError("concurrency ceiling decision binding is invalid")
-            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') ORDER BY rowid").fetchall()]
+            active = [json.loads(row[0]) for row in self.connection.execute("SELECT request_json FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') ORDER BY rowid").fetchall()]
             if len(active) >= 2 or any(item.get("projectId") == request.get("projectId") for item in active):
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
@@ -700,7 +700,7 @@ class PsychloBridgeStore:
         """Atomically preserve the default global ceiling of one."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start') LIMIT 1").fetchone() is not None:
+            if self.connection.execute("SELECT 1 FROM rounds WHERE result_json IS NULL AND dispatch_state NOT IN ('failed','cancelled-before-start','legacy-abandoned') LIMIT 1").fetchone() is not None:
                 raise ValueError("single_stream_busy")
             self.connection.execute("INSERT INTO rounds(round_id,request_json,receipt_json,capability_hash,capability_token,dispatch_state,result_json,result_forwarded) VALUES (?,?,?,?,?,'pending',NULL,0)", (request["roundId"], _dump_wire(request), _dump_wire(receipt), _token_hash(capability), capability))
             self.connection.execute("COMMIT")
@@ -800,14 +800,15 @@ class PsychloBridgeStore:
             ).fetchone()
             recovery = self.connection.execute("SELECT 1 FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
             failure = self.connection.execute("SELECT 1 FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
-            if row is None or json.loads(row[0]) != dict(request) or canonical_digest(json.loads(row[0])) != request_digest or row[1] != "pending" or row[2] is not None or row[3] is not None or row[4] is not None or recovery is not None or failure is not None:
+            abandonment = self.connection.execute("SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed') LIMIT 1", (round_id,)).fetchone()
+            if row is None or json.loads(row[0]) != dict(request) or canonical_digest(json.loads(row[0])) != request_digest or row[1] != "pending" or row[2] is not None or row[3] is not None or row[4] is not None or recovery is not None or failure is not None or abandonment is not None:
                 raise ValueError("round is not provably pending before start")
             before = {"dispatchState": "pending", "startedAt": None, "codexBinding": None, "result": None, "recovery": False, "operationalFailure": False}
             unsigned = {"schemaVersion": "psychlo.round-cancel-before-start.v1", "kind": "round-cancel-before-start", "status": "cancelled", "roundId": round_id, "projectId": str(request["projectId"]), "requestDigest": request_digest, "before": before, "cancelledAt": now}
             receipt = {**unsigned, "digest": canonical_digest(unsigned)}
             updated = self.connection.execute(
-                "UPDATE rounds SET dispatch_state='cancelled-before-start' WHERE round_id=? AND request_json=? AND dispatch_state='pending' AND result_json IS NULL AND started_at IS NULL AND codex_binding_json IS NULL AND NOT EXISTS (SELECT 1 FROM round_recoveries WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?)",
-                (round_id, row[0], round_id, round_id),
+                "UPDATE rounds SET dispatch_state='cancelled-before-start' WHERE round_id=? AND request_json=? AND dispatch_state='pending' AND result_json IS NULL AND started_at IS NULL AND codex_binding_json IS NULL AND NOT EXISTS (SELECT 1 FROM round_recoveries WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed'))",
+                (round_id, row[0], round_id, round_id, round_id),
             )
             if updated.rowcount != 1:
                 raise ValueError("round changed before cancellation")
@@ -873,6 +874,8 @@ class PsychloBridgeStore:
             row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
             if row is None or json.loads(row[0]) != dict(request) or row[1] != capability_hash or row[2] != capability or row[3] != "started" or row[4] is not None:
                 raise ValueError("operational failure round binding is invalid")
+            if self.connection.execute("SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed') LIMIT 1", (round_id,)).fetchone() is not None:
+                raise ValueError("operational failure is fenced by legacy abandonment")
             existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,payload_digest,payload_json FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
             if existing is not None:
                 if existing[:4] != (request_digest, capability_hash, str(request["idempotencyKey"]), payload_digest) or existing[4] != encoded:
@@ -905,6 +908,8 @@ class PsychloBridgeStore:
             row = self.connection.execute("SELECT request_json,capability_hash,capability_token,dispatch_state,result_json,codex_binding_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
             if row is None or json.loads(row[0]) != dict(request) or row[1] != capability_hash or row[2] != capability or row[3] != "started" or row[4] is not None or row[5] != encoded_binding:
                 raise ValueError("operational failure round binding is invalid")
+            if self.connection.execute("SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed') LIMIT 1", (round_id,)).fetchone() is not None:
+                raise ValueError("operational failure is fenced by legacy abandonment")
             delivery = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
             existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,payload_digest,payload_json,state,owner_id,claim_token,lease_expires_at FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
             if existing is not None and existing[:5] != (request_digest, capability_hash, str(request["idempotencyKey"]), payload_digest, encoded_payload):
@@ -953,6 +958,8 @@ class PsychloBridgeStore:
             intent = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,state,owner_id,claim_token,lease_expires_at FROM operational_failure_intents WHERE round_id=?", (round_id,)).fetchone()
             if round_row is None or intent is None or json.loads(round_row[0]) != dict(request) or round_row[1] != _token_hash(capability) or round_row[2] != capability or round_row[3] != "started" or round_row[4] is not None or intent[0] != self._round_request_digest(request) or intent[1] != _token_hash(capability) or intent[2] != str(request["idempotencyKey"]):
                 raise ValueError("operational failure claim binding is invalid")
+            if self.connection.execute("SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed') LIMIT 1", (round_id,)).fetchone() is not None:
+                raise ValueError("operational failure is fenced by legacy abandonment")
             if intent[3] == "accepted":
                 self.connection.execute("COMMIT")
                 return None
@@ -1070,7 +1077,8 @@ class PsychloBridgeStore:
                 raise ValueError("legacy abandonment action is not executable")
             round_row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (row[0],)).fetchone()
             delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (row[0],)).fetchone()
-            if round_row is None or round_row[0] != "started" or round_row[1] is not None or delivery is None or delivery[0] not in {"submitted", "abandonment-fence"}:
+            competing = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (row[0],)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations"))
+            if round_row is None or round_row[0] != "started" or round_row[1] is not None or delivery is None or delivery[0] not in {"submitted", "abandonment-fence"} or competing:
                 raise ValueError("legacy abandonment round changed before claim")
             self.connection.execute("UPDATE legacy_abandonment_intents SET state='peer-pending',attempts=attempts+1,last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state IN ('claimed','peer-pending')", (now, action_id, action_digest))
             self.connection.execute("UPDATE round_prompt_deliveries SET phase='abandonment-fence',updated_at=? WHERE round_id=? AND phase='submitted'", (now, row[0]))
@@ -1141,12 +1149,17 @@ class PsychloBridgeStore:
         encoded_binding = _dump_wire(binding)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            round_state = self.connection.execute("SELECT dispatch_state FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            if round_state is not None and round_state[0] == "legacy-abandoned":
+                raise ValueError("legacy-abandoned round prompt delivery is terminal")
             row = self.connection.execute("SELECT request_digest,capability_hash,binding_json,phase,prompt_digest FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
             if row is None:
                 self.connection.execute("INSERT INTO round_prompt_deliveries(round_id,request_digest,capability_hash,binding_json,phase,prompt_digest,updated_at) VALUES (?,?,?,?,?,?,?)", (round_id, request_digest, capability_hash, encoded_binding, phase, prompt_digest, now))
             else:
                 if (row[0], row[1], row[2], row[4]) != (request_digest, capability_hash, encoded_binding, prompt_digest):
                     raise ValueError("round prompt delivery binding conflict")
+                if row[3] == "abandonment-fence" and phase != "abandonment-fence":
+                    raise ValueError("round prompt delivery is fenced by legacy abandonment")
                 if expected_phase is not None and row[3] != expected_phase:
                     raise ValueError("round prompt delivery predecessor changed")
                 if phases.index(phase) < phases.index(str(row[3])):
@@ -1171,6 +1184,10 @@ class PsychloBridgeStore:
                 raise ValueError("round recovery request or capability binding is invalid")
             if row[3] != "started":
                 raise ValueError("only a started round can be recovered")
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            abandonment = self.connection.execute("SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed') LIMIT 1", (round_id,)).fetchone()
+            if abandonment is not None or (delivery is not None and delivery[0] == "abandonment-fence"):
+                raise ValueError("round recovery is fenced by legacy abandonment")
             request_digest = self._round_request_digest(request)
             idempotency_key = str(request.get("idempotencyKey", ""))
             existing = self.connection.execute("SELECT request_digest,capability_hash,idempotency_key,owner_id,claim_token,lease_expires_at,state FROM round_recoveries WHERE round_id=?", (round_id,)).fetchone()
@@ -1277,7 +1294,23 @@ class PsychloBridgeStore:
         return None if row is None else (json.loads(row[0]), json.loads(row[1]), row[2], row[3], row[4], json.loads(row[5]) if row[5] else None, bool(row[6]))
 
     def record_result(self, round_id: str, result: Mapping[str, Any], completed_at: str | None = None) -> None:
-        self.connection.execute("UPDATE rounds SET result_json=?,completed_at=COALESCE(completed_at,?) WHERE round_id=? AND result_json IS NULL", (_dump_wire(result), completed_at or result.get("occurredAt"), round_id))
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            abandonment = self.connection.execute("SELECT state FROM legacy_abandonment_intents WHERE round_id=?", (round_id,)).fetchone()
+            if row is None or row[0] not in {"started", "dispatched"} or row[1] is not None or (delivery is not None and delivery[0] == "abandonment-fence") or (abandonment is not None and abandonment[0] in {"peer-pending", "completed"}):
+                raise ValueError("round result is fenced or no longer expected")
+            updated = self.connection.execute(
+                "UPDATE rounds SET result_json=?,completed_at=COALESCE(completed_at,?) WHERE round_id=? AND dispatch_state IN ('started','dispatched') AND result_json IS NULL AND NOT EXISTS (SELECT 1 FROM legacy_abandonment_intents WHERE round_id=? AND state IN ('peer-pending','completed')) AND NOT EXISTS (SELECT 1 FROM round_prompt_deliveries WHERE round_id=? AND phase='abandonment-fence')",
+                (_dump_wire(result), completed_at or result.get("occurredAt"), round_id, round_id, round_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("round result state changed before persistence")
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def round_timing(self, round_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT canary_authorization_id,started_at,completed_at FROM rounds WHERE round_id=?", (round_id,)).fetchone()

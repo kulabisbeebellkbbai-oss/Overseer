@@ -17,8 +17,9 @@ import re
 from typing import Any, Mapping
 
 from .admin import AdminChangeKind, AdminChangePlan, plan_psychlo_legacy_abandonment
+from .core import ApprovalLevel, OwnerDomain, RiskLevel
 from .psychlo_contracts import canonical_digest
-from .psychlo_process_attestation import admin_plan_digest
+from .psychlo_process_attestation import SCHEMA as PROCESS_OBSERVATION_SCHEMA, _validate_process_observation_row, admin_plan_digest
 
 
 SCHEMA = "psychlo.legacy-round-abandon.v1"
@@ -61,12 +62,31 @@ def _immutable_plan_digest(plan: AdminChangePlan) -> str:
     return canonical_digest(value)
 
 
+def _require_approved_sisko_plan(plan: AdminChangePlan, kind: AdminChangeKind, target: str) -> None:
+    if (
+        plan.kind != kind or plan.target != target or plan.owner_domain != OwnerDomain.SISKO
+        or plan.risk_level != RiskLevel.HIGH or plan.approval_level != ApprovalLevel.HUMAN
+        or plan.approved is not True or plan.approved_by != "sisko"
+        or plan.canceled is not False or plan.archived is not False
+        or any(getattr(plan, name) is not None for name in ("canceled_by", "canceled_at", "cancellation_reason", "archived_by", "archived_at", "archive_record_id"))
+    ):
+        raise LegacyAbandonmentError("exact approved Sisko plan is required")
+    if not isinstance(plan.approved_at, str):
+        raise LegacyAbandonmentError("approved Sisko plan timestamp is missing")
+    try:
+        approved = datetime.fromisoformat(plan.approved_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise LegacyAbandonmentError("approved Sisko plan timestamp is invalid") from error
+    if approved.tzinfo is None or approved.utcoffset() != UTC.utcoffset(approved):
+        raise LegacyAbandonmentError("approved Sisko plan timestamp is not UTC")
+
+
 def _delivery_digest(delivery: Mapping[str, Any]) -> str:
     selected = {
         "requestDigest": delivery.get("requestDigest"),
         "capabilityHash": delivery.get("capabilityHash"),
         "binding": delivery.get("binding"),
-        "phase": delivery.get("phase"),
+        "submittedPhase": "submitted",
         "promptDigest": delivery.get("promptDigest"),
     }
     return canonical_digest(selected)
@@ -84,15 +104,39 @@ def _primary(bridge: Any) -> Any:
     return primary
 
 
+def _strict_source_observation(primary: Any, round_id: str, observation_plan_id: str) -> tuple[dict[str, Any], AdminChangePlan, dict[str, Any]]:
+    row = primary._connection.execute(
+        "SELECT observation_id,round_id,plan_id,observation_digest,plan_digest,state,manifest_json,inserted_at,recorded_at FROM psychlo_process_observations WHERE round_id=?",
+        (round_id,),
+    ).fetchone()
+    if row is None or row[2] != observation_plan_id or row[5] != "recorded":
+        raise LegacyAbandonmentError("exact recorded historical observation is required")
+    try:
+        manifest, source_plan, _encoded, _manifest_digest = _validate_process_observation_row(
+            primary, row, round_id=round_id, plan_id=observation_plan_id,
+        )
+    except Exception as error:
+        raise LegacyAbandonmentError("recorded historical observation is invalid") from error
+    if (
+        manifest.get("schemaVersion") != PROCESS_OBSERVATION_SCHEMA
+        or manifest.get("historical") is not True
+        or manifest.get("authoritative") is not False
+        or manifest.get("executable") is not False
+        or row[4] != admin_plan_digest(source_plan)
+    ):
+        raise LegacyAbandonmentError("recorded observation authority is not exact")
+    _require_approved_sisko_plan(source_plan, AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION, round_id)
+    return ({
+        "observationId": row[0], "roundId": row[1], "planId": row[2],
+        "observationDigest": row[3], "planDigest": row[4], "manifest": manifest,
+        "insertedAt": row[7], "recordedAt": row[8],
+    }, source_plan, manifest)
+
+
 def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str, successor: Mapping[str, str], *, allow_existing_abandonment: bool = False, allow_fence: bool = False) -> tuple[dict[str, Any], AdminChangePlan]:
-    observation = primary.process_observation(round_id)
-    if observation is None or observation.get("planId") != observation_plan_id:
-        raise LegacyAbandonmentError("recorded historical observation is required")
+    observation, source_plan, manifest = _strict_source_observation(primary, round_id, observation_plan_id)
     observation_digest = _digest(observation.get("observationDigest"), "observation digest")
     observation_plan_digest = _digest(observation.get("planDigest"), "observation plan digest")
-    manifest = observation.get("manifest")
-    if not isinstance(manifest, Mapping) or manifest.get("historical") is not True or manifest.get("authoritative") is not False or manifest.get("executable") is not False:
-        raise LegacyAbandonmentError("historical observation is not non-authoritative")
     record = bridge.store.get_round(round_id)
     if record is None:
         raise LegacyAbandonmentError("round is missing")
@@ -143,9 +187,6 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     action["actionDigest"] = action_digest
     wire = {"schemaVersion": SCHEMA, "actionId": action_id, "actionDigest": action_digest, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "reason": REASON, "occurredAt": _now(bridge)}
     action["wire"] = wire
-    source_plan = primary.load_admin_change_plan(observation_plan_id)
-    if source_plan.approved is not True or source_plan.approved_by != "sisko":
-        raise LegacyAbandonmentError("recorded observation requires an approved Sisko observation plan")
     return action, source_plan
 
 
@@ -223,8 +264,7 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
     """Send one exact signed peer action; retries are idempotent."""
     primary = _primary(bridge)
     plan = primary.load_admin_change_plan(plan_id)
-    if plan.kind != AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT or plan.approved is not True or plan.approved_by != "sisko" or plan.canceled or plan.archived:
-        raise LegacyAbandonmentError("exact approved Sisko abandonment plan is required")
+    _require_approved_sisko_plan(plan, AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT, plan.target)
     metadata = plan.adapter_metadata.get("legacy_abandonment") if isinstance(plan.adapter_metadata, Mapping) else None
     successor_id = metadata.get("successorPlanId") if isinstance(metadata, Mapping) else None
     if not isinstance(successor_id, str):
@@ -244,7 +284,7 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
         raise LegacyAbandonmentError("current bridge or observation identity differs from staged action")
     claimed = bridge.store.claim_legacy_abandonment(action_id, intent["actionDigest"], now=_now(bridge))
     try:
-        raw_response = bridge.sender("round-legacy-abandonment", action_id, action["wire"])
+        raw_response = bridge.sender("round-legacy-abandon", action_id, action["wire"])
     except Exception:
         # A transport/process failure is recoverable: leave the outbox in
         # peer-pending so the exact action can be replayed later.

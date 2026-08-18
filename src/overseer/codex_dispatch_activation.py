@@ -35,17 +35,13 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
 CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v2"
-JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v2"
+JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v3"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 # This path is relative to CODEX_HOME exactly once.
 DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
-SOURCE_FILES = (
-    "src/overseer/agent_adapters/codex.py",
-    "src/overseer/codex_usage.py",
-    "src/overseer/psychlo_bridge.py",
-)
+SOURCE_ROOTS = ("src/overseer",)
 DROP_IN_CONTENT = b"[Service]\nEnvironment=OVERSEER_CODEX_APP_SERVER_DISPATCH=1\n"
 CANONICAL_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 EUID_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
@@ -53,9 +49,33 @@ CODEX_HOME = EUID_HOME / ".codex"
 _HEX = set("0123456789abcdef")
 _JOURNAL_KEYS = {
     "schemaVersion", "planId", "specDigest", "phase", "dropInPath", "dropInDigest",
-    "dropInOwnership", "daemonSocketPath", "daemonOwnership",
+    "dropInOwnership", "daemonSocketPath", "daemonOwnership", "bootstrapOwnership",
+    "remoteControlPrior", "remoteControlOwnership",
 }
 _DAEMON_VERSION_KEYS = {"cliVersion", "daemonVersion", "state", "remoteControlEnabled", "socketPath"}
+_JOURNAL_PHASES = {
+    "none", "intent-bootstrap", "bootstrapped", "intent-start", "started",
+    "intent-drop-in", "drop-in-installed", "reloaded", "restarted",
+    "rollback-pending", "rolled-back", "verified",
+}
+_DROP_IN_OWNERSHIP = {"unknown", "write-issued", "created-by-operation", "preexisting", "removed"}
+_DAEMON_OWNERSHIP = {"unknown", "start-issued", "started-by-operation", "preexisting", "stopped"}
+_BOOTSTRAP_OWNERSHIP = {
+    "unknown", "bootstrap-issued", "created-by-operation", "preexisting",
+    "not-created", "residual",
+}
+_REMOTE_CONTROL_PRIOR = {"unknown", "absent", "disabled", "enabled"}
+_REMOTE_CONTROL_OWNERSHIP = {
+    "unknown", "disable-issued", "disabled-by-operation", "preexisting-disabled",
+    "not-changed", "residual", "restored",
+}
+_BOOTSTRAP_OUTPUT_KEYS = {
+    "status", "backend", "autoUpdateEnabled", "remoteControlEnabled",
+    "managedCodexPath", "managedCodexVersion", "socketPath", "cliVersion",
+    "appServerVersion",
+}
+_REMOTE_CONTROL_REQUIRED_KEYS = {"status", "remoteControlEnabled", "socketPath", "cliVersion"}
+_REMOTE_CONTROL_OPTIONAL_KEYS = {"backend", "appServerVersion"}
 
 
 def _canonical(value: object) -> str:
@@ -102,9 +122,29 @@ def _git(command: Sequence[str]) -> str:
     return _run_checked(("/usr/bin/git", "-C", str(CANONICAL_SOURCE_ROOT), *command))
 
 
-def _module_digest() -> str:
+def _reviewed_source_files() -> tuple[str, ...]:
+    tracked = tuple(
+        sorted(
+            item for item in _git(("ls-files", "--", *SOURCE_ROOTS)).splitlines()
+            if item.endswith(".py")
+        )
+    )
+    untracked = tuple(
+        sorted(
+            item for item in _git(("ls-files", "--others", "--exclude-standard", "--", *SOURCE_ROOTS)).splitlines()
+            if item.endswith(".py")
+        )
+    )
+    if untracked:
+        raise ValueError("untracked Python exists in a reviewed source root")
+    if not tracked:
+        raise ValueError("reviewed Python source inventory is empty")
+    return tracked
+
+
+def _module_digest(source_files: Sequence[str]) -> str:
     hasher = hashlib.sha256()
-    for relative in SOURCE_FILES:
+    for relative in source_files:
         path = CANONICAL_SOURCE_ROOT / relative
         if not path.is_file() or path.is_symlink():
             raise ValueError("reviewed source module is missing")
@@ -113,19 +153,26 @@ def _module_digest() -> str:
 
 
 def _source_clean() -> None:
-    status = _git(("status", "--porcelain", "--untracked-files=all", "--", *SOURCE_FILES, "pyproject.toml"))
+    _reviewed_source_files()
+    status = _git(("status", "--porcelain", "--untracked-files=no", "--", *SOURCE_ROOTS, "pyproject.toml"))
     if status:
         raise ValueError("reviewed source checkout is dirty")
 
 
-def _review_digest(source_commit: str, source_tree_digest: str, source_module_digest: str) -> str:
+def _review_digest(
+    source_commit: str,
+    source_tree_digest: str,
+    source_module_digest: str,
+    source_files: Sequence[str] | None = None,
+) -> str:
+    reviewed_files = tuple(source_files) if source_files is not None else _reviewed_source_files()
     return _digest({
         "reviewScope": "structured-codex-dispatch",
         "reviewAuthority": "canonical-overseer-checkout",
         "sourceCommit": source_commit,
         "sourceTreeDigest": source_tree_digest,
         "sourceModuleDigest": source_module_digest,
-        "sourceFiles": list(SOURCE_FILES),
+        "sourceFiles": list(reviewed_files),
     })
 
 
@@ -140,7 +187,7 @@ class CodexDispatchActivationSpec:
     drop_in_relative_path: str = DROP_IN_RELATIVE_PATH
     daemon_socket: str = DAEMON_SOCKET_RELATIVE_PATH
     health_url: str = HEALTH_URL
-    source_files: tuple[str, ...] = SOURCE_FILES
+    source_files: tuple[str, ...] = ()
 
     @property
     def source_root(self) -> Path:
@@ -182,14 +229,27 @@ class CodexDispatchActivationSpec:
             raise ValueError("service binding is not reviewed")
         if value["daemonSocket"] != DAEMON_SOCKET_RELATIVE_PATH or value["healthUrl"] != HEALTH_URL:
             raise ValueError("Codex endpoint binding is not reviewed")
-        if value["sourceFiles"] != list(SOURCE_FILES):
-            raise ValueError("sourceFiles are not the reviewed module binding")
+        raw_files = value["sourceFiles"]
+        if (not isinstance(raw_files, list) or not raw_files
+                or any(not isinstance(item, str) or not item.endswith(".py")
+                       or not any(item.startswith(f"{root}/") for root in SOURCE_ROOTS)
+                       for item in raw_files)
+                or raw_files != sorted(set(raw_files))):
+            raise ValueError("sourceFiles are not a closed reviewed Python inventory")
+        reviewed_files = tuple(raw_files)
         source_commit = str(value["sourceCommit"]).lower()
         source_tree = str(value["sourceTreeDigest"]).lower()
         source_module = str(value["sourceModuleDigest"]).lower()
-        if str(value["reviewDigest"]).lower() != _review_digest(source_commit, source_tree, source_module):
+        if str(value["reviewDigest"]).lower() != _review_digest(source_commit, source_tree, source_module, reviewed_files):
             raise ValueError("review digest is not derived from the reviewed binding")
-        return cls(CODEX_DISPATCH_ACTIVATION_SCHEMA, source_commit, source_tree, source_module, str(value["reviewDigest"]).lower())
+        return cls(
+            CODEX_DISPATCH_ACTIVATION_SCHEMA,
+            source_commit,
+            source_tree,
+            source_module,
+            str(value["reviewDigest"]).lower(),
+            source_files=reviewed_files,
+        )
 
 
 def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
@@ -197,15 +257,17 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
     if not CANONICAL_SOURCE_ROOT.is_dir() or CANONICAL_SOURCE_ROOT.is_symlink():
         raise ValueError("canonical reviewed source checkout is unavailable")
     _source_clean()
+    source_files = _reviewed_source_files()
     source_commit = _git(("rev-parse", "HEAD")).lower()
     source_tree = _git(("rev-parse", "HEAD^{tree}")).lower()
-    source_module = _module_digest()
+    source_module = _module_digest(source_files)
     return CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA,
         source_commit,
         source_tree,
         source_module,
-        _review_digest(source_commit, source_tree, source_module),
+        _review_digest(source_commit, source_tree, source_module, source_files),
+        source_files=source_files,
     )
 
 
@@ -279,9 +341,14 @@ def verify_reviewed_source_binding(spec: CodexDispatchActivationSpec) -> None:
     _source_clean()
     if _git(("rev-parse", "HEAD")).lower() != spec.source_commit or _git(("rev-parse", "HEAD^{tree}")).lower() != spec.source_tree_digest:
         raise ValueError("reviewed source commit or tree binding changed")
-    if _module_digest() != spec.source_module_digest:
+    reviewed_files = _reviewed_source_files()
+    if spec.source_files != reviewed_files:
+        raise ValueError("reviewed source file inventory changed")
+    if _module_digest(reviewed_files) != spec.source_module_digest:
         raise ValueError("reviewed source module digest changed")
-    if spec.review_digest != _review_digest(spec.source_commit, spec.source_tree_digest, spec.source_module_digest):
+    if spec.review_digest != _review_digest(
+        spec.source_commit, spec.source_tree_digest, spec.source_module_digest, reviewed_files
+    ):
         raise ValueError("review digest changed")
 
 
@@ -295,59 +362,81 @@ def _paths() -> tuple[Path, Path, Path, Path]:
 def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _owner_only(path.parent, "activation directory")
-    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temp = Path(raw)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(path.parent, directory_flags)
     try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
-        _owner_only(path, "activation file")
+        directory_info = os.fstat(directory_fd)
+        if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) & 0o077):
+            raise ValueError("activation directory descriptor is unsafe")
+        fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temp = Path(raw)
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, path)
+            _owner_only(path, "activation file")
+            os.fsync(directory_fd)
+        finally:
+            temp.unlink(missing_ok=True)
     finally:
-        temp.unlink(missing_ok=True)
+        os.close(directory_fd)
 
 
-def _secure_read_exact(path: Path, expected: bytes) -> bytes:
-    """Read one owner-only regular file without following replacement links."""
-    try:
-        lexical_before = path.lstat()
-    except FileNotFoundError:
-        raise
-    if lexical_before.st_uid != os.geteuid() or stat.S_IMODE(lexical_before.st_mode) & 0o077:
-        raise ValueError("drop-in is not owner-only")
-    if not stat.S_ISREG(lexical_before.st_mode) or stat.S_ISLNK(lexical_before.st_mode) or lexical_before.st_nlink != 1:
-        raise ValueError("drop-in is not a private single-link regular file")
+def _stable_stat(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _secure_read_stable(path: Path, label: str, *, owner_only: bool = True) -> bytes:
+    """Double-read one stable, euid-owned regular file through one nofollow fd."""
+    lexical_before = path.lstat()
+    if lexical_before.st_uid != os.geteuid():
+        raise ValueError(f"{label} is not euid-owned")
+    if owner_only and stat.S_IMODE(lexical_before.st_mode) & 0o077:
+        raise ValueError(f"{label} is not owner-only")
+    if not stat.S_ISREG(lexical_before.st_mode) or lexical_before.st_nlink != 1:
+        raise ValueError(f"{label} is not a private single-link regular file")
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
         before = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_uid, stat.S_IMODE(before.st_mode), before.st_nlink) != (
-            lexical_before.st_dev, lexical_before.st_ino, lexical_before.st_uid,
-            stat.S_IMODE(lexical_before.st_mode), lexical_before.st_nlink,
-        ):
-            raise ValueError("drop-in changed before secure read")
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077:
-            raise ValueError("drop-in descriptor is unsafe")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        data = b"".join(chunks)
+        if _stable_stat(before) != _stable_stat(lexical_before):
+            raise ValueError(f"{label} changed before secure read")
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid()
+                or (owner_only and stat.S_IMODE(before.st_mode) & 0o077)):
+            raise ValueError(f"{label} descriptor is unsafe")
+
+        def read_all() -> bytes:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+
+        first = read_all()
+        os.lseek(fd, 0, os.SEEK_SET)
+        second = read_all()
         after = os.fstat(fd)
         lexical_after = path.lstat()
-        if (after.st_dev, after.st_ino, after.st_uid, stat.S_IMODE(after.st_mode), after.st_nlink, after.st_size) != (
-            before.st_dev, before.st_ino, before.st_uid, stat.S_IMODE(before.st_mode), before.st_nlink, before.st_size,
-        ) or (lexical_after.st_dev, lexical_after.st_ino) != (before.st_dev, before.st_ino):
-            raise ValueError("drop-in changed during secure read")
-        if data != expected:
-            raise ValueError("drop-in content is not the reviewed override")
-        return data
+        if first != second or _stable_stat(after) != _stable_stat(before) or _stable_stat(lexical_after) != _stable_stat(before):
+            raise ValueError(f"{label} changed during stable secure read")
+        return first
     finally:
         os.close(fd)
+
+
+def _secure_read_exact(path: Path, expected: bytes) -> bytes:
+    data = _secure_read_stable(path, "drop-in")
+    if data != expected:
+        raise ValueError("drop-in content is not the reviewed override")
+    return data
 
 
 def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) -> dict[str, object]:
@@ -356,6 +445,8 @@ def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) 
         "schemaVersion": JOURNAL_SCHEMA, "planId": plan_id, "specDigest": digest, "phase": phase,
         "dropInPath": str(drop_in), "dropInDigest": hashlib.sha256(DROP_IN_CONTENT).hexdigest(),
         "dropInOwnership": "unknown", "daemonSocketPath": str(socket_path), "daemonOwnership": "unknown",
+        "bootstrapOwnership": "unknown", "remoteControlPrior": "unknown",
+        "remoteControlOwnership": "unknown",
     }
     value.update(updates)
     return value
@@ -363,13 +454,29 @@ def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) 
 
 def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     drop_in, path, _, socket_path = _paths()
-    if not path.exists():
+    try:
+        raw = _secure_read_stable(path, "activation journal")
+    except FileNotFoundError:
         return None
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if (set(value) != _JOURNAL_KEYS or value["schemaVersion"] != JOURNAL_SCHEMA or value["planId"] != plan_id
+    value = json.loads(raw.decode("utf-8"))
+    if (not isinstance(value, dict) or set(value) != _JOURNAL_KEYS
+            or value["schemaVersion"] != JOURNAL_SCHEMA or value["planId"] != plan_id
             or value["specDigest"] != digest or value["dropInPath"] != str(drop_in)
+            or value["dropInDigest"] != hashlib.sha256(DROP_IN_CONTENT).hexdigest()
             or value["daemonSocketPath"] != str(socket_path)):
         raise ValueError("activation journal binding is invalid")
+    if value["phase"] not in _JOURNAL_PHASES:
+        raise ValueError("activation journal phase is invalid")
+    if value["dropInOwnership"] not in _DROP_IN_OWNERSHIP:
+        raise ValueError("activation journal drop-in ownership is invalid")
+    if value["daemonOwnership"] not in _DAEMON_OWNERSHIP:
+        raise ValueError("activation journal daemon ownership is invalid")
+    if value["bootstrapOwnership"] not in _BOOTSTRAP_OWNERSHIP:
+        raise ValueError("activation journal bootstrap ownership is invalid")
+    if value["remoteControlPrior"] not in _REMOTE_CONTROL_PRIOR:
+        raise ValueError("activation journal remote-control prior state is invalid")
+    if value["remoteControlOwnership"] not in _REMOTE_CONTROL_OWNERSHIP:
+        raise ValueError("activation journal remote-control ownership is invalid")
     return value
 
 
@@ -383,9 +490,21 @@ def _activation_lock():
     _, _, path, _ = _paths()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _owner_only(path.parent, "activation lock directory")
-    with path.open("a+") as stream:
-        path.chmod(0o600)
-        _owner_only(path, "activation lock")
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        fd = os.open(path, flags)
+    with os.fdopen(fd, "r+") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1:
+            raise ValueError("activation lock is not a private euid-owned regular file")
+        if stat.S_IMODE(before.st_mode) & 0o077:
+            raise ValueError("activation lock is not owner-only")
+        os.fchmod(stream.fileno(), 0o600)
+        after = os.fstat(stream.fileno())
+        if _stable_stat(after)[:2] != _stable_stat(before)[:2] or stat.S_IMODE(after.st_mode) != 0o600:
+            raise ValueError("activation lock changed during validation")
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -441,6 +560,92 @@ def _daemon_status() -> str:
     except ValueError:
         raise
     return "running-valid"
+
+
+@dataclass(frozen=True)
+class _BootstrapState:
+    configured: bool
+    updater_running: bool
+    remote_control_enabled: bool | None
+    daemon_status: str
+
+
+def _pid_matches_updater(pid: int) -> bool:
+    proc = Path("/proc") / str(pid)
+    try:
+        if proc.stat().st_uid != os.geteuid():
+            return False
+        parts = (proc / "cmdline").read_bytes().split(b"\0")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return False
+    expected = str(CODEX_HOME / "packages/standalone/current/codex").encode()
+    return len(parts) >= 4 and parts[0] == expected and parts[1:4] == [
+        b"app-server", b"daemon", b"pid-update-loop",
+    ]
+
+
+def _bootstrap_state() -> _BootstrapState:
+    state_dir = CODEX_HOME / "app-server-daemon"
+    settings_path = state_dir / "settings.json"
+    updater_path = state_dir / "app-server-updater.pid"
+    remote_enabled: bool | None = None
+    configured = False
+    try:
+        raw_settings = _secure_read_stable(settings_path, "Codex daemon settings", owner_only=False)
+    except FileNotFoundError:
+        pass
+    else:
+        settings = json.loads(raw_settings.decode("utf-8"))
+        if not isinstance(settings, dict) or set(settings) != {"remoteControlEnabled"} or not isinstance(settings["remoteControlEnabled"], bool):
+            raise ValueError("Codex daemon settings contract is invalid")
+        configured = True
+        remote_enabled = settings["remoteControlEnabled"]
+    updater_running = False
+    try:
+        raw_pid = _secure_read_stable(updater_path, "Codex updater pid", owner_only=False)
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            pid_text = raw_pid.decode("ascii").strip()
+            pid = int(pid_text)
+        except (UnicodeError, ValueError) as error:
+            raise ValueError("Codex updater pid contract is invalid") from error
+        if pid <= 1:
+            raise ValueError("Codex updater pid contract is invalid")
+        updater_running = _pid_matches_updater(pid)
+    return _BootstrapState(configured, updater_running, remote_enabled, _daemon_status())
+
+
+def _bootstrap_contract(output: str) -> dict[str, object]:
+    value = json.loads(output)
+    expected_managed = str(CODEX_HOME / "packages/standalone/current/codex")
+    if (not isinstance(value, dict) or set(value) != _BOOTSTRAP_OUTPUT_KEYS
+            or value["status"] != "bootstrapped" or value["backend"] != "pid"
+            or value["autoUpdateEnabled"] is not True or value["remoteControlEnabled"] is not False
+            or value["managedCodexPath"] != expected_managed
+            or value["socketPath"] != str(CODEX_HOME / DAEMON_SOCKET_RELATIVE_PATH)
+            or not isinstance(value["cliVersion"], str) or not value["cliVersion"]
+            or not isinstance(value["appServerVersion"], str) or not value["appServerVersion"]
+            or not (value["managedCodexVersion"] is None or isinstance(value["managedCodexVersion"], str))):
+        raise ValueError("Codex bootstrap output contract is invalid")
+    return value
+
+
+def _remote_control_disabled_contract(output: str) -> dict[str, object]:
+    value = json.loads(output)
+    if (not isinstance(value, dict)
+            or not _REMOTE_CONTROL_REQUIRED_KEYS <= set(value)
+            or not set(value) <= _REMOTE_CONTROL_REQUIRED_KEYS | _REMOTE_CONTROL_OPTIONAL_KEYS
+            or value["status"] not in {"disabled", "alreadyDisabled"}
+            or value["remoteControlEnabled"] is not False
+            or value["socketPath"] != str(CODEX_HOME / DAEMON_SOCKET_RELATIVE_PATH)
+            or not isinstance(value["cliVersion"], str) or not value["cliVersion"]
+            or ("backend" in value and value["backend"] not in {None, "pid"})
+            or ("appServerVersion" in value and value["appServerVersion"] is not None
+                and not isinstance(value["appServerVersion"], str))):
+        raise ValueError("Codex remote-control output contract is invalid")
+    return value
 
 
 def _probe_proxy() -> None:
@@ -536,6 +741,28 @@ def _rollback(plan_id: str, digest: str) -> str:
         except (OSError, RuntimeError, ValueError) as error:
             raise RuntimeError(f"rollback daemon stop is retryable: {error}") from error
         journal["daemonOwnership"] = "stopped"
+    residual: list[str] = []
+    bootstrap_state: _BootstrapState | None = None
+    if journal["bootstrapOwnership"] in {"bootstrap-issued", "created-by-operation", "residual"}:
+        bootstrap_state = _bootstrap_state()
+        if bootstrap_state.configured or bootstrap_state.updater_running:
+            journal["bootstrapOwnership"] = "residual"
+            residual.append("bootstrap")
+        else:
+            journal["bootstrapOwnership"] = "not-created"
+    if journal["remoteControlOwnership"] in {"disable-issued", "disabled-by-operation", "residual"}:
+        bootstrap_state = bootstrap_state or _bootstrap_state()
+        prior = journal["remoteControlPrior"]
+        if bootstrap_state.remote_control_enabled is False and prior in {"enabled", "absent"}:
+            journal["remoteControlOwnership"] = "residual"
+            residual.append("remote-control setting")
+        elif prior == "enabled" and bootstrap_state.remote_control_enabled is True:
+            journal["remoteControlOwnership"] = "restored"
+        else:
+            journal["remoteControlOwnership"] = "not-changed"
+    if residual:
+        _write_journal(journal)
+        raise RuntimeError(f"rollback has residual {' and '.join(residual)} state")
     journal["phase"] = "rolled-back"
     _write_journal(journal)
     return "exact Codex dispatch activation rolled back"
@@ -549,10 +776,48 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             verify_reviewed_source_binding(spec)
         if operation == "bootstrap":
             journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            state = _bootstrap_state()
+            if (journal["bootstrapOwnership"] in {"bootstrap-issued", "created-by-operation"}
+                    and state.configured and state.updater_running
+                    and state.remote_control_enabled is False and state.daemon_status == "running-valid"):
+                journal["bootstrapOwnership"] = "created-by-operation"
+                if journal["daemonOwnership"] == "start-issued":
+                    journal["daemonOwnership"] = "started-by-operation"
+                journal["remoteControlOwnership"] = (
+                    "preexisting-disabled"
+                    if journal["remoteControlPrior"] == "disabled"
+                    else "disabled-by-operation"
+                )
+                journal["phase"] = "bootstrapped"
+                _write_journal(journal)
+                return 0, "daemon bootstrap effect reconciled with remote control disabled", ""
+            journal["bootstrapOwnership"] = "preexisting" if state.updater_running else "bootstrap-issued"
+            journal["remoteControlPrior"] = (
+                "absent" if not state.configured else "enabled" if state.remote_control_enabled else "disabled"
+            )
+            journal["remoteControlOwnership"] = (
+                "preexisting-disabled" if state.remote_control_enabled is False else "disable-issued"
+            )
+            journal["daemonOwnership"] = (
+                "preexisting" if state.daemon_status == "running-valid" else "start-issued"
+            )
             journal["phase"] = "intent-bootstrap"
             _write_journal(journal)
-            _run_checked(("codex", "app-server", "daemon", "bootstrap"))
-            _run_checked(("codex", "app-server", "daemon", "disable-remote-control"))
+            _bootstrap_contract(_run_checked(("codex", "app-server", "daemon", "bootstrap")))
+            _remote_control_disabled_contract(
+                _run_checked(("codex", "app-server", "daemon", "disable-remote-control"))
+            )
+            journal["bootstrapOwnership"] = (
+                "preexisting" if state.updater_running else "created-by-operation"
+            )
+            journal["daemonOwnership"] = (
+                "preexisting" if state.daemon_status == "running-valid" else "started-by-operation"
+            )
+            journal["remoteControlOwnership"] = (
+                "preexisting-disabled"
+                if journal["remoteControlPrior"] == "disabled"
+                else "disabled-by-operation"
+            )
             journal["phase"] = "bootstrapped"
             _write_journal(journal)
             return 0, "daemon bootstrapped without remote control", ""
@@ -620,8 +885,33 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
                 _write_journal(journal)
             return 0, "reviewed source binding verified", ""
         raise ValueError("unsupported Codex dispatch activation operation")
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
-        return 1, "", str(error)
+    except Exception as error:
+        return 1, "", f"activation operation failed: {error}"
+
+
+def _run_audited_step(
+    runner: Callable[[AdminCommandStep], AdminCommandResult],
+    step: AdminCommandStep,
+) -> AdminCommandResult:
+    try:
+        result = runner(step)
+        if not isinstance(result, AdminCommandResult):
+            raise TypeError("runner returned an invalid result")
+        return result
+    except Exception as error:
+        return AdminCommandResult(
+            step.title,
+            step.command,
+            1,
+            stderr=f"{type(error).__name__}: activation operation failed",
+        )
+
+
+def _run_rollback_steps(
+    runner: Callable[[AdminCommandStep], AdminCommandResult],
+    steps: Sequence[AdminCommandStep],
+) -> tuple[AdminCommandResult, ...]:
+    return tuple(_run_audited_step(runner, step) for step in steps)
 
 
 def execute_codex_dispatch_activation_plan(
@@ -643,17 +933,17 @@ def execute_codex_dispatch_activation_plan(
         with _activation_lock():
             command_results: list[AdminCommandResult] = []
             for step in plan.steps:
-                result = runner(step)
+                result = _run_audited_step(runner, step)
                 command_results.append(result)
                 if result.exit_code != 0:
-                    rollback = tuple(runner(item) for item in plan.rollback_steps)
+                    rollback = _run_rollback_steps(runner, plan.rollback_steps)
                     return AdminExecutionResult(f"admin.exec.{plan.id}.failed", plan.id, AdminExecutionStatus.FAILED, f"Codex dispatch activation failed during step: {result.title}; rollback attempted", tuple(command_results), rollback_results=rollback)
             verification: list[AdminCommandResult] = []
             for step in plan.verification_steps:
-                result = runner(step)
+                result = _run_audited_step(runner, step)
                 verification.append(result)
                 if result.exit_code != 0:
-                    rollback = tuple(runner(item) for item in plan.rollback_steps)
+                    rollback = _run_rollback_steps(runner, plan.rollback_steps)
                     return AdminExecutionResult(f"admin.exec.{plan.id}.failed", plan.id, AdminExecutionStatus.FAILED, f"Codex dispatch activation verification failed during step: {result.title}; rollback attempted", tuple(command_results), tuple(verification), rollback)
             return AdminExecutionResult(f"admin.exec.{plan.id}.completed", plan.id, AdminExecutionStatus.COMPLETED, "approved Codex dispatch activation completed and verified", tuple(command_results), tuple(verification))
     except RuntimeError as error:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +33,7 @@ def _spec() -> CodexDispatchActivationSpec:
         source_tree,
         source_module,
         activation._review_digest(source_commit, source_tree, source_module),
+        source_files=activation._reviewed_source_files(),
     )
 
 
@@ -39,6 +43,31 @@ def _plan() -> object:
 
 def _approved_plan():
     return replace(_plan(), approved=True, approved_by="sisko", approved_at="2026-08-18T00:00:00+00:00")
+
+
+def _bootstrap_output() -> str:
+    return json.dumps({
+        "status": "bootstrapped",
+        "backend": "pid",
+        "autoUpdateEnabled": True,
+        "remoteControlEnabled": False,
+        "managedCodexPath": str(activation.CODEX_HOME / "packages/standalone/current/codex"),
+        "managedCodexVersion": "0.147.0",
+        "socketPath": str(activation.CODEX_HOME / activation.DAEMON_SOCKET_RELATIVE_PATH),
+        "cliVersion": "0.147.0",
+        "appServerVersion": "0.147.0",
+    })
+
+
+def _remote_disabled_output() -> str:
+    return json.dumps({
+        "status": "alreadyDisabled",
+        "backend": "pid",
+        "remoteControlEnabled": False,
+        "socketPath": str(activation.CODEX_HOME / activation.DAEMON_SOCKET_RELATIVE_PATH),
+        "cliVersion": "0.147.0",
+        "appServerVersion": "0.147.0",
+    })
 
 
 def test_plan_is_exact_high_human_sisko_and_fixed_socket():
@@ -60,6 +89,26 @@ def test_caller_manifest_and_source_root_cannot_supply_authority(tmp_path: Path)
     assert spec.source_root == activation.CANONICAL_SOURCE_ROOT
     with pytest.raises(ValueError, match="exact keys"):
         CodexDispatchActivationSpec.from_json({**spec.to_json(), "sourceRoot": "/tmp/untrusted"})
+
+
+def test_reviewed_source_inventory_rejects_untracked_python_but_allows_unrelated_files(monkeypatch: pytest.MonkeyPatch):
+    tracked = "src/overseer/a.py\nsrc/overseer/agent_adapters/codex.py\n"
+
+    def clean_git(command):
+        return "" if "--others" in command else tracked
+
+    monkeypatch.setattr(activation, "_git", clean_git)
+    assert activation._reviewed_source_files() == (
+        "src/overseer/a.py",
+        "src/overseer/agent_adapters/codex.py",
+    )
+
+    def untracked_git(command):
+        return "src/overseer/injected.py" if "--others" in command else tracked
+
+    monkeypatch.setattr(activation, "_git", untracked_git)
+    with pytest.raises(ValueError, match="untracked Python"):
+        activation._reviewed_source_files()
 
 
 def test_plan_rejects_review_digest_or_metadata_drift():
@@ -91,8 +140,18 @@ def test_marker_bootstrap_proves_remote_control_contract(monkeypatch: pytest.Mon
     monkeypatch.setattr(activation, "EUID_HOME", Path("/tmp") / f"codex-dispatch-bootstrap-{id(plan)}")
     monkeypatch.setattr(activation, "CODEX_HOME", activation.EUID_HOME / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(
+        activation,
+        "_bootstrap_state",
+        lambda: activation._BootstrapState(False, False, None, "not-running"),
+    )
     calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
+
+    def run_checked(command, **_kwargs):
+        calls.append(tuple(command))
+        return _bootstrap_output() if command[-1] == "bootstrap" else _remote_disabled_output()
+
+    monkeypatch.setattr(activation, "_run_checked", run_checked)
     code, out, err = execute_codex_dispatch_activation_marker(plan.steps[0].command)
     assert code == 0, err
     assert out == "daemon bootstrapped without remote control"
@@ -167,6 +226,81 @@ def test_secure_dropin_read_rejects_path_replacement_after_fd_read(tmp_path: Pat
         activation._secure_read_exact(path, activation.DROP_IN_CONTENT)
 
 
+def test_secure_dropin_read_rejects_in_place_rewrite_between_double_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "drop-in.conf"
+    path.write_bytes(activation.DROP_IN_CONTENT)
+    path.chmod(0o600)
+    original_read = activation.os.read
+    rewritten = False
+
+    def rewriting_read(fd, size):
+        nonlocal rewritten
+        data = original_read(fd, size)
+        if not rewritten:
+            rewritten = True
+            with path.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(b"X" * len(activation.DROP_IN_CONTENT))
+                stream.flush()
+                os.fsync(stream.fileno())
+        return data
+
+    monkeypatch.setattr(activation.os, "read", rewriting_read)
+    with pytest.raises(ValueError, match="changed during|stable"):
+        activation._secure_read_exact(path, activation.DROP_IN_CONTENT)
+
+
+def test_activation_lock_rejects_symlink_and_unsafe_mode_without_chmod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    _, _, lock, _ = activation._paths()
+    lock.parent.mkdir(parents=True, mode=0o700)
+    target = tmp_path / "target.lock"
+    target.write_text("keep", encoding="utf-8")
+    target.chmod(0o644)
+    lock.symlink_to(target)
+    with pytest.raises(OSError):
+        with activation._activation_lock():
+            pass
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    lock.unlink()
+    lock.write_text("", encoding="utf-8")
+    lock.chmod(0o666)
+    with pytest.raises(ValueError, match="owner-only"):
+        with activation._activation_lock():
+            pass
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o666
+    lock.chmod(0o600)
+    hardlink = tmp_path / "hardlink.lock"
+    hardlink.hardlink_to(lock)
+    with pytest.raises(ValueError, match="private"):
+        with activation._activation_lock():
+            pass
+
+
+def test_journal_secure_read_rejects_symlink_and_unknown_enums(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    plan = _plan()
+    digest = plan.steps[0].command[2]
+    value = activation._journal(plan.id, digest)
+    activation._write_journal(value)
+    _, journal, _, _ = activation._paths()
+    real = tmp_path / "real-journal.json"
+    journal.rename(real)
+    journal.symlink_to(real)
+    with pytest.raises((OSError, ValueError)):
+        activation._load_journal(plan.id, digest)
+    journal.unlink()
+    value["phase"] = "invented"
+    activation._atomic_write(journal, (activation._canonical(value) + "\n").encode())
+    with pytest.raises(ValueError, match="phase"):
+        activation._load_journal(plan.id, digest)
+    journal.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only"):
+        activation._load_journal(plan.id, digest)
+
+
 def test_environment_verification_preserves_existing_variables(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "PATH=/usr/bin OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OTHER=ok")
     activation._verify_environment()
@@ -176,6 +310,7 @@ def test_environment_verification_preserves_existing_variables(monkeypatch: pyte
 
 
 def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
@@ -185,7 +320,7 @@ def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, mo
     monkeypatch.setattr(activation, "_daemon_status", lambda: (_ for _ in ()).throw(ValueError("invalid preexisting daemon")))
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
-    code, _, err = execute_codex_dispatch_activation_marker(_plan().steps[1].command)
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[1].command)
     assert code == 1
     assert "invalid preexisting" in err
     assert not any(command[-1:] == ("start",) for command in calls)
@@ -193,13 +328,13 @@ def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, mo
 
 
 def test_genuine_preexisting_valid_daemon_is_not_owned_by_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
-    plan = _plan()
     code, _, err = execute_codex_dispatch_activation_marker(plan.steps[1].command)
     assert code == 0, err
     assert activation._load_journal(plan.id, plan.steps[1].command[2])["daemonOwnership"] == "preexisting"
@@ -275,15 +410,27 @@ def test_retry_owned_resources_are_rolled_back_after_later_verification_failure(
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     plan = _approved_plan()
-    state = {"daemon_running": False}
+    state = {"daemon_running": False, "configured": False, "updater": False, "remote": None}
 
     def daemon_status():
         return "running-valid" if state["daemon_running"] else "not-running"
 
     monkeypatch.setattr(activation, "_daemon_status", daemon_status)
+    monkeypatch.setattr(
+        activation,
+        "_bootstrap_state",
+        lambda: activation._BootstrapState(
+            state["configured"], state["updater"], state["remote"], daemon_status()
+        ),
+    )
 
     def run_checked(command, **_kwargs):
         command = tuple(command)
+        if command[-1:] == ("bootstrap",):
+            state.update(daemon_running=True, configured=True, updater=True, remote=False)
+            return _bootstrap_output()
+        if command[-1:] == ("disable-remote-control",):
+            return _remote_disabled_output()
         if command[-1:] == ("start",):
             state["daemon_running"] = True
         elif command[-1:] == ("stop",):
@@ -304,9 +451,99 @@ def test_retry_owned_resources_are_rolled_back_after_later_verification_failure(
     journal = activation._load_journal(plan.id, plan.steps[0].command[2])
     assert not drop_in.exists()
     assert state["daemon_running"] is False
-    assert journal["phase"] == "rolled-back"
+    assert journal["phase"] == "rollback-pending"
     assert journal["dropInOwnership"] == "removed"
     assert journal["daemonOwnership"] == "stopped"
+    assert journal["bootstrapOwnership"] == "residual"
+
+
+def test_bootstrap_crash_retry_reconciles_and_rollback_reports_residual(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    state = {"configured": False, "updater": False, "remote": None, "daemon": False}
+
+    def bootstrap_state():
+        return activation._BootstrapState(
+            state["configured"], state["updater"], state["remote"],
+            "running-valid" if state["daemon"] else "not-running",
+        )
+
+    monkeypatch.setattr(activation, "_bootstrap_state", bootstrap_state)
+    monkeypatch.setattr(
+        activation,
+        "_daemon_status",
+        lambda: "running-valid" if state["daemon"] else "not-running",
+    )
+
+    def crash_after_bootstrap(command, **_kwargs):
+        if tuple(command)[-1:] == ("bootstrap",):
+            state.update(configured=True, updater=True, remote=False, daemon=True)
+            raise RuntimeError("crash after bootstrap effect")
+        return _remote_disabled_output()
+
+    monkeypatch.setattr(activation, "_run_checked", crash_after_bootstrap)
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[0].command)
+    assert code == 1
+    assert "crash after bootstrap effect" in err
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert journal["phase"] == "intent-bootstrap"
+    assert journal["bootstrapOwnership"] == "bootstrap-issued"
+    calls: list[tuple[str, ...]] = []
+
+    def after_crash(command, **_kwargs):
+        command = tuple(command)
+        calls.append(command)
+        if command[-1:] == ("stop",):
+            state["daemon"] = False
+        return "ok"
+
+    monkeypatch.setattr(activation, "_run_checked", after_crash)
+    retry_code, retry_out, retry_err = execute_codex_dispatch_activation_marker(plan.steps[0].command)
+    assert retry_code == 0, retry_err
+    assert "reconciled" in retry_out
+    assert not calls
+    rollback_code, _, rollback_err = execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)
+    assert rollback_code == 1
+    assert "residual bootstrap" in rollback_err
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert journal["phase"] == "rollback-pending"
+    assert journal["bootstrapOwnership"] == "residual"
+    assert journal["daemonOwnership"] == "stopped"
+    assert ("codex", "app-server", "daemon", "stop") in calls
+
+
+def test_genuine_preexisting_bootstrap_and_disabled_remote_state_are_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(
+        activation,
+        "_bootstrap_state",
+        lambda: activation._BootstrapState(True, True, False, "running-valid"),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def run_checked(command, **_kwargs):
+        command = tuple(command)
+        calls.append(command)
+        if command[-1:] == ("bootstrap",):
+            return _bootstrap_output()
+        if command[-1:] == ("disable-remote-control",):
+            return _remote_disabled_output()
+        return "ok"
+
+    monkeypatch.setattr(activation, "_run_checked", run_checked)
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[0].command)
+    assert code == 0, err
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert journal["bootstrapOwnership"] == "preexisting"
+    assert journal["remoteControlOwnership"] == "preexisting-disabled"
+    assert journal["daemonOwnership"] == "preexisting"
+    assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
+    assert not any(command[-1:] == ("stop",) for command in calls)
 
 
 def test_stop_failure_keeps_retryable_rollback_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -335,6 +572,36 @@ def test_disabled_adapter_gate_does_not_run_commands(monkeypatch: pytest.MonkeyP
     result = execute_codex_dispatch_activation_plan(_approved_plan(), runner=runner)
     assert result.status.value == "blocked"
     assert called is False
+
+
+def test_runner_timeout_after_effect_is_audited_failure_with_rollback(monkeypatch: pytest.MonkeyPatch):
+    plan = _approved_plan()
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    rolled_back = False
+
+    def runner(step):
+        nonlocal rolled_back
+        if step.title == "Rollback exact dispatch drop-in":
+            rolled_back = True
+            return AdminCommandResult(step.title, step.command, 0, stdout="rolled back")
+        if step.title == "Start local Codex app-server":
+            raise subprocess.TimeoutExpired(step.command, 30)
+        return AdminCommandResult(step.title, step.command, 0)
+
+    result = execute_codex_dispatch_activation_plan(plan, runner=runner, adapter_enabled=True)
+    assert result.status.value == "failed"
+    assert rolled_back is True
+    assert result.command_results[-1].exit_code == 1
+    assert result.rollback_results[0].exit_code == 0
+
+
+def test_marker_normalizes_probe_index_error(monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    monkeypatch.setattr(activation, "_probe_proxy", lambda: (_ for _ in ()).throw(IndexError("empty response")))
+    code, stdout, stderr = execute_codex_dispatch_activation_marker(plan.verification_steps[1].command)
+    assert code == 1
+    assert stdout == ""
+    assert "activation operation failed" in stderr
 
 
 def test_rollback_is_safe_when_drop_in_was_removed_and_retry_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

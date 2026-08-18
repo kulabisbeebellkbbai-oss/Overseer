@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 from pathlib import Path
 
 import pytest
@@ -197,7 +199,7 @@ def test_structured_turn_submission_is_bound_and_confirmed_before_ack(monkeypatc
     monkeypatch.setenv("OVERSEER_PSYCHLO_PEER_SECRET", "must-not-reach-codex")
     monkeypatch.setattr(
         "overseer.codex_usage.subprocess.Popen",
-        lambda *args, **kwargs: spawned.append(kwargs) or _FinishedProcess(),
+        lambda *args, **kwargs: spawned.append((args, kwargs)) or _FinishedProcess(),
     )
 
     evidence = client.submit_bound_turn(
@@ -230,8 +232,9 @@ def test_structured_turn_submission_is_bound_and_confirmed_before_ack(monkeypatc
         "clientUserMessageId": client_message_id,
         "cwd": "/workspace/Arcade",
     }
-    assert "OVERSEER_PSYCHLO_PEER_SECRET" not in spawned[0]["env"]
-    assert set(spawned[0]["env"]) <= {
+    assert spawned[0][0] == (("codex", "app-server", "proxy"),)
+    assert "OVERSEER_PSYCHLO_PEER_SECRET" not in spawned[0][1]["env"]
+    assert set(spawned[0][1]["env"]) <= {
         "CODEX_HOME",
         "HOME",
         "LANG",
@@ -254,6 +257,46 @@ def test_structured_thread_validation_rejects_non_list_items():
             "thread-1",
             "client-message-1",
         )
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "interrupted"])
+def test_structured_thread_validation_accepts_exact_terminal_history(terminal_status):
+    thread = {
+        "thread": {
+            "id": "thread-1",
+            "turns": [{"id": "turn-1", "status": terminal_status, "items": []}],
+        }
+    }
+    assert CodexAppServerClient._require_idle_thread(thread, "thread-1", "client-message-1")["id"] == "thread-1"
+
+
+def test_structured_thread_validation_rejects_active_history():
+    with pytest.raises(ValueError, match="thread is not idle"):
+        CodexAppServerClient._require_idle_thread(
+            {
+                "thread": {
+                    "id": "thread-1",
+                    "turns": [{"id": "turn-1", "status": "inProgress", "items": []}],
+                }
+            },
+            "thread-1",
+            "client-message-1",
+        )
+
+
+def test_receive_handles_coalesced_notification_and_response_lines():
+    client = CodexAppServerClient(timeout=1)
+    process = type("Process", (), {})()
+    process.stdout = io.StringIO(
+        "".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "method": "turn/started", "params": {}}) + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"ok": True}}) + "\n",
+            ]
+        )
+    )
+
+    assert client._receive(process, 7) == {"ok": True}
 
 
 def test_normalization_handles_legacy_single_limit():

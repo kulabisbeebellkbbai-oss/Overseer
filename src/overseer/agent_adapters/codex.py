@@ -12,7 +12,9 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Protocol
 
 from ..agent_contracts import (
@@ -65,6 +67,20 @@ CODEX_OUTPUT_LIMIT_BYTES = 65_536
 # post-paste aggregation. A 4.5 second margin stays bounded while covering
 # that observed boundary before the single Enter attempt.
 CODEX_PASTE_SETTLE_SECONDS = 4.5
+
+
+_THREAD_DISPATCH_LOCKS_GUARD = threading.Lock()
+_THREAD_DISPATCH_LOCKS: dict[str, threading.RLock] = {}
+
+
+@contextmanager
+def _thread_dispatch_lock(session: AgentSession):
+    """Serialize every local transport touching one immutable Codex thread."""
+    key = session.external_session_id or session.id
+    with _THREAD_DISPATCH_LOCKS_GUARD:
+        lock = _THREAD_DISPATCH_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 class BoundedCommandRunner(Protocol):
@@ -747,6 +763,22 @@ class CodexDriver:
         result_session_id: str,
         driver_epoch_id: str,
     ) -> tuple[AgentDispatchResult, LegacyResumeDetails]:
+        with _thread_dispatch_lock(session):
+            return self._resume_session_locked(
+                session,
+                request_id=request_id,
+                result_session_id=result_session_id,
+                driver_epoch_id=driver_epoch_id,
+            )
+
+    def _resume_session_locked(
+        self,
+        session: AgentSession,
+        *,
+        request_id: str,
+        result_session_id: str,
+        driver_epoch_id: str,
+    ) -> tuple[AgentDispatchResult, LegacyResumeDetails]:
         command_name = _legacy_text(session, "command")
         if self._tmux_session_exists(command_name):
             details = LegacyResumeDetails(
@@ -833,8 +865,30 @@ class CodexDriver:
         prompt_marker: str | None = None,
         phase_callback: Callable[[str], None] | None = None,
     ) -> AgentDispatchResult:
+        with _thread_dispatch_lock(session):
+            return self._dispatch_session_locked(
+                session,
+                request,
+                prompt_text=prompt_text,
+                prompt_marker=prompt_marker,
+                phase_callback=phase_callback,
+            )
+
+    def _dispatch_session_locked(
+        self,
+        session: AgentSession,
+        request: AgentDispatchRequest,
+        *,
+        prompt_text: str | None = None,
+        prompt_marker: str | None = None,
+        phase_callback: Callable[[str], None] | None = None,
+    ) -> AgentDispatchResult:
         dispatch_prompt = request.prompt if prompt_text is None else prompt_text
-        if self.structured_turn_client is not None:
+        # Structured app-server delivery is a round-only transport.  The
+        # durable phase callback is the bridge-owned external-effect fence;
+        # ordinary coordination and supervisor dispatches intentionally stay
+        # on the legacy path even when the feature is enabled.
+        if self.structured_turn_client is not None and phase_callback is not None:
             return self._dispatch_structured_session(
                 session,
                 request,

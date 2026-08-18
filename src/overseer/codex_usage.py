@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import select
+import queue
 import sqlite3
 import subprocess
+import threading
 import time
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -52,9 +54,19 @@ def _pick(mapping: dict[str, Any], camel: str, snake: str) -> Any:
 class CodexAppServerClient:
     """Small JSON-RPC client for the local, authenticated Codex app server."""
 
-    def __init__(self, command: tuple[str, ...] = ("codex", "app-server", "--stdio"), timeout: float = 15.0):
+    def __init__(
+        self,
+        command: tuple[str, ...] = ("codex", "app-server", "--stdio"),
+        timeout: float = 15.0,
+        structured_command: tuple[str, ...] = ("codex", "app-server", "proxy"),
+    ):
         self.command = command
         self.timeout = timeout
+        # Structured turns must go through the persistent daemon.  The proxy
+        # owns only this client connection; terminating it cannot terminate
+        # the daemon that hosts the actual Codex thread.
+        self.structured_command = structured_command
+        self._response_queues: weakref.WeakKeyDictionary[object, queue.Queue[str | None]] = weakref.WeakKeyDictionary()
 
     def read_usage(self) -> dict[str, Any]:
         process = subprocess.Popen(
@@ -129,7 +141,7 @@ class CodexAppServerClient:
         if not Path(cwd).is_absolute():
             raise ValueError("codex structured turn workspace is not absolute")
         process = subprocess.Popen(
-            self.command,
+            self.structured_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -203,8 +215,9 @@ class CodexAppServerClient:
     @classmethod
     def _require_idle_thread(cls, response: dict[str, Any], thread_id: str, client_message_id: str) -> dict[str, Any]:
         thread = cls._require_thread_identity(response, thread_id)
+        terminal_statuses = {"completed", "failed", "interrupted"}
         for turn in thread["turns"]:
-            if not isinstance(turn, dict) or turn.get("status") != "completed":
+            if not isinstance(turn, dict) or turn.get("status") not in terminal_statuses:
                 raise ValueError("codex structured thread is not idle")
             items = turn.get("items")
             if not isinstance(items, list):
@@ -262,16 +275,36 @@ class CodexAppServerClient:
         process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
         process.stdin.flush()
 
+    def _response_queue(self, process: subprocess.Popen[str]) -> queue.Queue[str | None]:
+        response_queue = self._response_queues.get(process)
+        if response_queue is not None:
+            return response_queue
+        if process.stdout is None:
+            raise RuntimeError("codex_app_server_stdout_unavailable")
+        response_queue = queue.Queue()
+
+        def read_lines() -> None:
+            try:
+                for line in iter(process.stdout.readline, ""):
+                    response_queue.put(line)
+            finally:
+                response_queue.put(None)
+
+        threading.Thread(target=read_lines, name="overseer-codex-app-server-reader", daemon=True).start()
+        self._response_queues[process] = response_queue
+        return response_queue
+
     def _receive(self, process: subprocess.Popen[str], request_id: int) -> dict[str, Any]:
         if process.stdout is None:
             raise RuntimeError("codex_app_server_stdout_unavailable")
         deadline = time.monotonic() + self.timeout
+        response_queue = self._response_queue(process)
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([process.stdout], [], [], max(0.0, deadline - time.monotonic()))
-            if not ready:
+            try:
+                line = response_queue.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
                 break
-            line = process.stdout.readline()
-            if not line:
+            if line is None:
                 break
             message = json.loads(line)
             if message.get("id") != request_id:

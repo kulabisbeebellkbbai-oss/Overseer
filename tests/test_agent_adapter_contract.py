@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -637,6 +638,96 @@ def test_structured_dispatch_requires_explicit_environment_enablement(codex_csv:
     monkeypatch.setenv("OVERSEER_CODEX_APP_SERVER_DISPATCH", "1")
     structured = CodexDriver.from_legacy_registry(codex_csv)
     assert isinstance(structured.structured_turn_client, CodexAppServerClient)
+
+
+def test_structured_dispatch_is_scoped_to_rounds_with_a_durable_phase_fence(codex_csv: Path) -> None:
+    class StructuredClient:
+        def submit_bound_turn(self, **_kwargs):
+            raise AssertionError("ordinary coordination must not use structured round delivery")
+
+    runner = RecordingRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+        structured_turn_client=StructuredClient(),
+        sleep=lambda _delay: None,
+    )
+
+    result = adapter.dispatch_legacy(
+        adapter.discover()[0],
+        "Keep this supervisor dispatch on the legacy transport.",
+        idempotency_key="supervisor.dispatch",
+    )
+
+    assert result.state is AgentOperationState.ACKNOWLEDGED
+    assert any(command[1] == "paste-buffer" for command in runner.commands)
+
+
+def test_structured_and_legacy_transports_share_one_thread_exclusion(codex_csv: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    structured_results = []
+    legacy_results = []
+
+    class StructuredClient:
+        def submit_bound_turn(self, *, thread_id, prompt, client_message_id, cwd, phase_callback):
+            entered.set()
+            assert release.wait(timeout=2)
+            for phase in ("prepared", "paste-intent", "submit-intent", "submitted"):
+                phase_callback(phase)
+            return {
+                "thread_id": thread_id,
+                "turn_id": "turn.exclusive",
+                "client_message_id": client_message_id,
+                "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                "delivery_proof": "app-server-user-message",
+            }
+
+    structured = CodexDriver.from_legacy_registry(
+        codex_csv,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=RecordingRunner(),
+        structured_turn_client=StructuredClient(),
+    )
+    legacy_runner = RecordingRunner()
+    legacy = CodexDriver.from_legacy_registry(
+        codex_csv,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=legacy_runner,
+        sleep=lambda _delay: None,
+    )
+    session = structured.discover()[0]
+
+    structured_thread = threading.Thread(
+        target=lambda: structured_results.append(
+            structured.dispatch_legacy(
+                session,
+                "One fenced round.",
+                idempotency_key="round.exclusive",
+                phase_callback=lambda _phase: None,
+            )
+        )
+    )
+    legacy_thread = threading.Thread(
+        target=lambda: legacy_results.append(
+            legacy.dispatch_legacy(session, "Do not overlap.", idempotency_key="legacy.exclusive")
+        )
+    )
+    structured_thread.start()
+    assert entered.wait(timeout=2)
+    legacy_thread.start()
+    assert not legacy_runner.commands
+    release.set()
+    structured_thread.join(timeout=2)
+    legacy_thread.join(timeout=2)
+
+    assert structured_results[0].state is AgentOperationState.ACKNOWLEDGED
+    assert legacy_results[0].state is AgentOperationState.ACKNOWLEDGED
+    assert any(command[1] == "paste-buffer" for command in legacy_runner.commands)
 
 
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(

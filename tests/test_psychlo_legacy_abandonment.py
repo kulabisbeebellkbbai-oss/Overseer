@@ -495,6 +495,70 @@ def test_strict_distinct_store_guard_rejects_missing_same_alias_and_hardlink(tmp
     assert bridge_identity != primary_identity
 
 
+def test_strict_store_accepts_live_style_private_primary_group_parent(tmp_path):
+    from overseer.psychlo_bridge import _strict_store_path_identity
+
+    tmp_path.chmod(0o775)
+    database = tmp_path / "primary.sqlite3"
+    database.touch(mode=0o600)
+    path, identity = _strict_store_path_identity(str(database), "primary authority")
+    metadata = database.stat()
+    assert path == database
+    assert identity == (metadata.st_dev, metadata.st_ino)
+
+
+def test_strict_store_rejects_foreign_group_writable_parent(tmp_path, monkeypatch):
+    from overseer import psychlo_bridge
+
+    tmp_path.chmod(0o775)
+    database = tmp_path / "primary.sqlite3"
+    database.touch(mode=0o600)
+    foreign_gid = os.getegid() + 1
+    monkeypatch.setattr(psychlo_bridge.os, "getegid", lambda: foreign_gid)
+    with pytest.raises(ValueError, match="parent is not trusted"):
+        psychlo_bridge._strict_store_path_identity(str(database), "primary authority")
+
+
+def test_strict_store_rejects_other_writable_parent(tmp_path):
+    from overseer.psychlo_bridge import _strict_store_path_identity
+
+    tmp_path.chmod(0o777)
+    database = tmp_path / "primary.sqlite3"
+    database.touch(mode=0o600)
+    with pytest.raises(ValueError, match="parent is not trusted"):
+        _strict_store_path_identity(str(database), "primary authority")
+
+
+def test_strict_store_rejects_symlink_and_noncanonical_path(tmp_path):
+    from overseer.psychlo_bridge import _strict_store_path_identity
+
+    database = tmp_path / "primary.sqlite3"
+    database.touch(mode=0o600)
+    alias = tmp_path / "primary-alias.sqlite3"
+    alias.symlink_to(database)
+    with pytest.raises(ValueError, match="not canonical"):
+        _strict_store_path_identity(str(alias), "primary authority")
+    (tmp_path / "nested").mkdir()
+    noncanonical = tmp_path / "nested" / ".." / database.name
+    with pytest.raises(ValueError, match="not canonical"):
+        _strict_store_path_identity(str(noncanonical), "primary authority")
+
+
+def test_strict_store_rejects_multilink_and_nonprivate_database(tmp_path):
+    from overseer.psychlo_bridge import _strict_store_path_identity
+
+    database = tmp_path / "primary.sqlite3"
+    database.touch(mode=0o600)
+    hardlink = tmp_path / "primary-hardlink.sqlite3"
+    os.link(database, hardlink)
+    with pytest.raises(ValueError, match="unique owned private"):
+        _strict_store_path_identity(str(database), "primary authority")
+    hardlink.unlink()
+    database.chmod(0o640)
+    with pytest.raises(ValueError, match="unique owned private"):
+        _strict_store_path_identity(str(database), "primary authority")
+
+
 def test_legacy_abandonment_cli_requires_strict_distinct_authority_store(monkeypatch):
     from overseer import psychlo_bridge_cli
 

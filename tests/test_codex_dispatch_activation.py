@@ -88,6 +88,8 @@ def test_marker_rejects_mutation_before_source_binding(monkeypatch: pytest.Monke
 
 def test_marker_bootstrap_proves_remote_control_contract(monkeypatch: pytest.MonkeyPatch):
     plan = _plan()
+    monkeypatch.setattr(activation, "EUID_HOME", Path("/tmp") / f"codex-dispatch-bootstrap-{id(plan)}")
+    monkeypatch.setattr(activation, "CODEX_HOME", activation.EUID_HOME / ".codex")
     monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
@@ -97,12 +99,114 @@ def test_marker_bootstrap_proves_remote_control_contract(monkeypatch: pytest.Mon
     assert calls == [("codex", "app-server", "daemon", "bootstrap"), ("codex", "app-server", "daemon", "disable-remote-control")]
 
 
+def test_daemon_contract_accepts_real_valid_payload_and_rejects_socket_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    payload = json.dumps({
+        "cliVersion": "0.147.0",
+        "daemonVersion": "0.147.0",
+        "state": "running",
+        "remoteControlEnabled": False,
+        "socketPath": str(tmp_path / ".codex" / "app-server-control/app-server-control.sock"),
+    })
+    assert activation._daemon_contract(payload)["remoteControlEnabled"] is False
+    with pytest.raises(ValueError, match="remote control|socket"):
+        activation._daemon_contract(payload.replace("app-server-control.sock", "wrong.sock"))
+
+
 def test_environment_verification_preserves_existing_variables(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "PATH=/usr/bin OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OTHER=ok")
     activation._verify_environment()
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OVERSEER_CODEX_APP_SERVER_DISPATCH=1")
     with pytest.raises(ValueError, match="exactly one"):
         activation._verify_environment()
+
+
+def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    _, _, _, socket_path = activation._paths()
+    socket_path.parent.mkdir(parents=True)
+    socket_path.write_bytes(b"existing-invalid")
+    monkeypatch.setattr(activation, "_daemon_status", lambda: (_ for _ in ()).throw(ValueError("invalid preexisting daemon")))
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
+    code, _, err = execute_codex_dispatch_activation_marker(_plan().steps[1].command)
+    assert code == 1
+    assert "invalid preexisting" in err
+    assert not any(command[-1:] == ("start",) for command in calls)
+    assert not any(command[-1:] == ("stop",) for command in calls)
+
+
+def test_start_crash_after_effect_is_reconciled_from_intent_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(activation, "_daemon_status", lambda: "not-running")
+    original = activation._run_checked
+
+    def crash_after_start(command, **kwargs):
+        if tuple(command) == ("codex", "app-server", "daemon", "start"):
+            _, _, _, socket_path = activation._paths()
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            socket_path.write_bytes(b"running")
+            raise RuntimeError("crash after daemon effect")
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(activation, "_run_checked", crash_after_start)
+    plan = _plan()
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[1].command)
+    assert code == 1
+    assert "crash after daemon effect" in err
+    journal = activation._load_journal(plan.id, plan.steps[1].command[2])
+    assert journal["phase"] == "intent-start"
+    assert journal["daemonOwnership"] == "start-issued"
+    monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
+    assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
+    assert ("codex", "app-server", "daemon", "stop") in calls
+
+
+def test_drop_in_crash_after_write_is_reconciled_from_intent_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    original = activation._atomic_write
+
+    def crash_after_dropin(path, content, mode=0o600):
+        original(path, content, mode)
+        if path.name == "10-overseer-codex-dispatch.conf":
+            raise RuntimeError("crash after drop-in effect")
+
+    monkeypatch.setattr(activation, "_atomic_write", crash_after_dropin)
+    plan = _plan()
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[2].command)
+    assert code == 1
+    assert "crash after drop-in effect" in err
+    drop_in, _, _, _ = activation._paths()
+    assert drop_in.exists()
+    journal = activation._load_journal(plan.id, plan.steps[2].command[2])
+    assert journal["phase"] == "intent-drop-in"
+    assert journal["dropInOwnership"] == "write-issued"
+    monkeypatch.setattr(activation, "_atomic_write", original)
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
+    assert not drop_in.exists()
+
+
+def test_stop_failure_keeps_retryable_rollback_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    plan = _plan()
+    activation._write_journal(activation._journal(plan.id, plan.steps[0].command[2], "started", daemonOwnership="started-by-operation"))
+    monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
+    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop failed")) if tuple(command)[-1:] == ("stop",) else "ok")
+    assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 1
+    assert activation._load_journal(plan.id, plan.steps[0].command[2])["phase"] == "rollback-pending"
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
+    assert activation._load_journal(plan.id, plan.steps[0].command[2])["phase"] == "rolled-back"
 
 
 def test_disabled_adapter_gate_does_not_run_commands(monkeypatch: pytest.MonkeyPatch):
@@ -141,8 +245,9 @@ def test_rollback_reconciles_daemon_started_by_operation_even_if_already_stopped
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     plan = _plan()
-    journal = activation._journal(plan.id, plan.steps[0].command[2], "started", daemonStartedByOperation=True)
+    journal = activation._journal(plan.id, plan.steps[0].command[2], "started", daemonOwnership="started-by-operation")
     activation._write_journal(journal)
+    monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
     assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0

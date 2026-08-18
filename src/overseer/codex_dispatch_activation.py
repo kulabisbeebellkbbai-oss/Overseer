@@ -38,7 +38,8 @@ CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v2"
 JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v1"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
-DAEMON_SOCKET_RELATIVE_PATH = ".codex/app-server-control/app-server-control.sock"
+# This path is relative to CODEX_HOME exactly once.
+DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
 SOURCE_FILES = (
     "src/overseer/agent_adapters/codex.py",
@@ -52,7 +53,7 @@ CODEX_HOME = EUID_HOME / ".codex"
 _HEX = set("0123456789abcdef")
 _JOURNAL_KEYS = {
     "schemaVersion", "planId", "specDigest", "phase", "dropInPath", "dropInDigest",
-    "dropInCreatedByOperation", "daemonStartedByOperation",
+    "dropInOwnership", "daemonSocketPath", "daemonOwnership",
 }
 _DAEMON_VERSION_KEYS = {"cliVersion", "daemonVersion", "state", "remoteControlEnabled", "socketPath"}
 
@@ -288,7 +289,7 @@ def _paths() -> tuple[Path, Path, Path, Path]:
     drop_in = EUID_HOME / DROP_IN_RELATIVE_PATH
     journal = EUID_HOME / ".local/state/overseer/codex-dispatch/activation-journal.json"
     lock = EUID_HOME / ".local/state/overseer/codex-dispatch/activation.lock"
-    return drop_in, journal, lock, EUID_HOME / DAEMON_SOCKET_RELATIVE_PATH
+    return drop_in, journal, lock, CODEX_HOME / DAEMON_SOCKET_RELATIVE_PATH
 
 
 def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
@@ -309,11 +310,11 @@ def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
 
 
 def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) -> dict[str, object]:
-    drop_in, _, _, _ = _paths()
+    drop_in, _, _, socket_path = _paths()
     value: dict[str, object] = {
         "schemaVersion": JOURNAL_SCHEMA, "planId": plan_id, "specDigest": digest, "phase": phase,
         "dropInPath": str(drop_in), "dropInDigest": hashlib.sha256(DROP_IN_CONTENT).hexdigest(),
-        "dropInCreatedByOperation": False, "daemonStartedByOperation": False,
+        "dropInOwnership": "unknown", "daemonSocketPath": str(socket_path), "daemonOwnership": "unknown",
     }
     value.update(updates)
     return value
@@ -380,6 +381,25 @@ def _daemon_version() -> dict[str, object]:
     return _daemon_contract(_run_checked(("codex", "app-server", "daemon", "version")))
 
 
+def _daemon_status() -> str:
+    """Return only an authoritative running/not-running state.
+
+    A failed version probe with no reviewed socket is the sole not-running
+    case.  Any payload or socket that exists but is malformed is an invalid
+    pre-existing daemon and must never be started or stopped by this plan.
+    """
+    _, _, _, socket_path = _paths()
+    try:
+        _daemon_version()
+    except RuntimeError:
+        if not socket_path.exists():
+            return "not-running"
+        raise ValueError("existing Codex daemon state is invalid")
+    except ValueError:
+        raise
+    return "running-valid"
+
+
 def _probe_proxy() -> None:
     _, _, _, socket_path = _paths()
     if not socket_path.exists() or socket_path.is_symlink():
@@ -413,9 +433,18 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     if existing is not None and existing != DROP_IN_CONTENT:
         raise ValueError("reviewed drop-in path contains unrelated content")
     journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
-    journal["dropInCreatedByOperation"] = existing is None
-    if existing is None:
-        _atomic_write(drop_in, DROP_IN_CONTENT)
+    if existing is not None:
+        journal["dropInOwnership"] = "preexisting"
+        journal["phase"] = "drop-in-installed"
+        _write_journal(journal)
+        return "exact owner-only service drop-in already present"
+    # Record intent before the effect.  A crash after os.replace but before
+    # the success phase leaves write-issued intent for rollback reconciliation.
+    journal["dropInOwnership"] = "write-issued"
+    journal["phase"] = "intent-drop-in"
+    _write_journal(journal)
+    _atomic_write(drop_in, DROP_IN_CONTENT)
+    journal["dropInOwnership"] = "created-by-operation"
     journal["phase"] = "drop-in-installed"
     _write_journal(journal)
     return "exact owner-only service drop-in installed"
@@ -425,23 +454,29 @@ def _rollback(plan_id: str, digest: str) -> str:
     journal = _load_journal(plan_id, digest)
     if journal is None:
         return "no activation journal owned by this plan"
+    if journal["phase"] == "rolled-back":
+        return "activation already rolled back"
+    prior_phase = str(journal["phase"])
+    journal["phase"] = "rollback-pending"
+    _write_journal(journal)
     drop_in, _, _, _ = _paths()
-    if journal["dropInCreatedByOperation"]:
+    if journal["dropInOwnership"] in {"write-issued", "created-by-operation"}:
         if drop_in.exists():
             if hashlib.sha256(drop_in.read_bytes()).hexdigest() != journal["dropInDigest"]:
                 raise ValueError("drop-in changed after activation; refusing unrelated removal")
             drop_in.unlink()
-    if journal["phase"] in {"drop-in-installed", "reloaded", "restarted", "verified"}:
+        journal["dropInOwnership"] = "removed"
+    if prior_phase in {"rollback-pending", "drop-in-installed", "reloaded", "restarted", "verified"} and journal["dropInOwnership"] in {"removed", "preexisting"}:
         _run_checked(("systemctl", "--user", "daemon-reload"))
         _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
-    if journal["daemonStartedByOperation"]:
+    if journal["daemonOwnership"] in {"start-issued", "started-by-operation"}:
         try:
-            _run_checked(("codex", "app-server", "daemon", "stop"))
-        except (OSError, RuntimeError, ValueError):
-            # stop is idempotent at the activation boundary; a daemon that
-            # already exited is safe, while a failed stop remains auditable
-            # through the retained rolled-back journal.
-            pass
+            status = _daemon_status()
+            if status == "running-valid":
+                _run_checked(("codex", "app-server", "daemon", "stop"))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(f"rollback daemon stop is retryable: {error}") from error
+        journal["daemonOwnership"] = "stopped"
     journal["phase"] = "rolled-back"
     _write_journal(journal)
     return "exact Codex dispatch activation rolled back"
@@ -454,19 +489,26 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
         if operation in {"bootstrap", "start", "install-drop-in", "daemon-reload", "restart-overseer"}:
             verify_reviewed_source_binding(spec)
         if operation == "bootstrap":
+            journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            journal["phase"] = "intent-bootstrap"
+            _write_journal(journal)
             _run_checked(("codex", "app-server", "daemon", "bootstrap"))
             _run_checked(("codex", "app-server", "daemon", "disable-remote-control"))
-            journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
             journal["phase"] = "bootstrapped"
             _write_journal(journal)
             return 0, "daemon bootstrapped without remote control", ""
         if operation == "start":
             journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
-            try:
-                _daemon_version()
-            except (OSError, RuntimeError, ValueError):
+            journal["phase"] = "intent-start"
+            _write_journal(journal)
+            status = _daemon_status()
+            if status == "running-valid":
+                journal["daemonOwnership"] = "preexisting"
+            elif status == "not-running":
+                journal["daemonOwnership"] = "start-issued"
+                _write_journal(journal)
                 _run_checked(("codex", "app-server", "daemon", "start"))
-                journal["daemonStartedByOperation"] = True
+                journal["daemonOwnership"] = "started-by-operation"
             journal["phase"] = "started"
             _write_journal(journal)
             return 0, "local daemon started", ""

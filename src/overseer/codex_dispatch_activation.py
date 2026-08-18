@@ -309,6 +309,47 @@ def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
         temp.unlink(missing_ok=True)
 
 
+def _secure_read_exact(path: Path, expected: bytes) -> bytes:
+    """Read one owner-only regular file without following replacement links."""
+    try:
+        lexical_before = path.lstat()
+    except FileNotFoundError:
+        raise
+    if lexical_before.st_uid != os.geteuid() or stat.S_IMODE(lexical_before.st_mode) & 0o077:
+        raise ValueError("drop-in is not owner-only")
+    if not stat.S_ISREG(lexical_before.st_mode) or stat.S_ISLNK(lexical_before.st_mode) or lexical_before.st_nlink != 1:
+        raise ValueError("drop-in is not a private single-link regular file")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_uid, stat.S_IMODE(before.st_mode), before.st_nlink) != (
+            lexical_before.st_dev, lexical_before.st_ino, lexical_before.st_uid,
+            stat.S_IMODE(lexical_before.st_mode), lexical_before.st_nlink,
+        ):
+            raise ValueError("drop-in changed before secure read")
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077:
+            raise ValueError("drop-in descriptor is unsafe")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+        lexical_after = path.lstat()
+        if (after.st_dev, after.st_ino, after.st_uid, stat.S_IMODE(after.st_mode), after.st_nlink, after.st_size) != (
+            before.st_dev, before.st_ino, before.st_uid, stat.S_IMODE(before.st_mode), before.st_nlink, before.st_size,
+        ) or (lexical_after.st_dev, lexical_after.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("drop-in changed during secure read")
+        if data != expected:
+            raise ValueError("drop-in content is not the reviewed override")
+        return data
+    finally:
+        os.close(fd)
+
+
 def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) -> dict[str, object]:
     drop_in, _, _, socket_path = _paths()
     value: dict[str, object] = {
@@ -321,11 +362,13 @@ def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) 
 
 
 def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
-    _, path, _, _ = _paths()
+    drop_in, path, _, socket_path = _paths()
     if not path.exists():
         return None
     value = json.loads(path.read_text(encoding="utf-8"))
-    if set(value) != _JOURNAL_KEYS or value["schemaVersion"] != JOURNAL_SCHEMA or value["planId"] != plan_id or value["specDigest"] != digest:
+    if (set(value) != _JOURNAL_KEYS or value["schemaVersion"] != JOURNAL_SCHEMA or value["planId"] != plan_id
+            or value["specDigest"] != digest or value["dropInPath"] != str(drop_in)
+            or value["daemonSocketPath"] != str(socket_path)):
         raise ValueError("activation journal binding is invalid")
     return value
 
@@ -429,9 +472,11 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     drop_in, _, _, _ = _paths()
     drop_in.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _owner_only(drop_in.parent, "systemd drop-in directory")
-    existing = drop_in.read_bytes() if drop_in.exists() else None
-    if existing is not None and existing != DROP_IN_CONTENT:
-        raise ValueError("reviewed drop-in path contains unrelated content")
+    try:
+        _secure_read_exact(drop_in, DROP_IN_CONTENT)
+        existing = DROP_IN_CONTENT
+    except FileNotFoundError:
+        existing = None
     journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
     if existing is not None:
         journal["dropInOwnership"] = "preexisting"
@@ -448,6 +493,13 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     journal["phase"] = "drop-in-installed"
     _write_journal(journal)
     return "exact owner-only service drop-in installed"
+
+
+def _revalidate_journal_drop_in(plan_id: str, digest: str) -> None:
+    journal = _load_journal(plan_id, digest)
+    if journal is None or journal["dropInOwnership"] not in {"preexisting", "created-by-operation"}:
+        raise ValueError("drop-in intent is not ready for systemd transition")
+    _secure_read_exact(Path(str(journal["dropInPath"])), DROP_IN_CONTENT)
 
 
 def _rollback(plan_id: str, digest: str) -> str:
@@ -515,13 +567,17 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
         if operation == "install-drop-in":
             return 0, _install_drop_in(plan_id, digest), ""
         if operation == "daemon-reload":
+            _revalidate_journal_drop_in(plan_id, digest)
             _run_checked(("systemctl", "--user", "daemon-reload"))
+            _revalidate_journal_drop_in(plan_id, digest)
             journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
             journal["phase"] = "reloaded"
             _write_journal(journal)
             return 0, "user systemd reloaded", ""
         if operation == "restart-overseer":
+            _revalidate_journal_drop_in(plan_id, digest)
             _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
+            _revalidate_journal_drop_in(plan_id, digest)
             journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
             journal["phase"] = "restarted"
             _write_journal(journal)

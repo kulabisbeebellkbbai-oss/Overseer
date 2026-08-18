@@ -113,6 +113,59 @@ def test_daemon_contract_accepts_real_valid_payload_and_rejects_socket_drift(tmp
         activation._daemon_contract(payload.replace("app-server-control.sock", "wrong.sock"))
 
 
+def test_existing_exact_dropin_requires_private_single_link_regular_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    plan = _plan()
+    drop_in, _, _, _ = activation._paths()
+    drop_in.parent.mkdir(parents=True)
+    drop_in.parent.chmod(0o700)
+    drop_in.write_bytes(activation.DROP_IN_CONTENT)
+    drop_in.chmod(0o600)
+    assert activation._install_drop_in(plan.id, plan.steps[0].command[2]) == "exact owner-only service drop-in already present"
+    drop_in.unlink()
+    target = tmp_path / "target.conf"
+    target.write_bytes(activation.DROP_IN_CONTENT)
+    target.chmod(0o600)
+    drop_in.symlink_to(target)
+    with pytest.raises(ValueError, match="regular|owner-only"):
+        activation._install_drop_in(plan.id, plan.steps[0].command[2])
+    drop_in.unlink()
+    drop_in.write_bytes(activation.DROP_IN_CONTENT)
+    drop_in.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only"):
+        activation._install_drop_in(plan.id, plan.steps[0].command[2])
+    drop_in.chmod(0o600)
+    hardlink = tmp_path / "hardlink.conf"
+    hardlink.hardlink_to(drop_in)
+    with pytest.raises(ValueError, match="single-link"):
+        activation._install_drop_in(plan.id, plan.steps[0].command[2])
+
+
+def test_secure_dropin_read_rejects_path_replacement_after_fd_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "drop-in.conf"
+    path.write_bytes(activation.DROP_IN_CONTENT)
+    path.chmod(0o600)
+    original_read = activation.os.read
+    replaced = False
+
+    def replacing_read(fd, size):
+        nonlocal replaced
+        data = original_read(fd, size)
+        if not replaced:
+            replaced = True
+            replacement = tmp_path / "replacement.conf"
+            replacement.write_bytes(activation.DROP_IN_CONTENT)
+            replacement.chmod(0o600)
+            path.rename(tmp_path / "old.conf")
+            replacement.rename(path)
+        return data
+
+    monkeypatch.setattr(activation.os, "read", replacing_read)
+    with pytest.raises(ValueError, match="changed during"):
+        activation._secure_read_exact(path, activation.DROP_IN_CONTENT)
+
+
 def test_environment_verification_preserves_existing_variables(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "PATH=/usr/bin OVERSEER_CODEX_APP_SERVER_DISPATCH=1 OTHER=ok")
     activation._verify_environment()

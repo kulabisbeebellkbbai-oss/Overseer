@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import subprocess
 from dataclasses import replace
 
 import pytest
@@ -58,9 +59,16 @@ def test_plan_binds_exact_two_stage_external_root_migration():
     assert bootstrap[:6] == ["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"]
     assert bootstrap[-2:] == [spec.helper_blob["sha256"], str(system.ROOT_HELPER_PATH)]
     assert plan.adapter_metadata["activateCommand"] == [
-        "/usr/bin/sudo", "-n", str(system.ROOT_HELPER_PATH), "activate",
+        "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
+        str(system.ROOT_HELPER_PATH), "activate",
         spec.capability(plan.id)["planDigest"],
     ]
+    assert plan.adapter_metadata["rollbackCommand"] == [
+        "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
+        str(system.ROOT_HELPER_PATH), "rollback",
+        spec.capability(plan.id)["planDigest"],
+    ]
+    assert spec.capability(plan.id)["rootPythonIdentity"] == spec.manifest.root_python
     assert system.validate_codex_dispatch_activation_plan(plan) == spec
 
 
@@ -188,3 +196,126 @@ def test_root_helper_restore_is_crash_retry_idempotent_and_never_replaces(tmp_pa
         helper._restore_exact_quarantine(str(active), str(quarantine), expected, uid=os.geteuid())
     assert active.read_bytes() == b"prior unit"
     assert quarantine.read_bytes() == b"prior unit"
+
+
+def test_root_helper_is_read_only_and_requires_exact_python_argv(tmp_path):
+    helper = tmp_path / "overseer-codex-dispatch-activation"
+    helper.write_bytes((system.CANONICAL_CHECKOUT / system.ROOT_HELPER_SOURCE).read_bytes())
+    helper.chmod(0o444)
+
+    with pytest.raises(PermissionError):
+        subprocess.run([str(helper), "verify", "0" * 64], check=False)
+    completed = subprocess.run(
+        ["/usr/bin/python3", "-I", "-S", str(helper), "verify", "0" * 64],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    assert completed.returncode != 0
+    assert "installed immutable path" in completed.stderr
+
+
+def test_listener_attestation_binds_loopback_socket_to_exact_pid(monkeypatch, tmp_path):
+    import overseer_codex_dispatch_root_helper as helper
+
+    proc = tmp_path / "proc"
+    pid = 4321
+    (proc / str(pid) / "fd").mkdir(parents=True)
+    (proc / str(pid) / "stat").write_text(f"{pid} (overseer) S " + " ".join(["0"] * 18 + ["777"] + ["0"] * 20))
+    (proc / str(pid) / "cgroup").write_text("0::/system.slice/overseer-api.service\n")
+    (proc / "net").mkdir()
+    (proc / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+        "   0: 0100007F:223E 00000000:0000 0A 0:0 00:0 0 1000 0 998877\n"
+    )
+    (proc / "net" / "tcp6").write_text("")
+    os.symlink("socket:[998877]", proc / str(pid) / "fd" / "9")
+    monkeypatch.setattr(helper, "PROC_ROOT", str(proc))
+
+    evidence = helper._attest_loopback_listener(pid)
+    assert evidence == {"inode": 998877, "pid": pid, "startTicks": 777}
+
+    (proc / "9999" / "fd").mkdir(parents=True)
+    os.symlink("socket:[998877]", proc / "9999" / "fd" / "3")
+    with pytest.raises(ValueError, match="foreign process"):
+        helper._attest_loopback_listener(pid)
+
+    (proc / "net" / "tcp").write_text(
+        "header\n   0: 00000000:223E 00000000:0000 0A 0:0 00:0 0 1000 0 998877\n"
+    )
+    with pytest.raises(ValueError, match="non-loopback"):
+        helper._attest_loopback_listener(pid)
+
+
+def test_health_200_is_rejected_when_listener_identity_changes(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    evidence = [
+        {"inode": 1, "pid": 4321, "startTicks": 777},
+        {"inode": 2, "pid": 4321, "startTicks": 777},
+    ]
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(helper, "_attest_loopback_listener", lambda _pid: evidence.pop(0))
+    monkeypatch.setattr(helper.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(helper.os, "pidfd_open", lambda *_args: os.dup(read_fd))
+    try:
+        with pytest.raises(ValueError, match="changed during health"):
+            helper._verify_bound_health(4321)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize(
+    ("initial_phase", "unexpected"),
+    [
+        ("rollback-new-unit-quarantined", set()),
+        ("rollback-old-unit-restored", set()),
+        ("rollback-system-reloaded", {"daemon-reload"}),
+        ("rollback-user-resources-restored", {"daemon-reload"}),
+        ("rollback-user-manager-reloaded", {"daemon-reload", "hup"}),
+        ("rollback-user-api-started", {"daemon-reload", "hup", "start-user"}),
+    ],
+)
+def test_rollback_resumes_after_each_persisted_restoration_boundary(monkeypatch, initial_phase, unexpected):
+    import overseer_codex_dispatch_root_helper as helper
+
+    calls = []
+    journal = {
+        "schemaVersion": helper.SCHEMA, "planDigest": "d" * 64, "phase": initial_phase,
+        "journalActionId": "action", "userResourceQuarantines": [
+            {"activePath": "/old/user.conf", "quarantinePath": "/old/.user.conf.inert",
+             "device": 2, "inode": 3, "sha256": "b" * 64},
+        ],
+        "oldSystemUnitQuarantine": "/etc/systemd/system/.old.inert",
+        "systemUnitIdentity": [4, 5], "lastError": "",
+    }
+    old_unit = {"path": helper.SYSTEM_UNIT, "sha256": "a" * 64, "device": 1,
+                "inode": 2, "mode": 0o644, "uid": 0, "size": 10}
+    old_user = {"path": "/old/user.conf", "sha256": "b" * 64, "device": 2,
+                "inode": 3, "mode": 0o600, "uid": 1000, "size": 11}
+    capability = {"planDigest": "d" * 64, "journalActionId": "action",
+                  "systemUnit": "new", "systemUnitSha256": "c" * 64,
+                  "oldSystemUnit": old_unit, "oldUserResources": [old_user],
+                  "managerBinding": {}, "oldApiBinding": {}}
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_write_journal", lambda value: calls.append(value["phase"]))
+    monkeypatch.setattr(helper, "_run_systemctl", lambda *args: calls.append("daemon-reload" if args == ("daemon-reload",) else "stop-system"))
+    monkeypatch.setattr(helper, "_restore_exact_quarantine", lambda active, *_args, **_kwargs: calls.append("restore-unit" if active == helper.SYSTEM_UNIT else "restore-user"))
+    monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: calls.append("hup"))
+    monkeypatch.setattr(helper, "_run_user_systemctl", lambda *_args: calls.append("start-user"))
+    monkeypatch.setattr(helper, "_wait_restored_user_api", lambda *_args: calls.append("attest-user"))
+
+    helper._rollback(capability)
+
+    assert not (unexpected & set(calls))
+    assert calls[-2:] == ["attest-user", "rolled-back"]

@@ -59,12 +59,12 @@ try:
   x=os.read(fd,1048576)
   if not x: break
   existing+=x
- s=os.fstat(fd);os.close(fd);assert existing==data and s.st_uid==0 and s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o555
+ s=os.fstat(fd);os.close(fd);assert existing==data and s.st_uid==0 and s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o444
 except FileNotFoundError:
- tmp="."+name+"."+digest+".new";fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o555,dir_fd=lfd);view=memoryview(data)
+ tmp="."+name+"."+digest+".new";fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o444,dir_fd=lfd);view=memoryview(data)
  while view:
   n=os.write(fd,view);assert n>0;view=view[n:]
- os.fchmod(fd,0o555);os.fsync(fd);s=os.fstat(fd);assert s.st_uid==0 and s.st_gid==0 and s.st_nlink==1
+ os.fchmod(fd,0o444);os.fsync(fd);s=os.fstat(fd);assert s.st_uid==0 and s.st_gid==0 and s.st_nlink==1
  os.close(fd);libc=ctypes.CDLL(None,use_errno=True)
  if libc.renameat2(lfd,tmp.encode(),lfd,name.encode(),1)!=0: raise OSError(ctypes.get_errno(),"helper no-replace install failed")
  os.fsync(lfd)
@@ -158,6 +158,7 @@ class SystemActivationSpec:
             "manifestDigest": self.manifest.digest, "releaseRoot": str(self.manifest.release_root),
             "systemUnit": self.system_unit, "systemUnitSha256": _sha256(self.system_unit.encode()),
             "bootstrapHelperSha256": self.helper_blob["sha256"], "rootHelperPath": str(ROOT_HELPER_PATH),
+            "rootPythonIdentity": dict(self.manifest.root_python),
             "oldUserResources": [dict(item) for item in self.old_user_resources],
             "oldSystemUnit": dict(self.old_system_unit) if self.old_system_unit is not None else None,
             "oldApiBinding": dict(self.old_api_binding), "managerBinding": dict(self.manager_binding),
@@ -201,6 +202,11 @@ def _bootstrap_command(spec: SystemActivationSpec) -> tuple[str, ...]:
             BOOTSTRAP_INSTALLER, str(spec.helper_blob["sha256"]), str(ROOT_HELPER_PATH))
 
 
+def _root_helper_command(action: str, digest: str) -> tuple[str, ...]:
+    return ("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
+            str(ROOT_HELPER_PATH), action, digest)
+
+
 def plan_codex_dispatch_activation(plan_id: str, spec: SystemActivationSpec, reason: str,
                                    current_state: str = "user service") -> AdminChangePlan:
     capability = spec.capability(plan_id)
@@ -208,8 +214,8 @@ def plan_codex_dispatch_activation(plan_id: str, spec: SystemActivationSpec, rea
     marker = lambda action: ("__overseer_codex_dispatch_system_v1", action, plan_id, digest)
     metadata = {"schemaVersion": SCHEMA, "spec": spec.to_json(), "capability": capability,
                 "bootstrapCommand": list(_bootstrap_command(spec)),
-                "activateCommand": ["/usr/bin/sudo", "-n", str(ROOT_HELPER_PATH), "activate", digest],
-                "rollbackCommand": ["/usr/bin/sudo", "-n", str(ROOT_HELPER_PATH), "rollback", digest],
+                "activateCommand": list(_root_helper_command("activate", digest)),
+                "rollbackCommand": list(_root_helper_command("rollback", digest)),
                 "externalCliOnly": True, "apiExecutionAllowed": False}
     return AdminChangePlan(
         id=plan_id, kind=AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
@@ -403,13 +409,13 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
         capability = spec.capability(plan_id)
         frames = [_canonical(capability)]
         if action == "activate-system":
-            cmd = ("/usr/bin/sudo", "-n", str(ROOT_HELPER_PATH), "activate", digest)
+            cmd = _root_helper_command("activate", digest)
             _run_activation_stream(cmd, capability, spec.manifest)
             return 0, f"system activation {action} completed", ""
         elif action == "rollback":
-            cmd = ("/usr/bin/sudo", "-n", str(ROOT_HELPER_PATH), "rollback", digest)
+            cmd = _root_helper_command("rollback", digest)
         elif action == "verify":
-            cmd = ("/usr/bin/sudo", "-n", str(ROOT_HELPER_PATH), "verify", digest)
+            cmd = _root_helper_command("verify", digest)
         else:
             raise ValueError("system activation marker operation is unsupported")
         _run_stream(cmd, frames, {"status": "completed", "planDigest": digest})

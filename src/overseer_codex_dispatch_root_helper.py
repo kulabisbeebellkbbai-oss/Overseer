@@ -12,6 +12,7 @@ import ctypes
 import hashlib
 import json
 import os
+import select
 import signal
 import stat
 import struct
@@ -28,6 +29,7 @@ SYSTEM_UNIT = "/etc/systemd/system/overseer-api.service"
 STATE_ROOT = "/var/lib/overseer/codex-dispatch-activation"
 SYSTEMCTL = "/usr/bin/systemctl"
 SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+PROC_ROOT = "/proc"
 
 
 def _canonical(value: object) -> bytes:
@@ -373,7 +375,10 @@ def _read_journal(plan_digest: str) -> dict[str, object]:
                 "userResourceQuarantines", "oldSystemUnitQuarantine", "systemUnitIdentity", "lastError"}
     phases = {"intent-system-unit", "system-unit-installed", "release-installed",
               "user-service-quarantined", "old-api-stopped", "system-service-started",
-              "verified", "rollback-pending", "rolled-back"}
+              "verified", "rollback-pending", "rollback-system-stopped",
+              "rollback-new-unit-quarantined", "rollback-old-unit-restored",
+              "rollback-system-reloaded", "rollback-user-resources-restored",
+              "rollback-user-manager-reloaded", "rollback-user-api-started", "rolled-back"}
     if (not isinstance(value, dict) or set(value) != expected or value["schemaVersion"] != SCHEMA
             or value["planDigest"] != plan_digest or value["phase"] not in phases):
         raise ValueError("root activation journal is invalid")
@@ -412,6 +417,80 @@ def _service_pids(path: str) -> list[int]:
     except FileNotFoundError:
         return []
     return [int(value) for value in values if value]
+
+
+def _process_start_ticks(pid: int) -> int:
+    raw = Path(f"{PROC_ROOT}/{pid}/stat").read_text(encoding="ascii")
+    fields = raw[raw.rfind(")") + 2:].split()
+    if len(fields) <= 19:
+        raise ValueError("process stat is truncated")
+    return int(fields[19])
+
+
+def _attest_loopback_listener(pid: int) -> dict[str, int]:
+    expected_cgroup = "0::/system.slice/overseer-api.service"
+    if Path(f"{PROC_ROOT}/{pid}/cgroup").read_text(encoding="ascii").strip() != expected_cgroup:
+        raise ValueError("listener process cgroup is not the system service")
+    listener_inodes: list[int] = []
+    for table, loopback in (("tcp", "0100007F"),
+                            ("tcp6", "00000000000000000000000001000000")):
+        path = Path(f"{PROC_ROOT}/net/{table}")
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":
+                continue
+            address, port = fields[1].rsplit(":", 1)
+            if port.upper() != "223E":
+                continue
+            if address.upper() != loopback:
+                raise ValueError("Overseer port has a non-loopback listener")
+            listener_inodes.append(int(fields[9]))
+    if len(listener_inodes) != 1:
+        raise ValueError("exactly one loopback Overseer listener is required")
+    inode = listener_inodes[0]
+    owners: set[int] = set()
+    for process_dir in Path(PROC_ROOT).iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        try:
+            descriptors = (process_dir / "fd").iterdir()
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor)
+                except FileNotFoundError:
+                    continue
+                except PermissionError as error:
+                    raise ValueError("cannot prove listener descriptor ownership") from error
+                if target == f"socket:[{inode}]":
+                    owners.add(int(process_dir.name))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except PermissionError as error:
+            raise ValueError("cannot enumerate listener process ownership") from error
+    if owners != {pid}:
+        raise ValueError("Overseer listener belongs to a foreign process")
+    return {"inode": inode, "pid": pid, "startTicks": _process_start_ticks(pid)}
+
+
+def _verify_bound_health(pid: int) -> dict[str, int]:
+    pidfd = os.pidfd_open(pid, 0)
+    poller = select.poll(); poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    try:
+        if poller.poll(0):
+            raise ValueError("root system API process exited before health verification")
+        listener = _attest_loopback_listener(pid)
+        with urllib.request.urlopen("http://127.0.0.1:8766/health", timeout=5) as response:
+            if response.status != 200:
+                raise ValueError("root system API health failed")
+        if poller.poll(0) or _attest_loopback_listener(pid) != listener:
+            raise ValueError("root system API listener changed during health verification")
+        return listener
+    finally:
+        os.close(pidfd)
 
 
 def _wait_no_user_api(timeout: float = 20.0) -> None:
@@ -461,10 +540,9 @@ def _verify_system_api(capability: dict[str, object]) -> dict[str, object]:
         raise ValueError("root system API does not run as god")
     if _service_pids("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/overseer-api.service/cgroup.procs"):
         raise ValueError("duplicate user Overseer API exists")
-    with urllib.request.urlopen("http://127.0.0.1:8766/health", timeout=5) as response:
-        if response.status != 200:
-            raise ValueError("root system API health failed")
+    listener = _verify_bound_health(pid)
     return {"pid": pid, "cgroup": "0::/system.slice/overseer-api.service",
+            "startTicks": listener["startTicks"], "listenerInode": listener["inode"],
             "cwd": capability["releaseRoot"], "unitSha256": capability["systemUnitSha256"]}
 
 
@@ -487,6 +565,7 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     keys = {
         "schemaVersion", "planDigest", "manifest", "manifestDigest", "releaseRoot",
         "systemUnit", "systemUnitSha256", "bootstrapHelperSha256", "rootHelperPath",
+        "rootPythonIdentity",
         "oldUserResources", "oldSystemUnit", "oldApiBinding", "managerBinding", "journalActionId",
         "rollback", "receiptStore",
     }
@@ -512,6 +591,31 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     if not isinstance(resources, list) or any(not isinstance(item, dict) for item in resources):
         raise ValueError("old user unit inventory is invalid")
     return value
+
+
+def _validate_python_invocation(capability: dict[str, object], action: str, digest: str) -> None:
+    expected_argv = ["/usr/bin/python3", "-I", "-S", HELPER_PATH, action, digest]
+    if list(getattr(sys, "orig_argv", ())) != expected_argv or not sys.flags.isolated or not sys.flags.no_site:
+        raise ValueError("root helper Python invocation is not exact")
+    binding = capability["rootPythonIdentity"]
+    required = {"path", "resolvedPath", "entryDevice", "entryInode", "entryMode", "device",
+                "inode", "mode", "links", "sha256", "size"}
+    if (not isinstance(binding, dict) or set(binding) != required
+            or not isinstance(capability["manifest"], dict)
+            or binding != capability["manifest"].get("rootPython")
+            or binding["path"] != "/usr/bin/python3"):
+        raise ValueError("root Python identity binding is invalid")
+    content, info = _stable_file(str(binding["resolvedPath"]), uid=0, mode=int(binding["mode"]),
+                                 digest=str(binding["sha256"]))
+    entry = os.lstat("/usr/bin/python3")
+    if (not stat.S_ISLNK(entry.st_mode)
+            or (entry.st_dev, entry.st_ino, stat.S_IMODE(entry.st_mode))
+            != (binding["entryDevice"], binding["entryInode"], binding["entryMode"])
+            or (info.st_dev, info.st_ino, info.st_nlink, len(content))
+            != (binding["device"], binding["inode"], binding["links"], binding["size"])
+            or os.path.realpath("/usr/bin/python3") != binding["resolvedPath"]
+            or os.readlink(f"{PROC_ROOT}/self/exe") != binding["resolvedPath"]):
+        raise ValueError("root Python identity changed")
 
 
 def _prepare_system_unit(capability: dict[str, object], journal: dict[str, object]) -> tuple[int, int]:
@@ -616,14 +720,12 @@ def _pin_and_signal(binding: dict[str, object], signum: signal.Signals) -> None:
     pid = int(binding["pid"] if "pid" in binding else binding["peerPid"])
     if binding["bootId"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
         raise ValueError("approved process boot identity changed")
-    raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-    fields = raw_stat[raw_stat.rfind(")") + 2:].split()
-    if int(fields[19]) != int(binding["startTicks"]):
+    if _process_start_ticks(pid) != int(binding["startTicks"]):
         raise ValueError("approved process start identity changed")
-    cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").strip()
+    cgroup = Path(f"{PROC_ROOT}/{pid}/cgroup").read_text(encoding="ascii").strip()
     if cgroup != binding["cgroup"]:
         raise ValueError("approved process cgroup changed")
-    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    cmdline = Path(f"{PROC_ROOT}/{pid}/cmdline").read_bytes()
     if "cmdlineHex" in binding and cmdline.hex() != binding["cmdlineHex"]:
         raise ValueError("approved API command changed")
     if "argv" in binding and cmdline != b"\0".join(item.encode() for item in binding["argv"]) + b"\0":
@@ -685,37 +787,78 @@ def _rollback(capability: dict[str, object]) -> None:
         raise ValueError("rollback journal action identity changed")
     if journal["phase"] == "rolled-back":
         return
-    journal["phase"] = "rollback-pending"; _write_journal(journal)
+    rollback_phases = (
+        "rollback-pending", "rollback-system-stopped", "rollback-new-unit-quarantined",
+        "rollback-old-unit-restored", "rollback-system-reloaded",
+        "rollback-user-resources-restored", "rollback-user-manager-reloaded",
+        "rollback-user-api-started", "rolled-back",
+    )
+    if journal["phase"] not in rollback_phases:
+        journal["phase"] = "rollback-pending"; _write_journal(journal)
     _run_systemctl("disable", "--now", "overseer-api.service")
-    parent_fd = os.open("/etc/systemd/system", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        if os.path.exists(SYSTEM_UNIT):
-            content, info = _stable_file(SYSTEM_UNIT, uid=0, mode=0o644,
-                                         digest=str(capability["systemUnitSha256"]))
-            recorded = journal["systemUnitIdentity"]
-            if content != str(capability["systemUnit"]).encode() or recorded != [info.st_dev, info.st_ino]:
-                raise ValueError("operation-owned system unit changed before rollback")
-            inert = f".overseer-api.service.{capability['journalActionId']}.new-system-inert"
-            _rename_noreplace(parent_fd, "overseer-api.service", parent_fd, inert)
-            os.fsync(parent_fd)
-        old = capability["oldSystemUnit"]
-        if old is not None:
-            quarantine = journal["oldSystemUnitQuarantine"]
-            if not quarantine:
-                raise ValueError("prior root system unit quarantine is absent")
-            _restore_exact_quarantine(SYSTEM_UNIT, str(quarantine), old, uid=0)
-    finally:
-        os.close(parent_fd)
-    _run_systemctl("daemon-reload")
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-system-stopped"):
+        journal["phase"] = "rollback-system-stopped"; _write_journal(journal)
+    system_parent = str(Path(SYSTEM_UNIT).parent)
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-new-unit-quarantined"):
+        parent_fd = os.open(system_parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.path.lexists(SYSTEM_UNIT):
+                try:
+                    content, info = _stable_file(SYSTEM_UNIT, uid=0, mode=0o644,
+                                                 digest=str(capability["systemUnitSha256"]))
+                    recorded = journal["systemUnitIdentity"]
+                    if content != str(capability["systemUnit"]).encode() or recorded != [info.st_dev, info.st_ino]:
+                        raise ValueError("operation-owned system unit changed before rollback")
+                except ValueError:
+                    old = capability["oldSystemUnit"]
+                    if old is None:
+                        raise
+                    prior, prior_info = _stable_file(SYSTEM_UNIT, uid=0, mode=int(old["mode"]),
+                                                     digest=str(old["sha256"]))
+                    if ((prior_info.st_dev, prior_info.st_ino, len(prior))
+                            != (old["device"], old["inode"], old["size"])):
+                        raise ValueError("restored prior system unit identity changed")
+                    journal["phase"] = "rollback-old-unit-restored"; _write_journal(journal)
+                else:
+                    inert = f".overseer-api.service.{capability['journalActionId']}.new-system-inert"
+                    _rename_noreplace(parent_fd, Path(SYSTEM_UNIT).name, parent_fd, inert)
+                    os.fsync(parent_fd)
+            if journal["phase"] != "rollback-old-unit-restored":
+                journal["phase"] = "rollback-new-unit-quarantined"; _write_journal(journal)
+        finally:
+            os.close(parent_fd)
+    old = capability["oldSystemUnit"]
+    if old is not None:
+        quarantine = journal["oldSystemUnitQuarantine"]
+        if not quarantine:
+            raise ValueError("prior root system unit quarantine is absent")
+        # This is also an attestation on every retry after restoration: when
+        # the quarantine is already gone, only the exact old active inode is
+        # accepted.
+        _restore_exact_quarantine(SYSTEM_UNIT, str(quarantine), old, uid=0)
+    elif os.path.lexists(SYSTEM_UNIT):
+        raise ValueError("system unit path unexpectedly occupied during rollback")
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-old-unit-restored"):
+        journal["phase"] = "rollback-old-unit-restored"; _write_journal(journal)
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-system-reloaded"):
+        _run_systemctl("daemon-reload")
+        journal["phase"] = "rollback-system-reloaded"; _write_journal(journal)
     by_active = {item["activePath"]: item for item in journal["userResourceQuarantines"]}
     for expected in capability["oldUserResources"]:
         active = str(expected["path"])
         record = by_active.get(active)
         if not isinstance(record, dict):
             raise ValueError("prior user resource quarantine journal is incomplete")
+        # Re-attest already restored resources on every later-phase retry.
         _restore_exact_quarantine(active, str(record["quarantinePath"]), expected, uid=1000)
-    _pin_and_signal(dict(capability["managerBinding"]), signal.SIGHUP)
-    _run_user_systemctl("start", "overseer-api.service")
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-user-resources-restored"):
+        journal["phase"] = "rollback-user-resources-restored"; _write_journal(journal)
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-user-manager-reloaded"):
+        _pin_and_signal(dict(capability["managerBinding"]), signal.SIGHUP)
+        journal["phase"] = "rollback-user-manager-reloaded"; _write_journal(journal)
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-user-api-started"):
+        _run_user_systemctl("start", "overseer-api.service")
+        journal["phase"] = "rollback-user-api-started"; _write_journal(journal)
     _wait_restored_user_api(capability)
     journal["phase"] = "rolled-back"; journal["lastError"] = ""; _write_journal(journal)
 
@@ -742,6 +885,7 @@ def main(argv: list[str] | None = None) -> int:
     if raw != _canonical(value):
         raise RuntimeError("activation capability is not canonical")
     capability = _validate_capability(value, arguments[1])
+    _validate_python_invocation(capability, arguments[0], arguments[1])
     if arguments[0] == "activate":
         _activate(capability, sys.stdin.buffer)
     elif arguments[0] == "rollback":

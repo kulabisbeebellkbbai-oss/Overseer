@@ -181,7 +181,8 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         authorization_required_before_enable=True,
         approval_plan_required=True,
         supported_commands=(("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"),
-                            ("/usr/bin/sudo", "-n", "/usr/local/libexec/overseer-codex-dispatch-activation"),
+                            ("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
+                             "/usr/local/libexec/overseer-codex-dispatch-activation"),
                             ("__overseer_codex_dispatch_system_v1",)),
     ),
     AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(

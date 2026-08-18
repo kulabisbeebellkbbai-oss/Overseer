@@ -23,6 +23,7 @@ from .psychlo_process_attestation import SCHEMA as PROCESS_OBSERVATION_SCHEMA, _
 
 
 SCHEMA = "psychlo.legacy-round-abandon.v1"
+ENVELOPE_SCHEMA = "overseer.psychlo.legacy-round-abandon-envelope.v1"
 REASON = "ambiguous-submitted-delivery"
 STATUS = "legacy-abandoned-uncertain"
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
@@ -291,6 +292,34 @@ def _validate_wire(wire: Any, action: Mapping[str, Any]) -> dict[str, Any]:
     return dict(wire)
 
 
+def _transport_envelope(
+    action: Mapping[str, Any],
+    current_action: Mapping[str, Any],
+    approved_plan: AdminChangePlan,
+    wire: Mapping[str, Any],
+) -> dict[str, Any]:
+    original_conversation_id = _id(
+        action.get("originalPlan", {}).get("conversationId"),
+        "original conversation id",
+    )
+    current_conversation_id = _id(
+        current_action.get("originalPlan", {}).get("conversationId"),
+        "current original conversation id",
+    )
+    metadata = approved_plan.adapter_metadata.get("legacy_abandonment") if isinstance(approved_plan.adapter_metadata, Mapping) else None
+    approved_conversation_id = _id(
+        metadata.get("originalConversationId") if isinstance(metadata, Mapping) else None,
+        "approved original conversation id",
+    )
+    if original_conversation_id != current_conversation_id or original_conversation_id != approved_conversation_id:
+        raise LegacyAbandonmentError("transport original conversation identity changed")
+    return {
+        "schemaVersion": ENVELOPE_SCHEMA,
+        "action": dict(wire),
+        "originalConversationId": original_conversation_id,
+    }
+
+
 def finalize_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
     primary = _primary(bridge)
     plan = primary.load_admin_change_plan(plan_id)
@@ -357,6 +386,7 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
     current_action, _ = _snapshot(bridge, primary, plan.target, action["observationPlanId"], action["successorPlan"], allow_existing_abandonment=True, allow_fence=intent["state"] == "peer-pending")
     if _action_core(current_action) != _action_core(action):
         raise LegacyAbandonmentError("current bridge or observation identity differs from staged action")
+    envelope = _transport_envelope(action, current_action, plan, wire)
     bridge.store.claim_legacy_abandonment(action_id, intent["actionDigest"], now=_now(bridge))
     try:
         primary.claim_psychlo_legacy_abandonment_execution(
@@ -371,7 +401,7 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
             )
         raise LegacyAbandonmentError("exact approved Sisko plan execution claim failed") from error
     try:
-        raw_response = bridge.sender("round-legacy-abandon", action_id, wire)
+        raw_response = bridge.sender("round-legacy-abandon", action_id, envelope)
     except Exception:
         # A transport/process failure is recoverable: leave the outbox in
         # peer-pending so the exact action can be replayed later.

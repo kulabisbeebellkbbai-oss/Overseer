@@ -938,6 +938,8 @@ class PsychloBridge:
         conversation_id = self._authorized_successor_conversation(request)
         binding_loader = getattr(self.dispatcher, "binding_provenance", None)
         binding: Mapping[str, Any] | None = None
+        if request.get("threadId") is not None and not callable(binding_loader):
+            raise ValueError("round thread requires exact dispatcher binding provenance")
         if callable(binding_loader):
             binding_kwargs = self._method_kwargs(binding_loader, request, conversation_id)
             binding = _require_rollout_binding_provenance(binding_loader(str(request["projectLeadId"]), **binding_kwargs))

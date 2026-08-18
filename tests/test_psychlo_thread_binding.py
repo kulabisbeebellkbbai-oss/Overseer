@@ -51,6 +51,15 @@ class _ThreadAwareDispatcher:
         return "dispatch-thread-binding"
 
 
+class _ThreadRoutingWithoutProvenance:
+    def __init__(self):
+        self.calls: list[tuple[str, str | None]] = []
+
+    def __call__(self, lead: str, _prompt: str, *, idempotency_key: str, thread_id: str | None = None):
+        self.calls.append((lead, thread_id))
+        return "dispatch-without-provenance"
+
+
 def test_signed_arbitrary_thread_id_cannot_replace_protected_static_binding(tmp_path: Path):
     dispatcher = _ThreadAwareDispatcher()
     bridge = PsychloBridge(
@@ -63,6 +72,21 @@ def test_signed_arbitrary_thread_id_cannot_replace_protected_static_binding(tmp_
         bridge.request_round(_request(thread_id="conversation-attacker"))
 
     assert dispatcher.dispatch_calls == []
+    assert bridge.store.get_round("round-thread-binding")[4] == "pending"
+
+
+def test_thread_routing_without_binding_provenance_fails_before_dispatch(tmp_path: Path):
+    dispatcher = _ThreadRoutingWithoutProvenance()
+    bridge = PsychloBridge(
+        store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=dispatcher,
+        sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766",
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="requires exact dispatcher binding provenance"):
+        bridge.request_round(_request(thread_id="attacker-thread"))
+
+    assert dispatcher.calls == []
     assert bridge.store.get_round("round-thread-binding")[4] == "pending"
 
 

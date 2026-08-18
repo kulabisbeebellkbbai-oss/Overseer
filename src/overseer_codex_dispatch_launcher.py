@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA = "overseer.codex-dispatch-activation.v3"
+SCHEMA = "overseer.codex-dispatch-activation.v4"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 DAEMON_SOCKET = "app-server-control/app-server-control.sock"
@@ -220,6 +220,7 @@ def _validate(args: argparse.Namespace) -> Path:
         "sourceModuleDigest": module,
         "reviewDigest": review,
         "dependencyDigest": args.dependency_digest.lower(),
+        "bootstrapBinding": json.loads(args.bootstrap_binding),
         "serviceName": SERVICE_NAME,
         "dropInRelativePath": DROP_IN_RELATIVE_PATH,
         "daemonSocket": DAEMON_SOCKET,
@@ -250,6 +251,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-digest", required=True)
     parser.add_argument("--spec-digest", required=True)
     parser.add_argument("--dependency-digest", required=True)
+    parser.add_argument("--bootstrap-binding", required=True)
     parser.add_argument("--site-packages")
     parser.add_argument("payload", nargs=argparse.REMAINDER)
     return parser

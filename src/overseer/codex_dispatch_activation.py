@@ -15,8 +15,10 @@ import importlib.machinery
 import json
 import os
 import pwd
+import select
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,7 +39,7 @@ from .admin import (
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
-CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v3"
+CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v4"
 JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v5"
 SERVICE_NAME = "overseer-api.service"
 BUSCTL = "/usr/bin/busctl"
@@ -61,6 +63,9 @@ CANONICAL_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 EUID_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
 CODEX_HOME = EUID_HOME / ".codex"
 ISOLATED_LAUNCHER = CANONICAL_SOURCE_ROOT / "src/overseer_codex_dispatch_launcher.py"
+ROOT_PYTHON = Path("/usr/bin/python3")
+ROOT_GIT = Path("/usr/bin/git")
+ROOT_SYSTEMD = Path("/usr/lib/systemd/systemd")
 SERVICE_PYTHON = EUID_HOME / ".local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/bin/python"
 SERVICE_SITE_PACKAGES = SERVICE_PYTHON.parents[1] / "lib/python3.13/site-packages"
 SERVICE_STORE = EUID_HOME / ".local/share/overseer/project/state/overseer.sqlite3"
@@ -101,6 +106,15 @@ _REMOTE_CONTROL_REQUIRED_KEYS = {"status", "remoteControlEnabled", "socketPath",
 _REMOTE_CONTROL_OPTIONAL_KEYS = {"backend", "appServerVersion"}
 _ISOLATED_ENTRY_BINDING: str | None = None
 
+IMMUTABLE_BOOTSTRAP = r'''import hashlib,json,os,subprocess,sys
+c=json.loads(sys.argv[1]); required={"sourceRoot","sourceCommit","sourceTree","sourceModule","reviewDigest","specDigest","dependencyDigest","sitePackages","launcherBlob","launcherSha256","launcherSize","bootstrapBinding","mode","payload"}
+assert isinstance(c,dict) and set(c)==required and c["sourceRoot"]=="/home/god/Documents/Codex Workspace/Overseer" and c["sitePackages"]=="/home/god/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/lib/python3.13/site-packages"
+e={"PATH":"/usr/bin:/bin","LANG":"C","LC_ALL":"C","GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":"/dev/null","GIT_CONFIG_GLOBAL":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
+p=subprocess.run(("/usr/bin/git","--no-replace-objects","-C",c["sourceRoot"],"cat-file","blob",c["launcherBlob"]),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=e,check=False)
+assert p.returncode==0 and len(p.stdout)==c["launcherSize"] and hashlib.sha256(p.stdout).hexdigest()==c["launcherSha256"]
+sys.argv=["reviewed:overseer_codex_dispatch_launcher.py","--source-root",c["sourceRoot"],"--source-commit",c["sourceCommit"],"--source-tree",c["sourceTree"],"--source-module",c["sourceModule"],"--review-digest",c["reviewDigest"],"--spec-digest",c["specDigest"],"--dependency-digest",c["dependencyDigest"],"--bootstrap-binding",json.dumps(c["bootstrapBinding"],sort_keys=True,separators=(",",":")),"--site-packages",c["sitePackages"],c["mode"],"--",*c["payload"]]
+exec(compile(p.stdout,"reviewed:overseer_codex_dispatch_launcher.py","exec",dont_inherit=True),{"__name__":"__main__","__file__":"reviewed:overseer_codex_dispatch_launcher.py"})'''
+
 
 def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -112,6 +126,95 @@ def _digest(value: object) -> str:
 
 def _valid_hex(value: object, lengths: set[int]) -> bool:
     return isinstance(value, str) and len(value) in lengths and set(value.lower()) <= _HEX
+
+
+def _root_binary_identity(path: Path, label: str) -> dict[str, object]:
+    lexical = path.lstat()
+    if lexical.st_uid != 0 or (not stat.S_ISLNK(lexical.st_mode) and stat.S_IMODE(lexical.st_mode) & 0o022):
+        raise ValueError(f"{label} entry is not root-owned and immutable")
+    resolved = path.resolve(strict=True)
+    resolved_info = resolved.lstat()
+    if (not stat.S_ISREG(resolved_info.st_mode) or resolved_info.st_uid != 0
+            or stat.S_IMODE(resolved_info.st_mode) & 0o022 or resolved_info.st_nlink != 1):
+        raise ValueError(f"{label} binary is not a root-owned single-link executable")
+    fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        content = _read_all_fd(fd)
+        after = os.fstat(fd)
+        if _stable_stat(before) != _stable_stat(resolved_info) or _stable_stat(after) != _stable_stat(before):
+            raise ValueError(f"{label} binary changed during attestation")
+    finally:
+        os.close(fd)
+    return {
+        "path": str(path), "resolvedPath": str(resolved), "device": before.st_dev,
+        "inode": before.st_ino, "mode": stat.S_IMODE(before.st_mode), "links": before.st_nlink,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _launcher_blob_binding() -> dict[str, object]:
+    listing = _git(("ls-files", "-s", "--", "src/overseer_codex_dispatch_launcher.py"))
+    fields = listing.split()
+    if len(fields) != 4 or fields[0] != "100644" or fields[2] != "0":
+        raise ValueError("reviewed launcher Git index binding is invalid")
+    blob = fields[1].lower()
+    completed = subprocess.run(
+        (str(ROOT_GIT), "--no-replace-objects", "-C", str(CANONICAL_SOURCE_ROOT), "cat-file", "blob", blob),
+        check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+             "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        raise ValueError("reviewed launcher blob is unavailable")
+    return {"launcherBlob": blob, "launcherSha256": hashlib.sha256(completed.stdout).hexdigest(),
+            "launcherSize": len(completed.stdout)}
+
+
+def _bootstrap_binding() -> dict[str, object]:
+    git_dir = CANONICAL_SOURCE_ROOT / ".git"
+    git_dir_info = git_dir.lstat()
+    if not stat.S_ISDIR(git_dir_info.st_mode) or git_dir.is_symlink():
+        raise ValueError("canonical Git directory identity is unsafe")
+    return {
+        "schema": "overseer.codex-dispatch-bootstrap.v1",
+        "bootstrapSha256": hashlib.sha256(IMMUTABLE_BOOTSTRAP.encode()).hexdigest(),
+        **_launcher_blob_binding(),
+        "python": _root_binary_identity(ROOT_PYTHON, "Python"),
+        "git": _root_binary_identity(ROOT_GIT, "Git"),
+        "systemd": _root_binary_identity(ROOT_SYSTEMD, "systemd user manager"),
+        "gitDir": {"path": str(git_dir), "device": git_dir_info.st_dev, "inode": git_dir_info.st_ino,
+                   "mode": stat.S_IMODE(git_dir_info.st_mode), "uid": git_dir_info.st_uid},
+    }
+
+
+def _validate_bootstrap_binding(value: object) -> dict[str, object]:
+    if (not isinstance(value, dict)
+            or set(value) != {"schema", "bootstrapSha256", "launcherBlob", "launcherSha256", "launcherSize",
+                              "python", "git", "systemd", "gitDir"}
+            or value["schema"] != "overseer.codex-dispatch-bootstrap.v1"
+            or value["bootstrapSha256"] != hashlib.sha256(IMMUTABLE_BOOTSTRAP.encode()).hexdigest()
+            or not _valid_hex(value["launcherBlob"], {40, 64})
+            or not _valid_hex(value["launcherSha256"], {64})
+            or not isinstance(value["launcherSize"], int) or isinstance(value["launcherSize"], bool)
+            or value["launcherSize"] <= 0):
+        raise ValueError("immutable bootstrap binding is malformed")
+    binary_keys = {"path", "resolvedPath", "device", "inode", "mode", "links", "sha256"}
+    for name in ("python", "git", "systemd"):
+        item = value[name]
+        if (not isinstance(item, dict) or set(item) != binary_keys
+                or not _valid_hex(item["sha256"], {64})
+                or any(not isinstance(item[key], int) or isinstance(item[key], bool) or item[key] < 0
+                       for key in ("device", "inode", "mode", "links"))
+                or not isinstance(item["path"], str) or not isinstance(item["resolvedPath"], str)):
+            raise ValueError("immutable bootstrap binary identity is malformed")
+    git_dir = value["gitDir"]
+    if (not isinstance(git_dir, dict) or set(git_dir) != {"path", "device", "inode", "mode", "uid"}
+            or not isinstance(git_dir["path"], str)
+            or any(not isinstance(git_dir[key], int) or isinstance(git_dir[key], bool) or git_dir[key] < 0
+                   for key in ("device", "inode", "mode", "uid"))):
+        raise ValueError("canonical Git directory identity is malformed")
+    return value
 
 
 def authorize_isolated_activation_entry(spec_digest: str) -> None:
@@ -280,6 +383,7 @@ class CodexDispatchActivationSpec:
     source_module_digest: str
     review_digest: str
     dependency_digest: str
+    bootstrap_binding: Mapping[str, object]
     service_name: str = SERVICE_NAME
     drop_in_relative_path: str = DROP_IN_RELATIVE_PATH
     daemon_socket: str = DAEMON_SOCKET_RELATIVE_PATH
@@ -298,6 +402,7 @@ class CodexDispatchActivationSpec:
             "sourceModuleDigest": self.source_module_digest,
             "reviewDigest": self.review_digest,
             "dependencyDigest": self.dependency_digest,
+            "bootstrapBinding": dict(self.bootstrap_binding),
             "serviceName": self.service_name,
             "dropInRelativePath": self.drop_in_relative_path,
             "daemonSocket": self.daemon_socket,
@@ -310,6 +415,7 @@ class CodexDispatchActivationSpec:
         expected = {
             "schemaVersion", "sourceCommit", "sourceTreeDigest", "sourceModuleDigest", "reviewDigest",
             "serviceName", "dropInRelativePath", "daemonSocket", "healthUrl", "sourceFiles", "dependencyDigest",
+            "bootstrapBinding",
         }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("Codex dispatch activation spec must contain exact keys")
@@ -349,6 +455,7 @@ class CodexDispatchActivationSpec:
             source_module,
             str(value["reviewDigest"]).lower(),
             str(value["dependencyDigest"]).lower(),
+            _validate_bootstrap_binding(value["bootstrapBinding"]),
             source_files=reviewed_files,
         )
 
@@ -370,6 +477,7 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
         source_module,
         _review_digest(source_commit, source_tree, source_module, source_files),
         _dependency_digest(),
+        _bootstrap_binding(),
         source_files=source_files,
     )
 
@@ -390,16 +498,18 @@ def _isolated_launcher_command(
     mode: str,
     payload: Sequence[str],
 ) -> tuple[str, ...]:
+    binding = _validate_bootstrap_binding(dict(spec.bootstrap_binding))
+    config = {
+        "sourceRoot": str(CANONICAL_SOURCE_ROOT), "sourceCommit": spec.source_commit,
+        "sourceTree": spec.source_tree_digest, "sourceModule": spec.source_module_digest,
+        "reviewDigest": spec.review_digest, "specDigest": codex_dispatch_activation_plan_digest(spec),
+        "dependencyDigest": spec.dependency_digest, "sitePackages": str(SERVICE_SITE_PACKAGES),
+        "launcherBlob": binding["launcherBlob"], "launcherSha256": binding["launcherSha256"],
+        "launcherSize": binding["launcherSize"], "mode": mode, "payload": list(payload),
+        "bootstrapBinding": binding,
+    }
     return (
-        str(SERVICE_PYTHON), "-I", "-S", str(ISOLATED_LAUNCHER),
-        "--source-root", str(CANONICAL_SOURCE_ROOT),
-        "--source-commit", spec.source_commit,
-        "--source-tree", spec.source_tree_digest,
-        "--source-module", spec.source_module_digest,
-        "--review-digest", spec.review_digest,
-        "--spec-digest", codex_dispatch_activation_plan_digest(spec),
-        "--dependency-digest", spec.dependency_digest,
-        "--site-packages", str(SERVICE_SITE_PACKAGES), mode, "--", *payload,
+        str(ROOT_PYTHON), "-I", "-S", "-c", IMMUTABLE_BOOTSTRAP, _canonical(config),
     )
 
 
@@ -481,6 +591,9 @@ def validate_codex_dispatch_activation_plan(plan: AdminChangePlan) -> CodexDispa
 def verify_reviewed_source_binding(spec: CodexDispatchActivationSpec) -> None:
     if spec.source_root != CANONICAL_SOURCE_ROOT:
         raise ValueError("source root is not canonical")
+    _validate_bootstrap_binding(dict(spec.bootstrap_binding))
+    if dict(spec.bootstrap_binding) != _bootstrap_binding():
+        raise ValueError("immutable bootstrap host binding changed")
     _source_clean()
     if _git(("rev-parse", "HEAD")).lower() != spec.source_commit or _git(("rev-parse", "HEAD^{tree}")).lower() != spec.source_tree_digest:
         raise ValueError("reviewed source commit or tree binding changed")
@@ -888,6 +1001,62 @@ def _validate_user_bus_socket(user_fd: int, expected: tuple[int, ...] | None = N
     return binding
 
 
+def _proc_bytes(pid: int, name: str) -> bytes:
+    path = Path("/proc") / str(pid) / name
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return _read_all_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _user_manager_process_binding(pid: int, uid: int, gid: int) -> dict[str, object]:
+    if uid != os.geteuid() or gid != os.getegid() or pid <= 1:
+        raise ValueError("user-bus peer credentials are invalid")
+    stat_raw = _proc_bytes(pid, "stat").decode("ascii")
+    close = stat_raw.rfind(")")
+    if close <= 0 or not stat_raw.startswith(f"{pid} ("):
+        raise ValueError("user-bus peer stat identity is invalid")
+    comm = stat_raw[len(str(pid)) + 2:close]
+    fields = stat_raw[close + 2:].split()
+    if len(fields) < 20:
+        raise ValueError("user-bus peer stat record is incomplete")
+    ppid = int(fields[1])
+    start_ticks = int(fields[19])
+    expected_cgroup = f"0::/user.slice/user-{uid}.slice/user@{uid}.service/init.scope\n".encode()
+    status = _proc_bytes(pid, "status").decode("ascii")
+    status_fields = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in status.splitlines() if ":" in line}
+    expected_ids = f"{uid}\t{uid}\t{uid}\t{uid}"
+    expected_gids = f"{gid}\t{gid}\t{gid}\t{gid}"
+    if (comm != "systemd" or ppid != 1 or start_ticks <= 0
+            or _proc_bytes(pid, "cmdline") != b"/usr/lib/systemd/systemd\0--user\0"
+            or _proc_bytes(pid, "cgroup") != expected_cgroup
+            or status_fields.get("Uid") != expected_ids or status_fields.get("Gid") != expected_gids):
+        raise ValueError("user-bus peer is not the exact systemd user manager")
+    _root_binary_identity(ROOT_SYSTEMD, "systemd user manager")
+    return {"pid": pid, "uid": uid, "gid": gid, "startTicks": start_ticks,
+            "ppid": ppid, "comm": comm, "cmdline": b"/usr/lib/systemd/systemd\0--user\0",
+            "cgroup": expected_cgroup, "statusUid": expected_ids, "statusGid": expected_gids}
+
+
+def _validate_user_bus_peer(peer: socket.socket) -> tuple[int, dict[str, object]]:
+    pid, uid, gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    binding = _user_manager_process_binding(pid, uid, gid)
+    pidfd = os.pidfd_open(pid, 0)
+    if select.select([pidfd], [], [], 0)[0]:
+        os.close(pidfd)
+        raise ValueError("user-bus peer exited during validation")
+    return pidfd, binding
+
+
+def _revalidate_user_bus_peer(pidfd: int, binding: Mapping[str, object]) -> None:
+    if select.select([pidfd], [], [], 0)[0]:
+        raise ValueError("user-bus peer exited during property query")
+    current = _user_manager_process_binding(int(binding["pid"]), int(binding["uid"]), int(binding["gid"]))
+    if current != binding:
+        raise ValueError("user-bus peer identity changed during property query")
+
+
 @contextmanager
 def _validated_user_bus():
     root_lexical = RUNTIME_USER_ROOT.lstat()
@@ -897,6 +1066,8 @@ def _validated_user_bus():
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root_fd = os.open(RUNTIME_USER_ROOT, flags)
     user_fd: int | None = None
+    peer: socket.socket | None = None
+    pidfd: int | None = None
     try:
         root_info = os.fstat(root_fd)
         if _directory_binding(root_info) != _directory_binding(root_lexical):
@@ -911,6 +1082,10 @@ def _validated_user_bus():
         if _directory_binding(user_info) != _directory_binding(user_lexical):
             raise ValueError("runtime user anchor changed before user-bus validation")
         bus_binding = _validate_user_bus_socket(user_fd)
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        peer.settimeout(5)
+        peer.connect(f"/proc/self/fd/{user_fd}/bus")
+        pidfd, peer_binding = _validate_user_bus_peer(peer)
 
         def validate() -> None:
             root_now = RUNTIME_USER_ROOT.lstat()
@@ -921,6 +1096,7 @@ def _validated_user_bus():
                     or _directory_binding(user_now) != _directory_binding(user_info)):
                 raise ValueError("stable runtime user-bus anchor changed or was replaced")
             _validate_user_bus_socket(user_fd, bus_binding)
+            _revalidate_user_bus_peer(pidfd, peer_binding)
 
         validate()
         try:
@@ -928,6 +1104,10 @@ def _validated_user_bus():
         finally:
             validate()
     finally:
+        if pidfd is not None:
+            os.close(pidfd)
+        if peer is not None:
+            peer.close()
         if user_fd is not None:
             os.close(user_fd)
         os.close(root_fd)

@@ -38,6 +38,7 @@ def _spec() -> CodexDispatchActivationSpec:
         source_module,
         activation._review_digest(source_commit, source_tree, source_module),
         dependency_digest="d" * 64,
+        bootstrap_binding=activation._bootstrap_binding(),
         source_files=activation._reviewed_source_files(),
     )
 
@@ -96,6 +97,48 @@ def test_plan_is_exact_high_human_sisko_and_fixed_socket():
     assert plan.adapter_metadata["spec"]["daemonSocket"] == DAEMON_SOCKET_RELATIVE_PATH
     assert all(step.command[0].startswith("__overseer_codex_dispatch_") for step in plan.steps + plan.rollback_steps + plan.verification_steps)
     assert "--remote-control" not in sum((list(step.command) for step in plan.steps), [])
+
+
+def test_isolated_command_uses_root_python_and_in_memory_reviewed_blob():
+    spec = _spec()
+    command = activation._isolated_launcher_command(spec, "activation-cli", ("codex-dispatch-activation-status",))
+    assert command[:4] == ("/usr/bin/python3", "-I", "-S", "-c")
+    assert str(activation.ISOLATED_LAUNCHER) not in command
+    assert command[4] == activation.IMMUTABLE_BOOTSTRAP
+    config = json.loads(command[5])
+    assert config["launcherBlob"] == spec.bootstrap_binding["launcherBlob"]
+    assert config["sourceRoot"] == str(activation.CANONICAL_SOURCE_ROOT)
+    assert config["sitePackages"] == str(activation.SERVICE_SITE_PACKAGES)
+
+
+def test_root_binary_identity_rejects_user_owned_interpreter_symlink(tmp_path: Path):
+    target = tmp_path / "python-real"
+    target.write_bytes(b"binary")
+    target.chmod(0o700)
+    link = tmp_path / "python"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="root-owned"):
+        activation._root_binary_identity(link, "Python")
+
+
+def test_mutable_checkout_launcher_is_never_executed(tmp_path: Path):
+    spec = _spec()
+    command = activation._isolated_launcher_command(spec, "probe", ())
+    launcher = activation.ISOLATED_LAUNCHER
+    original = launcher.read_bytes()
+    sentinel = tmp_path / "mutable-launcher-executed"
+    try:
+        launcher.write_text(
+            f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, env={
+            "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+        })
+        assert completed.returncode != 0
+        assert not sentinel.exists()
+    finally:
+        launcher.write_bytes(original)
 
 
 def test_caller_manifest_and_source_root_cannot_supply_authority(tmp_path: Path):
@@ -191,9 +234,11 @@ def test_dispatch_drop_in_uses_isolated_launcher_and_exact_service_arguments():
     assert "ExecStart=" in content
     assert " -I -S " in content
     assert "overseer_codex_dispatch_launcher.py" in content
-    assert "serve-api --store /home/god/.local/share/overseer/project/state/overseer.sqlite3" in content
-    assert "--host 127.0.0.1 --port 8766" in content
-    assert "--auth-token-file /home/god/.local/share/overseer/project/state/api-token" in content
+    assert "serve-api" in content
+    assert "/home/god/.local/share/overseer/project/state/overseer.sqlite3" in content
+    assert "--host" in content and "127.0.0.1" in content and "--port" in content and "8766" in content
+    assert "--auth-token-file" in content
+    assert "/home/god/.local/share/overseer/project/state/api-token" in content
 
 
 def test_isolated_launcher_rejects_nonisolated_invocation_before_dispatch():
@@ -262,13 +307,15 @@ def _isolated_probe_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
     dependency = activation._dependency_digest(site_packages)
     spec = CodexDispatchActivationSpec(
         CODEX_DISPATCH_ACTIVATION_SCHEMA, commit, tree, module, review, dependency, source_files=inventory,
+        bootstrap_binding=activation._bootstrap_binding(),
     )
     arguments = [
         "/usr/bin/python3", "-I", "-S", str(launcher),
         "--source-root", str(root), "--source-commit", commit, "--source-tree", tree,
         "--source-module", module, "--review-digest", review,
         "--spec-digest", activation.codex_dispatch_activation_plan_digest(spec),
-        "--dependency-digest", dependency, "--site-packages", str(site_packages), "probe",
+        "--dependency-digest", dependency, "--bootstrap-binding", activation._canonical(spec.bootstrap_binding),
+        "--site-packages", str(site_packages), "probe",
     ]
     return launcher, arguments
 
@@ -330,6 +377,7 @@ def test_isolated_launcher_rejects_dependency_injection_before_import(tmp_path: 
         arguments[arguments.index("--source-module") + 1],
         arguments[arguments.index("--review-digest") + 1],
         dependency_digest,
+        activation._bootstrap_binding(),
         source_files=inventory,
     )
     arguments[arguments.index("--site-packages") + 1] = str(dependency_root)
@@ -742,6 +790,16 @@ def test_fixed_address_busctl_contract_works_under_env_i():
     completed = subprocess.run(command, capture_output=True, text=True, check=False, env={})
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["type"] == "as"
+
+
+def test_same_euid_fake_user_bus_peer_is_rejected():
+    first, second = socket.socketpair(socket.AF_UNIX)
+    try:
+        with pytest.raises(ValueError, match="systemd user manager"):
+            activation._validate_user_bus_peer(first)
+    finally:
+        first.close()
+        second.close()
 
 
 @pytest.mark.parametrize("bad_field", [True, -1, 2**64])

@@ -452,7 +452,8 @@ def test_retry_owned_resources_are_rolled_back_after_later_verification_failure(
     assert not drop_in.exists()
     assert state["daemon_running"] is False
     assert journal["phase"] == "rollback-pending"
-    assert journal["dropInOwnership"] == "removed"
+    assert journal["dropInOwnership"] == "quarantined"
+    assert Path(str(journal["dropInQuarantinePath"])).exists()
     assert journal["daemonOwnership"] == "stopped"
     assert journal["bootstrapOwnership"] == "residual"
 
@@ -662,6 +663,45 @@ def test_rollback_quarantines_replacement_after_validation_without_deleting_it(t
     assert activation._load_journal(plan.id, plan.steps[0].command[2])["phase"] == "rollback-pending"
 
 
+def test_normal_rollback_retains_inert_quarantine_and_never_unlinks_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    plan = _plan()
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    assert execute_codex_dispatch_activation_marker(plan.steps[2].command)[0] == 0
+    drop_in, _, _, _ = activation._paths()
+    unrelated = drop_in.parent / "unrelated.txt"
+    unrelated.write_text("preserve me", encoding="utf-8")
+    original_unlink = activation.os.unlink
+
+    def reject_quarantine_unlink(path, *args, **kwargs):
+        if ".rollback-" in str(path):
+            raise AssertionError("rollback must retain inert quarantine")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(activation.os, "unlink", reject_quarantine_unlink)
+    rollback = plan.rollback_steps[0].command
+    code, out, err = execute_codex_dispatch_activation_marker(rollback)
+    assert code == 0, err
+    assert "retained" in out
+    assert not drop_in.exists()
+    quarantined = list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))
+    assert len(quarantined) == 1
+    assert not quarantined[0].name.endswith(".conf")
+    assert quarantined[0] not in list(drop_in.parent.glob("*.conf"))
+    assert quarantined[0].read_bytes() == activation.DROP_IN_CONTENT
+    assert unrelated.read_text(encoding="utf-8") == "preserve me"
+    inode = quarantined[0].stat().st_ino
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert journal["phase"] == "rolled-back"
+    assert journal["dropInOwnership"] == "quarantined"
+    assert journal["dropInQuarantinePath"] == str(quarantined[0])
+    assert journal["dropInQuarantineInode"] == inode
+    assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
+    assert quarantined[0].stat().st_ino == inode
+
+
 def test_rollback_retries_from_exact_quarantine_after_rename_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     plan = _plan()
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
@@ -687,10 +727,16 @@ def test_rollback_retries_from_exact_quarantine_after_rename_crash(tmp_path: Pat
     assert len(list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))) == 1
     monkeypatch.setattr(activation.os, "rename", original_rename)
     assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
-    assert not list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))
+    quarantined = list(drop_in.parent.glob(f".{drop_in.name}.rollback-*"))
+    assert len(quarantined) == 1
+    inode = quarantined[0].stat().st_ino
     journal = activation._load_journal(plan.id, plan.steps[0].command[2])
     assert journal["phase"] == "rolled-back"
-    assert journal["dropInOwnership"] == "removed"
+    assert journal["dropInOwnership"] == "quarantined"
+    assert journal["dropInQuarantinePath"] == str(quarantined[0])
+    assert journal["dropInQuarantineInode"] == inode
+    assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
+    assert quarantined[0].stat().st_ino == inode
 
 
 def test_rollback_reconciles_daemon_started_by_operation_even_if_already_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

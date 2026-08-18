@@ -35,7 +35,7 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
 CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v2"
-JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v4"
+JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v5"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 # This path is relative to CODEX_HOME exactly once.
@@ -51,6 +51,7 @@ _JOURNAL_KEYS = {
     "schemaVersion", "planId", "specDigest", "phase", "dropInPath", "dropInDigest",
     "dropInOwnership", "daemonSocketPath", "daemonOwnership", "bootstrapOwnership",
     "remoteControlPrior", "remoteControlOwnership", "dropInDevice", "dropInInode",
+    "dropInQuarantinePath", "dropInQuarantineDevice", "dropInQuarantineInode",
 }
 _DAEMON_VERSION_KEYS = {"cliVersion", "daemonVersion", "state", "remoteControlEnabled", "socketPath"}
 _JOURNAL_PHASES = {
@@ -58,7 +59,9 @@ _JOURNAL_PHASES = {
     "intent-drop-in", "drop-in-installed", "reloaded", "restarted",
     "rollback-pending", "rolled-back", "verified",
 }
-_DROP_IN_OWNERSHIP = {"unknown", "write-issued", "created-by-operation", "preexisting", "removed"}
+_DROP_IN_OWNERSHIP = {
+    "unknown", "write-issued", "created-by-operation", "preexisting", "quarantined", "removed",
+}
 _DAEMON_OWNERSHIP = {"unknown", "start-issued", "started-by-operation", "preexisting", "stopped"}
 _BOOTSTRAP_OWNERSHIP = {
     "unknown", "bootstrap-issued", "created-by-operation", "preexisting",
@@ -475,11 +478,18 @@ def _journal(plan_id: str, digest: str, phase: str = "none", **updates: object) 
         "dropInPath": str(drop_in), "dropInDigest": hashlib.sha256(DROP_IN_CONTENT).hexdigest(),
         "dropInOwnership": "unknown", "daemonSocketPath": str(socket_path), "daemonOwnership": "unknown",
         "dropInDevice": None, "dropInInode": None,
+        "dropInQuarantinePath": None, "dropInQuarantineDevice": None, "dropInQuarantineInode": None,
         "bootstrapOwnership": "unknown", "remoteControlPrior": "unknown",
         "remoteControlOwnership": "unknown",
     }
     value.update(updates)
     return value
+
+
+def _drop_in_quarantine_path(journal: Mapping[str, object]) -> Path:
+    drop_in, _, _, _ = _paths()
+    plan_suffix = _digest({"planId": journal["planId"], "specDigest": journal["specDigest"]})[:16]
+    return drop_in.parent / f".{drop_in.name}.rollback-{plan_suffix}"
 
 
 def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
@@ -508,6 +518,24 @@ def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     if (value["dropInOwnership"] == "created-by-operation" and not has_drop_in_identity
             or value["dropInOwnership"] in {"unknown", "preexisting"} and has_drop_in_identity):
         raise ValueError("activation journal drop-in identity ownership is invalid")
+    quarantine_values = (
+        value["dropInQuarantinePath"], value["dropInQuarantineDevice"], value["dropInQuarantineInode"],
+    )
+    has_quarantine_identity = quarantine_values != (None, None, None)
+    if has_quarantine_identity:
+        expected_quarantine = str(_drop_in_quarantine_path(value))
+        if (not isinstance(quarantine_values[0], str) or quarantine_values[0] != expected_quarantine
+                or not isinstance(quarantine_values[1], int) or isinstance(quarantine_values[1], bool)
+                or quarantine_values[1] < 0 or not isinstance(quarantine_values[2], int)
+                or isinstance(quarantine_values[2], bool) or quarantine_values[2] <= 0):
+            raise ValueError("activation journal quarantine identity is invalid")
+    if (value["dropInOwnership"] == "quarantined" and not has_quarantine_identity
+            or value["dropInOwnership"] != "quarantined" and has_quarantine_identity):
+        raise ValueError("activation journal quarantine ownership is invalid")
+    if value["dropInOwnership"] == "quarantined" and (
+        value["dropInDevice"], value["dropInInode"]
+    ) != (value["dropInQuarantineDevice"], value["dropInQuarantineInode"]):
+        raise ValueError("activation journal quarantine does not bind the operation-owned inode")
     if value["daemonOwnership"] not in _DAEMON_OWNERSHIP:
         raise ValueError("activation journal daemon ownership is invalid")
     if value["bootstrapOwnership"] not in _BOOTSTRAP_OWNERSHIP:
@@ -770,7 +798,7 @@ def _revalidate_journal_drop_in(plan_id: str, digest: str) -> None:
 
 
 def _remove_operation_drop_in(journal: dict[str, object]) -> None:
-    """Quarantine and unlink only the exact operation-owned drop-in inode."""
+    """Move the exact operation-owned inode to inert retained quarantine."""
     drop_in, _, _, _ = _paths()
     parent = drop_in.parent
     lexical_parent = parent.lstat()
@@ -779,8 +807,10 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
         raise ValueError("systemd drop-in directory is unsafe")
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     parent_fd = os.open(parent, flags)
-    plan_suffix = _digest({"planId": journal["planId"], "specDigest": journal["specDigest"]})[:16]
-    quarantine = f".{drop_in.name}.rollback-{plan_suffix}"
+    quarantine_path = _drop_in_quarantine_path(journal)
+    quarantine = quarantine_path.name
+    if quarantine.endswith(".conf"):
+        raise ValueError("drop-in quarantine name is not inert to systemd")
     try:
         parent_info = os.fstat(parent_fd)
         if ((parent_info.st_dev, parent_info.st_ino) != (lexical_parent.st_dev, lexical_parent.st_ino)
@@ -800,6 +830,8 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
         if original_exists and quarantine_exists:
             raise ValueError("drop-in rollback has conflicting original and quarantine paths")
         if not original_exists and not quarantine_exists:
+            if journal["dropInOwnership"] == "quarantined":
+                raise ValueError("retained drop-in quarantine is missing")
             journal["dropInOwnership"] = "removed"
             return
 
@@ -823,33 +855,78 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
             )
 
         fd, content, info = _open_stable_at(parent_fd, quarantine, "quarantined operation drop-in")
-        try:
-            if content != DROP_IN_CONTENT:
-                raise ValueError("quarantined drop-in content changed")
-            if (journal["dropInDevice"], journal["dropInInode"]) != (info.st_dev, info.st_ino):
-                raise ValueError("quarantined drop-in identity changed")
-            if exists(drop_in.name):
-                raise ValueError("drop-in path was replaced during rollback")
-            lexical = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
-            current = os.fstat(fd)
-            if _stable_stat(lexical) != _stable_stat(current):
-                raise ValueError("quarantined drop-in changed before unlink")
-            os.unlink(quarantine, dir_fd=parent_fd)
-            unlinked = os.fstat(fd)
-            if ((unlinked.st_dev, unlinked.st_ino) != (info.st_dev, info.st_ino)
-                    or unlinked.st_nlink != 0):
-                raise ValueError("drop-in unlink did not remove the validated inode")
-        finally:
-            os.close(fd)
-        if exists(drop_in.name) or exists(quarantine):
-            raise ValueError("drop-in rollback path is not absent after unlink")
+        os.close(fd)
+        if content != DROP_IN_CONTENT:
+            raise ValueError("quarantined drop-in content changed")
+        if (journal["dropInDevice"], journal["dropInInode"]) != (info.st_dev, info.st_ino):
+            raise ValueError("quarantined drop-in identity changed")
+        if exists(drop_in.name):
+            raise ValueError("drop-in path was replaced during rollback")
         parent_after = os.fstat(parent_fd)
         if ((parent_after.st_dev, parent_after.st_ino) != (parent_info.st_dev, parent_info.st_ino)
                 or not stat.S_ISDIR(parent_after.st_mode) or parent_after.st_uid != os.geteuid()
                 or stat.S_IMODE(parent_after.st_mode) & 0o077):
             raise ValueError("systemd drop-in directory changed during rollback")
         os.fsync(parent_fd)
-        journal["dropInOwnership"] = "removed"
+        if exists(drop_in.name):
+            raise ValueError("active systemd drop-in path reappeared during rollback")
+        retained_fd, retained_content, retained_info = _open_stable_at(
+            parent_fd, quarantine, "retained inert drop-in quarantine"
+        )
+        os.close(retained_fd)
+        if retained_content != DROP_IN_CONTENT or (retained_info.st_dev, retained_info.st_ino) != (
+            info.st_dev, info.st_ino
+        ):
+            raise ValueError("retained drop-in quarantine changed after directory sync")
+        journal["dropInOwnership"] = "quarantined"
+        journal["dropInQuarantinePath"] = str(quarantine_path)
+        journal["dropInQuarantineDevice"] = retained_info.st_dev
+        journal["dropInQuarantineInode"] = retained_info.st_ino
+    finally:
+        os.close(parent_fd)
+
+
+def _revalidate_retained_drop_in_quarantine(journal: Mapping[str, object]) -> None:
+    drop_in, _, _, _ = _paths()
+    parent = drop_in.parent
+    quarantine_path = _drop_in_quarantine_path(journal)
+    if journal["dropInQuarantinePath"] != str(quarantine_path) or quarantine_path.name.endswith(".conf"):
+        raise ValueError("retained drop-in quarantine binding is invalid")
+    lexical_parent = parent.lstat()
+    if (not stat.S_ISDIR(lexical_parent.st_mode) or lexical_parent.st_uid != os.geteuid()
+            or stat.S_IMODE(lexical_parent.st_mode) & 0o077):
+        raise ValueError("systemd drop-in directory is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(parent, flags)
+    try:
+        parent_info = os.fstat(parent_fd)
+        if ((parent_info.st_dev, parent_info.st_ino) != (lexical_parent.st_dev, lexical_parent.st_ino)
+                or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_info.st_mode) & 0o077):
+            raise ValueError("systemd drop-in directory changed during quarantine validation")
+        try:
+            os.stat(drop_in.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("active systemd drop-in path reappeared after rollback")
+        fd, content, info = _open_stable_at(
+            parent_fd, quarantine_path.name, "retained inert drop-in quarantine"
+        )
+        os.close(fd)
+        expected_identity = (journal["dropInQuarantineDevice"], journal["dropInQuarantineInode"])
+        if (content != DROP_IN_CONTENT or (info.st_dev, info.st_ino) != expected_identity
+                or expected_identity != (journal["dropInDevice"], journal["dropInInode"])):
+            raise ValueError("retained drop-in quarantine identity changed")
+        try:
+            os.stat(drop_in.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("active systemd drop-in path reappeared during quarantine validation")
+        parent_after = os.fstat(parent_fd)
+        if _stable_stat(parent_after) != _stable_stat(parent_info):
+            raise ValueError("systemd drop-in directory changed during quarantine validation")
     finally:
         os.close(parent_fd)
 
@@ -859,13 +936,25 @@ def _rollback(plan_id: str, digest: str) -> str:
     if journal is None:
         return "no activation journal owned by this plan"
     if journal["phase"] == "rolled-back":
+        if journal["dropInOwnership"] == "quarantined":
+            try:
+                _revalidate_retained_drop_in_quarantine(journal)
+            except Exception:
+                journal["phase"] = "rollback-pending"
+                _write_journal(journal)
+                raise
+            return (
+                "activation already rolled back; retained inert quarantine at "
+                f"{journal['dropInQuarantinePath']}"
+            )
         return "activation already rolled back"
     prior_phase = str(journal["phase"])
     journal["phase"] = "rollback-pending"
     _write_journal(journal)
-    if journal["dropInOwnership"] in {"write-issued", "created-by-operation"}:
+    if journal["dropInOwnership"] in {"write-issued", "created-by-operation", "quarantined"}:
         _remove_operation_drop_in(journal)
-    if prior_phase in {"rollback-pending", "drop-in-installed", "reloaded", "restarted", "verified"} and journal["dropInOwnership"] in {"removed", "preexisting"}:
+        _write_journal(journal)
+    if prior_phase in {"rollback-pending", "drop-in-installed", "reloaded", "restarted", "verified"} and journal["dropInOwnership"] in {"removed", "preexisting", "quarantined"}:
         _run_checked(("systemctl", "--user", "daemon-reload"))
         _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
     if journal["daemonOwnership"] in {"start-issued", "started-by-operation"}:
@@ -900,6 +989,11 @@ def _rollback(plan_id: str, digest: str) -> str:
         raise RuntimeError(f"rollback has residual {' and '.join(residual)} state")
     journal["phase"] = "rolled-back"
     _write_journal(journal)
+    if journal["dropInOwnership"] == "quarantined":
+        return (
+            "exact Codex dispatch activation rolled back; retained inert quarantine at "
+            f"{journal['dropInQuarantinePath']}"
+        )
     return "exact Codex dispatch activation rolled back"
 
 

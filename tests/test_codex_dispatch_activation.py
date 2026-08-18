@@ -1573,11 +1573,28 @@ def test_concurrent_execution_allows_only_one_owner(tmp_path: Path, monkeypatch:
 
 def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from overseer import cli
+    from overseer import codex_dispatch_release_activation as release
 
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
     store = tmp_path / "overseer.sqlite3"
-    monkeypatch.setattr(cli, "build_codex_dispatch_activation_spec", _spec)
+    launcher = release.ReleaseFile(
+        "app/src/overseer_codex_dispatch_release_launcher.py", "checkout",
+        "src/overseer_codex_dispatch_release_launcher.py", "d" * 64, 1, 0o444,
+    )
+    unit = "[Service]\nRestart=on-failure\n"
+    manifest = release.ImmutableReleaseManifest(
+        "a" * 40, "b" * 40, (launcher,),
+        {"path": "/usr/bin/python3", "resolvedPath": "/usr/bin/python3.13",
+         "entryDevice": 1, "entryInode": 1, "entryMode": 0o777,
+         "device": 1, "inode": 2, "mode": 0o755, "links": 1,
+         "sha256": "c" * 64, "size": 100},
+        hashlib.sha256(unit.encode()).hexdigest(),
+    )
+    release_spec = release.ReleaseActivationSpec(
+        manifest, {"peerPid": 1329}, {"pid": 99}, unit,
+    )
+    monkeypatch.setattr(cli, "build_codex_dispatch_activation_spec", lambda: release_spec)
     staged = cli.plan_admin_change_status(
         store, "admin.codex-dispatch.e2e", AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
         "overseer-api.service", "activate reviewed dispatch", "disabled",
@@ -1587,7 +1604,7 @@ def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_pa
     assert approved["approved"] is True
     request = cli.request_admin_adapter_enablement_status(store, AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value, "sisko")
     cli.approve_admin_adapter_enablement_status(store, request["approval_id"], "sisko", "2026-08-18T00:01:00+00:00")
-    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(release, "verify_reviewed_source_binding", lambda _spec: None)
     runner = lambda step: AdminCommandResult(step.title, step.command, 0)
     result = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)
     assert result["status"] == "completed"

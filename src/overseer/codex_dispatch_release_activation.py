@@ -20,11 +20,19 @@ import pwd
 import signal
 import stat
 import subprocess
+import threading
+import time
+import urllib.request
+from contextvars import ContextVar
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping, Sequence
 
-from .admin import AdminChangeKind, AdminChangePlan, AdminCommandStep
+from .admin import (
+    AdminChangeKind, AdminChangePlan, AdminCommandResult, AdminCommandStep,
+    AdminExecutionResult, AdminExecutionStatus,
+)
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
@@ -46,7 +54,21 @@ RELEASE_LAUNCHER = "app/src/overseer_codex_dispatch_release_launcher.py"
 SOURCE_PREFIX = PurePosixPath("app")
 DEPENDENCY_PREFIX = PurePosixPath("site-packages")
 MANIFEST_NAME = "release-manifest.json"
+UNIT_PATH = Path("/home/god/.config/systemd/user/overseer-api.service")
+CGROUP_PATH = Path(
+    f"/sys/fs/cgroup/user.slice/user-{os.geteuid()}.slice/"
+    f"user@{os.geteuid()}.service/app.slice/{SERVICE_NAME}/cgroup.procs"
+)
+EXPECTED_CGROUP = (
+    f"0::/user.slice/user-{os.geteuid()}.slice/user@{os.geteuid()}.service/"
+    f"app.slice/{SERVICE_NAME}"
+)
+JOURNAL_SCHEMA = "overseer.codex-dispatch-release-journal.v1"
 _HEX = frozenset("0123456789abcdef")
+_EXECUTION_CONTEXT: ContextVar[tuple["ReleaseActivationSpec", str, str] | None] = ContextVar(
+    "codex_dispatch_release_execution", default=None
+)
+_EXECUTION_MUTEX = threading.Lock()
 
 
 def _canonical(value: object) -> bytes:
@@ -165,6 +187,21 @@ class ImmutableReleaseManifest:
             raise ValueError("release file inventory must be nonempty, sorted, and unique")
         if RELEASE_LAUNCHER not in paths:
             raise ValueError("release launcher is absent from the reviewed release")
+        python_keys = {
+            "path", "resolvedPath", "entryDevice", "entryInode", "entryMode",
+            "device", "inode", "mode", "links", "sha256", "size",
+        }
+        python = self.root_python
+        if (not isinstance(python, Mapping) or set(python) != python_keys
+                or python["path"] != str(ROOT_PYTHON)
+                or not isinstance(python["resolvedPath"], str)
+                or not str(python["resolvedPath"]).startswith("/usr/bin/python3")
+                or any(not isinstance(python[name], int) or isinstance(python[name], bool) or int(python[name]) < 0
+                       for name in ("entryDevice", "entryInode", "entryMode", "device", "inode", "mode", "links", "size"))
+                or python["links"] != 1
+                or not isinstance(python["sha256"], str) or len(str(python["sha256"])) != 64
+                or not set(str(python["sha256"])) <= _HEX):
+            raise ValueError("root Python manifest identity is malformed")
         if len(self.unit_contract_sha256) != 64 or not set(self.unit_contract_sha256) <= _HEX:
             raise ValueError("unit contract digest is invalid")
 
@@ -208,6 +245,40 @@ class ImmutableReleaseManifest:
         if value["manifestDigest"] != manifest.digest or value["releaseRoot"] != str(manifest.release_root):
             raise ValueError("immutable release manifest digest or root is invalid")
         return manifest
+
+
+@dataclass(frozen=True)
+class ReleaseActivationSpec:
+    manifest: ImmutableReleaseManifest
+    manager_binding: Mapping[str, object]
+    old_api_binding: Mapping[str, object]
+    unit_contract: str
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schemaVersion": RELEASE_PLAN_SCHEMA,
+            "manifest": self.manifest.to_json(),
+            "managerBinding": dict(self.manager_binding),
+            "oldApiBinding": dict(self.old_api_binding),
+            "unitContract": self.unit_contract,
+        }
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, object]) -> "ReleaseActivationSpec":
+        expected = {"schemaVersion", "manifest", "managerBinding", "oldApiBinding", "unitContract"}
+        if not isinstance(value, Mapping) or set(value) != expected or value["schemaVersion"] != RELEASE_PLAN_SCHEMA:
+            raise ValueError("release activation spec has an open or unsupported schema")
+        if not isinstance(value["manifest"], Mapping) or not isinstance(value["managerBinding"], Mapping) or not isinstance(value["oldApiBinding"], Mapping):
+            raise ValueError("release activation spec bindings are malformed")
+        if not isinstance(value["unitContract"], str):
+            raise ValueError("release activation unit contract is malformed")
+        spec = cls(
+            ImmutableReleaseManifest.from_json(value["manifest"]), dict(value["managerBinding"]),
+            dict(value["oldApiBinding"]), value["unitContract"],
+        )
+        if _sha256(spec.unit_contract.encode()) != spec.manifest.unit_contract_sha256:
+            raise ValueError("release activation unit contract digest changed")
+        return spec
 
 
 def _root_identity(path: Path) -> dict[str, object]:
@@ -424,6 +495,11 @@ def verify_installed_release(manifest: ImmutableReleaseManifest) -> None:
             if current == manifest.release_root:
                 break
             current = current.parent
+    manifest_content, manifest_info = _stable_read(manifest.release_root / MANIFEST_NAME)
+    if (manifest_info.st_uid != 0 or manifest_info.st_gid != 0 or manifest_info.st_nlink != 1
+            or stat.S_IMODE(manifest_info.st_mode) != 0o444
+            or manifest_content != _canonical(manifest.to_json()) + b"\n"):
+        raise ValueError("installed release manifest is not exact root-owned immutable data")
 
 
 def send_pinned_signal(pidfd: int, expected_pid: int, signum: signal.Signals) -> None:
@@ -441,9 +517,591 @@ def assert_no_dbus_commands(commands: Iterable[Sequence[str]]) -> None:
             raise ValueError("D-Bus and systemctl commands are not activation authority")
 
 
+def _unit_contract() -> bytes:
+    content, info = _stable_read(UNIT_PATH)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError("Overseer API unit is not an owner-controlled immutable approval input")
+    text = content.decode("utf-8", "strict")
+    if "\nRestart=on-failure\n" not in f"\n{text}":
+        raise ValueError("Overseer API unit is not pre-attested Restart=on-failure")
+    return content
+
+
+def _proc_bytes(pid: int, name: str) -> bytes:
+    path = Path(f"/proc/{pid}/{name}")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        chunks: list[bytes] = []
+        while True:
+            value = os.read(fd, 1024 * 1024)
+            if not value:
+                break
+            chunks.append(value)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _proc_start_ticks(pid: int) -> int:
+    value = _proc_bytes(pid, "stat").decode("ascii", "strict")
+    end = value.rfind(")")
+    if end < 0:
+        raise ValueError("process stat is malformed")
+    return int(value[end + 2:].split()[19])
+
+
+def _boot_id() -> str:
+    value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    if not value:
+        raise ValueError("kernel boot identity is unavailable")
+    return value
+
+
+def _api_pid_from_cgroup() -> int:
+    content = CGROUP_PATH.read_text(encoding="ascii")
+    pids = [int(item) for item in content.splitlines() if item]
+    if len(pids) != 1 or pids[0] <= 1:
+        raise ValueError("Overseer API cgroup does not contain exactly one process")
+    return pids[0]
+
+
+def _capture_api_binding(pid: int | None = None) -> dict[str, object]:
+    pid = _api_pid_from_cgroup() if pid is None else pid
+    pidfd = os.pidfd_open(pid, 0)
+    try:
+        binding = {
+            "bootId": _boot_id(), "pid": pid, "startTicks": _proc_start_ticks(pid),
+            "cgroup": _proc_bytes(pid, "cgroup").decode("ascii", "strict").strip(),
+            "cmdlineHex": _proc_bytes(pid, "cmdline").hex(),
+            "cwd": os.readlink(f"/proc/{pid}/cwd"),
+        }
+        if binding["cgroup"] != EXPECTED_CGROUP:
+            raise ValueError("Overseer API process is outside the exact service cgroup")
+        if _proc_start_ticks(pid) != binding["startTicks"] or _boot_id() != binding["bootId"]:
+            raise ValueError("Overseer API process changed during attestation")
+        return binding
+    finally:
+        os.close(pidfd)
+
+
+def _capture_manager_binding() -> dict[str, object]:
+    # SO_PEERCRED is used only to identify and pin the user manager.  No D-Bus
+    # request or reply is ever used as an effect or proof.
+    from .codex_dispatch_activation import _capture_user_bus_peer_binding
+
+    return dict(_capture_user_bus_peer_binding())
+
+
+def build_codex_dispatch_activation_spec() -> ReleaseActivationSpec:
+    unit = _unit_contract()
+    return ReleaseActivationSpec(
+        build_immutable_release_manifest(unit_contract=unit),
+        _capture_manager_binding(), _capture_api_binding(), unit.decode("utf-8", "strict"),
+    )
+
+
+def plan_codex_dispatch_activation(
+    plan_id: str,
+    spec: ReleaseActivationSpec,
+    reason: str,
+    current_state: str = "mutable checkout service",
+) -> AdminChangePlan:
+    plan = plan_immutable_release_activation(
+        plan_id, reason, spec.manifest, manager_binding=spec.manager_binding,
+        unit_contract=spec.unit_contract.encode(), current_state=current_state,
+    )
+    metadata = dict(plan.adapter_metadata)
+    metadata["spec"] = spec.to_json()
+    metadata["specDigest"] = _sha256(_canonical(spec.to_json()))
+    plan_digest = _sha256(_canonical(metadata))
+    def rebind(step: AdminCommandStep) -> AdminCommandStep:
+        if len(step.command) != 4 or step.command[0] != "__overseer_codex_dispatch_release_v1":
+            raise ValueError("release activation plan contains a noncanonical marker")
+        return replace(step, command=(*step.command[:3], plan_digest))
+    return replace(
+        plan, adapter_metadata=metadata,
+        steps=tuple(rebind(step) for step in plan.steps),
+        rollback_steps=tuple(rebind(step) for step in plan.rollback_steps),
+        verification_steps=tuple(rebind(step) for step in plan.verification_steps),
+    )
+
+
+def _normalize_plan(plan: AdminChangePlan) -> AdminChangePlan:
+    return replace(
+        plan, approved=False, approved_by=None, approved_at=None, canceled=False,
+        canceled_by=None, canceled_at=None, cancellation_reason=None, archived=False,
+        archived_by=None, archived_at=None, archive_record_id=None,
+    )
+
+
+def validate_codex_dispatch_activation_plan(plan: AdminChangePlan) -> ReleaseActivationSpec:
+    if AdminChangeKind(plan.kind) != AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
+        raise ValueError("plan is not a Codex dispatch activation plan")
+    metadata = plan.adapter_metadata
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("spec"), dict):
+        raise ValueError("release activation plan spec is absent")
+    spec = ReleaseActivationSpec.from_json(metadata["spec"])
+    if metadata.get("specDigest") != _sha256(_canonical(spec.to_json())):
+        raise ValueError("release activation plan spec digest changed")
+    canonical = plan_codex_dispatch_activation(plan.id, spec, plan.reason, plan.current_state)
+    if _normalize_plan(plan) != canonical:
+        raise ValueError("release activation plan is not exact and canonical")
+    return spec
+
+
+def verify_reviewed_source_binding(spec: ReleaseActivationSpec) -> None:
+    """Pre-effect verification of the approved checkout/dependency inputs."""
+    current = build_immutable_release_manifest(unit_contract=spec.unit_contract.encode())
+    if current != spec.manifest:
+        raise ValueError("approved immutable release inputs changed; restage approval")
+    if _unit_contract().decode("utf-8", "strict") != spec.unit_contract:
+        raise ValueError("approved service unit contract changed; restage approval")
+    if _capture_manager_binding() != dict(spec.manager_binding):
+        raise ValueError("approved user manager changed; restage approval")
+    if _capture_api_binding() != dict(spec.old_api_binding):
+        raise ValueError("approved existing Overseer API changed; restage approval")
+
+
+def _state_root() -> Path:
+    return Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".local/state/overseer/codex-dispatch-release"
+
+
+def _journal_path(plan_id: str) -> Path:
+    safe = hashlib.sha256(plan_id.encode()).hexdigest()
+    return _state_root() / f"{safe}.journal.json"
+
+
+def _atomic_owner_write(path: Path, content: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent = path.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or path.parent.is_symlink() or parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+        raise ValueError("release activation state directory is unsafe")
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{threading.get_ident()}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, content)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _load_journal(plan_id: str, spec_digest: str) -> dict[str, object] | None:
+    path = _journal_path(plan_id)
+    if not path.exists():
+        return None
+    content, info = _stable_read(path)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("release activation journal is unsafe")
+    value = json.loads(content)
+    expected = {
+        "schemaVersion", "planId", "specDigest", "phase", "installedCommands",
+        "releaseOwnership", "dropInOwnership", "dropInQuarantine", "lastError",
+    }
+    phases = {
+        "install-intent", "release-installed", "dropin-intent", "dropin-installed",
+        "reload-intent", "reloaded", "restart-intent", "restarted", "verified",
+        "rollback-pending", "rolled-back",
+    }
+    if (not isinstance(value, dict) or set(value) != expected or value["schemaVersion"] != JOURNAL_SCHEMA
+            or value["planId"] != plan_id or value["specDigest"] != spec_digest
+            or value["phase"] not in phases or value["releaseOwnership"] not in {"install-issued", "operation-owned", "inert-partial"}
+            or value["dropInOwnership"] not in {"absent", "write-issued", "operation-owned", "preexisting", "quarantined"}
+            or not isinstance(value["installedCommands"], int)):
+        raise ValueError("release activation journal schema or authority is invalid")
+    return value
+
+
+def _write_journal(value: Mapping[str, object]) -> None:
+    _atomic_owner_write(_journal_path(str(value["planId"])), _canonical(value) + b"\n")
+
+
+def _new_journal(plan_id: str, spec_digest: str) -> dict[str, object]:
+    return {
+        "schemaVersion": JOURNAL_SCHEMA, "planId": plan_id, "specDigest": spec_digest,
+        "phase": "install-intent", "installedCommands": 0,
+        "releaseOwnership": "install-issued", "dropInOwnership": "absent",
+        "dropInQuarantine": "", "lastError": "",
+    }
+
+
+def _drop_in_path() -> Path:
+    return Path(pwd.getpwuid(os.geteuid()).pw_dir) / DROP_IN_RELATIVE_PATH
+
+
+def _manifest_staging_path(manifest: ImmutableReleaseManifest) -> Path:
+    return Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".local/state/overseer/codex-dispatch" / f"{manifest.digest}.release-manifest.json"
+
+
+def _stage_manifest_file(manifest: ImmutableReleaseManifest) -> None:
+    path = _manifest_staging_path(manifest)
+    content = _canonical(manifest.to_json()) + b"\n"
+    if path.exists():
+        existing, info = _stable_read(path)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or existing != content:
+            raise ValueError("release manifest staging file is unsafe or mismatched")
+        return
+    _atomic_owner_write(path, content)
+
+
+def _run_install(command: Sequence[str], manifest: ImmutableReleaseManifest) -> None:
+    validate_sudo_install_argv(command, manifest)
+    completed = subprocess.run(
+        tuple(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=False, env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("approved root release install command failed")
+
+
+def _install_release(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
+    journal = _load_journal(plan_id, digest) or _new_journal(plan_id, digest)
+    if journal["phase"] == "rolled-back":
+        raise ValueError("approved release activation plan is terminal after rollback")
+    _stage_manifest_file(spec.manifest)
+    commands = _install_commands(spec.manifest)
+    journal["phase"] = "install-intent"
+    _write_journal(journal)
+    for index, command in enumerate(commands):
+        if index < int(journal["installedCommands"]):
+            continue
+        _run_install(command, spec.manifest)
+        journal["installedCommands"] = index + 1
+        journal["releaseOwnership"] = "operation-owned"
+        _write_journal(journal)
+    verify_installed_release(spec.manifest)
+    journal["phase"] = "release-installed"
+    _write_journal(journal)
+    return "approved immutable root release installed and verified"
+
+
+def _install_drop_in(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
+    journal = _load_journal(plan_id, digest)
+    if journal is None or journal["phase"] not in {"release-installed", "dropin-intent"}:
+        raise ValueError("immutable release must be installed before the service drop-in")
+    path = _drop_in_path()
+    content = release_drop_in_content(spec.manifest)
+    existed_before_intent = path.exists()
+    journal["phase"] = "dropin-intent"
+    journal["dropInOwnership"] = "write-issued"
+    _write_journal(journal)
+    if path.exists():
+        existing, info = _stable_read(path)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or existing != content:
+            raise ValueError("existing dispatch drop-in is not the exact secure approved file")
+        journal["dropInOwnership"] = "preexisting" if existed_before_intent else "operation-owned"
+    else:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, content)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        journal["dropInOwnership"] = "operation-owned"
+    journal["phase"] = "dropin-installed"
+    _write_journal(journal)
+    return "exact operation-bound user service drop-in installed"
+
+
+def _manager_pidfd(spec: ReleaseActivationSpec) -> tuple[int, int]:
+    binding = _capture_manager_binding()
+    if binding != dict(spec.manager_binding):
+        raise ValueError("approved user manager identity drifted")
+    pid = int(binding["peerPid"])
+    return pid, os.pidfd_open(pid, 0)
+
+
+def _api_pidfd(binding: Mapping[str, object]) -> tuple[int, int]:
+    current = _capture_api_binding()
+    if current != dict(binding):
+        raise ValueError("approved Overseer API identity drifted")
+    pid = int(current["pid"])
+    return pid, os.pidfd_open(pid, 0)
+
+
+def _wait_for_api(predicate: Callable[[Mapping[str, object]], bool], *, old_pid: int, timeout: float = 30.0) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            binding = _capture_api_binding()
+            if int(binding["pid"]) != old_pid and predicate(binding):
+                return binding
+        except (OSError, ValueError) as error:
+            last_error = error
+        time.sleep(0.1)
+    raise RuntimeError("Overseer API replacement was not observed within the approved bound") from last_error
+
+
+def _expected_release_cmdline(spec: ReleaseActivationSpec) -> bytes:
+    drop_in = release_drop_in_content(spec.manifest).decode("ascii")
+    line = next(item for item in drop_in.splitlines() if item.startswith("ExecStart=/usr/bin/python3"))
+    return b"\0".join(item.encode() for item in line[len("ExecStart="):].split(" ")) + b"\0"
+
+
+def _attest_release_api(spec: ReleaseActivationSpec, binding: Mapping[str, object]) -> None:
+    if bytes.fromhex(str(binding["cmdlineHex"])) != _expected_release_cmdline(spec):
+        raise ValueError("replacement Overseer API argv is not the approved immutable release command")
+    if binding["cwd"] != str(spec.manifest.release_root):
+        raise ValueError("replacement Overseer API cwd is not the immutable release")
+    pid = int(binding["pid"])
+    for line in _proc_bytes(pid, "maps").decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if not fields or not fields[-1].startswith("/"):
+            continue
+        mapped = Path(fields[-1])
+        if str(mapped).startswith(str(CANONICAL_CHECKOUT)) or str(mapped).startswith(str(DEPENDENCY_ROOT)):
+            raise ValueError("replacement API maps mutable checkout or dependency code")
+        if str(mapped).startswith(str(spec.manifest.release_root)):
+            info = mapped.lstat()
+            if info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) & 0o222:
+                raise ValueError("replacement API mapped an unsafe release file")
+    with urllib.request.urlopen(HEALTH_URL, timeout=5) as response:
+        if response.status != 200:
+            raise ValueError("replacement Overseer API health check failed")
+
+
+def _reload(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
+    journal = _load_journal(plan_id, digest)
+    if journal is None or journal["phase"] not in {"dropin-installed", "reload-intent"}:
+        raise ValueError("exact drop-in must be installed before manager reload")
+    journal["phase"] = "reload-intent"
+    _write_journal(journal)
+    manager_pid, pidfd = _manager_pidfd(spec)
+    try:
+        send_pinned_signal(pidfd, manager_pid, signal.SIGHUP)
+        time.sleep(0.2)
+        if _capture_manager_binding() != dict(spec.manager_binding):
+            raise ValueError("user manager changed across SIGHUP reload")
+    finally:
+        os.close(pidfd)
+    journal["phase"] = "reloaded"
+    _write_journal(journal)
+    return "pinned user manager reloaded by pidfd SIGHUP"
+
+
+def _restart(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
+    journal = _load_journal(plan_id, digest)
+    if journal is None or journal["phase"] not in {"reloaded", "restart-intent"}:
+        raise ValueError("pinned manager reload must complete before API restart")
+    journal["phase"] = "restart-intent"
+    _write_journal(journal)
+    old_pid, pidfd = _api_pidfd(spec.old_api_binding)
+    try:
+        send_pinned_signal(pidfd, old_pid, signal.SIGKILL)
+    finally:
+        os.close(pidfd)
+    replacement = _wait_for_api(lambda value: True, old_pid=old_pid)
+    _attest_release_api(spec, replacement)
+    if _capture_manager_binding() != dict(spec.manager_binding):
+        raise ValueError("user manager changed across API replacement")
+    journal["phase"] = "restarted"
+    _write_journal(journal)
+    return "Overseer API replaced and attested from immutable release"
+
+
+def _quarantine_dropin(journal: dict[str, object]) -> None:
+    if journal["dropInOwnership"] not in {"write-issued", "operation-owned"}:
+        return
+    path = _drop_in_path()
+    if not path.exists():
+        journal["dropInOwnership"] = "quarantined"
+        return
+    quarantine = path.parent / f".{path.name}.{journal['specDigest']}.rollback-inert"
+    if quarantine.exists():
+        raise ValueError("rollback quarantine already exists unexpectedly")
+    os.rename(path, quarantine)
+    journal["dropInOwnership"] = "quarantined"
+    journal["dropInQuarantine"] = str(quarantine)
+
+
+def _rollback(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
+    journal = _load_journal(plan_id, digest)
+    if journal is None:
+        return "no operation-owned release activation effects exist"
+    if journal["phase"] == "rolled-back":
+        return "release activation already rolled back"
+    prior_phase = str(journal["phase"])
+    journal["phase"] = "rollback-pending"
+    _write_journal(journal)
+    try:
+        _quarantine_dropin(journal)
+        if int(journal["installedCommands"]) < len(_install_commands(spec.manifest)):
+            journal["releaseOwnership"] = "inert-partial"
+        _write_journal(journal)
+        manager_pid, manager_fd = _manager_pidfd(spec)
+        try:
+            send_pinned_signal(manager_fd, manager_pid, signal.SIGHUP)
+            time.sleep(0.2)
+        finally:
+            os.close(manager_fd)
+        needs_restored_api = prior_phase in {"restart-intent", "restarted", "rollback-pending"}
+        try:
+            current = _capture_api_binding()
+        except (OSError, ValueError):
+            current = None
+        if current is not None and str(current["cwd"]) == str(spec.manifest.release_root):
+            current_pid = int(current["pid"])
+            current_fd = os.pidfd_open(current_pid, 0)
+            try:
+                send_pinned_signal(current_fd, current_pid, signal.SIGKILL)
+            finally:
+                os.close(current_fd)
+            restored = _wait_for_api(
+                lambda value: value["cmdlineHex"] == spec.old_api_binding["cmdlineHex"] and value["cwd"] == spec.old_api_binding["cwd"],
+                old_pid=current_pid,
+            )
+            if restored["cgroup"] != EXPECTED_CGROUP:
+                raise ValueError("restored Overseer API cgroup is invalid")
+            current = restored
+        elif current is None and needs_restored_api:
+            current = _wait_for_api(
+                lambda value: value["cmdlineHex"] == spec.old_api_binding["cmdlineHex"] and value["cwd"] == spec.old_api_binding["cwd"],
+                old_pid=int(spec.old_api_binding["pid"]),
+            )
+        if current is not None and str(current["cwd"]) != str(spec.manifest.release_root):
+            if (current["cmdlineHex"] != spec.old_api_binding["cmdlineHex"]
+                    or current["cwd"] != spec.old_api_binding["cwd"]):
+                raise ValueError("rollback did not restore the approved prior API command")
+        if _capture_manager_binding() != dict(spec.manager_binding):
+            raise ValueError("manager changed during rollback")
+        journal["phase"] = "rolled-back"
+        journal["lastError"] = ""
+        _write_journal(journal)
+        return "release activation rolled back; root release retained inert for audited cleanup"
+    except Exception as error:
+        journal["phase"] = "rollback-pending"
+        journal["lastError"] = type(error).__name__
+        _write_journal(journal)
+        raise
+
+
+def _parse_marker(command: Sequence[str]) -> tuple[str, str, ReleaseActivationSpec, str]:
+    if len(command) != 4 or command[0] != "__overseer_codex_dispatch_release_v1":
+        raise ValueError("release activation marker is malformed")
+    operation, plan_id, digest = command[1:]
+    context = _EXECUTION_CONTEXT.get()
+    if context is None or context[1] != plan_id or context[2] != digest:
+        raise ValueError("release activation marker lacks exact active plan authority")
+    spec = context[0]
+    return operation, plan_id, spec, digest
+
+
+def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[int, str, str]:
+    try:
+        operation, plan_id, spec, digest = _parse_marker(command)
+        if operation == "install-release":
+            return 0, _install_release(plan_id, spec, digest), ""
+        if operation == "install-drop-in":
+            return 0, _install_drop_in(plan_id, spec, digest), ""
+        if operation == "reload-manager":
+            return 0, _reload(plan_id, spec, digest), ""
+        if operation == "restart-api":
+            return 0, _restart(plan_id, spec, digest), ""
+        if operation == "rollback":
+            return 0, _rollback(plan_id, spec, digest), ""
+        if operation == "verify-release":
+            verify_installed_release(spec.manifest)
+            return 0, "immutable release verified", ""
+        if operation == "verify-api":
+            binding = _capture_api_binding()
+            _attest_release_api(spec, binding)
+            return 0, "immutable release API verified", ""
+        if operation == "verify-proxy":
+            from .codex_dispatch_activation import _probe_proxy
+            _probe_proxy()
+            journal = _load_journal(plan_id, digest)
+            if journal is not None:
+                journal["phase"] = "verified"
+                _write_journal(journal)
+            return 0, "local Codex proxy verified", ""
+        raise ValueError("release activation marker operation is unsupported")
+    except Exception as error:
+        return 1, "", f"release activation operation failed: {type(error).__name__}: {error}"
+
+
+def execute_codex_dispatch_activation_plan(
+    plan: AdminChangePlan,
+    *,
+    runner: Callable[[AdminCommandStep], AdminCommandResult] | None = None,
+    adapter_enabled: bool = False,
+) -> AdminExecutionResult:
+    if not adapter_enabled:
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, "exact approved adapter enablement is required", ())
+    try:
+        spec = validate_codex_dispatch_activation_plan(plan)
+    except (OSError, ValueError) as error:
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, str(error), ())
+    if not plan.approved or plan.canceled or plan.archived:
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, "release activation requires an uncanceled HUMAN-approved plan", ())
+    digest = str(plan.steps[0].command[3])
+    journal = _load_journal(plan.id, digest)
+    if journal is not None and journal["phase"] in {"rolled-back", "verified"}:
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, "approved release activation plan is terminal and cannot be reused", ())
+    try:
+        verify_reviewed_source_binding(spec)
+    except (OSError, ValueError) as error:
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, str(error), ())
+    if not _EXECUTION_MUTEX.acquire(blocking=False):
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, "another release activation owns the lifecycle", ())
+    from .codex_dispatch_activation import _activation_lock
+    lock_context = _activation_lock()
+    try:
+        validate_lock = lock_context.__enter__()
+    except Exception as error:
+        _EXECUTION_MUTEX.release()
+        return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, f"stable activation lock unavailable: {error}", ())
+    token = _EXECUTION_CONTEXT.set((spec, plan.id, digest))
+    try:
+        if runner is None:
+            runner = lambda step: AdminCommandResult(step.title, step.command, *execute_codex_dispatch_activation_marker(step.command))
+        commands: list[AdminCommandResult] = []
+        for step in plan.steps:
+            validate_lock()
+            try:
+                result = runner(step)
+            except Exception as error:
+                result = AdminCommandResult(step.title, step.command, 1, stderr=type(error).__name__)
+            commands.append(result)
+            validate_lock()
+            if result.exit_code != 0:
+                rollback = tuple(runner(item) for item in plan.rollback_steps)
+                return AdminExecutionResult(f"admin.exec.{plan.id}.failed", plan.id, AdminExecutionStatus.FAILED, f"immutable release activation failed during {step.title}; rollback attempted", tuple(commands), rollback_results=rollback)
+        verification: list[AdminCommandResult] = []
+        for step in plan.verification_steps:
+            validate_lock()
+            result = runner(step)
+            validate_lock()
+            verification.append(result)
+            if result.exit_code != 0:
+                rollback = tuple(runner(item) for item in plan.rollback_steps)
+                return AdminExecutionResult(f"admin.exec.{plan.id}.failed", plan.id, AdminExecutionStatus.FAILED, f"immutable release verification failed during {step.title}; rollback attempted", tuple(commands), tuple(verification), rollback)
+        return AdminExecutionResult(f"admin.exec.{plan.id}.completed", plan.id, AdminExecutionStatus.COMPLETED, "approved immutable Codex dispatch release activated and verified", tuple(commands), tuple(verification))
+    finally:
+        _EXECUTION_CONTEXT.reset(token)
+        lock_context.__exit__(None, None, None)
+        _EXECUTION_MUTEX.release()
+
+
+def require_isolated_activation_entry() -> None:
+    # The production CLI remains entered through the reviewed isolated wrapper.
+    from .codex_dispatch_activation import require_isolated_activation_entry as legacy_gate
+    legacy_gate()
+
+
 __all__ = [
-    "ImmutableReleaseManifest", "ReleaseFile", "RELEASE_PLAN_SCHEMA", "RELEASE_SCHEMA",
+    "ImmutableReleaseManifest", "ReleaseActivationSpec", "ReleaseFile", "RELEASE_PLAN_SCHEMA", "RELEASE_SCHEMA",
     "assert_no_dbus_commands", "build_immutable_release_manifest",
-    "plan_immutable_release_activation", "release_drop_in_content", "send_pinned_signal",
+    "build_codex_dispatch_activation_spec", "execute_codex_dispatch_activation_marker",
+    "execute_codex_dispatch_activation_plan", "plan_codex_dispatch_activation",
+    "plan_immutable_release_activation", "release_drop_in_content", "require_isolated_activation_entry",
+    "send_pinned_signal", "validate_codex_dispatch_activation_plan", "verify_reviewed_source_binding",
     "validate_sudo_install_argv", "verify_installed_release",
 ]

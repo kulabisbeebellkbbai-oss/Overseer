@@ -54,8 +54,8 @@ from .psychlo_cycle_activation import (
     plan_psychlo_recurring_cycle_activation,
     psychlo_cycle_activation_spec_from_private_file,
 )
-from .codex_dispatch_activation import (
-    CodexDispatchActivationSpec,
+from .codex_dispatch_release_activation import (
+    ReleaseActivationSpec as CodexDispatchActivationSpec,
     build_codex_dispatch_activation_spec,
     execute_codex_dispatch_activation_marker,
     plan_codex_dispatch_activation,

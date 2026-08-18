@@ -46,12 +46,32 @@ def _verify(release_root: Path, manifest_path: Path, expected_digest: str) -> No
     digest = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if digest != expected_digest or supplied != digest or supplied_root != str(release_root):
         raise RuntimeError("release manifest binding failed")
+    python = value["rootPython"]
+    executable = Path(str(python["resolvedPath"]))
+    executable_content, executable_info = _read_stable(executable)
+    if (Path(str(python["path"])) != Path("/usr/bin/python3")
+            or Path("/usr/bin/python3").resolve(strict=True) != executable
+            or executable_info.st_uid != 0 or executable_info.st_gid != 0
+            or stat.S_IMODE(executable_info.st_mode) & 0o022
+            or executable_info.st_dev != python["device"] or executable_info.st_ino != python["inode"]
+            or hashlib.sha256(executable_content).hexdigest() != python["sha256"]):
+        raise RuntimeError("root Python identity changed")
     for item in value["files"]:
         path = release_root / item["releasePath"]
         content, info = _read_stable(path)
         if (info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != item["mode"]
                 or len(content) != item["size"] or hashlib.sha256(content).hexdigest() != item["sha256"]):
             raise RuntimeError("release file verification failed")
+        current = path.parent
+        while current != release_root.parent:
+            directory = current.lstat()
+            if (not stat.S_ISDIR(directory.st_mode) or current.is_symlink()
+                    or directory.st_uid != 0 or directory.st_gid != 0
+                    or stat.S_IMODE(directory.st_mode) & 0o222):
+                raise RuntimeError("release directory identity is unsafe")
+            if current == release_root:
+                break
+            current = current.parent
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,7 +85,10 @@ def main(argv: list[str] | None = None) -> int:
     _verify(release_root, Path(args.manifest), args.manifest_digest)
     if not args.payload or args.payload[0] != "--" or args.payload[1:2] != ["serve-api"]:
         raise RuntimeError("release launcher payload is not the reviewed service entry")
-    sys.path[:] = [str(release_root / "app/src"), str(release_root / "site-packages")]
+    # ``-I -S`` retains only root-owned standard-library entries.  Add the two
+    # verified release roots explicitly without enabling user/site imports.
+    sys.path.insert(0, str(release_root / "site-packages"))
+    sys.path.insert(0, str(release_root / "app/src"))
     from overseer.cli import main as overseer_main
     return overseer_main(args.payload[1:])
 

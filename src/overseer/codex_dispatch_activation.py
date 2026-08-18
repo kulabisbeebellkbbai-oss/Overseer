@@ -106,7 +106,7 @@ _REMOTE_CONTROL_REQUIRED_KEYS = {"status", "remoteControlEnabled", "socketPath",
 _REMOTE_CONTROL_OPTIONAL_KEYS = {"backend", "appServerVersion"}
 _ISOLATED_ENTRY_BINDING: str | None = None
 
-IMMUTABLE_BOOTSTRAP = r'''import hashlib,json,os,subprocess,sys
+IMMUTABLE_BOOTSTRAP = r'''import hashlib,json,os,select,socket,struct,subprocess,sys
 c=json.loads(sys.argv[1]); required={"sourceRoot","sourceCommit","sourceTree","sourceModule","reviewDigest","specDigest","dependencyDigest","sitePackages","launcherBlob","launcherSha256","launcherSize","bootstrapBinding","busPeerBinding","mode","payload"}
 assert isinstance(c,dict) and set(c)==required and c["sourceRoot"]=="/home/god/Documents/Codex Workspace/Overseer" and c["sitePackages"]=="/home/god/.local/share/overseer/venvs/psychlo-v1-1-cryptography-46.0.7-86d2f47/lib/python3.13/site-packages"
 e={"PATH":"/usr/bin:/bin","LANG":"C","LC_ALL":"C","GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":"/dev/null","GIT_CONFIG_GLOBAL":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
@@ -116,6 +116,13 @@ t=g("rev-parse",c["sourceCommit"]+"^{tree}"); r=g("rev-parse",c["sourceCommit"]+
 assert t.returncode==0 and t.stdout.strip().decode()==c["sourceTree"] and r.returncode==0 and r.stdout.strip().decode()==c["launcherBlob"]
 p=g("cat-file","blob",c["launcherBlob"])
 assert p.returncode==0 and len(p.stdout)==c["launcherSize"] and hashlib.sha256(p.stdout).hexdigest()==c["launcherSha256"]
+u=c["busPeerBinding"]; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect("/run/user/"+str(u["peerUid"])+"/bus"); pid,uid,gid=struct.unpack("3i",s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12)); assert [pid,uid,gid]==[u["peerPid"],u["peerUid"],u["peerGid"]]
+pidfd=os.pidfd_open(pid,0)
+def q(n):
+ f=os.open("/proc/"+str(pid)+"/"+n,os.O_RDONLY|os.O_CLOEXEC|getattr(os,"O_NOFOLLOW",0)); x=os.read(f,1048576); os.close(f); return x
+z=q("stat").decode(); k=z.rfind(")"); a=z[k+2:].split(); status={x.split(":",1)[0]:x.split(":",1)[1].strip() for x in q("status").decode().splitlines() if ":" in x}
+boot=open("/proc/sys/kernel/random/boot_id","r",encoding="ascii").read().strip()
+assert not select.select([pidfd],[],[],0)[0] and int(a[1])==u["ppid"]==1 and int(a[19])==u["startTicks"] and z[len(str(pid))+2:k]==u["comm"]=="systemd" and q("cmdline")==b"/usr/lib/systemd/systemd\0--user\0" and q("cgroup").decode().strip()==u["cgroup"] and status["Uid"]==u["statusUid"] and status["Gid"]==u["statusGid"] and boot==u["bootId"]
 sys.argv=["reviewed:overseer_codex_dispatch_launcher.py","--source-root",c["sourceRoot"],"--source-commit",c["sourceCommit"],"--source-tree",c["sourceTree"],"--source-module",c["sourceModule"],"--review-digest",c["reviewDigest"],"--spec-digest",c["specDigest"],"--dependency-digest",c["dependencyDigest"],"--launcher-blob",c["launcherBlob"],"--launcher-sha256",c["launcherSha256"],"--launcher-size",str(c["launcherSize"]),"--bootstrap-binding",json.dumps(c["bootstrapBinding"],sort_keys=True,separators=(",",":")),"--bus-peer-binding",json.dumps(c["busPeerBinding"],sort_keys=True,separators=(",",":")),"--site-packages",c["sitePackages"],c["mode"],"--",*c["payload"]]
 exec(compile(p.stdout,"reviewed:overseer_codex_dispatch_launcher.py","exec",dont_inherit=True),{"__name__":"__main__","__file__":"reviewed:overseer_codex_dispatch_launcher.py"})'''
 
@@ -275,10 +282,13 @@ def _safe_env() -> dict[str, str]:
     }
 
 
-def _run_checked(command: Sequence[str], *, timeout: float = 30.0, cwd: Path | None = None) -> str:
+def _run_checked(
+    command: Sequence[str], *, timeout: float = 30.0, cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
     completed = subprocess.run(
         tuple(command), check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        shell=False, env=_safe_env(), cwd=str(cwd) if cwd else None, timeout=timeout,
+        shell=False, env=dict(env) if env is not None else _safe_env(), cwd=str(cwd) if cwd else None, timeout=timeout,
     )
     if completed.returncode != 0:
         raise RuntimeError(f"command failed: {command[0]}")
@@ -1240,6 +1250,25 @@ def _read_user_bus_property(
     return value["data"]
 
 
+def _run_user_systemctl(
+    arguments: Sequence[str], expected_peer: Mapping[str, object], *, timeout: float = 30.0,
+) -> str:
+    if not arguments or any(not isinstance(item, str) or not item for item in arguments):
+        raise ValueError("systemctl arguments are invalid")
+    runtime_directory = RUNTIME_USER_ROOT / str(os.geteuid())
+    environment = {**_safe_env(), "XDG_RUNTIME_DIR": str(runtime_directory)}
+    if "DBUS_SESSION_BUS_ADDRESS" in environment:
+        raise ValueError("systemctl environment must not contain an inherited bus address")
+    with _validated_user_bus(expected_peer=expected_peer) as validate:
+        validate()
+        try:
+            return _run_checked(
+                ("/usr/bin/systemctl", "--user", *arguments), timeout=timeout, env=environment,
+            )
+        finally:
+            validate()
+
+
 @contextmanager
 def _activation_lock():
     with _runtime_anchor_lock() as validate_runtime:
@@ -1730,8 +1759,10 @@ def _rollback(
         _remove_operation_drop_in(journal)
         _write_journal(journal)
     if prior_phase in {"rollback-pending", "drop-in-installed", "reloaded", "restarted", "verified"} and journal["dropInOwnership"] in {"removed", "preexisting", "quarantined"}:
-        _run_checked(("systemctl", "--user", "daemon-reload"))
-        _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
+        if spec is None:
+            raise ValueError("rollback systemctl requires the approved peer binding")
+        _run_user_systemctl(("daemon-reload",), spec.bus_peer_binding)
+        _run_user_systemctl(("restart", SERVICE_NAME), spec.bus_peer_binding)
     if journal["daemonOwnership"] in {"start-issued", "started-by-operation"}:
         try:
             status = _daemon_status()
@@ -1853,7 +1884,7 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             return 0, _install_drop_in(plan_id, digest, spec), ""
         if operation == "daemon-reload":
             _revalidate_journal_drop_in(plan_id, digest, spec)
-            _run_checked(("systemctl", "--user", "daemon-reload"))
+            _run_user_systemctl(("daemon-reload",), spec.bus_peer_binding)
             _revalidate_journal_drop_in(plan_id, digest, spec)
             _verify_environment(spec)
             journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)
@@ -1863,7 +1894,7 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
         if operation == "restart-overseer":
             _revalidate_journal_drop_in(plan_id, digest, spec)
             _verify_environment(spec)
-            _run_checked(("systemctl", "--user", "restart", SERVICE_NAME))
+            _run_user_systemctl(("restart", SERVICE_NAME), spec.bus_peer_binding)
             _revalidate_journal_drop_in(plan_id, digest, spec)
             _verify_environment(spec)
             journal = _load_journal(plan_id, digest, spec) or _journal(plan_id, digest, spec=spec)

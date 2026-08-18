@@ -177,6 +177,25 @@ def test_bootstrap_rejects_unrelated_or_arbitrary_self_consistent_blob_before_ex
         assert completed.returncode != 0
 
 
+def test_service_bootstrap_rejects_approved_manager_drift_before_launcher_import():
+    head = activation._git(("rev-parse", "HEAD"))
+    tree = activation._git(("rev-parse", "HEAD^{tree}"))
+    spec = replace(_spec(), source_commit=head, source_tree_digest=tree,
+                   bootstrap_binding=activation._bootstrap_binding(head, tree))
+    drifted = {**spec.bus_peer_binding, "startTicks": int(spec.bus_peer_binding["startTicks"]) + 1}
+    spec = replace(spec, bus_peer_binding=drifted)
+    payload = (
+        "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+        "--auth-token-file", str(activation.SERVICE_TOKEN),
+    )
+    completed = subprocess.run(
+        activation._isolated_launcher_command(spec, "service", payload),
+        capture_output=True, text=True, check=False,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+    )
+    assert completed.returncode != 0
+
+
 def test_caller_manifest_and_source_root_cannot_supply_authority(tmp_path: Path):
     with pytest.raises(ValueError, match="not authoritative"):
         activation.codex_dispatch_activation_spec_from_private_file(tmp_path / "manifest.json")
@@ -761,7 +780,7 @@ def test_restart_rejects_alternate_effective_execstart_before_restart(tmp_path: 
     code, _, error = execute_codex_dispatch_activation_marker(plan.steps[4].command)
     assert code == 1
     assert "ExecStart" in error
-    assert ("systemctl", "--user", "restart", activation.SERVICE_NAME) not in calls
+    assert ("/usr/bin/systemctl", "--user", "restart", activation.SERVICE_NAME) not in calls
 
 
 @pytest.mark.parametrize("payload", [
@@ -840,6 +859,63 @@ def test_fixed_address_busctl_contract_works_under_env_i():
     completed = subprocess.run(command, capture_output=True, text=True, check=False, env={})
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["type"] == "as"
+
+
+def test_systemctl_runner_uses_only_fixed_validated_runtime_environment(monkeypatch: pytest.MonkeyPatch):
+    peer = activation._capture_user_bus_peer_binding()
+    captured: dict[str, object] = {}
+
+    def checked(command, **kwargs):
+        captured.update(command=tuple(command), env=kwargs["env"])
+        return "active"
+
+    monkeypatch.setattr(activation, "_run_checked", checked)
+    assert activation._run_user_systemctl(("is-active", activation.SERVICE_NAME), peer) == "active"
+    assert captured["command"] == ("/usr/bin/systemctl", "--user", "is-active", activation.SERVICE_NAME)
+    assert captured["env"] == {
+        **activation._safe_env(), "XDG_RUNTIME_DIR": f"/run/user/{os.geteuid()}",
+    }
+    assert "DBUS_SESSION_BUS_ADDRESS" not in captured["env"]
+
+
+def test_systemctl_read_only_probe_works_with_fixed_runtime_environment():
+    peer = activation._capture_user_bus_peer_binding()
+    assert activation._run_user_systemctl(("is-active", activation.SERVICE_NAME), peer) == "active"
+
+
+@pytest.mark.parametrize("message", ["missing runtime directory", "fake runtime directory"])
+def test_systemctl_rejects_missing_or_fake_runtime_anchor_before_command(
+    message: str, monkeypatch: pytest.MonkeyPatch,
+):
+    peer = _spec().bus_peer_binding
+    @contextmanager
+    def rejected(**_kwargs):
+        raise ValueError(message)
+        yield
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation, "_validated_user_bus", rejected)
+    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "")
+    with pytest.raises(ValueError, match=message):
+        activation._run_user_systemctl(("is-active", activation.SERVICE_NAME), peer)
+    assert calls == []
+
+
+def test_systemctl_failure_revalidates_peer_on_exception(monkeypatch: pytest.MonkeyPatch):
+    validations: list[str] = []
+    peer = _spec().bus_peer_binding
+
+    @contextmanager
+    def validated(**_kwargs):
+        def validate():
+            validations.append("validated")
+        yield validate
+
+    monkeypatch.setattr(activation, "_validated_user_bus", validated)
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")))
+    with pytest.raises(RuntimeError, match="failed"):
+        activation._run_user_systemctl(("daemon-reload",), peer)
+    assert len(validations) == 2
 
 
 def test_same_euid_fake_user_bus_peer_is_rejected():
@@ -1216,7 +1292,7 @@ def test_rollback_is_safe_when_drop_in_was_removed_and_retry_is_idempotent(tmp_p
     assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
     assert execute_codex_dispatch_activation_marker(rollback)[0] == 0
     assert journal.exists()
-    assert calls.count(("systemctl", "--user", "daemon-reload")) == 1
+    assert calls.count(("/usr/bin/systemctl", "--user", "daemon-reload")) == 1
 
 
 def test_rollback_quarantines_replacement_after_validation_without_deleting_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

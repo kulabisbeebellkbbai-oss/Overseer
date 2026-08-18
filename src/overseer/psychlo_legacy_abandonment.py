@@ -170,7 +170,12 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
     original_plan_id = _id(request.get("planId"), "original plan id")
     original_plan_version = _id(request.get("planVersion"), "original plan version")
     original_conversation_id = _id(binding.get("conversationId"), "original conversation id")
-    original_thread_id = _id(request.get("threadId"), "original thread id")
+    if "threadId" in request:
+        original_thread_id = _id(request.get("threadId"), "original thread id")
+        if original_thread_id != original_conversation_id:
+            raise LegacyAbandonmentError("original thread id does not match immutable binding")
+    else:
+        original_thread_id = original_conversation_id
     for name in ("successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId"):
         _id(successor.get(name), name)
     if (successor["successorPlanId"] == original_plan_id

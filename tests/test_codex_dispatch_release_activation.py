@@ -271,3 +271,27 @@ def test_partial_root_install_journal_rolls_back_to_inert_terminal(monkeypatch, 
         replace(plan, approved=True, approved_by="sisko", approved_at="2026-08-18T00:00:00+00:00"),
         adapter_enabled=True,
     ).status.value == "blocked"
+
+
+def test_dropin_retry_after_intent_effect_preserves_operation_ownership(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    spec = _spec()
+    plan = plan_codex_dispatch_activation("admin.dropin-crash", spec, "activate")
+    digest = plan.steps[0].command[3]
+    monkeypatch.setattr(release, "_state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(release, "_drop_in_path", lambda: tmp_path / "dropin.conf")
+    journal = release._new_journal("admin.dropin-crash", digest)
+    journal.update({
+        "phase": "dropin-intent", "installedCommands": 1,
+        "releaseOwnership": "operation-owned", "dropInOwnership": "write-issued",
+    })
+    release._write_journal(journal)
+    path = release._drop_in_path()
+    path.write_bytes(release_drop_in_content(spec.manifest))
+    path.chmod(0o600)
+
+    assert "operation-bound" in release._install_drop_in("admin.dropin-crash", spec, digest)
+    recovered = release._load_journal("admin.dropin-crash", digest)
+    assert recovered["phase"] == "dropin-installed"
+    assert recovered["dropInOwnership"] == "operation-owned"

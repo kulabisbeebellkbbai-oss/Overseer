@@ -795,6 +795,9 @@ def _install_drop_in(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> 
         raise ValueError("immutable release must be installed before the service drop-in")
     path = _drop_in_path()
     content = release_drop_in_content(spec.manifest)
+    prior_write_intent = (
+        journal["phase"] == "dropin-intent" and journal["dropInOwnership"] == "write-issued"
+    )
     existed_before_intent = path.exists()
     journal["phase"] = "dropin-intent"
     journal["dropInOwnership"] = "write-issued"
@@ -803,7 +806,9 @@ def _install_drop_in(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> 
         existing, info = _stable_read(path)
         if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or existing != content:
             raise ValueError("existing dispatch drop-in is not the exact secure approved file")
-        journal["dropInOwnership"] = "preexisting" if existed_before_intent else "operation-owned"
+        journal["dropInOwnership"] = (
+            "operation-owned" if prior_write_intent or not existed_before_intent else "preexisting"
+        )
     else:
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)

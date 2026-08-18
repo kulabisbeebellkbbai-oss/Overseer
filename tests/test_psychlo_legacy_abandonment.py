@@ -767,3 +767,63 @@ def test_every_legacy_abandonment_cli_operation_uses_strict_bridge(monkeypatch, 
         assert psychlo_bridge_cli.main(command) == 0
     assert calls == ["strict", "strict", "strict"]
     assert len(capsys.readouterr().out.splitlines()) == 3
+
+
+def test_legacy_abandonment_cli_preserves_v1_and_passes_v2_delivery_binding_only_when_supplied(monkeypatch, capsys):
+    from overseer import psychlo_bridge_cli
+
+    class Bridge:
+        def __init__(self):
+            self.calls = []
+
+        def stage_legacy_abandonment(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"staged": True}
+
+    bridge = Bridge()
+    monkeypatch.setattr(psychlo_bridge_cli, "_create_legacy_abandonment_bridge", lambda: bridge)
+    base = [
+        "stage-legacy-abandonment", "--round-id", "round", "--plan-id", "plan",
+        "--observation-plan-id", "observation-plan", "--successor-plan-id", "successor",
+        "--successor-plan-version", "2", "--successor-conversation-id", "conversation",
+        "--successor-thread-id", "thread",
+    ]
+    assert psychlo_bridge_cli.main(base) == 0
+    assert psychlo_bridge_cli.main([*base, "--delivery-conversation-id", "old-conversation"]) == 0
+    assert "delivery_conversation_id" not in bridge.calls[0]
+    assert bridge.calls[1]["delivery_conversation_id"] == "old-conversation"
+    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+def test_legacy_abandonment_cli_stages_v2_through_real_environment_and_fails_closed_for_v1_or_wrong_delivery(monkeypatch, tmp_path, capsys):
+    from overseer import psychlo_bridge_cli
+
+    bridge, primary = _runtime(tmp_path, request_thread_id="requested-thread")
+    bridge_path = bridge.store.filename
+    primary_path = primary.path
+    secret_path = tmp_path / "peer-secret"
+    secret_path.write_bytes(b"s" * 32)
+    secret_path.chmod(0o600)
+    bindings_path = tmp_path / "bindings.json"
+    bindings_path.write_text(json.dumps({"hermione": {"conversationId": "old-conversation"}}), encoding="utf-8")
+    bindings_path.chmod(0o600)
+    bridge.close()
+    monkeypatch.setenv("OVERSEER_PSYCHLO_BRIDGE_DATABASE", str(bridge_path))
+    monkeypatch.setenv("OVERSEER_STORE_DATABASE", str(primary_path))
+    monkeypatch.setenv("OVERSEER_PSYCHLO_PEER_SECRET_FILE", str(secret_path))
+    monkeypatch.setenv("OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE", str(bindings_path))
+    monkeypatch.setenv("OVERSEER_PSYCHLO_ENDPOINT", "http://127.0.0.1:8798")
+    command = [
+        "stage-legacy-abandonment", "--round-id", "round-arcade", "--plan-id", "abandon-plan",
+        "--observation-plan-id", "observation-plan", "--successor-plan-id", "arcade-plan-2",
+        "--successor-plan-version", "2.0", "--successor-conversation-id", "new-conversation",
+        "--successor-thread-id", "new-thread",
+    ]
+    with pytest.raises(LegacyAbandonmentError, match="original thread id does not match immutable binding"):
+        psychlo_bridge_cli.main(command)
+    with pytest.raises(LegacyAbandonmentError, match="delivery conversation does not match immutable binding"):
+        psychlo_bridge_cli.main([*command, "--delivery-conversation-id", "wrong-conversation"])
+    assert psychlo_bridge_cli.main([*command, "--delivery-conversation-id", "old-conversation"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["staged"] is True
+    assert output["state"] == "claimed"

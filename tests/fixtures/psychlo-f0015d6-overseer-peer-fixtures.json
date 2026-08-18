@@ -1,5 +1,23 @@
 {
   "schemaVersion": "psychlo.overseer-peer-fixtures.v1",
+  "legacyRoundAbandonment": {
+    "producer": "overseer.psychlo_legacy_abandonment",
+    "canonicalActionBody": "{\"actionId\":\"legacy-abandonment:fixture-round\",\"observationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"observationId\":\"fixture-observation\",\"occurredAt\":\"2026-08-17T12:00:00.000Z\",\"planId\":\"fixture-plan\",\"planVersion\":\"v1\",\"projectId\":\"fixture-project\",\"reason\":\"ambiguous-submitted-delivery\",\"requestDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"roundId\":\"fixture-round\",\"schemaVersion\":\"psychlo.legacy-round-abandon.v1\"}",
+    "action": {
+      "schemaVersion": "psychlo.legacy-round-abandon.v1",
+      "actionId": "legacy-abandonment:fixture-round",
+      "actionDigest": "f11c897d6c7d61ff4935891a8538c8f6bd95301807916997678495691f6eb4d8",
+      "roundId": "fixture-round",
+      "projectId": "fixture-project",
+      "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "planId": "fixture-plan",
+      "planVersion": "v1",
+      "observationId": "fixture-observation",
+      "observationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "reason": "ambiguous-submitted-delivery",
+      "occurredAt": "2026-08-17T12:00:00.000Z"
+    }
+  },
   "crossProjectWork": {
     "request": {
       "schemaVersion": "psychlo.event.v1",

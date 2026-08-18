@@ -505,13 +505,14 @@ class SQLiteStore:
             for row in self._connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name IN ('schema_migrations', 'agent_schema_migrations', "
-                "'roadex_approval_fixtures')"
+                "'roadex_approval_fixtures', 'psychlo_legacy_abandonment_execution_claims')"
             ).fetchall()
         }
         if tables != {
             "schema_migrations",
             "agent_schema_migrations",
             "roadex_approval_fixtures",
+            "psychlo_legacy_abandonment_execution_claims",
         }:
             return False
         schema_current = self._connection.execute(
@@ -643,6 +644,15 @@ class SQLiteStore:
                 id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS psychlo_legacy_abandonment_execution_claims (
+                plan_id TEXT PRIMARY KEY,
+                action_id TEXT NOT NULL UNIQUE,
+                action_digest TEXT NOT NULL UNIQUE,
+                plan_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('claimed','completed')),
+                claimed_at TEXT NOT NULL,
+                completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS psychlo_process_observations (
                 observation_id TEXT PRIMARY KEY,
@@ -2206,7 +2216,114 @@ class SQLiteStore:
         return _load_dataclass(HostInspectionSnapshot, str(row["payload"]))
 
     def save_admin_change_plan(self, plan: AdminChangePlan) -> None:
-        self._upsert("admin_change_plans", plan.id, _dump(plan))
+        with self.agent_transaction():
+            claimed = self._connection.execute(
+                "SELECT 1 FROM psychlo_legacy_abandonment_execution_claims WHERE plan_id=?",
+                (plan.id,),
+            ).fetchone()
+            if claimed is not None:
+                current = self._connection.execute(
+                    "SELECT payload FROM admin_change_plans WHERE id=?", (plan.id,)
+                ).fetchone()
+                if current is None or str(current["payload"]) != _dump(plan):
+                    raise ValueError("legacy abandonment execution claim prohibits authority mutation")
+            self._connection.execute(
+                "INSERT OR REPLACE INTO admin_change_plans (id, payload) VALUES (?, ?)",
+                (plan.id, _dump(plan)),
+            )
+
+    def claim_psychlo_legacy_abandonment_execution(
+        self,
+        plan_id: str,
+        action_id: str,
+        action_digest: str,
+        plan_digest: str,
+        *,
+        claimed_at: str,
+    ) -> dict[str, Any]:
+        """Fence approval cancellation before any peer abandonment send."""
+        from .admin import AdminChangeKind
+        from .psychlo_legacy_abandonment import _immutable_plan_digest
+
+        with self.agent_transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM admin_change_plans WHERE id=?", (plan_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("legacy abandonment authority plan is missing")
+            plan = _load_dataclass(AdminChangePlan, str(row["payload"]))
+            metadata = plan.adapter_metadata.get("legacy_abandonment") if isinstance(plan.adapter_metadata, dict) else None
+            successor_id = metadata.get("successorPlanId") if isinstance(metadata, dict) else None
+            try:
+                approved_at = datetime.fromisoformat(str(plan.approved_at).replace("Z", "+00:00"))
+            except ValueError:
+                approved_at = None
+            if (
+                plan.kind != AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT
+                or plan.owner_domain != OwnerDomain.SISKO
+                or plan.risk_level != RiskLevel.HIGH
+                or plan.approval_level != ApprovalLevel.HUMAN
+                or plan.approved is not True
+                or plan.approved_by != "sisko"
+                or approved_at is None
+                or approved_at.tzinfo is None
+                or approved_at.utcoffset() != UTC.utcoffset(approved_at)
+                or plan.canceled
+                or plan.archived
+                or any(getattr(plan, field) is not None for field in (
+                    "canceled_by", "canceled_at", "cancellation_reason", "archived_by",
+                    "archived_at", "archive_record_id",
+                ))
+                or action_id != f"legacy-abandonment:{plan.target}:{successor_id}"
+                or _immutable_plan_digest(plan) != plan_digest
+            ):
+                raise ValueError("exact active approved Sisko abandonment authority is required")
+            existing = self._connection.execute(
+                "SELECT * FROM psychlo_legacy_abandonment_execution_claims WHERE plan_id=?",
+                (plan_id,),
+            ).fetchone()
+            if existing is None:
+                self._connection.execute(
+                    "INSERT INTO psychlo_legacy_abandonment_execution_claims(plan_id,action_id,action_digest,plan_digest,state,claimed_at) VALUES (?,?,?,?,?,?)",
+                    (plan_id, action_id, action_digest, plan_digest, "claimed", claimed_at),
+                )
+            elif (
+                existing["action_id"] != action_id
+                or existing["action_digest"] != action_digest
+                or existing["plan_digest"] != plan_digest
+            ):
+                raise ValueError("legacy abandonment execution claim identity conflict")
+            current = self._connection.execute(
+                "SELECT * FROM psychlo_legacy_abandonment_execution_claims WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            return dict(current)
+
+    def complete_psychlo_legacy_abandonment_execution(
+        self,
+        plan_id: str,
+        action_id: str,
+        action_digest: str,
+        *,
+        completed_at: str,
+    ) -> dict[str, Any]:
+        with self.agent_transaction():
+            cursor = self._connection.execute(
+                "UPDATE psychlo_legacy_abandonment_execution_claims SET state='completed',completed_at=COALESCE(completed_at,?) "
+                "WHERE plan_id=? AND action_id=? AND action_digest=? AND state IN ('claimed','completed')",
+                (completed_at, plan_id, action_id, action_digest),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("legacy abandonment execution claim is missing or changed")
+            row = self._connection.execute(
+                "SELECT * FROM psychlo_legacy_abandonment_execution_claims WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            return dict(row)
+
+    def psychlo_legacy_abandonment_execution_claim(self, plan_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM psychlo_legacy_abandonment_execution_claims WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
 
     def stage_psychlo_policy_exception_authority(
         self,

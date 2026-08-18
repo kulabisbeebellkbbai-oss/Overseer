@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import sqlite3
+import subprocess
 
 import pytest
 
-from overseer.admin import approve_admin_change_plan, plan_psychlo_legacy_process_observation
+from overseer.admin import approve_admin_change_plan, cancel_admin_change_plan, plan_psychlo_legacy_process_observation
 from overseer.psychlo_bridge import PsychloBridge
 from overseer.psychlo_process_attestation import admin_plan_digest, manifest_digest
 from overseer.psychlo_store import PsychloBridgeStore
@@ -15,6 +18,7 @@ from overseer.psychlo_legacy_abandonment import (
     finalize_legacy_abandonment,
     stage_legacy_abandonment,
 )
+from overseer.psychlo_contracts import canonical_digest
 from overseer.store import SQLiteStore
 from tests.test_psychlo_process_attestation_v2 import _manifest as _process_manifest
 
@@ -88,8 +92,50 @@ def test_execute_fences_delivery_and_persists_terminal_non_result(tmp_path):
     assert bridge.store.legacy_abandonment(result["actionId"])["state"] == "completed"
     assert bridge._test_sent[0][0] == "round-legacy-abandon"
     assert set(bridge._test_sent[0][2]) == {"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "reason", "occurredAt"}
+    wire = bridge._test_sent[0][2]
+    assert wire["schemaVersion"] == "psychlo.legacy-round-abandon.v1"
+    assert wire["actionDigest"] == canonical_digest({key: value for key, value in wire.items() if key != "actionDigest"})
     replay = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
     assert replay["replay"] is True
+
+
+def test_wire_is_accepted_by_psychlo_contract_parser(tmp_path):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    wire = bridge._test_sent[0][2]
+    configured = os.environ.get("PSYCHLO_LEGACY_ABANDONMENT_PARSER")
+    workspace = Path(__file__).resolve().parents[4]
+    candidates = [
+        Path(configured) if configured else None,
+        workspace / "Psychlo" / ".worktrees" / "psychlo-legacy-abandon" / "dist" / "contracts" / "legacy-round-abandonment.js",
+        workspace / "Psychlo" / "dist" / "contracts" / "legacy-round-abandonment.js",
+    ]
+    parser = next((candidate for candidate in candidates if candidate is not None and candidate.is_file()), None)
+    if parser is None:
+        pytest.skip("Psychlo legacy abandonment contract parser is not built")
+    local_fixture = json.loads((Path(__file__).parent / "fixtures" / "psychlo-f0015d6-overseer-peer-fixtures.json").read_text(encoding="utf-8"))["legacyRoundAbandonment"]
+    psychlo_fixture_path = parser.parents[2] / "docs" / "contracts" / "psychlo-overseer-peer-fixtures.json"
+    psychlo_fixture = json.loads(psychlo_fixture_path.read_text(encoding="utf-8"))["legacyRoundAbandonment"]
+    assert local_fixture == psychlo_fixture
+    fixture_action = local_fixture["action"]
+    fixture_body = {key: value for key, value in fixture_action.items() if key != "actionDigest"}
+    assert json.dumps(fixture_body, sort_keys=True, separators=(",", ":")) == local_fixture["canonicalActionBody"]
+    assert canonical_digest(fixture_body) == "f11c897d6c7d61ff4935891a8538c8f6bd95301807916997678495691f6eb4d8"
+    script = """
+const { parseLegacyRoundAbandonment } = await import(process.argv[1]);
+let body = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => body += chunk);
+process.stdin.on('end', () => process.stdout.write(JSON.stringify(parseLegacyRoundAbandonment(JSON.parse(body)))));
+"""
+    completed = subprocess.run(
+        ["node", "--input-type=module", "-e", script, parser.as_uri()],
+        input=json.dumps(wire), text=True, capture_output=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == wire
 
 
 def test_transport_failure_leaves_replayable_outbox(tmp_path):
@@ -111,6 +157,57 @@ def test_transport_failure_leaves_replayable_outbox(tmp_path):
     result = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
     assert result["status"] == "legacy-abandoned-uncertain"
     assert calls[0] == calls[1]
+
+
+def test_cancellation_wins_before_authoritative_execution_claim(tmp_path):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    primary.save_admin_change_plan(cancel_admin_change_plan(approved, "sisko", "withdrawn", NOW))
+    with pytest.raises(LegacyAbandonmentError, match="approved Sisko plan"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge._test_sent == []
+    assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan") is None
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "claimed"
+
+
+def test_execution_claim_wins_and_prohibits_late_cancellation(tmp_path):
+    def unavailable(*_args):
+        raise RuntimeError("transport down")
+    bridge, primary = _runtime(tmp_path, sender=unavailable)
+    _stage(bridge)
+    approved = approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW)
+    primary.save_admin_change_plan(approved)
+    with pytest.raises(RuntimeError, match="transport down"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    claim = primary.psychlo_legacy_abandonment_execution_claim("abandon-plan")
+    assert claim is not None and claim["state"] == "claimed"
+    with pytest.raises(ValueError, match="execution claim"):
+        primary.save_admin_change_plan(cancel_admin_change_plan(approved, "sisko", "too late", NOW))
+    assert primary.load_admin_change_plan("abandon-plan").canceled is False
+
+
+def test_crash_after_bridge_completion_replays_without_resending(tmp_path, monkeypatch):
+    bridge, primary = _runtime(tmp_path)
+    _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    original_complete = primary.complete_psychlo_legacy_abandonment_execution
+    failures = 0
+    def crash_once(*args, **kwargs):
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise RuntimeError("primary completion crash")
+        return original_complete(*args, **kwargs)
+    monkeypatch.setattr(primary, "complete_psychlo_legacy_abandonment_execution", crash_once)
+    with pytest.raises(RuntimeError, match="primary completion crash"):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert len(bridge._test_sent) == 1
+    replay = execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert replay["replay"] is True
+    assert len(bridge._test_sent) == 1
+    assert primary.psychlo_legacy_abandonment_execution_claim("abandon-plan")["state"] == "completed"
 
 
 def test_peer_rejection_is_terminal_and_never_changes_round(tmp_path):

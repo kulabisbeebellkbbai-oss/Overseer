@@ -183,9 +183,10 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version},
         "successorPlan": dict(successor), "observationPlanId": observation_plan_id, "reason": REASON,
     }
-    action_digest = canonical_digest(action)
+    wire_body = {"schemaVersion": SCHEMA, "actionId": action_id, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "reason": REASON, "occurredAt": _now(bridge)}
+    action_digest = canonical_digest(wire_body)
     action["actionDigest"] = action_digest
-    wire = {"schemaVersion": SCHEMA, "actionId": action_id, "actionDigest": action_digest, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "reason": REASON, "occurredAt": _now(bridge)}
+    wire = {**wire_body, "actionDigest": action_digest}
     action["wire"] = wire
     return action, source_plan
 
@@ -207,9 +208,6 @@ def stage_legacy_abandonment(*, bridge: Any, plan_id: str, observation_plan_id: 
     )
     metadata["planId"] = plan_id
     metadata["planDigest"] = _immutable_plan_digest(plan)
-    metadata["actionDigest"] = canonical_digest({key: value for key, value in metadata.items() if key not in {"actionDigest", "wire", "planDigest"}} | {"planDigest": metadata["planDigest"]})
-    # Rebuild the signed wire after the final action digest is fixed.
-    metadata["wire"] = {**metadata["wire"], "actionDigest": metadata["actionDigest"]}
     if _plan_exists(primary, plan_id):
         existing_plan = primary.load_admin_change_plan(plan_id)
         if _immutable_plan_digest(existing_plan) != _immutable_plan_digest(plan):
@@ -236,8 +234,31 @@ def _action_core(value: Mapping[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key not in {"actionDigest", "wire", "planDigest", "planId"}}
 
 
-def _action_digest_content(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: item for key, item in value.items() if key not in {"actionDigest", "wire", "planDigest"}}
+_WIRE_KEYS = frozenset({"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "reason", "occurredAt"})
+_RESPONSE_KEYS = frozenset({"accepted", "actionId", "actionDigest", "roundId", "requestDigest", "status"})
+
+
+def _validate_wire(wire: Any, action: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(wire, Mapping) or set(wire) != _WIRE_KEYS:
+        raise LegacyAbandonmentError("legacy abandonment wire schema is not exact")
+    unsigned = {key: value for key, value in wire.items() if key != "actionDigest"}
+    if (
+        wire.get("schemaVersion") != SCHEMA
+        or wire.get("reason") != REASON
+        or wire.get("actionDigest") != canonical_digest(unsigned)
+        or wire.get("actionDigest") != action.get("actionDigest")
+        or wire.get("actionId") != action.get("actionId")
+        or wire.get("roundId") != action.get("roundId")
+        or wire.get("projectId") != action.get("projectId")
+        or wire.get("requestDigest") != action.get("requestDigest")
+        or wire.get("planId") != action.get("originalPlan", {}).get("planId")
+        or wire.get("planVersion") != action.get("originalPlan", {}).get("planVersion")
+        or wire.get("observationId") != action.get("observationId")
+        or wire.get("observationDigest") != action.get("observationDigest")
+    ):
+        raise LegacyAbandonmentError("legacy abandonment wire binding changed")
+    _timestamp(str(wire.get("occurredAt")))
+    return dict(wire)
 
 
 def finalize_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
@@ -255,7 +276,7 @@ def finalize_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
 
 
 def _validate_response(response: Mapping[str, Any], wire: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(response, Mapping) or response.get("accepted") is not True or response.get("actionId") != wire["actionId"] or response.get("actionDigest") != wire["actionDigest"] or response.get("roundId") != wire["roundId"] or response.get("requestDigest") != wire["requestDigest"] or response.get("status") not in {STATUS, "already-abandoned"}:
+    if not isinstance(response, Mapping) or set(response) != _RESPONSE_KEYS or response.get("accepted") is not True or response.get("actionId") != wire["actionId"] or response.get("actionDigest") != wire["actionDigest"] or response.get("roundId") != wire["roundId"] or response.get("requestDigest") != wire["requestDigest"] or response.get("status") not in {STATUS, "already-abandoned"}:
         raise LegacyAbandonmentError("Psychlo rejected legacy abandonment")
     return dict(response)
 
@@ -275,25 +296,39 @@ def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
         raise LegacyAbandonmentError("legacy abandonment intent is missing")
     action = intent["payload"]
     expected = _expected_plan(action, plan_id)
-    if _immutable_plan_digest(plan) != _immutable_plan_digest(expected) or intent["actionDigest"] != canonical_digest(_action_digest_content(action) | {"planDigest": action.get("planDigest")}):
+    plan_digest = _immutable_plan_digest(plan)
+    wire = _validate_wire(action.get("wire"), action)
+    if plan_digest != _immutable_plan_digest(expected) or action.get("planDigest") != plan_digest or intent["actionDigest"] != wire["actionDigest"]:
         raise LegacyAbandonmentError("approved abandonment plan or action identity changed")
+    try:
+        primary.claim_psychlo_legacy_abandonment_execution(
+            plan_id, action_id, intent["actionDigest"], plan_digest, claimed_at=_now(bridge),
+        )
+    except ValueError as error:
+        raise LegacyAbandonmentError("exact approved Sisko plan execution claim failed") from error
     if intent["state"] == "completed":
+        primary.complete_psychlo_legacy_abandonment_execution(
+            plan_id, action_id, intent["actionDigest"], completed_at=_now(bridge),
+        )
         return {"accepted": True, "replay": True, "status": STATUS, "receipt": intent["receipt"], "actionId": action_id}
     current_action, _ = _snapshot(bridge, primary, plan.target, action["observationPlanId"], action["successorPlan"], allow_existing_abandonment=True, allow_fence=intent["state"] == "peer-pending")
     if _action_core(current_action) != _action_core(action):
         raise LegacyAbandonmentError("current bridge or observation identity differs from staged action")
     claimed = bridge.store.claim_legacy_abandonment(action_id, intent["actionDigest"], now=_now(bridge))
     try:
-        raw_response = bridge.sender("round-legacy-abandon", action_id, action["wire"])
+        raw_response = bridge.sender("round-legacy-abandon", action_id, wire)
     except Exception:
         # A transport/process failure is recoverable: leave the outbox in
         # peer-pending so the exact action can be replayed later.
         raise
     try:
-        response = _validate_response(raw_response, action["wire"])
+        response = _validate_response(raw_response, wire)
     except Exception as error:
         bridge.store.reject_legacy_abandonment(action_id, intent["actionDigest"], str(error), now=_now(bridge))
         raise
     receipt = {**response, "status": STATUS, "actionId": action_id, "actionDigest": action["actionDigest"], "roundId": action["roundId"], "requestDigest": action["requestDigest"]}
     completed = bridge.store.complete_legacy_abandonment(action_id, intent["actionDigest"], receipt, now=_now(bridge))
+    primary.complete_psychlo_legacy_abandonment_execution(
+        plan_id, action_id, intent["actionDigest"], completed_at=_now(bridge),
+    )
     return {"accepted": True, "replay": False, "status": STATUS, "receipt": completed["receipt"], "actionId": action_id}

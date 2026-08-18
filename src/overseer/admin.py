@@ -1563,7 +1563,7 @@ def _execute_admin_change_plan_body(
 ) -> AdminExecutionResult:
     capability = admin_execution_capability_for(plan.kind, enabled_adapter_kinds)
     codex_dispatch_activation = AdminChangeKind(plan.kind) == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
-    if not capability.can_execute_live() and not codex_dispatch_activation:
+    if not capability.can_execute_live():
         return AdminExecutionResult(
             id=f"admin.exec.{plan.id}.blocked",
             plan_id=plan.id,
@@ -1596,7 +1596,7 @@ def _execute_admin_change_plan_body(
     if codex_dispatch_activation:
         from .codex_dispatch_activation import execute_codex_dispatch_activation_plan
 
-        return execute_codex_dispatch_activation_plan(plan, runner=command_runner)
+        return execute_codex_dispatch_activation_plan(plan, runner=command_runner, adapter_enabled=True)
     if AdminChangeKind(plan.kind) == AdminChangeKind.PYTHON_HASHED_VENV_PROVISION:
         try:
             from .python_venv import validate_python_venv_plan

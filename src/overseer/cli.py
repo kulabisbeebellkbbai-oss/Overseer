@@ -55,9 +55,9 @@ from .psychlo_cycle_activation import (
     psychlo_cycle_activation_spec_from_private_file,
 )
 from .codex_dispatch_activation import (
-    SERVICE_NAME,
     CodexDispatchActivationSpec,
-    codex_dispatch_activation_spec_from_private_file,
+    SERVICE_NAME,
+    build_codex_dispatch_activation_spec,
     execute_codex_dispatch_activation_marker,
     plan_codex_dispatch_activation,
     validate_codex_dispatch_activation_plan,
@@ -4351,9 +4351,9 @@ def plan_admin_change_status(
             raise ValueError("psychlo_cycle_spec is required for psychlo_recurring_cycle_activation")
         plan = plan_psychlo_recurring_cycle_activation(plan_id, psychlo_cycle_spec, reason, current_state)
     elif plan_kind == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION:
-        if codex_dispatch_spec is None:
-            raise ValueError("codex_dispatch_spec is required for codex_app_server_dispatch_activation")
-        plan = plan_codex_dispatch_activation(plan_id, codex_dispatch_spec, reason, current_state)
+        if codex_dispatch_spec is not None:
+            raise ValueError("caller-supplied Codex dispatch manifests are not authoritative")
+        plan = plan_codex_dispatch_activation(plan_id, build_codex_dispatch_activation_spec(), reason, current_state)
     else:
         raise ValueError(f"unsupported admin change kind: {kind}")
     status = admin_change_plan_status(plan)
@@ -10717,10 +10717,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--psychlo-cycle-spec",
         help="owner-only JSON manifest for psychlo_recurring_cycle_activation",
     )
-    admin_plan_parser.add_argument(
-        "--codex-dispatch-spec",
-        help="owner-only JSON manifest for codex_app_server_dispatch_activation",
-    )
     admin_plan_parser.add_argument("--use-firewalld", action="store_true", help="stage firewalld-specific firewall_deny_tcp commands")
     codex_dispatch_stage_parser = subparsers.add_parser(
         "stage-codex-dispatch-activation",
@@ -10728,7 +10724,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     codex_dispatch_stage_parser.add_argument("--store", required=True)
     codex_dispatch_stage_parser.add_argument("--plan-id", required=True)
-    codex_dispatch_stage_parser.add_argument("--spec", required=True)
     codex_dispatch_stage_parser.add_argument("--reason", required=True)
     codex_dispatch_stage_parser.add_argument("--current-state", default="unknown")
     codex_dispatch_status_parser = subparsers.add_parser(
@@ -12090,9 +12085,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         psychlo_cycle_spec = None
         if args.psychlo_cycle_spec:
             psychlo_cycle_spec = psychlo_cycle_activation_spec_from_private_file(args.psychlo_cycle_spec)
-        codex_dispatch_spec = None
-        if args.codex_dispatch_spec:
-            codex_dispatch_spec = codex_dispatch_activation_spec_from_private_file(args.codex_dispatch_spec)
         print(
             json.dumps(
                 plan_admin_change_status(
@@ -12118,7 +12110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     filesystem_type=args.filesystem_type,
                     python_venv_spec=python_venv_spec,
                     psychlo_cycle_spec=psychlo_cycle_spec,
-                    codex_dispatch_spec=codex_dispatch_spec,
+                    codex_dispatch_spec=None,
                 ),
                 sort_keys=True,
             )
@@ -12126,17 +12118,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "stage-codex-dispatch-activation":
-        spec = codex_dispatch_activation_spec_from_private_file(args.spec)
         print(
             json.dumps(
                 plan_admin_change_status(
                     args.store,
                     args.plan_id,
                     AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
-                    SERVICE_NAME,
+                    "overseer-api.service",
                     args.reason,
                     args.current_state,
-                    codex_dispatch_spec=spec,
+                    codex_dispatch_spec=None,
                 ),
                 sort_keys=True,
             )

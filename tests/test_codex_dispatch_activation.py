@@ -74,6 +74,17 @@ def _remote_disabled_output() -> str:
     })
 
 
+def _busctl_environment(*values: str) -> str:
+    return json.dumps({"type": "as", "data": list(values)})
+
+
+def _busctl_execstart(command: tuple[str, ...], *, path: str | None = None) -> str:
+    return json.dumps({
+        "type": "a(sasbttttuii)",
+        "data": [[path or command[0], list(command), False, 0, 0, 0, 0, 0, 0, 0]],
+    })
+
+
 def test_plan_is_exact_high_human_sisko_and_fixed_socket():
     plan = _plan()
     assert plan.kind == AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
@@ -560,12 +571,12 @@ def test_journal_secure_read_rejects_symlink_and_unknown_enums(tmp_path: Path, m
 
 
 def test_environment_verification_preserves_existing_variables(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: json.dumps(
-        {"Environment": ["PATH=/usr/bin", "OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OTHER=ok"]}
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: _busctl_environment(
+        "PATH=/usr/bin", "OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OTHER=ok",
     ))
     activation._verify_environment()
-    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: json.dumps(
-        {"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]}
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: _busctl_environment(
+        "OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OVERSEER_CODEX_APP_SERVER_DISPATCH=1",
     ))
     with pytest.raises(ValueError, match="exactly one"):
         activation._verify_environment()
@@ -584,8 +595,8 @@ def test_environment_verification_requires_effective_isolated_execstart(monkeypa
 
     def checked(command_args, **_kwargs):
         if any("ExecStart" in item for item in command_args):
-            return json.dumps({"ExecStart": [{"path": command[0], "argv": list(command), "ignore_errors": False}]})
-        return json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "OTHER=ok"]})
+            return _busctl_execstart(command)
+        return _busctl_environment("OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "PYTHONPATH=", "OTHER=ok")
 
     monkeypatch.setattr(activation, "_run_checked", checked)
     activation._verify_environment(spec)
@@ -593,9 +604,9 @@ def test_environment_verification_requires_effective_isolated_execstart(monkeypa
         activation,
         "_run_checked",
         lambda command_args, **_kwargs: (
-            json.dumps({"ExecStart": [{"path": "/usr/bin/python3", "argv": ["/usr/bin/python3", "-m", "overseer.cli"], "ignore_errors": False}]})
+            _busctl_execstart(("/usr/bin/python3", "-m", "overseer.cli"))
             if any("ExecStart" in item for item in command_args)
-            else json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]})
+            else _busctl_environment("OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "PYTHONPATH=")
         ),
     )
     with pytest.raises(ValueError, match="ExecStart"):
@@ -616,8 +627,8 @@ def test_environment_verification_rejects_wrapper_containing_expected_tokens(mon
     def checked(command_args, **_kwargs):
         if any("ExecStart" in item for item in command_args):
             evil = ["/bin/sh", "-c", " ".join(expected)]
-            return json.dumps({"ExecStart": [{"path": "/bin/sh", "argv": evil, "ignore_errors": False}]})
-        return json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]})
+            return _busctl_execstart(tuple(evil), path="/bin/sh")
+        return _busctl_environment("OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "PYTHONPATH=")
 
     monkeypatch.setattr(activation, "_run_checked", checked)
     with pytest.raises(ValueError, match="ExecStart"):
@@ -644,16 +655,70 @@ def test_restart_rejects_alternate_effective_execstart_before_restart(tmp_path: 
     def checked(command_args, **_kwargs):
         calls.append(tuple(command_args))
         if any("ExecStart" in item for item in command_args):
-            return json.dumps({"ExecStart": [{
-                "path": "/bin/sh", "argv": ["/bin/sh", "-c", " ".join(expected)], "ignore_errors": False,
-            }]})
-        return json.dumps({"Environment": ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]})
+            return _busctl_execstart(("/bin/sh", "-c", " ".join(expected)), path="/bin/sh")
+        return _busctl_environment("OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "PYTHONPATH=")
 
     monkeypatch.setattr(activation, "_run_checked", checked)
     code, _, error = execute_codex_dispatch_activation_marker(plan.steps[4].command)
     assert code == 1
     assert "ExecStart" in error
     assert ("systemctl", "--user", "restart", activation.SERVICE_NAME) not in calls
+
+
+@pytest.mark.parametrize("payload", [
+    "not-json",
+    json.dumps({"type": "wrong", "data": []}),
+    json.dumps({"type": "as", "data": [], "extra": True}),
+    json.dumps({"type": "as", "data": [1]}),
+])
+def test_busctl_environment_contract_rejects_text_wrong_types_and_extras(payload: str, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: payload)
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        activation._verify_environment()
+
+
+def test_busctl_uses_exact_fixed_service_property_contract(monkeypatch: pytest.MonkeyPatch):
+    spec = _spec()
+    expected = activation._isolated_launcher_command(
+        spec, "service", (
+            "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+            "--auth-token-file", str(activation.SERVICE_TOKEN),
+        ),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def checked(command, **_kwargs):
+        calls.append(tuple(command))
+        return (_busctl_execstart(expected) if command[-1] == "ExecStart"
+                else _busctl_environment("OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "PYTHONPATH="))
+
+    monkeypatch.setattr(activation, "_run_checked", checked)
+    activation._verify_environment(spec)
+    prefix = (
+        activation.BUSCTL, "--user", "--json=short", "get-property", activation.SYSTEMD_BUS_NAME,
+        activation.SERVICE_OBJECT, activation.SERVICE_INTERFACE,
+    )
+    assert calls == [(*prefix, "Environment"), (*prefix, "ExecStart")]
+
+
+@pytest.mark.parametrize("bad_field", [True, -1, 2**64])
+def test_busctl_execstart_contract_rejects_invalid_runtime_field_types(bad_field: object, monkeypatch: pytest.MonkeyPatch):
+    spec = _spec()
+    expected = activation._isolated_launcher_command(
+        spec, "service", (
+            "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
+            "--auth-token-file", str(activation.SERVICE_TOKEN),
+        ),
+    )
+    invalid = json.loads(_busctl_execstart(expected))
+    invalid["data"][0][3] = bad_field
+    monkeypatch.setattr(
+        activation, "_run_checked",
+        lambda command, **_kwargs: json.dumps(invalid) if command[-1] == "ExecStart"
+        else _busctl_environment("OVERSEER_CODEX_APP_SERVER_DISPATCH=1", "PYTHONPATH="),
+    )
+    with pytest.raises(ValueError, match="ExecStart"):
+        activation._verify_environment(spec)
 
 
 def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

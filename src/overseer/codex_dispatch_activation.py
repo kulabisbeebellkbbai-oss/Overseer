@@ -40,6 +40,10 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v3"
 JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v5"
 SERVICE_NAME = "overseer-api.service"
+BUSCTL = "/usr/bin/busctl"
+SYSTEMD_BUS_NAME = "org.freedesktop.systemd1"
+SERVICE_OBJECT = "/org/freedesktop/systemd1/unit/overseer_2dapi_2eservice"
+SERVICE_INTERFACE = "org.freedesktop.systemd1.Service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 # This path is relative to CODEX_HOME exactly once.
 DAEMON_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
@@ -1040,33 +1044,53 @@ def _probe_proxy() -> None:
 
 
 def _verify_environment(spec: CodexDispatchActivationSpec | None = None) -> None:
-    output = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=Environment", "--output=json"))
-    environment = json.loads(output)
-    if (not isinstance(environment, dict) or set(environment) != {"Environment"}
-            or not isinstance(environment["Environment"], list)
-            or any(not isinstance(item, str) for item in environment["Environment"])):
+    def property_value(name: str, signature: str) -> object:
+        output = _run_checked((
+            BUSCTL, "--user", "--json=short", "get-property", SYSTEMD_BUS_NAME,
+            SERVICE_OBJECT, SERVICE_INTERFACE, name,
+        ))
+        value = json.loads(output)
+        if (not isinstance(value, dict) or set(value) != {"type", "data"}
+                or value["type"] != signature):
+            raise ValueError(f"Overseer effective {name} output contract is invalid")
+        return value["data"]
+
+    environment = property_value("Environment", "as")
+    if (not isinstance(environment, list)
+            or any(not isinstance(item, str) or "=" not in item for item in environment)):
         raise ValueError("Overseer effective environment output contract is invalid")
-    assignments = environment["Environment"]
+    assignments = environment
+    names = [item.split("=", 1)[0] for item in assignments]
+    if len(names) != len(set(names)):
+        raise ValueError("Overseer effective environment does not contain exactly one assignment per variable")
     matches = [item for item in assignments if item.startswith("OVERSEER_CODEX_APP_SERVER_DISPATCH=")]
     if matches != ["OVERSEER_CODEX_APP_SERVER_DISPATCH=1"]:
         raise ValueError("Overseer service environment does not contain exactly one correct dispatch flag")
     if spec is not None:
+        if [item for item in assignments if item.startswith("PYTHONPATH=")] != ["PYTHONPATH="]:
+            raise ValueError("Overseer effective environment does not clear PYTHONPATH exactly once")
         service_payload = (
             "serve-api", "--store", str(SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
             "--auth-token-file", str(SERVICE_TOKEN),
         )
         expected = _isolated_launcher_command(spec, "service", service_payload)
-        output = _run_checked(("systemctl", "--user", "show", SERVICE_NAME, "--property=ExecStart", "--output=json"))
-        effective = json.loads(output)
-        if (not isinstance(effective, dict) or set(effective) != {"ExecStart"}
-                or not isinstance(effective["ExecStart"], list) or len(effective["ExecStart"]) != 1):
+        effective = property_value("ExecStart", "a(sasbttttuii)")
+        if not isinstance(effective, list) or len(effective) != 1:
             raise ValueError("Overseer effective ExecStart output contract is invalid")
-        command = effective["ExecStart"][0]
-        if (not isinstance(command, dict)
-                or set(command) != {"path", "argv", "ignore_errors"}
-                or command["path"] != expected[0]
-                or command["argv"] != list(expected)
-                or command["ignore_errors"] is not False):
+        command = effective[0]
+        unsigned64 = command[3:7] if isinstance(command, list) and len(command) == 10 else ()
+        unsigned32 = command[7:8] if isinstance(command, list) and len(command) == 10 else ()
+        signed32 = command[8:10] if isinstance(command, list) and len(command) == 10 else ()
+        valid_integer = lambda item, maximum, minimum=0: (
+            isinstance(item, int) and not isinstance(item, bool) and minimum <= item <= maximum
+        )
+        if (not isinstance(command, list) or len(command) != 10
+                or command[0] != expected[0]
+                or command[1] != list(expected)
+                or command[2] is not False
+                or any(not valid_integer(item, 2**64 - 1) for item in unsigned64)
+                or any(not valid_integer(item, 2**32 - 1) for item in unsigned32)
+                or any(not valid_integer(item, 2**31 - 1, -(2**31)) for item in signed32)):
             raise ValueError("Overseer effective ExecStart is not the exact isolated launcher binding")
 
 

@@ -37,7 +37,7 @@ from .admin import (
 from .core import ApprovalLevel, OwnerDomain, RiskLevel
 
 
-CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v2"
+CODEX_DISPATCH_ACTIVATION_SCHEMA = "overseer.codex-dispatch-activation.v3"
 JOURNAL_SCHEMA = "overseer.codex-dispatch-activation-journal.v5"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
@@ -47,6 +47,9 @@ HEALTH_URL = "http://127.0.0.1:8766/health"
 SOURCE_ROOTS = ("src",)
 SOURCE_EXECUTABLE_SUFFIXES = tuple(dict.fromkeys(
     (".py", ".pyc", ".pyd", *importlib.machinery.EXTENSION_SUFFIXES)
+))
+DEPENDENCY_EXECUTABLE_SUFFIXES = tuple(dict.fromkeys(
+    (".py", ".pyd", *importlib.machinery.EXTENSION_SUFFIXES)
 ))
 DROP_IN_CONTENT = b"[Service]\nEnvironment=OVERSEER_CODEX_APP_SERVER_DISPATCH=1\n"
 CANONICAL_SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -194,6 +197,52 @@ def _module_digest(source_files: Sequence[str]) -> str:
     return hasher.hexdigest()
 
 
+def _dependency_digest_once(root: Path) -> str:
+    """Digest the closed, euid-owned executable dependency inventory."""
+    root_info = root.lstat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o002):
+        raise ValueError("reviewed dependency root is unsafe")
+    inventory: list[str] = []
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        directory_info = directory_path.lstat()
+        if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) & 0o002):
+            raise ValueError("reviewed dependency directory is unsafe")
+        for name in names:
+            child = directory_path / name
+            if child.is_symlink():
+                raise ValueError("reviewed dependency tree contains a symlink")
+        for name in files:
+            path = directory_path / name
+            if path.is_symlink():
+                raise ValueError("reviewed dependency tree contains a symlink")
+            relative = path.relative_to(root).as_posix()
+            if relative.endswith(DEPENDENCY_EXECUTABLE_SUFFIXES):
+                inventory.append(relative)
+    if not inventory:
+        raise ValueError("reviewed executable dependency inventory is empty")
+    hasher = hashlib.sha256()
+    for relative in sorted(inventory):
+        path = root / relative
+        info = path.lstat()
+        if stat.S_IMODE(info.st_mode) & 0o002:
+            raise ValueError("reviewed executable dependency is writable by another user")
+        hasher.update(relative.encode() + b"\0" + _secure_read_stable(
+            path, "reviewed executable dependency", owner_only=False,
+        ))
+    return hasher.hexdigest()
+
+
+def _dependency_digest(root: Path = SERVICE_SITE_PACKAGES) -> str:
+    first = _dependency_digest_once(root)
+    second = _dependency_digest_once(root)
+    if first != second:
+        raise ValueError("reviewed executable dependency inventory changed during validation")
+    return first
+
+
 def _source_clean() -> None:
     _reviewed_source_files()
     status = _git(("status", "--porcelain", "--untracked-files=no", "--", *SOURCE_ROOTS, "pyproject.toml"))
@@ -225,6 +274,7 @@ class CodexDispatchActivationSpec:
     source_tree_digest: str
     source_module_digest: str
     review_digest: str
+    dependency_digest: str
     service_name: str = SERVICE_NAME
     drop_in_relative_path: str = DROP_IN_RELATIVE_PATH
     daemon_socket: str = DAEMON_SOCKET_RELATIVE_PATH
@@ -242,6 +292,7 @@ class CodexDispatchActivationSpec:
             "sourceTreeDigest": self.source_tree_digest,
             "sourceModuleDigest": self.source_module_digest,
             "reviewDigest": self.review_digest,
+            "dependencyDigest": self.dependency_digest,
             "serviceName": self.service_name,
             "dropInRelativePath": self.drop_in_relative_path,
             "daemonSocket": self.daemon_socket,
@@ -253,7 +304,7 @@ class CodexDispatchActivationSpec:
     def from_json(cls, value: Mapping[str, object]) -> "CodexDispatchActivationSpec":
         expected = {
             "schemaVersion", "sourceCommit", "sourceTreeDigest", "sourceModuleDigest", "reviewDigest",
-            "serviceName", "dropInRelativePath", "daemonSocket", "healthUrl", "sourceFiles",
+            "serviceName", "dropInRelativePath", "daemonSocket", "healthUrl", "sourceFiles", "dependencyDigest",
         }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("Codex dispatch activation spec must contain exact keys")
@@ -267,6 +318,8 @@ class CodexDispatchActivationSpec:
             raise ValueError("source module digest is invalid")
         if not _valid_hex(value["reviewDigest"], {64}):
             raise ValueError("review digest is invalid")
+        if not _valid_hex(value["dependencyDigest"], {64}):
+            raise ValueError("dependency digest is invalid")
         if value["serviceName"] != SERVICE_NAME or value["dropInRelativePath"] != DROP_IN_RELATIVE_PATH:
             raise ValueError("service binding is not reviewed")
         if value["daemonSocket"] != DAEMON_SOCKET_RELATIVE_PATH or value["healthUrl"] != HEALTH_URL:
@@ -290,6 +343,7 @@ class CodexDispatchActivationSpec:
             source_tree,
             source_module,
             str(value["reviewDigest"]).lower(),
+            str(value["dependencyDigest"]).lower(),
             source_files=reviewed_files,
         )
 
@@ -310,6 +364,7 @@ def build_codex_dispatch_activation_spec() -> CodexDispatchActivationSpec:
         source_tree,
         source_module,
         _review_digest(source_commit, source_tree, source_module, source_files),
+        _dependency_digest(),
         source_files=source_files,
     )
 
@@ -338,6 +393,7 @@ def _isolated_launcher_command(
         "--source-module", spec.source_module_digest,
         "--review-digest", spec.review_digest,
         "--spec-digest", codex_dispatch_activation_plan_digest(spec),
+        "--dependency-digest", spec.dependency_digest,
         "--site-packages", str(SERVICE_SITE_PACKAGES), mode, "--", *payload,
     )
 
@@ -428,6 +484,8 @@ def verify_reviewed_source_binding(spec: CodexDispatchActivationSpec) -> None:
         raise ValueError("reviewed source file inventory changed")
     if _module_digest(reviewed_files) != spec.source_module_digest:
         raise ValueError("reviewed source module digest changed")
+    if _dependency_digest() != spec.dependency_digest:
+        raise ValueError("reviewed executable dependency digest changed")
     _source_clean()
     if spec.review_digest != _review_digest(
         spec.source_commit, spec.source_tree_digest, spec.source_module_digest, reviewed_files

@@ -18,13 +18,16 @@ import sys
 from pathlib import Path
 
 
-SCHEMA = "overseer.codex-dispatch-activation.v2"
+SCHEMA = "overseer.codex-dispatch-activation.v3"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 DAEMON_SOCKET = "app-server-control/app-server-control.sock"
 HEALTH_URL = "http://127.0.0.1:8766/health"
 EXECUTABLE_SUFFIXES = tuple(dict.fromkeys(
     (".py", ".pyc", ".pyd", *importlib.machinery.EXTENSION_SUFFIXES)
+))
+DEPENDENCY_EXECUTABLE_SUFFIXES = tuple(dict.fromkeys(
+    (".py", ".pyd", *importlib.machinery.EXTENSION_SUFFIXES)
 ))
 ALLOWED_ACTIVATION_COMMANDS = {
     "stage-codex-dispatch-activation",
@@ -118,6 +121,62 @@ def _module_digest(root: Path, inventory: tuple[str, ...]) -> str:
     return hasher.hexdigest()
 
 
+def _dependency_digest_once(root: Path) -> str:
+    root_info = root.lstat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o002):
+        raise ValueError("reviewed dependency root is unsafe")
+    inventory: list[str] = []
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        directory_info = directory_path.lstat()
+        if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) & 0o002):
+            raise ValueError("reviewed dependency directory is unsafe")
+        if any((directory_path / name).is_symlink() for name in names):
+            raise ValueError("reviewed dependency tree contains a symlink")
+        for name in files:
+            path = directory_path / name
+            if path.is_symlink():
+                raise ValueError("reviewed dependency tree contains a symlink")
+            relative = path.relative_to(root).as_posix()
+            if relative.endswith(DEPENDENCY_EXECUTABLE_SUFFIXES):
+                inventory.append(relative)
+    if not inventory:
+        raise ValueError("reviewed executable dependency inventory is empty")
+    hasher = hashlib.sha256()
+    for relative in sorted(inventory):
+        path = root / relative
+        lexical = path.lstat()
+        if (not stat.S_ISREG(lexical.st_mode) or lexical.st_uid != os.geteuid()
+                or lexical.st_nlink != 1 or stat.S_IMODE(lexical.st_mode) & 0o002):
+            raise ValueError("reviewed executable dependency is unsafe")
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(fd)
+            first = _read_all(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            second = _read_all(fd)
+            after = os.fstat(fd)
+            lexical_after = path.lstat()
+            if (first != second or _stat_binding(before) != _stat_binding(lexical)
+                    or _stat_binding(after) != _stat_binding(before)
+                    or _stat_binding(lexical_after) != _stat_binding(before)):
+                raise ValueError("reviewed executable dependency changed during read")
+        finally:
+            os.close(fd)
+        hasher.update(relative.encode() + b"\0" + first)
+    return hasher.hexdigest()
+
+
+def _dependency_digest(root: Path) -> str:
+    first = _dependency_digest_once(root)
+    second = _dependency_digest_once(root)
+    if first != second:
+        raise ValueError("reviewed executable dependency inventory changed during validation")
+    return first
+
+
 def _stat_binding(info: os.stat_result) -> tuple[int, ...]:
     return (
         info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
@@ -160,6 +219,7 @@ def _validate(args: argparse.Namespace) -> Path:
         "sourceTreeDigest": tree,
         "sourceModuleDigest": module,
         "reviewDigest": review,
+        "dependencyDigest": args.dependency_digest.lower(),
         "serviceName": SERVICE_NAME,
         "dropInRelativePath": DROP_IN_RELATIVE_PATH,
         "daemonSocket": DAEMON_SOCKET,
@@ -189,6 +249,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-module", required=True)
     parser.add_argument("--review-digest", required=True)
     parser.add_argument("--spec-digest", required=True)
+    parser.add_argument("--dependency-digest", required=True)
     parser.add_argument("--site-packages")
     parser.add_argument("payload", nargs=argparse.REMAINDER)
     return parser
@@ -200,6 +261,12 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("isolated launcher requires fixed interpreter flags -I -S")
         args = _parser().parse_args(argv)
         root = _validate(args)
+        site_packages = Path(args.site_packages or "")
+        if (not site_packages.is_absolute() or not site_packages.is_dir()
+                or site_packages.is_symlink()):
+            raise ValueError("reviewed site-packages path is unavailable")
+        if _dependency_digest(site_packages) != args.dependency_digest.lower():
+            raise ValueError("reviewed executable dependency digest changed")
         if args.mode == "probe":
             return 0
         payload = list(args.payload)
@@ -215,10 +282,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("isolated activation CLI store binding is invalid")
         if args.mode == "service" and tuple(payload) != SERVICE_PAYLOAD:
             raise ValueError("isolated service payload is not the exact reviewed command")
-        site_packages = Path(args.site_packages or "")
-        if (not site_packages.is_absolute() or not site_packages.is_dir()
-                or site_packages.is_symlink()):
-            raise ValueError("reviewed site-packages path is unavailable")
+        if _dependency_digest(site_packages) != args.dependency_digest.lower():
+            raise ValueError("reviewed executable dependency digest changed before import")
         interpreter_path_hooks = tuple(sys.path_hooks)
         source_only_hook = importlib.machinery.FileFinder.path_hook(
             (importlib.machinery.SourceFileLoader, importlib.machinery.SOURCE_SUFFIXES),

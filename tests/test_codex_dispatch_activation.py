@@ -36,6 +36,7 @@ def _spec() -> CodexDispatchActivationSpec:
         source_tree,
         source_module,
         activation._review_digest(source_commit, source_tree, source_module),
+        dependency_digest="d" * 64,
         source_files=activation._reviewed_source_files(),
     )
 
@@ -125,6 +126,23 @@ def test_reviewed_source_inventory_rejects_untracked_native_extension(monkeypatc
     monkeypatch.setattr(activation, "_git", git)
     with pytest.raises(ValueError, match="executable import artifact"):
         activation._reviewed_source_files()
+
+
+def test_dependency_digest_changes_for_injected_python_or_native_extension(tmp_path: Path):
+    tmp_path.chmod(0o700)
+    (tmp_path / "package").mkdir()
+    (tmp_path / "package").chmod(0o700)
+    module = tmp_path / "package/module.py"
+    module.write_text("VALUE = 1\n", encoding="utf-8")
+    module.chmod(0o600)
+    initial = activation._dependency_digest(tmp_path)
+    injected = tmp_path / "package/injected.cpython-313-x86_64-linux-gnu.so"
+    injected.write_bytes(b"native")
+    injected.chmod(0o600)
+    assert activation._dependency_digest(tmp_path) != initial
+    injected.unlink()
+    module.write_text("VALUE = 2\n", encoding="utf-8")
+    assert activation._dependency_digest(tmp_path) != initial
 
 
 def test_reviewed_source_inventory_covers_preimport_python_anywhere_under_src(monkeypatch: pytest.MonkeyPatch):
@@ -228,14 +246,17 @@ def _isolated_probe_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
     tree = subprocess.check_output(("git", "-C", str(root), "rev-parse", "HEAD^{tree}"), text=True).strip()
     module = module_hasher.hexdigest()
     review = activation._review_digest(commit, tree, module, inventory)
+    site_packages = activation.SERVICE_SITE_PACKAGES
+    dependency = activation._dependency_digest(site_packages)
     spec = CodexDispatchActivationSpec(
-        CODEX_DISPATCH_ACTIVATION_SCHEMA, commit, tree, module, review, source_files=inventory,
+        CODEX_DISPATCH_ACTIVATION_SCHEMA, commit, tree, module, review, dependency, source_files=inventory,
     )
     arguments = [
         "/usr/bin/python3", "-I", "-S", str(launcher),
         "--source-root", str(root), "--source-commit", commit, "--source-tree", tree,
         "--source-module", module, "--review-digest", review,
-        "--spec-digest", activation.codex_dispatch_activation_plan_digest(spec), "probe",
+        "--spec-digest", activation.codex_dispatch_activation_plan_digest(spec),
+        "--dependency-digest", dependency, "--site-packages", str(site_packages), "probe",
     ]
     return launcher, arguments
 
@@ -258,7 +279,7 @@ def test_isolated_launcher_blocks_transient_sitecustomize_and_sourceless_pyc(tmp
 
     site_packages = activation.SERVICE_SITE_PACKAGES
     service = arguments[:-1] + [
-        "--site-packages", str(site_packages), "service", "--",
+        "service", "--",
         "serve-api", "--store", str(activation.SERVICE_STORE), "--host", "127.0.0.1", "--port", "8766",
         "--auth-token-file", str(activation.SERVICE_TOKEN),
     ]
@@ -274,6 +295,42 @@ def test_isolated_launcher_blocks_transient_sitecustomize_and_sourceless_pyc(tmp
     assert rejected.returncode != 0
     assert "untracked executable Python" in rejected.stderr
     assert not sentinel.exists()
+
+
+def test_isolated_launcher_rejects_dependency_injection_before_import(tmp_path: Path):
+    _, arguments = _isolated_probe_fixture(tmp_path)
+    dependency_root = tmp_path / "reviewed-dependencies"
+    dependency_root.mkdir(mode=0o700)
+    dependency_module = dependency_root / "allowed.py"
+    dependency_module.write_text("VALUE = 1\n", encoding="utf-8")
+    dependency_module.chmod(0o600)
+    dependency_digest = activation._dependency_digest(dependency_root)
+    source_root = Path(arguments[arguments.index("--source-root") + 1])
+    inventory = tuple(sorted(
+        item for item in subprocess.check_output(
+            ("git", "-C", str(source_root), "ls-files", "--", "src"), text=True,
+        ).splitlines() if item.endswith(activation.SOURCE_EXECUTABLE_SUFFIXES)
+    ))
+    spec = CodexDispatchActivationSpec(
+        CODEX_DISPATCH_ACTIVATION_SCHEMA,
+        arguments[arguments.index("--source-commit") + 1],
+        arguments[arguments.index("--source-tree") + 1],
+        arguments[arguments.index("--source-module") + 1],
+        arguments[arguments.index("--review-digest") + 1],
+        dependency_digest,
+        source_files=inventory,
+    )
+    arguments[arguments.index("--site-packages") + 1] = str(dependency_root)
+    arguments[arguments.index("--dependency-digest") + 1] = dependency_digest
+    arguments[arguments.index("--spec-digest") + 1] = activation.codex_dispatch_activation_plan_digest(spec)
+    injected = dependency_root / "injected.cpython-313-x86_64-linux-gnu.so"
+    injected.write_bytes(b"not executable")
+    injected.chmod(0o600)
+    completed = subprocess.run(arguments, capture_output=True, text=True, check=False, env={
+        "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+    })
+    assert completed.returncode != 0
+    assert "dependency digest changed" in completed.stderr
 
 
 def test_plan_rejects_review_digest_or_metadata_drift():

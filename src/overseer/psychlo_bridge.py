@@ -2536,9 +2536,18 @@ def _strict_store_path_identity(value: str | None, label: str) -> tuple[Path, tu
         raise ValueError(f"{label} database must preexist") from error
     if canonical != path or not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"{label} database path is not canonical")
-    if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
+    if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
         raise ValueError(f"{label} database must be a unique owned private file")
-    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+    parent_mode = stat.S_IMODE(parent.st_mode)
+    unsafe_group_write = bool(parent_mode & 0o020) and (
+        parent.st_gid != os.getegid() or not _private_group_is_safe(parent.st_gid)
+    )
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or bool(parent_mode & 0o002)
+        or unsafe_group_write
+    ):
         raise ValueError(f"{label} database parent is not trusted")
     descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
     try:

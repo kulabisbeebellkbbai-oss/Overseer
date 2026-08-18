@@ -69,6 +69,9 @@ def test_plan_binds_exact_two_stage_external_root_migration():
         spec.capability(plan.id)["planDigest"],
     ]
     assert spec.capability(plan.id)["rootPythonIdentity"] == spec.manifest.root_python
+    assert spec.capability(plan.id)["priorSystemServiceState"] == {
+        "present": False, "enabled": False, "active": False,
+    }
     assert system.validate_codex_dispatch_activation_plan(plan) == spec
 
 
@@ -278,12 +281,14 @@ def test_health_200_is_rejected_when_listener_identity_changes(monkeypatch):
 @pytest.mark.parametrize(
     ("initial_phase", "unexpected"),
     [
-        ("rollback-new-unit-quarantined", set()),
-        ("rollback-old-unit-restored", set()),
-        ("rollback-system-reloaded", {"daemon-reload"}),
-        ("rollback-user-resources-restored", {"daemon-reload"}),
-        ("rollback-user-manager-reloaded", {"daemon-reload", "hup"}),
-        ("rollback-user-api-started", {"daemon-reload", "hup", "start-user"}),
+        ("rollback-new-unit-quarantined", {"stop-system"}),
+        ("rollback-old-unit-restored", {"stop-system"}),
+        ("rollback-system-reloaded", {"stop-system", "daemon-reload"}),
+        ("rollback-prior-system-enabled", {"stop-system", "daemon-reload"}),
+        ("rollback-prior-system-active", {"stop-system", "daemon-reload"}),
+        ("rollback-user-resources-restored", {"stop-system", "daemon-reload"}),
+        ("rollback-user-manager-reloaded", {"stop-system", "daemon-reload", "hup"}),
+        ("rollback-user-api-started", {"stop-system", "daemon-reload", "hup", "start-user"}),
     ],
 )
 def test_rollback_resumes_after_each_persisted_restoration_boundary(monkeypatch, initial_phase, unexpected):
@@ -297,19 +302,25 @@ def test_rollback_resumes_after_each_persisted_restoration_boundary(monkeypatch,
              "device": 2, "inode": 3, "sha256": "b" * 64},
         ],
         "oldSystemUnitQuarantine": "/etc/systemd/system/.old.inert",
-        "systemUnitIdentity": [4, 5], "lastError": "",
+        "systemUnitIdentity": [4, 5],
+        "priorSystemServiceState": {"present": True, "enabled": False, "active": False},
+        "lastError": "",
     }
     old_unit = {"path": helper.SYSTEM_UNIT, "sha256": "a" * 64, "device": 1,
-                "inode": 2, "mode": 0o644, "uid": 0, "size": 10}
+                "inode": 2, "mode": 0o644, "uid": 0, "size": 10,
+                "enabled": False, "active": False}
     old_user = {"path": "/old/user.conf", "sha256": "b" * 64, "device": 2,
                 "inode": 3, "mode": 0o600, "uid": 1000, "size": 11}
     capability = {"planDigest": "d" * 64, "journalActionId": "action",
                   "systemUnit": "new", "systemUnitSha256": "c" * 64,
                   "oldSystemUnit": old_unit, "oldUserResources": [old_user],
+                  "priorSystemServiceState": {"present": True, "enabled": False, "active": False},
                   "managerBinding": {}, "oldApiBinding": {}}
     monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
     monkeypatch.setattr(helper, "_write_journal", lambda value: calls.append(value["phase"]))
     monkeypatch.setattr(helper, "_run_systemctl", lambda *args: calls.append("daemon-reload" if args == ("daemon-reload",) else "stop-system"))
+    monkeypatch.setattr(helper, "_system_service_enabled", lambda: False)
+    monkeypatch.setattr(helper, "_system_service_active", lambda: False)
     monkeypatch.setattr(helper, "_restore_exact_quarantine", lambda active, *_args, **_kwargs: calls.append("restore-unit" if active == helper.SYSTEM_UNIT else "restore-user"))
     monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: calls.append("hup"))
     monkeypatch.setattr(helper, "_run_user_systemctl", lambda *_args: calls.append("start-user"))
@@ -319,3 +330,97 @@ def test_rollback_resumes_after_each_persisted_restoration_boundary(monkeypatch,
 
     assert not (unexpected & set(calls))
     assert calls[-2:] == ["attest-user", "rolled-back"]
+
+
+def test_rollback_stops_only_after_operation_owned_unit_attestation(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    calls = []
+    journal = {
+        "schemaVersion": helper.SCHEMA, "planDigest": "d" * 64, "phase": "rollback-pending",
+        "journalActionId": "action", "userResourceQuarantines": [],
+        "oldSystemUnitQuarantine": "", "systemUnitIdentity": [4, 5],
+        "priorSystemServiceState": {"present": False, "enabled": False, "active": False},
+        "lastError": "",
+    }
+    capability = {"planDigest": "d" * 64, "journalActionId": "action",
+                  "systemUnit": "new", "systemUnitSha256": "c" * 64,
+                  "oldSystemUnit": None, "oldUserResources": [],
+                  "priorSystemServiceState": dict(journal["priorSystemServiceState"])}
+
+    class Crash(RuntimeError):
+        pass
+
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_verify_system_unit", lambda *_args: calls.append("attest-owned"))
+    monkeypatch.setattr(helper, "_system_service_active", lambda: True)
+    monkeypatch.setattr(helper, "_run_systemctl", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        helper, "_write_journal",
+        lambda value: (_ for _ in ()).throw(Crash()) if value["phase"] == "rollback-system-stopped" else None,
+    )
+
+    with pytest.raises(Crash):
+        helper._rollback(capability)
+    assert calls == ["attest-owned", ("disable", "--now", "overseer-api.service")]
+
+
+def test_rollback_rejects_prior_service_state_journal_drift_before_stop(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    journal = {
+        "schemaVersion": helper.SCHEMA, "planDigest": "d" * 64, "phase": "rollback-pending",
+        "journalActionId": "action", "userResourceQuarantines": [],
+        "oldSystemUnitQuarantine": "", "systemUnitIdentity": [4, 5],
+        "priorSystemServiceState": {"present": False, "enabled": True, "active": False},
+        "lastError": "",
+    }
+    capability = {"planDigest": "d" * 64, "journalActionId": "action",
+                  "priorSystemServiceState": {"present": False, "enabled": False, "active": False}}
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_run_systemctl", lambda *_args: pytest.fail("stop called"))
+    with pytest.raises(ValueError, match="journal binding"):
+        helper._rollback(capability)
+
+
+def test_rollback_restores_prior_enabled_active_state_without_repeated_disable(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    calls = []
+    state = {"enabled": False, "active": False}
+    prior = {"present": True, "enabled": True, "active": True}
+    journal = {
+        "schemaVersion": helper.SCHEMA, "planDigest": "d" * 64,
+        "phase": "rollback-old-unit-restored", "journalActionId": "action",
+        "userResourceQuarantines": [], "oldSystemUnitQuarantine": "/old.inert",
+        "systemUnitIdentity": [4, 5], "priorSystemServiceState": prior, "lastError": "",
+    }
+    old = {"path": helper.SYSTEM_UNIT, "sha256": "a" * 64, "device": 1, "inode": 2,
+           "mode": 0o644, "uid": 0, "size": 10, "enabled": True, "active": True}
+    capability = {"planDigest": "d" * 64, "journalActionId": "action",
+                  "systemUnit": "new", "systemUnitSha256": "c" * 64,
+                  "oldSystemUnit": old, "oldUserResources": [],
+                  "priorSystemServiceState": prior, "managerBinding": {}, "oldApiBinding": {}}
+
+    def run_systemctl(*args):
+        calls.append(args)
+        if args[0] == "enable":
+            state["enabled"] = True
+        elif args[0] == "start":
+            state["active"] = True
+
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_write_journal", lambda _value: None)
+    monkeypatch.setattr(helper, "_restore_exact_quarantine", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(helper, "_run_systemctl", run_systemctl)
+    monkeypatch.setattr(helper, "_system_service_enabled", lambda: state["enabled"])
+    monkeypatch.setattr(helper, "_system_service_active", lambda: state["active"])
+    monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: None)
+    monkeypatch.setattr(helper, "_run_user_systemctl", lambda *_args: None)
+    monkeypatch.setattr(helper, "_wait_restored_user_api", lambda *_args: None)
+
+    helper._rollback(capability)
+    assert ("disable", "--now", "overseer-api.service") not in calls
+    assert ("disable", "overseer-api.service") not in calls
+    assert calls == [("daemon-reload",), ("enable", "overseer-api.service"),
+                     ("start", "overseer-api.service")]

@@ -32,6 +32,8 @@ SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 ROOT_HELPER_SOURCE = "src/overseer_codex_dispatch_root_helper.py"
 ROOT_HELPER_PATH = Path("/usr/local/libexec/overseer-codex-dispatch-activation")
 SYSTEM_UNIT_PATH = Path("/etc/systemd/system/overseer-api.service")
+SYSTEM_ENABLE_LINK = Path("/etc/systemd/system/multi-user.target.wants/overseer-api.service")
+SYSTEM_CGROUP_PROCS = Path("/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs")
 USER_UNIT = Path("/home/god/.config/systemd/user/overseer-api.service")
 USER_DROPINS = Path("/home/god/.config/systemd/user/overseer-api.service.d")
 PRIMARY_STORE = "/home/god/.local/share/overseer/project/state/overseer.sqlite3"
@@ -102,13 +104,22 @@ def _bound_user_resource(path: Path) -> dict[str, object]:
 
 def _old_system_unit() -> Mapping[str, object] | None:
     if not SYSTEM_UNIT_PATH.exists():
+        if os.path.lexists(SYSTEM_ENABLE_LINK) or (SYSTEM_CGROUP_PROCS.exists() and SYSTEM_CGROUP_PROCS.read_text().strip()):
+            raise ValueError("root system service state exists without its unit")
         return None
     content, info = _stable_read(SYSTEM_UNIT_PATH)
     if info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o022:
         raise ValueError("preexisting root system unit is unsafe")
+    enabled = os.path.lexists(SYSTEM_ENABLE_LINK)
+    if enabled:
+        link = SYSTEM_ENABLE_LINK.lstat()
+        if (not stat.S_ISLNK(link.st_mode) or link.st_uid != 0
+                or SYSTEM_ENABLE_LINK.resolve(strict=True) != SYSTEM_UNIT_PATH):
+            raise ValueError("preexisting root system enablement link is unsafe")
+    active = bool(SYSTEM_CGROUP_PROCS.exists() and SYSTEM_CGROUP_PROCS.read_text().strip())
     return {"path": str(SYSTEM_UNIT_PATH), "sha256": _sha256(content), "device": info.st_dev,
             "inode": info.st_ino, "mode": stat.S_IMODE(info.st_mode), "uid": 0,
-            "size": info.st_size}
+            "size": info.st_size, "enabled": enabled, "active": active}
 
 
 def _old_user_resources() -> tuple[Mapping[str, object], ...]:
@@ -153,6 +164,11 @@ class SystemActivationSpec:
     system_unit: str
 
     def capability(self, plan_id: str) -> dict[str, object]:
+        prior_service_state = {
+            "present": self.old_system_unit is not None,
+            "enabled": bool(self.old_system_unit and self.old_system_unit["enabled"]),
+            "active": bool(self.old_system_unit and self.old_system_unit["active"]),
+        }
         unsigned = {
             "schemaVersion": SCHEMA, "manifest": self.manifest.to_json(),
             "manifestDigest": self.manifest.digest, "releaseRoot": str(self.manifest.release_root),
@@ -161,6 +177,7 @@ class SystemActivationSpec:
             "rootPythonIdentity": dict(self.manifest.root_python),
             "oldUserResources": [dict(item) for item in self.old_user_resources],
             "oldSystemUnit": dict(self.old_system_unit) if self.old_system_unit is not None else None,
+            "priorSystemServiceState": prior_service_state,
             "oldApiBinding": dict(self.old_api_binding), "managerBinding": dict(self.manager_binding),
             "journalActionId": _digest({"planId": plan_id, "manifestDigest": self.manifest.digest})[:32],
             "rollback": {"mode": "external-root-helper", "restoreOnlyExactQuarantines": True,

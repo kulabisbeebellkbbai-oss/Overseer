@@ -26,6 +26,8 @@ from pathlib import Path
 SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 HELPER_PATH = "/usr/local/libexec/overseer-codex-dispatch-activation"
 SYSTEM_UNIT = "/etc/systemd/system/overseer-api.service"
+SYSTEM_ENABLE_LINK = "/etc/systemd/system/multi-user.target.wants/overseer-api.service"
+SYSTEM_CGROUP_PROCS = "/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs"
 STATE_ROOT = "/var/lib/overseer/codex-dispatch-activation"
 SYSTEMCTL = "/usr/bin/systemctl"
 SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
@@ -372,15 +374,21 @@ def _read_journal(plan_digest: str) -> dict[str, object]:
     content, info = _stable_file(path, uid=0, mode=0o600, digest=None)
     value = json.loads(content)
     expected = {"schemaVersion", "planDigest", "phase", "journalActionId",
-                "userResourceQuarantines", "oldSystemUnitQuarantine", "systemUnitIdentity", "lastError"}
+                "userResourceQuarantines", "oldSystemUnitQuarantine", "systemUnitIdentity",
+                "priorSystemServiceState", "lastError"}
     phases = {"intent-system-unit", "system-unit-installed", "release-installed",
               "user-service-quarantined", "old-api-stopped", "system-service-started",
               "verified", "rollback-pending", "rollback-system-stopped",
               "rollback-new-unit-quarantined", "rollback-old-unit-restored",
-              "rollback-system-reloaded", "rollback-user-resources-restored",
+              "rollback-system-reloaded", "rollback-prior-system-enabled",
+              "rollback-prior-system-active", "rollback-user-resources-restored",
               "rollback-user-manager-reloaded", "rollback-user-api-started", "rolled-back"}
     if (not isinstance(value, dict) or set(value) != expected or value["schemaVersion"] != SCHEMA
-            or value["planDigest"] != plan_digest or value["phase"] not in phases):
+            or value["planDigest"] != plan_digest or value["phase"] not in phases
+            or not isinstance(value["priorSystemServiceState"], dict)
+            or set(value["priorSystemServiceState"]) != {"present", "enabled", "active"}
+            or any(not isinstance(value["priorSystemServiceState"][key], bool)
+                   for key in ("present", "enabled", "active"))):
         raise ValueError("root activation journal is invalid")
     return value
 
@@ -401,6 +409,20 @@ def _run_user_systemctl(*arguments: str) -> None:
                                stderr=subprocess.PIPE, env=SAFE_ENV, check=False, timeout=60)
     if completed.returncode != 0:
         raise RuntimeError("user service restoration action failed")
+
+
+def _system_service_enabled() -> bool:
+    if not os.path.lexists(SYSTEM_ENABLE_LINK):
+        return False
+    info = os.lstat(SYSTEM_ENABLE_LINK)
+    if (not stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+            or os.path.realpath(SYSTEM_ENABLE_LINK) != SYSTEM_UNIT):
+        raise ValueError("root system service enablement link is unsafe")
+    return True
+
+
+def _system_service_active() -> bool:
+    return bool(_service_pids(SYSTEM_CGROUP_PROCS))
 
 
 def _verify_system_unit(capability: dict[str, object], identity: tuple[int, int]) -> None:
@@ -566,7 +588,8 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
         "schemaVersion", "planDigest", "manifest", "manifestDigest", "releaseRoot",
         "systemUnit", "systemUnitSha256", "bootstrapHelperSha256", "rootHelperPath",
         "rootPythonIdentity",
-        "oldUserResources", "oldSystemUnit", "oldApiBinding", "managerBinding", "journalActionId",
+        "oldUserResources", "oldSystemUnit", "priorSystemServiceState",
+        "oldApiBinding", "managerBinding", "journalActionId",
         "rollback", "receiptStore",
     }
     if not isinstance(value, dict) or set(value) != keys or value["schemaVersion"] != SCHEMA:
@@ -590,6 +613,21 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     resources = value["oldUserResources"]
     if not isinstance(resources, list) or any(not isinstance(item, dict) for item in resources):
         raise ValueError("old user unit inventory is invalid")
+    old_system = value["oldSystemUnit"]
+    old_keys = {"path", "sha256", "device", "inode", "mode", "uid", "size", "enabled", "active"}
+    if (old_system is not None
+            and (not isinstance(old_system, dict) or set(old_system) != old_keys
+                 or not isinstance(old_system["enabled"], bool)
+                 or not isinstance(old_system["active"], bool))):
+        raise ValueError("preexisting system unit binding is invalid")
+    prior = value["priorSystemServiceState"]
+    expected_prior = {
+        "present": old_system is not None,
+        "enabled": bool(old_system and old_system["enabled"]),
+        "active": bool(old_system and old_system["active"]),
+    }
+    if prior != expected_prior:
+        raise ValueError("prior root system service state binding is invalid")
     return value
 
 
@@ -621,7 +659,7 @@ def _validate_python_invocation(capability: dict[str, object], action: str, dige
 def _prepare_system_unit(capability: dict[str, object], journal: dict[str, object]) -> tuple[int, int]:
     old = capability["oldSystemUnit"]
     if old is not None:
-        if not isinstance(old, dict) or set(old) != {"path", "sha256", "device", "inode", "mode", "uid", "size"}:
+        if not isinstance(old, dict) or set(old) != {"path", "sha256", "device", "inode", "mode", "uid", "size", "enabled", "active"}:
             raise ValueError("preexisting system unit binding is invalid")
         quarantine = f"/etc/systemd/system/.overseer-api.service.{capability['journalActionId']}.prior-inert"
         if journal.get("oldSystemUnitQuarantine"):
@@ -747,6 +785,7 @@ def _activate(capability: dict[str, object], stream) -> None:
         journal = {"schemaVersion": SCHEMA, "planDigest": plan_digest, "phase": "intent-system-unit",
                    "journalActionId": capability["journalActionId"], "userResourceQuarantines": [],
                    "oldSystemUnitQuarantine": "", "systemUnitIdentity": None, "lastError": ""}
+        journal["priorSystemServiceState"] = dict(capability["priorSystemServiceState"])
         _write_journal(journal)
     _install_release(capability, stream)
     journal["phase"] = "release-installed"
@@ -785,18 +824,30 @@ def _rollback(capability: dict[str, object]) -> None:
     journal = _read_journal(str(capability["planDigest"]))
     if journal["journalActionId"] != capability["journalActionId"]:
         raise ValueError("rollback journal action identity changed")
+    prior_state = journal["priorSystemServiceState"]
+    if prior_state != capability["priorSystemServiceState"]:
+        raise ValueError("prior root system service journal binding changed")
     if journal["phase"] == "rolled-back":
         return
     rollback_phases = (
         "rollback-pending", "rollback-system-stopped", "rollback-new-unit-quarantined",
         "rollback-old-unit-restored", "rollback-system-reloaded",
+        "rollback-prior-system-enabled", "rollback-prior-system-active",
         "rollback-user-resources-restored", "rollback-user-manager-reloaded",
         "rollback-user-api-started", "rolled-back",
     )
     if journal["phase"] not in rollback_phases:
         journal["phase"] = "rollback-pending"; _write_journal(journal)
-    _run_systemctl("disable", "--now", "overseer-api.service")
     if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-system-stopped"):
+        identity = journal["systemUnitIdentity"]
+        if identity is not None:
+            if not isinstance(identity, list) or len(identity) != 2:
+                raise ValueError("operation-owned system unit journal identity is invalid")
+            _verify_system_unit(capability, (int(identity[0]), int(identity[1])))
+            if _system_service_active():
+                _run_systemctl("disable", "--now", "overseer-api.service")
+            else:
+                _run_systemctl("disable", "overseer-api.service")
         journal["phase"] = "rollback-system-stopped"; _write_journal(journal)
     system_parent = str(Path(SYSTEM_UNIT).parent)
     if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-new-unit-quarantined"):
@@ -807,7 +858,12 @@ def _rollback(capability: dict[str, object]) -> None:
                     content, info = _stable_file(SYSTEM_UNIT, uid=0, mode=0o644,
                                                  digest=str(capability["systemUnitSha256"]))
                     recorded = journal["systemUnitIdentity"]
-                    if content != str(capability["systemUnit"]).encode() or recorded != [info.st_dev, info.st_ino]:
+                    if content != str(capability["systemUnit"]).encode():
+                        raise ValueError("operation-owned system unit changed before rollback")
+                    if recorded is None:
+                        journal["systemUnitIdentity"] = [info.st_dev, info.st_ino]
+                        _write_journal(journal)
+                    elif recorded != [info.st_dev, info.st_ino]:
                         raise ValueError("operation-owned system unit changed before rollback")
                 except ValueError:
                     old = capability["oldSystemUnit"]
@@ -843,6 +899,24 @@ def _rollback(capability: dict[str, object]) -> None:
     if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-system-reloaded"):
         _run_systemctl("daemon-reload")
         journal["phase"] = "rollback-system-reloaded"; _write_journal(journal)
+    if prior_state["enabled"]:
+        if not _system_service_enabled():
+            _run_systemctl("enable", "overseer-api.service")
+        if not _system_service_enabled():
+            raise RuntimeError("prior root system service enablement was not restored")
+    elif _system_service_enabled():
+        raise ValueError("restored prior root system service was unexpectedly enabled")
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-prior-system-enabled"):
+        journal["phase"] = "rollback-prior-system-enabled"; _write_journal(journal)
+    if prior_state["active"]:
+        if not _system_service_active():
+            _run_systemctl("start", "overseer-api.service")
+        if not _system_service_active():
+            raise RuntimeError("prior root system service activity was not restored")
+    elif _system_service_active():
+        raise ValueError("restored prior root system service was unexpectedly active")
+    if rollback_phases.index(journal["phase"]) < rollback_phases.index("rollback-prior-system-active"):
+        journal["phase"] = "rollback-prior-system-active"; _write_journal(journal)
     by_active = {item["activePath"]: item for item in journal["userResourceQuarantines"]}
     for expected in capability["oldUserResources"]:
         active = str(expected["path"])

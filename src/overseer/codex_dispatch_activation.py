@@ -7,6 +7,8 @@ trusted.  Marker commands are interpreted here rather than by a shell.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -492,6 +494,23 @@ def _drop_in_quarantine_path(journal: Mapping[str, object]) -> Path:
     return drop_in.parent / f".{drop_in.name}.rollback-{plan_suffix}"
 
 
+def _rename_noreplace_at(source: str, destination: str, *, dir_fd: int) -> None:
+    """Atomically rename without replacing a concurrently-created destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace rename is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(dir_fd, os.fsencode(source), dir_fd, os.fsencode(destination), 1) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, "quarantine destination already exists", destination)
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _load_journal(plan_id: str, digest: str) -> dict[str, object] | None:
     drop_in, path, _, socket_path = _paths()
     try:
@@ -847,12 +866,7 @@ def _remove_operation_drop_in(journal: dict[str, object]) -> None:
                 _write_journal(journal)
             elif recorded != (info.st_dev, info.st_ino):
                 raise ValueError("operation-owned drop-in identity changed")
-            os.rename(
-                drop_in.name,
-                quarantine,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
+            _rename_noreplace_at(drop_in.name, quarantine, dir_fd=parent_fd)
 
         fd, content, info = _open_stable_at(parent_fd, quarantine, "quarantined operation drop-in")
         os.close(fd)

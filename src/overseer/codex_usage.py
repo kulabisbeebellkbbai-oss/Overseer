@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import select
 import sqlite3
@@ -10,10 +11,19 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_DB_PATH = Path("state/codex-usage.sqlite3")
+_APP_SERVER_ENVIRONMENT_ALLOWLIST = {
+    "CODEX_HOME",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "TMPDIR",
+}
 
 
 class CodexAppServerMethodNotFound(RuntimeError):
@@ -54,6 +64,7 @@ class CodexAppServerClient:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            env={key: value for key, value in os.environ.items() if key in _APP_SERVER_ENVIRONMENT_ALLOWLIST},
         )
         try:
             self._send(
@@ -89,6 +100,7 @@ class CodexAppServerClient:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            env={key: value for key, value in os.environ.items() if key in _APP_SERVER_ENVIRONMENT_ALLOWLIST},
         )
         try:
             self._send(process, 1, "initialize", {"clientInfo": {"name": "overseer-codex-meter", "version": "0.1.0"}, "capabilities": {}})
@@ -101,6 +113,135 @@ class CodexAppServerClient:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
+
+    def submit_bound_turn(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        client_message_id: str,
+        cwd: str,
+        phase_callback: Callable[[str], None],
+    ) -> dict[str, str]:
+        """Submit one structured turn and require its exact durable user item."""
+        if not all(isinstance(value, str) and value.strip() for value in (thread_id, prompt, client_message_id, cwd)):
+            raise ValueError("codex structured turn binding is incomplete")
+        if not Path(cwd).is_absolute():
+            raise ValueError("codex structured turn workspace is not absolute")
+        process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env={key: value for key, value in os.environ.items() if key in _APP_SERVER_ENVIRONMENT_ALLOWLIST},
+        )
+        try:
+            self._send(
+                process,
+                1,
+                "initialize",
+                {"clientInfo": {"name": "overseer-codex-dispatch", "version": "0.1.0"}, "capabilities": {}},
+            )
+            self._receive(process, 1)
+            self._send(process, 2, "thread/read", {"threadId": thread_id, "includeTurns": True})
+            baseline = self._require_idle_thread(self._receive(process, 2), thread_id, client_message_id)
+            self._send(process, 3, "thread/resume", {"threadId": thread_id, "cwd": cwd})
+            resumed = self._receive(process, 3)
+            self._require_thread_identity(resumed, thread_id)
+            self._send(process, 4, "thread/read", {"threadId": thread_id, "includeTurns": True})
+            before_submit = self._require_idle_thread(self._receive(process, 4), thread_id, client_message_id)
+            if self._turn_ids(before_submit) != self._turn_ids(baseline):
+                raise ValueError("codex structured thread changed before submission")
+            phase_callback("prepared")
+            phase_callback("paste-intent")
+            phase_callback("submit-intent")
+            self._send(
+                process,
+                5,
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": prompt}],
+                    "clientUserMessageId": client_message_id,
+                    "cwd": cwd,
+                },
+            )
+            started = self._receive(process, 5)
+            turn = started.get("turn")
+            if not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not turn["id"].strip():
+                raise ValueError("codex structured turn response is invalid")
+            turn_id = turn["id"]
+            phase_callback("submitted")
+            self._send(process, 6, "thread/read", {"threadId": thread_id, "includeTurns": True})
+            confirmed = self._require_thread_identity(self._receive(process, 6), thread_id)
+            if not self._has_exact_user_item(confirmed, turn_id, client_message_id, prompt):
+                raise ValueError("codex structured user message was not confirmed")
+            return {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "client_message_id": client_message_id,
+                "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "delivery_proof": "app-server-user-message",
+            }
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+    @staticmethod
+    def _require_thread_identity(response: dict[str, Any], thread_id: str) -> dict[str, Any]:
+        thread = response.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id or not isinstance(thread.get("turns"), list):
+            raise ValueError("codex structured thread identity is invalid")
+        return thread
+
+    @classmethod
+    def _require_idle_thread(cls, response: dict[str, Any], thread_id: str, client_message_id: str) -> dict[str, Any]:
+        thread = cls._require_thread_identity(response, thread_id)
+        for turn in thread["turns"]:
+            if not isinstance(turn, dict) or turn.get("status") != "completed":
+                raise ValueError("codex structured thread is not idle")
+            items = turn.get("items")
+            if not isinstance(items, list):
+                raise ValueError("codex structured turn history is invalid")
+            for item in items:
+                if isinstance(item, dict) and item.get("type") == "userMessage" and item.get("clientId") == client_message_id:
+                    raise ValueError("codex structured client message identity already exists")
+        return thread
+
+    @staticmethod
+    def _turn_ids(thread: dict[str, Any]) -> tuple[str, ...]:
+        ids = tuple(turn.get("id") for turn in thread["turns"] if isinstance(turn, dict))
+        if len(ids) != len(thread["turns"]) or any(not isinstance(value, str) or not value for value in ids):
+            raise ValueError("codex structured turn history is invalid")
+        return ids
+
+    @staticmethod
+    def _has_exact_user_item(thread: dict[str, Any], turn_id: str, client_message_id: str, prompt: str) -> bool:
+        matches = []
+        for turn in thread["turns"]:
+            if not isinstance(turn, dict):
+                raise ValueError("codex structured turn history is invalid")
+            items = turn.get("items")
+            if not isinstance(items, list):
+                raise ValueError("codex structured turn history is invalid")
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "userMessage" or item.get("clientId") != client_message_id:
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list) or any(not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str) for part in content):
+                    raise ValueError("codex structured user message content is invalid")
+                matches.append((turn.get("id"), "".join(part["text"] for part in content)))
+        if not matches:
+            return False
+        if len(matches) != 1 or matches[0] != (turn_id, prompt):
+            raise ValueError("codex structured user message binding conflicts")
+        return True
 
     def _read_rate_limits(self, process: subprocess.Popen[str]) -> dict[str, Any]:
         self._send(process, 2, "account/rateLimits/read", {})

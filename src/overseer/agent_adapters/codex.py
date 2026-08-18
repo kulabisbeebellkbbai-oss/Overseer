@@ -108,6 +108,18 @@ class PromptDeliveryEvidence(Protocol):
     def confirm(self, prompt: str) -> bool: ...
 
 
+class StructuredTurnClient(Protocol):
+    def submit_bound_turn(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        client_message_id: str,
+        cwd: str,
+        phase_callback: Callable[[str], None],
+    ) -> dict[str, str]: ...
+
+
 class RolloutPromptDeliveryEvidence:
     """Confirm a prompt through the newly appended Codex rollout records."""
 
@@ -255,6 +267,7 @@ class CodexDriver:
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: BoundedCommandRunner | None = None,
         delivery_evidence_factory=None,
+        structured_turn_client: StructuredTurnClient | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
@@ -295,6 +308,7 @@ class CodexDriver:
         self._legacy_resume_details: dict[str, LegacyResumeDetails] = {}
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
         self.delivery_evidence_factory = delivery_evidence_factory or (lambda session: RolloutPromptDeliveryEvidence(session))
+        self.structured_turn_client = structured_turn_client
         if not callable(sleep):
             raise TypeError("Codex sleep hook must be callable")
         self._sleep = sleep
@@ -312,8 +326,14 @@ class CodexDriver:
         codex_memory_session_path: str | Path = DEFAULT_CODEX_MEMORY_SESSION,
         runner: CliCommandRunner | SubprocessRunner | None = None,
         delivery_evidence_factory=None,
+        structured_turn_client: StructuredTurnClient | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> CodexDriver:
+        selected_structured_turn_client = structured_turn_client
+        if selected_structured_turn_client is None and os.environ.get("OVERSEER_CODEX_APP_SERVER_DISPATCH") == "1":
+            from ..codex_usage import CodexAppServerClient
+
+            selected_structured_turn_client = CodexAppServerClient(timeout=15.0)
         selected_provider = provider or AgentProvider(
             id="codex",
             adapter_id="codex",
@@ -337,6 +357,7 @@ class CodexDriver:
             codex_memory_session_path=codex_memory_session_path,
             runner=runner,
             delivery_evidence_factory=delivery_evidence_factory,
+            structured_turn_client=selected_structured_turn_client,
             sleep=sleep,
         )
 
@@ -813,6 +834,14 @@ class CodexDriver:
         phase_callback: Callable[[str], None] | None = None,
     ) -> AgentDispatchResult:
         dispatch_prompt = request.prompt if prompt_text is None else prompt_text
+        if self.structured_turn_client is not None:
+            return self._dispatch_structured_session(
+                session,
+                request,
+                dispatch_prompt,
+                prompt_marker=prompt_marker,
+                phase_callback=phase_callback,
+            )
         resume_result, resume_details = self._resume_session(
             session,
             request_id=f"{request.id}.resume",
@@ -1074,6 +1103,114 @@ class CodexDriver:
             evidence={
                 "prompt_digest": hashlib.sha256(dispatch_prompt.encode("utf-8")).hexdigest(),
                 "delivery_proof": "rollout-user-message" if delivery_evidence is not None else "legacy-tmux-advisory",
+                **({"prompt_marker": prompt_marker} if prompt_marker is not None else {}),
+            },
+        )
+        self._legacy_prompt_details[result.id] = details
+        return result
+
+    def _dispatch_structured_session(
+        self,
+        session: AgentSession,
+        request: AgentDispatchRequest,
+        dispatch_prompt: str,
+        *,
+        prompt_marker: str | None,
+        phase_callback: Callable[[str], None] | None,
+    ) -> AgentDispatchResult:
+        thread_id = session.external_session_id
+        resume_details = LegacyResumeDetails(
+            status="structured",
+            reason="codex app-server exact thread binding",
+        )
+        if not isinstance(thread_id, str) or not thread_id.strip() or phase_callback is None:
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex structured dispatch lacks durable thread or phase binding",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+            )
+        session_check = self._run(
+            [
+                str(self.tmux_path),
+                "has-session",
+                "-t",
+                _legacy_text(session, "command"),
+            ]
+        )
+        if session_check.returncode == 0:
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="live interactive codex session prevents structured dispatch",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+            )
+        if session_check.returncode != 1:
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex interactive session absence could not be proven",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+            )
+        try:
+            evidence = self.structured_turn_client.submit_bound_turn(
+                thread_id=thread_id,
+                prompt=dispatch_prompt,
+                client_message_id=request.id,
+                cwd=session.workspace,
+                phase_callback=phase_callback,
+            )
+        except Exception as error:
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex structured turn was not confirmed",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                stderr=str(error),
+            )
+        expected_digest = hashlib.sha256(dispatch_prompt.encode("utf-8")).hexdigest()
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != {"thread_id", "turn_id", "client_message_id", "prompt_digest", "delivery_proof"}
+            or evidence.get("thread_id") != thread_id
+            or evidence.get("client_message_id") != request.id
+            or evidence.get("prompt_digest") != expected_digest
+            or evidence.get("delivery_proof") != "app-server-user-message"
+            or not isinstance(evidence.get("turn_id"), str)
+            or not evidence["turn_id"].strip()
+        ):
+            return self._prompt_failure(
+                request,
+                session,
+                resume_details,
+                status="delivery_unconfirmed",
+                reason="codex structured turn proof is invalid",
+                category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+            )
+        reason = "prompt submitted through codex app-server and confirmed as an exact user message"
+        details = LegacyPromptDetails(status="prompt_dispatched", reason=reason, resume=resume_details)
+        result = self._success_result(
+            request_id=request.id,
+            instance_id=request.instance_id,
+            session_id=request.session_id,
+            driver_epoch_id=request.driver_epoch_id,
+            state=AgentOperationState.ACKNOWLEDGED,
+            session=session,
+            status=details.status,
+            reason=reason,
+            evidence={
+                "prompt_digest": expected_digest,
+                "delivery_proof": "app-server-user-message",
+                "turn_id": evidence["turn_id"],
+                "client_message_id": request.id,
                 **({"prompt_marker": prompt_marker} if prompt_marker is not None else {}),
             },
         )

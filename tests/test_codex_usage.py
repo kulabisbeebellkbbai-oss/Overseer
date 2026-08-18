@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,19 @@ class _ScriptedAppServerClient(CodexAppServerClient):
         if request_id == 2:
             return {"rateLimitsByLimitId": {"codex": {"limitId": "codex", "primary": {"usedPercent": 12, "windowDurationMins": 60, "resetsAt": 1786000000}}}}
         raise self.terminal_error
+
+
+class _StructuredDispatchClient(CodexAppServerClient):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = responses
+        self.sent = []
+
+    def _send(self, process, request_id, method, params):
+        self.sent.append((request_id, method, params))
+
+    def _receive(self, process, request_id):
+        return self.responses[request_id]
 
 
 class FakeClient:
@@ -121,6 +135,125 @@ def test_read_usage_does_not_hide_other_provider_failures(monkeypatch):
     monkeypatch.setattr("overseer.codex_usage.subprocess.Popen", lambda *args, **kwargs: _FinishedProcess())
     with pytest.raises(TimeoutError, match="provider timeout"):
         _ScriptedAppServerClient(TimeoutError("provider timeout")).read_usage()
+
+
+def test_structured_turn_submission_is_bound_and_confirmed_before_ack(monkeypatch):
+    thread_id = "01a01569-7874-7f72-bca9-9c91bb869846"
+    client_message_id = "legacy.dispatch.round-arcade-v5"
+    prompt = "Execute exactly one approved Arcade round."
+    idle = {
+        "thread": {
+            "id": thread_id,
+            "status": {"type": "notLoaded"},
+            "turns": [
+                {
+                    "id": "turn.ready",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "id": "item.ready",
+                            "type": "userMessage",
+                            "clientId": None,
+                            "content": [{"type": "text", "text": "Identity initialization only."}],
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    confirmed = {
+        "thread": {
+            "id": thread_id,
+            "status": {"type": "active"},
+            "turns": [
+                *idle["thread"]["turns"],
+                {
+                    "id": "turn.arcade",
+                    "status": "inProgress",
+                    "items": [
+                        {
+                            "id": "item.arcade",
+                            "type": "userMessage",
+                            "clientId": client_message_id,
+                            "content": [{"type": "text", "text": prompt}],
+                        }
+                    ],
+                },
+            ],
+        }
+    }
+    client = _StructuredDispatchClient(
+        {
+            1: {},
+            2: idle,
+            3: idle,
+            4: idle,
+            5: {"turn": {"id": "turn.arcade", "status": "inProgress", "items": []}},
+            6: confirmed,
+        }
+    )
+    phases = []
+    spawned = []
+    monkeypatch.setenv("OVERSEER_PSYCHLO_PEER_SECRET", "must-not-reach-codex")
+    monkeypatch.setattr(
+        "overseer.codex_usage.subprocess.Popen",
+        lambda *args, **kwargs: spawned.append(kwargs) or _FinishedProcess(),
+    )
+
+    evidence = client.submit_bound_turn(
+        thread_id=thread_id,
+        prompt=prompt,
+        client_message_id=client_message_id,
+        cwd="/workspace/Arcade",
+        phase_callback=phases.append,
+    )
+
+    assert evidence == {
+        "thread_id": thread_id,
+        "turn_id": "turn.arcade",
+        "client_message_id": client_message_id,
+        "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "delivery_proof": "app-server-user-message",
+    }
+    assert phases == ["prepared", "paste-intent", "submit-intent", "submitted"]
+    assert [method for _, method, _ in client.sent] == [
+        "initialize",
+        "thread/read",
+        "thread/resume",
+        "thread/read",
+        "turn/start",
+        "thread/read",
+    ]
+    assert client.sent[4][2] == {
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": prompt}],
+        "clientUserMessageId": client_message_id,
+        "cwd": "/workspace/Arcade",
+    }
+    assert "OVERSEER_PSYCHLO_PEER_SECRET" not in spawned[0]["env"]
+    assert set(spawned[0]["env"]) <= {
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "TMPDIR",
+    }
+
+
+def test_structured_thread_validation_rejects_non_list_items():
+    with pytest.raises(ValueError, match="turn history is invalid"):
+        CodexAppServerClient._require_idle_thread(
+            {
+                "thread": {
+                    "id": "thread-1",
+                    "turns": [{"id": "turn-1", "status": "completed", "items": {}}],
+                }
+            },
+            "thread-1",
+            "client-message-1",
+        )
 
 
 def test_normalization_handles_legacy_single_limit():

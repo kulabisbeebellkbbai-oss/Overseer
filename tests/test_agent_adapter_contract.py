@@ -12,6 +12,7 @@ from typing import Callable
 import pytest
 
 from overseer.agent_adapters.codex import CODEX_PASTE_SETTLE_SECONDS, CodexDriver
+from overseer.codex_usage import CodexAppServerClient
 from overseer.agent_adapters.claude import ClaudeDriver
 from overseer.agent_adapters.antigravity import antigravity_adapter_factory
 from overseer.agent_adapters.mistral_vibe import mistral_vibe_adapter_factory
@@ -544,6 +545,98 @@ def test_dispatch_persists_external_effect_phases_before_each_irreversible_step(
 
     assert result.state is AgentOperationState.ACKNOWLEDGED
     assert phases == ["prepared", "paste-intent", "submit-intent", "submitted"]
+
+
+def test_structured_dispatch_uses_app_server_without_tmux_side_effects(codex_csv: Path) -> None:
+    phases: list[str] = []
+
+    class StructuredClient:
+        def submit_bound_turn(self, *, thread_id, prompt, client_message_id, cwd, phase_callback):
+            assert thread_id == "conversation-1"
+            assert prompt == "Execute one structured round."
+            assert client_message_id.startswith("legacy.dispatch.")
+            assert cwd == "/workspace/example"
+            for phase in ("prepared", "paste-intent", "submit-intent", "submitted"):
+                phase_callback(phase)
+            return {
+                "thread_id": thread_id,
+                "turn_id": "turn.structured",
+                "client_message_id": client_message_id,
+                "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "delivery_proof": "app-server-user-message",
+            }
+
+    runner = RecordingRunner()
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        instance_id="overseer.default",
+        workspace="/workspace/example",
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=runner,
+        structured_turn_client=StructuredClient(),
+    )
+
+    result = adapter.dispatch_legacy(
+        adapter.discover()[0],
+        "Execute one structured round.",
+        idempotency_key="round:arcade:structured",
+        prompt_marker="round:arcade:structured",
+        phase_callback=phases.append,
+    )
+
+    assert result.state is AgentOperationState.ACKNOWLEDGED
+    assert result.evidence["delivery_proof"] == "app-server-user-message"
+    assert result.evidence["turn_id"] == "turn.structured"
+    assert phases == ["prepared", "paste-intent", "submit-intent", "submitted"]
+    assert runner.commands == [("/tmp/tmux", "has-session", "-t", "example")]
+
+
+def test_structured_dispatch_rejects_a_live_interactive_session_before_turn_start(codex_csv: Path) -> None:
+    calls = []
+
+    class LiveSessionRunner(RecordingRunner):
+        def __call__(self, command, input=None, text=True, capture_output=True):
+            if command[1] == "has-session":
+                self.commands.append(tuple(command))
+                self.inputs.append(input)
+                return subprocess.CompletedProcess(command, 0, "live", "")
+            return super().__call__(command, input=input, text=text, capture_output=capture_output)
+
+    class StructuredClient:
+        def submit_bound_turn(self, **_kwargs):
+            calls.append("turn/start")
+            raise AssertionError("structured submission must not run")
+
+    adapter = CodexDriver.from_legacy_registry(
+        codex_csv,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=LiveSessionRunner(),
+        structured_turn_client=StructuredClient(),
+    )
+
+    result = adapter.dispatch_legacy(
+        adapter.discover()[0],
+        "Do not race the live terminal.",
+        idempotency_key="round:arcade:live-terminal",
+        prompt_marker="round:arcade:live-terminal",
+        phase_callback=lambda _phase: None,
+    )
+
+    assert result.state is AgentOperationState.FAILED
+    assert result.error_message == "live interactive codex session prevents structured dispatch"
+    assert calls == []
+
+
+def test_structured_dispatch_requires_explicit_environment_enablement(codex_csv: Path, monkeypatch) -> None:
+    monkeypatch.delenv("OVERSEER_CODEX_APP_SERVER_DISPATCH", raising=False)
+    legacy = CodexDriver.from_legacy_registry(codex_csv)
+    assert legacy.structured_turn_client is None
+
+    monkeypatch.setenv("OVERSEER_CODEX_APP_SERVER_DISPATCH", "1")
+    structured = CodexDriver.from_legacy_registry(codex_csv)
+    assert isinstance(structured.structured_turn_client, CodexAppServerClient)
 
 
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(

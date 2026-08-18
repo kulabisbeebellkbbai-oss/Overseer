@@ -769,6 +769,32 @@ def test_production_dispatch_intent_survives_post_send_crash_without_repaste(tmp
     assert sends == [request["id"]]
 
 
+def test_project_dispatcher_accepts_exact_app_server_user_message_proof(tmp_path: Path, monkeypatch):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text(json.dumps({"lead-arcade": {"conversationId": "conversation-1"}}), encoding="utf-8")
+    bindings.chmod(0o600)
+    prompt = "Execute one structured Arcade round."
+
+    class StructuredDriver:
+        def discover(self):
+            return [SimpleNamespace(id="session-1", external_session_id="conversation-1")]
+
+        def dispatch_legacy(self, _session, actual_prompt, **_kwargs):
+            return SimpleNamespace(
+                id="result.structured",
+                state=SimpleNamespace(value="acknowledged"),
+                evidence={
+                    "status": "prompt_dispatched",
+                    "prompt_digest": hashlib.sha256(actual_prompt.encode("utf-8")).hexdigest(),
+                    "delivery_proof": "app-server-user-message",
+                },
+            )
+
+    monkeypatch.setattr("overseer.agent_adapters.codex.CodexDriver.from_legacy_registry", lambda: StructuredDriver())
+
+    assert CodexProjectDispatcher(bindings)("lead-arcade", prompt, "round:arcade:structured") == "result.structured"
+
+
 def test_canary_result_without_recorded_rounds_is_rejected_before_terminal_persistence(tmp_path: Path):
     fixture = _peer_fixtures()["concurrencyCanaryResult"]
     result = fixture["request"]

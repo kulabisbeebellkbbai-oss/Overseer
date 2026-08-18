@@ -2493,7 +2493,7 @@ class CodexProjectDispatcher:
         if (
             result.evidence.get("status") != "prompt_dispatched"
             or result.evidence.get("prompt_digest") != expected_prompt_digest
-            or result.evidence.get("delivery_proof") != "rollout-user-message"
+            or result.evidence.get("delivery_proof") not in {"rollout-user-message", "app-server-user-message"}
         ):
             raise ValueError("project lead dispatch lacks exact prompt delivery proof")
         return result.id

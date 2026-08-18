@@ -1043,6 +1043,26 @@ class PsychloBridgeStore:
             "receipt": json.loads(row[6]) if row[6] else None, "lastError": row[7], "updatedAt": row[8],
         }
 
+    def legacy_abandonment_for_round(self, round_id: str) -> dict[str, Any] | None:
+        """Return the one frozen abandonment intent associated with a round."""
+        row = self.connection.execute(
+            "SELECT action_id FROM legacy_abandonment_intents WHERE round_id=?",
+            (round_id,),
+        ).fetchone()
+        return None if row is None else self.legacy_abandonment(str(row[0]))
+
+    def completed_legacy_successor_intents(self, project_id: str) -> list[dict[str, Any]]:
+        """Return completed successor intents for one project in insertion order."""
+        rows = self.connection.execute(
+            "SELECT action_id FROM legacy_abandonment_intents WHERE state='completed' ORDER BY rowid"
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            intent = self.legacy_abandonment(str(row[0]))
+            if isinstance(intent, dict) and isinstance(intent.get("payload"), dict) and intent["payload"].get("projectId") == project_id:
+                result.append(intent)
+        return result
+
     def stage_legacy_abandonment(self, action_id: str, round_id: str, action_digest: str, payload: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         encoded = _dump_wire(payload)
         self.connection.execute("BEGIN IMMEDIATE")

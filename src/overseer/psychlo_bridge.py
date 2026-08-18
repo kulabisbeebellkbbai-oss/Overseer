@@ -664,7 +664,7 @@ class PsychloBridge:
         retrying_fenced_failure = existing is not None and existing["state"] == "forward-pending" and delivery is not None and delivery["phase"] == "failure-fence"
         if delivery is not None and delivery["phase"] in {"failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved"} and not retrying_fenced_failure:
             raise ValueError("operational failure is unsafe while prompt delivery is unresolved")
-        scan = _require_rollout_scan(scanner(request["projectLeadId"], self._round_prompt(request, capability)))
+        scan = _require_rollout_scan(self._scan_rollout(scanner, request, self._round_prompt(request, capability), binding["conversationId"]))
         if scan["binding"] != binding:
             raise ValueError("rollout identity changed")
         if scan["found"]:
@@ -740,11 +740,15 @@ class PsychloBridge:
         try:
             # The first read is a complete rollout scan.  It is the only safe
             # way to distinguish a post-send crash from an unsent prompt.
-            scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
             recovery_binding = self.store.round_binding(round_id) or existing.get("binding")
             if recovery_binding is None:
-                self.store.bind_round_recovery(round_id, owner, claim_token, scan["binding"])
+                if request.get("threadId") is not None:
+                    raise ValueError("original Codex execution binding is missing")
+                scan = _require_rollout_scan(scanner(str(request["projectLeadId"]), prompt))
                 recovery_binding = scan["binding"]
+                self.store.bind_round_recovery(round_id, owner, claim_token, scan["binding"])
+            else:
+                scan = _require_rollout_scan(self._scan_rollout(scanner, request, prompt, recovery_binding["conversationId"]))
             if scan["binding"] != recovery_binding:
                 raise ValueError("rollout identity changed")
             if scan["found"]:
@@ -769,7 +773,7 @@ class PsychloBridge:
             phase_capable = self._dispatcher_supports_prompt_phases()
             if phase_capable:
                 self.store.record_round_prompt_delivery_phase(round_id, request, capability, recovery_binding, attempted["promptDigest"], "prepared", now=now)
-            pre_dispatch_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+            pre_dispatch_scan = _require_rollout_scan(self._scan_rollout(scanner, request, prompt, recovery_binding["conversationId"]))
             if pre_dispatch_scan["binding"] != recovery_binding:
                 raise ValueError("rollout identity changed")
             if pre_dispatch_scan["found"]:
@@ -789,10 +793,10 @@ class PsychloBridge:
                     self.store.record_round_prompt_delivery_phase(round_id, request, capability, recovery_binding, attempted["promptDigest"], phase, now=self.clock(), expected_phase=predecessor)
                 self.store.mark_round_recovery_attempted(round_id, owner, claim_token, {**attempted, "phase": phase, "observedAt": self.clock()}, now=self.clock())
 
-            dispatch_id = self._dispatch_round(request, prompt, phase_callback=persist_phase if phase_capable else None)
+            dispatch_id = self._dispatch_round(request, prompt, phase_callback=persist_phase if phase_capable else None, conversation_id=recovery_binding["conversationId"])
             # The dispatcher acknowledgement is not sufficient: require a
             # complete rollout scan after the one allowed redelivery.
-            post_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+            post_scan = _require_rollout_scan(self._scan_rollout(scanner, request, prompt, recovery_binding["conversationId"]))
             if post_scan["binding"] != recovery_binding:
                 raise ValueError("rollout identity changed")
             if not post_scan["found"]:
@@ -815,7 +819,10 @@ class PsychloBridge:
             if isinstance(error, ValueError) and str(error).startswith(("rollout delivery proof", "rollout identity")):
                 raise
             if current is not None and current["state"] == "claimed":
-                post_scan = _require_rollout_scan(scanner(request["projectLeadId"], prompt))
+                stored_binding = self.store.round_binding(round_id) or current.get("binding")
+                if not isinstance(stored_binding, Mapping) or not isinstance(stored_binding.get("conversationId"), str):
+                    raise ValueError("original Codex execution binding is missing")
+                post_scan = _require_rollout_scan(self._scan_rollout(scanner, request, prompt, stored_binding["conversationId"]))
                 if post_scan["binding"] == (self.store.round_binding(round_id) or current.get("binding")) and post_scan["found"]:
                     evidence = {"redeliveryAttempted": True, "phase": "confirmed", "deliveryProof": "rollout-user-message", "source": "exception-rescan", "roundId": round_id, "requestDigest": current["requestDigest"], "rollout": post_scan["binding"], "observedAt": self.clock()}
                     delivery = self.store.round_prompt_delivery(round_id)
@@ -830,7 +837,65 @@ class PsychloBridge:
                     self.store.record_round_prompt_delivery_phase(round_id, request, capability, delivery["binding"], delivery["promptDigest"], "unresolved", now=self.clock(), expected_phase=delivery["phase"])
             raise ValueError("rollout delivery proof is missing") from error
 
-    def _dispatch_round(self, request: Mapping[str, Any], prompt: str, *, phase_callback=None) -> str:
+    def _authorized_successor_conversation(self, request: Mapping[str, Any]) -> str | None:
+        """Resolve a successor only from a completed, approved abandonment action."""
+        thread_id = request.get("threadId")
+        if not isinstance(thread_id, str):
+            return None
+        intents = self.store.completed_legacy_successor_intents(str(request["projectId"]))
+        for intent in intents:
+            payload = intent.get("payload")
+            successor = payload.get("successorPlan") if isinstance(payload, Mapping) else None
+            if not isinstance(payload, Mapping) or not isinstance(successor, Mapping):
+                continue
+            if successor.get("successorThreadId") != thread_id:
+                continue
+            # A matching thread is not enough: plan/version/conversation must
+            # be the exact frozen successor identity and the original action
+            # must still be backed by its approved Sisko plan.
+            if (payload.get("projectId") != request.get("projectId")
+                    or successor.get("successorPlanId") != request.get("planId")
+                    or successor.get("successorPlanVersion") != request.get("planVersion")):
+                raise ValueError("successor round plan identity does not match approved action")
+            if self.approval_store is None:
+                raise ValueError("approved successor authority is unavailable")
+            try:
+                from .admin import AdminChangeKind
+                from .psychlo_legacy_abandonment import (
+                    _expected_plan, _immutable_plan_digest, _require_approved_sisko_plan, _validate_wire,
+                )
+                plan_id = payload.get("planId")
+                plan = self.approval_store.load_admin_change_plan(str(plan_id))
+                _require_approved_sisko_plan(plan, AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT, str(payload.get("roundId")))
+                expected = _expected_plan(payload, str(plan_id))
+                if payload.get("planDigest") != _immutable_plan_digest(plan) or _immutable_plan_digest(plan) != _immutable_plan_digest(expected):
+                    raise ValueError("approved successor action identity is invalid")
+                _validate_wire(payload.get("wire"), payload)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("approved successor authority is invalid") from error
+            conversation_id = successor.get("successorConversationId")
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                raise ValueError("successor conversation identity is unavailable")
+            return conversation_id
+        return None
+
+    @staticmethod
+    def _method_kwargs(method: Callable[..., Any], request: Mapping[str, Any], conversation_id: str | None) -> dict[str, Any]:
+        parameters = inspect.signature(method).parameters
+        accepts_var_kwargs = any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+        kwargs: dict[str, Any] = {}
+        if conversation_id is not None and ("conversation_id" in parameters or accepts_var_kwargs):
+            kwargs["conversation_id"] = conversation_id
+        if "thread_id" in parameters or accepts_var_kwargs:
+            if request.get("threadId") is not None:
+                kwargs["thread_id"] = request["threadId"]
+        return kwargs
+
+    def _scan_rollout(self, scanner: Callable[..., Any], request: Mapping[str, Any], prompt: str, conversation_id: str) -> Any:
+        kwargs = self._method_kwargs(scanner, request, conversation_id)
+        return scanner(str(request["projectLeadId"]), prompt, **kwargs)
+
+    def _dispatch_round(self, request: Mapping[str, Any], prompt: str, *, phase_callback=None, conversation_id: str | None = None) -> str:
         parameters = inspect.signature(self.dispatcher).parameters
         accepts_keyword = "idempotency_key" in parameters or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
         accepts_phase = "phase_callback" in parameters
@@ -840,6 +905,11 @@ class PsychloBridge:
             kwargs["idempotency_key"] = str(request["idempotencyKey"])
         if accepts_phase and phase_callback is not None:
             kwargs["phase_callback"] = phase_callback
+        if conversation_id is not None and ("conversation_id" in parameters or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())):
+            kwargs["conversation_id"] = conversation_id
+        if "thread_id" in parameters or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+            if request.get("threadId") is not None:
+                kwargs["thread_id"] = request["threadId"]
         if kwargs:
             result = self.dispatcher(str(request["projectLeadId"]), prompt, **kwargs)
         elif accepts_third:
@@ -865,10 +935,16 @@ class PsychloBridge:
         return {"accepted": True}
 
     def _dispatch_reserved(self, request: Mapping[str, Any], capability: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        conversation_id = self._authorized_successor_conversation(request)
         binding_loader = getattr(self.dispatcher, "binding_provenance", None)
         binding: Mapping[str, Any] | None = None
         if callable(binding_loader):
-            binding = _require_rollout_binding_provenance(binding_loader(str(request["projectLeadId"])))
+            binding_kwargs = self._method_kwargs(binding_loader, request, conversation_id)
+            binding = _require_rollout_binding_provenance(binding_loader(str(request["projectLeadId"]), **binding_kwargs))
+            if request.get("threadId") is not None and conversation_id is None and binding.get("conversationId") != request.get("threadId"):
+                raise ValueError("round thread is not authorized by protected project binding")
+            if conversation_id is not None and binding.get("conversationId") != conversation_id:
+                raise ValueError("successor conversation binding is not exact")
             self.store.bind_round_execution(str(request["roundId"]), binding)
         prompt = self._round_prompt(request, capability)
         prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -885,7 +961,7 @@ class PsychloBridge:
             predecessor = {"paste-intent": "prepared", "submit-intent": "paste-intent", "submitted": "submit-intent"}.get(phase)
             self.store.record_round_prompt_delivery_phase(str(request["roundId"]), request, capability, ledger_binding, prompt_digest, phase, now=self.clock(), expected_phase=predecessor)
 
-        provider_reference = self._dispatch_round(request, prompt, phase_callback=persist_phase if ledger_binding is not None else None)
+        provider_reference = self._dispatch_round(request, prompt, phase_callback=persist_phase if ledger_binding is not None else None, conversation_id=conversation_id)
         if ledger_binding is not None:
             self.store.record_round_prompt_delivery_phase(str(request["roundId"]), request, capability, ledger_binding, prompt_digest, "confirmed", now=self.clock(), expected_phase="submitted")
         delivered = {**receipt, "provenanceId": str(provider_reference)}
@@ -2389,8 +2465,8 @@ class CodexProjectDispatcher:
         if not isinstance(bindings, dict): raise ValueError("Psychlo project bindings must be an object")
         self.bindings = bindings
 
-    def __call__(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None, phase_callback=None) -> str:
-        driver, session = self._resolve(project_lead_id)
+    def __call__(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None, phase_callback=None, *, conversation_id: str | None = None, thread_id: str | None = None) -> str:
+        driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)
         kwargs = {"idempotency_key": idempotency_key, "prompt_marker": idempotency_key}
         if phase_callback is not None and "phase_callback" in inspect.signature(driver.dispatch_legacy).parameters:
             kwargs["phase_callback"] = phase_callback
@@ -2406,21 +2482,21 @@ class CodexProjectDispatcher:
             raise ValueError("project lead dispatch lacks exact prompt delivery proof")
         return result.id
 
-    def scan_rollout(self, project_lead_id: str, prompt: str) -> bool:
+    def scan_rollout(self, project_lead_id: str, prompt: str, *, conversation_id: str | None = None, thread_id: str | None = None) -> dict[str, object]:
         """Search the complete bound Codex rollout before any recovery paste."""
-        driver, session = self._resolve(project_lead_id)
+        driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)
         result = driver.scan_rollout_prompt(session, prompt)
         if isinstance(result, bool):
-            return result
+            return {"found": result, **driver.rollout_provenance(session)}
         if not isinstance(result, Mapping) or not isinstance(result.get("found"), bool):
             raise ValueError("project lead rollout scan lacks exact identity provenance")
-        return bool(result["found"])
+        return {"found": bool(result["found"]), **driver.rollout_provenance(session)}
 
-    def binding_provenance(self, project_lead_id: str) -> dict[str, object]:
-        driver, session = self._resolve(project_lead_id)
+    def binding_provenance(self, project_lead_id: str, *, conversation_id: str | None = None, thread_id: str | None = None) -> dict[str, object]:
+        driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)
         return driver.rollout_provenance(session)
 
-    def process_binding_provenance(self, project_lead_id: str) -> dict[str, object]:
+    def process_binding_provenance(self, project_lead_id: str, *, conversation_id: str | None = None, thread_id: str | None = None) -> dict[str, object]:
         """Return canonical project-registry identity for process attestation.
 
         The protected JSON binding intentionally contains only the conversation
@@ -2428,7 +2504,7 @@ class CodexProjectDispatcher:
         driver's canonical codex-projects registry, never from that JSON or a
         caller-supplied attestation manifest.
         """
-        driver, session = self._resolve(project_lead_id)
+        driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)
         references = session.legacy_references
         command = references.get("command")
         launcher = references.get("launcher")
@@ -2476,19 +2552,22 @@ class CodexProjectDispatcher:
             "registryPath": str(driver.registry_path),
         }
 
-    def prepare(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None) -> str:
+    def prepare(self, project_lead_id: str, prompt: str, idempotency_key: str | None = None, *, conversation_id: str | None = None, thread_id: str | None = None) -> str:
         """Resolve the exact stable result identity without dispatching a prompt."""
-        driver, session = self._resolve(project_lead_id)
+        driver, session = self._resolve(project_lead_id, conversation_id=conversation_id)
         request = driver.prepare_legacy_dispatch(session, prompt, idempotency_key=idempotency_key)
         return f"result.{request.id}"
 
-    def _resolve(self, project_lead_id: str):
+    def _resolve(self, project_lead_id: str, *, conversation_id: str | None = None):
         binding = self.bindings.get(project_lead_id)
         if not isinstance(binding, dict) or not isinstance(binding.get("conversationId"), str):
             raise ValueError("project lead has no approved Codex conversation binding")
+        target = conversation_id if conversation_id is not None else binding["conversationId"]
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("project lead conversation binding is invalid")
         from .agent_adapters.codex import CodexDriver
         driver = CodexDriver.from_legacy_registry()
-        session = next((item for item in driver.discover() if item.external_session_id == binding["conversationId"] or item.id == binding["conversationId"]), None)
+        session = next((item for item in driver.discover() if item.external_session_id == target or item.id == target), None)
         if session is None: raise ValueError("bound project lead conversation is unavailable")
         return driver, session
 

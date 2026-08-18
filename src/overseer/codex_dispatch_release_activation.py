@@ -20,6 +20,7 @@ import pwd
 import grp
 import signal
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -47,7 +48,6 @@ DEPENDENCY_ROOT = Path(
 RELEASES_ROOT = Path("/opt/overseer/releases")
 ROOT_PYTHON = Path("/usr/bin/python3")
 SUDO = "/usr/bin/sudo"
-INSTALL = "/usr/bin/install"
 SERVICE_NAME = "overseer-api.service"
 DROP_IN_RELATIVE_PATH = ".config/systemd/user/overseer-api.service.d/10-overseer-codex-dispatch.conf"
 HEALTH_URL = "http://127.0.0.1:8766/health"
@@ -70,6 +70,85 @@ _EXECUTION_CONTEXT: ContextVar[tuple["ReleaseActivationSpec", str, str] | None] 
     "codex_dispatch_release_execution", default=None
 )
 _EXECUTION_MUTEX = threading.Lock()
+
+ROOT_RELEASE_HELPER = r'''import ctypes,hashlib,json,os,stat,struct,sys
+MAG=b"OVERSEER-RELEASE-V1\0"
+def exact(n):
+ b=b""
+ while len(b)<n:
+  x=sys.stdin.buffer.read(n-len(b))
+  if not x: raise RuntimeError("truncated release stream")
+  b+=x
+ return b
+def frame(): return exact(struct.unpack(">Q",exact(8))[0])
+expected,final=sys.argv[1:]; raw=frame(); value=json.loads(raw); assert raw==json.dumps(value,sort_keys=True,separators=(",",":")).encode()
+keys={"schemaVersion","sourceCommit","sourceTree","files","rootPython","unitContractSha256","manifestDigest","releaseRoot"}
+assert isinstance(value,dict) and set(value)==keys and value["schemaVersion"]=="overseer.codex-dispatch-release.v1"
+unsigned={k:value[k] for k in value if k not in {"manifestDigest","releaseRoot"}}
+digest=hashlib.sha256(json.dumps(unsigned,sort_keys=True,separators=(",",":" )).encode()).hexdigest()
+assert digest==expected==value["manifestDigest"] and final==value["releaseRoot"]
+assert final=="/opt/overseer/releases/"+value["sourceCommit"]+"-"+digest
+files=value["files"]; paths=[x["releasePath"] for x in files]
+assert paths==sorted(set(paths)) and paths and all(isinstance(x,dict) and set(x)=={"releasePath","sourceKind","sourcePath","sha256","size","mode"} for x in files)
+def rel(s):
+ assert isinstance(s,str) and s and not s.startswith("/") and ".." not in s.split("/") and "//" not in s and s not in {".",".."}; return s.split("/")
+for x in files:
+ rel(x["releasePath"]); rel(x["sourcePath"]); assert x["sourceKind"] in {"checkout","dependency"} and x["mode"] in {292,365} and isinstance(x["size"],int) and x["size"]>=0 and isinstance(x["sha256"],str) and len(x["sha256"])==64
+opt=os.lstat("/opt"); optid=(opt.st_dev,opt.st_ino,opt.st_uid,opt.st_gid,stat.S_IMODE(opt.st_mode))
+assert stat.S_ISDIR(opt.st_mode) and opt.st_uid==0 and opt.st_gid==0 and not stat.S_IMODE(opt.st_mode)&0o022
+ofd=os.open("/opt",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW); ofs=os.fstat(ofd); assert optid==(ofs.st_dev,ofs.st_ino,ofs.st_uid,ofs.st_gid,stat.S_IMODE(ofs.st_mode))
+def directory(parent,name,mode):
+ try: os.mkdir(name,mode,dir_fd=parent)
+ except FileExistsError: pass
+ fd=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent); s=os.fstat(fd)
+ assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and s.st_gid==0 and not stat.S_IMODE(s.st_mode)&0o022
+ return fd
+ov=directory(ofd,"overseer",0o555); releases=directory(ov,"releases",0o555)
+name=final.rsplit("/",1)[1]; staging="."+name+".staging-inert"
+os.mkdir(staging,0o700,dir_fd=releases); root=os.open(staging,os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=releases)
+opened={"":root}
+def parent(parts):
+ key=""; fd=root
+ for part in parts:
+  key=key+"/"+part
+  if key not in opened:
+   opened[key]=directory(fd,part,0o700)
+  fd=opened[key]
+ return fd
+for item in files:
+ parts=rel(item["releasePath"]); data=frame(); assert len(data)==item["size"] and hashlib.sha256(data).hexdigest()==item["sha256"]
+ p=parent(parts[:-1]); fd=os.open(parts[-1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,item["mode"],dir_fd=p)
+ try:
+  view=memoryview(data)
+  while view:
+   n=os.write(fd,view); assert n>0; view=view[n:]
+  os.fchmod(fd,item["mode"]); os.fsync(fd); s=os.fstat(fd); assert s.st_uid==0 and s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==item["mode"]
+ finally: os.close(fd)
+assert sys.stdin.buffer.read(1)==b""
+mraw=json.dumps(value,sort_keys=True,separators=(",",":")).encode()+b"\n"; mf=os.open("release-manifest.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o444,dir_fd=root); view=memoryview(mraw)
+while view:
+ n=os.write(mf,view); assert n>0; view=view[n:]
+os.fchmod(mf,0o444); os.fsync(mf); os.close(mf); mf=os.open("release-manifest.json",os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root); verify=b""
+while True:
+ chunk=os.read(mf,1048576)
+ if not chunk: break
+ verify+=chunk
+ms=os.fstat(mf); os.close(mf); assert verify==mraw and ms.st_uid==0 and ms.st_gid==0 and ms.st_nlink==1 and stat.S_IMODE(ms.st_mode)==0o444
+for item in files:
+ parts=rel(item["releasePath"]); p=parent(parts[:-1]); fd=os.open(parts[-1],os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=p); h=hashlib.sha256(); total=0
+ while True:
+  chunk=os.read(fd,1048576)
+  if not chunk: break
+  h.update(chunk); total+=len(chunk)
+ s=os.fstat(fd); os.close(fd); assert total==item["size"] and h.hexdigest()==item["sha256"] and s.st_uid==0 and s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==item["mode"]
+for key,fd in sorted(opened.items(),key=lambda x:x[0].count("/"),reverse=True): os.fchmod(fd,0o555); os.fsync(fd)
+libc=ctypes.CDLL(None,use_errno=True); AT_FDCWD=-100; RENAME_NOREPLACE=1
+if libc.renameat2(releases,staging.encode(),releases,name.encode(),RENAME_NOREPLACE)!=0: raise OSError(ctypes.get_errno(),"release no-replace publication failed")
+os.fsync(releases); os.fsync(ov); os.fsync(ofd)
+after=os.lstat("/opt"); assert optid==(after.st_dev,after.st_ino,after.st_uid,after.st_gid,stat.S_IMODE(after.st_mode))
+for fd in opened.values(): os.close(fd)
+os.close(releases);os.close(ov);os.close(ofd)
+print(json.dumps({"status":"installed","manifestDigest":digest,"releaseRoot":final},sort_keys=True,separators=(",",":")))'''
 
 
 def _canonical(value: object) -> bytes:
@@ -377,24 +456,10 @@ def release_drop_in_content(manifest: ImmutableReleaseManifest) -> bytes:
 
 
 def _install_commands(manifest: ImmutableReleaseManifest) -> tuple[tuple[str, ...], ...]:
-    release_root = manifest.release_root
-    directories = {RELEASES_ROOT.parent, RELEASES_ROOT, release_root}
-    for item in manifest.files:
-        destination = release_root / item.release_path
-        directories.update(destination.parents)
-    directories = {path for path in directories if path == release_root or release_root in path.parents}
-    commands: list[tuple[str, ...]] = []
-    for directory in sorted(directories, key=lambda item: (len(item.parts), str(item))):
-        commands.append((SUDO, "-n", INSTALL, "-d", "-o", "root", "-g", "root", "-m", "0555", str(directory)))
-    for item in manifest.files:
-        source_root = CANONICAL_CHECKOUT if item.source_kind == "checkout" else DEPENDENCY_ROOT
-        commands.append((
-            SUDO, "-n", INSTALL, "-o", "root", "-g", "root", "-m", format(item.mode, "04o"),
-            str(source_root / item.source_path), str(release_root / item.release_path),
-        ))
-    staging = Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".local/state/overseer/codex-dispatch" / f"{manifest.digest}.release-manifest.json"
-    commands.append((SUDO, "-n", INSTALL, "-o", "root", "-g", "root", "-m", "0444", str(staging), str(release_root / MANIFEST_NAME)))
-    return tuple(commands)
+    return ((
+        SUDO, "-n", str(ROOT_PYTHON), "-I", "-S", "-c", ROOT_RELEASE_HELPER,
+        manifest.digest, str(manifest.release_root),
+    ),)
 
 
 def plan_immutable_release_activation(
@@ -418,6 +483,7 @@ def plan_immutable_release_activation(
         "manifest": manifest.to_json(),
         "managerBinding": dict(manager_binding),
         "rootInstallCommands": [list(command) for command in commands],
+        "rootHelperSha256": _sha256(ROOT_RELEASE_HELPER.encode()),
         "dropInSha256": _sha256(drop_in),
         "dropInContent": drop_in.decode("ascii"),
         "unitContractSha256": _sha256(unit_contract),
@@ -446,14 +512,14 @@ def plan_immutable_release_activation(
         current_state=current_state,
         proposed_state=f"root-owned immutable reviewed release {manifest.release_root}",
         steps=(
-            AdminCommandStep("Install approved immutable release", marker("install-release"), "issue only the manifest-bound sudo install argv after approval"),
+            AdminCommandStep("Install approved immutable release", marker("install-release"), "stream held verified source descriptors to the one approved isolated root helper"),
             AdminCommandStep("Install exact user service drop-in", marker("install-drop-in"), "atomically install the approved service binding"),
             AdminCommandStep("Reload pinned user manager", marker("reload-manager"), "send SIGHUP through the approved live manager pidfd"),
             AdminCommandStep("Restart pinned Overseer API", marker("restart-api"), "SIGKILL the attested old API pid and require Restart=on-failure replacement"),
         ),
         rollback_steps=(AdminCommandStep("Rollback exact release activation", marker("rollback"), "quarantine only operation-owned active files and restore the prior service"),),
         risks=(
-            "root-owned files are installed under the exact approved release path",
+            "one fixed isolated root helper atomically publishes the manifest-bound release under the exact approved path",
             "Overseer API is force-stopped and must be restarted by the pre-attested unit policy",
             "manager drift, partial install, timeout, or process mismatch causes rollback",
         ),
@@ -469,8 +535,8 @@ def plan_immutable_release_activation(
 def validate_sudo_install_argv(command: Sequence[str], manifest: ImmutableReleaseManifest) -> None:
     if tuple(command) not in _install_commands(manifest):
         raise ValueError("privileged command is outside the approved sudo install allowlist")
-    if tuple(command[:3]) != (SUDO, "-n", INSTALL):
-        raise ValueError("privileged command must use fixed sudo -n install argv")
+    if tuple(command[:7]) != (SUDO, "-n", str(ROOT_PYTHON), "-I", "-S", "-c", ROOT_RELEASE_HELPER):
+        raise ValueError("privileged command must use the fixed isolated root release helper")
 
 
 def verify_installed_release(manifest: ImmutableReleaseManifest) -> None:
@@ -709,7 +775,9 @@ def _load_journal(plan_id: str, spec_digest: str) -> dict[str, object] | None:
     value = json.loads(content)
     expected = {
         "schemaVersion", "planId", "specDigest", "phase", "installedCommands",
-        "releaseOwnership", "dropInOwnership", "dropInQuarantine", "lastError",
+        "releaseOwnership", "rootHelperSha256", "manifestDigest", "dropInOwnership",
+        "dropInDigest", "dropInDevice", "dropInInode", "dropInQuarantine",
+        "dropInQuarantineDevice", "dropInQuarantineInode", "lastError",
     }
     phases = {
         "install-intent", "release-installed", "dropin-intent", "dropin-installed",
@@ -718,9 +786,11 @@ def _load_journal(plan_id: str, spec_digest: str) -> dict[str, object] | None:
     }
     if (not isinstance(value, dict) or set(value) != expected or value["schemaVersion"] != JOURNAL_SCHEMA
             or value["planId"] != plan_id or value["specDigest"] != spec_digest
-            or value["phase"] not in phases or value["releaseOwnership"] not in {"install-issued", "operation-owned", "inert-partial"}
+            or value["phase"] not in phases or value["releaseOwnership"] not in {"install-issued", "operation-owned", "preexisting", "inert-partial"}
             or value["dropInOwnership"] not in {"absent", "write-issued", "operation-owned", "preexisting", "quarantined"}
-            or not isinstance(value["installedCommands"], int)):
+            or not isinstance(value["installedCommands"], int)
+            or value["rootHelperSha256"] != _sha256(ROOT_RELEASE_HELPER.encode())
+            or not isinstance(value["manifestDigest"], str)):
         raise ValueError("release activation journal schema or authority is invalid")
     return value
 
@@ -729,12 +799,16 @@ def _write_journal(value: Mapping[str, object]) -> None:
     _atomic_owner_write(_journal_path(str(value["planId"])), _canonical(value) + b"\n")
 
 
-def _new_journal(plan_id: str, spec_digest: str) -> dict[str, object]:
+def _new_journal(plan_id: str, spec_digest: str, manifest: ImmutableReleaseManifest | None = None) -> dict[str, object]:
     return {
         "schemaVersion": JOURNAL_SCHEMA, "planId": plan_id, "specDigest": spec_digest,
         "phase": "install-intent", "installedCommands": 0,
-        "releaseOwnership": "install-issued", "dropInOwnership": "absent",
-        "dropInQuarantine": "", "lastError": "",
+        "releaseOwnership": "install-issued",
+        "rootHelperSha256": _sha256(ROOT_RELEASE_HELPER.encode()),
+        "manifestDigest": manifest.digest if manifest is not None else "",
+        "dropInOwnership": "absent", "dropInDigest": "", "dropInDevice": None,
+        "dropInInode": None, "dropInQuarantine": "", "dropInQuarantineDevice": None,
+        "dropInQuarantineInode": None, "lastError": "",
     }
 
 
@@ -742,40 +816,91 @@ def _drop_in_path() -> Path:
     return Path(pwd.getpwuid(os.geteuid()).pw_dir) / DROP_IN_RELATIVE_PATH
 
 
-def _manifest_staging_path(manifest: ImmutableReleaseManifest) -> Path:
-    return Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".local/state/overseer/codex-dispatch" / f"{manifest.digest}.release-manifest.json"
-
-
-def _stage_manifest_file(manifest: ImmutableReleaseManifest) -> None:
-    path = _manifest_staging_path(manifest)
-    content = _canonical(manifest.to_json()) + b"\n"
-    if path.exists():
-        existing, info = _stable_read(path)
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or existing != content:
-            raise ValueError("release manifest staging file is unsafe or mismatched")
-        return
-    _atomic_owner_write(path, content)
-
-
 def _run_install(command: Sequence[str], manifest: ImmutableReleaseManifest) -> None:
     validate_sudo_install_argv(command, manifest)
-    completed = subprocess.run(
-        tuple(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        check=False, env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
-        timeout=120,
+    opened: list[tuple[int, ReleaseFile, tuple[int, ...]]] = []
+    identity = lambda info: (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
     )
-    if completed.returncode != 0:
-        raise RuntimeError("approved root release install command failed")
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        for item in manifest.files:
+            root = CANONICAL_CHECKOUT if item.source_kind == "checkout" else DEPENDENCY_ROOT
+            path = root / item.source_path
+            lexical = path.lstat()
+            if not stat.S_ISREG(lexical.st_mode) or path.is_symlink() or lexical.st_nlink != 1:
+                raise ValueError("release stream source is not a regular single-link file")
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+            current = os.fstat(fd)
+            if identity(current) != identity(lexical) or current.st_size != item.size:
+                os.close(fd)
+                raise ValueError("release stream source changed before descriptor pinning")
+            opened.append((fd, item, identity(current)))
+        process = subprocess.Popen(
+            tuple(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        )
+        if process.stdin is None:
+            raise RuntimeError("root release helper stdin is unavailable")
+        manifest_raw = _canonical(manifest.to_json())
+        process.stdin.write(struct.pack(">Q", len(manifest_raw)))
+        process.stdin.write(manifest_raw)
+        for fd, item, before in opened:
+            process.stdin.write(struct.pack(">Q", item.size))
+            hasher = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                process.stdin.write(chunk)
+                hasher.update(chunk)
+                total += len(chunk)
+            after = os.fstat(fd)
+            if identity(after) != before or total != item.size or hasher.hexdigest() != item.sha256:
+                raise ValueError("release stream source changed during descriptor transfer")
+        process.stdin.close()
+        process.stdin = None
+        stdout, stderr = process.communicate(timeout=120)
+        if process.returncode != 0:
+            raise RuntimeError("approved root release helper failed; inert staging is retained")
+        try:
+            result = json.loads(stdout)
+        except (json.JSONDecodeError, UnicodeError) as error:
+            raise RuntimeError("root release helper returned an invalid contract") from error
+        if result != {"status": "installed", "manifestDigest": manifest.digest, "releaseRoot": str(manifest.release_root)}:
+            raise RuntimeError("root release helper result is not the approved exact contract")
+        if stderr:
+            raise RuntimeError("root release helper emitted unexpected diagnostic output")
+    except Exception:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        raise
+    finally:
+        for fd, _, _ in opened:
+            os.close(fd)
 
 
 def _install_release(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
-    journal = _load_journal(plan_id, digest) or _new_journal(plan_id, digest)
+    journal = _load_journal(plan_id, digest) or _new_journal(plan_id, digest, spec.manifest)
+    if journal["manifestDigest"] != spec.manifest.digest:
+        raise ValueError("release journal manifest digest is not the approved digest")
     if journal["phase"] == "rolled-back":
         raise ValueError("approved release activation plan is terminal after rollback")
-    _stage_manifest_file(spec.manifest)
     commands = _install_commands(spec.manifest)
     journal["phase"] = "install-intent"
     _write_journal(journal)
+    if spec.manifest.release_root.exists():
+        verify_installed_release(spec.manifest)
+        journal["installedCommands"] = len(commands)
+        journal["releaseOwnership"] = (
+            "operation-owned" if journal["releaseOwnership"] == "install-issued" else "preexisting"
+        )
+        journal["phase"] = "release-installed"
+        _write_journal(journal)
+        return "approved immutable root release already installed and verified"
     for index, command in enumerate(commands):
         if index < int(journal["installedCommands"]):
             continue
@@ -790,37 +915,73 @@ def _install_release(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> 
 
 
 def _install_drop_in(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
+    from .codex_dispatch_activation import _owner_only, _publish_drop_in_noreplace, _secure_snapshot
+
     journal = _load_journal(plan_id, digest)
+    if journal is not None and journal["manifestDigest"] != spec.manifest.digest:
+        raise ValueError("drop-in journal is not bound to the approved release manifest")
     if journal is None or journal["phase"] not in {"release-installed", "dropin-intent"}:
         raise ValueError("immutable release must be installed before the service drop-in")
     path = _drop_in_path()
     content = release_drop_in_content(spec.manifest)
-    prior_write_intent = (
-        journal["phase"] == "dropin-intent" and journal["dropInOwnership"] == "write-issued"
-    )
-    existed_before_intent = path.exists()
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _owner_only(path.parent, "release activation drop-in directory")
+    prior_ownership = str(journal["dropInOwnership"])
+    journal["dropInDigest"] = _sha256(content)
+    try:
+        existing, info = _secure_snapshot(path, "release activation drop-in")
+    except FileNotFoundError:
+        existing, info = None, None
+    if existing is not None:
+        if existing != content:
+            raise ValueError("existing dispatch drop-in is not the exact secure approved file")
+        journal["dropInOwnership"] = (
+            "operation-owned" if prior_ownership in {"write-issued", "operation-owned"} else "preexisting"
+        )
+        journal["dropInDevice"] = info.st_dev
+        journal["dropInInode"] = info.st_ino
+        journal["phase"] = "dropin-installed"
+        _write_journal(journal)
+        return "exact operation-bound user service drop-in already present"
     journal["phase"] = "dropin-intent"
     journal["dropInOwnership"] = "write-issued"
     _write_journal(journal)
-    if path.exists():
-        existing, info = _stable_read(path)
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or existing != content:
-            raise ValueError("existing dispatch drop-in is not the exact secure approved file")
-        journal["dropInOwnership"] = (
-            "operation-owned" if prior_write_intent or not existed_before_intent else "preexisting"
-        )
-    else:
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        try:
-            os.write(fd, content)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        journal["dropInOwnership"] = "operation-owned"
+    try:
+        _publish_drop_in_noreplace(path, content)
+    except FileExistsError:
+        concurrent, concurrent_info = _secure_snapshot(path, "concurrent release activation drop-in")
+        if concurrent != content:
+            raise ValueError("concurrent dispatch drop-in is not the approved file")
+        journal["dropInOwnership"] = "preexisting"
+        journal["dropInDevice"] = concurrent_info.st_dev
+        journal["dropInInode"] = concurrent_info.st_ino
+        journal["phase"] = "dropin-installed"
+        _write_journal(journal)
+        return "exact secure drop-in concurrently present"
+    installed, installed_info = _secure_snapshot(path, "installed release activation drop-in")
+    if installed != content:
+        raise ValueError("installed dispatch drop-in is not exact")
+    journal["dropInOwnership"] = "operation-owned"
+    journal["dropInDevice"] = installed_info.st_dev
+    journal["dropInInode"] = installed_info.st_ino
     journal["phase"] = "dropin-installed"
     _write_journal(journal)
     return "exact operation-bound user service drop-in installed"
+
+
+def _revalidate_drop_in(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> None:
+    from .codex_dispatch_activation import _secure_snapshot
+
+    journal = _load_journal(plan_id, digest)
+    if journal is not None and journal["manifestDigest"] != spec.manifest.digest:
+        raise ValueError("drop-in journal is not bound to the approved release manifest")
+    if journal is None or journal["dropInOwnership"] not in {"operation-owned", "preexisting"}:
+        raise ValueError("drop-in journal authority is not ready for a lifecycle signal")
+    content, info = _secure_snapshot(_drop_in_path(), "release activation drop-in")
+    if (content != release_drop_in_content(spec.manifest)
+            or _sha256(content) != journal["dropInDigest"]
+            or (info.st_dev, info.st_ino) != (journal["dropInDevice"], journal["dropInInode"])):
+        raise ValueError("release activation drop-in inode or content changed")
 
 
 def _manager_pidfd(spec: ReleaseActivationSpec) -> tuple[int, int]:
@@ -887,10 +1048,14 @@ def _reload(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
         raise ValueError("exact drop-in must be installed before manager reload")
     journal["phase"] = "reload-intent"
     _write_journal(journal)
+    _revalidate_drop_in(plan_id, spec, digest)
     manager_pid, pidfd = _manager_pidfd(spec)
     try:
+        _revalidate_drop_in(plan_id, spec, digest)
         send_pinned_signal(pidfd, manager_pid, signal.SIGHUP)
+        _revalidate_drop_in(plan_id, spec, digest)
         time.sleep(0.2)
+        _revalidate_drop_in(plan_id, spec, digest)
         if _capture_manager_binding() != dict(spec.manager_binding):
             raise ValueError("user manager changed across SIGHUP reload")
     finally:
@@ -906,8 +1071,10 @@ def _restart(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
         raise ValueError("pinned manager reload must complete before API restart")
     journal["phase"] = "restart-intent"
     _write_journal(journal)
+    _revalidate_drop_in(plan_id, spec, digest)
     old_pid, pidfd = _api_pidfd(spec.old_api_binding)
     try:
+        _revalidate_drop_in(plan_id, spec, digest)
         send_pinned_signal(pidfd, old_pid, signal.SIGKILL)
     finally:
         os.close(pidfd)
@@ -923,22 +1090,87 @@ def _restart(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
 def _quarantine_dropin(journal: dict[str, object]) -> None:
     if journal["dropInOwnership"] not in {"write-issued", "operation-owned"}:
         return
+    from .codex_dispatch_activation import _open_stable_at, _rename_noreplace_at
+
     path = _drop_in_path()
-    if not path.exists():
-        journal["dropInOwnership"] = "quarantined"
-        return
     quarantine = path.parent / f".{path.name}.{journal['specDigest']}.rollback-inert"
-    if quarantine.exists():
-        raise ValueError("rollback quarantine already exists unexpectedly")
-    os.rename(path, quarantine)
-    journal["dropInOwnership"] = "quarantined"
-    journal["dropInQuarantine"] = str(quarantine)
+    if quarantine.name.endswith(".conf"):
+        raise ValueError("drop-in quarantine is not inert")
+    lexical_parent = path.parent.lstat()
+    if (not stat.S_ISDIR(lexical_parent.st_mode) or path.parent.is_symlink()
+            or lexical_parent.st_uid != os.geteuid() or stat.S_IMODE(lexical_parent.st_mode) & 0o077):
+        raise ValueError("drop-in parent is unsafe for rollback")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(path.parent, flags)
+    try:
+        parent_info = os.fstat(parent_fd)
+        if (parent_info.st_dev, parent_info.st_ino) != (lexical_parent.st_dev, lexical_parent.st_ino):
+            raise ValueError("drop-in parent changed before rollback")
+        try:
+            fd, content, info = _open_stable_at(parent_fd, path.name, "operation-owned release drop-in")
+        except FileNotFoundError:
+            try:
+                retained_fd, retained, retained_info = _open_stable_at(parent_fd, quarantine.name, "retained release drop-in quarantine")
+            except FileNotFoundError:
+                if journal["dropInOwnership"] == "write-issued" and journal["dropInDevice"] is None:
+                    journal["dropInOwnership"] = "quarantined"
+                    journal["dropInQuarantine"] = ""
+                    return
+                raise ValueError("operation-owned drop-in and quarantine are both absent")
+            else:
+                os.close(retained_fd)
+                if (_sha256(retained) != journal["dropInDigest"]
+                        or (retained_info.st_dev, retained_info.st_ino) != (journal["dropInDevice"], journal["dropInInode"])):
+                    raise ValueError("retained release drop-in quarantine changed")
+        else:
+            os.close(fd)
+            if _sha256(content) != journal["dropInDigest"]:
+                raise ValueError("operation-owned release drop-in changed before rollback")
+            if journal["dropInOwnership"] == "write-issued" and journal["dropInDevice"] is None:
+                journal["dropInDevice"], journal["dropInInode"] = info.st_dev, info.st_ino
+                _write_journal(journal)
+            elif (info.st_dev, info.st_ino) != (journal["dropInDevice"], journal["dropInInode"]):
+                raise ValueError("operation-owned release drop-in inode changed before rollback")
+            try:
+                os.stat(quarantine.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("release drop-in quarantine path already exists")
+            _rename_noreplace_at(path.name, quarantine.name, dir_fd=parent_fd)
+            retained_fd, retained, retained_info = _open_stable_at(parent_fd, quarantine.name, "retained release drop-in quarantine")
+            os.close(retained_fd)
+            if (_sha256(retained) != journal["dropInDigest"]
+                    or (retained_info.st_dev, retained_info.st_ino) != (journal["dropInDevice"], journal["dropInInode"])):
+                raise ValueError("release drop-in quarantine identity changed")
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("active release drop-in path reappeared during rollback")
+        os.fsync(parent_fd)
+        if (os.fstat(parent_fd).st_dev, os.fstat(parent_fd).st_ino) != (parent_info.st_dev, parent_info.st_ino):
+            raise ValueError("drop-in parent changed during rollback")
+        final_fd, final_content, final_info = _open_stable_at(parent_fd, quarantine.name, "fsynced release drop-in quarantine")
+        os.close(final_fd)
+        if (_sha256(final_content) != journal["dropInDigest"]
+                or (final_info.st_dev, final_info.st_ino) != (journal["dropInDevice"], journal["dropInInode"])):
+            raise ValueError("release drop-in quarantine changed after directory sync")
+        journal["dropInOwnership"] = "quarantined"
+        journal["dropInQuarantine"] = str(quarantine)
+        journal["dropInQuarantineDevice"] = journal["dropInDevice"]
+        journal["dropInQuarantineInode"] = journal["dropInInode"]
+    finally:
+        os.close(parent_fd)
 
 
 def _rollback(plan_id: str, spec: ReleaseActivationSpec, digest: str) -> str:
     journal = _load_journal(plan_id, digest)
     if journal is None:
         return "no operation-owned release activation effects exist"
+    if journal["manifestDigest"] != spec.manifest.digest:
+        raise ValueError("rollback journal is not bound to the approved release manifest")
     if journal["phase"] == "rolled-back":
         return "release activation already rolled back"
     prior_phase = str(journal["phase"])

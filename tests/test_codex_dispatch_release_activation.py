@@ -4,11 +4,14 @@ import hashlib
 import json
 import os
 import signal
+import struct
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from overseer import codex_dispatch_release_activation as release_module
 from overseer.codex_dispatch_release_activation import (
     ImmutableReleaseManifest,
     RELEASE_PLAN_SCHEMA,
@@ -94,8 +97,12 @@ def test_stage_is_high_human_sisko_and_binds_root_mutation_without_running_it(mo
     assert plan.approved is False
     assert plan.adapter_metadata["schemaVersion"] == RELEASE_PLAN_SCHEMA
     commands = plan.adapter_metadata["rootInstallCommands"]
-    assert commands
-    assert all(command[:3] == ["/usr/bin/sudo", "-n", "/usr/bin/install"] for command in commands)
+    assert len(commands) == 1
+    assert commands[0][:6] == ["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"]
+    assert commands[0][-2:] == [manifest.digest, str(manifest.release_root)]
+    assert plan.adapter_metadata["rootHelperSha256"] == hashlib.sha256(
+        release_module.ROOT_RELEASE_HELPER.encode()
+    ).hexdigest()
     assert plan.adapter_metadata["lifecycle"] == {
         "reload": "pidfd_send_signal(manager,SIGHUP)",
         "restart": "pidfd_send_signal(oldOverseerApi,SIGKILL)",
@@ -241,7 +248,6 @@ def test_partial_root_install_journal_rolls_back_to_inert_terminal(monkeypatch, 
         ("/usr/bin/sudo", "-n", "/usr/bin/install", "second"),
     )
     monkeypatch.setattr(release, "_state_root", lambda: tmp_path)
-    monkeypatch.setattr(release, "_stage_manifest_file", lambda manifest: None)
     monkeypatch.setattr(release, "_install_commands", lambda manifest: commands)
     calls = []
     def install(command, manifest):
@@ -281,7 +287,7 @@ def test_dropin_retry_after_intent_effect_preserves_operation_ownership(monkeypa
     digest = plan.steps[0].command[3]
     monkeypatch.setattr(release, "_state_root", lambda: tmp_path / "state")
     monkeypatch.setattr(release, "_drop_in_path", lambda: tmp_path / "dropin.conf")
-    journal = release._new_journal("admin.dropin-crash", digest)
+    journal = release._new_journal("admin.dropin-crash", digest, spec.manifest)
     journal.update({
         "phase": "dropin-intent", "installedCommands": 1,
         "releaseOwnership": "operation-owned", "dropInOwnership": "write-issued",
@@ -295,3 +301,215 @@ def test_dropin_retry_after_intent_effect_preserves_operation_ownership(monkeypa
     recovered = release._load_journal("admin.dropin-crash", digest)
     assert recovered["phase"] == "dropin-installed"
     assert recovered["dropInOwnership"] == "operation-owned"
+
+
+def test_root_helper_stream_uses_pinned_descriptor_when_source_path_is_swapped(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    source = tmp_path / "src/overseer_codex_dispatch_release_launcher.py"
+    source.parent.mkdir(parents=True)
+    original = b"reviewed pinned bytes"
+    source.write_bytes(original)
+    item = ReleaseFile(
+        "app/src/overseer_codex_dispatch_release_launcher.py", "checkout",
+        "src/overseer_codex_dispatch_release_launcher.py",
+        hashlib.sha256(original).hexdigest(), len(original), 0o444,
+    )
+    manifest = ImmutableReleaseManifest(
+        "a" * 40, "b" * 40, (item,), _manifest().root_python,
+        hashlib.sha256(b"Restart=on-failure\n").hexdigest(),
+    )
+    monkeypatch.setattr(release, "CANONICAL_CHECKOUT", tmp_path)
+    captured = bytearray()
+
+    class Stdin:
+        def write(self, value):
+            captured.extend(value)
+            return len(value)
+        def close(self):
+            return None
+
+    class Process:
+        def __init__(self):
+            self.stdin = Stdin()
+            self.returncode = 0
+            source.rename(source.with_suffix(".reviewed-held"))
+            source.write_bytes(b"same-euid replacement")
+        def communicate(self, timeout=None):
+            return (json.dumps({"status": "installed", "manifestDigest": manifest.digest,
+                                "releaseRoot": str(manifest.release_root)}).encode(), b"")
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(release.subprocess, "Popen", lambda *args, **kwargs: Process())
+    release._run_install(release._install_commands(manifest)[0], manifest)
+
+    manifest_length = int.from_bytes(captured[:8], "big")
+    offset = 8 + manifest_length
+    content_length = int.from_bytes(captured[offset:offset + 8], "big")
+    assert bytes(captured[offset + 8:]) == original
+    assert content_length == len(original)
+
+
+def test_root_helper_command_rejects_injected_or_self_consistent_alternate_authority():
+    manifest = _manifest()
+    approved = list(release_module._install_commands(manifest)[0])
+    for index, replacement in ((6, release_module.ROOT_RELEASE_HELPER + "\nprint('evil')"),
+                               (-2, "e" * 64), (-1, "/opt/overseer/releases/alternate")):
+        evil = approved.copy()
+        evil[index] = replacement
+        with pytest.raises(ValueError, match="allowlist|fixed isolated"):
+            validate_sudo_install_argv(evil, manifest)
+
+
+def test_root_helper_rejects_alternate_manifest_before_root_path_access():
+    manifest = _manifest()
+    alternate_value = json.loads(json.dumps(manifest.to_json()))
+    alternate_value["unitContractSha256"] = "e" * 64
+    unsigned = {key: alternate_value[key] for key in alternate_value if key not in {"manifestDigest", "releaseRoot"}}
+    alternate_digest = hashlib.sha256(json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    alternate_value["manifestDigest"] = alternate_digest
+    alternate_value["releaseRoot"] = f"/opt/overseer/releases/{manifest.source_commit}-{alternate_digest}"
+    raw = json.dumps(alternate_value, sort_keys=True, separators=(",", ":")).encode()
+    completed = subprocess.run(
+        ("/usr/bin/python3", "-I", "-S", "-c", release_module.ROOT_RELEASE_HELPER,
+         manifest.digest, str(manifest.release_root)),
+        input=struct.pack(">Q", len(raw)) + raw, capture_output=True, check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    assert completed.returncode != 0
+    assert b"AssertionError" in completed.stderr
+
+
+def test_staging_never_includes_or_changes_opt_metadata():
+    before = os.stat("/opt", follow_symlinks=False)
+    manifest = _manifest()
+    plan = plan_immutable_release_activation(
+        "admin.opt-invariant", "bind root helper without touching opt", manifest,
+        manager_binding={"peerPid": 1329}, unit_contract=b"Restart=on-failure\n",
+    )
+    after = os.stat("/opt", follow_symlinks=False)
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_uid, value.st_gid,
+                              value.st_mode & 0o7777)
+    assert identity(after) == identity(before)
+    command = plan.adapter_metadata["rootInstallCommands"][0]
+    assert command[-1] == str(manifest.release_root)
+    assert "/opt" not in command[:-1]
+
+
+def test_dropin_parent_symlink_is_rejected(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    spec = _spec()
+    plan = plan_codex_dispatch_activation("admin.parent-link", spec, "activate")
+    digest = plan.steps[0].command[3]
+    monkeypatch.setattr(release, "_state_root", lambda: tmp_path / "state")
+    real_parent = tmp_path / "real"
+    real_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    monkeypatch.setattr(release, "_drop_in_path", lambda: linked_parent / "dropin.conf")
+    journal = release._new_journal("admin.parent-link", digest, spec.manifest)
+    journal["phase"] = "release-installed"
+    journal["releaseOwnership"] = "operation-owned"
+    release._write_journal(journal)
+    with pytest.raises(ValueError, match="directory|owner-only|unsafe"):
+        release._install_drop_in("admin.parent-link", spec, digest)
+
+
+def test_dropin_replacement_before_hup_prevents_signal(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    spec = _spec()
+    plan = plan_codex_dispatch_activation("admin.hup-race", spec, "activate")
+    digest = plan.steps[0].command[3]
+    monkeypatch.setattr(release, "_state_root", lambda: tmp_path)
+    journal = release._new_journal("admin.hup-race", digest, spec.manifest)
+    journal.update({"phase": "dropin-installed", "releaseOwnership": "operation-owned",
+                    "dropInOwnership": "operation-owned"})
+    release._write_journal(journal)
+    calls = []
+    monkeypatch.setattr(release, "_revalidate_drop_in", lambda *args: (_ for _ in ()).throw(ValueError("replaced")))
+    monkeypatch.setattr(release, "send_pinned_signal", lambda *args: calls.append(args))
+    with pytest.raises(ValueError, match="replaced"):
+        release._reload("admin.hup-race", spec, digest)
+    assert calls == []
+
+
+def test_dropin_replacement_after_hup_is_detected_before_api_kill(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    spec = _spec()
+    plan = plan_codex_dispatch_activation("admin.after-hup-race", spec, "activate")
+    digest = plan.steps[0].command[3]
+    monkeypatch.setattr(release, "_state_root", lambda: tmp_path)
+    journal = release._new_journal("admin.after-hup-race", digest, spec.manifest)
+    journal.update({"phase": "dropin-installed", "releaseOwnership": "operation-owned",
+                    "dropInOwnership": "operation-owned"})
+    release._write_journal(journal)
+    validations = []
+    def validate(*args):
+        validations.append(1)
+        if len(validations) == 3:
+            raise ValueError("replacement after HUP")
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    monkeypatch.setattr(release, "_revalidate_drop_in", validate)
+    monkeypatch.setattr(release, "_manager_pidfd", lambda value: (1329, read_fd))
+    signals = []
+    monkeypatch.setattr(release, "send_pinned_signal", lambda *args: signals.append(args[-1]))
+    with pytest.raises(ValueError, match="after HUP"):
+        release._reload("admin.after-hup-race", spec, digest)
+    assert signals == [signal.SIGHUP]
+
+
+def test_rollback_never_quarantines_replacement_inode(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    parent = tmp_path / "dropins"
+    parent.mkdir(mode=0o700)
+    path = parent / "10-overseer-codex-dispatch.conf"
+    approved = b"approved drop-in"
+    path.write_bytes(approved)
+    path.chmod(0o600)
+    identity = path.lstat()
+    monkeypatch.setattr(release, "_drop_in_path", lambda: path)
+    journal = {
+        "dropInOwnership": "operation-owned", "dropInDigest": hashlib.sha256(approved).hexdigest(),
+        "dropInDevice": identity.st_dev, "dropInInode": identity.st_ino,
+        "specDigest": "f" * 64, "dropInQuarantine": "",
+        "dropInQuarantineDevice": None, "dropInQuarantineInode": None,
+    }
+    path.rename(parent / "original-retained")
+    replacement = b"unrelated replacement"
+    path.write_bytes(replacement)
+    path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="changed|inode"):
+        release._quarantine_dropin(journal)
+    assert path.read_bytes() == replacement
+    assert not any(item.name.endswith("rollback-inert") for item in parent.iterdir())
+
+
+def test_operation_dropin_quarantine_is_noreplace_and_retry_idempotent(monkeypatch, tmp_path):
+    from overseer import codex_dispatch_release_activation as release
+
+    parent = tmp_path / "dropins"
+    parent.mkdir(mode=0o700)
+    path = parent / "10-overseer-codex-dispatch.conf"
+    approved = b"approved drop-in"
+    path.write_bytes(approved)
+    path.chmod(0o600)
+    identity = path.lstat()
+    monkeypatch.setattr(release, "_drop_in_path", lambda: path)
+    journal = {
+        "dropInOwnership": "operation-owned", "dropInDigest": hashlib.sha256(approved).hexdigest(),
+        "dropInDevice": identity.st_dev, "dropInInode": identity.st_ino,
+        "specDigest": "f" * 64, "dropInQuarantine": "",
+        "dropInQuarantineDevice": None, "dropInQuarantineInode": None,
+    }
+    release._quarantine_dropin(journal)
+    quarantine = Path(journal["dropInQuarantine"])
+    assert not path.exists() and quarantine.read_bytes() == approved
+    release._quarantine_dropin(journal)
+    assert quarantine.read_bytes() == approved

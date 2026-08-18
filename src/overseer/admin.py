@@ -180,7 +180,7 @@ DEFAULT_ADMIN_EXECUTION_CAPABILITIES: dict[AdminChangeKind, AdminExecutionCapabi
         summary="approved high-risk root-owned immutable release and pidfd lifecycle activation requires this exact plan",
         authorization_required_before_enable=True,
         approval_plan_required=True,
-        supported_commands=(("/usr/bin/sudo", "-n", "/usr/bin/install"), ("__overseer_codex_dispatch_release_v1",)),
+        supported_commands=(("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"), ("__overseer_codex_dispatch_release_v1",)),
     ),
     AdminChangeKind.PYTHON_HASHED_VENV_PROVISION: AdminExecutionCapability(
         kind=AdminChangeKind.PYTHON_HASHED_VENV_PROVISION,

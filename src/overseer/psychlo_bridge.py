@@ -688,6 +688,18 @@ class PsychloBridge:
         from .psychlo_legacy_binding import attest_legacy_round_binding
         return attest_legacy_round_binding(self, round_id, manifest_path)
 
+    def stage_legacy_abandonment(self, **kwargs: Any) -> dict[str, Any]:
+        from .psychlo_legacy_abandonment import stage_legacy_abandonment
+        return stage_legacy_abandonment(bridge=self, **kwargs)
+
+    def finalize_legacy_abandonment(self, *, plan_id: str) -> dict[str, Any]:
+        from .psychlo_legacy_abandonment import finalize_legacy_abandonment
+        return finalize_legacy_abandonment(bridge=self, plan_id=plan_id)
+
+    def execute_legacy_abandonment(self, *, plan_id: str) -> dict[str, Any]:
+        from .psychlo_legacy_abandonment import execute_legacy_abandonment
+        return execute_legacy_abandonment(bridge=self, plan_id=plan_id)
+
     def recover_round(self, round_id: str, *, owner_id: str | None = None) -> dict[str, Any]:
         """Recover exactly one uncertain started round without synthesizing a result."""
         if not isinstance(round_id, str) or not round_id.strip():

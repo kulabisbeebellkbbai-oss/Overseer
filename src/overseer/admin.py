@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import ipaddress
 import subprocess
+import re
 from datetime import datetime, timezone
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ class AdminChangeKind(StrEnum):
     PSYCHLO_POLICY_EXCEPTION = "psychlo_policy_exception"
     PSYCHLO_LEGACY_ROUND_RECONCILIATION = "psychlo_legacy_round_reconciliation"
     PSYCHLO_LEGACY_PROCESS_OBSERVATION = "psychlo_legacy_process_observation"
+    PSYCHLO_LEGACY_ABANDONMENT = "psychlo_legacy_abandonment"
     PYTHON_HASHED_VENV_PROVISION = "python_hashed_venv_provision"
     PSYCHLO_RECURRING_CYCLE_ACTIVATION = "psychlo_recurring_cycle_activation"
     USER_SERVICE_RESTART = "user_service_restart"
@@ -154,7 +156,7 @@ class AdminChangePlan:
         return (
             not self.archived
             and not self.canceled
-            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION, AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION}
+            and self.kind not in {AdminChangeKind.PSYCHLO_POLICY_EXCEPTION, AdminChangeKind.PSYCHLO_LEGACY_ROUND_RECONCILIATION, AdminChangeKind.PSYCHLO_LEGACY_PROCESS_OBSERVATION, AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT}
             and (self.approved or not self.requires_explicit_approval())
             and not missing_admin_change_fields(self)
         )
@@ -480,6 +482,70 @@ def plan_psychlo_legacy_process_observation(
         risks=("recording the wrong historical identity", "stale or reused PID", "conflicting tmux or rollout evidence"),
         verification_steps=(AdminCommandStep("Verify observation evidence", ("__overseer_psychlo_legacy_process_observation_verify__",), "recheck evidence within the observation window only"),),
         adapter_metadata={"legacy_process_observation": {"manifestDigest": manifest_digest, "roundId": round_id, "sourceCommit": source_commit, "sourceTreeDigest": source_tree_digest, "sourceModuleDigest": source_module_digest or "", "historical": True, "authoritative": False, "executable": False}},
+    )
+
+
+def plan_psychlo_legacy_abandonment(
+    plan_id: str,
+    round_id: str,
+    observation_id: str,
+    observation_digest: str,
+    observation_plan_digest: str,
+    request_digest: str,
+    capability_hash: str,
+    delivery_digest: str,
+    original_plan_id: str,
+    original_plan_version: str,
+    successor_plan_id: str,
+    successor_plan_version: str,
+    successor_conversation_id: str,
+    successor_thread_id: str,
+    reason: str = "authorize one exact ambiguous submitted delivery abandonment",
+) -> AdminChangePlan:
+    """Create high-risk Sisko/HUMAN authority for one typed legacy abandonment.
+
+    This plan is deliberately non-executable by the generic admin runner.  The
+    dedicated Psychlo adapter revalidates every immutable binding against both
+    stores before it emits the signed peer action.
+    """
+    values = (plan_id, round_id, observation_id, original_plan_id, original_plan_version,
+              successor_plan_id, successor_plan_version, successor_conversation_id,
+              successor_thread_id, reason)
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("legacy abandonment plan identity is required")
+    if successor_plan_id == original_plan_id or successor_plan_version == original_plan_version:
+        raise ValueError("successor plan identity must be distinct")
+    for name, value in (("observationDigest", observation_digest), ("observationPlanDigest", observation_plan_digest),
+                        ("requestDigest", request_digest), ("capabilityHash", capability_hash), ("deliveryDigest", delivery_digest)):
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError(f"legacy abandonment {name} is invalid")
+    metadata = {
+        "legacy_abandonment": {
+            "roundId": round_id, "observationId": observation_id,
+            "observationDigest": observation_digest, "observationPlanDigest": observation_plan_digest,
+            "requestDigest": request_digest, "capabilityHash": capability_hash,
+            "deliveryDigest": delivery_digest, "submittedPhase": "submitted",
+            "originalPlanId": original_plan_id, "originalPlanVersion": original_plan_version,
+            "successorPlanId": successor_plan_id, "successorPlanVersion": successor_plan_version,
+            "successorConversationId": successor_conversation_id, "successorThreadId": successor_thread_id,
+            "reason": "ambiguous-submitted-delivery",
+        }
+    }
+    return AdminChangePlan(
+        id=plan_id,
+        kind=AdminChangeKind.PSYCHLO_LEGACY_ABANDONMENT,
+        owner_domain=OwnerDomain.SISKO,
+        risk_level=RiskLevel.HIGH,
+        approval_level=ApprovalLevel.HUMAN,
+        target=round_id,
+        reason=reason + "; no prompt input, dispatch, termination, or Codex binding mutation",
+        current_state="submitted legacy delivery is ambiguous and has no result",
+        proposed_state="record one idempotent legacy-abandoned-uncertain terminal receipt and release the exact round",
+        steps=(AdminCommandStep("Record legacy abandonment", ("__overseer_psychlo_legacy_abandonment__",), "dedicated signed adapter only; generic admin execution is disabled"),),
+        rollback_steps=(AdminCommandStep("Retain abandonment receipt", ("__overseer_psychlo_legacy_abandonment_retention__",), "terminal non-result receipts are append-only and have no rollback"),),
+        risks=("wrong historical observation", "stale submitted-delivery state", "successor identity collision"),
+        verification_steps=(AdminCommandStep("Verify exact abandonment binding", ("__overseer_psychlo_legacy_abandonment_verify__",), "revalidate both stores, approval, and signed peer receipt"),),
+        adapter_metadata=metadata,
     )
 
 

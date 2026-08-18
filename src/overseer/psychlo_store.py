@@ -74,6 +74,7 @@ class PsychloBridgeStore:
             CREATE TABLE IF NOT EXISTS operational_failure_intents(round_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, capability_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL UNIQUE, state TEXT NOT NULL, owner_id TEXT, claim_token TEXT, lease_expires_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, outcome_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_binding_attestations(round_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS round_cancellations(cancellation_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL UNIQUE, attestation_json TEXT NOT NULL, receipt_json TEXT NOT NULL, inserted_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS legacy_abandonment_intents(action_id TEXT PRIMARY KEY, round_id TEXT NOT NULL UNIQUE, action_digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('claimed','peer-pending','completed','rejected')), attempts INTEGER NOT NULL DEFAULT 0, receipt_json TEXT, last_error TEXT, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, decided_at TEXT, reason TEXT);
             CREATE TABLE IF NOT EXISTS decision_intents(decision_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, outcome_json TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY, registration_json TEXT NOT NULL, scheduling_json TEXT NOT NULL);
@@ -1022,8 +1023,117 @@ class PsychloBridgeStore:
             return None
         return {"roundId": round_id, "requestDigest": row[0], "capabilityHash": row[1], "binding": json.loads(row[2]), "phase": row[3], "promptDigest": row[4], "updatedAt": row[5]}
 
+    def legacy_abandonment(self, action_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT action_id,round_id,action_digest,payload_json,state,attempts,receipt_json,last_error,updated_at FROM legacy_abandonment_intents WHERE action_id=?",
+            (action_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "actionId": row[0], "roundId": row[1], "actionDigest": row[2],
+            "payload": json.loads(row[3]), "state": row[4], "attempts": row[5],
+            "receipt": json.loads(row[6]) if row[6] else None, "lastError": row[7], "updatedAt": row[8],
+        }
+
+    def stage_legacy_abandonment(self, action_id: str, round_id: str, action_digest: str, payload: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+        encoded = _dump_wire(payload)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT action_id,round_id,action_digest,payload_json,state FROM legacy_abandonment_intents WHERE action_id=? OR round_id=? OR action_digest=?",
+                (action_id, round_id, action_digest),
+            ).fetchone()
+            if existing is not None:
+                if existing[:4] != (action_id, round_id, action_digest, encoded):
+                    raise ValueError("legacy abandonment action identity conflict")
+                self.connection.execute("COMMIT")
+                return self.legacy_abandonment(action_id)  # type: ignore[return-value]
+            self.connection.execute(
+                "INSERT INTO legacy_abandonment_intents(action_id,round_id,action_digest,payload_json,state,updated_at) VALUES (?,?,?,?, 'claimed',?)",
+                (action_id, round_id, action_digest, encoded, now),
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.legacy_abandonment(action_id)
+        if result is None:
+            raise ValueError("legacy abandonment intent is missing")
+        return result
+
+    def claim_legacy_abandonment(self, action_id: str, action_digest: str, *, now: str) -> dict[str, Any]:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT round_id,action_digest,state FROM legacy_abandonment_intents WHERE action_id=?", (action_id,)).fetchone()
+            if row is None or row[1] != action_digest or row[2] not in {"claimed", "peer-pending"}:
+                raise ValueError("legacy abandonment action is not executable")
+            round_row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (row[0],)).fetchone()
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (row[0],)).fetchone()
+            if round_row is None or round_row[0] != "started" or round_row[1] is not None or delivery is None or delivery[0] not in {"submitted", "abandonment-fence"}:
+                raise ValueError("legacy abandonment round changed before claim")
+            self.connection.execute("UPDATE legacy_abandonment_intents SET state='peer-pending',attempts=attempts+1,last_error=NULL,updated_at=? WHERE action_id=? AND action_digest=? AND state IN ('claimed','peer-pending')", (now, action_id, action_digest))
+            self.connection.execute("UPDATE round_prompt_deliveries SET phase='abandonment-fence',updated_at=? WHERE round_id=? AND phase='submitted'", (now, row[0]))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.legacy_abandonment(action_id)
+        if result is None:
+            raise ValueError("legacy abandonment intent is missing")
+        return result
+
+    def complete_legacy_abandonment(self, action_id: str, action_digest: str, receipt: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+        encoded_receipt = _dump_wire(receipt)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            intent = self.connection.execute("SELECT round_id,action_digest,payload_json,state,receipt_json FROM legacy_abandonment_intents WHERE action_id=?", (action_id,)).fetchone()
+            if intent is None or intent[1] != action_digest:
+                raise ValueError("legacy abandonment action is missing")
+            if intent[3] == "completed":
+                if intent[4] != encoded_receipt:
+                    raise ValueError("legacy abandonment receipt conflict")
+                self.connection.execute("COMMIT")
+                return self.legacy_abandonment(action_id)  # type: ignore[return-value]
+            if intent[3] != "peer-pending":
+                raise ValueError("legacy abandonment action is not peer-pending")
+            round_id = intent[0]
+            row = self.connection.execute("SELECT dispatch_state,result_json FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+            delivery = self.connection.execute("SELECT phase FROM round_prompt_deliveries WHERE round_id=?", (round_id,)).fetchone()
+            forbidden = any(self.connection.execute(f"SELECT 1 FROM {table} WHERE round_id=? LIMIT 1", (round_id,)).fetchone() is not None for table in ("round_recoveries", "operational_failure_intents", "round_cancellations"))
+            if row is None or row[0] != "started" or row[1] is not None or delivery is None or delivery[0] != "abandonment-fence" or forbidden:
+                raise ValueError("legacy abandonment round changed before completion")
+            updated = self.connection.execute("UPDATE rounds SET dispatch_state='legacy-abandoned' WHERE round_id=? AND dispatch_state='started' AND result_json IS NULL AND NOT EXISTS (SELECT 1 FROM round_recoveries WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM operational_failure_intents WHERE round_id=?) AND NOT EXISTS (SELECT 1 FROM round_cancellations WHERE round_id=?)", (round_id, round_id, round_id, round_id))
+            if updated.rowcount != 1:
+                raise ValueError("legacy abandonment round changed before completion")
+            self.connection.execute("UPDATE legacy_abandonment_intents SET state='completed',receipt_json=?,updated_at=? WHERE action_id=? AND action_digest=? AND state='peer-pending'", (encoded_receipt, now, action_id, action_digest))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.legacy_abandonment(action_id)
+        if result is None:
+            raise ValueError("legacy abandonment intent disappeared")
+        return result
+
+    def reject_legacy_abandonment(self, action_id: str, action_digest: str, error: str, *, now: str) -> dict[str, Any]:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute("SELECT action_digest,state FROM legacy_abandonment_intents WHERE action_id=?", (action_id,)).fetchone()
+            if row is None or row[0] != action_digest or row[1] != "peer-pending":
+                raise ValueError("legacy abandonment action is not peer-pending")
+            self.connection.execute("UPDATE legacy_abandonment_intents SET state='rejected',last_error=?,updated_at=? WHERE action_id=? AND action_digest=? AND state='peer-pending'", (error[:512], now, action_id, action_digest))
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        result = self.legacy_abandonment(action_id)
+        if result is None:
+            raise ValueError("legacy abandonment intent disappeared")
+        return result
+
     def record_round_prompt_delivery_phase(self, round_id: str, request: Mapping[str, Any], capability: str, binding: Mapping[str, Any], prompt_digest: str, phase: str, *, now: str, expected_phase: str | None = None) -> dict[str, Any]:
-        phases = ("prepared", "failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "confirmed", "unresolved")
+        phases = ("prepared", "failure-fence", "paste-intent", "pasted", "submit-intent", "submitted", "abandonment-fence", "confirmed", "unresolved")
         if phase not in phases or not isinstance(prompt_digest, str) or len(prompt_digest) != 64:
             raise ValueError("round prompt delivery phase is invalid")
         request_digest = self._round_request_digest(request)

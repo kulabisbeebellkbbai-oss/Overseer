@@ -76,6 +76,18 @@ def build_parser() -> argparse.ArgumentParser:
     process_attest = subparsers.add_parser("record-process-observation", help="record one immutable historical process observation")
     process_attest.add_argument("--round-id", required=True)
     process_attest.add_argument("--plan-id", required=True)
+    abandon_stage = subparsers.add_parser("stage-legacy-abandonment", help="stage one exact non-executable legacy abandonment authority")
+    abandon_stage.add_argument("--round-id", required=True)
+    abandon_stage.add_argument("--plan-id", required=True)
+    abandon_stage.add_argument("--observation-plan-id", required=True)
+    abandon_stage.add_argument("--successor-plan-id", required=True)
+    abandon_stage.add_argument("--successor-plan-version", required=True)
+    abandon_stage.add_argument("--successor-conversation-id", required=True)
+    abandon_stage.add_argument("--successor-thread-id", required=True)
+    abandon_finalize = subparsers.add_parser("finalize-legacy-abandonment", help="report one exact legacy abandonment authority")
+    abandon_finalize.add_argument("--plan-id", required=True)
+    abandon_execute = subparsers.add_parser("execute-legacy-abandonment", help="execute one exact approved legacy abandonment adapter")
+    abandon_execute.add_argument("--plan-id", required=True)
     subparsers.add_parser("tick")
     return parser
 
@@ -152,6 +164,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "record-process-observation":
         result = record_process_observation(round_id=args.round_id, plan_id=args.plan_id)
         print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "stage-legacy-abandonment":
+        bridge = create_bridge_from_environment()
+        result = bridge.stage_legacy_abandonment(
+            plan_id=args.plan_id, observation_plan_id=args.observation_plan_id, round_id=args.round_id,
+            successor_plan_id=args.successor_plan_id, successor_plan_version=args.successor_plan_version,
+            successor_conversation_id=args.successor_conversation_id, successor_thread_id=args.successor_thread_id,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "finalize-legacy-abandonment":
+        bridge = create_bridge_from_environment()
+        print(json.dumps(bridge.finalize_legacy_abandonment(plan_id=args.plan_id), sort_keys=True))
+        return 0
+    if args.command == "execute-legacy-abandonment":
+        bridge = create_bridge_from_environment()
+        print(json.dumps(bridge.execute_legacy_abandonment(plan_id=args.plan_id), sort_keys=True))
         return 0
     if args.command == "tick":
         bridge = create_bridge_from_environment()

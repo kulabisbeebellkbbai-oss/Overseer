@@ -128,6 +128,20 @@ def test_cli_exposes_only_one_exact_legacy_attestation_command():
     assert args.manifest_path == "/private/attestation.json"
 
 
+def test_cli_legacy_abandonment_delivery_conversation_is_optional_v2_extension():
+    parser = build_parser()
+    common = [
+        "stage-legacy-abandonment", "--round-id", "round", "--plan-id", "plan",
+        "--observation-plan-id", "observation-plan", "--successor-plan-id", "successor",
+        "--successor-plan-version", "2", "--successor-conversation-id", "conversation",
+        "--successor-thread-id", "thread",
+    ]
+    v1 = parser.parse_args(common)
+    assert v1.delivery_conversation_id is None
+    v2 = parser.parse_args([*common, "--delivery-conversation-id", "old-conversation"])
+    assert v2.delivery_conversation_id == "old-conversation"
+
+
 def test_cli_propagates_delivery_lease_to_usage_ledger(monkeypatch, tmp_path: Path, capsys):
     captured = {}
 

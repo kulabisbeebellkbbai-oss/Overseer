@@ -89,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_stage.add_argument("--successor-plan-version", required=True)
     abandon_stage.add_argument("--successor-conversation-id", required=True)
     abandon_stage.add_argument("--successor-thread-id", required=True)
+    abandon_stage.add_argument(
+        "--delivery-conversation-id",
+        default=None,
+        help="immutable submitted-delivery conversation for a v2 historical-misbinding request",
+    )
     abandon_finalize = subparsers.add_parser("finalize-legacy-abandonment", help="report one exact legacy abandonment authority")
     abandon_finalize.add_argument("--plan-id", required=True)
     abandon_execute = subparsers.add_parser("execute-legacy-abandonment", help="execute one exact approved legacy abandonment adapter")
@@ -172,11 +177,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "stage-legacy-abandonment":
         bridge = _create_legacy_abandonment_bridge()
-        result = bridge.stage_legacy_abandonment(
-            plan_id=args.plan_id, observation_plan_id=args.observation_plan_id, round_id=args.round_id,
-            successor_plan_id=args.successor_plan_id, successor_plan_version=args.successor_plan_version,
-            successor_conversation_id=args.successor_conversation_id, successor_thread_id=args.successor_thread_id,
-        )
+        stage_kwargs = {
+            "plan_id": args.plan_id, "observation_plan_id": args.observation_plan_id, "round_id": args.round_id,
+            "successor_plan_id": args.successor_plan_id, "successor_plan_version": args.successor_plan_version,
+            "successor_conversation_id": args.successor_conversation_id, "successor_thread_id": args.successor_thread_id,
+        }
+        if args.delivery_conversation_id is not None:
+            stage_kwargs["delivery_conversation_id"] = args.delivery_conversation_id
+        result = bridge.stage_legacy_abandonment(**stage_kwargs)
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "finalize-legacy-abandonment":

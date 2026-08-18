@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import pwd
+import grp
 import signal
 import stat
 import subprocess
@@ -519,7 +520,14 @@ def assert_no_dbus_commands(commands: Iterable[Sequence[str]]) -> None:
 
 def _unit_contract() -> bytes:
     content, info = _stable_read(UNIT_PATH)
-    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    private_group = False
+    if info.st_gid == pwd.getpwuid(os.geteuid()).pw_gid:
+        group = grp.getgrgid(info.st_gid)
+        same_gid_users = [entry.pw_uid for entry in pwd.getpwall() if entry.pw_gid == info.st_gid]
+        private_group = same_gid_users == [os.geteuid()] and set(group.gr_mem) <= {pwd.getpwuid(os.geteuid()).pw_name}
+    mode = stat.S_IMODE(info.st_mode)
+    if (info.st_uid != os.geteuid() or mode & 0o002
+            or (mode & 0o020 and not private_group)):
         raise ValueError("Overseer API unit is not an owner-controlled immutable approval input")
     text = content.decode("utf-8", "strict")
     if "\nRestart=on-failure\n" not in f"\n{text}":

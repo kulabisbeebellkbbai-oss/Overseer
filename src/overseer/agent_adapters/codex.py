@@ -778,7 +778,7 @@ class CodexDriver:
         result_session_id: str,
         driver_epoch_id: str,
     ) -> tuple[AgentDispatchResult, LegacyResumeDetails]:
-        with _thread_dispatch_lock(session):
+        with self._thread_operation_lock(session):
             return self._resume_session_locked(
                 session,
                 request_id=request_id,
@@ -898,7 +898,7 @@ class CodexDriver:
         prompt_marker: str | None = None,
         phase_callback: Callable[[str], None] | None = None,
     ) -> AgentDispatchResult:
-        with _thread_dispatch_lock(session):
+        with self._thread_operation_lock(session):
             return self._dispatch_session_locked(
                 session,
                 request,
@@ -929,7 +929,9 @@ class CodexDriver:
                 prompt_marker=prompt_marker,
                 phase_callback=phase_callback,
             )
-        resume_result, resume_details = self._resume_session(
+        # The outer dispatch operation already owns the process and file
+        # locks, so call the locked resume primitive directly.
+        resume_result, resume_details = self._resume_session_locked(
             session,
             request_id=f"{request.id}.resume",
             result_session_id=session.external_session_id or session.id,
@@ -1330,17 +1332,47 @@ class CodexDriver:
             return True
         return True
 
-    @contextmanager
-    def _claim_structured_thread(self, session: AgentSession):
+    def _ensure_structured_fence_root(self) -> Path:
         root = self.structured_thread_fence_root
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        root_metadata = root.lstat()
+        metadata = root.lstat()
         if (
-            not stat.S_ISDIR(root_metadata.st_mode)
-            or root_metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise RuntimeError("structured Codex thread fence directory is unsafe")
+        return root
+
+    @contextmanager
+    def _thread_operation_lock(self, session: AgentSession):
+        """Serialize legacy and structured effects across processes."""
+        with _thread_dispatch_lock(session):
+            root = self._ensure_structured_fence_root()
+            thread_id = session.external_session_id or session.id
+            lock_path = root / (hashlib.sha256(thread_id.encode("utf-8")).hexdigest() + ".lock")
+            descriptor = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_nlink != 1
+                ):
+                    raise RuntimeError("Codex thread operation lock is unsafe")
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(descriptor)
+
+    @contextmanager
+    def _claim_structured_thread(self, session: AgentSession):
+        root = self._ensure_structured_fence_root()
         marker = _structured_thread_marker(root, session)
         descriptor = os.open(marker, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         try:

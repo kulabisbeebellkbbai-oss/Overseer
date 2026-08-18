@@ -590,7 +590,10 @@ def test_structured_dispatch_uses_app_server_without_tmux_side_effects(codex_csv
     assert result.evidence["delivery_proof"] == "app-server-user-message"
     assert result.evidence["turn_id"] == "turn.structured"
     assert phases == ["prepared", "paste-intent", "submit-intent", "submitted"]
-    assert runner.commands == [("/tmp/tmux", "has-session", "-t", "example")]
+    assert runner.commands == [
+        ("/tmp/tmux", "has-session", "-t", "example"),
+        ("/tmp/tmux", "has-session", "-t", "example"),
+    ]
 
 
 def test_structured_dispatch_rejects_a_live_interactive_session_before_turn_start(codex_csv: Path) -> None:
@@ -665,7 +668,7 @@ def test_structured_dispatch_is_scoped_to_rounds_with_a_durable_phase_fence(code
     assert any(command[1] == "paste-buffer" for command in runner.commands)
 
 
-def test_structured_and_legacy_transports_share_one_thread_exclusion(codex_csv: Path) -> None:
+def test_structured_thread_fence_blocks_concurrent_and_later_legacy_transport(codex_csv: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
     structured_results = []
@@ -726,8 +729,24 @@ def test_structured_and_legacy_transports_share_one_thread_exclusion(codex_csv: 
     legacy_thread.join(timeout=2)
 
     assert structured_results[0].state is AgentOperationState.ACKNOWLEDGED
-    assert legacy_results[0].state is AgentOperationState.ACKNOWLEDGED
-    assert any(command[1] == "paste-buffer" for command in legacy_runner.commands)
+    assert legacy_results[0].state is AgentOperationState.FAILED
+    assert legacy_results[0].error_message == "structured Codex thread cannot be resumed through tmux"
+    assert legacy_runner.commands == []
+
+    restarted = CodexDriver.from_legacy_registry(
+        codex_csv,
+        tmux_path="/tmp/tmux",
+        codex_memory_session_path="/tmp/codex-memory-session",
+        runner=RecordingRunner(),
+        sleep=lambda _delay: None,
+    )
+    restarted_result = restarted.dispatch_legacy(
+        restarted.discover()[0],
+        "A restart must preserve the structured-only transport.",
+        idempotency_key="legacy.after-restart",
+    )
+    assert restarted_result.state is AgentOperationState.FAILED
+    assert restarted_result.error_message == "structured Codex thread cannot be resumed through tmux"
 
 
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -81,6 +83,11 @@ def _thread_dispatch_lock(session: AgentSession):
         lock = _THREAD_DISPATCH_LOCKS.setdefault(key, threading.RLock())
     with lock:
         yield
+
+
+def _structured_thread_marker(root: Path, session: AgentSession) -> Path:
+    thread_id = session.external_session_id or session.id
+    return root / (hashlib.sha256(thread_id.encode("utf-8")).hexdigest() + ".structured")
 
 
 class BoundedCommandRunner(Protocol):
@@ -284,6 +291,7 @@ class CodexDriver:
         runner: BoundedCommandRunner | None = None,
         delivery_evidence_factory=None,
         structured_turn_client: StructuredTurnClient | None = None,
+        structured_thread_fence_root: str | Path | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if provider.id != "codex" or provider.adapter_id != "codex":
@@ -325,6 +333,11 @@ class CodexDriver:
         self._legacy_prompt_details: dict[str, LegacyPromptDetails] = {}
         self.delivery_evidence_factory = delivery_evidence_factory or (lambda session: RolloutPromptDeliveryEvidence(session))
         self.structured_turn_client = structured_turn_client
+        self.structured_thread_fence_root = Path(
+            structured_thread_fence_root
+            if structured_thread_fence_root is not None
+            else self.registry_path.parent / ".overseer-structured-threads"
+        )
         if not callable(sleep):
             raise TypeError("Codex sleep hook must be callable")
         self._sleep = sleep
@@ -343,6 +356,7 @@ class CodexDriver:
         runner: CliCommandRunner | SubprocessRunner | None = None,
         delivery_evidence_factory=None,
         structured_turn_client: StructuredTurnClient | None = None,
+        structured_thread_fence_root: str | Path | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> CodexDriver:
         selected_structured_turn_client = structured_turn_client
@@ -374,6 +388,7 @@ class CodexDriver:
             runner=runner,
             delivery_evidence_factory=delivery_evidence_factory,
             structured_turn_client=selected_structured_turn_client,
+            structured_thread_fence_root=structured_thread_fence_root,
             sleep=sleep,
         )
 
@@ -779,6 +794,24 @@ class CodexDriver:
         result_session_id: str,
         driver_epoch_id: str,
     ) -> tuple[AgentDispatchResult, LegacyResumeDetails]:
+        if self._structured_thread_is_fenced(session):
+            details = LegacyResumeDetails(
+                status="failed",
+                reason="structured Codex thread cannot be resumed through tmux",
+            )
+            return (
+                self._failure_result(
+                    request_id=request_id,
+                    instance_id=session.instance_id or self.profile.id,
+                    session_id=result_session_id,
+                    driver_epoch_id=driver_epoch_id,
+                    category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
+                    message=details.reason,
+                    external_session_id=session.external_session_id,
+                    provider_reference=_legacy_text(session, "command"),
+                ),
+                details,
+            )
         command_name = _legacy_text(session, "command")
         if self._tmux_session_exists(command_name):
             details = LegacyResumeDetails(
@@ -1213,13 +1246,24 @@ class CodexDriver:
                 category=AgentErrorCategory.PROVIDER_PROTOCOL_ERROR,
             )
         try:
-            evidence = self.structured_turn_client.submit_bound_turn(
-                thread_id=thread_id,
-                prompt=dispatch_prompt,
-                client_message_id=request.id,
-                cwd=session.workspace,
-                phase_callback=phase_callback,
-            )
+            with self._claim_structured_thread(session):
+                # Recheck after publishing the durable structured-only fence.
+                # Every Overseer legacy path observes this marker; the second
+                # tmux probe closes the internal check-to-submit window.
+                fenced_session_check = self._run(
+                    [str(self.tmux_path), "has-session", "-t", _legacy_text(session, "command")]
+                )
+                if fenced_session_check.returncode == 0:
+                    raise RuntimeError("live interactive codex session prevents structured dispatch")
+                if fenced_session_check.returncode != 1:
+                    raise RuntimeError("codex interactive session absence could not be proven")
+                evidence = self.structured_turn_client.submit_bound_turn(
+                    thread_id=thread_id,
+                    prompt=dispatch_prompt,
+                    client_message_id=request.id,
+                    cwd=session.workspace,
+                    phase_callback=phase_callback,
+                )
         except Exception as error:
             return self._prompt_failure(
                 request,
@@ -1270,6 +1314,62 @@ class CodexDriver:
         )
         self._legacy_prompt_details[result.id] = details
         return result
+
+    def _structured_thread_is_fenced(self, session: AgentSession) -> bool:
+        marker = _structured_thread_marker(self.structured_thread_fence_root, session)
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            return True
+        return True
+
+    @contextmanager
+    def _claim_structured_thread(self, session: AgentSession):
+        root = self.structured_thread_fence_root
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_metadata = root.lstat()
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise RuntimeError("structured Codex thread fence directory is unsafe")
+        marker = _structured_thread_marker(root, session)
+        descriptor = os.open(marker, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+            ):
+                raise RuntimeError("structured Codex thread fence is unsafe")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            thread_digest = hashlib.sha256((session.external_session_id or session.id).encode("utf-8")).hexdigest()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            existing = os.read(descriptor, 65).decode("ascii")
+            if existing not in {"", thread_digest}:
+                raise RuntimeError("structured Codex thread fence binding conflicts")
+            if not existing:
+                if os.write(descriptor, thread_digest.encode("ascii")) != len(thread_digest):
+                    raise RuntimeError("structured Codex thread fence write was incomplete")
+                os.fsync(descriptor)
+                root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    os.fsync(root_descriptor)
+                finally:
+                    os.close(root_descriptor)
+            yield
+        finally:
+            os.close(descriptor)
 
     def _prompt_failure(
         self,

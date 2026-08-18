@@ -800,6 +800,16 @@ def test_structured_thread_fence_uses_canonical_registry_namespace(codex_csv: Pa
     assert legacy_runner.commands == []
 
 
+def test_codex_registry_hardlink_alias_is_rejected(codex_csv: Path, tmp_path: Path) -> None:
+    alias_directory = tmp_path / "alias"
+    alias_directory.mkdir()
+    alias = alias_directory / "codex-projects.csv"
+    os.link(codex_csv, alias)
+
+    with pytest.raises(ValueError, match="must not have hardlink aliases"):
+        CodexDriver.from_legacy_registry(alias)
+
+
 def test_dispatch_fails_closed_if_paste_settle_wait_fails(
     codex_csv: Path,
 ) -> None:

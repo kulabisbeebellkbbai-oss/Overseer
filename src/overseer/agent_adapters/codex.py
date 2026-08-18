@@ -322,6 +322,8 @@ class CodexDriver:
         # One registry inode must map to one cross-process transport-fence
         # namespace even when callers supply relative or symlink aliases.
         self.registry_path = Path(registry_path).expanduser().resolve(strict=False)
+        if self.registry_path.exists() and self.registry_path.stat(follow_symlinks=False).st_nlink != 1:
+            raise ValueError("Codex projects registry must not have hardlink aliases")
         self.tmux_path = Path(tmux_path)
         self.codex_memory_session_path = Path(codex_memory_session_path)
         self.runner: BoundedCommandRunner = runner or CliCommandRunner(
@@ -1336,10 +1338,8 @@ class CodexDriver:
 
     def _ensure_structured_fence_root(self) -> Path:
         root = self.structured_thread_fence_root
-        created = False
         try:
             root.mkdir(mode=0o700, parents=False, exist_ok=False)
-            created = True
         except FileExistsError:
             pass
         metadata = root.lstat()
@@ -1349,15 +1349,16 @@ class CodexDriver:
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise RuntimeError("structured Codex thread fence directory is unsafe")
-        if created:
-            parent_descriptor = os.open(
-                root.parent,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
-            try:
-                os.fsync(parent_descriptor)
-            finally:
-                os.close(parent_descriptor)
+        # Sync unconditionally.  Another process may have won the mkdir race
+        # but not yet synced the directory entry before this process proceeds.
+        parent_descriptor = os.open(
+            root.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
         return root
 
     @contextmanager

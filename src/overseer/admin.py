@@ -496,6 +496,8 @@ def plan_psychlo_legacy_abandonment(
     delivery_digest: str,
     original_plan_id: str,
     original_plan_version: str,
+    original_conversation_id: str,
+    original_thread_id: str,
     successor_plan_id: str,
     successor_plan_version: str,
     successor_conversation_id: str,
@@ -509,11 +511,14 @@ def plan_psychlo_legacy_abandonment(
     stores before it emits the signed peer action.
     """
     values = (plan_id, round_id, observation_id, original_plan_id, original_plan_version,
+              original_conversation_id, original_thread_id,
               successor_plan_id, successor_plan_version, successor_conversation_id,
               successor_thread_id, reason)
     if not all(isinstance(value, str) and value.strip() for value in values):
         raise ValueError("legacy abandonment plan identity is required")
-    if successor_plan_id == original_plan_id or successor_plan_version == original_plan_version:
+    if (successor_plan_id == original_plan_id or successor_plan_version == original_plan_version
+            or successor_conversation_id == original_conversation_id
+            or successor_thread_id == original_thread_id):
         raise ValueError("successor plan identity must be distinct")
     for name, value in (("observationDigest", observation_digest), ("observationPlanDigest", observation_plan_digest),
                         ("requestDigest", request_digest), ("capabilityHash", capability_hash), ("deliveryDigest", delivery_digest)):
@@ -526,6 +531,7 @@ def plan_psychlo_legacy_abandonment(
             "requestDigest": request_digest, "capabilityHash": capability_hash,
             "deliveryDigest": delivery_digest, "submittedPhase": "submitted",
             "originalPlanId": original_plan_id, "originalPlanVersion": original_plan_version,
+            "originalConversationId": original_conversation_id, "originalThreadId": original_thread_id,
             "successorPlanId": successor_plan_id, "successorPlanVersion": successor_plan_version,
             "successorConversationId": successor_conversation_id, "successorThreadId": successor_thread_id,
             "reason": "ambiguous-submitted-delivery",

@@ -59,7 +59,7 @@ def _runtime(tmp_path, *, sender=None, observation_approved_at=NOW):
     if sender is None:
         def sender(kind, key, payload):
             sent.append((kind, key, payload))
-            return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "legacy-abandoned-uncertain"}
+            return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "legacy-abandoned-uncertain", "status_code": 202}
     bridge = PsychloBridge(store=bridge_store, dispatcher=lambda *args: "", sender=sender, callback_origin="http://127.0.0.1", approval_store=primary, clock=lambda: NOW, recover=False)
     bridge._test_sent = sent
     return bridge, primary
@@ -78,6 +78,36 @@ def test_stage_is_high_human_sisko_and_non_executable(tmp_path):
     assert plan.risk_level.value == "high" and plan.approval_level.value == "human" and plan.owner_domain.value == "sisko"
     assert plan.can_execute() is False
     assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "submitted"
+
+
+def test_stage_exact_replay_returns_frozen_intent_and_divergence_conflicts(tmp_path):
+    bridge, primary = _runtime(tmp_path)
+    first = _stage(bridge)
+    replay = _stage(bridge)
+    assert replay["replayed"] is True
+    assert replay["actionDigest"] == first["actionDigest"]
+    with pytest.raises(LegacyAbandonmentError, match="identity conflict"):
+        stage_legacy_abandonment(
+            bridge=bridge, plan_id="abandon-plan", observation_plan_id="observation-plan",
+            round_id="round-arcade", successor_plan_id="arcade-plan-2",
+            successor_plan_version="2.0", successor_conversation_id="new-conversation",
+            successor_thread_id="divergent-thread",
+        )
+
+
+@pytest.mark.parametrize(
+    ("conversation_id", "thread_id"),
+    [("old-conversation", "new-thread"), ("new-conversation", "old-thread")],
+)
+def test_successor_conversation_and_thread_must_each_be_distinct(tmp_path, conversation_id, thread_id):
+    bridge, primary = _runtime(tmp_path)
+    with pytest.raises((LegacyAbandonmentError, ValueError), match="successor.*distinct"):
+        stage_legacy_abandonment(
+            bridge=bridge, plan_id="abandon-plan", observation_plan_id="observation-plan",
+            round_id="round-arcade", successor_plan_id="arcade-plan-2",
+            successor_plan_version="2.0", successor_conversation_id=conversation_id,
+            successor_thread_id=thread_id,
+        )
 
 
 def test_execute_fences_delivery_and_persists_terminal_non_result(tmp_path):
@@ -145,7 +175,7 @@ def test_transport_failure_leaves_replayable_outbox(tmp_path):
         calls.append(payload)
         if len(calls) == 1:
             raise RuntimeError("transport down")
-        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "legacy-abandoned-uncertain"}
+        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "legacy-abandoned-uncertain", "status_code": 202}
     bridge, primary = _runtime(tmp_path, sender=sender)
     _stage(bridge)
     plan = primary.load_admin_change_plan("abandon-plan")
@@ -309,7 +339,7 @@ def test_invalid_peer_response_remains_pending_and_replays_after_remote_commit(t
             # The receiver may have committed before its response was
             # truncated or corrupted in transport.
             return {"accepted": True, "actionId": payload["actionId"]}
-        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned"}
+        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned", "status_code": 202}
     bridge, primary = _runtime(tmp_path, sender=sender)
     _stage(bridge)
     plan = primary.load_admin_change_plan("abandon-plan")
@@ -334,6 +364,32 @@ def test_every_unverifiable_peer_response_stays_replayable(tmp_path, invalid):
     intent = bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")
     assert intent["state"] == "peer-pending" and intent["receipt"] is None
     assert bridge.store.round_prompt_delivery("round-arcade")["phase"] == "abandonment-fence"
+
+
+@pytest.mark.parametrize("status_code", [200, 201, 409, "202", None])
+def test_peer_transport_status_must_be_exact_for_abandonment(tmp_path, status_code):
+    def sender(_kind, _key, payload):
+        response = {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned"}
+        if status_code is not None:
+            response["status_code"] = status_code
+        return response
+    bridge, primary = _runtime(tmp_path, sender=sender)
+    _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    with pytest.raises(LegacyAbandonmentError):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "peer-pending"
+
+
+def test_peer_response_rejects_extra_transport_or_body_fields(tmp_path):
+    def sender(_kind, _key, payload):
+        return {"accepted": True, "actionId": payload["actionId"], "actionDigest": payload["actionDigest"], "roundId": payload["roundId"], "requestDigest": payload["requestDigest"], "status": "already-abandoned", "status_code": 202, "extra": "forbidden"}
+    bridge, primary = _runtime(tmp_path, sender=sender)
+    _stage(bridge)
+    primary.save_admin_change_plan(approve_admin_change_plan(primary.load_admin_change_plan("abandon-plan"), "sisko", NOW))
+    with pytest.raises(LegacyAbandonmentError):
+        execute_legacy_abandonment(bridge=bridge, plan_id="abandon-plan")
+    assert bridge.store.legacy_abandonment("legacy-abandonment:round-arcade:arcade-plan-2")["state"] == "peer-pending"
 
 
 def test_abandonment_fence_rejects_recovery_and_late_result(tmp_path):

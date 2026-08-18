@@ -169,9 +169,14 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         raise LegacyAbandonmentError("round already has an abandonment intent")
     original_plan_id = _id(request.get("planId"), "original plan id")
     original_plan_version = _id(request.get("planVersion"), "original plan version")
+    original_conversation_id = _id(binding.get("conversationId"), "original conversation id")
+    original_thread_id = _id(request.get("threadId"), "original thread id")
     for name in ("successorPlanId", "successorPlanVersion", "successorConversationId", "successorThreadId"):
         _id(successor.get(name), name)
-    if successor["successorPlanId"] == original_plan_id or successor["successorPlanVersion"] == original_plan_version:
+    if (successor["successorPlanId"] == original_plan_id
+            or successor["successorPlanVersion"] == original_plan_version
+            or successor["successorConversationId"] == original_conversation_id
+            or successor["successorThreadId"] == original_thread_id):
         raise LegacyAbandonmentError("successor plan identity must be distinct")
     action_id = f"legacy-abandonment:{round_id}:{successor['successorPlanId']}"
     action = {
@@ -180,7 +185,7 @@ def _snapshot(bridge: Any, primary: Any, round_id: str, observation_plan_id: str
         "capabilityHash": capability_hash, "observationId": _id(observation.get("observationId"), "observation id"),
         "observationDigest": observation_digest, "observationPlanDigest": observation_plan_digest,
         "delivery": {"phase": "submitted", "promptDigest": prompt_digest, "deliveryDigest": delivery_digest, "bindingDigest": expected_binding_digest},
-        "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version},
+        "originalPlan": {"planId": original_plan_id, "planVersion": original_plan_version, "conversationId": original_conversation_id, "threadId": original_thread_id},
         "successorPlan": dict(successor), "observationPlanId": observation_plan_id, "reason": REASON,
     }
     wire_body = {"schemaVersion": SCHEMA, "actionId": action_id, "roundId": round_id, "projectId": action["projectId"], "requestDigest": request_digest, "planId": original_plan_id, "planVersion": original_plan_version, "observationId": action["observationId"], "observationDigest": observation_digest, "reason": REASON, "occurredAt": _now(bridge)}
@@ -195,19 +200,33 @@ def stage_legacy_abandonment(*, bridge: Any, plan_id: str, observation_plan_id: 
     """Stage one non-executable authority plan and bridge outbox intent."""
     primary = _primary(bridge)
     successor = {"successorPlanId": successor_plan_id, "successorPlanVersion": successor_plan_version, "successorConversationId": successor_conversation_id, "successorThreadId": successor_thread_id}
-    action, _source_plan = _snapshot(bridge, primary, round_id, observation_plan_id, successor)
     action_id = f"legacy-abandonment:{round_id}:{successor_plan_id}"
     existing_intent = bridge.store.legacy_abandonment(action_id)
-    if existing_intent is not None:
-        if existing_intent["payload"].get("planId") != plan_id:
-            raise LegacyAbandonmentError("legacy abandonment action identity conflict")
-        return {"staged": True, "historical": True, "authoritative": False, "executable": False, "actionId": action_id, "actionDigest": existing_intent["actionDigest"], "planId": plan_id, "roundId": round_id, "state": existing_intent["state"], "replayed": True}
+    action, _source_plan = _snapshot(
+        bridge, primary, round_id, observation_plan_id, successor,
+        allow_existing_abandonment=existing_intent is not None,
+        allow_fence=bool(existing_intent and existing_intent["state"] == "peer-pending"),
+    )
     metadata = action
     plan = plan_psychlo_legacy_abandonment(
-        plan_id, round_id, action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], successor_plan_id, successor_plan_version, successor_conversation_id, successor_thread_id,
+        plan_id, round_id, action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], successor_plan_id, successor_plan_version, successor_conversation_id, successor_thread_id,
     )
     metadata["planId"] = plan_id
     metadata["planDigest"] = _immutable_plan_digest(plan)
+    if existing_intent is not None:
+        frozen = existing_intent["payload"]
+        existing_plan = primary.load_admin_change_plan(plan_id) if _plan_exists(primary, plan_id) else None
+        if (
+            frozen.get("planId") != plan_id
+            or frozen.get("planDigest") != metadata["planDigest"]
+            or existing_intent["actionDigest"] != frozen.get("actionDigest")
+            or _action_core(frozen) != _action_core(metadata)
+            or _validate_wire(frozen.get("wire"), frozen).get("actionDigest") != existing_intent["actionDigest"]
+            or existing_plan is None
+            or _immutable_plan_digest(existing_plan) != _immutable_plan_digest(plan)
+        ):
+            raise LegacyAbandonmentError("legacy abandonment action identity conflict")
+        return {"staged": True, "historical": True, "authoritative": False, "executable": False, "actionId": action_id, "actionDigest": existing_intent["actionDigest"], "planId": plan_id, "roundId": round_id, "state": existing_intent["state"], "replayed": True}
     if _plan_exists(primary, plan_id):
         existing_plan = primary.load_admin_change_plan(plan_id)
         if _immutable_plan_digest(existing_plan) != _immutable_plan_digest(plan):
@@ -227,7 +246,7 @@ def _plan_exists(primary: Any, plan_id: str) -> bool:
 
 
 def _expected_plan(action: Mapping[str, Any], plan_id: str) -> AdminChangePlan:
-    return plan_psychlo_legacy_abandonment(plan_id, action["roundId"], action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["successorPlan"]["successorPlanId"], action["successorPlan"]["successorPlanVersion"], action["successorPlan"]["successorConversationId"], action["successorPlan"]["successorThreadId"])
+    return plan_psychlo_legacy_abandonment(plan_id, action["roundId"], action["observationId"], action["observationDigest"], action["observationPlanDigest"], action["requestDigest"], action["capabilityHash"], action["delivery"]["deliveryDigest"], action["originalPlan"]["planId"], action["originalPlan"]["planVersion"], action["originalPlan"]["conversationId"], action["originalPlan"]["threadId"], action["successorPlan"]["successorPlanId"], action["successorPlan"]["successorPlanVersion"], action["successorPlan"]["successorConversationId"], action["successorPlan"]["successorThreadId"])
 
 
 def _action_core(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -236,6 +255,8 @@ def _action_core(value: Mapping[str, Any]) -> dict[str, Any]:
 
 _WIRE_KEYS = frozenset({"schemaVersion", "actionId", "actionDigest", "roundId", "projectId", "requestDigest", "planId", "planVersion", "observationId", "observationDigest", "reason", "occurredAt"})
 _RESPONSE_KEYS = frozenset({"accepted", "actionId", "actionDigest", "roundId", "requestDigest", "status"})
+_SENDER_RESPONSE_KEYS = _RESPONSE_KEYS | {"status_code"}
+_ABANDONMENT_HTTP_STATUS = 202
 
 
 def _validate_wire(wire: Any, action: Mapping[str, Any]) -> dict[str, Any]:
@@ -276,9 +297,12 @@ def finalize_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:
 
 
 def _validate_response(response: Mapping[str, Any], wire: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(response, Mapping) or set(response) != _RESPONSE_KEYS or response.get("accepted") is not True or response.get("actionId") != wire["actionId"] or response.get("actionDigest") != wire["actionDigest"] or response.get("roundId") != wire["roundId"] or response.get("requestDigest") != wire["requestDigest"] or response.get("status") not in {STATUS, "already-abandoned"}:
+    if not isinstance(response, Mapping) or set(response) != _SENDER_RESPONSE_KEYS or response.get("status_code") != _ABANDONMENT_HTTP_STATUS:
         raise LegacyAbandonmentError("Psychlo rejected legacy abandonment")
-    return dict(response)
+    body = {key: value for key, value in response.items() if key != "status_code"}
+    if set(body) != _RESPONSE_KEYS or body.get("accepted") is not True or body.get("actionId") != wire["actionId"] or body.get("actionDigest") != wire["actionDigest"] or body.get("roundId") != wire["roundId"] or body.get("requestDigest") != wire["requestDigest"] or body.get("status") not in {STATUS, "already-abandoned"}:
+        raise LegacyAbandonmentError("Psychlo rejected legacy abandonment")
+    return body
 
 
 def execute_legacy_abandonment(*, bridge: Any, plan_id: str) -> dict[str, Any]:

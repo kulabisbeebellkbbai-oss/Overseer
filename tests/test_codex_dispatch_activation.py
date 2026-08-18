@@ -123,6 +123,7 @@ def test_existing_exact_dropin_requires_private_single_link_regular_file(tmp_pat
     drop_in.write_bytes(activation.DROP_IN_CONTENT)
     drop_in.chmod(0o600)
     assert activation._install_drop_in(plan.id, plan.steps[0].command[2]) == "exact owner-only service drop-in already present"
+    assert activation._load_journal(plan.id, plan.steps[0].command[2])["dropInOwnership"] == "preexisting"
     drop_in.unlink()
     target = tmp_path / "target.conf"
     target.write_bytes(activation.DROP_IN_CONTENT)
@@ -191,6 +192,21 @@ def test_preexisting_invalid_daemon_is_not_started_or_stopped(tmp_path: Path, mo
     assert not any(command[-1:] == ("stop",) for command in calls)
 
 
+def test_genuine_preexisting_valid_daemon_is_not_owned_by_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
+    plan = _plan()
+    code, _, err = execute_codex_dispatch_activation_marker(plan.steps[1].command)
+    assert code == 0, err
+    assert activation._load_journal(plan.id, plan.steps[1].command[2])["daemonOwnership"] == "preexisting"
+    assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
+    assert not any(command[-1:] == ("stop",) for command in calls)
+
+
 def test_start_crash_after_effect_is_reconciled_from_intent_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
     monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
@@ -217,6 +233,9 @@ def test_start_crash_after_effect_is_reconciled_from_intent_journal(tmp_path: Pa
     monkeypatch.setattr(activation, "_daemon_status", lambda: "running-valid")
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(activation, "_run_checked", lambda command, **_kwargs: calls.append(tuple(command)) or "ok")
+    retry_code, _, retry_err = execute_codex_dispatch_activation_marker(plan.steps[1].command)
+    assert retry_code == 0, retry_err
+    assert activation._load_journal(plan.id, plan.steps[1].command[2])["daemonOwnership"] == "started-by-operation"
     assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
     assert ("codex", "app-server", "daemon", "stop") in calls
 
@@ -244,8 +263,50 @@ def test_drop_in_crash_after_write_is_reconciled_from_intent_journal(tmp_path: P
     assert journal["dropInOwnership"] == "write-issued"
     monkeypatch.setattr(activation, "_atomic_write", original)
     monkeypatch.setattr(activation, "_run_checked", lambda *_args, **_kwargs: "ok")
+    retry_code, _, retry_err = execute_codex_dispatch_activation_marker(plan.steps[2].command)
+    assert retry_code == 0, retry_err
+    assert activation._load_journal(plan.id, plan.steps[2].command[2])["dropInOwnership"] == "created-by-operation"
     assert execute_codex_dispatch_activation_marker(plan.rollback_steps[0].command)[0] == 0
     assert not drop_in.exists()
+
+
+def test_retry_owned_resources_are_rolled_back_after_later_verification_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(activation, "EUID_HOME", tmp_path)
+    monkeypatch.setattr(activation, "CODEX_HOME", tmp_path / ".codex")
+    monkeypatch.setattr(activation, "verify_reviewed_source_binding", lambda _spec: None)
+    plan = _approved_plan()
+    state = {"daemon_running": False}
+
+    def daemon_status():
+        return "running-valid" if state["daemon_running"] else "not-running"
+
+    monkeypatch.setattr(activation, "_daemon_status", daemon_status)
+
+    def run_checked(command, **_kwargs):
+        command = tuple(command)
+        if command[-1:] == ("start",):
+            state["daemon_running"] = True
+        elif command[-1:] == ("stop",):
+            state["daemon_running"] = False
+        return "ok"
+
+    monkeypatch.setattr(activation, "_run_checked", run_checked)
+
+    def runner(step):
+        if step.title == "Verify daemon version":
+            return AdminCommandResult(step.title, step.command, 1, stderr="verification injected failure")
+        code, stdout, stderr = execute_codex_dispatch_activation_marker(step.command)
+        return AdminCommandResult(step.title, step.command, code, stdout, stderr)
+
+    result = execute_codex_dispatch_activation_plan(plan, runner=runner, adapter_enabled=True)
+    assert result.status.value == "failed"
+    drop_in, _, _, _ = activation._paths()
+    journal = activation._load_journal(plan.id, plan.steps[0].command[2])
+    assert not drop_in.exists()
+    assert state["daemon_running"] is False
+    assert journal["phase"] == "rolled-back"
+    assert journal["dropInOwnership"] == "removed"
+    assert journal["daemonOwnership"] == "stopped"
 
 
 def test_stop_failure_keeps_retryable_rollback_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

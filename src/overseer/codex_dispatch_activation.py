@@ -472,14 +472,21 @@ def _install_drop_in(plan_id: str, digest: str) -> str:
     drop_in, _, _, _ = _paths()
     drop_in.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _owner_only(drop_in.parent, "systemd drop-in directory")
+    journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+    prior_ownership = str(journal["dropInOwnership"])
     try:
         _secure_read_exact(drop_in, DROP_IN_CONTENT)
         existing = DROP_IN_CONTENT
     except FileNotFoundError:
         existing = None
-    journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
     if existing is not None:
-        journal["dropInOwnership"] = "preexisting"
+        # An exact file left by a persisted write intent belongs to this
+        # operation even when a retry observes it before the success phase.
+        journal["dropInOwnership"] = (
+            "created-by-operation"
+            if prior_ownership in {"write-issued", "created-by-operation"}
+            else "preexisting"
+        )
         journal["phase"] = "drop-in-installed"
         _write_journal(journal)
         return "exact owner-only service drop-in already present"
@@ -551,11 +558,18 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             return 0, "daemon bootstrapped without remote control", ""
         if operation == "start":
             journal = _load_journal(plan_id, digest) or _journal(plan_id, digest)
+            prior_ownership = str(journal["daemonOwnership"])
             journal["phase"] = "intent-start"
             _write_journal(journal)
             status = _daemon_status()
             if status == "running-valid":
-                journal["daemonOwnership"] = "preexisting"
+                # A running daemon observed after a persisted start intent is
+                # the operation's daemon, not an unrelated preexisting one.
+                journal["daemonOwnership"] = (
+                    "started-by-operation"
+                    if prior_ownership in {"start-issued", "started-by-operation"}
+                    else "preexisting"
+                )
             elif status == "not-running":
                 journal["daemonOwnership"] = "start-issued"
                 _write_journal(journal)

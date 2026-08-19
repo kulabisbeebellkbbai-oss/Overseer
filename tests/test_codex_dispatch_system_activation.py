@@ -70,22 +70,15 @@ def test_plan_binds_closed_out_of_band_authority_ceremony_and_external_root_migr
     assert plan.adapter_metadata["externalCliOnly"] is True
     assert plan.adapter_metadata["apiExecutionAllowed"] is False
     artifact = plan.adapter_metadata["ceremonyArtifact"]
-    bootstrap = artifact["command"]
-    assert bootstrap[:6] == ["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"]
-    assert bootstrap[-3:] == [spec.capability(plan.id)["planDigest"], spec.helper_blob["sha256"],
-                              artifact["authorityDigest"]]
     assert artifact["rootAuthorityPath"] == str(system.ROOT_AUTHORITY_ROOT / f"{artifact['planDigest']}.json")
-    assert artifact["ceremonyInlineSha256"] == hashlib.sha256(system.CEREMONY_INSTALLER.encode()).hexdigest()
-    assert plan.adapter_metadata["activateCommand"] == [
-        "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
-        str(system.ROOT_HELPER_PATH), "activate",
-        spec.capability(plan.id)["planDigest"],
-    ]
-    assert plan.adapter_metadata["rollbackCommand"] == [
-        "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
-        str(system.ROOT_HELPER_PATH), "rollback",
-        spec.capability(plan.id)["planDigest"],
-    ]
+    assert artifact["activeAuthorityPath"] == str(system.ROOT_ACTIVE_AUTHORITY_PATH)
+    assert set(artifact) == {"schemaVersion", "planDigest", "helperGitBlob", "helperSha256",
+                             "helperSize", "rootHelperPath", "rootAuthorityPath",
+                             "activeAuthorityPath", "instructions"}
+    published = json.dumps(plan.adapter_metadata, sort_keys=True)
+    assert "/usr/bin/sudo" not in published
+    assert "CEREMONY_INSTALLER" not in published
+    assert "command" not in plan.adapter_metadata
     assert spec.capability(plan.id)["rootPythonIdentity"] == spec.manifest.root_python
     assert spec.capability(plan.id)["priorSystemServiceState"] == {
         "present": False, "enabled": False, "active": False,
@@ -101,6 +94,54 @@ def test_product_has_no_authority_bootstrap_execution_command():
     assert "def bootstrap_codex_dispatch_authority" not in system_source
     assert '"bootstrap-codex-dispatch-authority"' not in cli_source
     assert "bootstrap_codex_dispatch_authority_status" not in cli_source
+    assert "CEREMONY_INSTALLER" not in system_source
+
+
+def test_authority_export_loads_stored_approved_plan_and_binds_real_approval(monkeypatch, tmp_path):
+    from overseer.cli import export_codex_dispatch_authority_data_status
+    from overseer.store import SQLiteStore
+
+    store_path = tmp_path / "overseer.sqlite3"
+    plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", _spec(), "migrate"),
+                   approved=True, approved_by="sisko", approved_at="2026-08-18T21:30:00+00:00")
+    store = SQLiteStore(store_path)
+    try:
+        store.save_admin_change_plan(plan)
+    finally:
+        store.close()
+    monkeypatch.setattr(system, "_reject_api_context", lambda: None)
+    with system.external_activation_cli():
+        result = export_codex_dispatch_authority_data_status(store_path, plan.id)
+    approval = result["authorityRecord"]["approval"]
+    assert approval == {
+        "planId": plan.id, "approvedBy": "sisko", "approvedAt": plan.approved_at,
+        "kind": "codex_app_server_dispatch_activation", "riskLevel": "high",
+        "approvalLevel": "human", "ownerDomain": "sisko",
+        "target": "system/overseer-api.service",
+    }
+    assert "command" not in json.dumps(result, sort_keys=True).lower()
+    assert "sudo" not in json.dumps(result, sort_keys=True).lower()
+
+
+def test_authority_export_rejects_noncanonical_or_non_sisko_stored_approval(monkeypatch, tmp_path):
+    from overseer.cli import export_codex_dispatch_authority_data_status
+    from overseer.store import SQLiteStore
+
+    monkeypatch.setattr(system, "_reject_api_context", lambda: None)
+    for suffix, approved_by, approved_at in (
+        ("wrong-owner", "captain", "2026-08-18T21:30:00+00:00"),
+        ("noncanonical-time", "sisko", "2026-08-18T21:30:00Z"),
+    ):
+        store_path = tmp_path / f"{suffix}.sqlite3"
+        plan = replace(system.plan_codex_dispatch_activation(f"admin.{suffix}", _spec(), "migrate"),
+                       approved=True, approved_by=approved_by, approved_at=approved_at)
+        store = SQLiteStore(store_path)
+        try:
+            store.save_admin_change_plan(plan)
+        finally:
+            store.close()
+        with system.external_activation_cli(), pytest.raises(ValueError, match="approved"):
+            export_codex_dispatch_authority_data_status(store_path, plan.id)
 
 
 def test_complete_system_unit_is_root_service_and_ignores_user_unit_search_paths():
@@ -166,9 +207,7 @@ def test_swapped_coordinator_cannot_change_bootstrap_command_or_helper_digest(mo
     plan = system.plan_codex_dispatch_activation("admin.system-v2", _spec(), "migrate")
     metadata = dict(plan.adapter_metadata)
     artifact = dict(metadata["ceremonyArtifact"])
-    command = list(artifact["command"])
-    command[-2] = "0" * 64
-    artifact["command"] = command
+    artifact["helperSha256"] = "0" * 64
     metadata["ceremonyArtifact"] = artifact
     with pytest.raises(ValueError, match="canonical"):
         system.validate_codex_dispatch_activation_plan(replace(plan, adapter_metadata=metadata))
@@ -209,7 +248,9 @@ def test_root_helper_capability_rejects_extra_fields_and_authority_rejects_self_
     unsigned["systemUnitSha256"] = hashlib.sha256(str(unsigned["systemUnit"]).encode()).hexdigest()
     altered = {**unsigned, "planDigest": helper._digest(unsigned)}
     helper._validate_capability(altered, altered["planDigest"])
-    original_authority = system._authority_record(_spec(), "admin.system-v2")
+    original_plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", _spec(), "migrate"),
+                            approved=True, approved_by="sisko", approved_at="2026-08-18T21:30:00+00:00")
+    original_authority = system._approved_authority_record(original_plan, _spec())
 
     class Info:
         st_gid = 0
@@ -230,6 +271,89 @@ def test_root_helper_capability_rejects_extra_fields_and_authority_rejects_self_
         helper._load_root_authority(altered)
 
 
+def test_root_helper_rejects_historical_authority_after_active_pointer_supersession(monkeypatch, tmp_path):
+    import overseer_codex_dispatch_root_helper as helper
+
+    spec = _spec()
+    plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", spec, "migrate"),
+                   approved=True, approved_by="sisko", approved_at="2026-08-18T21:30:00+00:00")
+    capability = spec.capability(plan.id)
+    authority = system._approved_authority_record(plan, spec)
+    unsigned_pointer = {
+        "schemaVersion": "overseer.codex-dispatch-active-authority.v1",
+        "generation": 2, "planDigest": "f" * 64, "authorityDigest": "e" * 64,
+        "authorityPath": f"/etc/overseer/codex-dispatch-authorities/{'f' * 64}.json",
+        "supersedesPlanDigest": capability["planDigest"],
+    }
+    pointer = {**unsigned_pointer, "recordDigest": helper._digest(unsigned_pointer)}
+    root = tmp_path / "authorities"; root.mkdir()
+    monkeypatch.setattr(helper, "AUTHORITY_ROOT", str(root))
+    monkeypatch.setattr(helper, "ACTIVE_AUTHORITY_PATH", str(root / "active.json"))
+    authority["rootAuthorityPath"] = str(root / f"{capability['planDigest']}.json")
+    authority["activeAuthorityPath"] = helper.ACTIVE_AUTHORITY_PATH
+    authority["authorityDigest"] = helper._digest(
+        {key: authority[key] for key in authority if key != "authorityDigest"}
+    )
+    monkeypatch.setattr(helper, "_open_existing_authority_directory",
+                        lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+
+    class Info:
+        st_gid = 0
+
+    def stable(path, **_kwargs):
+        if path == helper.HELPER_PATH:
+            return b"h" * 123, Info()
+        if path == helper.ACTIVE_AUTHORITY_PATH:
+            return helper._canonical(pointer) + b"\n", Info()
+        return helper._canonical(authority) + b"\n", Info()
+
+    monkeypatch.setattr(helper, "_stable_file", stable)
+    with pytest.raises(ValueError, match="currently active"):
+        helper._load_root_authority(capability)
+
+
+def test_root_helper_rejects_active_pointer_that_supersedes_itself(monkeypatch, tmp_path):
+    import overseer_codex_dispatch_root_helper as helper
+
+    spec = _spec()
+    plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", spec, "migrate"),
+                   approved=True, approved_by="sisko", approved_at="2026-08-18T21:30:00+00:00")
+    capability = spec.capability(plan.id)
+    authority = system._approved_authority_record(plan, spec)
+    root = tmp_path / "authorities"; root.mkdir()
+    monkeypatch.setattr(helper, "AUTHORITY_ROOT", str(root))
+    monkeypatch.setattr(helper, "ACTIVE_AUTHORITY_PATH", str(root / "active.json"))
+    authority["rootAuthorityPath"] = str(root / f"{capability['planDigest']}.json")
+    authority["activeAuthorityPath"] = helper.ACTIVE_AUTHORITY_PATH
+    authority["authorityDigest"] = helper._digest(
+        {key: authority[key] for key in authority if key != "authorityDigest"}
+    )
+    unsigned_pointer = {
+        "schemaVersion": "overseer.codex-dispatch-active-authority.v1",
+        "generation": 2, "planDigest": capability["planDigest"],
+        "authorityDigest": authority["authorityDigest"],
+        "authorityPath": authority["rootAuthorityPath"],
+        "supersedesPlanDigest": capability["planDigest"],
+    }
+    pointer = {**unsigned_pointer, "recordDigest": helper._digest(unsigned_pointer)}
+    monkeypatch.setattr(helper, "_open_existing_authority_directory",
+                        lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+
+    class Info:
+        st_gid = 0
+
+    def stable(path, **_kwargs):
+        if path == helper.HELPER_PATH:
+            return b"h" * 123, Info()
+        if path == helper.ACTIVE_AUTHORITY_PATH:
+            return helper._canonical(pointer) + b"\n", Info()
+        return helper._canonical(authority) + b"\n", Info()
+
+    monkeypatch.setattr(helper, "_stable_file", stable)
+    with pytest.raises(ValueError, match="currently active"):
+        helper._load_root_authority(capability)
+
+
 def test_per_plan_authority_paths_rotate_without_overwriting_prior_records():
     first = system.plan_codex_dispatch_activation("admin.system-v2-a", _spec(), "migrate")
     second = system.plan_codex_dispatch_activation("admin.system-v2-b", _spec(), "migrate")
@@ -238,8 +362,7 @@ def test_per_plan_authority_paths_rotate_without_overwriting_prior_records():
     assert first_artifact["rootAuthorityPath"] != second_artifact["rootAuthorityPath"]
     assert first_artifact["rootAuthorityPath"].endswith(f"/{first_artifact['planDigest']}.json")
     assert second_artifact["rootAuthorityPath"].endswith(f"/{second_artifact['planDigest']}.json")
-    assert first_artifact["command"][-3] == first_artifact["planDigest"]
-    assert second_artifact["command"][-3] == second_artifact["planDigest"]
+    assert first_artifact["activeAuthorityPath"] == second_artifact["activeAuthorityPath"]
 
 
 def test_authority_directory_rejects_symlink_before_record_read(tmp_path):

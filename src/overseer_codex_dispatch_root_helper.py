@@ -31,6 +31,7 @@ from pathlib import Path
 SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 HELPER_PATH = "/usr/local/libexec/overseer-codex-dispatch-activation"
 AUTHORITY_ROOT = "/etc/overseer/codex-dispatch-authorities"
+ACTIVE_AUTHORITY_PATH = f"{AUTHORITY_ROOT}/active.json"
 SYSTEM_UNIT = "/etc/systemd/system/overseer-api.service"
 SYSTEM_ENABLE_LINK = "/etc/systemd/system/multi-user.target.wants/overseer-api.service"
 SYSTEM_CGROUP_PROCS = "/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs"
@@ -957,8 +958,8 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     keys = {
         "schemaVersion", "planDigest", "manifest", "manifestDigest", "releaseRoot",
         "systemUnit", "systemUnitSha256", "bootstrapHelperSha256", "rootHelperPath",
-        "bootstrapHelperGitBlob", "bootstrapHelperSize", "ceremonyInlineSha256",
-        "rootAuthorityDirectory", "approvalRecordId", "approvalRecordDigest", "rootPythonIdentity",
+        "bootstrapHelperGitBlob", "bootstrapHelperSize", "rootAuthorityDirectory",
+        "activeAuthorityPath", "planBinding", "rootPythonIdentity",
         "oldUserResources", "oldSystemUnit", "priorSystemServiceState",
         "oldApiBinding", "managerBinding", "journalActionId", "codexDaemon", "psychloPeerSecret",
         "rollback", "receiptStore",
@@ -973,6 +974,14 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
         raise ValueError("activation helper path is invalid")
     if value["rootAuthorityDirectory"] != AUTHORITY_ROOT:
         raise ValueError("activation authority directory is invalid")
+    if value["activeAuthorityPath"] != ACTIVE_AUTHORITY_PATH:
+        raise ValueError("activation active-authority path is invalid")
+    expected_plan_binding = {"planId": value.get("planBinding", {}).get("planId") if isinstance(value.get("planBinding"), dict) else None,
+                             "kind": "codex_app_server_dispatch_activation", "riskLevel": "high",
+                             "approvalLevel": "human", "ownerDomain": "sisko",
+                             "target": "system/overseer-api.service"}
+    if value.get("planBinding") != expected_plan_binding or not expected_plan_binding["planId"]:
+        raise ValueError("activation plan binding is invalid")
     unit = value["systemUnit"]
     if not isinstance(unit, str) or hashlib.sha256(unit.encode()).hexdigest() != value["systemUnitSha256"]:
         raise ValueError("system unit binding is invalid")
@@ -1021,35 +1030,72 @@ def _load_root_authority(capability: dict[str, object]) -> dict[str, object]:
     )
     if (helper_info.st_gid != 0 or len(helper_content) != capability["bootstrapHelperSize"]):
         raise ValueError("installed root dispatch helper is not the approved immutable helper")
-    unsigned = {
-        "schemaVersion": "overseer.codex-dispatch-root-authority.v1",
-        "planDigest": capability["planDigest"],
-        "helperGitBlob": capability["bootstrapHelperGitBlob"],
-        "helperSha256": capability["bootstrapHelperSha256"],
-        "helperSize": capability["bootstrapHelperSize"],
-        "rootHelperPath": HELPER_PATH,
-        "rootAuthorityPath": f"{AUTHORITY_ROOT}/{capability['planDigest']}.json",
-        "ceremonyInlineSha256": capability["ceremonyInlineSha256"],
-        "systemUnitSha256": capability["systemUnitSha256"],
-        "releaseManifestDigest": capability["manifestDigest"],
-        "approvalRecordId": capability["approvalRecordId"],
-        "approvalRecordDigest": capability["approvalRecordDigest"],
-    }
-    expected = {**unsigned, "authorityDigest": _digest(unsigned)}
     authority_fd = _open_existing_authority_directory(AUTHORITY_ROOT)
     try:
         authority_path = f"{AUTHORITY_ROOT}/{capability['planDigest']}.json"
         content, info = _stable_file(authority_path, uid=0, mode=0o400, digest=None)
+        active_content, active_info = _stable_file(ACTIVE_AUTHORITY_PATH, uid=0, mode=0o400, digest=None)
         after = os.fstat(authority_fd)
         lexical = os.lstat(AUTHORITY_ROOT)
         if ((after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid)
                 != (lexical.st_dev, lexical.st_ino, lexical.st_mode, lexical.st_uid, lexical.st_gid)):
             raise ValueError("root authority directory changed during record read")
-        if info.st_gid != 0 or content != _canonical(expected) + b"\n":
+        if info.st_gid != 0 or active_info.st_gid != 0:
+            raise ValueError("root dispatch authority ownership is invalid")
+        record = json.loads(content)
+        record_keys = {"schemaVersion", "planDigest", "helperGitBlob", "helperSha256", "helperSize",
+                       "rootHelperPath", "rootAuthorityPath", "activeAuthorityPath",
+                       "systemUnitSha256", "releaseManifestDigest", "approval", "approvalDigest",
+                       "authorityDigest"}
+        approval_keys = {"planId", "approvedBy", "approvedAt", "kind", "riskLevel",
+                         "approvalLevel", "ownerDomain", "target"}
+        if (not isinstance(record, dict) or set(record) != record_keys
+                or content != _canonical(record) + b"\n"):
+            raise ValueError("root dispatch authority record schema is invalid")
+        unsigned = {key: record[key] for key in record if key != "authorityDigest"}
+        approval = record["approval"]
+        plan_binding = capability["planBinding"]
+        try:
+            approved_at = datetime.fromisoformat(str(approval.get("approvedAt")))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("root dispatch authority approval timestamp is invalid") from None
+        if (not isinstance(approval, dict) or set(approval) != approval_keys
+                or approval["approvedBy"] != "sisko"
+                or approved_at.tzinfo is None or approved_at.utcoffset() != UTC.utcoffset(approved_at)
+                or approved_at.isoformat() != approval["approvedAt"]
+                or {key: approval[key] for key in ("planId", "kind", "riskLevel", "approvalLevel",
+                                                    "ownerDomain", "target")} != plan_binding
+                or record["approvalDigest"] != _digest(approval)
+                or record["planDigest"] != capability["planDigest"]
+                or record["helperGitBlob"] != capability["bootstrapHelperGitBlob"]
+                or record["helperSha256"] != capability["bootstrapHelperSha256"]
+                or record["helperSize"] != capability["bootstrapHelperSize"]
+                or record["rootHelperPath"] != HELPER_PATH
+                or record["rootAuthorityPath"] != authority_path
+                or record["activeAuthorityPath"] != ACTIVE_AUTHORITY_PATH
+                or record["systemUnitSha256"] != capability["systemUnitSha256"]
+                or record["releaseManifestDigest"] != capability["manifestDigest"]
+                or record["authorityDigest"] != _digest(unsigned)):
             raise ValueError("root dispatch authority does not exactly authorize this capability")
+        active = json.loads(active_content)
+        active_keys = {"schemaVersion", "generation", "planDigest", "authorityDigest",
+                       "authorityPath", "supersedesPlanDigest", "recordDigest"}
+        if (not isinstance(active, dict) or set(active) != active_keys
+                or active_content != _canonical(active) + b"\n"
+                or active["schemaVersion"] != "overseer.codex-dispatch-active-authority.v1"
+                or not isinstance(active["generation"], int) or active["generation"] < 1
+                or active["supersedesPlanDigest"] is not None
+                   and (not isinstance(active["supersedesPlanDigest"], str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", active["supersedesPlanDigest"])
+                        or active["supersedesPlanDigest"] == active["planDigest"])
+                or active["recordDigest"] != _digest({key: active[key] for key in active if key != "recordDigest"})
+                or active["planDigest"] != capability["planDigest"]
+                or active["authorityDigest"] != record["authorityDigest"]
+                or active["authorityPath"] != authority_path):
+            raise ValueError("root dispatch authority is not the currently active authority")
     finally:
         os.close(authority_fd)
-    return expected
+    return record
 
 
 def _validate_python_invocation(capability: dict[str, object], action: str, digest: str) -> None:

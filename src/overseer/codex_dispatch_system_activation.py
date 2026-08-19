@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import ctypes
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -33,6 +33,7 @@ SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 ROOT_HELPER_SOURCE = "src/overseer_codex_dispatch_root_helper.py"
 ROOT_HELPER_PATH = Path("/usr/local/libexec/overseer-codex-dispatch-activation")
 ROOT_AUTHORITY_ROOT = Path("/etc/overseer/codex-dispatch-authorities")
+ROOT_ACTIVE_AUTHORITY_PATH = ROOT_AUTHORITY_ROOT / "active.json"
 SYSTEM_UNIT_PATH = Path("/etc/systemd/system/overseer-api.service")
 SYSTEM_ENABLE_LINK = Path("/etc/systemd/system/multi-user.target.wants/overseer-api.service")
 SYSTEM_CGROUP_PROCS = Path("/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs")
@@ -45,73 +46,39 @@ CODEX_SETTINGS = Path("/home/god/.codex/app-server-daemon/settings.json")
 PSYCHLO_SECRET_PATH = Path("/home/god/.config/psychlo/overseer-peer-secret")
 _EXTERNAL = ContextVar("overseer_codex_system_activation_external", default=False)
 
-CEREMONY_INSTALLER = r'''import ctypes,hashlib,json,os,stat,struct,sys
-plan_digest,digest,authority_digest=sys.argv[1:];target="/usr/local/libexec/overseer-codex-dispatch-activation";assert all(len(x)==64 for x in (plan_digest,digest,authority_digest))
-def exact(n):
- b=b""
- while len(b)<n:
-  x=sys.stdin.buffer.read(n-len(b))
-  if not x: raise RuntimeError("truncated helper stream")
-  b+=x
- return b
-size=struct.unpack(">Q",exact(8))[0];data=exact(size);asize=struct.unpack(">Q",exact(8))[0];authority=exact(asize);assert not sys.stdin.buffer.read(1) and hashlib.sha256(data).hexdigest()==digest
-record=json.loads(authority);unsigned=dict(record);record_digest=unsigned.pop("authorityDigest");assert authority==json.dumps(record,sort_keys=True,separators=(",",":")).encode()+b"\n" and hashlib.sha256(json.dumps(unsigned,sort_keys=True,separators=(",",":")).encode()).hexdigest()==authority_digest==record_digest and record["planDigest"]==plan_digest and record["helperSha256"]==digest and record["rootHelperPath"]==target and record["rootAuthorityPath"]=="/etc/overseer/codex-dispatch-authorities/"+plan_digest+".json"
-root=os.lstat("/usr/local"); rootid=(root.st_dev,root.st_ino,root.st_uid,root.st_gid,stat.S_IMODE(root.st_mode)); assert stat.S_ISDIR(root.st_mode) and root.st_uid==0 and root.st_gid==0 and not stat.S_IMODE(root.st_mode)&0o022
-rfd=os.open("/usr/local",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW)
-try: os.mkdir("libexec",0o755,dir_fd=rfd)
-except FileExistsError: pass
-lfd=os.open("libexec",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=rfd); ls=os.fstat(lfd); assert ls.st_uid==0 and ls.st_gid==0 and not stat.S_IMODE(ls.st_mode)&0o022
-name="overseer-codex-dispatch-activation"
-try:
- fd=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=lfd); existing=b""
- while True:
-  x=os.read(fd,1048576)
-  if not x: break
-  existing+=x
- s=os.fstat(fd);os.close(fd);assert existing==data and s.st_uid==0 and s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o444
-except FileNotFoundError:
- tmp="."+name+"."+digest+".new";fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o444,dir_fd=lfd);view=memoryview(data)
- while view:
-  n=os.write(fd,view);assert n>0;view=view[n:]
- os.fchmod(fd,0o444);os.fsync(fd);s=os.fstat(fd);assert s.st_uid==0 and s.st_gid==0 and s.st_nlink==1
- os.close(fd);libc=ctypes.CDLL(None,use_errno=True)
- if libc.renameat2(lfd,tmp.encode(),lfd,name.encode(),1)!=0: raise OSError(ctypes.get_errno(),"helper no-replace install failed")
- os.fsync(lfd)
-after=os.lstat("/usr/local");assert rootid==(after.st_dev,after.st_ino,after.st_uid,after.st_gid,stat.S_IMODE(after.st_mode));os.close(lfd);os.close(rfd)
-efd=os.open("/etc",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW)
-try: os.mkdir("overseer",0o755,dir_fd=efd)
-except FileExistsError: pass
-ofd=os.open("overseer",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=efd);oi=os.fstat(ofd);assert oi.st_uid==0 and oi.st_gid==0 and not stat.S_IMODE(oi.st_mode)&0o022
-try: os.mkdir("codex-dispatch-authorities",0o755,dir_fd=ofd)
-except FileExistsError: pass
-afdroot=os.open("codex-dispatch-authorities",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=ofd);os.close(ofd);ofd=afdroot;oi=os.fstat(ofd);assert oi.st_uid==0 and oi.st_gid==0 and not stat.S_IMODE(oi.st_mode)&0o022
-name=plan_digest+".json"
-try:
- afd=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=ofd);existing=os.read(afd,1048576);ai=os.fstat(afd);os.close(afd);assert existing==authority and ai.st_uid==0 and ai.st_gid==0 and ai.st_nlink==1 and stat.S_IMODE(ai.st_mode)==0o400
-except FileNotFoundError:
- tmp="."+name+"."+authority_digest+".new";afd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o400,dir_fd=ofd);assert os.write(afd,authority)==len(authority);os.fchmod(afd,0o400);os.fsync(afd);os.close(afd);libc=ctypes.CDLL(None,use_errno=True)
- if libc.renameat2(ofd,tmp.encode(),ofd,name.encode(),1)!=0: raise OSError(ctypes.get_errno(),"authority no-replace install failed")
- os.fsync(ofd)
-os.close(ofd);os.close(efd);print(json.dumps({"status":"installed","planDigest":plan_digest,"helperDigest":digest,"authorityDigest":authority_digest},sort_keys=True,separators=(",",":")))'''
-
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _authority_record(spec: "SystemActivationSpec", plan_id: str) -> dict[str, object]:
-    approval = {"recordId": f"admin-approval:{plan_id}", "planId": plan_id,
-                "approvalLevel": "human", "ownerDomain": "sisko"}
+def _approved_authority_record(plan: AdminChangePlan, spec: "SystemActivationSpec") -> dict[str, object]:
+    if (not plan.approved or plan.approved_by != "sisko" or plan.approved_at is None
+            or plan.canceled or plan.archived or plan.kind is not AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
+            or plan.risk_level is not RiskLevel.HIGH or plan.approval_level is not ApprovalLevel.HUMAN
+            or plan.owner_domain is not OwnerDomain.SISKO or plan.target != "system/overseer-api.service"):
+        raise ValueError("exact stored HUMAN/SISKO approved plan is required for authority export")
+    try:
+        approved_at = datetime.fromisoformat(plan.approved_at)
+    except ValueError:
+        raise ValueError("stored approved_at is not canonical") from None
+    if (approved_at.tzinfo is None or approved_at.utcoffset() != timezone.utc.utcoffset(approved_at)
+            or approved_at.isoformat() != plan.approved_at):
+        raise ValueError("stored approved_at is not canonical UTC")
+    approval = {"planId": plan.id, "approvedBy": plan.approved_by, "approvedAt": plan.approved_at,
+                "kind": plan.kind.value, "riskLevel": plan.risk_level.value,
+                "approvalLevel": plan.approval_level.value, "ownerDomain": plan.owner_domain.value,
+                "target": plan.target}
+    plan_digest = spec.capability(plan.id)["planDigest"]
     unsigned = {
         "schemaVersion": "overseer.codex-dispatch-root-authority.v1",
-        "planDigest": spec.capability(plan_id)["planDigest"],
+        "planDigest": plan_digest,
         "helperGitBlob": spec.helper_blob["blob"], "helperSha256": spec.helper_blob["sha256"],
         "helperSize": spec.helper_blob["size"], "rootHelperPath": str(ROOT_HELPER_PATH),
-        "rootAuthorityPath": str(ROOT_AUTHORITY_ROOT / f"{spec.capability(plan_id)['planDigest']}.json"),
-        "ceremonyInlineSha256": _sha256(CEREMONY_INSTALLER.encode()),
+        "rootAuthorityPath": str(ROOT_AUTHORITY_ROOT / f"{plan_digest}.json"),
+        "activeAuthorityPath": str(ROOT_ACTIVE_AUTHORITY_PATH),
         "systemUnitSha256": _sha256(spec.system_unit.encode()),
         "releaseManifestDigest": spec.manifest.digest,
-        "approvalRecordId": approval["recordId"], "approvalRecordDigest": _digest(approval),
+        "approval": approval, "approvalDigest": _digest(approval),
     }
     return {**unsigned, "authorityDigest": _digest(unsigned)}
 
@@ -287,11 +254,13 @@ class SystemActivationSpec:
             "systemUnit": self.system_unit, "systemUnitSha256": _sha256(self.system_unit.encode()),
             "bootstrapHelperSha256": self.helper_blob["sha256"], "rootHelperPath": str(ROOT_HELPER_PATH),
             "bootstrapHelperGitBlob": self.helper_blob["blob"], "bootstrapHelperSize": self.helper_blob["size"],
-            "ceremonyInlineSha256": _sha256(CEREMONY_INSTALLER.encode()),
             "rootAuthorityDirectory": str(ROOT_AUTHORITY_ROOT),
-            "approvalRecordId": f"admin-approval:{plan_id}",
-            "approvalRecordDigest": _digest({"recordId": f"admin-approval:{plan_id}", "planId": plan_id,
-                                              "approvalLevel": "human", "ownerDomain": "sisko"}),
+            "activeAuthorityPath": str(ROOT_ACTIVE_AUTHORITY_PATH),
+            "planBinding": {"planId": plan_id,
+                            "kind": AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value,
+                            "riskLevel": RiskLevel.HIGH.value, "approvalLevel": ApprovalLevel.HUMAN.value,
+                            "ownerDomain": OwnerDomain.SISKO.value,
+                            "target": "system/overseer-api.service"},
             "codexDaemon": dict(self.codex_daemon),
             "psychloPeerSecret": dict(self.psychlo_peer_secret),
             "rootPythonIdentity": dict(self.manifest.root_python),
@@ -338,13 +307,6 @@ def build_codex_dispatch_activation_spec() -> SystemActivationSpec:
                                 _codex_daemon_spec(), _psychlo_secret_spec())
 
 
-def _ceremony_command(spec: SystemActivationSpec, plan_id: str) -> tuple[str, ...]:
-    authority = _authority_record(spec, plan_id)
-    return ("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c",
-            CEREMONY_INSTALLER, str(authority["planDigest"]), str(spec.helper_blob["sha256"]),
-            str(authority["authorityDigest"]))
-
-
 def _root_helper_command(action: str, digest: str) -> tuple[str, ...]:
     return ("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
             str(ROOT_HELPER_PATH), action, digest)
@@ -355,21 +317,21 @@ def plan_codex_dispatch_activation(plan_id: str, spec: SystemActivationSpec, rea
     capability = spec.capability(plan_id)
     digest = str(capability["planDigest"])
     marker = lambda action: ("__overseer_codex_dispatch_system_v1", action, plan_id, digest)
-    authority = _authority_record(spec, plan_id)
     ceremony_artifact = {
+        "schemaVersion": "overseer.codex-dispatch-authority-ceremony-requirements.v1",
         "planDigest": digest, "helperGitBlob": spec.helper_blob["blob"],
         "helperSha256": spec.helper_blob["sha256"], "helperSize": spec.helper_blob["size"],
         "rootHelperPath": str(ROOT_HELPER_PATH),
         "rootAuthorityPath": str(ROOT_AUTHORITY_ROOT / f"{digest}.json"),
-        "ceremonyInlineCode": CEREMONY_INSTALLER,
-        "ceremonyInlineSha256": _sha256(CEREMONY_INSTALLER.encode()),
-        "authorityRecord": authority, "authorityDigest": authority["authorityDigest"],
-        "command": list(_ceremony_command(spec, plan_id)),
+        "activeAuthorityPath": str(ROOT_ACTIVE_AUTHORITY_PATH),
+        "instructions": [
+            "after exact plan approval, export the closed authority data from the isolated external CLI",
+            "an independent human-authorized root ceremony installs the reviewed helper and per-plan authority without replacement",
+            "the same root ceremony atomically rotates active.json; product code never installs or rotates authority",
+        ],
     }
     metadata = {"schemaVersion": SCHEMA, "spec": spec.to_json(), "capability": capability,
                 "ceremonyArtifact": ceremony_artifact,
-                "activateCommand": list(_root_helper_command("activate", digest)),
-                "rollbackCommand": list(_root_helper_command("rollback", digest)),
                 "externalCliOnly": True, "apiExecutionAllowed": False}
     return AdminChangePlan(
         id=plan_id, kind=AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION,
@@ -394,7 +356,7 @@ def validate_codex_dispatch_activation_plan(plan: AdminChangePlan) -> SystemActi
     metadata = plan.adapter_metadata
     if (AdminChangeKind(plan.kind) != AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
             or not isinstance(metadata, dict) or set(metadata) != {"schemaVersion", "spec", "capability",
-                                                               "ceremonyArtifact", "activateCommand", "rollbackCommand",
+                                                               "ceremonyArtifact",
                                                                "externalCliOnly", "apiExecutionAllowed"}):
         raise ValueError("system activation plan metadata is invalid")
     spec = SystemActivationSpec.from_json(metadata["spec"])
@@ -467,6 +429,7 @@ def _authority_files_present(spec: SystemActivationSpec, plan_id: str) -> bool:
         authority_root = ROOT_AUTHORITY_ROOT.lstat()
         helper_content, helper_info = _stable_read(ROOT_HELPER_PATH)
         info = authority_path.lstat()
+        active_info = ROOT_ACTIVE_AUTHORITY_PATH.lstat()
     except FileNotFoundError:
         return False
     if (not stat.S_ISDIR(authority_root.st_mode) or ROOT_AUTHORITY_ROOT.is_symlink()
@@ -481,7 +444,35 @@ def _authority_files_present(spec: SystemActivationSpec, plan_id: str) -> bool:
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
             or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o400):
         raise ValueError("root dispatch authority record is unsafe")
+    if (not stat.S_ISREG(active_info.st_mode) or active_info.st_uid != 0 or active_info.st_gid != 0
+            or active_info.st_nlink != 1 or stat.S_IMODE(active_info.st_mode) != 0o400):
+        raise ValueError("root active-authority ledger is unsafe")
     return True
+
+
+def _authority_ceremony_data_for_loaded_plan(plan: AdminChangePlan) -> dict[str, object]:
+    require_external_activation_context()
+    spec = validate_codex_dispatch_activation_plan(plan)
+    record = _approved_authority_record(plan, spec)
+    return {
+        "schemaVersion": "overseer.codex-dispatch-authority-export.v1",
+        "planId": plan.id, "planDigest": record["planDigest"],
+        "rootHelper": {"path": str(ROOT_HELPER_PATH), "gitBlob": spec.helper_blob["blob"],
+                       "sha256": spec.helper_blob["sha256"], "size": spec.helper_blob["size"]},
+        "authorityPath": record["rootAuthorityPath"], "authorityRecord": record,
+        "authorityDigest": record["authorityDigest"],
+        "activeAuthorityPath": str(ROOT_ACTIVE_AUTHORITY_PATH),
+        "activeAuthoritySchema": {
+            "schemaVersion": "overseer.codex-dispatch-active-authority.v1",
+            "requiredFields": ["schemaVersion", "generation", "planDigest", "authorityDigest",
+                               "authorityPath", "supersedesPlanDigest", "recordDigest"],
+        },
+        "instructions": [
+            "data only: no privileged action is executed by Overseer",
+            "independent root ceremony installs the immutable helper and authority file with no replacement",
+            "independent root ceremony advances active.json with a monotonic generation and prior active plan digest",
+        ],
+    }
 
 
 def _run_stream(command: Sequence[str], frames: Sequence[bytes], expected: Mapping[str, object]) -> None:

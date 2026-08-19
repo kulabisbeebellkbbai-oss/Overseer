@@ -465,8 +465,8 @@ def test_rollback_restores_prior_enabled_active_state_without_repeated_disable(m
 
 @pytest.mark.parametrize(
     ("crash_window", "expected_phase"),
-    [("new-fsynced", "intent-system-unit"),
-     ("prior-replaced", "intent-system-unit"),
+    [("new-fsynced", "release-installed"),
+     ("prior-replaced", "release-installed"),
      ("active-replaced", "release-installed")],
 )
 def test_journal_recovers_newest_committed_generation_at_every_replace_window(
@@ -516,6 +516,60 @@ def test_journal_recovers_newest_committed_generation_at_every_replace_window(
     if crash_window == "active-replaced":
         Path(helper._journal_path("d" * 64)).write_bytes(b"corrupt\n")
         assert helper._read_journal("d" * 64)["phase"] == "intent-system-unit"
+
+
+@pytest.mark.parametrize("crash_window", ["new-fsynced", "prior-replaced"])
+def test_journal_adopts_pending_generation_and_next_write_survives_restart(
+        monkeypatch, tmp_path, crash_window):
+    import overseer_codex_dispatch_root_helper as helper
+
+    monkeypatch.setattr(helper, "STATE_ROOT", str(tmp_path))
+    original_stable = helper._stable_file
+    monkeypatch.setattr(
+        helper, "_stable_file",
+        lambda path, *, uid, mode, digest: (
+            lambda result: (result[0], SimpleNamespace(st_gid=0))
+        )(original_stable(path, uid=os.geteuid(), mode=mode, digest=digest)),
+    )
+
+    def user_directory(path, mode):
+        os.makedirs(path, mode=mode, exist_ok=True)
+        return os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+    monkeypatch.setattr(helper, "_root_directory", user_directory)
+    journal = {
+        "schemaVersion": helper.SCHEMA, "planDigest": "e" * 64,
+        "phase": "intent-system-unit", "journalActionId": "action",
+        "userResourceQuarantines": [], "oldSystemUnitQuarantine": "",
+        "systemUnitIdentity": None,
+        "priorSystemServiceState": {"present": False, "enabled": False, "active": False},
+        "priorDaemonState": None, "daemonOwnership": "", "daemonEvidence": None,
+        "lastError": "",
+    }
+    helper._write_journal(journal)
+    journal["phase"] = "release-installed"
+
+    class Crash(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        helper, "_JOURNAL_CRASH_HOOK",
+        lambda phase: (_ for _ in ()).throw(Crash()) if phase == crash_window else None,
+    )
+    with pytest.raises(Crash):
+        helper._write_journal(journal)
+
+    # A fresh helper process must adopt the fully fsynced pending generation,
+    # then be able to publish the following generation without stale-name poison.
+    assert helper._read_journal("e" * 64)["phase"] == "release-installed"
+    monkeypatch.setattr(helper, "_JOURNAL_CRASH_HOOK", lambda _phase: None)
+    recovered = helper._read_journal("e" * 64)
+    recovered["phase"] = "daemon-ready"
+    helper._write_journal(recovered)
+    final = helper._read_journal("e" * 64)
+    assert final["phase"] == "daemon-ready"
+    assert final["generation"] == 3
+    assert not list(tmp_path.glob("*.pending"))
 
 
 def test_codex_daemon_start_intent_is_journaled_and_remote_control_is_disabled(monkeypatch):
@@ -587,3 +641,78 @@ def test_prior_root_service_stop_crash_retry_does_not_repeat_stop(monkeypatch):
     monkeypatch.setattr(helper, "_write_journal", lambda value: calls.append(value["phase"]))
     helper._stop_prior_system_service(capability, journal)
     assert calls == ["prior-system-stopped"]
+
+
+@pytest.mark.parametrize("phase", ["prior-system-stopped", "system-unit-installed",
+                                    "system-service-started", "verified"])
+def test_prior_root_service_quiesce_is_not_repeated_after_journaled_boundary(monkeypatch, phase):
+    import overseer_codex_dispatch_root_helper as helper
+
+    capability = {"oldSystemUnit": {"active": True, "activeProcess": {"pid": 7}}}
+    journal = {"phase": phase}
+    monkeypatch.setattr(helper, "_system_service_active", lambda: pytest.fail("reprobed prior service"))
+    monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: pytest.fail("resignalled prior PID"))
+    monkeypatch.setattr(helper, "_run_systemctl", lambda *_args: pytest.fail("repeated prior stop"))
+    monkeypatch.setattr(helper, "_write_journal", lambda _value: pytest.fail("rewrote stop phase"))
+
+    helper._stop_prior_system_service(capability, journal)
+
+
+@pytest.mark.parametrize("phase", ["system-service-started", "verified"])
+def test_activation_retry_after_system_service_start_resumes_attestation_only(monkeypatch, phase):
+    import overseer_codex_dispatch_root_helper as helper
+
+    writes = []
+    evidence = {"peerPid": 19, "peerStartTicks": 44}
+    journal = {
+        "phase": phase, "journalActionId": "action", "systemUnitIdentity": [8, 9],
+        "daemonEvidence": evidence,
+    }
+    capability = {
+        "planDigest": "f" * 64, "journalActionId": "action",
+        "codexDaemon": {"binary": {}}, "systemUnitSha256": "a" * 64,
+    }
+    monkeypatch.setattr(helper.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_validate_codex_binary", lambda _binding: None)
+    monkeypatch.setattr(helper, "_codex_daemon_evidence", lambda: evidence)
+    monkeypatch.setattr(helper, "_install_release", lambda _capability, _stream: None)
+    monkeypatch.setattr(helper, "_verify_system_unit", lambda _capability, identity: identity == (8, 9) or pytest.fail("wrong unit"))
+    monkeypatch.setattr(helper, "_verify_system_api", lambda _capability: {"pid": 23})
+    monkeypatch.setattr(helper, "_write_journal", lambda value: writes.append(value["phase"]))
+    monkeypatch.setattr(helper, "_ensure_codex_daemon", lambda *_args: pytest.fail("restarted daemon stage"))
+    monkeypatch.setattr(helper, "_stop_prior_system_service", lambda *_args: pytest.fail("repeated prior stop"))
+    monkeypatch.setattr(helper, "_prepare_system_unit", lambda *_args: pytest.fail("reinstalled system unit"))
+    monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: pytest.fail("repeated process signal"))
+    monkeypatch.setattr(helper, "_run_systemctl", lambda *_args: pytest.fail("repeated service mutation"))
+
+    helper._activate(capability, object())
+
+    assert journal["phase"] == "verified"
+    assert writes == ([] if phase == "verified" else ["verified"])
+
+
+def test_daemon_rollback_attests_already_stopped_operation_daemon_without_second_stop(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    calls = []
+    journal = {
+        "daemonOwnership": "started-by-operation",
+        "daemonEvidence": {"peerPid": 17, "peerStartTicks": 99},
+        "priorDaemonState": None,
+    }
+    monkeypatch.setattr(helper.os.path, "lexists", lambda path: False if path == helper.CODEX_SOCKET else os.path.lexists(path))
+    monkeypatch.setattr(
+        helper, "_run_codex",
+        lambda *args: calls.append(args) or {
+            "cliVersion": "1", "daemonVersion": "1", "state": "stopped",
+            "remoteControlEnabled": False, "socketPath": helper.CODEX_SOCKET,
+        },
+    )
+    monkeypatch.setattr(helper, "_process_start_ticks", lambda _pid: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(helper, "_write_journal", lambda value: calls.append(("journal", value["daemonOwnership"])))
+
+    helper._restore_codex_daemon(journal)
+
+    assert ("app-server", "daemon", "stop") not in calls
+    assert calls == [("app-server", "daemon", "version"), ("journal", "stopped-by-rollback")]

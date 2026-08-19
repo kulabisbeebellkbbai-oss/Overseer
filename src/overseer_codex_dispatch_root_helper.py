@@ -401,7 +401,81 @@ def _journal_candidate(path: str, plan_digest: str) -> tuple[dict[str, object], 
     return _decode_journal(content, plan_digest), content
 
 
+def _pending_journal_names(plan_digest: str, parent_fd: int) -> list[str]:
+    prefix = f".{plan_digest}.journal.json."
+    suffix = ".pending"
+    names = os.listdir(parent_fd)
+    return sorted(
+        name for name in names
+        if name.startswith(prefix) and name.endswith(suffix)
+        and name[len(prefix):-len(suffix)].isdigit()
+    )
+
+
+def _quarantine_pending(parent_fd: int, name: str) -> None:
+    _rename_noreplace(parent_fd, name, parent_fd, f"{name}.conflict-inert")
+    os.fsync(parent_fd)
+
+
+def _recover_pending_journal(plan_digest: str) -> None:
+    parent_fd = _root_directory(STATE_ROOT, 0o700)
+    try:
+        pending_names = _pending_journal_names(plan_digest, parent_fd)
+        if not pending_names:
+            return
+        committed: list[tuple[dict[str, object], bytes]] = []
+        for path in (_journal_path(plan_digest), _journal_prior_path(plan_digest)):
+            try:
+                candidate = _journal_candidate(path, plan_digest)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if candidate is not None:
+                committed.append(candidate)
+        valid: list[tuple[str, dict[str, object], bytes]] = []
+        prefix = f".{plan_digest}.journal.json."
+        for name in pending_names:
+            try:
+                candidate = _journal_candidate(str(Path(STATE_ROOT) / name), plan_digest)
+                if candidate is None:
+                    continue
+                generation = int(name[len(prefix):-len(".pending")])
+                if candidate[0]["generation"] != generation:
+                    raise ValueError("pending journal generation does not match its name")
+            except (ValueError, json.JSONDecodeError):
+                _quarantine_pending(parent_fd, name)
+                continue
+            valid.append((name, candidate[0], candidate[1]))
+        if not valid:
+            return
+        newest_committed = max(committed, key=lambda item: int(item[0]["generation"]), default=None)
+        committed_generation = int(newest_committed[0]["generation"]) if newest_committed else 0
+        valid.sort(key=lambda item: int(item[1]["generation"]))
+        adoptable = [item for item in valid if int(item[1]["generation"]) > committed_generation]
+        if (len(adoptable) != 1
+                or int(adoptable[0][1]["generation"]) != committed_generation + 1):
+            for name, _record, _content in adoptable:
+                _quarantine_pending(parent_fd, name)
+            raise ValueError("pending journal generation conflicts with committed chain")
+        adopted_name, _adopted, _content = adoptable[0]
+        for name, record, _record_content in valid:
+            if name == adopted_name:
+                continue
+            if int(record["generation"]) <= committed_generation:
+                _quarantine_pending(parent_fd, name)
+        if newest_committed is not None:
+            _atomic_replace_journal(
+                parent_fd, Path(_journal_prior_path(plan_digest)).name,
+                newest_committed[1], int(adoptable[0][1]["generation"]),
+            )
+        os.replace(adopted_name, Path(_journal_path(plan_digest)).name,
+                   src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _journal_candidates(plan_digest: str) -> list[tuple[dict[str, object], bytes]]:
+    _recover_pending_journal(plan_digest)
     candidates = []
     errors = []
     for path in (_journal_path(plan_digest), _journal_prior_path(plan_digest)):
@@ -435,6 +509,24 @@ def _atomic_replace_journal(parent_fd: int, name: str, content: bytes, generatio
     os.fsync(parent_fd)
 
 
+def _atomic_create_journal(parent_fd: int, name: str, content: bytes, generation: int) -> None:
+    temporary = f".{name}.{os.getpid()}.{generation}.new"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                 0o600, dir_fd=parent_fd)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("journal write made no progress")
+            view = view[written:]
+        os.fchmod(fd, 0o600); os.fsync(fd)
+    finally:
+        os.close(fd)
+    _rename_noreplace(parent_fd, temporary, parent_fd, name)
+    os.fsync(parent_fd)
+
+
 def _write_journal(value: dict[str, object]) -> None:
     plan_digest = str(value["planDigest"])
     path = _journal_path(plan_digest); prior_path = _journal_prior_path(plan_digest)
@@ -446,8 +538,8 @@ def _write_journal(value: dict[str, object]) -> None:
     content = _canonical(record) + b"\n"
     parent_fd = _root_directory(str(Path(path).parent), 0o700)
     try:
-        _atomic_replace_journal(parent_fd, f".{Path(path).name}.{generation}.pending", content, generation)
         pending = f".{Path(path).name}.{generation}.pending"
+        _atomic_create_journal(parent_fd, pending, content, generation)
         _JOURNAL_CRASH_HOOK("new-fsynced")
         if candidates:
             newest = max(candidates, key=lambda item: int(item[0]["generation"]))
@@ -979,6 +1071,12 @@ def _pin_and_signal(binding: dict[str, object], signum: int | signal.Signals) ->
 
 
 def _stop_prior_system_service(capability: dict[str, object], journal: dict[str, object]) -> None:
+    completed_phases = {
+        "prior-system-stopped", "system-unit-installed", "user-service-quarantined",
+        "old-api-stopped", "system-service-started", "verified",
+    }
+    if journal.get("phase") in completed_phases or str(journal.get("phase", "")).startswith("rollback-"):
+        return
     old_system = capability["oldSystemUnit"]
     if old_system is None or not old_system["active"]:
         return
@@ -994,11 +1092,29 @@ def _stop_prior_system_service(capability: dict[str, object], journal: dict[str,
     journal["phase"] = "prior-system-stopped"; _write_journal(journal)
 
 
+def _attest_codex_daemon_stopped(journal: dict[str, object]) -> None:
+    if os.path.lexists(CODEX_SOCKET):
+        raise RuntimeError("operation-started Codex daemon socket remains")
+    version = _run_codex("app-server", "daemon", "version")
+    required = {"cliVersion", "daemonVersion", "state", "remoteControlEnabled", "socketPath"}
+    if (set(version) != required or version["state"] != "stopped"
+            or version["remoteControlEnabled"] is not False or version["socketPath"] != CODEX_SOCKET):
+        raise RuntimeError("operation-started Codex daemon is not attested stopped")
+    evidence = journal.get("daemonEvidence")
+    if isinstance(evidence, dict) and isinstance(evidence.get("peerPid"), int):
+        try:
+            start_ticks = _process_start_ticks(int(evidence["peerPid"]))
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if start_ticks == evidence.get("peerStartTicks"):
+            raise RuntimeError("operation-started Codex daemon process remains")
+
+
 def _restore_codex_daemon(journal: dict[str, object]) -> None:
     if journal.get("daemonOwnership") == "started-by-operation":
-        _run_codex("app-server", "daemon", "stop")
         if os.path.lexists(CODEX_SOCKET):
-            raise RuntimeError("operation-started Codex daemon did not stop")
+            _run_codex("app-server", "daemon", "stop")
+        _attest_codex_daemon_stopped(journal)
         journal["daemonOwnership"] = "stopped-by-rollback"; _write_journal(journal)
     prior = journal.get("priorDaemonState")
     if not isinstance(prior, dict):
@@ -1030,6 +1146,13 @@ def _restore_codex_daemon(journal: dict[str, object]) -> None:
             raise ValueError("prior Codex daemon settings were not restored exactly")
 
 
+def _attest_ready_codex_daemon(capability: dict[str, object], journal: dict[str, object]) -> None:
+    _validate_codex_binary(capability["codexDaemon"]["binary"])
+    evidence = _codex_daemon_evidence()
+    if evidence != journal.get("daemonEvidence"):
+        raise ValueError("journaled Codex daemon identity changed during activation retry")
+
+
 def _activate(capability: dict[str, object], stream) -> None:
     plan_digest = str(capability["planDigest"])
     if os.path.exists(_journal_path(plan_digest)):
@@ -1045,37 +1168,56 @@ def _activate(capability: dict[str, object], stream) -> None:
         journal["daemonOwnership"] = ""
         journal["daemonEvidence"] = None
         _write_journal(journal)
-    _ensure_codex_daemon(capability, journal)
+    forward_phases = (
+        "intent-system-unit", "intent-daemon", "daemon-ready", "release-installed",
+        "intent-stop-prior-system", "prior-system-stopped", "system-unit-installed",
+        "user-service-quarantined", "old-api-stopped", "system-service-started", "verified",
+    )
+    phase = str(journal["phase"])
+    if phase not in forward_phases:
+        raise ValueError("root activation journal is not resumable")
+    reached = lambda boundary: forward_phases.index(phase) >= forward_phases.index(boundary)
+    if reached("daemon-ready"):
+        _attest_ready_codex_daemon(capability, journal)
+    else:
+        _ensure_codex_daemon(capability, journal)
     _install_release(capability, stream)
-    journal["phase"] = "release-installed"
-    _write_journal(journal)
-    _stop_prior_system_service(capability, journal)
-    unit_identity = _prepare_system_unit(capability, journal)
-    journal["systemUnitIdentity"] = list(unit_identity)
-    journal["phase"] = "system-unit-installed"
-    _write_journal(journal)
-    _quarantine_user_resources(capability, journal)
-    journal["phase"] = "user-service-quarantined"
-    _write_journal(journal)
-    _pin_and_signal(dict(capability["managerBinding"]), signal.SIGHUP)
-    try:
-        _pin_and_signal(dict(capability["oldApiBinding"]), signal.SIGKILL)
-    except (FileNotFoundError, ProcessLookupError):
-        pass
-    _wait_no_user_api()
-    _require_port_free()
-    journal["phase"] = "old-api-stopped"
-    _write_journal(journal)
+    if not reached("release-installed"):
+        journal["phase"] = "release-installed"; _write_journal(journal)
+    if not reached("prior-system-stopped"):
+        _stop_prior_system_service(capability, journal)
+    if not reached("system-unit-installed"):
+        unit_identity = _prepare_system_unit(capability, journal)
+        journal["systemUnitIdentity"] = list(unit_identity)
+        journal["phase"] = "system-unit-installed"; _write_journal(journal)
+    else:
+        recorded = journal.get("systemUnitIdentity")
+        if not isinstance(recorded, list) or len(recorded) != 2:
+            raise ValueError("journaled system unit identity is invalid")
+        unit_identity = (int(recorded[0]), int(recorded[1]))
+        _verify_system_unit(capability, unit_identity)
+    if not reached("user-service-quarantined"):
+        _quarantine_user_resources(capability, journal)
+        journal["phase"] = "user-service-quarantined"; _write_journal(journal)
+    if not reached("old-api-stopped"):
+        _pin_and_signal(dict(capability["managerBinding"]), signal.SIGHUP)
+        try:
+            _pin_and_signal(dict(capability["oldApiBinding"]), signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        _wait_no_user_api()
+        _require_port_free()
+        journal["phase"] = "old-api-stopped"; _write_journal(journal)
     _verify_system_unit(capability, unit_identity)
-    _run_systemctl("daemon-reload")
-    _verify_system_unit(capability, unit_identity)
-    _run_systemctl("enable", "--now", "overseer-api.service")
-    journal["phase"] = "system-service-started"
-    _write_journal(journal)
+    if not reached("system-service-started"):
+        _run_systemctl("daemon-reload")
+        _verify_system_unit(capability, unit_identity)
+        _run_systemctl("enable", "--now", "overseer-api.service")
+        journal["phase"] = "system-service-started"; _write_journal(journal)
     _verify_system_unit(capability, unit_identity)
     _verify_system_api(capability)
-    journal["phase"] = "verified"
-    _write_journal(journal)
+    if not reached("verified"):
+        journal["phase"] = "verified"; _write_journal(journal)
 
 
 def _rollback(capability: dict[str, object]) -> None:

@@ -1010,7 +1010,7 @@ def _restore_codex_daemon(journal: dict[str, object]) -> None:
         if os.path.lexists(CODEX_SETTINGS):
             lexical = os.lstat(CODEX_SETTINGS)
             mode = stat.S_IMODE(lexical.st_mode)
-            if mode & 0o022:
+            if mode & 0o002:
                 raise ValueError("operation-created Codex daemon settings are unsafe")
             content, info = _stable_file(CODEX_SETTINGS, uid=1000, mode=mode, digest=None)
             if json.loads(content) != {"remoteControlEnabled": False}:

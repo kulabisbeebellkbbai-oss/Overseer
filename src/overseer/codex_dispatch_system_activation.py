@@ -184,7 +184,7 @@ def _codex_daemon_spec() -> Mapping[str, object]:
     prior_settings = None
     if CODEX_SETTINGS.exists():
         content, info = _stable_read(CODEX_SETTINGS)
-        if info.st_uid != 1000 or stat.S_IMODE(info.st_mode) & 0o022:
+        if info.st_uid != 1000 or info.st_gid != 1000 or stat.S_IMODE(info.st_mode) & 0o002:
             raise ValueError("Codex daemon settings are unsafe")
         settings = json.loads(content)
         if not isinstance(settings, dict) or set(settings) != {"remoteControlEnabled"}:

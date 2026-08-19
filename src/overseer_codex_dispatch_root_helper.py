@@ -9,10 +9,14 @@ helper independently validates that closed capability before any effect.
 from __future__ import annotations
 
 import ctypes
+from datetime import UTC, datetime
 import hashlib
+import hmac
 import json
 import os
+import re
 import select
+import secrets
 import signal
 import socket
 import stat
@@ -26,7 +30,7 @@ from pathlib import Path
 
 SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 HELPER_PATH = "/usr/local/libexec/overseer-codex-dispatch-activation"
-AUTHORITY_PATH = "/etc/overseer/codex-dispatch-authority.json"
+AUTHORITY_ROOT = "/etc/overseer/codex-dispatch-authorities"
 SYSTEM_UNIT = "/etc/systemd/system/overseer-api.service"
 SYSTEM_ENABLE_LINK = "/etc/systemd/system/multi-user.target.wants/overseer-api.service"
 SYSTEM_CGROUP_PROCS = "/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs"
@@ -35,6 +39,9 @@ SYSTEMCTL = "/usr/bin/systemctl"
 CODEX_BINARY = "/usr/local/bin/codex"
 CODEX_SOCKET = "/home/god/.codex/app-server-control/app-server-control.sock"
 CODEX_SETTINGS = "/home/god/.codex/app-server-daemon/settings.json"
+PSYCHLO_SECRET = "/home/god/.config/psychlo/overseer-peer-secret"
+PSYCHLO_ENDPOINT = "http://127.0.0.1:8798/internal/overseer/readiness-probe"
+PEER_VERSION = b"psychlo-overseer-v1\0"
 SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
 PROC_ROOT = "/proc"
 
@@ -107,6 +114,21 @@ def _root_directory(path: str, mode: int) -> int:
             or info.st_gid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
         raise ValueError("root state directory is unsafe")
     return os.open(value, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _open_existing_authority_directory(path: str, *, uid: int = 0) -> int:
+    lexical = os.lstat(path)
+    if (not stat.S_ISDIR(lexical.st_mode) or stat.S_ISLNK(lexical.st_mode)
+            or lexical.st_uid != uid or lexical.st_gid != uid
+            or stat.S_IMODE(lexical.st_mode) != 0o755):
+        raise ValueError("root authority directory is unsafe")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    opened = os.fstat(fd)
+    if ((opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid)
+            != (lexical.st_dev, lexical.st_ino, lexical.st_mode, lexical.st_uid, lexical.st_gid)):
+        os.close(fd)
+        raise ValueError("root authority directory changed during open")
+    return fd
 
 
 def _directory_at(parent_fd: int, name: str, mode: int) -> int:
@@ -781,6 +803,86 @@ def _verify_bound_health(pid: int) -> dict[str, int]:
         os.close(pidfd)
 
 
+def _peer_message_input(timestamp: str, nonce: str, body: bytes) -> bytes:
+    return PEER_VERSION + b"overseer-to-psychlo\0" + timestamp.encode() + b"\0" + nonce.encode() + b"\0" + body
+
+
+def _canonical_peer_response(kind: str, message_id: str, request_nonce: str,
+                             request_digest: str, timestamp: str, nonce: str, body: bytes) -> bytes:
+    return (PEER_VERSION + b"overseer-to-psychlo-response\0" + kind.encode() + b"\0"
+            + message_id.encode() + b"\0" + request_nonce.encode() + b"\0"
+            + request_digest.encode() + b"\0" + timestamp.encode() + b"\0"
+            + nonce.encode() + b"\0" + body)
+
+
+def _psychlo_secret(capability: dict[str, object]) -> bytes:
+    binding = capability["psychloPeerSecret"]
+    content, info = _stable_file(str(binding["path"]), uid=int(binding["uid"]),
+                                 mode=int(binding["mode"]), digest=str(binding["sha256"]))
+    if ((info.st_dev, info.st_ino, info.st_gid, info.st_nlink, len(content))
+            != (binding["device"], binding["inode"], binding["gid"], binding["links"], binding["size"])
+            or len(content) < 32):
+        raise ValueError("Psychlo peer secret identity changed")
+    return content
+
+
+def _verify_psychlo_readiness(capability: dict[str, object]) -> dict[str, object]:
+    secret = _psychlo_secret(capability)
+    probe_id = f"overseer-readiness-{secrets.token_hex(16)}"
+    correlation_id = f"codex-dispatch-{capability['planDigest'][:32]}"
+    unsigned = {"schemaVersion": "psychlo.readiness-probe.v1", "probeId": probe_id,
+                "correlationId": correlation_id}
+    payload = {**unsigned, "requestDigest": hashlib.sha256(_canonical(unsigned)).hexdigest()}
+    timestamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    request_nonce = secrets.token_urlsafe(24)
+    outer = {"kind": "readiness-probe", "messageId": probe_id,
+             "occurredAt": timestamp, "payload": payload}
+    body = _canonical(outer)
+    signature = hmac.new(secret, _peer_message_input(timestamp, request_nonce, body), hashlib.sha256).hexdigest()
+    request = urllib.request.Request(
+        PSYCHLO_ENDPOINT, data=body, method="POST",
+        headers={"Host": "127.0.0.1:8798", "Content-Type": "application/json",
+                 "Content-Length": str(len(body)), "X-Psychlo-Peer-Kind": "readiness-probe",
+                 "X-Psychlo-Peer-Message-Id": probe_id, "X-Psychlo-Peer-Timestamp": timestamp,
+                 "X-Psychlo-Peer-Nonce": request_nonce, "X-Psychlo-Peer-Signature": signature},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        response_body = response.read()
+        headers = {key.lower(): value for key, value in response.headers.items()}
+        if response.status != 200:
+            raise ValueError("signed Psychlo readiness response status is invalid")
+    response_timestamp = headers.get("x-psychlo-peer-response-timestamp", "")
+    response_nonce = headers.get("x-psychlo-peer-response-nonce", "")
+    response_signature = headers.get("x-psychlo-peer-response-signature", "")
+    if (headers.get("x-psychlo-peer-response-kind") != "readiness-probe"
+            or not response_timestamp
+            or not re.fullmatch(r"[A-Za-z0-9_-]{16,160}", response_nonce)
+            or not re.fullmatch(r"[a-f0-9]{64}", response_signature)):
+        raise ValueError("signed Psychlo readiness response headers are invalid")
+    try:
+        response_time = datetime.fromisoformat(response_timestamp.replace("Z", "+00:00"))
+        if (response_time.tzinfo is None
+                or abs((datetime.now(UTC) - response_time).total_seconds()) > 300):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("signed Psychlo readiness response timestamp is invalid") from None
+    expected_signature = hmac.new(
+        secret,
+        _canonical_peer_response("readiness-probe", probe_id, request_nonce,
+                                 hashlib.sha256(body).hexdigest(), response_timestamp,
+                                 response_nonce, response_body), hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, response_signature):
+        raise ValueError("signed Psychlo readiness response signature is invalid")
+    receipt = json.loads(response_body)
+    expected = {"accepted": True, "schemaVersion": "psychlo.readiness-probe-receipt.v1",
+                "probeId": probe_id, "service": "psychlo", "ready": True,
+                "requestDigest": payload["requestDigest"]}
+    if receipt != expected:
+        raise ValueError("signed Psychlo readiness receipt is invalid")
+    return receipt
+
+
 def _wait_no_user_api(timeout: float = 20.0) -> None:
     path = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/overseer-api.service/cgroup.procs"
     deadline = time.monotonic() + timeout
@@ -829,9 +931,11 @@ def _verify_system_api(capability: dict[str, object]) -> dict[str, object]:
     if _service_pids("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/overseer-api.service/cgroup.procs"):
         raise ValueError("duplicate user Overseer API exists")
     listener = _verify_bound_health(pid)
+    readiness = _verify_psychlo_readiness(capability)
     return {"pid": pid, "cgroup": "0::/system.slice/overseer-api.service",
             "startTicks": listener["startTicks"], "listenerInode": listener["inode"],
-            "cwd": capability["releaseRoot"], "unitSha256": capability["systemUnitSha256"]}
+            "cwd": capability["releaseRoot"], "unitSha256": capability["systemUnitSha256"],
+            "psychloReadinessRequestDigest": readiness["requestDigest"]}
 
 
 def _wait_restored_user_api(capability: dict[str, object], timeout: float = 30.0) -> None:
@@ -853,10 +957,10 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     keys = {
         "schemaVersion", "planDigest", "manifest", "manifestDigest", "releaseRoot",
         "systemUnit", "systemUnitSha256", "bootstrapHelperSha256", "rootHelperPath",
-        "bootstrapHelperGitBlob", "bootstrapHelperSize", "bootstrapInlineSha256",
-        "rootAuthorityPath", "approvalRecordId", "approvalRecordDigest", "rootPythonIdentity",
+        "bootstrapHelperGitBlob", "bootstrapHelperSize", "ceremonyInlineSha256",
+        "rootAuthorityDirectory", "approvalRecordId", "approvalRecordDigest", "rootPythonIdentity",
         "oldUserResources", "oldSystemUnit", "priorSystemServiceState",
-        "oldApiBinding", "managerBinding", "journalActionId", "codexDaemon",
+        "oldApiBinding", "managerBinding", "journalActionId", "codexDaemon", "psychloPeerSecret",
         "rollback", "receiptStore",
     }
     if not isinstance(value, dict) or set(value) != keys or value["schemaVersion"] != SCHEMA:
@@ -867,8 +971,8 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
         raise ValueError("activation capability is not the approved plan")
     if value["rootHelperPath"] != HELPER_PATH:
         raise ValueError("activation helper path is invalid")
-    if value["rootAuthorityPath"] != AUTHORITY_PATH:
-        raise ValueError("activation authority path is invalid")
+    if value["rootAuthorityDirectory"] != AUTHORITY_ROOT:
+        raise ValueError("activation authority directory is invalid")
     unit = value["systemUnit"]
     if not isinstance(unit, str) or hashlib.sha256(unit.encode()).hexdigest() != value["systemUnitSha256"]:
         raise ValueError("system unit binding is invalid")
@@ -902,27 +1006,49 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
                 and (not isinstance(daemon["priorSettings"], dict)
                      or set(daemon["priorSettings"]) != {"sha256", "size", "mode", "uid"}))):
         raise ValueError("Codex daemon capability is invalid")
+    secret = value["psychloPeerSecret"]
+    secret_keys = {"path", "sha256", "device", "inode", "mode", "uid", "gid", "links", "size"}
+    if (not isinstance(secret, dict) or set(secret) != secret_keys or secret["path"] != PSYCHLO_SECRET
+            or secret["uid"] != 1000 or secret["gid"] != 1000 or secret["mode"] != 0o600
+            or secret["links"] != 1 or not isinstance(secret["sha256"], str)):
+        raise ValueError("Psychlo peer secret capability is invalid")
     return value
 
 
 def _load_root_authority(capability: dict[str, object]) -> dict[str, object]:
+    helper_content, helper_info = _stable_file(
+        HELPER_PATH, uid=0, mode=0o444, digest=str(capability["bootstrapHelperSha256"]),
+    )
+    if (helper_info.st_gid != 0 or len(helper_content) != capability["bootstrapHelperSize"]):
+        raise ValueError("installed root dispatch helper is not the approved immutable helper")
     unsigned = {
         "schemaVersion": "overseer.codex-dispatch-root-authority.v1",
         "planDigest": capability["planDigest"],
         "helperGitBlob": capability["bootstrapHelperGitBlob"],
         "helperSha256": capability["bootstrapHelperSha256"],
         "helperSize": capability["bootstrapHelperSize"],
-        "rootHelperPath": HELPER_PATH, "rootAuthorityPath": AUTHORITY_PATH,
-        "bootstrapInlineSha256": capability["bootstrapInlineSha256"],
+        "rootHelperPath": HELPER_PATH,
+        "rootAuthorityPath": f"{AUTHORITY_ROOT}/{capability['planDigest']}.json",
+        "ceremonyInlineSha256": capability["ceremonyInlineSha256"],
         "systemUnitSha256": capability["systemUnitSha256"],
         "releaseManifestDigest": capability["manifestDigest"],
         "approvalRecordId": capability["approvalRecordId"],
         "approvalRecordDigest": capability["approvalRecordDigest"],
     }
     expected = {**unsigned, "authorityDigest": _digest(unsigned)}
-    content, info = _stable_file(AUTHORITY_PATH, uid=0, mode=0o400, digest=None)
-    if info.st_gid != 0 or content != _canonical(expected) + b"\n":
-        raise ValueError("root dispatch authority does not exactly authorize this capability")
+    authority_fd = _open_existing_authority_directory(AUTHORITY_ROOT)
+    try:
+        authority_path = f"{AUTHORITY_ROOT}/{capability['planDigest']}.json"
+        content, info = _stable_file(authority_path, uid=0, mode=0o400, digest=None)
+        after = os.fstat(authority_fd)
+        lexical = os.lstat(AUTHORITY_ROOT)
+        if ((after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid)
+                != (lexical.st_dev, lexical.st_ino, lexical.st_mode, lexical.st_uid, lexical.st_gid)):
+            raise ValueError("root authority directory changed during record read")
+        if info.st_gid != 0 or content != _canonical(expected) + b"\n":
+            raise ValueError("root dispatch authority does not exactly authorize this capability")
+    finally:
+        os.close(authority_fd)
     return expected
 
 
@@ -1220,6 +1346,59 @@ def _activate(capability: dict[str, object], stream) -> None:
         journal["phase"] = "verified"; _write_journal(journal)
 
 
+def _attest_unchanged_pre_activation_resources(capability: dict[str, object]) -> None:
+    old = capability["oldSystemUnit"]
+    if old is None:
+        if os.path.lexists(SYSTEM_UNIT) or _system_service_enabled() or _system_service_active():
+            raise ValueError("unexpected prior root system service appeared before rollback")
+    else:
+        content, info = _stable_file(SYSTEM_UNIT, uid=0, mode=int(old["mode"]),
+                                     digest=str(old["sha256"]))
+        if ((info.st_dev, info.st_ino, len(content))
+                != (old["device"], old["inode"], old["size"])
+                or _system_service_enabled() != old["enabled"]
+                or _system_service_active() != old["active"]):
+            raise ValueError("prior root system service changed before early rollback")
+        binding = old.get("activeProcess")
+        if old["active"]:
+            if (not isinstance(binding, dict)
+                    or binding["bootId"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                    or _process_start_ticks(int(binding["pid"])) != binding["startTicks"]
+                    or Path(f"{PROC_ROOT}/{binding['pid']}/cgroup").read_text().strip() != binding["cgroup"]
+                    or Path(f"{PROC_ROOT}/{binding['pid']}/cmdline").read_bytes().hex() != binding["cmdlineHex"]):
+                raise ValueError("prior root system service process changed before early rollback")
+    for item in capability["oldUserResources"]:
+        content, info = _stable_file(str(item["path"]), uid=1000, mode=int(item["mode"]),
+                                     digest=str(item["sha256"]))
+        if ((info.st_dev, info.st_ino, len(content))
+                != (item["device"], item["inode"], item["size"])):
+            raise ValueError("prior user service resource changed before early rollback")
+
+
+def _restore_pre_quarantine_baseline(capability: dict[str, object]) -> None:
+    old = capability["oldSystemUnit"]
+    if old is None or _system_service_active() == old["active"]:
+        _attest_unchanged_pre_activation_resources(capability)
+        return
+    if not old["active"]:
+        raise ValueError("prior inactive root service became active before rollback")
+    content, info = _stable_file(SYSTEM_UNIT, uid=0, mode=int(old["mode"]),
+                                 digest=str(old["sha256"]))
+    if ((info.st_dev, info.st_ino, len(content)) != (old["device"], old["inode"], old["size"])
+            or _system_service_enabled() != old["enabled"]):
+        raise ValueError("prior root system service files changed before rollback")
+    for item in capability["oldUserResources"]:
+        user_content, user_info = _stable_file(
+            str(item["path"]), uid=1000, mode=int(item["mode"]), digest=str(item["sha256"]),
+        )
+        if ((user_info.st_dev, user_info.st_ino, len(user_content))
+                != (item["device"], item["inode"], item["size"])):
+            raise ValueError("prior user service resource changed before rollback")
+    _run_systemctl("start", "overseer-api.service")
+    if not _system_service_active():
+        raise RuntimeError("prior root system service activity was not restored")
+
+
 def _rollback(capability: dict[str, object]) -> None:
     # Rollback is externally supervised: stop system service first so the
     # helper never kills the process executing its own control path.
@@ -1230,6 +1409,18 @@ def _rollback(capability: dict[str, object]) -> None:
     if prior_state != capability["priorSystemServiceState"]:
         raise ValueError("prior root system service journal binding changed")
     if journal["phase"] == "rolled-back":
+        return
+    if (journal["phase"] in {"intent-system-unit", "intent-daemon", "daemon-ready", "release-installed",
+                             "intent-stop-prior-system", "prior-system-stopped"}
+            and journal.get("systemUnitIdentity") is None
+            and not journal.get("oldSystemUnitQuarantine")
+            and not journal.get("userResourceQuarantines")):
+        if journal["phase"] in {"intent-stop-prior-system", "prior-system-stopped"}:
+            _restore_pre_quarantine_baseline(capability)
+        else:
+            _attest_unchanged_pre_activation_resources(capability)
+        _restore_codex_daemon(journal)
+        journal["phase"] = "rolled-back"; journal["lastError"] = ""; _write_journal(journal)
         return
     rollback_phases = (
         "rollback-pending", "rollback-system-stopped", "rollback-new-unit-quarantined",

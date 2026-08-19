@@ -32,7 +32,7 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 ROOT_HELPER_SOURCE = "src/overseer_codex_dispatch_root_helper.py"
 ROOT_HELPER_PATH = Path("/usr/local/libexec/overseer-codex-dispatch-activation")
-ROOT_AUTHORITY_PATH = Path("/etc/overseer/codex-dispatch-authority.json")
+ROOT_AUTHORITY_ROOT = Path("/etc/overseer/codex-dispatch-authorities")
 SYSTEM_UNIT_PATH = Path("/etc/systemd/system/overseer-api.service")
 SYSTEM_ENABLE_LINK = Path("/etc/systemd/system/multi-user.target.wants/overseer-api.service")
 SYSTEM_CGROUP_PROCS = Path("/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs")
@@ -42,9 +42,10 @@ PRIMARY_STORE = "/home/god/.local/share/overseer/project/state/overseer.sqlite3"
 CODEX_BINARY = Path("/usr/local/bin/codex")
 CODEX_SOCKET = Path("/home/god/.codex/app-server-control/app-server-control.sock")
 CODEX_SETTINGS = Path("/home/god/.codex/app-server-daemon/settings.json")
+PSYCHLO_SECRET_PATH = Path("/home/god/.config/psychlo/overseer-peer-secret")
 _EXTERNAL = ContextVar("overseer_codex_system_activation_external", default=False)
 
-BOOTSTRAP_INSTALLER = r'''import ctypes,hashlib,json,os,stat,struct,sys
+CEREMONY_INSTALLER = r'''import ctypes,hashlib,json,os,stat,struct,sys
 plan_digest,digest,authority_digest=sys.argv[1:];target="/usr/local/libexec/overseer-codex-dispatch-activation";assert all(len(x)==64 for x in (plan_digest,digest,authority_digest))
 def exact(n):
  b=b""
@@ -54,7 +55,7 @@ def exact(n):
   b+=x
  return b
 size=struct.unpack(">Q",exact(8))[0];data=exact(size);asize=struct.unpack(">Q",exact(8))[0];authority=exact(asize);assert not sys.stdin.buffer.read(1) and hashlib.sha256(data).hexdigest()==digest
-record=json.loads(authority);unsigned=dict(record);record_digest=unsigned.pop("authorityDigest");assert authority==json.dumps(record,sort_keys=True,separators=(",",":")).encode()+b"\n" and hashlib.sha256(json.dumps(unsigned,sort_keys=True,separators=(",",":")).encode()).hexdigest()==authority_digest==record_digest and record["planDigest"]==plan_digest and record["helperSha256"]==digest
+record=json.loads(authority);unsigned=dict(record);record_digest=unsigned.pop("authorityDigest");assert authority==json.dumps(record,sort_keys=True,separators=(",",":")).encode()+b"\n" and hashlib.sha256(json.dumps(unsigned,sort_keys=True,separators=(",",":")).encode()).hexdigest()==authority_digest==record_digest and record["planDigest"]==plan_digest and record["helperSha256"]==digest and record["rootHelperPath"]==target and record["rootAuthorityPath"]=="/etc/overseer/codex-dispatch-authorities/"+plan_digest+".json"
 root=os.lstat("/usr/local"); rootid=(root.st_dev,root.st_ino,root.st_uid,root.st_gid,stat.S_IMODE(root.st_mode)); assert stat.S_ISDIR(root.st_mode) and root.st_uid==0 and root.st_gid==0 and not stat.S_IMODE(root.st_mode)&0o022
 rfd=os.open("/usr/local",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW)
 try: os.mkdir("libexec",0o755,dir_fd=rfd)
@@ -81,7 +82,10 @@ efd=os.open("/etc",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW)
 try: os.mkdir("overseer",0o755,dir_fd=efd)
 except FileExistsError: pass
 ofd=os.open("overseer",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=efd);oi=os.fstat(ofd);assert oi.st_uid==0 and oi.st_gid==0 and not stat.S_IMODE(oi.st_mode)&0o022
-name="codex-dispatch-authority.json"
+try: os.mkdir("codex-dispatch-authorities",0o755,dir_fd=ofd)
+except FileExistsError: pass
+afdroot=os.open("codex-dispatch-authorities",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=ofd);os.close(ofd);ofd=afdroot;oi=os.fstat(ofd);assert oi.st_uid==0 and oi.st_gid==0 and not stat.S_IMODE(oi.st_mode)&0o022
+name=plan_digest+".json"
 try:
  afd=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=ofd);existing=os.read(afd,1048576);ai=os.fstat(afd);os.close(afd);assert existing==authority and ai.st_uid==0 and ai.st_gid==0 and ai.st_nlink==1 and stat.S_IMODE(ai.st_mode)==0o400
 except FileNotFoundError:
@@ -103,8 +107,8 @@ def _authority_record(spec: "SystemActivationSpec", plan_id: str) -> dict[str, o
         "planDigest": spec.capability(plan_id)["planDigest"],
         "helperGitBlob": spec.helper_blob["blob"], "helperSha256": spec.helper_blob["sha256"],
         "helperSize": spec.helper_blob["size"], "rootHelperPath": str(ROOT_HELPER_PATH),
-        "rootAuthorityPath": str(ROOT_AUTHORITY_PATH),
-        "bootstrapInlineSha256": _sha256(BOOTSTRAP_INSTALLER.encode()),
+        "rootAuthorityPath": str(ROOT_AUTHORITY_ROOT / f"{spec.capability(plan_id)['planDigest']}.json"),
+        "ceremonyInlineSha256": _sha256(CEREMONY_INSTALLER.encode()),
         "systemUnitSha256": _sha256(spec.system_unit.encode()),
         "releaseManifestDigest": spec.manifest.digest,
         "approvalRecordId": approval["recordId"], "approvalRecordDigest": _digest(approval),
@@ -226,6 +230,16 @@ def _codex_daemon_spec() -> Mapping[str, object]:
             "uid": 1000, "gid": 1000}
 
 
+def _psychlo_secret_spec() -> Mapping[str, object]:
+    content, info = _stable_read(PSYCHLO_SECRET_PATH)
+    if (info.st_uid != 1000 or info.st_gid != 1000 or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600 or len(content) < 32):
+        raise ValueError("Psychlo peer secret is unsafe")
+    return {"path": str(PSYCHLO_SECRET_PATH), "sha256": _sha256(content),
+            "device": info.st_dev, "inode": info.st_ino, "mode": 0o600,
+            "uid": 1000, "gid": 1000, "links": 1, "size": len(content)}
+
+
 def system_unit_content(manifest: ImmutableReleaseManifest) -> str:
     root = manifest.release_root
     old_exec = release_drop_in_content(manifest).decode().splitlines()
@@ -259,6 +273,7 @@ class SystemActivationSpec:
     old_system_unit: Mapping[str, object] | None
     system_unit: str
     codex_daemon: Mapping[str, object] = field(default_factory=dict)
+    psychlo_peer_secret: Mapping[str, object] = field(default_factory=dict)
 
     def capability(self, plan_id: str) -> dict[str, object]:
         prior_service_state = {
@@ -272,12 +287,13 @@ class SystemActivationSpec:
             "systemUnit": self.system_unit, "systemUnitSha256": _sha256(self.system_unit.encode()),
             "bootstrapHelperSha256": self.helper_blob["sha256"], "rootHelperPath": str(ROOT_HELPER_PATH),
             "bootstrapHelperGitBlob": self.helper_blob["blob"], "bootstrapHelperSize": self.helper_blob["size"],
-            "bootstrapInlineSha256": _sha256(BOOTSTRAP_INSTALLER.encode()),
-            "rootAuthorityPath": str(ROOT_AUTHORITY_PATH),
+            "ceremonyInlineSha256": _sha256(CEREMONY_INSTALLER.encode()),
+            "rootAuthorityDirectory": str(ROOT_AUTHORITY_ROOT),
             "approvalRecordId": f"admin-approval:{plan_id}",
             "approvalRecordDigest": _digest({"recordId": f"admin-approval:{plan_id}", "planId": plan_id,
                                               "approvalLevel": "human", "ownerDomain": "sisko"}),
             "codexDaemon": dict(self.codex_daemon),
+            "psychloPeerSecret": dict(self.psychlo_peer_secret),
             "rootPythonIdentity": dict(self.manifest.root_python),
             "oldUserResources": [dict(item) for item in self.old_user_resources],
             "oldSystemUnit": dict(self.old_system_unit) if self.old_system_unit is not None else None,
@@ -296,19 +312,22 @@ class SystemActivationSpec:
                 "oldApiBinding": dict(self.old_api_binding),
                 "oldUserResources": [dict(item) for item in self.old_user_resources],
                 "oldSystemUnit": dict(self.old_system_unit) if self.old_system_unit is not None else None,
-                "systemUnit": self.system_unit, "codexDaemon": dict(self.codex_daemon)}
+                "systemUnit": self.system_unit, "codexDaemon": dict(self.codex_daemon),
+                "psychloPeerSecret": dict(self.psychlo_peer_secret)}
 
     @classmethod
     def from_json(cls, value: Mapping[str, object]) -> "SystemActivationSpec":
         keys = {"schemaVersion", "manifest", "helperBlob", "managerBinding", "oldApiBinding",
-                "oldUserResources", "oldSystemUnit", "systemUnit", "codexDaemon"}
+                "oldUserResources", "oldSystemUnit", "systemUnit", "codexDaemon",
+                "psychloPeerSecret"}
         if not isinstance(value, Mapping) or set(value) != keys or value["schemaVersion"] != SCHEMA:
             raise ValueError("system activation spec is invalid")
         return cls(ImmutableReleaseManifest.from_json(value["manifest"]), dict(value["helperBlob"]),
                    dict(value["managerBinding"]), dict(value["oldApiBinding"]),
                    tuple(dict(item) for item in value["oldUserResources"]),
                    dict(value["oldSystemUnit"]) if isinstance(value["oldSystemUnit"], Mapping) else None,
-                   str(value["systemUnit"]), dict(value["codexDaemon"]))
+                   str(value["systemUnit"]), dict(value["codexDaemon"]),
+                   dict(value["psychloPeerSecret"]))
 
 
 def build_codex_dispatch_activation_spec() -> SystemActivationSpec:
@@ -316,17 +335,13 @@ def build_codex_dispatch_activation_spec() -> SystemActivationSpec:
     unit = system_unit_content(provisional)
     return SystemActivationSpec(provisional, _helper_blob(), _capture_manager_binding(),
                                 _capture_api_binding(), _old_user_resources(), _old_system_unit(), unit,
-                                _codex_daemon_spec())
+                                _codex_daemon_spec(), _psychlo_secret_spec())
 
 
-def _bootstrap_command(spec: SystemActivationSpec) -> tuple[str, ...]:
-    raise RuntimeError("plan id is required for the authority bootstrap command")
-
-
-def _authority_bootstrap_command(spec: SystemActivationSpec, plan_id: str) -> tuple[str, ...]:
+def _ceremony_command(spec: SystemActivationSpec, plan_id: str) -> tuple[str, ...]:
     authority = _authority_record(spec, plan_id)
     return ("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c",
-            BOOTSTRAP_INSTALLER, str(authority["planDigest"]), str(spec.helper_blob["sha256"]),
+            CEREMONY_INSTALLER, str(authority["planDigest"]), str(spec.helper_blob["sha256"]),
             str(authority["authorityDigest"]))
 
 
@@ -341,17 +356,18 @@ def plan_codex_dispatch_activation(plan_id: str, spec: SystemActivationSpec, rea
     digest = str(capability["planDigest"])
     marker = lambda action: ("__overseer_codex_dispatch_system_v1", action, plan_id, digest)
     authority = _authority_record(spec, plan_id)
-    bootstrap_artifact = {
+    ceremony_artifact = {
         "planDigest": digest, "helperGitBlob": spec.helper_blob["blob"],
         "helperSha256": spec.helper_blob["sha256"], "helperSize": spec.helper_blob["size"],
-        "rootHelperPath": str(ROOT_HELPER_PATH), "rootAuthorityPath": str(ROOT_AUTHORITY_PATH),
-        "bootstrapInlineCode": BOOTSTRAP_INSTALLER,
-        "bootstrapInlineSha256": _sha256(BOOTSTRAP_INSTALLER.encode()),
+        "rootHelperPath": str(ROOT_HELPER_PATH),
+        "rootAuthorityPath": str(ROOT_AUTHORITY_ROOT / f"{digest}.json"),
+        "ceremonyInlineCode": CEREMONY_INSTALLER,
+        "ceremonyInlineSha256": _sha256(CEREMONY_INSTALLER.encode()),
         "authorityRecord": authority, "authorityDigest": authority["authorityDigest"],
-        "command": list(_authority_bootstrap_command(spec, plan_id)),
+        "command": list(_ceremony_command(spec, plan_id)),
     }
     metadata = {"schemaVersion": SCHEMA, "spec": spec.to_json(), "capability": capability,
-                "bootstrapArtifact": bootstrap_artifact,
+                "ceremonyArtifact": ceremony_artifact,
                 "activateCommand": list(_root_helper_command("activate", digest)),
                 "rollbackCommand": list(_root_helper_command("rollback", digest)),
                 "externalCliOnly": True, "apiExecutionAllowed": False}
@@ -378,7 +394,7 @@ def validate_codex_dispatch_activation_plan(plan: AdminChangePlan) -> SystemActi
     metadata = plan.adapter_metadata
     if (AdminChangeKind(plan.kind) != AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
             or not isinstance(metadata, dict) or set(metadata) != {"schemaVersion", "spec", "capability",
-                                                               "bootstrapArtifact", "activateCommand", "rollbackCommand",
+                                                               "ceremonyArtifact", "activateCommand", "rollbackCommand",
                                                                "externalCliOnly", "apiExecutionAllowed"}):
         raise ValueError("system activation plan metadata is invalid")
     spec = SystemActivationSpec.from_json(metadata["spec"])
@@ -404,6 +420,8 @@ def verify_system_activation_spec(spec: SystemActivationSpec) -> None:
         raise ValueError("preexisting root system unit changed; restage")
     if dict(spec.codex_daemon) != dict(_codex_daemon_spec()):
         raise ValueError("Codex daemon binary or prior state changed; restage")
+    if dict(spec.psychlo_peer_secret) != dict(_psychlo_secret_spec()):
+        raise ValueError("Psychlo peer secret identity changed; restage")
     if dict(spec.manager_binding) != _capture_manager_binding():
         raise ValueError("approved user manager changed; restage")
     if dict(spec.old_api_binding) != _capture_api_binding():
@@ -442,48 +460,28 @@ def external_activation_cli():
         _EXTERNAL.reset(token)
 
 
-def _helper_bytes(spec: SystemActivationSpec) -> bytes:
-    binding = spec.helper_blob
-    if _git("rev-parse", f"{binding['sourceCommit']}:{ROOT_HELPER_SOURCE}").strip().decode() != binding["blob"]:
-        raise ValueError("reviewed helper commit/path binding changed")
-    completed = subprocess.run(("/usr/bin/git", "--no-replace-objects", "-C", str(CANONICAL_CHECKOUT),
-                                "cat-file", "blob", str(binding["blob"])),
-                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
-                                    "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null"})
-    if (completed.returncode != 0 or len(completed.stdout) != binding["size"]
-            or _sha256(completed.stdout) != binding["sha256"]):
-        raise ValueError("reviewed helper blob bytes changed")
-    return completed.stdout
-
-
-def _authority_file_present() -> bool:
+def _authority_files_present(spec: SystemActivationSpec, plan_id: str) -> bool:
+    digest = str(spec.capability(plan_id)["planDigest"])
+    authority_path = ROOT_AUTHORITY_ROOT / f"{digest}.json"
     try:
-        info = ROOT_AUTHORITY_PATH.lstat()
+        authority_root = ROOT_AUTHORITY_ROOT.lstat()
+        helper_content, helper_info = _stable_read(ROOT_HELPER_PATH)
+        info = authority_path.lstat()
     except FileNotFoundError:
         return False
+    if (not stat.S_ISDIR(authority_root.st_mode) or ROOT_AUTHORITY_ROOT.is_symlink()
+            or authority_root.st_uid != 0 or authority_root.st_gid != 0
+            or stat.S_IMODE(authority_root.st_mode) != 0o755):
+        raise ValueError("root dispatch authority directory is unsafe")
+    if (helper_info.st_uid != 0 or helper_info.st_gid != 0 or helper_info.st_nlink != 1
+            or stat.S_IMODE(helper_info.st_mode) != 0o444
+            or len(helper_content) != spec.helper_blob["size"]
+            or _sha256(helper_content) != spec.helper_blob["sha256"]):
+        raise ValueError("preexisting root dispatch helper is not the approved immutable helper")
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
             or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o400):
         raise ValueError("root dispatch authority record is unsafe")
     return True
-
-
-def bootstrap_codex_dispatch_authority(plan: AdminChangePlan) -> dict[str, object]:
-    require_external_activation_context()
-    spec = validate_codex_dispatch_activation_plan(plan)
-    if (not plan.approved or str(plan.approved_by).lower() != "sisko"
-            or plan.approval_level is not ApprovalLevel.HUMAN or plan.owner_domain is not OwnerDomain.SISKO):
-        raise ValueError("exact HUMAN/SISKO plan approval is required for root authority bootstrap")
-    authority = _authority_record(spec, plan.id)
-    command = _authority_bootstrap_command(spec, plan.id)
-    _run_stream(
-        command,
-        (_helper_bytes(spec), _canonical(authority) + b"\n"),
-        {"status": "installed", "planDigest": authority["planDigest"],
-         "helperDigest": authority["helperSha256"], "authorityDigest": authority["authorityDigest"]},
-    )
-    return {"status": "installed", "planId": plan.id, "planDigest": authority["planDigest"],
-            "authorityRecordPath": str(ROOT_AUTHORITY_PATH), "authorityDigest": authority["authorityDigest"]}
 
 
 def _run_stream(command: Sequence[str], frames: Sequence[bytes], expected: Mapping[str, object]) -> None:
@@ -593,14 +591,16 @@ def execute_codex_dispatch_activation_plan(plan: AdminChangePlan, *, runner: Cal
     if not _EXTERNAL.get():
         return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED,
                                     "Codex system activation is forbidden through API/UI; use the external isolated CLI", ())
-    if not adapter_enabled or not plan.approved or plan.canceled or plan.archived:
+    if (not adapter_enabled or not plan.approved or str(plan.approved_by).lower() != "sisko"
+            or plan.approval_level is not ApprovalLevel.HUMAN or plan.owner_domain is not OwnerDomain.SISKO
+            or plan.canceled or plan.archived):
         return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED,
                                     "exact HUMAN/SISKO approval and adapter enablement are required", ())
     try:
         spec = validate_codex_dispatch_activation_plan(plan)
         _reject_api_context()
-        if not _authority_file_present():
-            raise ValueError("root dispatch authority is missing; complete the approved bootstrap-authority ceremony")
+        if not _authority_files_present(spec, plan.id):
+            raise ValueError("preexisting root helper or exact per-plan authority is missing; complete the out-of-band ceremony")
         verify_system_activation_spec(spec)
     except (OSError, ValueError) as error:
         return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, str(error), ())
@@ -629,7 +629,7 @@ def execute_codex_dispatch_activation_plan(plan: AdminChangePlan, *, runner: Cal
         _ACTIVE.reset(token)
 
 
-__all__ = ["SystemActivationSpec", "bootstrap_codex_dispatch_authority",
+__all__ = ["SystemActivationSpec",
            "build_codex_dispatch_activation_spec", "external_activation_cli",
            "execute_codex_dispatch_activation_marker", "execute_codex_dispatch_activation_plan",
            "plan_codex_dispatch_activation", "require_external_activation_context",

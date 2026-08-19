@@ -1612,7 +1612,7 @@ def test_stage_status_and_execute_persist_exact_approval_and_adapter_gate(tmp_pa
     request = cli.request_admin_adapter_enablement_status(store, AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION.value, "sisko")
     cli.approve_admin_adapter_enablement_status(store, request["approval_id"], "sisko", "2026-08-18T00:01:00+00:00")
     monkeypatch.setattr(system, "_reject_api_context", lambda: None)
-    monkeypatch.setattr(system, "_authority_file_present", lambda: True)
+    monkeypatch.setattr(system, "_authority_files_present", lambda _spec, _plan_id: True)
     monkeypatch.setattr(system, "verify_system_activation_spec", lambda _spec: None)
     runner = lambda step: AdminCommandResult(step.title, step.command, 0)
     blocked = cli.execute_admin_change_status(store, "admin.codex-dispatch.e2e", runner=runner)

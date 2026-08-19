@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import inspect
+import json
 import os
 import subprocess
 from dataclasses import replace
@@ -50,10 +52,13 @@ def _spec() -> system.SystemActivationSpec:
          "socketPath": "/home/god/.codex/app-server-control/app-server-control.sock",
          "priorRunning": False, "priorEvidence": None,
          "priorRemoteControlEnabled": None, "priorSettings": None, "uid": 1000, "gid": 1000},
+        {"path": "/home/god/.config/psychlo/overseer-peer-secret", "sha256": "8" * 64,
+         "device": 1, "inode": 4, "mode": 0o600, "uid": 1000, "gid": 1000,
+         "links": 1, "size": 64},
     )
 
 
-def test_plan_binds_closed_authority_ceremony_and_external_root_migration():
+def test_plan_binds_closed_out_of_band_authority_ceremony_and_external_root_migration():
     spec = _spec()
     plan = system.plan_codex_dispatch_activation("admin.system-v2", spec, "migrate")
 
@@ -64,13 +69,13 @@ def test_plan_binds_closed_authority_ceremony_and_external_root_migration():
     assert [step.command[1] for step in plan.steps] == ["activate-system"]
     assert plan.adapter_metadata["externalCliOnly"] is True
     assert plan.adapter_metadata["apiExecutionAllowed"] is False
-    artifact = plan.adapter_metadata["bootstrapArtifact"]
+    artifact = plan.adapter_metadata["ceremonyArtifact"]
     bootstrap = artifact["command"]
     assert bootstrap[:6] == ["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"]
     assert bootstrap[-3:] == [spec.capability(plan.id)["planDigest"], spec.helper_blob["sha256"],
                               artifact["authorityDigest"]]
-    assert artifact["rootAuthorityPath"] == str(system.ROOT_AUTHORITY_PATH)
-    assert artifact["bootstrapInlineSha256"] == hashlib.sha256(system.BOOTSTRAP_INSTALLER.encode()).hexdigest()
+    assert artifact["rootAuthorityPath"] == str(system.ROOT_AUTHORITY_ROOT / f"{artifact['planDigest']}.json")
+    assert artifact["ceremonyInlineSha256"] == hashlib.sha256(system.CEREMONY_INSTALLER.encode()).hexdigest()
     assert plan.adapter_metadata["activateCommand"] == [
         "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S",
         str(system.ROOT_HELPER_PATH), "activate",
@@ -86,6 +91,16 @@ def test_plan_binds_closed_authority_ceremony_and_external_root_migration():
         "present": False, "enabled": False, "active": False,
     }
     assert system.validate_codex_dispatch_activation_plan(plan) == spec
+
+
+def test_product_has_no_authority_bootstrap_execution_command():
+    import overseer.cli as cli
+
+    system_source = inspect.getsource(system)
+    cli_source = inspect.getsource(cli)
+    assert "def bootstrap_codex_dispatch_authority" not in system_source
+    assert '"bootstrap-codex-dispatch-authority"' not in cli_source
+    assert "bootstrap_codex_dispatch_authority_status" not in cli_source
 
 
 def test_complete_system_unit_is_root_service_and_ignores_user_unit_search_paths():
@@ -124,7 +139,7 @@ def test_external_cli_context_runs_only_exact_typed_markers(monkeypatch):
     plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", spec, "migrate"),
                    approved=True, approved_by="sisko", approved_at="2026-08-18T00:00:00+00:00")
     monkeypatch.setattr(system, "_reject_api_context", lambda: None)
-    monkeypatch.setattr(system, "_authority_file_present", lambda: True)
+    monkeypatch.setattr(system, "_authority_files_present", lambda _spec, _plan_id: True)
     monkeypatch.setattr(system, "verify_system_activation_spec", lambda value: None)
     seen = []
     with system.external_activation_cli():
@@ -136,14 +151,25 @@ def test_external_cli_context_runs_only_exact_typed_markers(monkeypatch):
     assert seen == [step.command for step in (*plan.steps, *plan.verification_steps)]
 
 
+def test_external_execute_rejects_non_sisko_approval_before_root_authority(monkeypatch):
+    plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", _spec(), "migrate"),
+                   approved=True, approved_by="captain", approved_at="2026-08-18T00:00:00+00:00")
+    monkeypatch.setattr(system, "_reject_api_context", lambda: None)
+    monkeypatch.setattr(system, "_authority_files_present", lambda *_args: pytest.fail("authority probed"))
+    with system.external_activation_cli():
+        result = system.execute_codex_dispatch_activation_plan(plan, adapter_enabled=True)
+    assert result.status.value == "blocked"
+    assert "HUMAN/SISKO" in result.summary
+
+
 def test_swapped_coordinator_cannot_change_bootstrap_command_or_helper_digest(monkeypatch):
     plan = system.plan_codex_dispatch_activation("admin.system-v2", _spec(), "migrate")
     metadata = dict(plan.adapter_metadata)
-    artifact = dict(metadata["bootstrapArtifact"])
+    artifact = dict(metadata["ceremonyArtifact"])
     command = list(artifact["command"])
     command[-2] = "0" * 64
     artifact["command"] = command
-    metadata["bootstrapArtifact"] = artifact
+    metadata["ceremonyArtifact"] = artifact
     with pytest.raises(ValueError, match="canonical"):
         system.validate_codex_dispatch_activation_plan(replace(plan, adapter_metadata=metadata))
 
@@ -170,7 +196,7 @@ def test_root_helper_artifact_has_crash_resume_port_conflict_and_external_rollba
     assert "user-1000.slice" in source
 
 
-def test_root_helper_capability_rejects_extra_fields_and_authority_rejects_self_signed_unit(monkeypatch):
+def test_root_helper_capability_rejects_extra_fields_and_authority_rejects_self_signed_unit(monkeypatch, tmp_path):
     import overseer_codex_dispatch_root_helper as helper
 
     capability = _spec().capability("admin.system-v2")
@@ -188,25 +214,43 @@ def test_root_helper_capability_rejects_extra_fields_and_authority_rejects_self_
     class Info:
         st_gid = 0
 
-    monkeypatch.setattr(helper, "_stable_file", lambda *_args, **_kwargs: (helper._canonical(original_authority) + b"\n", Info()))
+    authority_root = tmp_path / "authorities"
+    authority_root.mkdir()
+    monkeypatch.setattr(helper, "AUTHORITY_ROOT", str(authority_root))
+    monkeypatch.setattr(
+        helper, "_open_existing_authority_directory",
+        lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    monkeypatch.setattr(
+        helper, "_stable_file",
+        lambda path, **_kwargs: ((b"h" * 123, Info()) if path == helper.HELPER_PATH
+                                 else (helper._canonical(original_authority) + b"\n", Info())),
+    )
     with pytest.raises(ValueError, match="does not exactly authorize"):
         helper._load_root_authority(altered)
 
 
-def test_approved_authority_bootstrap_streams_only_closed_artifact(monkeypatch):
-    spec = _spec()
-    plan = replace(system.plan_codex_dispatch_activation("admin.system-v2", spec, "migrate"),
-                   approved=True, approved_by="sisko", approved_at="2026-08-18T00:00:00+00:00")
-    seen = []
-    monkeypatch.setattr(system, "_reject_api_context", lambda: None)
-    monkeypatch.setattr(system, "_helper_bytes", lambda _spec: b"helper")
-    monkeypatch.setattr(system, "_run_stream", lambda command, frames, expected: seen.append((command, frames, expected)))
-    with system.external_activation_cli():
-        result = system.bootstrap_codex_dispatch_authority(plan)
-    artifact = plan.adapter_metadata["bootstrapArtifact"]
-    assert list(seen[0][0]) == artifact["command"]
-    assert seen[0][1] == (b"helper", system._canonical(artifact["authorityRecord"]) + b"\n")
-    assert result["authorityDigest"] == artifact["authorityDigest"]
+def test_per_plan_authority_paths_rotate_without_overwriting_prior_records():
+    first = system.plan_codex_dispatch_activation("admin.system-v2-a", _spec(), "migrate")
+    second = system.plan_codex_dispatch_activation("admin.system-v2-b", _spec(), "migrate")
+    first_artifact = first.adapter_metadata["ceremonyArtifact"]
+    second_artifact = second.adapter_metadata["ceremonyArtifact"]
+    assert first_artifact["rootAuthorityPath"] != second_artifact["rootAuthorityPath"]
+    assert first_artifact["rootAuthorityPath"].endswith(f"/{first_artifact['planDigest']}.json")
+    assert second_artifact["rootAuthorityPath"].endswith(f"/{second_artifact['planDigest']}.json")
+    assert first_artifact["command"][-3] == first_artifact["planDigest"]
+    assert second_artifact["command"][-3] == second_artifact["planDigest"]
+
+
+def test_authority_directory_rejects_symlink_before_record_read(tmp_path):
+    import overseer_codex_dispatch_root_helper as helper
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="authority directory"):
+        helper._open_existing_authority_directory(str(alias), uid=os.geteuid())
 
 
 def test_root_helper_restore_is_crash_retry_idempotent_and_never_replaces(tmp_path):
@@ -314,6 +358,94 @@ def test_health_200_is_rejected_when_listener_identity_changes(monkeypatch):
         os.close(write_fd)
 
 
+def test_signed_psychlo_readiness_probe_binds_exact_request_and_secret(monkeypatch, tmp_path):
+    import overseer_codex_dispatch_root_helper as helper
+
+    secret = b"r" * 64
+    secret_path = tmp_path / "overseer-peer-secret"
+    secret_path.write_bytes(secret)
+    secret_path.chmod(0o600)
+    info = secret_path.stat()
+    monkeypatch.setattr(helper, "PSYCHLO_SECRET", str(secret_path))
+    capability = {
+        "planDigest": "d" * 64,
+        "psychloPeerSecret": {
+            "path": str(secret_path), "sha256": hashlib.sha256(secret).hexdigest(),
+            "device": info.st_dev, "inode": info.st_ino, "mode": 0o600,
+            "uid": os.geteuid(), "gid": os.getegid(), "links": 1, "size": len(secret),
+        },
+    }
+
+    class Response:
+        status = 200
+
+        def __init__(self, request):
+            request_body = request.data
+            outer = json.loads(request_body)
+            payload = outer["payload"]
+            self.body = json.dumps({
+                "accepted": True, "schemaVersion": "psychlo.readiness-probe-receipt.v1",
+                "probeId": payload["probeId"], "service": "psychlo", "ready": True,
+                "requestDigest": payload["requestDigest"],
+            }, separators=(",", ":")).encode()
+            timestamp = outer["occurredAt"]
+            response_nonce = "response_readiness_123456"
+            signature = hmac.new(
+                secret,
+                helper._canonical_peer_response(
+                    "readiness-probe", outer["messageId"],
+                    request.headers["X-psychlo-peer-nonce"], hashlib.sha256(request_body).hexdigest(),
+                    timestamp, response_nonce, self.body,
+                ), hashlib.sha256,
+            ).hexdigest()
+            self.headers = {
+                "x-psychlo-peer-response-kind": "readiness-probe",
+                "x-psychlo-peer-response-timestamp": timestamp,
+                "x-psychlo-peer-response-nonce": response_nonce,
+                "x-psychlo-peer-response-signature": signature,
+            }
+
+        def read(self):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(helper.urllib.request, "urlopen", lambda request, **_kwargs: Response(request))
+    receipt = helper._verify_psychlo_readiness(capability)
+    assert receipt["service"] == "psychlo"
+    assert receipt["ready"] is True
+
+
+def test_signed_psychlo_readiness_rejects_unsigned_boolean_receipt(monkeypatch, tmp_path):
+    import overseer_codex_dispatch_root_helper as helper
+
+    secret = b"s" * 64
+    secret_path = tmp_path / "secret"
+    secret_path.write_bytes(secret); secret_path.chmod(0o600)
+    info = secret_path.stat()
+    monkeypatch.setattr(helper, "PSYCHLO_SECRET", str(secret_path))
+    capability = {"planDigest": "e" * 64, "psychloPeerSecret": {
+        "path": str(secret_path), "sha256": hashlib.sha256(secret).hexdigest(),
+        "device": info.st_dev, "inode": info.st_ino, "mode": 0o600,
+        "uid": os.geteuid(), "gid": os.getegid(), "links": 1, "size": len(secret),
+    }}
+
+    class Unsigned:
+        status = 200
+        headers = {}
+        def read(self): return b'{"accepted":true,"ready":true}'
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+
+    monkeypatch.setattr(helper.urllib.request, "urlopen", lambda *_args, **_kwargs: Unsigned())
+    with pytest.raises(ValueError, match="signed Psychlo readiness"):
+        helper._verify_psychlo_readiness(capability)
+
+
 @pytest.mark.parametrize(
     ("initial_phase", "unexpected"),
     [
@@ -399,6 +531,60 @@ def test_rollback_stops_only_after_operation_owned_unit_attestation(monkeypatch)
     with pytest.raises(Crash):
         helper._rollback(capability)
     assert calls == ["attest-owned", ("disable", "--now", "overseer-api.service")]
+
+
+def test_rollback_before_any_quarantine_attests_baseline_without_restore_or_signal(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    journal = {
+        "phase": "intent-system-unit", "planDigest": "d" * 64, "journalActionId": "action",
+        "systemUnitIdentity": None, "oldSystemUnitQuarantine": "",
+        "userResourceQuarantines": [], "daemonOwnership": "", "priorDaemonState": None,
+        "priorSystemServiceState": {"present": True, "enabled": True, "active": True},
+    }
+    old_system = {"path": helper.SYSTEM_UNIT, "sha256": "a" * 64, "device": 1, "inode": 2,
+                  "mode": 0o644, "uid": 0, "size": 10, "enabled": True, "active": True,
+                  "activeProcess": {}}
+    old_user = {"path": "/old/user.service", "sha256": "b" * 64, "device": 3, "inode": 4,
+                "mode": 0o600, "uid": 1000, "size": 11}
+    capability = {"planDigest": "d" * 64, "journalActionId": "action",
+                  "oldSystemUnit": old_system, "oldUserResources": [old_user],
+                  "priorSystemServiceState": dict(journal["priorSystemServiceState"])}
+    writes = []
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_write_journal", lambda value: writes.append(value["phase"]))
+    monkeypatch.setattr(helper, "_attest_unchanged_pre_activation_resources", lambda *_args: None)
+    monkeypatch.setattr(helper, "_restore_codex_daemon", lambda _journal: None)
+    monkeypatch.setattr(helper, "_restore_exact_quarantine", lambda *_args, **_kwargs: pytest.fail("restore called"))
+    monkeypatch.setattr(helper, "_run_systemctl", lambda *_args: pytest.fail("systemctl called"))
+    monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: pytest.fail("signal called"))
+
+    helper._rollback(capability)
+    assert writes == ["rolled-back"]
+
+
+def test_rollback_after_prior_stop_but_before_quarantine_restores_only_prior_activity(monkeypatch):
+    import overseer_codex_dispatch_root_helper as helper
+
+    journal = {
+        "phase": "prior-system-stopped", "planDigest": "d" * 64, "journalActionId": "action",
+        "systemUnitIdentity": None, "oldSystemUnitQuarantine": "", "userResourceQuarantines": [],
+        "daemonOwnership": "", "priorDaemonState": None,
+        "priorSystemServiceState": {"present": True, "enabled": True, "active": True},
+    }
+    capability = {"planDigest": "d" * 64, "journalActionId": "action",
+                  "oldSystemUnit": {"active": True}, "oldUserResources": [],
+                  "priorSystemServiceState": dict(journal["priorSystemServiceState"])}
+    calls = []
+    monkeypatch.setattr(helper, "_read_journal", lambda _digest: journal)
+    monkeypatch.setattr(helper, "_restore_pre_quarantine_baseline", lambda _capability: calls.append("restore-prior-activity"))
+    monkeypatch.setattr(helper, "_restore_codex_daemon", lambda _journal: None)
+    monkeypatch.setattr(helper, "_write_journal", lambda value: calls.append(value["phase"]))
+    monkeypatch.setattr(helper, "_restore_exact_quarantine", lambda *_args, **_kwargs: pytest.fail("quarantine restore called"))
+    monkeypatch.setattr(helper, "_pin_and_signal", lambda *_args: pytest.fail("signal called"))
+
+    helper._rollback(capability)
+    assert calls == ["restore-prior-activity", "rolled-back"]
 
 
 def test_rollback_rejects_prior_service_state_journal_drift_before_stop(monkeypatch):

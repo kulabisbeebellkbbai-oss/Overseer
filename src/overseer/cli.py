@@ -56,6 +56,7 @@ from .psychlo_cycle_activation import (
 )
 from .codex_dispatch_system_activation import (
     SystemActivationSpec as CodexDispatchActivationSpec,
+    bootstrap_codex_dispatch_authority,
     build_codex_dispatch_activation_spec,
     external_activation_cli,
     execute_codex_dispatch_activation_marker,
@@ -4422,6 +4423,14 @@ def execute_admin_change_status(
             "policy_profile_path": str(profile_path),
             **admin_execution_status(result),
         }
+    finally:
+        store.close()
+
+
+def bootstrap_codex_dispatch_authority_status(store_path: str | Path, plan_id: str) -> dict[str, object]:
+    store = SQLiteStore(store_path)
+    try:
+        return bootstrap_codex_dispatch_authority(store.load_admin_change_plan(plan_id))
     finally:
         store.close()
 
@@ -10735,6 +10744,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     codex_dispatch_status_parser.add_argument("--store", required=True)
     codex_dispatch_status_parser.add_argument("--plan-id", required=True)
+    codex_dispatch_bootstrap_parser = subparsers.add_parser(
+        "bootstrap-codex-dispatch-authority",
+        help="perform the one-time external HUMAN/SISKO root authority ceremony for an approved plan",
+    )
+    codex_dispatch_bootstrap_parser.add_argument("--store", required=True)
+    codex_dispatch_bootstrap_parser.add_argument("--plan-id", required=True)
     codex_dispatch_execute_parser = subparsers.add_parser(
         "execute-codex-dispatch-activation",
         help="execute an approved reviewed Codex dispatch activation",
@@ -12148,6 +12163,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(admin_change_plan_status(plan), sort_keys=True))
         finally:
             store.close()
+        return 0
+
+    if args.command == "bootstrap-codex-dispatch-authority":
+        require_isolated_activation_entry()
+        with external_activation_cli():
+            print(json.dumps(bootstrap_codex_dispatch_authority_status(args.store, args.plan_id), sort_keys=True))
         return 0
 
     if args.command == "execute-codex-dispatch-activation":

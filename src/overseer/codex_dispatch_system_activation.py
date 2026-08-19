@@ -6,12 +6,13 @@ import ctypes
 import hashlib
 import json
 import os
+import socket
 import stat
 import struct
 import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -31,16 +32,20 @@ from .core import ApprovalLevel, OwnerDomain, RiskLevel
 SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 ROOT_HELPER_SOURCE = "src/overseer_codex_dispatch_root_helper.py"
 ROOT_HELPER_PATH = Path("/usr/local/libexec/overseer-codex-dispatch-activation")
+ROOT_AUTHORITY_PATH = Path("/etc/overseer/codex-dispatch-authority.json")
 SYSTEM_UNIT_PATH = Path("/etc/systemd/system/overseer-api.service")
 SYSTEM_ENABLE_LINK = Path("/etc/systemd/system/multi-user.target.wants/overseer-api.service")
 SYSTEM_CGROUP_PROCS = Path("/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs")
 USER_UNIT = Path("/home/god/.config/systemd/user/overseer-api.service")
 USER_DROPINS = Path("/home/god/.config/systemd/user/overseer-api.service.d")
 PRIMARY_STORE = "/home/god/.local/share/overseer/project/state/overseer.sqlite3"
+CODEX_BINARY = Path("/usr/local/bin/codex")
+CODEX_SOCKET = Path("/home/god/.codex/app-server-control/app-server-control.sock")
+CODEX_SETTINGS = Path("/home/god/.codex/app-server-daemon/settings.json")
 _EXTERNAL = ContextVar("overseer_codex_system_activation_external", default=False)
 
 BOOTSTRAP_INSTALLER = r'''import ctypes,hashlib,json,os,stat,struct,sys
-digest,target=sys.argv[1:]; assert target=="/usr/local/libexec/overseer-codex-dispatch-activation" and len(digest)==64
+plan_digest,digest,authority_digest=sys.argv[1:];target="/usr/local/libexec/overseer-codex-dispatch-activation";assert all(len(x)==64 for x in (plan_digest,digest,authority_digest))
 def exact(n):
  b=b""
  while len(b)<n:
@@ -48,7 +53,8 @@ def exact(n):
   if not x: raise RuntimeError("truncated helper stream")
   b+=x
  return b
-size=struct.unpack(">Q",exact(8))[0]; data=exact(size); assert not sys.stdin.buffer.read(1) and hashlib.sha256(data).hexdigest()==digest
+size=struct.unpack(">Q",exact(8))[0];data=exact(size);asize=struct.unpack(">Q",exact(8))[0];authority=exact(asize);assert not sys.stdin.buffer.read(1) and hashlib.sha256(data).hexdigest()==digest
+record=json.loads(authority);unsigned=dict(record);record_digest=unsigned.pop("authorityDigest");assert authority==json.dumps(record,sort_keys=True,separators=(",",":")).encode()+b"\n" and hashlib.sha256(json.dumps(unsigned,sort_keys=True,separators=(",",":")).encode()).hexdigest()==authority_digest==record_digest and record["planDigest"]==plan_digest and record["helperSha256"]==digest
 root=os.lstat("/usr/local"); rootid=(root.st_dev,root.st_ino,root.st_uid,root.st_gid,stat.S_IMODE(root.st_mode)); assert stat.S_ISDIR(root.st_mode) and root.st_uid==0 and root.st_gid==0 and not stat.S_IMODE(root.st_mode)&0o022
 rfd=os.open("/usr/local",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW)
 try: os.mkdir("libexec",0o755,dir_fd=rfd)
@@ -70,12 +76,40 @@ except FileNotFoundError:
  os.close(fd);libc=ctypes.CDLL(None,use_errno=True)
  if libc.renameat2(lfd,tmp.encode(),lfd,name.encode(),1)!=0: raise OSError(ctypes.get_errno(),"helper no-replace install failed")
  os.fsync(lfd)
-after=os.lstat("/usr/local");assert rootid==(after.st_dev,after.st_ino,after.st_uid,after.st_gid,stat.S_IMODE(after.st_mode))
-os.close(lfd);os.close(rfd);print(json.dumps({"status":"installed","helperDigest":digest,"helperPath":target},sort_keys=True,separators=(",",":")))'''
+after=os.lstat("/usr/local");assert rootid==(after.st_dev,after.st_ino,after.st_uid,after.st_gid,stat.S_IMODE(after.st_mode));os.close(lfd);os.close(rfd)
+efd=os.open("/etc",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW)
+try: os.mkdir("overseer",0o755,dir_fd=efd)
+except FileExistsError: pass
+ofd=os.open("overseer",os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=efd);oi=os.fstat(ofd);assert oi.st_uid==0 and oi.st_gid==0 and not stat.S_IMODE(oi.st_mode)&0o022
+name="codex-dispatch-authority.json"
+try:
+ afd=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=ofd);existing=os.read(afd,1048576);ai=os.fstat(afd);os.close(afd);assert existing==authority and ai.st_uid==0 and ai.st_gid==0 and ai.st_nlink==1 and stat.S_IMODE(ai.st_mode)==0o400
+except FileNotFoundError:
+ tmp="."+name+"."+authority_digest+".new";afd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o400,dir_fd=ofd);assert os.write(afd,authority)==len(authority);os.fchmod(afd,0o400);os.fsync(afd);os.close(afd);libc=ctypes.CDLL(None,use_errno=True)
+ if libc.renameat2(ofd,tmp.encode(),ofd,name.encode(),1)!=0: raise OSError(ctypes.get_errno(),"authority no-replace install failed")
+ os.fsync(ofd)
+os.close(ofd);os.close(efd);print(json.dumps({"status":"installed","planDigest":plan_digest,"helperDigest":digest,"authorityDigest":authority_digest},sort_keys=True,separators=(",",":")))'''
 
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _authority_record(spec: "SystemActivationSpec", plan_id: str) -> dict[str, object]:
+    approval = {"recordId": f"admin-approval:{plan_id}", "planId": plan_id,
+                "approvalLevel": "human", "ownerDomain": "sisko"}
+    unsigned = {
+        "schemaVersion": "overseer.codex-dispatch-root-authority.v1",
+        "planDigest": spec.capability(plan_id)["planDigest"],
+        "helperGitBlob": spec.helper_blob["blob"], "helperSha256": spec.helper_blob["sha256"],
+        "helperSize": spec.helper_blob["size"], "rootHelperPath": str(ROOT_HELPER_PATH),
+        "rootAuthorityPath": str(ROOT_AUTHORITY_PATH),
+        "bootstrapInlineSha256": _sha256(BOOTSTRAP_INSTALLER.encode()),
+        "systemUnitSha256": _sha256(spec.system_unit.encode()),
+        "releaseManifestDigest": spec.manifest.digest,
+        "approvalRecordId": approval["recordId"], "approvalRecordDigest": _digest(approval),
+    }
+    return {**unsigned, "authorityDigest": _digest(unsigned)}
 
 
 def _helper_blob() -> dict[str, object]:
@@ -116,10 +150,23 @@ def _old_system_unit() -> Mapping[str, object] | None:
         if (not stat.S_ISLNK(link.st_mode) or link.st_uid != 0
                 or SYSTEM_ENABLE_LINK.resolve(strict=True) != SYSTEM_UNIT_PATH):
             raise ValueError("preexisting root system enablement link is unsafe")
-    active = bool(SYSTEM_CGROUP_PROCS.exists() and SYSTEM_CGROUP_PROCS.read_text().strip())
+    pids = [int(item) for item in SYSTEM_CGROUP_PROCS.read_text().split()] if SYSTEM_CGROUP_PROCS.exists() else []
+    if len(pids) > 1:
+        raise ValueError("preexisting root system service is not a unique process")
+    active = bool(pids)
+    active_process = None
+    if pids:
+        pid = pids[0]
+        raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw_stat[raw_stat.rfind(")") + 2:].split()
+        active_process = {"bootId": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                          "pid": pid, "startTicks": int(fields[19]),
+                          "cgroup": Path(f"/proc/{pid}/cgroup").read_text().strip(),
+                          "cmdlineHex": Path(f"/proc/{pid}/cmdline").read_bytes().hex()}
     return {"path": str(SYSTEM_UNIT_PATH), "sha256": _sha256(content), "device": info.st_dev,
             "inode": info.st_ino, "mode": stat.S_IMODE(info.st_mode), "uid": 0,
-            "size": info.st_size, "enabled": enabled, "active": active}
+            "size": info.st_size, "enabled": enabled, "active": active,
+            "activeProcess": active_process}
 
 
 def _old_user_resources() -> tuple[Mapping[str, object], ...]:
@@ -129,6 +176,54 @@ def _old_user_resources() -> tuple[Mapping[str, object], ...]:
             raise ValueError("user service drop-in directory is unsafe")
         paths.extend(sorted(USER_DROPINS.glob("*.conf")))
     return tuple(_bound_user_resource(path) for path in paths)
+
+
+def _codex_daemon_spec() -> Mapping[str, object]:
+    binary = _root_identity(CODEX_BINARY)
+    prior_remote: bool | None = None
+    prior_settings = None
+    if CODEX_SETTINGS.exists():
+        content, info = _stable_read(CODEX_SETTINGS)
+        if info.st_uid != 1000 or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError("Codex daemon settings are unsafe")
+        settings = json.loads(content)
+        if not isinstance(settings, dict) or set(settings) != {"remoteControlEnabled"}:
+            raise ValueError("Codex daemon settings contract is invalid")
+        prior_remote = settings["remoteControlEnabled"]
+        prior_settings = {"sha256": _sha256(content), "size": info.st_size,
+                          "mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid}
+    prior_running = CODEX_SOCKET.exists()
+    prior_evidence = None
+    if prior_running:
+        socket_info = CODEX_SOCKET.lstat()
+        if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != 1000:
+            raise ValueError("Codex daemon socket is unsafe")
+        completed = subprocess.run((str(CODEX_BINARY), "app-server", "daemon", "version"),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env={"HOME": "/home/god", "CODEX_HOME": "/home/god/.codex",
+                                        "XDG_RUNTIME_DIR": "/run/user/1000", "PATH": "/usr/local/bin:/usr/bin:/bin",
+                                        "LC_ALL": "C"}, check=False)
+        version = json.loads(completed.stdout)
+        if (completed.returncode != 0 or completed.stderr or not isinstance(version, dict)
+                or version.get("remoteControlEnabled") is not False
+                or version.get("socketPath") != str(CODEX_SOCKET)):
+            raise ValueError("preexisting Codex daemon contract is invalid")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.connect(str(CODEX_SOCKET))
+            pid, uid, gid = struct.unpack("3i", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        finally:
+            client.close()
+        raw_stat = Path(f"/proc/{pid}/stat").read_text()
+        prior_evidence = {"version": version, "peerPid": pid, "peerUid": uid, "peerGid": gid,
+                          "peerStartTicks": int(raw_stat[raw_stat.rfind(")") + 2:].split()[19]),
+                          "socketDevice": socket_info.st_dev, "socketInode": socket_info.st_ino,
+                          "peerCmdlineHex": Path(f"/proc/{pid}/cmdline").read_bytes().hex(),
+                          "peerCgroup": Path(f"/proc/{pid}/cgroup").read_text().strip()}
+    return {"binary": binary, "socketPath": str(CODEX_SOCKET),
+            "priorRunning": prior_running, "priorEvidence": prior_evidence,
+            "priorRemoteControlEnabled": prior_remote, "priorSettings": prior_settings,
+            "uid": 1000, "gid": 1000}
 
 
 def system_unit_content(manifest: ImmutableReleaseManifest) -> str:
@@ -144,6 +239,7 @@ def system_unit_content(manifest: ImmutableReleaseManifest) -> str:
         "Environment=OVERSEER_PSYCHLO_BRIDGE_DATABASE=/home/god/.local/share/overseer/psychlo/bridge.sqlite3\n"
         "Environment=OVERSEER_PSYCHLO_PROJECT_BINDINGS_FILE=/home/god/.config/overseer/psychlo-project-bindings.json\n"
         "Environment=OVERSEER_PSYCHLO_POLICY_VERSION=2026-08-08\n"
+        "Environment=OVERSEER_PSYCHLO_PEER_SECRET_FILE=%d/psychlo-overseer-peer-secret\n"
         "LoadCredential=psychlo-overseer-peer-secret:/home/god/.config/psychlo/overseer-peer-secret\n"
         f"{exec_start}\nRestart=on-failure\nRestartSec=5\n"
         "NoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\n"
@@ -162,6 +258,7 @@ class SystemActivationSpec:
     old_user_resources: tuple[Mapping[str, object], ...]
     old_system_unit: Mapping[str, object] | None
     system_unit: str
+    codex_daemon: Mapping[str, object] = field(default_factory=dict)
 
     def capability(self, plan_id: str) -> dict[str, object]:
         prior_service_state = {
@@ -174,6 +271,13 @@ class SystemActivationSpec:
             "manifestDigest": self.manifest.digest, "releaseRoot": str(self.manifest.release_root),
             "systemUnit": self.system_unit, "systemUnitSha256": _sha256(self.system_unit.encode()),
             "bootstrapHelperSha256": self.helper_blob["sha256"], "rootHelperPath": str(ROOT_HELPER_PATH),
+            "bootstrapHelperGitBlob": self.helper_blob["blob"], "bootstrapHelperSize": self.helper_blob["size"],
+            "bootstrapInlineSha256": _sha256(BOOTSTRAP_INSTALLER.encode()),
+            "rootAuthorityPath": str(ROOT_AUTHORITY_PATH),
+            "approvalRecordId": f"admin-approval:{plan_id}",
+            "approvalRecordDigest": _digest({"recordId": f"admin-approval:{plan_id}", "planId": plan_id,
+                                              "approvalLevel": "human", "ownerDomain": "sisko"}),
+            "codexDaemon": dict(self.codex_daemon),
             "rootPythonIdentity": dict(self.manifest.root_python),
             "oldUserResources": [dict(item) for item in self.old_user_resources],
             "oldSystemUnit": dict(self.old_system_unit) if self.old_system_unit is not None else None,
@@ -192,31 +296,38 @@ class SystemActivationSpec:
                 "oldApiBinding": dict(self.old_api_binding),
                 "oldUserResources": [dict(item) for item in self.old_user_resources],
                 "oldSystemUnit": dict(self.old_system_unit) if self.old_system_unit is not None else None,
-                "systemUnit": self.system_unit}
+                "systemUnit": self.system_unit, "codexDaemon": dict(self.codex_daemon)}
 
     @classmethod
     def from_json(cls, value: Mapping[str, object]) -> "SystemActivationSpec":
         keys = {"schemaVersion", "manifest", "helperBlob", "managerBinding", "oldApiBinding",
-                "oldUserResources", "oldSystemUnit", "systemUnit"}
+                "oldUserResources", "oldSystemUnit", "systemUnit", "codexDaemon"}
         if not isinstance(value, Mapping) or set(value) != keys or value["schemaVersion"] != SCHEMA:
             raise ValueError("system activation spec is invalid")
         return cls(ImmutableReleaseManifest.from_json(value["manifest"]), dict(value["helperBlob"]),
                    dict(value["managerBinding"]), dict(value["oldApiBinding"]),
                    tuple(dict(item) for item in value["oldUserResources"]),
                    dict(value["oldSystemUnit"]) if isinstance(value["oldSystemUnit"], Mapping) else None,
-                   str(value["systemUnit"]))
+                   str(value["systemUnit"]), dict(value["codexDaemon"]))
 
 
 def build_codex_dispatch_activation_spec() -> SystemActivationSpec:
     provisional = build_immutable_release_manifest(unit_contract=b"system-unit-v1")
     unit = system_unit_content(provisional)
     return SystemActivationSpec(provisional, _helper_blob(), _capture_manager_binding(),
-                                _capture_api_binding(), _old_user_resources(), _old_system_unit(), unit)
+                                _capture_api_binding(), _old_user_resources(), _old_system_unit(), unit,
+                                _codex_daemon_spec())
 
 
 def _bootstrap_command(spec: SystemActivationSpec) -> tuple[str, ...]:
+    raise RuntimeError("plan id is required for the authority bootstrap command")
+
+
+def _authority_bootstrap_command(spec: SystemActivationSpec, plan_id: str) -> tuple[str, ...]:
+    authority = _authority_record(spec, plan_id)
     return ("/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c",
-            BOOTSTRAP_INSTALLER, str(spec.helper_blob["sha256"]), str(ROOT_HELPER_PATH))
+            BOOTSTRAP_INSTALLER, str(authority["planDigest"]), str(spec.helper_blob["sha256"]),
+            str(authority["authorityDigest"]))
 
 
 def _root_helper_command(action: str, digest: str) -> tuple[str, ...]:
@@ -229,8 +340,18 @@ def plan_codex_dispatch_activation(plan_id: str, spec: SystemActivationSpec, rea
     capability = spec.capability(plan_id)
     digest = str(capability["planDigest"])
     marker = lambda action: ("__overseer_codex_dispatch_system_v1", action, plan_id, digest)
+    authority = _authority_record(spec, plan_id)
+    bootstrap_artifact = {
+        "planDigest": digest, "helperGitBlob": spec.helper_blob["blob"],
+        "helperSha256": spec.helper_blob["sha256"], "helperSize": spec.helper_blob["size"],
+        "rootHelperPath": str(ROOT_HELPER_PATH), "rootAuthorityPath": str(ROOT_AUTHORITY_PATH),
+        "bootstrapInlineCode": BOOTSTRAP_INSTALLER,
+        "bootstrapInlineSha256": _sha256(BOOTSTRAP_INSTALLER.encode()),
+        "authorityRecord": authority, "authorityDigest": authority["authorityDigest"],
+        "command": list(_authority_bootstrap_command(spec, plan_id)),
+    }
     metadata = {"schemaVersion": SCHEMA, "spec": spec.to_json(), "capability": capability,
-                "bootstrapCommand": list(_bootstrap_command(spec)),
+                "bootstrapArtifact": bootstrap_artifact,
                 "activateCommand": list(_root_helper_command("activate", digest)),
                 "rollbackCommand": list(_root_helper_command("rollback", digest)),
                 "externalCliOnly": True, "apiExecutionAllowed": False}
@@ -240,12 +361,8 @@ def plan_codex_dispatch_activation(plan_id: str, spec: SystemActivationSpec, rea
         approval_level=ApprovalLevel.HUMAN, target="system/overseer-api.service", reason=reason,
         current_state=current_state,
         proposed_state=f"root system service from immutable release {spec.manifest.release_root}",
-        steps=(
-            AdminCommandStep("Install reviewed root activation helper", marker("bootstrap-helper"),
-                             "stream the exact reviewed helper Git blob to the tiny fixed root installer"),
-            AdminCommandStep("Activate immutable root system service", marker("activate-system"),
-                             "root helper resumes the exact journaled migration and attests the system service"),
-        ),
+        steps=(AdminCommandStep("Activate immutable root system service", marker("activate-system"),
+                                "root helper resumes the exact journaled migration and attests the system service"),),
         rollback_steps=(AdminCommandStep("Externally rollback system-service migration", marker("rollback"),
                                          "root helper stops the system service before exact user-service restoration"),),
         risks=("root helper and system unit installation require explicit approval",
@@ -261,7 +378,7 @@ def validate_codex_dispatch_activation_plan(plan: AdminChangePlan) -> SystemActi
     metadata = plan.adapter_metadata
     if (AdminChangeKind(plan.kind) != AdminChangeKind.CODEX_APP_SERVER_DISPATCH_ACTIVATION
             or not isinstance(metadata, dict) or set(metadata) != {"schemaVersion", "spec", "capability",
-                                                               "bootstrapCommand", "activateCommand", "rollbackCommand",
+                                                               "bootstrapArtifact", "activateCommand", "rollbackCommand",
                                                                "externalCliOnly", "apiExecutionAllowed"}):
         raise ValueError("system activation plan metadata is invalid")
     spec = SystemActivationSpec.from_json(metadata["spec"])
@@ -285,6 +402,8 @@ def verify_system_activation_spec(spec: SystemActivationSpec) -> None:
         raise ValueError("old user service resources changed; restage")
     if spec.old_system_unit != _old_system_unit():
         raise ValueError("preexisting root system unit changed; restage")
+    if dict(spec.codex_daemon) != dict(_codex_daemon_spec()):
+        raise ValueError("Codex daemon binary or prior state changed; restage")
     if dict(spec.manager_binding) != _capture_manager_binding():
         raise ValueError("approved user manager changed; restage")
     if dict(spec.old_api_binding) != _capture_api_binding():
@@ -336,6 +455,35 @@ def _helper_bytes(spec: SystemActivationSpec) -> bytes:
             or _sha256(completed.stdout) != binding["sha256"]):
         raise ValueError("reviewed helper blob bytes changed")
     return completed.stdout
+
+
+def _authority_file_present() -> bool:
+    try:
+        info = ROOT_AUTHORITY_PATH.lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o400):
+        raise ValueError("root dispatch authority record is unsafe")
+    return True
+
+
+def bootstrap_codex_dispatch_authority(plan: AdminChangePlan) -> dict[str, object]:
+    require_external_activation_context()
+    spec = validate_codex_dispatch_activation_plan(plan)
+    if (not plan.approved or str(plan.approved_by).lower() != "sisko"
+            or plan.approval_level is not ApprovalLevel.HUMAN or plan.owner_domain is not OwnerDomain.SISKO):
+        raise ValueError("exact HUMAN/SISKO plan approval is required for root authority bootstrap")
+    authority = _authority_record(spec, plan.id)
+    command = _authority_bootstrap_command(spec, plan.id)
+    _run_stream(
+        command,
+        (_helper_bytes(spec), _canonical(authority) + b"\n"),
+        {"status": "installed", "planDigest": authority["planDigest"],
+         "helperDigest": authority["helperSha256"], "authorityDigest": authority["authorityDigest"]},
+    )
+    return {"status": "installed", "planId": plan.id, "planDigest": authority["planDigest"],
+            "authorityRecordPath": str(ROOT_AUTHORITY_PATH), "authorityDigest": authority["authorityDigest"]}
 
 
 def _run_stream(command: Sequence[str], frames: Sequence[bytes], expected: Mapping[str, object]) -> None:
@@ -419,12 +567,6 @@ def execute_codex_dispatch_activation_marker(command: Sequence[str]) -> tuple[in
             raise ValueError("system activation marker lacks exact plan authority")
         spec, plan_id, digest = context
         action = command[1]
-        if action == "bootstrap-helper":
-            helper = _helper_bytes(spec)
-            _run_stream(_bootstrap_command(spec), (helper,),
-                        {"status": "installed", "helperDigest": spec.helper_blob["sha256"],
-                         "helperPath": str(ROOT_HELPER_PATH)})
-            return 0, "reviewed root helper installed", ""
         capability = spec.capability(plan_id)
         frames = [_canonical(capability)]
         if action == "activate-system":
@@ -457,6 +599,8 @@ def execute_codex_dispatch_activation_plan(plan: AdminChangePlan, *, runner: Cal
     try:
         spec = validate_codex_dispatch_activation_plan(plan)
         _reject_api_context()
+        if not _authority_file_present():
+            raise ValueError("root dispatch authority is missing; complete the approved bootstrap-authority ceremony")
         verify_system_activation_spec(spec)
     except (OSError, ValueError) as error:
         return AdminExecutionResult(f"admin.exec.{plan.id}.blocked", plan.id, AdminExecutionStatus.BLOCKED, str(error), ())
@@ -485,7 +629,8 @@ def execute_codex_dispatch_activation_plan(plan: AdminChangePlan, *, runner: Cal
         _ACTIVE.reset(token)
 
 
-__all__ = ["SystemActivationSpec", "build_codex_dispatch_activation_spec", "external_activation_cli",
+__all__ = ["SystemActivationSpec", "bootstrap_codex_dispatch_authority",
+           "build_codex_dispatch_activation_spec", "external_activation_cli",
            "execute_codex_dispatch_activation_marker", "execute_codex_dispatch_activation_plan",
            "plan_codex_dispatch_activation", "require_external_activation_context",
            "require_isolated_activation_entry",

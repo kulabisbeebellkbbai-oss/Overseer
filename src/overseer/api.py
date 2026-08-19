@@ -358,7 +358,8 @@ def make_api_handler(
             path = _strip_protected_gateway_prefix(route.path)
             query = parse_qs(route.query, keep_blank_values=True)
             if path == "/health":
-                self._write_json({"ok": True, "service": "overseer-api"})
+                self._write_json({"ok": True, "service": "overseer-api",
+                                  "psychloBridgeReady": psychlo_bridge is not None})
                 return
             if path == "/favicon.ico":
                 self._write_empty(HTTPStatus.NO_CONTENT)

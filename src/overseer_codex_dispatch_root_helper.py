@@ -14,6 +14,7 @@ import json
 import os
 import select
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -25,11 +26,15 @@ from pathlib import Path
 
 SCHEMA = "overseer.codex-dispatch-system-activation.v1"
 HELPER_PATH = "/usr/local/libexec/overseer-codex-dispatch-activation"
+AUTHORITY_PATH = "/etc/overseer/codex-dispatch-authority.json"
 SYSTEM_UNIT = "/etc/systemd/system/overseer-api.service"
 SYSTEM_ENABLE_LINK = "/etc/systemd/system/multi-user.target.wants/overseer-api.service"
 SYSTEM_CGROUP_PROCS = "/sys/fs/cgroup/system.slice/overseer-api.service/cgroup.procs"
 STATE_ROOT = "/var/lib/overseer/codex-dispatch-activation"
 SYSTEMCTL = "/usr/bin/systemctl"
+CODEX_BINARY = "/usr/local/bin/codex"
+CODEX_SOCKET = "/home/god/.codex/app-server-control/app-server-control.sock"
+CODEX_SETTINGS = "/home/god/.codex/app-server-daemon/settings.json"
 SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
 PROC_ROOT = "/proc"
 
@@ -351,32 +356,21 @@ def _journal_path(plan_digest: str) -> str:
     return f"{STATE_ROOT}/{plan_digest}.journal.json"
 
 
-def _write_journal(value: dict[str, object]) -> None:
-    path = _journal_path(str(value["planDigest"]))
-    if os.path.exists(path):
-        # Root journal replacement is descriptor-anchored; the old inode is
-        # retained as an inert recovery record.
-        parent_fd = _root_directory(str(Path(path).parent), 0o700)
-        try:
-            name = Path(path).name
-            prior = f".{name}.{os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_ino}.prior-inert"
-            try:
-                _rename_noreplace(parent_fd, name, parent_fd, prior)
-            except FileExistsError:
-                raise RuntimeError("root journal prior record already exists")
-        finally:
-            os.close(parent_fd)
-    _atomic_root_file(path, _canonical(value) + b"\n", 0o600)
+_JOURNAL_CRASH_HOOK = lambda _phase: None
 
 
-def _read_journal(plan_digest: str) -> dict[str, object]:
-    path = _journal_path(plan_digest)
-    content, info = _stable_file(path, uid=0, mode=0o600, digest=None)
+def _journal_prior_path(plan_digest: str) -> str:
+    return f"{STATE_ROOT}/.{plan_digest}.journal.prior.json"
+
+
+def _decode_journal(content: bytes, plan_digest: str) -> dict[str, object]:
     value = json.loads(content)
     expected = {"schemaVersion", "planDigest", "phase", "journalActionId",
                 "userResourceQuarantines", "oldSystemUnitQuarantine", "systemUnitIdentity",
-                "priorSystemServiceState", "lastError"}
-    phases = {"intent-system-unit", "system-unit-installed", "release-installed",
+                "priorSystemServiceState", "priorDaemonState", "daemonOwnership", "daemonEvidence",
+                "lastError", "generation", "recordDigest"}
+    phases = {"intent-system-unit", "intent-daemon", "daemon-ready", "intent-stop-prior-system",
+              "prior-system-stopped", "system-unit-installed", "release-installed",
               "user-service-quarantined", "old-api-stopped", "system-service-started",
               "verified", "rollback-pending", "rollback-system-stopped",
               "rollback-new-unit-quarantined", "rollback-old-unit-restored",
@@ -385,12 +379,93 @@ def _read_journal(plan_digest: str) -> dict[str, object]:
               "rollback-user-manager-reloaded", "rollback-user-api-started", "rolled-back"}
     if (not isinstance(value, dict) or set(value) != expected or value["schemaVersion"] != SCHEMA
             or value["planDigest"] != plan_digest or value["phase"] not in phases
+            or not isinstance(value["generation"], int) or value["generation"] < 1
+            or not isinstance(value["recordDigest"], str)
+            or value["recordDigest"] != _digest({key: value[key] for key in value if key != "recordDigest"})
+            or content != _canonical(value) + b"\n"
             or not isinstance(value["priorSystemServiceState"], dict)
             or set(value["priorSystemServiceState"]) != {"present", "enabled", "active"}
             or any(not isinstance(value["priorSystemServiceState"][key], bool)
                    for key in ("present", "enabled", "active"))):
         raise ValueError("root activation journal is invalid")
     return value
+
+
+def _journal_candidate(path: str, plan_digest: str) -> tuple[dict[str, object], bytes] | None:
+    try:
+        content, info = _stable_file(path, uid=0, mode=0o600, digest=None)
+    except FileNotFoundError:
+        return None
+    if info.st_gid != 0:
+        raise ValueError("root activation journal group is invalid")
+    return _decode_journal(content, plan_digest), content
+
+
+def _journal_candidates(plan_digest: str) -> list[tuple[dict[str, object], bytes]]:
+    candidates = []
+    errors = []
+    for path in (_journal_path(plan_digest), _journal_prior_path(plan_digest)):
+        try:
+            candidate = _journal_candidate(path, plan_digest)
+        except (ValueError, json.JSONDecodeError) as error:
+            errors.append(error)
+            continue
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates and errors:
+        raise ValueError("no valid root activation journal generation remains") from errors[0]
+    return candidates
+
+
+def _atomic_replace_journal(parent_fd: int, name: str, content: bytes, generation: int) -> None:
+    temporary = f".{name}.{os.getpid()}.{generation}.new"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                 0o600, dir_fd=parent_fd)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("journal write made no progress")
+            view = view[written:]
+        os.fchmod(fd, 0o600); os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _write_journal(value: dict[str, object]) -> None:
+    plan_digest = str(value["planDigest"])
+    path = _journal_path(plan_digest); prior_path = _journal_prior_path(plan_digest)
+    candidates = _journal_candidates(plan_digest)
+    generation = max((int(item[0]["generation"]) for item in candidates), default=0) + 1
+    unsigned = {key: item for key, item in value.items() if key not in {"generation", "recordDigest"}}
+    unsigned["generation"] = generation
+    record = {**unsigned, "recordDigest": _digest(unsigned)}
+    content = _canonical(record) + b"\n"
+    parent_fd = _root_directory(str(Path(path).parent), 0o700)
+    try:
+        _atomic_replace_journal(parent_fd, f".{Path(path).name}.{generation}.pending", content, generation)
+        pending = f".{Path(path).name}.{generation}.pending"
+        _JOURNAL_CRASH_HOOK("new-fsynced")
+        if candidates:
+            newest = max(candidates, key=lambda item: int(item[0]["generation"]))
+            _atomic_replace_journal(parent_fd, Path(prior_path).name, newest[1], generation)
+        _JOURNAL_CRASH_HOOK("prior-replaced")
+        os.replace(pending, Path(path).name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        _JOURNAL_CRASH_HOOK("active-replaced")
+    finally:
+        os.close(parent_fd)
+    value.clear(); value.update(record)
+
+
+def _read_journal(plan_digest: str) -> dict[str, object]:
+    candidates = _journal_candidates(plan_digest)
+    if not candidates:
+        raise FileNotFoundError(_journal_path(plan_digest))
+    return max(candidates, key=lambda item: int(item[0]["generation"]))[0]
 
 
 def _run_systemctl(*arguments: str) -> None:
@@ -409,6 +484,103 @@ def _run_user_systemctl(*arguments: str) -> None:
                                stderr=subprocess.PIPE, env=SAFE_ENV, check=False, timeout=60)
     if completed.returncode != 0:
         raise RuntimeError("user service restoration action failed")
+
+
+def _run_codex(*arguments: str) -> dict[str, object]:
+    command = ("/usr/sbin/runuser", "-u", "god", "--", "/usr/bin/env", "-i",
+               "HOME=/home/god", "CODEX_HOME=/home/god/.codex", "XDG_RUNTIME_DIR=/run/user/1000",
+               "PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C", CODEX_BINARY, *arguments)
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=SAFE_ENV, check=False, timeout=120)
+    if completed.returncode != 0 or completed.stderr:
+        raise RuntimeError("Codex daemon command failed")
+    try:
+        value = json.loads(completed.stdout)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("Codex daemon command output is not JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("Codex daemon command output is invalid")
+    return value
+
+
+def _validate_codex_binary(binding: dict[str, object]) -> None:
+    required = {"path", "resolvedPath", "entryDevice", "entryInode", "entryMode", "device",
+                "inode", "mode", "links", "sha256", "size"}
+    if not isinstance(binding, dict) or set(binding) != required or binding["path"] != CODEX_BINARY:
+        raise ValueError("Codex binary binding is invalid")
+    content, info = _stable_file(str(binding["resolvedPath"]), uid=0, mode=int(binding["mode"]),
+                                 digest=str(binding["sha256"]))
+    entry = os.lstat(CODEX_BINARY)
+    if ((entry.st_dev, entry.st_ino, stat.S_IMODE(entry.st_mode))
+            != (binding["entryDevice"], binding["entryInode"], binding["entryMode"])
+            or (info.st_dev, info.st_ino, info.st_nlink, len(content))
+            != (binding["device"], binding["inode"], binding["links"], binding["size"])
+            or os.path.realpath(CODEX_BINARY) != binding["resolvedPath"]):
+        raise ValueError("Codex binary identity changed")
+
+
+def _codex_daemon_evidence() -> dict[str, object]:
+    version = _run_codex("app-server", "daemon", "version")
+    required = {"cliVersion", "daemonVersion", "state", "remoteControlEnabled", "socketPath"}
+    if (set(version) != required or version["state"] != "running"
+            or version["remoteControlEnabled"] is not False or version["socketPath"] != CODEX_SOCKET):
+        raise ValueError("Codex daemon version contract is invalid")
+    info = os.lstat(CODEX_SOCKET)
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 1000:
+        raise ValueError("Codex daemon socket is unsafe")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(CODEX_SOCKET)
+        pid, uid, gid = struct.unpack("3i", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    finally:
+        client.close()
+    if uid != 1000 or gid != 1000:
+        raise ValueError("Codex daemon peer identity is invalid")
+    return {"version": version, "peerPid": pid, "peerUid": uid, "peerGid": gid,
+            "peerStartTicks": _process_start_ticks(pid), "socketDevice": info.st_dev,
+            "socketInode": info.st_ino,
+            "peerCmdlineHex": Path(f"{PROC_ROOT}/{pid}/cmdline").read_bytes().hex(),
+            "peerCgroup": Path(f"{PROC_ROOT}/{pid}/cgroup").read_text().strip()}
+
+
+def _ensure_codex_daemon(capability: dict[str, object], journal: dict[str, object]) -> None:
+    daemon = capability["codexDaemon"]
+    _validate_codex_binary(daemon["binary"])
+    running = os.path.lexists(CODEX_SOCKET)
+    if not journal["daemonOwnership"]:
+        if running != daemon["priorRunning"]:
+            raise ValueError("Codex daemon prior state changed")
+        journal["priorDaemonState"] = {"running": daemon["priorRunning"],
+                                       "remoteControlEnabled": daemon["priorRemoteControlEnabled"],
+                                       "settings": daemon["priorSettings"]}
+        journal["daemonOwnership"] = "preexisting" if running else "start-issued"
+        journal["phase"] = "intent-daemon"; _write_journal(journal)
+    if running and journal["daemonOwnership"] == "start-issued":
+        journal["daemonOwnership"] = "started-by-operation"
+    if running and daemon["priorRemoteControlEnabled"] is True:
+        _run_codex("app-server", "daemon", "disable-remote-control")
+    if not running:
+        bootstrap = _run_codex("app-server", "daemon", "bootstrap")
+        if (set(bootstrap) != {"status", "backend", "autoUpdateEnabled", "remoteControlEnabled",
+                              "managedCodexPath", "managedCodexVersion", "socketPath", "cliVersion",
+                              "appServerVersion"}
+                or bootstrap["status"] != "bootstrapped" or bootstrap["backend"] != "pid"
+                or bootstrap["autoUpdateEnabled"] is not True
+                or bootstrap["remoteControlEnabled"] is not False or bootstrap["socketPath"] != CODEX_SOCKET):
+            raise ValueError("Codex daemon bootstrap protocol is invalid")
+        disabled = _run_codex("app-server", "daemon", "disable-remote-control")
+        if (not {"status", "remoteControlEnabled", "socketPath", "cliVersion"} <= set(disabled)
+                or disabled["status"] not in {"disabled", "alreadyDisabled"}
+                or disabled["remoteControlEnabled"] is not False or disabled["socketPath"] != CODEX_SOCKET):
+            raise ValueError("Codex daemon remote-control protocol is invalid")
+        if not os.path.lexists(CODEX_SOCKET):
+            _run_codex("app-server", "daemon", "start")
+        journal["daemonOwnership"] = "started-by-operation"
+    evidence = _codex_daemon_evidence()
+    if daemon["priorRunning"] and daemon["priorEvidence"] != evidence:
+        raise ValueError("preexisting Codex daemon peer/version identity changed")
+    journal["daemonEvidence"] = evidence
+    journal["phase"] = "daemon-ready"; _write_journal(journal)
 
 
 def _system_service_enabled() -> bool:
@@ -506,8 +678,10 @@ def _verify_bound_health(pid: int) -> dict[str, int]:
             raise ValueError("root system API process exited before health verification")
         listener = _attest_loopback_listener(pid)
         with urllib.request.urlopen("http://127.0.0.1:8766/health", timeout=5) as response:
-            if response.status != 200:
-                raise ValueError("root system API health failed")
+            health = json.loads(response.read())
+            if (response.status != 200 or health != {"ok": True, "service": "overseer-api",
+                                                     "psychloBridgeReady": True}):
+                raise ValueError("root system API and Psychlo bridge readiness failed")
         if poller.poll(0) or _attest_loopback_listener(pid) != listener:
             raise ValueError("root system API listener changed during health verification")
         return listener
@@ -587,9 +761,10 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     keys = {
         "schemaVersion", "planDigest", "manifest", "manifestDigest", "releaseRoot",
         "systemUnit", "systemUnitSha256", "bootstrapHelperSha256", "rootHelperPath",
-        "rootPythonIdentity",
+        "bootstrapHelperGitBlob", "bootstrapHelperSize", "bootstrapInlineSha256",
+        "rootAuthorityPath", "approvalRecordId", "approvalRecordDigest", "rootPythonIdentity",
         "oldUserResources", "oldSystemUnit", "priorSystemServiceState",
-        "oldApiBinding", "managerBinding", "journalActionId",
+        "oldApiBinding", "managerBinding", "journalActionId", "codexDaemon",
         "rollback", "receiptStore",
     }
     if not isinstance(value, dict) or set(value) != keys or value["schemaVersion"] != SCHEMA:
@@ -600,21 +775,17 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
         raise ValueError("activation capability is not the approved plan")
     if value["rootHelperPath"] != HELPER_PATH:
         raise ValueError("activation helper path is invalid")
+    if value["rootAuthorityPath"] != AUTHORITY_PATH:
+        raise ValueError("activation authority path is invalid")
     unit = value["systemUnit"]
     if not isinstance(unit, str) or hashlib.sha256(unit.encode()).hexdigest() != value["systemUnitSha256"]:
         raise ValueError("system unit binding is invalid")
-    required = (
-        "User=god\n", "Group=god\n", f"WorkingDirectory={value['releaseRoot']}\n",
-        "ExecStart=/usr/bin/python3 -I -S ", "Restart=on-failure\n",
-        "NoNewPrivileges=true\n", "ProtectSystem=strict\n",
-    )
-    if any(item not in unit for item in required):
-        raise ValueError("system unit is missing a mandatory exact directive")
     resources = value["oldUserResources"]
     if not isinstance(resources, list) or any(not isinstance(item, dict) for item in resources):
         raise ValueError("old user unit inventory is invalid")
     old_system = value["oldSystemUnit"]
-    old_keys = {"path", "sha256", "device", "inode", "mode", "uid", "size", "enabled", "active"}
+    old_keys = {"path", "sha256", "device", "inode", "mode", "uid", "size", "enabled", "active",
+                "activeProcess"}
     if (old_system is not None
             and (not isinstance(old_system, dict) or set(old_system) != old_keys
                  or not isinstance(old_system["enabled"], bool)
@@ -628,7 +799,39 @@ def _validate_capability(value: object, approved_digest: str) -> dict[str, objec
     }
     if prior != expected_prior:
         raise ValueError("prior root system service state binding is invalid")
+    daemon = value["codexDaemon"]
+    if (not isinstance(daemon, dict)
+            or set(daemon) != {"binary", "socketPath", "priorRunning", "priorEvidence", "priorSettings",
+                               "priorRemoteControlEnabled", "uid", "gid"}
+            or daemon["socketPath"] != CODEX_SOCKET or daemon["uid"] != 1000 or daemon["gid"] != 1000
+            or not isinstance(daemon["priorRunning"], bool)
+            or daemon["priorRemoteControlEnabled"] not in {None, False, True}
+            or (daemon["priorSettings"] is not None
+                and (not isinstance(daemon["priorSettings"], dict)
+                     or set(daemon["priorSettings"]) != {"sha256", "size", "mode", "uid"}))):
+        raise ValueError("Codex daemon capability is invalid")
     return value
+
+
+def _load_root_authority(capability: dict[str, object]) -> dict[str, object]:
+    unsigned = {
+        "schemaVersion": "overseer.codex-dispatch-root-authority.v1",
+        "planDigest": capability["planDigest"],
+        "helperGitBlob": capability["bootstrapHelperGitBlob"],
+        "helperSha256": capability["bootstrapHelperSha256"],
+        "helperSize": capability["bootstrapHelperSize"],
+        "rootHelperPath": HELPER_PATH, "rootAuthorityPath": AUTHORITY_PATH,
+        "bootstrapInlineSha256": capability["bootstrapInlineSha256"],
+        "systemUnitSha256": capability["systemUnitSha256"],
+        "releaseManifestDigest": capability["manifestDigest"],
+        "approvalRecordId": capability["approvalRecordId"],
+        "approvalRecordDigest": capability["approvalRecordDigest"],
+    }
+    expected = {**unsigned, "authorityDigest": _digest(unsigned)}
+    content, info = _stable_file(AUTHORITY_PATH, uid=0, mode=0o400, digest=None)
+    if info.st_gid != 0 or content != _canonical(expected) + b"\n":
+        raise ValueError("root dispatch authority does not exactly authorize this capability")
+    return expected
 
 
 def _validate_python_invocation(capability: dict[str, object], action: str, digest: str) -> None:
@@ -659,7 +862,7 @@ def _validate_python_invocation(capability: dict[str, object], action: str, dige
 def _prepare_system_unit(capability: dict[str, object], journal: dict[str, object]) -> tuple[int, int]:
     old = capability["oldSystemUnit"]
     if old is not None:
-        if not isinstance(old, dict) or set(old) != {"path", "sha256", "device", "inode", "mode", "uid", "size", "enabled", "active"}:
+        if not isinstance(old, dict) or set(old) != {"path", "sha256", "device", "inode", "mode", "uid", "size", "enabled", "active", "activeProcess"}:
             raise ValueError("preexisting system unit binding is invalid")
         quarantine = f"/etc/systemd/system/.overseer-api.service.{capability['journalActionId']}.prior-inert"
         if journal.get("oldSystemUnitQuarantine"):
@@ -754,7 +957,7 @@ def _restore_exact_quarantine(active: str, quarantine: str, expected: dict[str, 
         raise ValueError("restored resource changed during rename")
 
 
-def _pin_and_signal(binding: dict[str, object], signum: signal.Signals) -> None:
+def _pin_and_signal(binding: dict[str, object], signum: int | signal.Signals) -> None:
     pid = int(binding["pid"] if "pid" in binding else binding["peerPid"])
     if binding["bootId"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
         raise ValueError("approved process boot identity changed")
@@ -775,6 +978,58 @@ def _pin_and_signal(binding: dict[str, object], signum: signal.Signals) -> None:
         os.close(pidfd)
 
 
+def _stop_prior_system_service(capability: dict[str, object], journal: dict[str, object]) -> None:
+    old_system = capability["oldSystemUnit"]
+    if old_system is None or not old_system["active"]:
+        return
+    if _system_service_active():
+        binding = old_system["activeProcess"]
+        if not isinstance(binding, dict):
+            raise ValueError("prior active root service process binding is absent")
+        _pin_and_signal(binding, 0)
+        journal["phase"] = "intent-stop-prior-system"; _write_journal(journal)
+        _run_systemctl("stop", "overseer-api.service")
+    if _system_service_active():
+        raise RuntimeError("prior root system service did not stop before unit replacement")
+    journal["phase"] = "prior-system-stopped"; _write_journal(journal)
+
+
+def _restore_codex_daemon(journal: dict[str, object]) -> None:
+    if journal.get("daemonOwnership") == "started-by-operation":
+        _run_codex("app-server", "daemon", "stop")
+        if os.path.lexists(CODEX_SOCKET):
+            raise RuntimeError("operation-started Codex daemon did not stop")
+        journal["daemonOwnership"] = "stopped-by-rollback"; _write_journal(journal)
+    prior = journal.get("priorDaemonState")
+    if not isinstance(prior, dict):
+        return
+    if prior.get("remoteControlEnabled") is True:
+        _run_codex("app-server", "daemon", "enable-remote-control")
+    settings = prior.get("settings")
+    if settings is None:
+        if os.path.lexists(CODEX_SETTINGS):
+            lexical = os.lstat(CODEX_SETTINGS)
+            mode = stat.S_IMODE(lexical.st_mode)
+            if mode & 0o022:
+                raise ValueError("operation-created Codex daemon settings are unsafe")
+            content, info = _stable_file(CODEX_SETTINGS, uid=1000, mode=mode, digest=None)
+            if json.loads(content) != {"remoteControlEnabled": False}:
+                raise ValueError("operation-created Codex daemon settings changed")
+            parent_fd = os.open(str(Path(CODEX_SETTINGS).parent),
+                                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                inert = f".settings.{journal['journalActionId']}.rollback-inert.json"
+                _rename_noreplace(parent_fd, Path(CODEX_SETTINGS).name, parent_fd, inert)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+    else:
+        content, _ = _stable_file(CODEX_SETTINGS, uid=1000, mode=int(settings["mode"]),
+                                  digest=str(settings["sha256"]))
+        if len(content) != settings["size"]:
+            raise ValueError("prior Codex daemon settings were not restored exactly")
+
+
 def _activate(capability: dict[str, object], stream) -> None:
     plan_digest = str(capability["planDigest"])
     if os.path.exists(_journal_path(plan_digest)):
@@ -786,10 +1041,15 @@ def _activate(capability: dict[str, object], stream) -> None:
                    "journalActionId": capability["journalActionId"], "userResourceQuarantines": [],
                    "oldSystemUnitQuarantine": "", "systemUnitIdentity": None, "lastError": ""}
         journal["priorSystemServiceState"] = dict(capability["priorSystemServiceState"])
+        journal["priorDaemonState"] = None
+        journal["daemonOwnership"] = ""
+        journal["daemonEvidence"] = None
         _write_journal(journal)
+    _ensure_codex_daemon(capability, journal)
     _install_release(capability, stream)
     journal["phase"] = "release-installed"
     _write_journal(journal)
+    _stop_prior_system_service(capability, journal)
     unit_identity = _prepare_system_unit(capability, journal)
     journal["systemUnitIdentity"] = list(unit_identity)
     journal["phase"] = "system-unit-installed"
@@ -934,6 +1194,7 @@ def _rollback(capability: dict[str, object]) -> None:
         _run_user_systemctl("start", "overseer-api.service")
         journal["phase"] = "rollback-user-api-started"; _write_journal(journal)
     _wait_restored_user_api(capability)
+    _restore_codex_daemon(journal)
     journal["phase"] = "rolled-back"; journal["lastError"] = ""; _write_journal(journal)
 
 
@@ -960,6 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("activation capability is not canonical")
     capability = _validate_capability(value, arguments[1])
     _validate_python_invocation(capability, arguments[0], arguments[1])
+    _load_root_authority(capability)
     if arguments[0] == "activate":
         _activate(capability, sys.stdin.buffer)
     elif arguments[0] == "rollback":

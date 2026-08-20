@@ -57,6 +57,7 @@ from .psychlo_legacy_binding import _private_group_is_safe
 
 
 MAX_BODY_BYTES = 256 * 1024
+DECISION_CONTINUATION_MODES = {"same-plan", "successor-plan-required"}
 PEER_VERSION = b"psychlo-overseer-v1\0"
 POLICY_EXCEPTION_RECEIPT_SCHEMA = "psychlo.policy-exception-receiver-receipt.v1"
 OPERATIONAL_FAILURE_SCHEMA = "psychlo.operational-failure.v1"
@@ -1123,6 +1124,9 @@ class PsychloBridge:
 
     def stage_decision(self, request: Mapping[str, Any]) -> dict[str, Any]:
         decision_id = _required_string(request, "decisionId")
+        continuation_mode = request.get("continuationMode", "successor-plan-required")
+        if continuation_mode not in DECISION_CONTINUATION_MODES:
+            raise ValueError("decision continuation mode is invalid")
         if decision_id.startswith("roadex:external:"):
             receipt = {**request, "sourceId": "overseer", "provenanceId": f"roadex:{decision_id}", "status": "staged"}
             return self.store.stage_external_decision(request, receipt)
@@ -1134,6 +1138,48 @@ class PsychloBridge:
         self.store.record_decision(request, receipt)
         return {"accepted": True, "receipt": receipt}
 
+    def reconcile_decision(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the authoritative state of one exact staged decision.
+
+        The reconciliation request is the original immutable stage request,
+        not a project/crew approval summary.  Requiring byte-for-byte mapping
+        equality with the persisted request prevents a caller from using a
+        valid decision id to obtain the state of a different plan, workflow,
+        or question.  The peer envelope is authenticated by the HTTP handler
+        before this method is reached.
+        """
+        if not isinstance(request, Mapping):
+            raise ValueError("decision reconciliation request is invalid")
+        decision_id = request.get("decisionId")
+        if not isinstance(decision_id, str) or not decision_id.strip():
+            raise ValueError("decision reconciliation request is invalid")
+        record = self.store.decision_record(decision_id)
+        if record is None:
+            raise ValueError("an exact staged Psychlo decision is required")
+        if record["request"] != dict(request):
+            raise ValueError("decision identity conflict")
+        if record["status"] not in {"pending", "approved", "revision-requested", "rejected", "expired"}:
+            raise ValueError("decision state is invalid")
+        continuation_mode = record["request"].get("continuationMode", "successor-plan-required")
+        if continuation_mode not in DECISION_CONTINUATION_MODES:
+            raise ValueError("decision continuation mode is invalid")
+        # Return one canonical receipt. Do not echo a second nested copy of
+        # the request: the immutable request identity is the receipt itself.
+        receipt = {
+            **record["request"],
+            "sourceId": "overseer",
+            "status": record["status"],
+            "continuationMode": continuation_mode,
+        }
+        if record["status"] != "pending":
+            receipt.update({
+                "provenanceId": f"roadex-outcome:{decision_id}:{record['status']}",
+                "decidedBy": record["decidedBy"],
+                "decidedAt": record["decidedAt"],
+                "reason": record["reason"],
+            })
+        return {"accepted": True, "receipt": receipt}
+
     def list_decisions(self) -> list[dict[str, Any]]:
         items = []
         for record in self.store.list_staged_decisions():
@@ -1143,9 +1189,15 @@ class PsychloBridge:
         return items
 
     def decide(self, decision_id: str, decision: str, decided_by: str, reason: str) -> dict[str, Any]:
-        if decision not in {"approve", "deny", "request_revision"} or not decided_by.strip(): raise ValueError("exact human decision is required")
+        if decision not in {"approve", "deny", "request_revision"} or not isinstance(decided_by, str) or not decided_by.strip() or not isinstance(reason, str) or not reason.strip():
+            raise ValueError("exact human decision and reason are required")
         record = self.store.decision(decision_id)
-        status = {"approve": "approved", "deny": "rejected", "request_revision": "rejected"}[decision]
+        status = {"approve": "approved", "deny": "rejected", "request_revision": "revision-requested"}[decision]
+        # External-round gates use the legacy successor-plan workflow.  Keep
+        # their terminal rejection contract stable while direct Psychlo
+        # decisions expose the distinct revision directive to the scheduler.
+        if decision_id.startswith("roadex:external:") and status == "revision-requested":
+            status = "rejected"
         now = self.clock()
         if decision_id.startswith("roadex:external:"):
             if record is None:
@@ -1153,12 +1205,23 @@ class PsychloBridge:
             if record[2] != "staged" and record[2] != status:
                 raise ValueError("external decision conflict")
             return self._decide_external(record[0], status, decided_by, now, reason)
-        if record is None or record[2] != "staged": raise ValueError("an exact staged Psychlo decision is required")
+        if record is None:
+            raise ValueError("an exact staged Psychlo decision is required")
         request = record[0]
         outcome = {**request, "sourceId": "overseer", "provenanceId": f"roadex-outcome:{decision_id}:{status}", "status": status}
-        response = self.sender("decision-outcome", str(request["decisionId"]), outcome)
-        if response.get("accepted") is not True: raise ValueError("Psychlo rejected decision outcome")
-        self.store.decide(decision_id, status, decided_by, now, reason)
+        if record[2] != "staged":
+            persisted = self.store.decision_record(decision_id)
+            if persisted is None or persisted["status"] != status or persisted["decidedBy"] != decided_by or persisted["reason"] != reason:
+                raise ValueError("decision conflict")
+            intent = self.store.decision_intent(decision_id)
+            if intent is not None:
+                if intent["request"] != request or intent["outcome"] != outcome or intent["decidedBy"] != decided_by or intent["reason"] != reason:
+                    raise ValueError("decision conflict")
+                if intent["status"] == "pending":
+                    self._deliver_decision_intent(decision_id)
+            return {"ok": True, "decision": decision, "action_status": status, "mutation_performed": False, "host_mutation_performed": False}
+        self.store.record_terminal_decision_intent(request, outcome, decided_by, now, reason)
+        self._deliver_decision_intent(decision_id)
         return {"ok": True, "decision": decision, "action_status": status, "mutation_performed": True, "host_mutation_performed": False}
 
     def _decide_external(self, request: Mapping[str, Any], status: str, decided_by: str, decided_at: str, reason: str) -> dict[str, Any]:
@@ -1193,9 +1256,12 @@ class PsychloBridge:
         response = self.sender("decision-outcome", decision_id, intent["outcome"])
         if response.get("accepted") is not True:
             raise ValueError("Psychlo rejected decision outcome")
-        reconciliation_id = decision_id.removeprefix("roadex:external:")
         status = str(intent["outcome"]["status"])
-        self.store.settle_external_decision(decision_id, status, intent["decidedBy"], intent["decidedAt"], intent["reason"], reconciliation_id)
+        if decision_id.startswith("roadex:external:"):
+            reconciliation_id = decision_id.removeprefix("roadex:external:")
+            self.store.settle_external_decision(decision_id, status, intent["decidedBy"], intent["decidedAt"], intent["reason"], reconciliation_id)
+        else:
+            self.store.settle_decision_intent(decision_id, status)
 
     def _recover_decision_intents(self) -> None:
         for decision_id in self.store.pending_decision_intents():
@@ -2427,7 +2493,7 @@ class PsychloBridge:
         self.store.transition_protocol(kind, str(record["id"]), "delivered", receipt=dict(response))
 
     def _external_decision_request(self, envelope: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
-        return {"decisionId": f"roadex:external:{envelope['reconciliationId']}", "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": workflow_id, "decisionVersion": envelope["planVersion"], "correlationId": envelope["correlationId"], "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}", "question": envelope["explicitGate"], "resultProvenanceId": envelope["digest"]}
+        return {"decisionId": f"roadex:external:{envelope['reconciliationId']}", "projectId": envelope["projectId"], "planId": envelope["planId"], "workflowId": workflow_id, "decisionVersion": envelope["planVersion"], "correlationId": envelope["correlationId"], "idempotencyKey": f"roadex:external:{envelope['idempotencyKey']}", "question": envelope["explicitGate"], "resultProvenanceId": envelope["digest"], "continuationMode": "successor-plan-required"}
 
     def _ensure_external_decision(self, envelope: Mapping[str, Any], decision_id: str) -> None:
         if f"roadex:external:{envelope['reconciliationId']}" != decision_id:

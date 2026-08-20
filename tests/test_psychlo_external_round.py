@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import pytest
 
 from overseer.psychlo_bridge import PsychloBridge
 from overseer.psychlo_store import PsychloBridgeStore
@@ -17,13 +18,25 @@ def external_payload():
     return payload
 
 
+@pytest.mark.parametrize("continuation_mode", [None, "same-plan", "invalid"])
+def test_external_gate_requires_successor_plan_continuation_mode(tmp_path: Path, continuation_mode: str | None):
+    bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
+    bridge.receive_external_round(external_payload())
+    request = {"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]}
+    if continuation_mode is not None:
+        request["continuationMode"] = continuation_mode
+    with pytest.raises(ValueError, match="identity|continuation mode"):
+        bridge.stage_decision(request)
+    assert bridge.store.decision("roadex:external:reconcile-1") is None
+
+
 def test_external_round_persists_separately_before_forward_and_creates_gate(tmp_path: Path):
     forwarded = []
     bridge = None
     def send(kind, message_id, payload):
         forwarded.append((kind, message_id, payload))
         if kind == "external-round":
-            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
         return {"accepted": True}
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     receipt = bridge.receive_external_round(external_payload())
@@ -41,7 +54,7 @@ def test_external_round_uses_exact_psychlo_gate_receipt_once(tmp_path: Path):
     def send(kind, message_id, payload):
         forwarded.append((kind, message_id, payload))
         if kind == "external-round":
-            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
         return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}}
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     first = bridge.receive_external_round(external_payload())
@@ -80,7 +93,7 @@ def test_approved_external_decide_settles_one_gate_and_releases_only_a_fresh_bou
     def send(kind, message_id, payload):
         forwarded.append((kind, message_id, payload))
         if kind == "external-round":
-            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
         return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}} if kind == "external-round" else {"accepted": True}
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda lead, prompt: dispatched.append((lead, prompt)) or "fresh-dispatch", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW, token_factory=lambda: "fresh-capability-1234567890abcdef")
     bridge.receive_external_round(external_payload())
@@ -113,7 +126,7 @@ def test_rejected_and_expired_external_decisions_remain_blocked(tmp_path: Path):
         bridge = None
         def send(kind, message_id, payload):
             if kind == "external-round":
-                bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+                bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
                 return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}}
             return {"accepted": True}
         bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / f"{outcome}.sqlite3"), dispatcher=lambda *_: "fresh-dispatch", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
@@ -135,7 +148,7 @@ def test_external_decision_restart_repairs_interstep_settlement_and_expired_outc
     def send(kind, message_id, payload):
         forwarded.append((kind, message_id, payload))
         if kind == "external-round":
-            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
         return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}} if kind == "external-round" else {"accepted": True}
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     bridge.receive_external_round(external_payload())
@@ -156,7 +169,7 @@ def test_external_decision_restart_repairs_interstep_settlement_and_expired_outc
     expired_bridge = None
     def expired_send(kind, message_id, payload):
         if kind == "external-round":
-            expired_bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+            expired_bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "roadex-callback-v7", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
             return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}}
         return {"accepted": True}
     expired_bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "expired.sqlite3"), dispatcher=lambda *_: "unused", sender=expired_send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
@@ -170,13 +183,13 @@ def test_external_gate_binds_callback_workflow_and_rejects_conflicting_workflow(
     bridge = None
     def send(kind, message_id, payload):
         if kind == "external-round":
-            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "configured-roadex-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+            bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "configured-roadex-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
         return {"accepted": True, "receipt": {"decisionId": "roadex:external:reconcile-1", "decisionStatus": "pending"}}
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=send, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     bridge.receive_external_round(external_payload())
     assert bridge.store.external_execution("reconcile-1")["gateWorkflowId"] == "configured-roadex-workflow"
     try:
-        bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "wrong-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+        bridge.stage_decision({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": "wrong-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
     except ValueError as error:
         assert "workflow" in str(error)
     else:
@@ -186,7 +199,7 @@ def test_external_gate_binds_callback_workflow_and_rejects_conflicting_workflow(
 def test_external_callback_validates_before_mutation_wrong_first_then_correct_retry_and_restart(tmp_path: Path):
     bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
     bridge.receive_external_round(external_payload())
-    malformed = {"decisionId": "roadex:external:reconcile-1", "projectId": "wrong-project", "planId": "plan-1", "workflowId": "configured-roadex-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]}
+    malformed = {"decisionId": "roadex:external:reconcile-1", "projectId": "wrong-project", "planId": "plan-1", "workflowId": "configured-roadex-workflow", "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"}
     try:
         bridge.stage_decision(malformed)
     except ValueError as error:
@@ -207,7 +220,7 @@ def test_external_first_callbacks_serialize_one_exact_winner_and_conflicting_los
     seed.receive_external_round(external_payload())
     requests = []
     for workflow in ("workflow-a", "workflow-b"):
-        requests.append({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": workflow, "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"]})
+        requests.append({"decisionId": "roadex:external:reconcile-1", "projectId": "arcade", "planId": "plan-1", "workflowId": workflow, "decisionVersion": "v1", "correlationId": "corr-1", "idempotencyKey": "roadex:external:reconcile-1", "question": "approve next round", "resultProvenanceId": external_payload()["digest"], "continuationMode": "successor-plan-required"})
     def callback(request):
         bridge = PsychloBridge(store=PsychloBridgeStore(tmp_path / "bridge.sqlite3"), dispatcher=lambda *_: "unused", sender=lambda *_: {"accepted": True}, callback_origin="http://127.0.0.1:8766", clock=lambda: NOW)
         try:

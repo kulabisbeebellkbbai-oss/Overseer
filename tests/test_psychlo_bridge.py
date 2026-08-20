@@ -2964,7 +2964,7 @@ def test_stages_and_completes_roadex_decision(tmp_path: Path):
     assert bridge.stage_decision(request)["receipt"]["status"] == "staged"
     item = bridge.list_decisions()[0]
     assert item["human_approval_required"] is True
-    bridge.decide("decision-1", "approve", "human-user", "")
+    bridge.decide("decision-1", "approve", "human-user", "approved exact decision")
     assert forwarded[0][0] == "decision-outcome"
     assert forwarded[0][2]["status"] == "approved"
 
